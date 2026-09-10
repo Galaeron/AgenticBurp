@@ -117,9 +117,15 @@ class ReportFinding:
     is_chain: bool = False
     fingerprint: str = ""
     duplicate_count: int = 1   # how many raw findings collapsed into this survivor
+    # T06: the concrete case coordinates + stable issue identity.
+    method: str = ""
+    parameter_location: str = ""
+    parameter_name: str = ""
+    issue_id: str = ""
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
+    import issues
     vc = d.get("vulnerability_class", "")
     return ReportFinding(
         url=d.get("url", ""),
@@ -135,6 +141,11 @@ def _from_store_dict(d: dict) -> ReportFinding:
         agent=d.get("agent", ""),
         is_chain=vc.startswith("potential-attack-chain:"),
         fingerprint=d.get("fingerprint", ""),
+        method=(d.get("method") or "").upper(),
+        parameter_location=d.get("parameter_location", "") or "",
+        parameter_name=d.get("parameter_name", "") or "",
+        issue_id=("" if vc.startswith("potential-attack-chain:")
+                  else issues.issue_id_for(issues.issue_key(d))),
     )
 
 
@@ -231,14 +242,18 @@ def _rank_unconfirmed_by_value_density(
     return [unconfirmed[i] for i in order]
 
 
-def _dedup_key(f: "ReportFinding") -> tuple[str, str]:
-    """The identity a duplicate shares: the endpoint FAMILY (object ids collapsed
-    to {id}, so /tickets/1 and /tickets/2 are one family) and the canonical class.
-    This is what makes 45 confirmed findings collapse to ~4 real bugs -- the same
-    IDOR proven on ticket 1..8 is one finding about /tickets/{id}, not eight."""
-    family = normalize_path(f.url) if f.url else ""
-    canon = canonicalize(f.vulnerability_class) or (f.vulnerability_class or "").strip().lower()
-    return (family, canon)
+def _dedup_key(f: "ReportFinding") -> tuple:
+    """The identity a duplicate shares (T06, conservative): endpoint FAMILY (object
+    ids collapsed to {id}, so /tickets/1 and /tickets/2 are one family), method,
+    canonical class, affected input, and authorization boundary. This is what makes
+    the same IDOR proven on ticket 1..8 collapse to one issue about /tickets/{id},
+    while keeping two SQLi inputs on one endpoint -- and a read vs a write -- as
+    distinct issues. It is exactly `issues.issue_key`, so the report's collapse and
+    the issue export agree by construction."""
+    import issues
+    return issues.issue_key({
+        "url": f.url, "method": f.method, "vulnerability_class": f.vulnerability_class,
+        "parameter_location": f.parameter_location, "parameter_name": f.parameter_name})
 
 
 def _rank_tuple(f: "ReportFinding") -> tuple:
@@ -416,6 +431,9 @@ def _render_finding(f: ReportFinding) -> list[str]:
                  f"_(generic starting point -- verify against this target's actual implementation)_")
     lines.append("")
     lines.append(f"_Reported by: `{f.agent}`_")
+    if f.issue_id:
+        lines.append(f"_Issue: `{f.issue_id}` -- stable across runs; a retest of this bug links "
+                      f"to this same issue id rather than opening a new one._")
     if f.fingerprint:
         lines.append(f"_Fingerprint: `{f.fingerprint[:16]}` -- use this to suppress if this is a "
                       f"false positive, so it doesn't resurface on a future scan of this host._")
@@ -441,3 +459,29 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     suppressed_count = len(all_including_suppressed) - len(findings)
     host = store.host_of(url)
     return generate_markdown_report(host, findings, effort_ledger=effort_ledger, suppressed_count=suppressed_count)
+
+
+def issue_exports(findings: list[dict], proofs_by_case: dict | None = None) -> list[dict]:
+    """Group store-shaped findings into stable issues and render each as a
+    reproducible, secret-free export (T06). This is the machine-readable
+    counterpart to the Markdown report: it keeps EVERY affected case/instance
+    (not just a winner + count) and links case/proof ids, so an issue exported
+    from one run maps to the same issue id on a patched-fixture retest."""
+    import issues
+    grouped = issues.group_findings_into_issues(findings)
+    return [issues.export_issue(i, proofs_by_case=proofs_by_case) for i in grouped]
+
+
+def export_issues_for_host(url: str) -> list[dict]:
+    """Convenience: pull a host's findings from store.py and return their T06 issue
+    exports, enriched with each case's recorded proof verdict where available."""
+    import store
+    findings = store.all_host_findings(url)
+    proofs_by_case: dict = {}
+    for f in findings:
+        cid = f.get("case_id")
+        if cid and cid not in proofs_by_case:
+            best = store.best_proof_for_case(cid)
+            if best:
+                proofs_by_case[cid] = best
+    return issue_exports(findings, proofs_by_case=proofs_by_case)
