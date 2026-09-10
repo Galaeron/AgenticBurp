@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import evidence
 import store
@@ -27,7 +28,11 @@ def _case(**over) -> TestCaseRef:
 class VerdictTests(unittest.TestCase):
     def test_status_mapping(self):
         self.assertEqual(Verdict.from_validation("confirmed", True), Verdict.CONFIRMED)
-        self.assertEqual(Verdict.from_validation("not_confirmed", False), Verdict.CONTROLLED_NEGATIVE)
+        self.assertEqual(Verdict.from_validation("not_confirmed", False), Verdict.INCONCLUSIVE)
+        self.assertEqual(
+            Verdict.from_validation("not_confirmed", False, controlled=True, executed=True),
+            Verdict.CONTROLLED_NEGATIVE,
+        )
         self.assertEqual(Verdict.from_validation("error", False), Verdict.ERROR)
         self.assertEqual(Verdict.from_validation("skipped", False), Verdict.INCONCLUSIVE)
         self.assertEqual(Verdict.from_validation("confirmed", True, blocked=True), Verdict.BLOCKED)
@@ -39,6 +44,11 @@ class VerdictTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ProofRecord(proof_id="", case=_case(), validator="v",
                         verdict=Verdict.CONTROLLED_NEGATIVE, executed=False)
+
+    def test_controlled_negative_requires_control_artifact(self):
+        with self.assertRaises(ValueError):
+            ProofRecord(proof_id="", case=_case(), validator="v",
+                        verdict=Verdict.CONTROLLED_NEGATIVE, executed=True)
 
     def test_confirmed_requires_execution(self):
         with self.assertRaises(ValueError):
@@ -94,6 +104,17 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(back.verdict, Verdict.CONFIRMED)
         self.assertEqual(back.case, p.case)
         self.assertTrue(back.executed)
+        self.assertTrue(back.legacy)
+        self.assertIn("legacy/unstructured", back.limitation)
+
+    def test_structured_controlled_negative_requires_explicit_execution_and_control(self):
+        kwargs = dict(case=_case(), validator="cross_identity", status="not_confirmed",
+                      confirmed=False, controlled=True, control_artifact_ids=("control-1",))
+        implicit = ProofRecord.from_validation_result(**kwargs)
+        self.assertEqual(implicit.verdict, Verdict.INCONCLUSIVE)
+        explicit = ProofRecord.from_validation_result(**kwargs, executed=True)
+        self.assertEqual(explicit.verdict, Verdict.CONTROLLED_NEGATIVE)
+        self.assertFalse(explicit.legacy)
 
     def test_legacy_confirmed_is_flagged_not_fabricated(self):
         p = ProofRecord.legacy_confirmed(case=_case(), validator="cross_identity")
@@ -119,7 +140,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(len(ledger.proofs_for(ca.case_id)), 1)
         self.assertEqual(len(ledger.proofs_for(cb.case_id)), 1)
         self.assertEqual(ledger.best_proof(ca.case_id).verdict, Verdict.CONFIRMED)
-        self.assertEqual(ledger.best_proof(cb.case_id).verdict, Verdict.CONTROLLED_NEGATIVE)
+        self.assertEqual(ledger.best_proof(cb.case_id).verdict, Verdict.INCONCLUSIVE)
 
     def test_later_inconclusive_preserves_earlier_confirmed(self):
         c = _case()
@@ -267,10 +288,18 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         self.assertEqual(len(store.proofs_for_case(case_id)), 1)
         self.assertEqual(store.best_proof_for_case(case_id)["verdict"], "confirmed")
 
-    def test_not_confirmed_is_controlled_negative(self):
+    def test_legacy_not_confirmed_is_inconclusive(self):
         reg = _FakeRegistry({"idor": _FakeValidator("cross_identity", "not_confirmed", False)})
         _, proofs = self._run(self._reports("idor"), self._exchange(), reg)
-        self.assertEqual(proofs[0]["verdict"], "controlled_negative")
+        self.assertEqual(proofs[0]["verdict"], "inconclusive")
+        self.assertTrue(proofs[0]["legacy"])
+        self.assertIn("legacy/unstructured", proofs[0]["limitation"])
+
+    def test_retired_observation_is_not_a_secure_boundary(self):
+        reg = _FakeRegistry({"csrf": _FakeValidator("csrf", "not_confirmed", False)})
+        _, proofs = self._run(self._reports("csrf"), self._exchange(), reg)
+        self.assertEqual(proofs[0]["verdict"], "inconclusive")
+        self.assertFalse(proofs[0]["confirmed"] if "confirmed" in proofs[0] else False)
 
     def test_errored_validator_is_error_not_controlled_negative(self):
         reg = _FakeRegistry({"xxe": _FakeValidator("xxe", "confirmed", True, raise_exc=True)})
@@ -278,6 +307,15 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         self.assertEqual(len(vreports), 0)                 # crashed leg -> no validation report
         self.assertEqual(len(proofs), 1)
         self.assertEqual(proofs[0]["verdict"], "error")    # honestly recorded, never controlled_negative
+
+    def test_persistence_rejection_is_surfaced_and_not_returned_as_durable(self):
+        reg = _FakeRegistry({"sqli": _FakeValidator("sqlmap", "confirmed", True)})
+        with patch("store.persist_proof_record", return_value=(False, "disk_unavailable")):
+            vreports, proofs = self._run(self._reports("sqli"), self._exchange(), reg)
+        self.assertEqual(proofs, [])
+        self.assertEqual(vreports[0].status, "error")
+        self.assertFalse(vreports[0].confirmed)
+        self.assertIn("disk_unavailable", vreports[0].summary)
 
     def test_distinct_classes_get_distinct_cases(self):
         reg = _FakeRegistry({"sqli": _FakeValidator("sqlmap", "confirmed", True),

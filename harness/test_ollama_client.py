@@ -8,7 +8,7 @@ from ollama_client import OllamaClient, OllamaError, OllamaModelNotFoundError
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
-def _make_client(handler) -> OllamaClient:
+def _make_client(testcase: unittest.TestCase, handler) -> OllamaClient:
     client = OllamaClient(base_url="http://fake-ollama:11434")
 
     class PatchedAsyncClient(_REAL_ASYNC_CLIENT):
@@ -18,6 +18,10 @@ def _make_client(handler) -> OllamaClient:
 
     import ollama_client as mod
     mod.httpx.AsyncClient = PatchedAsyncClient
+    # httpx is a shared module object, so this assignment affects every transport
+    # user in the process.  Restore it after EACH test; module cleanup registered
+    # during discovery can run under the wrong module boundary.
+    testcase.addCleanup(setattr, mod.httpx, "AsyncClient", _REAL_ASYNC_CLIENT)
     return client
 
 
@@ -30,7 +34,7 @@ class ChatJsonMeteredTests(unittest.IsolatedAsyncioTestCase):
                 "prompt_eval_count": 742,
                 "eval_count": 88,
             })
-        client = _make_client(handler)
+        client = _make_client(self, handler)
         result = await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
         self.assertEqual(result.data, {"findings": []})
         self.assertEqual(result.prompt_tokens, 742)
@@ -43,7 +47,7 @@ class ChatJsonMeteredTests(unittest.IsolatedAsyncioTestCase):
                 "done": True,
                 # no prompt_eval_count / eval_count -- older server or stripping proxy
             })
-        client = _make_client(handler)
+        client = _make_client(self, handler)
         result = await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
         self.assertEqual(result.prompt_tokens, 0)
         self.assertEqual(result.completion_tokens, 0)
@@ -57,7 +61,7 @@ class ChatJsonMeteredTests(unittest.IsolatedAsyncioTestCase):
                 "prompt_eval_count": 500,
                 "eval_count": 40,
             })
-        client = _make_client(handler)
+        client = _make_client(self, handler)
         result = await client.chat_json(model="m", system_prompt="s", user_prompt="u")
         self.assertEqual(result, {"dispatch": ["sqli"]})
         self.assertNotIsInstance(result, tuple)
@@ -65,14 +69,14 @@ class ChatJsonMeteredTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_json_content_raises_ollama_error(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"message": {"content": "not json"}, "done": True})
-        client = _make_client(handler)
+        client = _make_client(self, handler)
         with self.assertRaises(OllamaError):
             await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
 
     async def test_non_200_status_raises_ollama_error(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(500, text="internal error")
-        client = _make_client(handler)
+        client = _make_client(self, handler)
         with self.assertRaises(OllamaError):
             await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
 
@@ -100,7 +104,7 @@ class ThinkingModeDisabledTests(unittest.IsolatedAsyncioTestCase):
                 "message": {"content": json.dumps({"ok": True})},
                 "done": True,
             })
-        client = _make_client(handler)
+        client = _make_client(self, handler)
         await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
         self.assertIn("think", captured["body"])
         self.assertFalse(captured["body"]["think"])
@@ -134,14 +138,14 @@ class ModelNotFoundDoesNotTripSharedBreakerTests(unittest.IsolatedAsyncioTestCas
     async def test_404_raises_model_not_found_subclass(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(404, json={"error": "model 'bad-tag:latest' not found"})
-        client = _make_client(handler)
+        client = _make_client(self, handler)
         with self.assertRaises(OllamaModelNotFoundError):
             await client.chat_json_metered(model="bad-tag:latest", system_prompt="s", user_prompt="u")
 
     async def test_three_consecutive_404s_do_not_open_the_breaker(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(404, json={"error": "model 'bad-tag:latest' not found"})
-        client = _make_client(handler)
+        client = _make_client(self, handler)
         for _ in range(3):
             with self.assertRaises(OllamaModelNotFoundError):
                 await client.chat_json_metered(model="bad-tag:latest", system_prompt="s", user_prompt="u")
@@ -154,7 +158,7 @@ class ModelNotFoundDoesNotTripSharedBreakerTests(unittest.IsolatedAsyncioTestCas
         shares the same breaker."""
         def not_found_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(404, json={"error": "model 'bad-tag:latest' not found"})
-        bad_client = _make_client(not_found_handler)
+        bad_client = _make_client(self, not_found_handler)
         for _ in range(5):  # well past the failure_threshold of 3
             with self.assertRaises(OllamaModelNotFoundError):
                 await bad_client.chat_json_metered(model="bad-tag:latest", system_prompt="s", user_prompt="u")
@@ -164,7 +168,7 @@ class ModelNotFoundDoesNotTripSharedBreakerTests(unittest.IsolatedAsyncioTestCas
                 "message": {"content": json.dumps({"ok": True})},
                 "done": True, "prompt_eval_count": 10, "eval_count": 5,
             })
-        good_client = _make_client(working_handler)
+        good_client = _make_client(self, working_handler)
         self.assertIs(good_client.circuit_breaker, bad_client.circuit_breaker,
                        "test assumption: both clients must share the same breaker")
         result = await good_client.chat_json_metered(model="working-model", system_prompt="s", user_prompt="u")

@@ -11,6 +11,18 @@ Older session narratives are in git history / `archive/`; this file is deliberat
 
 ## ►► SESSION-17 STATE (READ FIRST) ◄◄
 
+**2026-09-10 implementation continuation from `9fdbb11`:** Work continues on
+`codex/astra-review-fixes` in an isolated worktree so the occupied
+`impl/astra-tickets` worktree and dirty `WorkingSunday` checkout remain untouched.
+T01 F02/F06 is complete: legacy `not_confirmed` maps to inconclusive; a controlled
+negative requires explicit execution plus a control artifact; artifact-free results
+are labelled `legacy/unstructured`. A pre-existing `test_ollama_client` global-httpx
+leak was also contained per test so real-transport tests survive full discovery.
+Focused verdict/oracle/authorization checks: **37 tests OK**. Ordered transport
+isolation regression: **28 tests OK**. Full stdlib discovery: **1,578 tests OK,
+2 skipped**, 314.586s. Exact case binding (F03) is next; T01 as a whole remains
+partial until that focused commit lands.
+
 **2026-09-10 review-only addendum:** Source inspected at HEAD `8b5c6e1`;
 implementation handoff saved to
 [`reviews/review-Astra-Medium-10-09-06-30/IMPLEMENTATION_HANDOFF.md`](reviews/review-Astra-Medium-10-09-06-30/IMPLEMENTATION_HANDOFF.md).

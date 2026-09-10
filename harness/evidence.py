@@ -68,7 +68,8 @@ class Verdict(str, Enum):
     ERROR = "error"                             # the leg ran but failed (transport/exception)
 
     @classmethod
-    def from_validation(cls, status: str, confirmed: bool, *, blocked: bool = False) -> "Verdict":
+    def from_validation(cls, status: str, confirmed: bool, *, blocked: bool = False,
+                        controlled: bool = False, executed: bool = False) -> "Verdict":
         """Classify a ValidationResult (status, confirmed) into a Verdict.
 
         An `error` status is ALWAYS `ERROR` and can never be read as a controlled
@@ -81,7 +82,7 @@ class Verdict(str, Enum):
         if s == "error":
             return cls.ERROR
         if s == "not_confirmed":
-            return cls.CONTROLLED_NEGATIVE
+            return cls.CONTROLLED_NEGATIVE if controlled and executed else cls.INCONCLUSIVE
         # "skipped", "", or anything else without a real verdict.
         return cls.INCONCLUSIVE
 
@@ -240,6 +241,10 @@ class ProofRecord:
             raise ValueError(
                 f"verdict {self.verdict.value!r} asserts an executed comparison but "
                 f"executed=False -- a non-executed leg cannot confirm or controlled-negate")
+        if self.verdict == Verdict.CONTROLLED_NEGATIVE and not self.control_artifact_ids:
+            raise ValueError(
+                "controlled_negative requires control artifact references; a bare "
+                "not_confirmed observation is inconclusive")
         if not self.proof_id:
             object.__setattr__(self, "proof_id", uuid.uuid4().hex)
         if not self.created_at:
@@ -254,17 +259,41 @@ class ProofRecord:
                                confirmed: bool, validator_version: str = "",
                                observed_result: str = "", expected_invariant: str = "",
                                limitation: str = "", blocked: bool = False,
+                               executed: bool | None = None, controlled: bool = False,
                                baseline_artifact_id: str = "", attack_artifact_id: str = "",
                                control_artifact_ids: tuple[str, ...] = ()) -> "ProofRecord":
-        """Build a proof from a real validator result. `error`/`skipped`/`blocked`
-        never yield a confirmed or controlled-negative verdict."""
-        verdict = Verdict.from_validation(status, confirmed, blocked=blocked)
-        executed = (not blocked) and (status or "").lower() in ("confirmed", "not_confirmed", "error")
+        """Build a proof from a validator compatibility result.
+
+        Legacy validators did not report whether the comparison and its controls
+        actually executed.  Their bare ``not_confirmed`` therefore remains
+        inconclusive.  A controlled negative requires an explicit ``executed=True``
+        contract *and* at least one control artifact.  Artifact-free results remain
+        readable, but are labelled legacy/unstructured instead of being presented as
+        migrated structured proof.
+        """
+        control_artifact_ids = tuple(control_artifact_ids)
+        has_artifacts = bool(baseline_artifact_id or attack_artifact_id or control_artifact_ids)
+        explicit_execution = executed is True
+        controlled_negative = controlled and explicit_execution and bool(control_artifact_ids)
+        verdict = Verdict.from_validation(
+            status, confirmed, blocked=blocked,
+            controlled=controlled_negative, executed=explicit_execution,
+        )
+        # Confirmed legacy results are retained rather than downgraded merely because
+        # the old validator could not emit the new execution/artifact contract.
+        record_executed = explicit_execution or (
+            not blocked and confirmed and (status or "").lower() == "confirmed"
+        )
+        legacy = not has_artifacts
+        if legacy:
+            legacy_note = "legacy/unstructured result: no resolvable exchange artifacts were captured"
+            limitation = f"{limitation}; {legacy_note}" if limitation else legacy_note
         return cls(proof_id="", case=case, validator=validator, verdict=verdict,
                    validator_version=validator_version, observed_result=observed_result,
                    expected_invariant=expected_invariant, limitation=limitation,
                    baseline_artifact_id=baseline_artifact_id, attack_artifact_id=attack_artifact_id,
-                   control_artifact_ids=tuple(control_artifact_ids), executed=executed)
+                   control_artifact_ids=control_artifact_ids, executed=record_executed,
+                   legacy=legacy)
 
     @classmethod
     def legacy_confirmed(cls, *, case: TestCaseRef, validator: str, observed_result: str = "",
