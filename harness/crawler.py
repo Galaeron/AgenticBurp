@@ -72,6 +72,8 @@ async def crawl(
     max_pages: int = 40,
     max_depth: int = 2,
     timeout: float = 15.0,
+    run_context=None,
+    session_ref: str | None = None,
 ) -> CrawlResult:
     """BFS from `base_url`, fetching same-origin HTML pages (to depth) and every
     JavaScript bundle they load, mining each for endpoint references. Returns a
@@ -93,7 +95,9 @@ async def crawl(
     # queue of (url, depth, is_script)
     queue: list[tuple[str, int, bool]] = [(base_url, 0, False)]
 
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    client = None if run_context is not None else httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True)
+    try:
         while queue and result.pages_fetched + result.scripts_mined < max_pages:
             url, depth, is_script = queue.pop(0)
             norm_url = url.split("#", 1)[0]
@@ -104,13 +108,25 @@ async def crawl(
                 continue
 
             try:
-                await global_throttle.acquire()
-                resp = await client.get(norm_url, headers=headers)
+                if run_context is not None:
+                    from run_context import TypedRequest
+                    request_headers = {k: v for k, v in headers.items()
+                                       if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
+                    outcome = await run_context.executor().execute(
+                        TypedRequest("GET", norm_url, headers=request_headers),
+                        capability="crawler", session_ref=session_ref)
+                    if not outcome.ok:
+                        result.errors.append(f"{norm_url}: {outcome.outcome}")
+                        continue
+                    body = outcome.body or ""
+                else:
+                    await global_throttle.acquire()
+                    resp = await client.get(norm_url, headers=headers)
+                    body = resp.text or ""
             except httpx.HTTPError as e:
                 result.errors.append(f"{norm_url}: {e.__class__.__name__}")
                 continue
 
-            body = resp.text or ""
             found = extract_endpoints(body, norm_url)
             result.endpoints |= found.same_origin_paths
             result.external_urls |= found.external_urls
@@ -133,4 +149,7 @@ async def crawl(
                     if link.startswith(origin_prefix) and link.split("#", 1)[0] not in seen:
                         queue.append((link, depth + 1, False))
 
+    finally:
+        if client is not None:
+            await client.aclose()
     return result

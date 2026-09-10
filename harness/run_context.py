@@ -183,6 +183,27 @@ class SessionManager:
     def all(self) -> list[ManagedSession]:
         return list(self._by_id.values())
 
+    def bind_headers(self, headers: dict | None) -> tuple[str | None, dict]:
+        """Resolve credential headers to their owning session.
+
+        Returns the session reference plus non-credential request headers. If no
+        registered session owns supplied credentials, leaves them in place so
+        Executor's credential-without-session rule fails closed.
+        """
+        supplied = dict(headers or {})
+        wanted = {k.lower(): v for k, v in supplied.items()
+                  if k.lower() in _CREDENTIAL_HEADERS}
+        if not wanted:
+            return None, supplied
+        for session in self._by_id.values():
+            actual = {k.lower(): v for k, v in session.headers.items()
+                      if k.lower() in _CREDENTIAL_HEADERS}
+            if actual == wanted:
+                return session.session_id, {
+                    k: v for k, v in supplied.items()
+                    if k.lower() not in _CREDENTIAL_HEADERS}
+        return None, supplied
+
     async def aclose(self) -> None:
         for s in self._by_id.values():
             await s.aclose()

@@ -206,7 +206,8 @@ class SurfaceDiscovery:
                  allowed_hosts: list[str] | None = None,
                  nouns=None, collections=None, prefixes=None, seed_paths=None,
                  actions=None, sensitive_files=None, timeout: float = 8.0, max_probes: int = 6000,
-                 use_ffuf: bool = True, ffuf_image: str = "harness/ffuf:2.1.0"):
+                 use_ffuf: bool = True, ffuf_image: str = "harness/ffuf:2.1.0",
+                 run_context=None, session_ref: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
         self.allowed_hosts = allowed_hosts or []
@@ -225,6 +226,8 @@ class SurfaceDiscovery:
         self.max_probes = max_probes
         self.use_ffuf = use_ffuf
         self.ffuf_image = ffuf_image
+        self.run_context = run_context
+        self.session_ref = session_ref
         self._seen: dict[str, Route] = {}
         self._probes = 0
         self._phase_limit = max_probes
@@ -246,6 +249,16 @@ class SurfaceDiscovery:
         url = self.base_url + path
         if not _host_in_scope(url, self.allowed_hosts):
             return None
+        if self.run_context is not None:
+            from run_context import TypedRequest
+            request_headers = {k: v for k, v in self.headers.items()
+                               if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
+            outcome = await self.run_context.executor().execute(
+                TypedRequest(method, url, headers=request_headers),
+                capability="surface_discovery", session_ref=self.session_ref)
+            if not outcome.ok:
+                return None
+            return outcome.status or 0, outcome.body or "", outcome.headers.get("Allow", "")
         import global_throttle
         await global_throttle.acquire()
         try:

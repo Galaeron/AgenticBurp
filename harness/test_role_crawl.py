@@ -51,7 +51,8 @@ def _auth_of(headers):
 
 
 def _fake_crawl(endpoints):
-    async def fake(base_url, headers=None, allowed_hosts=None, max_pages=40, max_depth=2, timeout=15.0):
+    async def fake(base_url, headers=None, allowed_hosts=None, max_pages=40, max_depth=2,
+                   timeout=15.0, **kwargs):
         from crawler import CrawlResult
         r = CrawlResult(base_url=base_url)
         r.endpoints = set(endpoints)

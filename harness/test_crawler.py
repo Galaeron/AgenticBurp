@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import global_throttle
 import crawler
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 
 
 class _Resp:
@@ -72,6 +74,27 @@ class CrawlerTests(unittest.TestCase):
     def test_unsupported_scheme(self):
         r = asyncio.run(crawler.crawl("ftp://t.test/", allowed_hosts=["t.test"]))
         self.assertTrue(any("unsupported scheme" in e for e in r.errors))
+
+    def test_run_context_routes_actual_fetch_with_session_and_budget(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=1,
+                                gate_config={"active_enabled": True})
+        ctx.sessions.register("user", "user", {"Authorization": "Bearer crawl"},
+                              allowed_origins=[ScopePolicy.origin_of(fixture.base)])
+        async def scenario():
+            result = await crawler.crawl(
+                fixture.base, headers={"Authorization": "Bearer crawl"},
+                allowed_hosts=["127.0.0.1"], max_pages=1,
+                run_context=ctx, session_ref="user")
+            await ctx.aclose()
+            return result
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.pages_fetched, 1)
+            self.assertEqual(ctx.budget.used, 1)
+            self.assertEqual(fixture.httpd.received[0]["authorization"], "Bearer crawl")
+        finally:
+            fixture.close()
 
 
 if __name__ == "__main__":

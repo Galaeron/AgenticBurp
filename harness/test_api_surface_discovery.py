@@ -2,6 +2,8 @@ import asyncio
 import unittest
 
 from api_surface_discovery import SurfaceDiscovery, _is_not_found, _paths_from_spec
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 
 # Flask/Werkzeug wraps an unknown route as a 500 carrying this marker; the oracle
 # must read that as "route does not exist" just like a bare 404.
@@ -52,6 +54,28 @@ class DiscoveryTests(unittest.TestCase):
             collections=["admin", "tickets"],
             nouns=["health", "users", "login", "tickets", "articles"],
         )
+
+    def test_run_context_routes_actual_probe_with_session_and_budget(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=1,
+                                gate_config={"active_enabled": True})
+        ctx.sessions.register("user", "user", {"Authorization": "Bearer discover"},
+                              allowed_origins=[ScopePolicy.origin_of(fixture.base)])
+        disc = SurfaceDiscovery(
+            fixture.base, headers={"Authorization": "Bearer discover"},
+            allowed_hosts=["127.0.0.1"], max_probes=1, use_ffuf=False,
+            run_context=ctx, session_ref="user")
+        async def scenario():
+            result = await disc.discover()
+            await ctx.aclose()
+            return result
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.probes_sent, 1)
+            self.assertEqual(ctx.budget.used, 1)
+            self.assertEqual(fixture.httpd.received[0]["authorization"], "Bearer discover")
+        finally:
+            fixture.close()
 
     def test_finds_nested_route_a_flat_wordlist_misses(self):
         # /api/admin/users lives two segments deep; single-noun probing never

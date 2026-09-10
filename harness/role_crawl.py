@@ -257,10 +257,13 @@ async def crawl_roles(
 
     # 1. Discover the surface, per role (authenticated pages/JS may reveal more).
     discovered: set[str] = set()
-    for r in roles:
+    for role_index, r in enumerate(roles):
         try:
             cr = await crawler.crawl(base_url, headers=r.norm_headers(),
-                                     allowed_hosts=allowed_hosts, max_pages=max_pages)
+                                     allowed_hosts=allowed_hosts, max_pages=max_pages,
+                                     run_context=run_context,
+                                     session_ref=(session_refs[role_index]
+                                                  if session_refs is not None else None))
             discovered |= cr.endpoints
             result.errors.extend(f"[{r.role}] {e}" for e in cr.errors)
         except Exception as e:  # a bad role's crawl must not sink the whole run
@@ -293,7 +296,10 @@ async def crawl_roles(
                     # namespaces they reveal (Phase 0.2(a)) and later sweeps benefit.
                     disc = SurfaceDiscovery(base_url, headers=sr.norm_headers(),
                                             allowed_hosts=allowed_hosts, max_probes=per_budget,
-                                            seed_paths=sorted(discovered))
+                                            seed_paths=sorted(discovered),
+                                            run_context=run_context,
+                                            session_ref=(session_refs[roles.index(sr)]
+                                                         if session_refs is not None else None))
                     sres = await disc.discover()
                     discovered |= {_template_ids(rt.path) for rt in sres.routes}
                     total_routes += len(sres.routes); total_probes += sres.probes_sent
