@@ -7,6 +7,8 @@ from models import Finding, HttpExchange
 from validators.verb_tamper_validator import VerbTamperValidator
 from validators.csrf_validator import CsrfValidator, _has_csrf_token, _session_cookie_samesite
 from validators.file_upload_validator import FileUploadValidator
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 
 
 def _exchange(url="http://target.test/api/admin", method="GET", status=403,
@@ -185,6 +187,78 @@ class CsrfValidatorTests(unittest.TestCase):
         self.assertFalse(r.confirmed)
         self.assertIn("observation", r.summary.lower())
 
+
+class RunContextTransportTests(unittest.TestCase):
+    def _context(self, fixture, *, budget=10):
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=budget,
+            gate_config={"active_enabled": True, "allow_mutating_replay": True})
+        ctx.sessions.register(
+            "victim", "victim", {"Authorization": "Bearer victim"},
+            allowed_origins=[ScopePolicy.origin_of(fixture.base)], role="user")
+        return ctx
+
+    def test_csrf_replay_uses_run_session_and_shared_budget(self):
+        fixture = _Fixture()
+        ctx = self._context(fixture, budget=1)
+        validator = CsrfValidator(allowed_hosts=["127.0.0.1"], run_context=ctx)
+        exchange = _exchange(
+            url=fixture.base + "/csrf", method="POST", status=200,
+            request_headers={"Authorization": "Bearer victim", "X-CSRF-Token": "secret"},
+            request_body="action=update&csrf_token=secret")
+        async def scenario():
+            result = await validator.validate(_finding("csrf"), exchange)
+            await ctx.aclose()
+            return result
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.status, "not_confirmed")
+            self.assertEqual(ctx.budget.used, 1)
+            self.assertEqual(fixture.httpd.received[0]["authorization"], "Bearer victim")
+            self.assertNotIn("csrf", fixture.httpd.received[0]["body"].lower())
+        finally:
+            fixture.close()
+
+    def test_csrf_unknown_credentials_fail_closed_without_send(self):
+        fixture = _Fixture()
+        ctx = self._context(fixture)
+        validator = CsrfValidator(allowed_hosts=["127.0.0.1"], run_context=ctx)
+        exchange = _exchange(
+            url=fixture.base + "/csrf", method="POST", status=200,
+            request_headers={"Authorization": "Bearer unregistered"},
+            request_body="action=update")
+        async def scenario():
+            result = await validator.validate(_finding("csrf"), exchange)
+            await ctx.aclose()
+            return result
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.status, "skipped")
+            self.assertEqual(fixture.httpd.received, [])
+            self.assertEqual(ctx.budget.used, 0)
+        finally:
+            fixture.close()
+
+    def test_verb_tamper_uses_run_session_for_actual_alternate(self):
+        fixture = _Fixture()
+        ctx = self._context(fixture)
+        validator = VerbTamperValidator(allowed_hosts=["127.0.0.1"], run_context=ctx)
+        exchange = _exchange(
+            url=fixture.base + "/admin", method="POST", status=403,
+            request_headers={"Authorization": "Bearer victim"})
+        async def scenario():
+            result = await validator.validate(_finding(), exchange)
+            await ctx.aclose()
+            return result
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.status, "not_confirmed")
+            self.assertIn("observation", result.summary.lower())
+            self.assertEqual(fixture.httpd.received[-1]["authorization"], "Bearer victim")
+            self.assertGreaterEqual(ctx.budget.used, 1)
+        finally:
+            fixture.close()
+
     @patch("validators.csrf_validator.GatedAsyncClient")
     @patch("global_throttle.acquire", new_callable=AsyncMock)
     def test_not_confirmed_replay_rejected(self, _throttle, mock_client_cls):
@@ -197,7 +271,8 @@ class CsrfValidatorTests(unittest.TestCase):
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock()
         mock_client_cls.return_value = mock_client
-        r = asyncio.run(self.v.validate(_finding("csrf"), ex))
+        r = asyncio.run(CsrfValidator(allowed_hosts=["target.test"]).validate(
+            _finding("csrf"), ex))
         self.assertEqual(r.status, "not_confirmed")
         self.assertFalse(r.confirmed)
 

@@ -67,9 +67,11 @@ class CsrfValidator(Validator):
     finding_classes = {"csrf", "cross-site request forgery", "cross site request forgery", "xsrf"}
     active = True
 
-    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0):
+    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
+                 run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        self.run_context = run_context
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if not super().applies(finding, exchange):
@@ -106,22 +108,38 @@ class CsrfValidator(Validator):
         stripped_body = _CSRF_TOKEN_NAMES.sub("REMOVED", body) if body else ""
 
         try:
-            await global_throttle.acquire()
-            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
-                                        follow_redirects=False, verify=False) as client:
-                resp = await client.request(method, exchange.url,
-                                            headers=strip_headers or None,
-                                            content=stripped_body or None)
+            if self.run_context is not None:
+                from run_context import TypedRequest
+                from .transport import bind_session
+                session_ref, request_headers = bind_session(self.run_context, strip_headers)
+                outcome = await self.run_context.executor().execute(
+                    TypedRequest(method, exchange.url, headers=request_headers,
+                                 body=stripped_body or None),
+                    capability=self.name, session_ref=session_ref)
+                if not outcome.executed:
+                    return self._skip(f"CSRF replay declined: {outcome.outcome}")
+                if outcome.outcome == "error":
+                    return ValidationResult(self.name, "error", "csrf",
+                                            summary=f"HTTP error during replay: {outcome.error}")
+                status_code = outcome.status or 0
+            else:
+                await global_throttle.acquire()
+                async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                            follow_redirects=False, verify=False) as client:
+                    resp = await client.request(method, exchange.url,
+                                                headers=strip_headers or None,
+                                                content=stripped_body or None)
+                status_code = resp.status_code
         except SafetyGateBlocked:
             return self._skip("mutating CSRF replay not authorized (set validators.allow_mutating_replay)")
         except httpx.HTTPError as e:
             return ValidationResult(
                 self.name, "error", "csrf", summary=f"HTTP error during replay: {e}")
 
-        if 200 <= resp.status_code < 300:
+        if 200 <= status_code < 300:
             token_present = _has_csrf_token(exchange)
             evidence_parts = [
-                f"Replayed {method} {exchange.url} without CSRF token → {resp.status_code}.",
+                f"Replayed {method} {exchange.url} without CSRF token → {status_code}.",
             ]
             if not token_present:
                 evidence_parts.append("Original request also carried no CSRF token.")
@@ -150,5 +168,5 @@ class CsrfValidator(Validator):
 
         return ValidationResult(
             self.name, "not_confirmed", "csrf", confidence=0.0, confirmed=False,
-            summary=f"Replay without CSRF token returned {resp.status_code} (rejected).",
-            evidence=f"{method} {exchange.url} without token → {resp.status_code}.")
+            summary=f"Replay without CSRF token returned {status_code} (rejected).",
+            evidence=f"{method} {exchange.url} without token → {status_code}.")
