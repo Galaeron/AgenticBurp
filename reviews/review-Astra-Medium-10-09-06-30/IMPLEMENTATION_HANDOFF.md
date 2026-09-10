@@ -236,7 +236,7 @@ Append actual results to EXECUTION_LOG.md in this directory as work proceeds. Fo
 - [x] T06 issue identity and reproducible export (branch `astra-t05-t08`: stable run-independent
       issue IDs, conservative grouping, redacted export + replay view; operator root-cause MERGE
       and Burp one-click replay deferred to T10.)
-- [ ] T07 stateful workflow engine
+- [x] T07 stateful workflow engine
 - [ ] T08 transport migration and individually qualified oracle improvements (branch
       `astra-t05-t08`: INVENTORY + routing-gap AUDIT + enforcement test done — 32 sites, 23
       target gaps owned/named; the actual per-site executor migration and per-oracle

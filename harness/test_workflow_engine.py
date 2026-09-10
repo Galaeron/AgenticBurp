@@ -207,8 +207,11 @@ class ExecutionTests(unittest.TestCase):
 class RealTransportWorkflowTests(unittest.TestCase):
     """Readable create->approve->verify fixture; transport and executor are real."""
 
-    def _run(self, vulnerable):
+    def _run(self, vulnerable, variant=None):
         state = {"items": {}, "next": 1, "calls": [], "vulnerable": vulnerable}
+        if variant:
+            state["items"]["1"] = {"owner": "alice", "approved": False}
+            state["next"] = 2
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
@@ -261,7 +264,12 @@ class RealTransportWorkflowTests(unittest.TestCase):
              "prerequisites":["create"],"cleanup":True}
           ]}
         try:
-            result = asyncio.run(engagement_builder.execute_declared_workflows([declaration], ctx))[0]
+            if variant:
+                wf = __import__("workflow_engine").workflow_from_dict(declaration)
+                result = asyncio.run(execute_misuse_variant(
+                    wf, variant, ctx, initial_values={"id":"1"}))
+            else:
+                result = asyncio.run(engagement_builder.execute_declared_workflows([declaration], ctx))[0]
             asyncio.run(ctx.aclose())
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=2)
@@ -280,6 +288,22 @@ class RealTransportWorkflowTests(unittest.TestCase):
         self.assertEqual(by_id["verify"].status, StepStatus.BLOCKED)
         self.assertNotIn(("GET", "/items/1", "alice"), state["calls"])
         self.assertEqual(result.cleanup_completed, ["cleanup"])
+
+    def test_actual_transport_skip_prerequisite_vulnerable_and_patched(self):
+        variant = MisuseVariant("skip_prerequisite", "approve")
+        vulnerable, vstate = self._run(True, variant)
+        patched, pstate = self._run(False, variant)
+        self.assertEqual(vulnerable.steps[0].status, StepStatus.PASSED)
+        self.assertEqual(patched.steps[0].reason, "access denied")
+        self.assertIn(("POST", "/items/1/approve", "bob"), vstate["calls"])
+        self.assertIn(("POST", "/items/1/approve", "bob"), pstate["calls"])
+
+    def test_actual_transport_repeat_is_exactly_two_sends(self):
+        variant = MisuseVariant("repeat", "create")
+        result, state = self._run(True, variant)
+        creates = [c for c in state["calls"] if c[:2] == ("POST", "/items")]
+        self.assertEqual(len(creates), 2)
+        self.assertTrue(result.complete)
 
 
 if __name__ == "__main__":

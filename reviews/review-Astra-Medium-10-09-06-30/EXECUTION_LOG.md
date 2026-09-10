@@ -257,8 +257,14 @@ visibility/contract refinements, not correctness fabrications.
 - Invalid environment attempt with a mistyped dependency path failed imports and is not
   counted. Valid focused workflow + production-caller smoke: exit 0, **30 tests OK**.
 - Full stdlib discovery: exit 0, **1,702 tests OK, 2 skipped, in 324.669s**.
-- T07 remains open: misuse variants are planned but not yet executed/qualified; resume
-  dependency preservation and the full failure/cancel cleanup matrix still need tests.
+- T07 completion: `execute_misuse_variant` sends bounded skip/repeat/switch-principal
+  variants through the same executor; resume accepts only the same workflow/version and
+  preserves passed dependencies and extracted values without replay; cleanup failures
+  remain visible. The readable loopback fixture adds vulnerable/patched prerequisite-skip
+  controls and proves repeat dispatch is exactly two target sends.
+- Final T07 focused workflow/identity/production/transport matrix — exit 0,
+  **102 tests OK in 21.300s**. Full stdlib discovery — exit 0,
+  **1,708 tests OK, 2 skipped, in 320.729s**.
 ## T03 F07 — invocation-local run identity
 
 - Baseline: `e24ca7f`; commit subject: `fix(t03): isolate run identity per invocation`
