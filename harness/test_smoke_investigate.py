@@ -303,6 +303,31 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
             "Smoke test is not testing confirmation: a secure (signature-verifying) "
             "server was still reported as a confirmed JWT forgery.")
 
+    def test_declared_workflow_runs_through_investigate_production_caller(self):
+        """T07 wiring: the existing investigate job invokes the declared-workflow
+        adapter with its invocation-local RunContext and returns the result."""
+        from run_context import RunContext
+        cfg = _test_config()
+        cfg.setdefault("engagement", {})["declared_workflows"] = [{
+            "id": "wf", "steps": [{"id": "read", "method": "GET",
+            "url_template": BASE_URL + "/x", "session_ref": "anonymous"}]}]
+        orch = Orchestrator(cfg)
+        orch.run_active_probe = AsyncMock(return_value={
+            "iterative_result": {"stop_reason": "gave_up", "findings": []}, "integration": {}})
+        ctx = RunContext.create(run_id="workflow-run", config=cfg, allowed_hosts=["localhost"])
+        fake = SimpleNamespace(to_dict=lambda: {"workflow_id": "wf", "version": 1,
+                                                "complete": True, "steps": []})
+        with patch("engagement_builder.build_engagement", side_effect=_canned_engagement), \
+             patch("engagement_builder.execute_declared_workflows",
+                   new_callable=AsyncMock, return_value=[fake]) as execute, \
+             patch("httpx.AsyncClient.get", new_callable=AsyncMock,
+                   side_effect=_responder(False)):
+            result = asyncio.run(orch.investigate_engagement(
+                BASE_URL, ROLES, max_nodes=0, max_chain_rounds=0, run_context=ctx))
+        self.assertEqual(result["workflows"][0]["workflow_id"], "wf")
+        self.assertIs(execute.await_args.args[1], ctx)
+        asyncio.run(ctx.aclose())
+
 
 class CoverageProofCoordinatesTest(unittest.TestCase):
     """T05/R26: the coverage-driven proof carries the CONCRETE parameter case

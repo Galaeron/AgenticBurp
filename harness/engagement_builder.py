@@ -136,3 +136,18 @@ async def feature_crawl_captures(
              "%d seed path(s)",
              base_url, len(out), len(sweep_roles), len(seed_paths or []))
     return out
+
+
+async def execute_declared_workflows(workflows, run_context) -> list:
+    """Production adapter for T07 declarations used by investigate_engagement.
+
+    Accepts config-shaped dictionaries or already-validated Workflow records and
+    executes each through the invocation's existing RunContext.
+    """
+    import workflow_engine
+    results = []
+    for declaration in workflows or []:
+        workflow = (declaration if isinstance(declaration, workflow_engine.Workflow)
+                    else workflow_engine.workflow_from_dict(declaration))
+        results.append(await workflow_engine.execute_workflow(workflow, run_context))
+    return results

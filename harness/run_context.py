@@ -205,6 +205,7 @@ class ExecutionOutcome:
     outcome: str                      # ok | out_of_scope | blocked | budget_exhausted | cancelled | error
     status: int | None = None
     body: str = ""
+    headers: dict = field(default_factory=dict)
     final_url: str = ""
     error: str = ""
     artifact: "evidence.ExchangeArtifact | None" = None
@@ -237,7 +238,8 @@ class Executor:
 
     async def execute(self, request: TypedRequest, *, capability: str,
                       session_ref: str | None = None, case_ref: str = "",
-                      max_redirects: int = 5) -> ExecutionOutcome:
+                      max_redirects: int = 5,
+                      allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
         """Send one request through scope + gate + budget, following redirects
         MANUALLY so every hop is re-checked. Captures an artifact on every path,
         including blocks and errors."""
@@ -266,7 +268,7 @@ class Executor:
         body = request.body
 
         for _hop in range(max_redirects + 1):
-            if ctx.cancel.cancelled:
+            if ctx.cancel.cancelled and not allow_cancelled_cleanup:
                 return ExecutionOutcome(outcome="cancelled", final_url=url,
                                         artifact=self._artifact(url, "cancelled", session_ref))
             # 1. Scope -- BEFORE any send, so an off-scope (redirect) target is never contacted.
@@ -314,7 +316,8 @@ class Executor:
                 headers = {}          # drop one-shot headers; creds re-decided by same-origin next hop
                 url = nxt
                 continue
-            return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text, final_url=url,
+            return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
+                                    headers=dict(resp.headers), final_url=url,
                                     artifact=self._artifact(url, "ok", session_ref, status=resp.status_code))
         # Redirect budget exhausted -> return the last hop as ok-ish (no further follow).
         return ExecutionOutcome(outcome="ok", status=None, final_url=url,

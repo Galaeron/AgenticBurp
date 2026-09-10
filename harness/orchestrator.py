@@ -1152,6 +1152,7 @@ class Orchestrator:
         # is recorded here and surfaced in the result as `errors` + `degraded`, so a
         # run that skipped a phase is declared incomplete rather than looking clean.
         _errors: list[dict] = []
+        workflow_results: list[dict] = []
 
         # Phase 0.1: promote every substantive 2xx encountered during discovery
         # into full content-level review before prioritising/iterating. A body
@@ -1259,6 +1260,16 @@ class Orchestrator:
                     role="anonymous", name="anonymous",
                     principal=role_crawl.RoleSession(
                         role="anonymous", headers={}).to_principal())
+            declarations = ((self.config.get("engagement", {}) or {})
+                            .get("declared_workflows", []))
+            if declarations:
+                try:
+                    executed = await engagement_builder.execute_declared_workflows(
+                        declarations, run_context)
+                    workflow_results = [r.to_dict() for r in executed]
+                except Exception as e:
+                    _errors.append({"phase": "declared_workflows",
+                                    "error": f"{type(e).__name__}: {e}"})
         for r in roles:
             if r.headers:
                 # Register under a DISTINCT principal id (R10): two same-role users
@@ -1774,6 +1785,7 @@ class Orchestrator:
             "chains": chains,
             "chain_rounds": rounds,
             "coverage": coverage,
+            "workflows": workflow_results,
             "task_graph": state.graph.to_dict(),
             "ready_tasks": state.pending(),
             "blocked_tasks": state.blocked(),
