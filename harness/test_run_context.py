@@ -228,5 +228,47 @@ class CookieAndRedirectTests(unittest.TestCase):
             other.close()
 
 
+class CrossIdentityExecutorMigrationTests(unittest.TestCase):
+    """T03b: the cross-identity probe (a production caller) now sends through the
+    RunContext executor -- asserted by the TARGET-side counter, not a mock."""
+
+    def setUp(self):
+        self.srv = _Fixture()
+
+    def tearDown(self):
+        self.srv.close()
+
+    def _validator(self, ctx):
+        from validators.cross_identity_validator import CrossIdentityValidator
+        return CrossIdentityValidator(allowed_hosts=["127.0.0.1"], run_context=ctx)
+
+    def test_probe_sends_through_executor_and_counts_budget(self):
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=5)
+        v = self._validator(ctx)
+
+        async def scenario():
+            p = await v._probe(f"{self.srv.base}/probe", {"Authorization": "Bearer X"})
+            await ctx.aclose()
+            return p
+
+        p = asyncio.run(scenario())
+        self.assertEqual(p.status, 200)
+        self.assertIn("/probe", self.srv.paths())     # the executor actually sent it (target-side)
+        self.assertEqual(ctx.budget.used, 1)          # and it counted against the run budget
+
+    def test_probe_out_of_scope_is_not_sent(self):
+        ctx = RunContext.create(allowed_hosts=["only.allowed.test"])  # fixture host not allowed
+        v = self._validator(ctx)
+
+        async def scenario():
+            p = await v._probe(f"{self.srv.base}/blocked", {})
+            await ctx.aclose()
+            return p
+
+        p = asyncio.run(scenario())
+        self.assertEqual(p.status, 0)                 # policy-declined -> not reached
+        self.assertEqual(self.srv.paths(), [])        # target never contacted
+
+
 if __name__ == "__main__":
     unittest.main()

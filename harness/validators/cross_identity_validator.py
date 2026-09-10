@@ -194,7 +194,8 @@ class CrossIdentityValidator(Validator):
     active = True  # sends live requests; only runs when validators.active_enabled
 
     def __init__(self, allowed_hosts: list[str] | None = None,
-                 timeout: float = 10.0, max_identities: int = 3, ownership=None):
+                 timeout: float = 10.0, max_identities: int = 3, ownership=None,
+                 run_context=None):
         self.allowed_hosts = set(allowed_hosts or [])
         self.timeout = timeout
         self.max_identities = max_identities
@@ -203,6 +204,12 @@ class CrossIdentityValidator(Validator):
         # object's owner, an explicitly-shared principal, or a public object is NOT
         # reported as a boundary crossing. Default None keeps pre-T02 behavior.
         self.ownership = ownership
+        # T03: an optional run_context.RunContext. When supplied, every probe is sent
+        # through its Executor -- one gate/scope/budget decision with redirects
+        # re-checked per hop -- instead of a bespoke httpx client. Default None keeps
+        # the legacy direct path, so registry construction is unchanged until a run
+        # supplies a context.
+        self.run_context = run_context
 
     def _object_ref(self, url: str) -> str:
         """The object identity used to look up ownership facts. The URL path is a
@@ -214,8 +221,21 @@ class CrossIdentityValidator(Validator):
         return access_control_gate._is_access_control_class(finding.vulnerability_class)
 
     async def _probe(self, url: str, headers: dict) -> identity_compare.Probe:
-        """Live GET, throttled. A method seam so unit tests can replace it with
-        a canned responder and never touch the network."""
+        """Live GET. A method seam so unit tests can replace it with a canned
+        responder and never touch the network. When a RunContext is configured (T03)
+        the send goes through its Executor -- one policy path (scope + gate + budget,
+        redirects re-checked per hop); a policy-declined send is reported as
+        'not reached' (status 0), never a crash."""
+        if self.run_context is not None:
+            from run_context import TypedRequest
+            out = await self.run_context.executor().execute(
+                TypedRequest("GET", url, headers=dict(headers or {})),
+                capability=self.name, session_ref=None)
+            if out.outcome == "error":
+                raise RuntimeError(out.error or "probe transport error")
+            if not out.executed:   # out_of_scope / blocked / budget / cancelled -> not reached
+                return identity_compare.Probe(0, "")
+            return identity_compare.Probe(out.status or 0, out.body or "")
         import global_throttle
         await global_throttle.acquire()
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
