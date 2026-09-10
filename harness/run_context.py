@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlsplit
 
@@ -295,6 +296,7 @@ class RunContext:
     cancel: CancelToken
     sessions: SessionManager
     config: dict = field(default_factory=dict)
+    cache_namespace: str = ""
     timeout: float = 15.0
     _default_client: httpx.AsyncClient | None = None
 
@@ -305,12 +307,19 @@ class RunContext:
         # A FRESH gate per run (never the process-global default) -- the #3 isolation
         # fix: authorization state is per run, so two runs cannot contaminate each
         # other's mutation budgets or audit log.
+        resolved_run_id = run_id or uuid.uuid4().hex
+        config_snapshot = deepcopy(config or {})
+        configured_namespace = str(
+            ((config_snapshot.get("runs", {}) or {}).get("cache_namespace") or "")
+        )
         return cls(
-            run_id=run_id or uuid.uuid4().hex,
+            run_id=resolved_run_id,
             scope=ScopePolicy(allowed_hosts=frozenset((h or "").lower() for h in (allowed_hosts or []))),
             gate=SafetyGate(SafetyGateConfig.from_dict(gate_config or {})),
             budget=RequestBudget(max_requests), cancel=CancelToken(),
-            sessions=SessionManager(), config=config or {}, timeout=timeout)
+            sessions=SessionManager(), config=config_snapshot,
+            cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
+                             if configured_namespace else resolved_run_id), timeout=timeout)
 
     def default_client(self) -> httpx.AsyncClient:
         if self._default_client is None:

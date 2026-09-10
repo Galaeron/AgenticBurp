@@ -30,6 +30,15 @@ case hash. Focused evidence/engagement/transport checks: **79 tests OK**. Full s
 discovery: **1,581 tests OK, 2 skipped**, 314.376s. T01 is now complete against the
 reviewed F02/F03/F06 requirements; invocation-local run identity (T03 F07) is next.
 
+**T03 F07 complete:** the server job manifest now owns an invocation-local
+`RunContext`, and that immutable run ID is passed into engagement/captured-exchange
+analysis and exact proof construction. The singleton lazy run ID was removed.
+Configuration is deep-snapshotted, cache namespaces are salted by run ID, request
+budgets/cancellation are per context, API cancellation signals the context, and owned
+clients close with the job lifecycle. Focused cache/context/proof/manifest/API checks:
+**80 tests OK**. Full stdlib discovery: **1,585 tests OK, 2 skipped**, 287.529s.
+T03 F04/F05 session and credential isolation is next.
+
 **2026-09-10 review-only addendum:** Source inspected at HEAD `8b5c6e1`;
 implementation handoff saved to
 [`reviews/review-Astra-Medium-10-09-06-30/IMPLEMENTATION_HANDOFF.md`](reviews/review-Astra-Medium-10-09-06-30/IMPLEMENTATION_HANDOFF.md).

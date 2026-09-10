@@ -92,3 +92,42 @@
 - Full stdlib discovery — exit 0, **1,581 tests OK, 2 skipped, in 314.376s**.
 - No model, browser/container, blind target, or live engagement run was performed.
   T01 is complete for review findings F02/F03/F06; T03 F07 is next.
+
+## T03 F07 — invocation-local run identity
+
+- Baseline: `e24ca7f`; commit subject: `fix(t03): isolate run identity per invocation`
+  (this focused commit).
+- Production caller: `POST /engagement/{host}/investigate` creates one `RunContext`
+  whose run ID matches the persisted manifest, passes it into
+  `investigate_engagement`, and closes it with the job lifecycle. Cancellation signals
+  the same context before cancelling the asyncio task.
+- Proof path: `analyze`, recursive captured/discovered exchange analysis, and
+  `_validate_findings` accept the invocation context. The process-wide orchestrator no
+  longer lazily stores or reuses a run ID.
+- Isolation: configuration is deep-copied at context creation; cache keys accept a
+  namespace and API-created namespaces combine the configured label with the manifest
+  run ID. Request budgets, cancellation tokens, gates, sessions, and cache/proof
+  namespaces remain distinct across sequential and overlapping jobs.
+- Regression/negative control: back-to-back and concurrent proof construction retains
+  different case namespaces without mutating the orchestrator; mutating the source
+  configuration after context creation does not affect the earlier run; two API jobs
+  pass distinct manifest-matching contexts.
+- Initial focused run after the server edit — exit 1: **55 tests run**, with server job
+  endpoint errors caused by a misplaced local `urlsplit` import. Corrected before any
+  pass was recorded.
+- Focused `test_run_context test_evidence test_run_manifest` plus investigation API
+  endpoint tests — exit 0, **55 tests OK in 7.021s**.
+- First expanded focused run including `test_cache` — exit 1, **80 tests run in
+  7.825s**. The concurrent proof test raced on its shared temporary SQLite persistence
+  and produced `database is locked`; persistence was replaced with the existing seam
+  because that test targets concurrent case construction, not SQLite concurrency.
+- Corrected expanded focused run — exit 0, **80 tests OK in 8.025s**.
+- Full stdlib discovery — exit 0, **1,585 tests OK, 2 skipped, in 291.453s**.
+- After enforcing a fresh context before every top-level captured-exchange cache lookup,
+  final focused cache/context/proof/smoke/API checks — exit 0, **80 tests OK in
+  149.575s**; definitive full stdlib discovery — exit 0, **1,585 tests OK, 2 skipped,
+  in 287.529s**.
+- Test tier: hermetic/unit, local executor transport inherited from `test_run_context`,
+  and HTTP API production-boundary tests. No model, browser/container, blind target, or
+  live engagement run was performed. T03 F04/F05 credential isolation is next; broad
+  executor wiring remains intentionally assigned to F01.

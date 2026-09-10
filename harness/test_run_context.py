@@ -92,6 +92,18 @@ class ScopeAndIsolationTests(unittest.TestCase):
         self.assertEqual(c1.budget.used, 1)
         self.assertEqual(c2.budget.used, 0)                      # budgets are not shared
 
+    def test_configuration_and_cache_namespace_are_invocation_local(self):
+        source = {"runs": {"cache_namespace": "run-a"}, "nested": {"limit": 2}}
+        c1 = RunContext.create(run_id="a", allowed_hosts=["a.test"], config=source)
+        source["runs"]["cache_namespace"] = "mutated"
+        source["nested"]["limit"] = 99
+        c2 = RunContext.create(run_id="b", allowed_hosts=["b.test"], config=source)
+        self.assertEqual(c1.config["nested"]["limit"], 2)
+        self.assertEqual(c1.cache_namespace, "run-a:a")
+        self.assertEqual(c2.config["nested"]["limit"], 99)
+        self.assertEqual(c2.cache_namespace, "mutated:b")
+        self.assertIsNot(c1.config, c2.config)
+
     def test_scope_fails_closed_on_empty_allowlist(self):
         empty = ScopePolicy()
         self.assertFalse(empty.in_scope("http://anything.test/"))

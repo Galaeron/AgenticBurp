@@ -380,6 +380,48 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         vreports, proofs = self._run(self._reports("sqli"), self._exchange(), _FakeRegistry({}))
         self.assertEqual((vreports, proofs), ([], []))
 
+    def test_back_to_back_invocations_keep_distinct_proof_namespaces(self):
+        from run_context import RunContext
+        reg = _FakeRegistry({"sqli": _FakeValidator("sqlmap", "confirmed", True)})
+        import orchestrator
+        orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+        orch.validator_registry = reg
+
+        async def scenario():
+            first = await orch._validate_findings(
+                self._exchange(), self._reports("sqli"),
+                run_context=RunContext.create(run_id="manifest-one"))
+            second = await orch._validate_findings(
+                self._exchange(), self._reports("sqli"),
+                run_context=RunContext.create(run_id="manifest-two"))
+            return first[1][0], second[1][0]
+
+        first, second = asyncio.run(scenario())
+        self.assertEqual(first["case"]["run_id"], "manifest-one")
+        self.assertEqual(second["case"]["run_id"], "manifest-two")
+        self.assertNotEqual(first["case"]["case_id"], second["case"]["case_id"])
+
+    def test_overlapping_invocations_do_not_mutate_orchestrator_run_id(self):
+        from run_context import RunContext
+        import orchestrator
+        orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+        orch.validator_registry = _FakeRegistry(
+            {"sqli": _FakeValidator("sqlmap", "confirmed", True)})
+
+        async def one(run_id):
+            _, proofs = await orch._validate_findings(
+                self._exchange(), self._reports("sqli"),
+                run_context=RunContext.create(run_id=run_id))
+            return proofs[0]["case"]["run_id"]
+
+        async def scenario():
+            return await asyncio.gather(one("overlap-a"), one("overlap-b"))
+
+        with patch("store.persist_proof_record", return_value=(True, "")):
+            observed = asyncio.run(scenario())
+        self.assertEqual(set(observed), {"overlap-a", "overlap-b"})
+        self.assertFalse(hasattr(orch, "run_id"))
+
 
 if __name__ == "__main__":
     unittest.main()
