@@ -60,6 +60,16 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   max-coverage VulnCorp run to move any
   numbers. New live behavior is flag-gated OFF, so live recall is unchanged until enabled.
 
+- **T07 in progress (`ec19ed8`, `cbbc192`):** added versioned Workflow/Step/Result
+  records; strict prerequisite and placeholder blocking; JSON Pointer, Location, and
+  hidden-field extractors; bounded 401 refresh distinct from 403 denial; eager cleanup
+  registration and cleanup-after-cancel through the run-scoped executor; declarative
+  production wiring in `investigate_engagement`; and an actual-loopback vulnerable/
+  patched cross-principal create→approve→independent-read control. Focused T07 caller/
+  transport suite: 30 OK. Full suite: **1,702 OK, 2 skipped**, 324.669s. Still open:
+  execute and verify skip/repeat/switch misuse variants, resume dependency preservation,
+  and the complete failure/cancel cleanup matrix before marking T07 done.
+
 ---
 
 ## ►► SESSION-17 STATE (READ FIRST) ◄◄

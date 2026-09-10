@@ -240,6 +240,25 @@ visibility/contract refinements, not correctness fabrications.
 - Full stdlib discovery using CPython 3.12.10 with the recorded shim + `.review-deps` —
   exit 0, **1,685 tests OK, 2 skipped, in 317.988s**.
 - No external target, real model, browser, or container run was performed.
+
+## T07a/T07b — explicit workflow contracts and RunContext execution (in progress)
+
+- Commits `ec19ed8` and `cbbc192` add versioned workflow/step/result records,
+  dependency validation, strict template binding, JSON Pointer/Location/hidden-field
+  extraction, assertions, cleanup registration, bounded refresh, and deterministic
+  skip/repeat/switch-principal variant plans.
+- Production caller: `Orchestrator.investigate_engagement` reads
+  `engagement.declared_workflows`, passes the invocation-local `RunContext` through
+  `engagement_builder.execute_declared_workflows`, and returns serialized outcomes.
+- Real-transport tier: readable loopback fixture creates as Alice, attempts approval
+  as Bob, independently reads state as Alice, and cleans up. Vulnerable mode passes
+  only after the state read; patched mode returns 403, blocks verification, and still
+  cleans up. Target calls are asserted; transport/executor are not mocked.
+- Invalid environment attempt with a mistyped dependency path failed imports and is not
+  counted. Valid focused workflow + production-caller smoke: exit 0, **30 tests OK**.
+- Full stdlib discovery: exit 0, **1,702 tests OK, 2 skipped, in 324.669s**.
+- T07 remains open: misuse variants are planned but not yet executed/qualified; resume
+  dependency preservation and the full failure/cancel cleanup matrix still need tests.
 ## T03 F07 — invocation-local run identity
 
 - Baseline: `e24ca7f`; commit subject: `fix(t03): isolate run identity per invocation`
