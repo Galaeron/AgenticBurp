@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 from workflow_engine import (
     Assertion, Extractor, ExtractorKind, StepStatus, Workflow, WorkflowResult,
-    WorkflowStep, bind_template, execute_workflow, extract_all, json_pointer,
-    misuse_variants,
+    WorkflowStep, bind_template, execute_misuse_variant, execute_workflow,
+    extract_all, json_pointer, misuse_variants, MisuseVariant,
 )
 
 
@@ -154,6 +154,54 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn(("skip_prerequisite", "approve"), kinds)
         self.assertIn(("repeat", "create"), kinds)
         self.assertIn(("switch_principal", "approve"), kinds)
+
+    def test_resume_preserves_values_and_dependencies_without_replaying_create(self):
+        wf = self._workflow()
+        prior = WorkflowResult(wf.id, wf.version,
+            steps=[type("S", (), {"step_id":"create", "status":StepStatus.PASSED})()],
+            values={"item_id":"9"})
+        ctx = _Context([_out(200), _out(204)])
+        result = asyncio.run(execute_workflow(wf, ctx, resume=prior))
+        self.assertEqual(len(ctx._executor.calls), 1)
+        self.assertIn("/9/approve", ctx._executor.calls[0][0].url)
+        self.assertEqual(result.cleanup_completed, [])  # prior cleanup was not re-registered implicitly
+
+    def test_resume_rejects_other_version(self):
+        wf = self._workflow()
+        prior = WorkflowResult(wf.id, 99)
+        with self.assertRaises(ValueError):
+            asyncio.run(execute_workflow(wf, _Context([]), resume=prior))
+
+    def test_cleanup_failure_is_visible_not_successful_teardown(self):
+        ctx = _Context([_out(201, '{"id":7}'), _out(200),
+                        _out(status=None, outcome="error")])
+        result = asyncio.run(execute_workflow(self._workflow(), ctx))
+        self.assertEqual(result.cleanup_completed, [])
+        self.assertEqual(result.steps[-1].status, StepStatus.BLOCKED)
+
+    def test_skip_repeat_and_switch_variants_execute_exact_shape(self):
+        wf = Workflow("skip", (
+            WorkflowStep("setup", "POST", "http://t.test/setup", "alice"),
+            WorkflowStep("approve", "POST", "http://t.test/items/{{item_id}}/approve",
+                         "manager", prerequisites=("setup",)),))
+        ctx = _Context([_out(200)])
+        skipped = asyncio.run(execute_misuse_variant(
+            wf, MisuseVariant("skip_prerequisite", "approve"), ctx,
+            initial_values={"item_id":"7"}))
+        self.assertEqual(skipped.steps[0].status, StepStatus.PASSED)
+        self.assertEqual(len(ctx._executor.calls), 1)
+
+        one = Workflow("single", (WorkflowStep("act", "POST", "http://t.test/x", "alice"),))
+        ctx = _Context([_out(200), _out(200)])
+        repeated = asyncio.run(execute_misuse_variant(one, MisuseVariant("repeat", "act"), ctx))
+        self.assertEqual(len(ctx._executor.calls), 2)
+        self.assertTrue(repeated.complete)
+
+        ctx = _Context([_out(200)])
+        switched = asyncio.run(execute_misuse_variant(
+            one, MisuseVariant("switch_principal", "act", "bob"), ctx))
+        self.assertEqual(ctx._executor.calls[0][1]["session_ref"], "bob")
+        self.assertTrue(switched.complete)
 
 
 class RealTransportWorkflowTests(unittest.TestCase):

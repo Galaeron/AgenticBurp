@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import asyncio
+from dataclasses import replace
 from dataclasses import dataclass, field
 from enum import Enum
 from html.parser import HTMLParser
@@ -210,7 +211,8 @@ def _assertions_hold(assertions: tuple[Assertion, ...], *, status: int | None,
 
 async def execute_workflow(workflow: Workflow, run_context, *, initial_values=None,
                            capability: str = "workflow", refresh_fn=None,
-                           max_refresh_attempts: int = 1) -> WorkflowResult:
+                           max_refresh_attempts: int = 1,
+                           resume: WorkflowResult | None = None) -> WorkflowResult:
     """Execute an explicit workflow through the run-scoped policy executor.
 
     Cleanup steps are deferred and registered as soon as their prerequisite step
@@ -220,12 +222,18 @@ async def execute_workflow(workflow: Workflow, run_context, *, initial_values=No
     """
     from run_context import TypedRequest
 
+    if resume and (resume.workflow_id != workflow.id or resume.version != workflow.version):
+        raise ValueError("resume record belongs to a different workflow/version")
     result = WorkflowResult(workflow.id, workflow.version,
-                            values=dict(initial_values or {}))
+                            values=dict((resume.values if resume else {}) or {}))
+    result.values.update(initial_values or {})
     by_id = {s.id: s for s in workflow.steps}
     cleanup_steps = [s for s in workflow.steps if s.cleanup]
     normal_steps = [s for s in workflow.steps if not s.cleanup]
-    statuses: dict[str, StepStatus] = {}
+    statuses: dict[str, StepStatus] = {
+        s.step_id: s.status for s in (resume.steps if resume else [])
+        if s.status in (StepStatus.PASSED, StepStatus.CLEANED)}
+    already_passed = {sid for sid, status in statuses.items() if status == StepStatus.PASSED}
     executor = run_context.executor()
 
     async def run_step(step: WorkflowStep, *, is_cleanup=False) -> StepResult:
@@ -281,6 +289,8 @@ async def execute_workflow(workflow: Workflow, run_context, *, initial_values=No
 
     try:
         for step in normal_steps:
+            if step.id in already_passed:
+                continue
             sr = await run_step(step)
             result.steps.append(sr)
             statuses[step.id] = sr.status
@@ -321,6 +331,42 @@ def misuse_variants(workflow: Workflow, *, alternate_session_ref: str = "") -> t
         if alternate_session_ref and alternate_session_ref != step.session_ref:
             out.append(MisuseVariant("switch_principal", step.id, alternate_session_ref))
     return tuple(out)
+
+
+async def execute_misuse_variant(workflow: Workflow, variant: MisuseVariant, run_context,
+                                 *, initial_values=None) -> WorkflowResult:
+    """Execute one bounded misuse plan through the same policy executor.
+
+    The caller supplies extracted IDs/tokens when intentionally skipping setup;
+    missing values still block. A repeat contains exactly two target sends. A
+    principal switch changes only the selected step's session reference.
+    """
+    target = next((s for s in workflow.steps if s.id == variant.step_id), None)
+    if target is None or target.cleanup:
+        raise ValueError("misuse variant references an unknown/non-executable step")
+    cleanup = tuple(s for s in workflow.steps if s.cleanup)
+    if variant.kind == "skip_prerequisite":
+        selected = replace(target, prerequisites=())
+        shaped = Workflow(f"{workflow.id}:skip:{target.id}", (selected,) + tuple(
+            replace(c, prerequisites=(selected.id,)) for c in cleanup),
+            workflow.version, workflow.invariant)
+    elif variant.kind == "switch_principal":
+        selected = replace(target, session_ref=variant.session_ref)
+        prefix = tuple(s for s in workflow.steps if not s.cleanup and s.id != target.id)
+        # Keep only the target's actual prerequisite prefix.
+        needed = set(target.prerequisites)
+        prefix = tuple(s for s in prefix if s.id in needed)
+        shaped = Workflow(f"{workflow.id}:switch:{target.id}", prefix + (selected,) + cleanup,
+                          workflow.version, workflow.invariant)
+    elif variant.kind == "repeat":
+        first = replace(target, id=f"{target.id}:first", prerequisites=())
+        second = replace(target, id=f"{target.id}:repeat", prerequisites=(first.id,))
+        shaped = Workflow(f"{workflow.id}:repeat:{target.id}", (first, second),
+                          workflow.version, workflow.invariant)
+    else:
+        raise ValueError(f"unknown misuse variant: {variant.kind}")
+    return await execute_workflow(shaped, run_context, initial_values=initial_values,
+                                  capability=f"workflow:{variant.kind}")
 
 
 def workflow_from_dict(data: dict) -> Workflow:
