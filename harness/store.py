@@ -109,6 +109,39 @@ CREATE INDEX IF NOT EXISTS idx_sessions_identity ON sessions(identity_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_host ON sessions(host);
 """
 
+# Astra T01: case-bound structured proof records. Additive -- a new table, so a
+# database created by an earlier build gets it via CREATE TABLE IF NOT EXISTS on
+# the next _connect() (legacy rows in other tables are untouched and stay readable).
+# Append-only: proof_id is unique per attempt, so a later re-run never overwrites an
+# earlier confirmed proof of the same case (best_proof_for_case picks the strongest).
+_EVIDENCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS proof_records (
+    proof_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL DEFAULT '',
+    request_template_id TEXT NOT NULL DEFAULT '',
+    check_id TEXT NOT NULL DEFAULT '',
+    parameter_location TEXT NOT NULL DEFAULT '',
+    parameter_name TEXT NOT NULL DEFAULT '',
+    workflow_state_id TEXT NOT NULL DEFAULT '',
+    validator TEXT NOT NULL DEFAULT '',
+    validator_version TEXT NOT NULL DEFAULT '',
+    verdict TEXT NOT NULL DEFAULT 'inconclusive',
+    executed INTEGER NOT NULL DEFAULT 0,
+    legacy INTEGER NOT NULL DEFAULT 0,
+    baseline_artifact_id TEXT NOT NULL DEFAULT '',
+    attack_artifact_id TEXT NOT NULL DEFAULT '',
+    control_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+    expected_invariant TEXT NOT NULL DEFAULT '',
+    observed_result TEXT NOT NULL DEFAULT '',
+    limitation TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_proof_case ON proof_records(case_id);
+CREATE INDEX IF NOT EXISTS idx_proof_run ON proof_records(run_id);
+"""
+
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(_DB_PATH, timeout=10.0)
@@ -119,6 +152,7 @@ def _connect() -> sqlite3.Connection:
     conn.executescript(_CHAIN_SCHEMA)
     conn.executescript(_COVERAGE_SCHEMA)
     conn.executescript(_IDENTITY_SCHEMA)
+    conn.executescript(_EVIDENCE_SCHEMA)
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -401,6 +435,91 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
         return True, "accepted"
     finally:
         conn.close()
+
+
+_PROOF_COLUMNS = (
+    "proof_id, run_id, case_id, principal_id, request_template_id, check_id, "
+    "parameter_location, parameter_name, workflow_state_id, validator, validator_version, "
+    "verdict, executed, legacy, baseline_artifact_id, attack_artifact_id, "
+    "control_artifact_ids_json, expected_invariant, observed_result, limitation, created_at"
+)
+
+
+def persist_proof_record(proof) -> tuple[bool, str]:
+    """Persist one structured proof attempt (Astra T01), append-only.
+
+    Rejects a proof whose case ref is inconsistent -- a forged/unknown case whose
+    case_id does not match its own identity-bearing fields. Uses INSERT OR IGNORE
+    keyed on the per-attempt proof_id, so re-persisting is idempotent and a later
+    weaker attempt never overwrites an earlier stronger proof of the same case
+    (best_proof_for_case selects the strongest)."""
+    from evidence import ProofRecord  # local import: evidence has no store dependency
+    if not isinstance(proof, ProofRecord):
+        return False, "not a ProofRecord"
+    if not proof.case.consistent:
+        return False, "unknown_or_forged_case"
+    c = proof.case
+    conn = _connect()
+    try:
+        conn.execute(
+            f"INSERT OR IGNORE INTO proof_records ({_PROOF_COLUMNS}) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (proof.proof_id, c.run_id, c.case_id, c.principal_id, c.request_template_id,
+             c.check_id, c.parameter_location, c.parameter_name, c.workflow_state_id,
+             proof.validator, proof.validator_version, proof.verdict.value,
+             int(proof.executed), int(proof.legacy), proof.baseline_artifact_id,
+             proof.attack_artifact_id, json.dumps(list(proof.control_artifact_ids)),
+             proof.expected_invariant, proof.observed_result, proof.limitation,
+             proof.created_at),
+        )
+        conn.commit()
+        return True, "accepted"
+    finally:
+        conn.close()
+
+
+def _proof_row_to_dict(row) -> dict:
+    """Reconstruct a ProofRecord.to_dict()-shaped dict (nested case) from a row."""
+    (proof_id, run_id, case_id, principal_id, request_template_id, check_id,
+     parameter_location, parameter_name, workflow_state_id, validator, validator_version,
+     verdict, executed, legacy, baseline_artifact_id, attack_artifact_id,
+     control_artifact_ids_json, expected_invariant, observed_result, limitation, created_at) = row
+    return {
+        "proof_id": proof_id,
+        "case": {"run_id": run_id, "case_id": case_id, "principal_id": principal_id,
+                 "request_template_id": request_template_id, "check_id": check_id,
+                 "parameter_location": parameter_location, "parameter_name": parameter_name,
+                 "workflow_state_id": workflow_state_id},
+        "validator": validator, "validator_version": validator_version, "verdict": verdict,
+        "executed": bool(executed), "legacy": bool(legacy),
+        "baseline_artifact_id": baseline_artifact_id, "attack_artifact_id": attack_artifact_id,
+        "control_artifact_ids": json.loads(control_artifact_ids_json or "[]"),
+        "expected_invariant": expected_invariant, "observed_result": observed_result,
+        "limitation": limitation, "created_at": created_at,
+    }
+
+
+def proofs_for_case(case_id: str) -> list[dict]:
+    """All proof attempts for one case, oldest first (append-only history)."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT {_PROOF_COLUMNS} FROM proof_records WHERE case_id = ? ORDER BY created_at ASC",
+            (case_id,)).fetchall()
+        return [_proof_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def best_proof_for_case(case_id: str) -> dict | None:
+    """The strongest proof attempt for a case (confirmed > controlled_negative >
+    inconclusive/blocked > error; ties break to the most recent). A later weaker
+    attempt never displaces an earlier stronger one."""
+    from evidence import Verdict
+    proofs = proofs_for_case(case_id)
+    if not proofs:
+        return None
+    return max(proofs, key=lambda d: (Verdict(d["verdict"]).rank(), d["created_at"]))
 
 
 def _strip_backticks(text: str) -> str:

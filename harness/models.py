@@ -196,6 +196,12 @@ class AnalysisResponse(BaseModel):
     # tools, each with a command templated to this exchange's URL.
     tool_recommendations: list[dict] = Field(default_factory=list)
     telemetry: dict = Field(default_factory=dict)
+    # Astra T01: case-bound structured proof records for this analysis, one per
+    # validator attempt (evidence.ProofRecord.to_dict()). This is the API/report
+    # surface for structured, verdict-honest evidence -- distinct from the
+    # free-text validation_reports compatibility view above. Empty when no
+    # validator ran.
+    proof_records: list[dict] = Field(default_factory=list)
 
 
 class UrlEstimateItem(BaseModel):
