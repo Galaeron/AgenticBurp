@@ -67,3 +67,28 @@
   No model, browser/container, blind target, or live engagement run was performed.
 - Remaining T01 work: F03 exact originating-case binding and removal of class-wide
   confirmation assignment. No T01-complete claim is made by this commit.
+
+## T01 F03 — exact originating-case binding
+
+- Baseline: `21f6580`; commit subject: `fix(t01): bind proofs to originating findings`
+  (this focused commit).
+- Production path: `Orchestrator._validate_findings` creates the case before dispatch
+  and carries `(finding, validator, case)` together through result handling. Durable
+  confirmations update only that exact finding and attach its case/proof IDs; the
+  class-wide confirmation map and class-wide cross-identity downgrade were removed.
+- Case coordinates now include a stable finding discriminator plus explicit principal,
+  request-template, input, and workflow fields when supplied. The captured request
+  fallback template distinguishes body variants as well as method/URL.
+- Persistence: `proof_records.finding_ref` and finding-level `finding_id`, `case_id`,
+  and `proof_id` are additive migrations and are returned by `all_host_findings`.
+  Legacy proof rows without `finding_ref` retain their original deterministic case hash.
+- Regression/negative control: two same-class findings return confirmed and skipped;
+  only the former is updated and linked. Separate principal/request variants receive
+  distinct case IDs. The exact linkage round-trips through finding persistence.
+- Bundled Python with existing `.review-deps`, `test_evidence` — exit 0,
+  **31 tests OK in 1.147s**.
+- Bundled Python with existing `.review-deps`, `test_evidence test_engagement
+  test_smoke_authorization_workflow` — exit 0, **79 tests OK in 6.160s**.
+- Full stdlib discovery — exit 0, **1,581 tests OK, 2 skipped, in 314.376s**.
+- No model, browser/container, blind target, or live engagement run was performed.
+  T01 is complete for review findings F02/F03/F06; T03 F07 is next.

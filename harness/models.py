@@ -74,6 +74,19 @@ class Finding(BaseModel):
     confirmed: bool = False
     validation_hints: list[str] = Field(default_factory=list)
 
+    # Originating-case coordinates (T01).  Producers may supply authoritative
+    # values; the orchestrator derives a stable invocation-local finding_id when
+    # legacy findings omit one.  proof_id/case_id are populated only after the
+    # exact finding's proof is durably persisted.
+    finding_id: str = ""
+    principal_id: str = ""
+    request_template_id: str = ""
+    parameter_location: str = ""
+    parameter_name: str = ""
+    workflow_state_id: str = ""
+    proof_id: str = ""
+    case_id: str = ""
+
 
 class AgentReport(BaseModel):
     agent: str

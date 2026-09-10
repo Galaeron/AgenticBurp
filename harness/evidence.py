@@ -117,6 +117,7 @@ class TestCaseRef:
     parameter_location: str = ""   # "query" | "body_json" | "header" | ... ("" = whole request)
     parameter_name: str = ""       # param name or JSON pointer
     workflow_state_id: str = ""
+    finding_ref: str = ""
     case_id: str = ""
 
     def __post_init__(self) -> None:
@@ -124,9 +125,12 @@ class TestCaseRef:
             object.__setattr__(self, "case_id", self.recompute_id())
 
     def recompute_id(self) -> str:
-        return _short(self.run_id, self.request_template_id, self.check_id,
-                      self.principal_id, self.parameter_location, self.parameter_name,
-                      self.workflow_state_id)
+        parts = (self.run_id, self.request_template_id, self.check_id,
+                 self.principal_id, self.parameter_location, self.parameter_name,
+                 self.workflow_state_id)
+        # Old persisted cases predate finding_ref; retain their original hash so
+        # additive migration does not make their case_id look forged.
+        return _short(*parts, self.finding_ref) if self.finding_ref else _short(*parts)
 
     @property
     def consistent(self) -> bool:
@@ -138,16 +142,18 @@ class TestCaseRef:
     @classmethod
     def make(cls, *, run_id: str, request_template_id: str, check_id: str,
              principal_id: str = "", parameter_location: str = "", parameter_name: str = "",
-             workflow_state_id: str = "") -> "TestCaseRef":
+             workflow_state_id: str = "", finding_ref: str = "") -> "TestCaseRef":
         return cls(run_id=run_id, request_template_id=request_template_id, check_id=check_id,
                    principal_id=principal_id, parameter_location=parameter_location,
-                   parameter_name=parameter_name, workflow_state_id=workflow_state_id)
+                   parameter_name=parameter_name, workflow_state_id=workflow_state_id,
+                   finding_ref=finding_ref)
 
     def to_dict(self) -> dict:
         return {"run_id": self.run_id, "request_template_id": self.request_template_id,
                 "check_id": self.check_id, "principal_id": self.principal_id,
                 "parameter_location": self.parameter_location, "parameter_name": self.parameter_name,
-                "workflow_state_id": self.workflow_state_id, "case_id": self.case_id}
+                "workflow_state_id": self.workflow_state_id, "finding_ref": self.finding_ref,
+                "case_id": self.case_id}
 
     @classmethod
     def from_dict(cls, d: dict) -> "TestCaseRef":
@@ -156,6 +162,7 @@ class TestCaseRef:
                    parameter_location=d.get("parameter_location", ""),
                    parameter_name=d.get("parameter_name", ""),
                    workflow_state_id=d.get("workflow_state_id", ""),
+                   finding_ref=d.get("finding_ref", ""),
                    case_id=d.get("case_id", ""))
 
 

@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS findings (
     fingerprint TEXT NOT NULL DEFAULT '',
     model TEXT NOT NULL DEFAULT '',
     prompt_version TEXT NOT NULL DEFAULT '',
+    finding_id TEXT NOT NULL DEFAULT '',
+    case_id TEXT NOT NULL DEFAULT '',
+    proof_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_findings_host ON findings(host);
@@ -125,6 +128,7 @@ CREATE TABLE IF NOT EXISTS proof_records (
     parameter_location TEXT NOT NULL DEFAULT '',
     parameter_name TEXT NOT NULL DEFAULT '',
     workflow_state_id TEXT NOT NULL DEFAULT '',
+    finding_ref TEXT NOT NULL DEFAULT '',
     validator TEXT NOT NULL DEFAULT '',
     validator_version TEXT NOT NULL DEFAULT '',
     verdict TEXT NOT NULL DEFAULT 'inconclusive',
@@ -185,6 +189,10 @@ def _connect() -> sqlite3.Connection:
         if col not in plan_cols:
             conn.execute(ddl)
 
+    proof_cols = {row[1] for row in conn.execute("PRAGMA table_info(proof_records)")}
+    if "finding_ref" not in proof_cols:
+        conn.execute("ALTER TABLE proof_records ADD COLUMN finding_ref TEXT NOT NULL DEFAULT ''")
+
     cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)")}
     if "confirmed" not in cols:
         conn.execute("ALTER TABLE findings ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
@@ -208,6 +216,9 @@ def _connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE findings ADD COLUMN suggested_test TEXT NOT NULL DEFAULT ''")
     if "owasp_category" not in cols:
         conn.execute("ALTER TABLE findings ADD COLUMN owasp_category TEXT")
+    for col in ("finding_id", "case_id", "proof_id"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE findings ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_fingerprint ON findings(fingerprint)")
 
     # T02: additive principal metadata on the existing identities table (reuse the
@@ -283,13 +294,14 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
             rows.append((host, exchange.url, exchange.method, agent_name, f.vulnerability_class,
                          f.severity, f.confidence, f.summary, f.basis, f.evidence, f.suggested_test,
                          f.owasp_category, f.review_verdict, int(f.confirmed), fingerprint,
-                         model, prompt_version, now))
+                         model, prompt_version, f.finding_id, f.case_id, f.proof_id, now))
         conn.executemany(
             """INSERT OR IGNORE INTO findings
                (host, url, method, agent, vulnerability_class, severity,
                 confidence, summary, basis, evidence, suggested_test, owasp_category,
-                review_verdict, confirmed, fingerprint, model, prompt_version, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                review_verdict, confirmed, fingerprint, model, prompt_version,
+                finding_id, case_id, proof_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
         conn.commit()
     finally:
         conn.close()
@@ -468,7 +480,7 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
 
 _PROOF_COLUMNS = (
     "proof_id, run_id, case_id, principal_id, request_template_id, check_id, "
-    "parameter_location, parameter_name, workflow_state_id, validator, validator_version, "
+    "parameter_location, parameter_name, workflow_state_id, finding_ref, validator, validator_version, "
     "verdict, executed, legacy, baseline_artifact_id, attack_artifact_id, "
     "control_artifact_ids_json, expected_invariant, observed_result, limitation, created_at"
 )
@@ -492,9 +504,9 @@ def persist_proof_record(proof) -> tuple[bool, str]:
     try:
         conn.execute(
             f"INSERT OR IGNORE INTO proof_records ({_PROOF_COLUMNS}) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (proof.proof_id, c.run_id, c.case_id, c.principal_id, c.request_template_id,
-             c.check_id, c.parameter_location, c.parameter_name, c.workflow_state_id,
+             c.check_id, c.parameter_location, c.parameter_name, c.workflow_state_id, c.finding_ref,
              proof.validator, proof.validator_version, proof.verdict.value,
              int(proof.executed), int(proof.legacy), proof.baseline_artifact_id,
              proof.attack_artifact_id, json.dumps(list(proof.control_artifact_ids)),
@@ -510,7 +522,7 @@ def persist_proof_record(proof) -> tuple[bool, str]:
 def _proof_row_to_dict(row) -> dict:
     """Reconstruct a ProofRecord.to_dict()-shaped dict (nested case) from a row."""
     (proof_id, run_id, case_id, principal_id, request_template_id, check_id,
-     parameter_location, parameter_name, workflow_state_id, validator, validator_version,
+     parameter_location, parameter_name, workflow_state_id, finding_ref, validator, validator_version,
      verdict, executed, legacy, baseline_artifact_id, attack_artifact_id,
      control_artifact_ids_json, expected_invariant, observed_result, limitation, created_at) = row
     return {
@@ -518,7 +530,7 @@ def _proof_row_to_dict(row) -> dict:
         "case": {"run_id": run_id, "case_id": case_id, "principal_id": principal_id,
                  "request_template_id": request_template_id, "check_id": check_id,
                  "parameter_location": parameter_location, "parameter_name": parameter_name,
-                 "workflow_state_id": workflow_state_id},
+                 "workflow_state_id": workflow_state_id, "finding_ref": finding_ref},
         "validator": validator, "validator_version": validator_version, "verdict": verdict,
         "executed": bool(executed), "legacy": bool(legacy),
         "baseline_artifact_id": baseline_artifact_id, "attack_artifact_id": attack_artifact_id,
@@ -619,7 +631,8 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
         rows = conn.execute(
             """SELECT f.url, f.vulnerability_class, f.severity, f.confidence, f.summary,
                       f.evidence, f.suggested_test, f.owasp_category, f.basis, f.confirmed,
-                      f.agent, f.fingerprint, s.fingerprint IS NOT NULL AS suppressed
+                      f.agent, f.fingerprint, f.finding_id, f.case_id, f.proof_id,
+                      s.fingerprint IS NOT NULL AS suppressed
                FROM findings f
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                WHERE f.host = ?
@@ -631,8 +644,11 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
     results = [
         {"url": u, "vulnerability_class": vc, "severity": sev, "confidence": conf, "summary": s,
          "evidence": ev, "suggested_test": st, "owasp_category": oc, "basis": basis,
-         "confirmed": bool(confirmed), "agent": agent, "fingerprint": fp, "suppressed": bool(suppressed)}
-        for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp, suppressed) in rows
+         "confirmed": bool(confirmed), "agent": agent, "fingerprint": fp,
+         "finding_id": finding_id, "case_id": case_id, "proof_id": proof_id,
+         "suppressed": bool(suppressed)}
+        for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
+             finding_id, case_id, proof_id, suppressed) in rows
     ]
     if not include_suppressed:
         results = [r for r in results if not r["suppressed"]]

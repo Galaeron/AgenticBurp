@@ -20,8 +20,15 @@ are labelled `legacy/unstructured`. A pre-existing `test_ollama_client` global-h
 leak was also contained per test so real-transport tests survive full discovery.
 Focused verdict/oracle/authorization checks: **37 tests OK**. Ordered transport
 isolation regression: **28 tests OK**. Full stdlib discovery: **1,578 tests OK,
-2 skipped**, 314.586s. Exact case binding (F03) is next; T01 as a whole remains
-partial until that focused commit lands.
+2 skipped**, 314.586s.
+
+**T01 F03 complete:** `Finding` now carries originating finding/principal/request/input
+coordinates and exact `case_id`/`proof_id` links. `_validate_findings` binds each job,
+proof, persistence write, confirmation, and cross-identity downgrade to that concrete
+finding; the class-wide assignment was removed. Old proof rows retain their pre-F03
+case hash. Focused evidence/engagement/transport checks: **79 tests OK**. Full stdlib
+discovery: **1,581 tests OK, 2 skipped**, 314.376s. T01 is now complete against the
+reviewed F02/F03/F06 requirements; invocation-local run identity (T03 F07) is next.
 
 **2026-09-10 review-only addendum:** Source inspected at HEAD `8b5c6e1`;
 implementation handoff saved to

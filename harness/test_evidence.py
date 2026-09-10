@@ -248,6 +248,13 @@ class _FakeRegistry:
         return [v] if v else []
 
 
+class _PerFindingRegistry:
+    def for_finding(self, finding, exchange):
+        if finding.summary == "confirmed-case":
+            return [_FakeValidator("sqlmap", "confirmed", True)]
+        return [_FakeValidator("sqlmap", "skipped", False)]
+
+
 class ValidateFindingsWiringTests(unittest.TestCase):
     """The T01 'Done' bar: the PRODUCTION confirmation path (_validate_findings)
     persists structured proofs and returns them through the response data -- not
@@ -322,6 +329,52 @@ class ValidateFindingsWiringTests(unittest.TestCase):
                              "xss": _FakeValidator("browser_xss", "not_confirmed", False)})
         _, proofs = self._run(self._reports("sqli", "xss"), self._exchange(), reg)
         self.assertEqual(len({p["case"]["case_id"] for p in proofs}), 2)
+
+    def test_same_class_findings_keep_exact_outcomes(self):
+        from models import AgentReport, Finding
+        a = Finding(vulnerability_class="sqli", confidence=0.7, summary="confirmed-case",
+                    evidence="parameter id", suggested_test="t", basis="derived",
+                    parameter_location="query", parameter_name="id")
+        b = Finding(vulnerability_class="sqli", confidence=0.7, summary="skipped-case",
+                    evidence="parameter ref", suggested_test="t", basis="derived",
+                    parameter_location="query", parameter_name="ref")
+        reports = [AgentReport(agent="a", model="m", findings=[a, b])]
+        _, proofs = self._run(reports, self._exchange(), _PerFindingRegistry())
+        self.assertTrue(a.confirmed)
+        self.assertFalse(b.confirmed)
+        self.assertTrue(a.proof_id)
+        self.assertFalse(b.proof_id)
+        self.assertNotEqual(proofs[0]["case"]["case_id"], proofs[1]["case"]["case_id"])
+        self.assertEqual([p["verdict"] for p in proofs], ["confirmed", "inconclusive"])
+
+    def test_principal_and_request_variant_are_case_coordinates(self):
+        from models import AgentReport, Finding
+        findings = [
+            Finding(vulnerability_class="idor", confidence=0.7, summary="confirmed-case",
+                    evidence="e", suggested_test="t", basis="derived",
+                    principal_id="alice", request_template_id="read-object-1"),
+            Finding(vulnerability_class="idor", confidence=0.7, summary="skipped-case",
+                    evidence="e", suggested_test="t", basis="derived",
+                    principal_id="bob", request_template_id="read-object-2"),
+        ]
+        reports = [AgentReport(agent="a", model="m", findings=findings)]
+        _, proofs = self._run(reports, self._exchange(), _PerFindingRegistry())
+        self.assertEqual(proofs[0]["case"]["principal_id"], "alice")
+        self.assertEqual(proofs[1]["case"]["principal_id"], "bob")
+        self.assertEqual(proofs[0]["case"]["request_template_id"], "read-object-1")
+        self.assertEqual(proofs[1]["case"]["request_template_id"], "read-object-2")
+        self.assertNotEqual(proofs[0]["case"]["case_id"], proofs[1]["case"]["case_id"])
+
+    def test_exact_case_and_proof_survive_finding_persistence(self):
+        reports = self._reports("sqli")
+        finding = reports[0].findings[0]
+        self._run(reports, self._exchange(),
+                  _FakeRegistry({"sqli": _FakeValidator("sqlmap", "confirmed", True)}))
+        store.persist_findings(self._exchange(), "a", [finding])
+        rows = store.all_host_findings(self._exchange().url)
+        self.assertEqual(rows[0]["finding_id"], finding.finding_id)
+        self.assertEqual(rows[0]["case_id"], finding.case_id)
+        self.assertEqual(rows[0]["proof_id"], finding.proof_id)
 
     def test_no_validators_returns_empty_pair(self):
         vreports, proofs = self._run(self._reports("sqli"), self._exchange(), _FakeRegistry({}))
