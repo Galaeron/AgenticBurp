@@ -351,7 +351,7 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
         _, case1 = asyncio.run(orch._coverage_proof(
             identity="user", check=check, exchange=ex, result=res, case_key=CaseKey("query", "id", 1)))
         self.assertNotEqual(case0, case1)  # occurrence -> distinct proof cases
-        self.assertEqual(store.proofs_for_case(case1)[0]["case"]["parameter_name"], "id[1]")
+        self.assertEqual(store.proofs_for_case(case1)[0]["case"]["parameter_name"], "id[occ:1]")
 
 
 if __name__ == "__main__":

@@ -45,6 +45,28 @@ def _trust(role: str) -> int:
     return _TRUST.get((role or "").lower(), 1)
 
 
+def _principal_of(r) -> str:
+    """The durable principal id for a role session (R02): the identity track's
+    RoleSession.principal_id() when available, so two same-role accounts (Alice and
+    Bob, both `user`) stay DISTINCT coverage identities. Falls back to role/str for
+    plain stubs."""
+    pid = getattr(r, "principal_id", None)
+    if callable(pid):
+        try:
+            got = pid()
+            if got:
+                return str(got)
+        except Exception:
+            pass
+    return getattr(r, "role", None) or (r if isinstance(r, str) else str(r))
+
+
+def _role_of(r) -> str:
+    if isinstance(r, str):
+        return r
+    return getattr(r, "role", None) or "anonymous"
+
+
 # Confirmation methods that are deterministic legs (vs "agent"/"manual"): an
 # applicable cell for one of these, on an investigated endpoint, can be marked
 # "attempted -> not_detected" because the shape-driven precondition path runs it
@@ -104,11 +126,16 @@ class CoverageTracker:
 
     # --- build the matrix from the engagement ---
 
-    def build(self, endpoints: dict[str, dict], identities: list[str]) -> dict:
+    def build(self, endpoints: dict[str, dict], identities: list[str],
+              identity_roles: dict[str, str] | None = None) -> dict:
         """Fill applicability across identities × endpoints × checks, then mark
-        reachability skips. `endpoints` maps endpoint_key -> a dict carrying
-        path/methods/access/reachable_roles/object_scoped (see
-        `endpoint_view`). Returns {applicable, not_applicable, skipped_reach}."""
+        reachability skips. `identities` are durable principal ids (R02);
+        `identity_roles` maps each to its role for reachability (reachable_roles is
+        role-based) -- defaulting a principal to itself when unmapped. `endpoints`
+        maps endpoint_key -> a dict carrying path/methods/access/reachable_roles/
+        object_scoped (see `endpoint_view`). Returns {applicable, not_applicable,
+        skipped_reach}."""
+        identity_roles = identity_roles or {}
         na = self.matrix.fill_applicability(identities, endpoints, self.checks)
         skipped = 0
         for ep_key, ep in endpoints.items():
@@ -116,7 +143,7 @@ class CoverageTracker:
             if not reach:
                 continue  # reachability unknown -> leave applicable cells pending
             for ident in identities:
-                if ident in reach:
+                if identity_roles.get(ident, ident) in reach:
                     continue
                 # this identity never reached this endpoint -> not attemptable as it
                 for check in self.checks:
@@ -129,12 +156,16 @@ class CoverageTracker:
         applicable = sum(1 for c in self.matrix.cells().values() if c.status == CellStatus.PENDING)
         return {"applicable": applicable, "not_applicable": na, "skipped_reachability": skipped}
 
-    def _probe_identity(self, ep: dict, identities: list[str]) -> str:
+    def _probe_identity(self, ep: dict, identities: list[str],
+                        identity_roles: dict[str, str] | None = None) -> str:
+        identity_roles = identity_roles or {}
         reach = [str(r) for r in (ep.get("reachable_roles") or [])]
-        pool = [i for i in identities if i in reach] or list(identities)
-        return min(pool, key=_trust) if pool else (identities[0] if identities else "anonymous")
+        pool = [i for i in identities if identity_roles.get(i, i) in reach] or list(identities)
+        return (min(pool, key=lambda i: _trust(identity_roles.get(i, i))) if pool
+                else (identities[0] if identities else "anonymous"))
 
-    def record_findings_from_state(self, endpoints: dict[str, dict], identities: list[str]) -> int:
+    def record_findings_from_state(self, endpoints: dict[str, dict], identities: list[str],
+                                   identity_roles: dict[str, str] | None = None) -> int:
         """Record CONFIRMED/DETECTED cells from the findings attached to each
         endpoint, attributed to the endpoint's probe identity. Returns cells set."""
         n = 0
@@ -142,7 +173,7 @@ class CoverageTracker:
             findings = ep.get("findings") or []
             if not findings:
                 continue
-            ident = self._probe_identity(ep, identities)
+            ident = self._probe_identity(ep, identities, identity_roles)
             for f in findings:
                 vc = f.get("vulnerability_class", "")
                 confirmed = bool(f.get("confirmed"))
@@ -275,55 +306,106 @@ class CoverageTracker:
         total = 0
         for (ident, ep_key, check) in self.pending_leg_cells(driveable):
             ep = endpoints.get(ep_key) or {}
-            cases = []
+            # Always register the request-level (no-parameter) case FIRST: it is the
+            # representative the leg's whole-request result binds to. A PARAMETER
+            # check additionally enumerates the endpoint's concrete inputs -- for
+            # VISIBILITY, not per-parameter attribution (R01): these deterministic
+            # legs test the whole request, so a sibling input is left inconclusive
+            # rather than credited with the request-level verdict.
+            # The request-level representative is ALWAYS registered (it is the case
+            # the leg is actually driven on) -- it is never starved by the budget.
+            rep_res = self.matrix.expand_cases(ident, ep_key, check.id, [NO_PARAMETER_CASE])
+            total += rep_res["added"]
+            # The concrete parameter inputs are enumerated for visibility, bounded by
+            # the per-cell budget; over-budget inputs stay visible (SKIPPED).
             if check.phase == Phase.PARAMETER:
-                cases = derive_input_cases_from_template(ep.get("template"))
-            if not cases:
-                cases = [NO_PARAMETER_CASE]
-            res = self.matrix.expand_cases(ident, ep_key, check.id, cases,
-                                           budget_remaining=per_cell_budget)
-            total += res["added"] + res["budget_skipped"]
+                params = derive_input_cases_from_template(ep.get("template"))
+                if params:
+                    p_res = self.matrix.expand_cases(ident, ep_key, check.id, params,
+                                                     budget_remaining=per_cell_budget)
+                    total += p_res["added"] + p_res["budget_skipped"]
         return total
 
     async def drive_coverage_cases(self, run_case, *, driveable: set[str] | None = None,
                                    budget: int = 80) -> int:
         """Fire each PENDING child case via the injected async
         `run_case(identity, method, path, check, case_key) -> result` (result
-        exposing .status/.summary/..., or None to skip), recording the REAL
-        per-case outcome (T05). This is the case-granular analogue of
-        `drive_coverage_legs`: confirming one input marks only THAT case, never its
-        siblings. Bounded by `budget`. Returns cases driven."""
+        exposing .status/.summary/..., or None when the leg produced no send),
+        recording the REAL per-case outcome (T05). This is the case-granular analogue
+        of `drive_coverage_legs`: confirming one input marks only THAT case, never
+        its siblings.
+
+        The leg is driven ONCE PER CELL, on the request-level (no-parameter)
+        representative, and the result binds to THAT case (R01): a deterministic leg
+        tests the whole request, so its verdict is NOT stamped onto each enumerated
+        parameter. Every other (parameter) case in the cell is recorded INCONCLUSIVE
+        with an explicit "no per-parameter attribution" reason -- visible, but never
+        credited with the request-level verdict, proof, or a separate execution.
+
+        `budget` bounds DISPATCH ATTEMPTS -- one per driven cell (R05). A callback
+        that RAISES records the representative ERROR (visible, never swallowed); one
+        that returns None records INCONCLUSIVE (dispatched, no usable send). An
+        unknown status fails conservatively to INCONCLUSIVE, not an optimistic
+        NOT_DETECTED (R06). Returns the number of dispatch attempts made."""
         _STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.NOT_DETECTED,
                    "controlled_negative": CellStatus.CONTROLLED_NEGATIVE,
                    "blocked": CellStatus.BLOCKED, "inconclusive": CellStatus.INCONCLUSIVE,
                    "skipped": CellStatus.SKIPPED, "error": CellStatus.ERROR}
-        n = 0
+        # group pending cases by cell so each leg is driven once, at request level
+        cells: dict[tuple[str, str, str], list] = {}
         for (ident, ep_key, check_id, ck) in self.matrix.pending_cases():
-            if n >= budget:
-                break
             check = CHECKS_BY_ID.get(check_id)
             if not check or check.confirmation not in _LEG_CONFIRMATIONS:
                 continue
             if driveable is not None and check.confirmation not in driveable:
                 continue
+            cells.setdefault((ident, ep_key, check_id), []).append(ck)
+
+        def _mark_siblings_inconclusive(ident, ep_key, check_id, cks, target, reason):
+            for c in cks:
+                if c.coord_id() == target.coord_id():
+                    continue
+                self.matrix.record_case(ident, ep_key, check_id, c,
+                                        status=CellStatus.INCONCLUSIVE, reason=reason)
+
+        attempts = 0
+        for (ident, ep_key, check_id), cks in cells.items():
+            if attempts >= budget:
+                break
+            check = CHECKS_BY_ID[check_id]
             method, _, path = ep_key.partition(" ")
+            # the request-level representative the whole-request result binds to
+            rep = next((c for c in cks if c.is_no_parameter), cks[0])
+            no_attr_reason = (f"{check.confirmation} ran at request level; this leg does not "
+                              f"attribute per-parameter evidence, so this input is untested")
+            attempts += 1
             try:
-                res = await run_case(ident, method, path, check, ck)
-            except Exception as e:  # a leg blowing up must not sink coverage
-                log.debug("drive_coverage_cases: %s on %s [%s] failed: %s",
-                          check.confirmation, ep_key, ck.label(), e)
+                res = await run_case(ident, method, path, check, rep)
+            except Exception as e:  # a leg blowing up is recorded, never swallowed
+                log.debug("drive_coverage_cases: %s on %s failed: %s", check.confirmation, ep_key, e)
+                self.matrix.record_case(
+                    ident, ep_key, check_id, rep, status=CellStatus.ERROR,
+                    reason=f"{check.confirmation} attempt errored: {type(e).__name__}: {e}"[:180],
+                    validator=check.confirmation)
+                _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep,
+                                            f"{check.confirmation} attempt errored at request level")
                 continue
             if res is None:
+                self.matrix.record_case(
+                    ident, ep_key, check_id, rep, status=CellStatus.INCONCLUSIVE,
+                    reason=f"{check.confirmation} produced no send (declined/unsupported)",
+                    validator=check.confirmation)
+                _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
                 continue
-            n += 1
-            status = _STATUS.get(getattr(res, "status", ""), CellStatus.NOT_DETECTED)
+            status = _STATUS.get(getattr(res, "status", ""), CellStatus.INCONCLUSIVE)
             self.matrix.record_case(
-                ident, ep_key, check_id, ck, status=status,
-                reason=(getattr(res, "summary", "") or f"{check.confirmation} case driven off the matrix")[:180],
+                ident, ep_key, check_id, rep, status=status,
+                reason=(getattr(res, "summary", "") or f"{check.confirmation} driven at request level")[:180],
                 confidence=getattr(res, "confidence", None),
                 validator=getattr(res, "validator", None) or check.confirmation,
                 evidence=(getattr(res, "evidence", "") or "")[:200])
-        return n
+            _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
+        return attempts
 
     def finalize_pending_reasons(self, investigated_keys: set[str] | None = None) -> int:
         """Give remaining applicable-pending cells an explicit reason so the
@@ -382,6 +464,17 @@ def endpoint_view(state) -> dict[str, dict]:
     return out
 
 
+def _identities_of(roles) -> tuple[list[str], dict[str, str]]:
+    """Durable principal identities + their role map for coverage (R02). Two
+    same-role accounts stay distinct coverage identities via their principal id;
+    role is retained (as metadata) only for reachability and trust ordering."""
+    identity_roles: dict[str, str] = {}
+    for r in (roles or []):
+        identity_roles[_principal_of(r)] = _role_of(r)
+    identities = sorted(identity_roles) or ["anonymous"]
+    return identities, identity_roles
+
+
 def build_coverage(state, roles, investigated_keys: set[str] | None = None,
                    execution_events=None) -> dict:
     """One call: build + fill + record the coverage matrix for a finished
@@ -393,11 +486,9 @@ def build_coverage(state, roles, investigated_keys: set[str] | None = None,
     `record_execution_events`)."""
     tracker = CoverageTracker()
     endpoints = endpoint_view(state)
-    identities = [getattr(r, "role", str(r)) for r in (roles or [])] or ["anonymous"]
-    # dedup identities by label (two 'user' accounts are one column here)
-    identities = sorted(set(identities))
-    tracker.build(endpoints, identities)
-    tracker.record_findings_from_state(endpoints, identities)
+    identities, identity_roles = _identities_of(roles)
+    tracker.build(endpoints, identities, identity_roles)
+    tracker.record_findings_from_state(endpoints, identities, identity_roles)
     if execution_events:
         tracker.record_execution_events(execution_events)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
@@ -413,9 +504,9 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     driving sends live traffic through the injected `run_leg` seam."""
     tracker = CoverageTracker()
     endpoints = endpoint_view(state)
-    identities = sorted({getattr(r, "role", str(r)) for r in (roles or [])}) or ["anonymous"]
-    tracker.build(endpoints, identities)
-    tracker.record_findings_from_state(endpoints, identities)
+    identities, identity_roles = _identities_of(roles)
+    tracker.build(endpoints, identities, identity_roles)
+    tracker.record_findings_from_state(endpoints, identities, identity_roles)
     # The driver records REAL leg outcomes cell-by-cell; there is no inference to
     # add afterwards. Cells the driver did not reach stay pending and are given an
     # honest skip reason below (R01: never fabricate a not_detected).
@@ -440,9 +531,9 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     enabled. Async because driving sends live traffic through `run_case`."""
     tracker = CoverageTracker()
     endpoints = endpoint_view(state)
-    identities = sorted({getattr(r, "role", str(r)) for r in (roles or [])}) or ["anonymous"]
-    tracker.build(endpoints, identities)
-    tracker.record_findings_from_state(endpoints, identities)
+    identities, identity_roles = _identities_of(roles)
+    tracker.build(endpoints, identities, identity_roles)
+    tracker.record_findings_from_state(endpoints, identities, identity_roles)
     enumerated = tracker.expand_parameter_cases(
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
     driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget)

@@ -169,11 +169,13 @@ class CaseKey:
 
     def case_parameter_name(self) -> str:
         """The name to carry into `evidence.TestCaseRef.parameter_name`. A repeated
-        parameter folds its occurrence into the name (`id[1]`) so two occurrences
-        get DISTINCT TestCaseRef.case_ids even though TestCaseRef has no occurrence
-        field -- the coverage identity and the proof identity stay 1:1."""
+        parameter folds its occurrence into the name so two occurrences get DISTINCT
+        TestCaseRef.case_ids even though TestCaseRef has no occurrence field -- the
+        coverage identity and the proof identity stay 1:1. The encoding is
+        `<name>[occ:<n>]`, a structured token that does NOT collide with a literal
+        parameter named `<name>[<n>]` (the previous `id[1]` form did -- review R07)."""
         if self.occurrence:
-            return f"{self.parameter_name}[{self.occurrence}]"
+            return f"{self.parameter_name}[occ:{self.occurrence}]"
         return self.parameter_name
 
     def label(self) -> str:
@@ -736,21 +738,28 @@ class CoverageMatrix:
 
         n_cases = len(bucket)
         confirmed = sum(1 for _c, r in bucket.values() if r.status == CellStatus.CONFIRMED)
+        # Completion (not_detected / controlled_negative) requires EVERY child to be
+        # a conclusive negative. An errored, blocked, inconclusive, or still-open
+        # child forbids the cell from claiming the endpoint was fully tested (R06):
+        # a negative sibling next to an errored one is NOT "all tested".
+        _NEG = {CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE}
         if CellStatus.CONFIRMED in statuses:
             agg, reason = CellStatus.CONFIRMED, f"{confirmed}/{n_cases} case(s) confirmed"
         elif CellStatus.DETECTED in statuses:
             agg, reason = CellStatus.DETECTED, "a case was detected but unconfirmed"
+        elif statuses <= {CellStatus.CONTROLLED_NEGATIVE}:
+            agg, reason = CellStatus.CONTROLLED_NEGATIVE, f"all {n_cases} case(s) held under a controlled negative"
+        elif statuses <= _NEG:
+            agg, reason = CellStatus.NOT_DETECTED, f"all {n_cases} case(s) tested, none detected"
         elif statuses & _OPEN_STATUSES:
             n_open = sum(1 for _c, r in bucket.values() if r.status in _OPEN_STATUSES)
             agg, reason = CellStatus.PENDING, (
                 f"{n_open}/{n_cases} case(s) not yet conclusively tested "
                 f"-- endpoint not marked complete")
-        elif statuses <= {CellStatus.CONTROLLED_NEGATIVE}:
-            agg, reason = CellStatus.CONTROLLED_NEGATIVE, f"all {n_cases} case(s) held under a controlled negative"
-        elif statuses & {CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE}:
-            agg, reason = CellStatus.NOT_DETECTED, f"all {n_cases} case(s) tested, none detected"
         elif CellStatus.ERROR in statuses:
-            agg, reason = CellStatus.ERROR, "every case attempt errored"
+            # remaining mix is negatives + errors (no open child): an unresolved
+            # error means the cell is not a clean completion.
+            agg, reason = CellStatus.ERROR, "a case attempt errored -- endpoint not marked complete"
         else:
             agg, reason = CellStatus.PENDING, "cases awaiting attempt"
         # Never downgrade a locked CONFIRMED cell.

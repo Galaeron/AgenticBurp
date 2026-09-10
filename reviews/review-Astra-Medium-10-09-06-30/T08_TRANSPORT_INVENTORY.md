@@ -83,7 +83,12 @@ workflow/identity foundations), per the handoff.
 
 ## Verification
 
-`python -m unittest test_transport_inventory` — 9 tests. The enforcement test
+`python -m unittest test_transport_inventory` — 10 tests. The guard
 (`test_scan_matches_registry`) scans the tree for httpx client constructions and
-fails if any production module is un-inventoried or any registry entry is stale, so
-this audit cannot silently drift from the source.
+fails if any production **module** is un-inventoried or any registry entry is
+stale. It is **module-granular** (review R11): it does NOT catch a second direct
+site added inside an already-registered module, an aliased constructor
+(`import httpx as h`), or a non-httpx transport API — `test_inventory_is_module_granular`
+pins that limitation. Adding an owner here is inventory, not executor-policy
+enforcement; the actual per-site migration onto the run-scoped executor is the
+follow-on work each row's owner/gap names.

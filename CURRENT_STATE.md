@@ -37,9 +37,19 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   surfaces method+case coords; `report_generator` uses the issue key + renders issue
   IDs + `export_issues_for_host`. Operator root-cause merge + Burp replay = T10.
 - **T08 (`e1ac8e9`) — inventory + audit only.** `transport_inventory.py` (32 sites,
-  **23 target routing gaps** owned/named) + `test_transport_inventory` enforcement +
-  `T08_TRANSPORT_INVENTORY.md`. The actual per-site executor migration and per-oracle
+  **23 target routing gaps** owned/named) + `test_transport_inventory` (module-granular)
+  + `T08_TRANSPORT_INVENTORY.md`. The actual per-site executor migration and per-oracle
   re-qualification remain OPEN (feeds identity F01 role_crawl, F04 cross_identity).
+- **Review round (IMPLEMENTATION_REVIEW_T05_T08.md) — all 11 findings addressed**, each
+  with a paired regression; reviewer's `review_t05_t08_checks.py` diagnostics all corrected.
+  Key fixes: R01 per-input attribution no longer fabricated (leg drives once per cell at
+  request level; parameter siblings inconclusive); R02 coverage keys on durable
+  `principal_id`; R03 URL/JSON redaction across export+replay; R04 issue id adds host +
+  unknown-input disambiguator; R05 errors recorded + budget bounds attempts; R06 error/
+  blocked child forbids completion; R07 occurrence encoding `[occ:n]`; R08 findings dedup
+  now `(fingerprint,case_id)` so retests persist + export shows full proof history; R09
+  verdict by exact proof id; R10 class-keyed invariant + honest artifacts; R11 guard
+  reworded module-granular. See EXECUTION_LOG "Review response".
 - **Verification:** full stdlib discovery after all three tickets — **1,653 tests OK,
   2 skipped**, exit 0 (1,581 baseline + 72 new; zero real failures). No model / browser /
   container / blind-target / live run performed — all hermetic.

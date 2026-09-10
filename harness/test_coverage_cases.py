@@ -40,7 +40,12 @@ class CaseKeyTests(unittest.TestCase):
 
     def test_case_parameter_name_folds_occurrence(self):
         self.assertEqual(CaseKey("query", "id", 0).case_parameter_name(), "id")
-        self.assertEqual(CaseKey("query", "id", 1).case_parameter_name(), "id[1]")
+        self.assertEqual(CaseKey("query", "id", 1).case_parameter_name(), "id[occ:1]")
+
+    def test_occurrence_encoding_does_not_collide_with_literal_bracket_name(self):
+        # R07: occurrence 1 of `id` must not equal occurrence 0 of a literal `id[1]`.
+        self.assertNotEqual(CaseKey("query", "id", 1).case_parameter_name(),
+                            CaseKey("query", "id[1]", 0).case_parameter_name())
 
     def test_no_parameter_case(self):
         self.assertTrue(NO_PARAMETER_CASE.is_no_parameter)
@@ -169,6 +174,21 @@ class AggregationTests(unittest.TestCase):
         m, by_name = self._matrix_with_two_query_cases()
         m.record_case(*self.KEY, by_name["search"], status=CellStatus.NOT_DETECTED, reason="clean")
         # sort still pending -> cell must stay PENDING (not not_detected)
+        self.assertEqual(m.get(*self.KEY).status, CellStatus.PENDING)
+
+    def test_negative_plus_error_child_is_not_completion(self):
+        # R06: a controlled-negative sibling next to an errored one must NOT read as
+        # "all tested" -- the unresolved error forbids a completion claim.
+        m, by_name = self._matrix_with_two_query_cases()
+        m.record_case(*self.KEY, by_name["search"], status=CellStatus.CONTROLLED_NEGATIVE, reason="held")
+        m.record_case(*self.KEY, by_name["sort"], status=CellStatus.ERROR, reason="leg crashed")
+        self.assertEqual(m.get(*self.KEY).status, CellStatus.ERROR)
+        self.assertNotEqual(m.get(*self.KEY).status, CellStatus.NOT_DETECTED)
+
+    def test_negative_plus_blocked_child_is_not_completion(self):
+        m, by_name = self._matrix_with_two_query_cases()
+        m.record_case(*self.KEY, by_name["search"], status=CellStatus.NOT_DETECTED, reason="clean")
+        m.record_case(*self.KEY, by_name["sort"], status=CellStatus.BLOCKED, reason="gate denied")
         self.assertEqual(m.get(*self.KEY).status, CellStatus.PENDING)
 
     def test_all_controlled_negative_marks_controlled_negative(self):

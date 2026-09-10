@@ -1681,7 +1681,12 @@ class Orchestrator:
                 _sqlmap_inst = self.validator_registry.validators.get("sqlmap")
                 if _sqlmap_inst is not None:
                     _val_by_conf["sqlmap"] = _sqlmap_inst
-                _role_headers = {r.role: dict(r.headers or {}) for r in roles}
+                # Key headers by DURABLE PRINCIPAL id (R02), matching the coverage
+                # identity, so two same-role accounts don't collapse/overwrite.
+                def _pid(r):
+                    p = getattr(r, "principal_id", None)
+                    return str(p()) if callable(p) else (getattr(r, "role", None) or "anonymous")
+                _role_headers = {_pid(r): dict(r.headers or {}) for r in roles}
 
                 async def _run_leg_core(identity, method, path, check, case_key=None):
                     validator = _val_by_conf.get(check.confirmation)

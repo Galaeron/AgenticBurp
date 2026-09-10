@@ -219,7 +219,16 @@ def _connect() -> sqlite3.Connection:
     for col in ("finding_id", "case_id", "proof_id"):
         if col not in cols:
             conn.execute(f"ALTER TABLE findings ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_fingerprint ON findings(fingerprint)")
+    # T06/R08: dedup on (fingerprint, case_id), not fingerprint alone, so a
+    # patched-fixture RETEST -- same coordinates, a NEW case identity -- is retained
+    # as its own row (append-only retest history) instead of being IGNORE'd. Legacy
+    # findings (empty case_id) still dedup by fingerprint. Suppression is unchanged:
+    # it keys on `fingerprint` alone, so suppressing a finding still suppresses every
+    # case-variant that shares its coordinates across runs. The old fingerprint-only
+    # unique index is dropped first so the composite key takes effect on old DBs.
+    conn.execute("DROP INDEX IF EXISTS idx_findings_fingerprint")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_fingerprint_case "
+                 "ON findings(fingerprint, case_id)")
 
     # T02: additive principal metadata on the existing identities table (reuse the
     # store, don't fork a second identity registry). Old rows default to unknown

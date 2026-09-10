@@ -151,9 +151,10 @@ contracts (evidence.TestCaseRef / ProofRecord / Verdict) and case/proof identity
 
 - Commit `e1ac8e9`. `transport_inventory.py` registers all 32 outbound sites (29 http,
   1 container, 1 browser, 1 raw-socket) with scope/routing/owner/gap;
-  `test_transport_inventory` (9) enforces that a new direct httpx site cannot be added
-  un-inventoried (`test_scan_matches_registry`) and that each of the **23 target-directed
-  routing gaps** is owned+named. Audit doc: `T08_TRANSPORT_INVENTORY.md`.
+  `test_transport_inventory` (10) enforces MODULE-granularly that a new module opening an
+  httpx client cannot be added un-inventoried (`test_scan_matches_registry`) and that each
+  of the **23 target-directed routing gaps** is owned+named (guard limits pinned by
+  `test_inventory_is_module_granular` after review R11). Audit doc: `T08_TRANSPORT_INVENTORY.md`.
 - Inventory + audit only — no transport behavior changed. Per-leg oracle re-qualification
   (paired live fixtures, proof contracts) is named as deferred follow-on, not claimed.
 - Highest-value gaps feed the identity track: `role_crawl.py` (F01) and
@@ -168,3 +169,55 @@ contracts (evidence.TestCaseRef / ProofRecord / Verdict) and case/proof identity
 - No model, browser/container, blind-target, or live engagement run performed — all
   hermetic. New live coverage behavior is flag-gated OFF by default, so target recall is
   unchanged until a run enables `coverage_drive_cases`. Not yet merged into `WorkingSunday`.
+
+### Review response — IMPLEMENTATION_REVIEW_T05_T08.md (11 findings)
+
+Reviewer's offline diagnostics (`review_t05_t08_checks.py`) all now return the corrected
+values. Each fix has a paired regression:
+
+- **R01 (P1) per-input attribution fabricated** — the case driver now drives a leg ONCE
+  PER CELL on the request-level (no-parameter) representative and binds the verdict + its
+  proof there; enumerated parameter inputs are recorded INCONCLUSIVE ("no per-parameter
+  attribution"), never credited with the request-level verdict/proof/execution.
+  `test_coverage_tracker.test_request_level_confirm_does_not_credit_parameter_siblings`.
+- **R02 (P1) principals collapsed to role** — coverage now keys on the durable
+  `RoleSession.principal_id()` (identity track's scheme), mapping principal→role only for
+  reachability/trust; `_role_headers` keyed by principal id.
+  `test_coverage_tracker.PrincipalIdentityTests` (Alice/Bob/anon stay 3 identities).
+- **R03 (P1) export/replay retained secrets** — `redact()` now masks JSON secret keys;
+  `redact_url()` masks userinfo + secret query params; every exported field, all
+  `affected_instances`, and the replay view are redacted. `test_issues.ReviewRegressionTests`
+  (url/json/replay secret markers gone).
+- **R04 (P1) issue id omitted application + over-grouped unknowns** — `issue_key` now
+  includes the scheme+host namespace and, for an UNKNOWN input, a per-finding disambiguator
+  so distinct unattributed findings stay separate (attributed inputs / repeated object ids
+  still group). `test_issues` (different targets distinct; two unknown-input findings → 2).
+- **R05 (P1) errors vanished / no budget** — `drive_coverage_cases` budget now bounds
+  DISPATCH ATTEMPTS; a raising callback records ERROR (visible), None records INCONCLUSIVE.
+  `test_coverage_tracker.test_failing_callback_is_recorded_as_error_and_consumes_budget`.
+- **R06 (P1) negative+error read as "all tested"** — aggregation now claims completion only
+  when EVERY child is a conclusive negative; an errored/blocked/inconclusive child forbids
+  it; unknown status maps to INCONCLUSIVE not NOT_DETECTED.
+  `test_coverage_cases.test_negative_plus_error_child_is_not_completion`.
+- **R07 (P2) occurrence name collision** — occurrence folds as `<name>[occ:<n>]`, which
+  cannot collide with a literal `<name>[<n>]`. `test_coverage_cases.test_occurrence_encoding_*`.
+- **R08 (P1) retest history discarded by storage** — findings dedup index is now
+  `(fingerprint, case_id)`, so a retest (new case identity) is its own row; suppression is
+  unchanged (keys on `fingerprint` alone). `export_issues_for_host` surfaces the FULL
+  append-only proof-attempt history per case. `test_issues.test_retest_survives_storage_as_one_issue_with_both_attempts`.
+- **R09 (P2) proof id/verdict mismatch** — proof references resolve each verdict by the
+  EXACT proof id and list every recorded attempt; a member pointer with no ledger attempt
+  carries no fabricated verdict. `test_issues.test_proof_verdict_resolved_by_exact_id`.
+- **R10 (P2) generic export** — expected invariant is class-keyed (not a blanket
+  read/write); per-member evidence is preserved; an `artifacts` block marks what is/ isn't
+  replayable. `export_issues_for_host` is the operator entry point.
+- **R11 (P2) inventory guard weaker than claimed** — reworded to a MODULE-granular guard;
+  `test_inventory_is_module_granular` pins that a second site in a registered module / an
+  aliased constructor is not caught, and the doc no longer overstates enforcement.
+
+Documented, NOT fixed here (review "additional gaps", coordinate with identity track):
+child cases are enumerated only for pending cells (a prior confirmed/detected finding hides
+its untested sibling inputs); production case derivation omits headers/workflow-state (the
+standalone CaseKey supports them); `_coverage_proof` does not yet forward execution/control
+artifact metadata and inherits the singleton run-id (identity F07). These are visibility/
+contract refinements, not correctness fabrications.

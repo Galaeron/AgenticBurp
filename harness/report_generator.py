@@ -474,14 +474,16 @@ def issue_exports(findings: list[dict], proofs_by_case: dict | None = None) -> l
 
 def export_issues_for_host(url: str) -> list[dict]:
     """Convenience: pull a host's findings from store.py and return their T06 issue
-    exports, enriched with each case's recorded proof verdict where available."""
+    exports, enriched with the FULL append-only proof-attempt history per case
+    (store.proofs_for_case) -- so every attempt, including a patched-fixture retest,
+    is preserved with its own proof id and verdict (T06 history preservation)."""
     import store
     findings = store.all_host_findings(url)
     proofs_by_case: dict = {}
     for f in findings:
         cid = f.get("case_id")
         if cid and cid not in proofs_by_case:
-            best = store.best_proof_for_case(cid)
-            if best:
-                proofs_by_case[cid] = best
+            attempts = store.proofs_for_case(cid)   # every recorded attempt, append-only
+            if attempts:
+                proofs_by_case[cid] = attempts
     return issue_exports(findings, proofs_by_case=proofs_by_case)

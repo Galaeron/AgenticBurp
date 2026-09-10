@@ -124,23 +124,25 @@ class ExportTests(unittest.TestCase):
 
     def test_export_has_the_required_reproducibility_fields(self):
         exp = issues.export_issue(self._issue(),
-                                  proofs_by_case={"c1": {"verdict": "confirmed"}})
+                                  proofs_by_case={"c1": [{"proof_id": "p1", "verdict": "confirmed"}]})
         for key in ("issue_id", "title", "vulnerability_class", "severity", "confirmed",
                     "prerequisites", "principal_aliases", "request_sequence",
                     "expected_vs_observed", "impact", "proof_references",
-                    "affected_instances", "limitations", "retest"):
+                    "affected_instances", "member_evidence", "artifacts", "limitations", "retest"):
             self.assertIn(key, exp)
         self.assertEqual(exp["expected_vs_observed"].keys(), {"expected", "observed"})
 
     def test_export_references_available_artifacts(self):
-        exp = issues.export_issue(self._issue(),
-                                  proofs_by_case={"c1": {"verdict": "confirmed"}})
+        exp = issues.export_issue(self._issue(), proofs_by_case={
+            "c1": [{"proof_id": "p1", "verdict": "confirmed"}]})
         refs = exp["proof_references"]
         self.assertEqual({r["case_id"] for r in refs}, {"c1", "c2"})
         self.assertEqual({r["proof_id"] for r in refs}, {"p1", "p2"})
         self.assertTrue(any(r.get("verdict") == "confirmed" for r in refs))
         # both affected object instances are exported (never dropped)
         self.assertEqual(len(exp["affected_instances"]), 2)
+        # every member's own evidence is preserved (not just the best member)
+        self.assertEqual(len(exp["member_evidence"]), 2)
 
     def test_principal_aliases_never_expose_raw_credentials(self):
         exp = issues.export_issue(self._issue())
@@ -164,6 +166,75 @@ class ExportTests(unittest.TestCase):
         fs = [F("https://x/api/x", "xss", method="GET", confirmed=False)]
         exp = issues.export_issue(issues.group_findings_into_issues(fs)[0])
         self.assertTrue(any("hypothesis" in l.lower() for l in exp["limitations"]))
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """Direct regressions for the T05-T08 review (R03/R04/R08/R09/R10)."""
+
+    def test_different_targets_get_distinct_issue_ids(self):  # R04
+        left = F("https://a.invalid/items/1", "idor")
+        right = F("https://b.invalid/items/1", "idor")
+        self.assertNotEqual(issues.issue_id_for(issues.issue_key(left)),
+                            issues.issue_id_for(issues.issue_key(right)))
+
+    def test_distinct_unknown_input_findings_do_not_collapse(self):  # R04
+        # two distinct unattributed findings (distinct finding_ids) must NOT merge
+        fa = F("https://a.invalid/items/1", "idor"); fa["finding_id"] = "A"
+        fb = F("https://a.invalid/items/1", "idor"); fb["finding_id"] = "B"
+        self.assertEqual(len(issues.group_findings_into_issues([fa, fb])), 2)
+
+    def test_export_redacts_url_query_secret(self):  # R03
+        exp = issues.export_issue(issues.group_findings_into_issues([
+            F("https://a.invalid/items/1?token=SUPERSECRETVALUE", "idor")])[0])
+        import json
+        blob = json.dumps(exp)
+        self.assertNotIn("SUPERSECRETVALUE", blob)
+        self.assertIn("<REDACTED>", blob)
+
+    def test_export_redacts_json_secret_in_evidence(self):  # R03
+        exp = issues.export_issue(issues.group_findings_into_issues([
+            F("https://a.invalid/x", "idor", evidence='{"password":"JSONSECRETVALUE"}')])[0])
+        import json
+        self.assertNotIn("JSONSECRETVALUE", json.dumps(exp))
+
+    def test_replay_redacts_url_secret(self):  # R03
+        view = issues.replay_view(issues.group_findings_into_issues([
+            F("https://a.invalid/x?session=REPLAYSECRET", "idor")])[0])
+        import json
+        self.assertNotIn("REPLAYSECRET", json.dumps(view))
+
+    def test_proof_verdict_resolved_by_exact_id(self):  # R09
+        # member points at proof-old; the case's ledger has a different best proof.
+        issue = issues.group_findings_into_issues([
+            F("https://a.invalid/items/1", "idor", case_id="case-A", proof_id="proof-old")])[0]
+        exp = issues.export_issue(issue, proofs_by_case={
+            "case-A": [{"proof_id": "proof-new", "verdict": "confirmed"}]})
+        refs = {r["proof_id"]: r.get("verdict") for r in exp["proof_references"]}
+        # proof-new is labeled with ITS verdict; proof-old is never mislabeled confirmed.
+        self.assertEqual(refs.get("proof-new"), "confirmed")
+        self.assertNotEqual(refs.get("proof-old"), "confirmed")
+
+    def test_retest_history_preserves_every_attempt(self):  # R08
+        # two attempts for one case (a confirm, then a patched retest) both survive.
+        issue = issues.group_findings_into_issues([
+            F("https://a.invalid/items/1", "idor", case_id="case-A", proof_id="p1", confirmed=True)])[0]
+        exp = issues.export_issue(issue, proofs_by_case={"case-A": [
+            {"proof_id": "p1", "verdict": "confirmed"},
+            {"proof_id": "p2", "verdict": "inconclusive"}]})
+        pids = {r["proof_id"] for r in exp["proof_references"]}
+        self.assertEqual(pids, {"p1", "p2"})   # retest attempt not lost
+
+    def test_expected_invariant_is_class_specific(self):  # R10
+        idor = issues.export_issue(issues.group_findings_into_issues([
+            F("https://a.invalid/x", "sqli", method="GET")])[0])
+        # a GET SQLi must NOT get a generic authorization-read invariant
+        self.assertIn("SQL", idor["expected_vs_observed"]["expected"])
+
+    def test_export_marks_missing_artifacts_when_no_proof(self):  # R10
+        exp = issues.export_issue(issues.group_findings_into_issues([
+            F("https://a.invalid/x", "idor")])[0])
+        self.assertFalse(exp["artifacts"]["replayable"])
+        self.assertTrue(exp["artifacts"]["missing"])
 
 
 class ReplayViewTests(unittest.TestCase):
@@ -240,6 +311,44 @@ class StoreExportIntegrationTests(unittest.TestCase):
         # a reproducible sequence is present
         self.assertGreaterEqual(len(exp["request_sequence"]), 2)
         self.assertIn(exp["issue_id"], exp["retest"])
+
+    def test_retest_survives_storage_as_one_issue_with_both_attempts(self):  # R08
+        import store, evidence, report_generator
+        from models import HttpExchange, Finding
+        ex = HttpExchange(url="https://shop.example.com/api/tickets/1", method="GET",
+                          request_headers={}, request_body="")
+
+        def _persist(run_id, confirmed):
+            case = evidence.TestCaseRef.make(run_id=run_id, request_template_id="tmpl1",
+                                             check_id="WSTG-ATHZ-04", principal_id="user")
+            pr = evidence.ProofRecord.from_validation_result(
+                case=case, validator="cross_identity",
+                status="confirmed" if confirmed else "not_confirmed", confirmed=confirmed,
+                observed_result=f"{run_id} attempt")
+            store.persist_proof_record(pr)
+            f = Finding(vulnerability_class="idor", confidence=0.9, summary="IDOR on ticket",
+                        evidence="same summary each run", suggested_test="replay as another user",
+                        basis="derived", severity="high", confirmed=confirmed,
+                        case_id=case.case_id, proof_id=pr.proof_id)
+            store.persist_findings(ex, "idor_agent", [f])
+            return case.case_id, pr.proof_id
+
+        c1, p1 = _persist("run1", True)      # initial confirm
+        c2, p2 = _persist("run2", False)     # patched retest, same coordinates, new case
+        self.assertNotEqual(c1, c2)          # distinct case identities across runs
+
+        # both finding rows survived storage (R08 -- retest not IGNORE'd)
+        rows = store.all_host_findings(ex.url)
+        self.assertEqual({r["case_id"] for r in rows}, {c1, c2})
+
+        exports = report_generator.export_issues_for_host(ex.url)
+        self.assertEqual(len(exports), 1)                    # ONE stable issue
+        exp = exports[0]
+        pids = {r["proof_id"] for r in exp["proof_references"]}
+        self.assertEqual(pids, {p1, p2})                     # BOTH attempts preserved
+        verdicts = {r["proof_id"]: r.get("verdict") for r in exp["proof_references"]}
+        self.assertEqual(verdicts[p1], "confirmed")          # exact verdict per proof (R09)
+        self.assertEqual(verdicts[p2], "inconclusive")
 
 
 if __name__ == "__main__":

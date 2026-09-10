@@ -10,7 +10,7 @@ danger is that a NEW direct send is added and silently bypasses the gate/executo
 -- exactly the "green tests, dead pipeline" failure mode this project guards
 against, one channel down.
 
-This module makes the transport surface *auditable and enforced*:
+This module makes the transport surface *auditable*, with a MODULE-granular guard:
 
   - `TRANSPORT_SITES` is a curated registry: every production module that opens an
     outbound channel (HTTP, container, browser, raw socket), with its scope
@@ -18,12 +18,20 @@ This module makes the transport surface *auditable and enforced*:
     target-directed send not yet on the executor -- the specific remaining gap.
   - `scan_http_client_modules()` scans the source tree for `httpx` client
     constructions. The paired test asserts the scan and the registry agree, so a
-    new un-inventoried direct send fails CI until it is either routed through the
-    executor or explicitly documented here with an owner.
+    new MODULE that opens an httpx client fails CI until it is either routed through
+    the executor or documented here with an owner.
 
-This is inventory + audit only: it changes no transport behavior. Actually
-migrating a gap (and re-qualifying the retired oracles) is the follow-on work the
-registry's `owner`/`gap` fields point at.
+Scope and limits of the guard (review R11 -- do not overstate it). It is a
+*module* inventory, not a call-site or transport-family detector. It will NOT
+catch: a SECOND direct client added inside an already-registered module; an
+aliased constructor (`import httpx as h; h.AsyncClient(...)`); or a non-httpx
+transport API (requests/aiohttp/raw socket beyond the ones already listed).
+`test_inventory_is_module_granular` documents that gap explicitly. Adding an owner
+to the registry is inventory, NOT executor-policy enforcement -- the actual
+migration of a gap onto the run-scoped executor is tracked separately by each
+site's `owner`/`gap`.
+
+This is inventory + audit only: it changes no transport behavior.
 """
 from __future__ import annotations
 

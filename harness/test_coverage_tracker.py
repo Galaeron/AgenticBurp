@@ -246,6 +246,47 @@ class DriveLegsTests(unittest.TestCase):
         self.assertTrue(all(nt.get("reason") for nt in report["not_tested"]))
 
 
+class PrincipalIdentityTests(unittest.TestCase):
+    """R02: two same-role principals + anonymous stay THREE distinct coverage
+    identities -- role no longer collapses Alice and Bob into one column."""
+
+    def test_same_role_principals_are_distinct_identities(self):
+        from role_crawl import RoleSession
+        from coverage_tracker import _identities_of
+        roles = [RoleSession("user", {"Authorization": "Bearer A"}, name="alice"),
+                 RoleSession("user", {"Authorization": "Bearer B"}, name="bob"),
+                 RoleSession("anonymous", {})]
+        identities, identity_roles = _identities_of(roles)
+        self.assertEqual(set(identities), {"alice", "bob", "anonymous"})
+        self.assertEqual(identity_roles["alice"], "user")
+        self.assertEqual(identity_roles["bob"], "user")
+
+    def test_matrix_keeps_same_role_principals_separate(self):
+        from role_crawl import RoleSession
+        st = _state_with([("GET", "/api/tickets/{id}", {"reachable_roles": ["user"]})])
+        t = CoverageTracker()
+        eps = endpoint_view(st)
+        from coverage_tracker import _identities_of
+        identities, identity_roles = _identities_of([
+            RoleSession("user", {"Authorization": "Bearer A"}, name="alice"),
+            RoleSession("user", {"Authorization": "Bearer B"}, name="bob"),
+            RoleSession("anonymous", {})])
+        t.build(eps, identities, identity_roles)
+        # alice and bob each get their own IDOR cell (both reach as role user) ...
+        self.assertEqual(t.matrix.get("alice", "GET /api/tickets/{id}", "WSTG-ATHZ-04").status,
+                         CellStatus.PENDING)
+        self.assertEqual(t.matrix.get("bob", "GET /api/tickets/{id}", "WSTG-ATHZ-04").status,
+                         CellStatus.PENDING)
+        # ... and are independent: confirming alice's does not touch bob's
+        t.matrix.record("alice", "GET /api/tickets/{id}", "WSTG-ATHZ-04",
+                        status=CellStatus.CONFIRMED, reason="alice only")
+        self.assertEqual(t.matrix.get("bob", "GET /api/tickets/{id}", "WSTG-ATHZ-04").status,
+                         CellStatus.PENDING)
+        # anonymous never reached (role not in reachable_roles) -> skipped
+        self.assertEqual(t.matrix.get("anonymous", "GET /api/tickets/{id}", "WSTG-ATHZ-04").status,
+                         CellStatus.SKIPPED)
+
+
 class CasesDrivenTests(unittest.TestCase):
     """T05: case-granular driving -- fan a parameter leg out over the endpoint's
     real inputs, drive per case, and keep un-run siblings honestly pending."""
@@ -267,16 +308,20 @@ class CasesDrivenTests(unittest.TestCase):
         eps = endpoint_view(st)
         t.build(eps, ["user"])
         t.expand_parameter_cases(eps, per_cell_budget=8)
-        # SQLi (parameter phase) -> one case per query input
+        # SQLi (parameter phase) -> a request-level representative + one case per input
         sqli_cases = t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-05")
-        names = sorted(ck.parameter_name for ck, _ in sqli_cases)
-        self.assertEqual(names, ["search", "sort"])
+        param_names = sorted(ck.parameter_name for ck, _ in sqli_cases if not ck.is_no_parameter)
+        self.assertEqual(param_names, ["search", "sort"])
+        self.assertTrue(any(ck.is_no_parameter for ck, _ in sqli_cases))  # the representative
         # IDOR (endpoint phase) -> a single explicit no-parameter case
         idor_cases = t.matrix.cases_for_cell("user", "GET /api/tickets/{id}", "WSTG-ATHZ-04")
         self.assertEqual(len(idor_cases), 1)
         self.assertTrue(idor_cases[0][0].is_no_parameter)
 
-    def test_confirm_one_input_leaves_sibling_pending(self):
+    def test_request_level_confirm_does_not_credit_parameter_siblings(self):
+        # R01: a whole-request confirm marks the cell as RISK (via the request-level
+        # case), but the enumerated parameter inputs are NOT credited with it -- they
+        # stay inconclusive (untested), never inheriting the verdict.
         import asyncio
         st = self._state()
         t = CoverageTracker()
@@ -288,18 +333,25 @@ class CasesDrivenTests(unittest.TestCase):
             def __init__(self, s): self.status = s; self.summary = "x"; self.confidence = 0.9; self.evidence = "e"; self.validator = "v"
 
         async def run_case(identity, method, path, check, case_key):
-            if check.id == "WSTG-INPV-05" and case_key.parameter_name == "search":
+            # a request-level confirm on the SQLi cell (the driver only calls the
+            # no-parameter representative); no per-parameter attribution
+            if check.id == "WSTG-INPV-05":
+                self.assertTrue(case_key.is_no_parameter)   # driven at request level
                 return _Res("confirmed")
-            return None  # do NOT drive the sort sibling (leave it pending)
+            return None
 
-        driven = asyncio.run(t.drive_coverage_cases(run_case, budget=100))
-        self.assertGreaterEqual(driven, 1)
-        # the search case is confirmed; the cell shows risk ...
+        asyncio.run(t.drive_coverage_cases(run_case, budget=100))
+        # the cell shows endpoint RISK ...
         self.assertEqual(t.matrix.get("user", "POST /api/search", "WSTG-INPV-05").status,
                          CellStatus.CONFIRMED)
-        # ... but the sort sibling is still pending (not tested)
-        pending_names = {c["parameter_name"] for c in t.matrix.cases_not_tested()}
-        self.assertIn("sort", pending_names)
+        # ... but neither parameter input is confirmed; both stay inconclusive (untested)
+        cases = {ck.parameter_name: r for ck, r in
+                 t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-05")}
+        self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
+        self.assertEqual(cases["sort"].status, CellStatus.INCONCLUSIVE)
+        nt_params = {c["parameter_name"] for c in t.matrix.cases_not_tested()}
+        self.assertIn("search", nt_params)
+        self.assertIn("sort", nt_params)
 
     def test_build_coverage_cases_driven_reports_pending_honestly(self):
         import asyncio
@@ -310,8 +362,8 @@ class CasesDrivenTests(unittest.TestCase):
             status = "not_confirmed"; summary = ""; confidence = None; evidence = ""; validator = "v"
 
         async def run_case(identity, method, path, check, case_key):
-            # only drive the SQLi 'search' input; everything else stays pending
-            if check.id == "WSTG-INPV-05" and case_key.parameter_name == "search":
+            # a not_confirmed request-level result on the SQLi cell only
+            if check.id == "WSTG-INPV-05":
                 return _Res()
             return None
 
@@ -320,15 +372,54 @@ class CasesDrivenTests(unittest.TestCase):
         self.assertIn("cases_enumerated", report)
         self.assertIn("cases_driven", report)
         self.assertGreaterEqual(report["cases_enumerated"], 2)
-        self.assertEqual(report["cases_driven"], 1)
+        # cases_driven counts DISPATCH ATTEMPTS (R05), one per driven cell.
+        self.assertGreaterEqual(report["cases_driven"], 1)
         # every not-tested case carries a reason (I5 at case granularity)
         self.assertTrue(all(c.get("reason") for c in report["cases_not_tested"]))
-        # Under the SQLi check specifically: 'sort' stays pending, 'search' (driven)
-        # does not. ('search' remains pending under the OTHER parameter checks it was
-        # also enumerated for -- correctly, since only SQLi was driven on it.)
+        # The SQLi leg ran at REQUEST LEVEL (not_confirmed) -> the concrete parameter
+        # inputs 'search'/'sort' were NOT individually attributed, so they stay in the
+        # honest not-tested list; the request-level result is not itself a gap.
         nt = {(c["endpoint"], c["check"], c["parameter_name"]) for c in report["cases_not_tested"]}
+        self.assertIn(("POST /api/search", "WSTG-INPV-05", "search"), nt)
         self.assertIn(("POST /api/search", "WSTG-INPV-05", "sort"), nt)
-        self.assertNotIn(("POST /api/search", "WSTG-INPV-05", "search"), nt)
+
+    def test_failing_callback_is_recorded_as_error_and_consumes_budget(self):
+        # R05: a raising callback must be recorded ERROR (visible) and the budget must
+        # bound DISPATCH ATTEMPTS -- budget=1 permits exactly one attempt.
+        import asyncio
+        st = self._state()
+        t = CoverageTracker()
+        eps = endpoint_view(st)
+        t.build(eps, ["user"])
+        t.expand_parameter_cases(eps, per_cell_budget=8)
+        calls = {"n": 0}
+
+        async def failing(identity, method, path, check, case_key):
+            calls["n"] += 1
+            raise RuntimeError("synthetic operational failure")
+
+        attempts = asyncio.run(t.drive_coverage_cases(failing, budget=1))
+        self.assertEqual(attempts, 1)
+        self.assertEqual(calls["n"], 1)                       # budget bounded the calls
+        self.assertEqual(t.matrix.case_summary()["error"], 1)  # the failure is visible
+
+    def test_none_result_is_inconclusive_not_silent(self):
+        # R05: a callback that returns None is recorded INCONCLUSIVE (dispatched, no
+        # usable send) -- distinct from an untested case, never silently dropped.
+        import asyncio
+        st = self._state()
+        t = CoverageTracker()
+        eps = endpoint_view(st)
+        t.build(eps, ["user"])
+        t.expand_parameter_cases(eps, per_cell_budget=8)
+
+        async def declines(identity, method, path, check, case_key):
+            return None
+
+        asyncio.run(t.drive_coverage_cases(declines, budget=100))
+        cs = t.matrix.case_summary()
+        self.assertGreater(cs["inconclusive"], 0)
+        self.assertEqual(cs["not_detected"], 0)   # None never becomes an optimistic negative
 
     def test_per_cell_budget_bounds_fanout(self):
         st = _state_with([("POST", "/api/x", {"reachable_roles": ["user"]})])
@@ -340,10 +431,13 @@ class CasesDrivenTests(unittest.TestCase):
         t.build(eps, ["user"])
         t.expand_parameter_cases(eps, per_cell_budget=2)
         cases = t.matrix.cases_for_cell("user", "POST /api/x", "WSTG-INPV-05")
-        pending = [r for _ck, r in cases if r.status == CellStatus.PENDING]
-        skipped = [r for _ck, r in cases if r.status == CellStatus.SKIPPED]
-        self.assertEqual(len(pending), 2)   # only 2 attempted within budget
-        self.assertEqual(len(skipped), 2)   # the rest visible + budget-skipped
+        # parameter inputs are budgeted (2 of 4 pending, 2 budget-skipped); the
+        # request-level representative is always present on top.
+        param_pending = [r for ck, r in cases if not ck.is_no_parameter and r.status == CellStatus.PENDING]
+        param_skipped = [r for ck, r in cases if not ck.is_no_parameter and r.status == CellStatus.SKIPPED]
+        self.assertEqual(len(param_pending), 2)
+        self.assertEqual(len(param_skipped), 2)
+        self.assertTrue(any(ck.is_no_parameter for ck, _ in cases))  # representative kept
 
 
 if __name__ == "__main__":
