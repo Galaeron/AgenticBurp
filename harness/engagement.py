@@ -144,8 +144,10 @@ class SurfaceEndpoint:
             "confirmed": bool(f.get("confirmed", False)),
         }
         # Carry proof/context when present -- never fabricate empty keys.
+        # (T04: proof_id/case_id link a finding to its case-bound structured proof so
+        # the link survives ingestion into state and the report projection.)
         for k in ("evidence", "summary", "url", "confirmation_method",
-                  "validator", "identity", "basis"):
+                  "validator", "identity", "basis", "proof_id", "case_id"):
             if f.get(k):
                 slim[k] = f[k]
 
