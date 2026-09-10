@@ -48,13 +48,14 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
 
     # --- helpers -----------------------------------------------------------
 
-    def _ledger(self):
+    def _ledger(self, fx):
         led = principals.OwnershipLedger()
-        led.record(principals.OwnershipFact(object_ref="/objects/7", owner_principal_id="alice", tenant="A",
+        ref = lambda oid: principals.object_reference(fx.object_url(oid), run_id="t04")
+        led.record(principals.OwnershipFact(object_ref=ref("7"), owner_principal_id="alice", tenant="A",
                                             provenance="created-as:alice"))
-        led.record(principals.OwnershipFact(object_ref="/objects/5", owner_principal_id="alice", tenant="A",
+        led.record(principals.OwnershipFact(object_ref=ref("5"), owner_principal_id="alice", tenant="A",
                                             shared_with=frozenset({"bob"}), provenance="shared-with:bob"))
-        led.record(principals.OwnershipFact(object_ref="/objects/1", public=True, provenance="public listing"))
+        led.record(principals.OwnershipFact(object_ref=ref("1"), public=True, provenance="public listing"))
         return led
 
     def _validate(self, fx, oid, *, ledger=None, source_token="alice-token",
@@ -68,7 +69,14 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
         exchange = HttpExchange(url=url, method="GET",
                                 request_headers={"Authorization": f"Bearer {source_token}"},
                                 response_status=r.status_code, response_body=r.text)
-        ctx = RunContext.create(allowed_hosts=[HOST], max_requests=25, gate_config={"active_enabled": True})
+        ctx = RunContext.create(run_id="t04", allowed_hosts=[HOST], max_requests=25,
+                                gate_config={"active_enabled": True})
+        for name, tok in identities:
+            ctx.sessions.register(
+                f"principal:{name}", name, {"Authorization": f"Bearer {tok}"},
+                allowed_origins=[fx.base], role="user", name=name)
+        ctx.sessions.register("anonymous", "anonymous", allowed_origins=[fx.base],
+                              role="anonymous", name="anonymous")
         v = CrossIdentityValidator(allowed_hosts=[HOST], run_context=ctx, ownership=ledger)
         finding = Finding(vulnerability_class="idor", confidence=0.6, summary="possible idor",
                           evidence="", suggested_test="", basis="derived")
@@ -85,7 +93,7 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
     def test_1_vulnerable_confirms_the_crossing(self):
         fx = AuthorizationWorkflowFixture("vulnerable")
         self.addCleanup(fx.close)
-        _ex, res = self._validate(fx, "7", ledger=self._ledger())
+        _ex, res = self._validate(fx, "7", ledger=self._ledger(fx))
         self.assertEqual(res.status, "confirmed")
         self.assertTrue(res.confirmed)
         self.assertGreaterEqual(res.confidence, 0.7)
@@ -98,7 +106,7 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
     def test_2_patched_does_not_confirm(self):
         fx = AuthorizationWorkflowFixture("patched")
         self.addCleanup(fx.close)
-        _ex, res = self._validate(fx, "7", ledger=self._ledger())
+        _ex, res = self._validate(fx, "7", ledger=self._ledger(fx))
         self.assertFalse(res.confirmed)
         # The controlled negative is real: Bob's request actually ran and was denied.
         bob = httpx.get(fx.object_url("7"), headers={"Authorization": "Bearer bob-token"})
@@ -107,14 +115,14 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
     def test_3a_public_object_cannot_confirm(self):
         fx = AuthorizationWorkflowFixture("vulnerable")
         self.addCleanup(fx.close)
-        _ex, res = self._validate(fx, "1", ledger=self._ledger())
+        _ex, res = self._validate(fx, "1", ledger=self._ledger(fx))
         self.assertFalse(res.confirmed)   # a public object read by another identity is not BOLA
 
     def test_3b_identical_principal_cannot_confirm(self):
         fx = AuthorizationWorkflowFixture("vulnerable")
         self.addCleanup(fx.close)
         # Seed the SOURCE principal (Alice) as the only "other" identity -> self-comparison.
-        _ex, res = self._validate(fx, "7", ledger=self._ledger(),
+        _ex, res = self._validate(fx, "7", ledger=self._ledger(fx),
                                   identities=(("alice", "alice-token"),))
         self.assertNotEqual(res.status, "confirmed")   # R10: you cannot IDOR against yourself
 
@@ -126,13 +134,13 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
         # gate (T02b) is what made the difference, over real transport.
         _ex, res_no_owner = self._validate(fx, "5", ledger=None)
         self.assertTrue(res_no_owner.confirmed)
-        _ex2, res_shared = self._validate(fx, "5", ledger=self._ledger())
+        _ex2, res_shared = self._validate(fx, "5", ledger=self._ledger(fx))
         self.assertFalse(res_shared.confirmed)
 
     def test_4_target_side_counters_show_attempt_and_control(self):
         fx = AuthorizationWorkflowFixture("vulnerable")
         self.addCleanup(fx.close)
-        self._validate(fx, "7", ledger=self._ledger())
+        self._validate(fx, "7", ledger=self._ledger(fx))
         auths = [r["authorization"] for r in fx.requests_for("/objects/7")]
         self.assertIn("Bearer bob-token", auths)   # the unauthorized attempt actually ran
         self.assertIn(None, auths)                  # the anonymous control actually ran
@@ -140,7 +148,7 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
     def test_5_proof_roundtrips_and_links_to_finding(self):
         fx = AuthorizationWorkflowFixture("vulnerable")
         self.addCleanup(fx.close)
-        ex, res = self._validate(fx, "7", ledger=self._ledger())
+        ex, res = self._validate(fx, "7", ledger=self._ledger(fx))
         self.assertTrue(res.confirmed)
         case = evidence.TestCaseRef.make(run_id="t04", request_template_id="/objects/7",
                                          check_id="idor", principal_id="bob")
@@ -166,9 +174,9 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
     def test_6_rerun_isolated_reproduces(self):
         fx = AuthorizationWorkflowFixture("vulnerable")
         self.addCleanup(fx.close)
-        r1 = self._validate(fx, "7", ledger=self._ledger())[1]
+        r1 = self._validate(fx, "7", ledger=self._ledger(fx))[1]
         identity_headers.clear(HOST)
-        r2 = self._validate(fx, "7", ledger=self._ledger())[1]
+        r2 = self._validate(fx, "7", ledger=self._ledger(fx))[1]
         self.assertTrue(r1.confirmed and r2.confirmed)   # reproducible with isolated state
 
 

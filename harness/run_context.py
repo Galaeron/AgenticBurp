@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlsplit
 
@@ -61,8 +62,11 @@ class ScopePolicy:
     def origin_of(url: str) -> str:
         p = urlsplit(url)
         host = (p.hostname or "").lower()
-        port = f":{p.port}" if p.port else ""
-        return f"{(p.scheme or '').lower()}://{host}{port}"
+        scheme = (p.scheme or "").lower()
+        port_value = p.port
+        port = "" if (scheme == "http" and port_value in (None, 80)) or \
+            (scheme == "https" and port_value in (None, 443)) else f":{port_value}"
+        return f"{scheme}://{host}{port}"
 
     @staticmethod
     def host_of(url: str) -> str:
@@ -138,6 +142,10 @@ class ManagedSession:
     session_id: str
     principal_id: str
     headers: dict = field(default_factory=dict)   # Authorization/etc.; the credential, kept out of findings
+    allowed_origins: frozenset = frozenset()
+    role: str = "user"
+    name: str = ""
+    principal: object | None = None
     generation: int = 0
     _client: httpx.AsyncClient | None = None
 
@@ -157,13 +165,23 @@ class SessionManager:
     def __init__(self):
         self._by_id: dict[str, ManagedSession] = {}
 
-    def register(self, session_id: str, principal_id: str, headers: dict | None = None) -> ManagedSession:
-        s = ManagedSession(session_id=session_id, principal_id=principal_id, headers=dict(headers or {}))
+    def register(self, session_id: str, principal_id: str, headers: dict | None = None, *,
+                 allowed_origins=None, role: str = "user", name: str = "",
+                 principal=None) -> ManagedSession:
+        normalized = frozenset(ScopePolicy.origin_of(o) for o in (allowed_origins or []))
+        if headers and not normalized:
+            raise ValueError("credential-bearing sessions require an explicit allowed origin")
+        s = ManagedSession(session_id=session_id, principal_id=principal_id,
+                           headers=dict(headers or {}), allowed_origins=normalized,
+                           role=role, name=name or principal_id, principal=principal)
         self._by_id[session_id] = s
         return s
 
     def get(self, session_id: str | None) -> ManagedSession | None:
         return self._by_id.get(session_id) if session_id else None
+
+    def all(self) -> list[ManagedSession]:
+        return list(self._by_id.values())
 
     async def aclose(self) -> None:
         for s in self._by_id.values():
@@ -225,7 +243,23 @@ class Executor:
         including blocks and errors."""
         ctx = self.ctx
         session = ctx.sessions.get(session_ref)
+        if session_ref and session is None:
+            return ExecutionOutcome(
+                outcome="unknown_session", final_url=request.url,
+                error=f"unknown session reference: {session_ref}",
+                artifact=self._artifact(request.url, "unknown_session", session_ref))
+        if not session_ref and any(k.lower() in _CREDENTIAL_HEADERS
+                                   for k in (request.headers or {})):
+            return ExecutionOutcome(
+                outcome="blocked", final_url=request.url,
+                error="credential-bearing request requires an explicit session reference",
+                artifact=self._artifact(request.url, "credentials_require_session", None))
         origin0 = ScopePolicy.origin_of(request.url)
+        if session and origin0 not in session.allowed_origins:
+            return ExecutionOutcome(
+                outcome="blocked", final_url=request.url,
+                error="session is not authorized for the requested destination",
+                artifact=self._artifact(request.url, "credential_destination_blocked", session_ref))
         method = (request.method or "GET").upper()
         url = request.url
         headers = dict(request.headers or {})
@@ -254,13 +288,16 @@ class Executor:
                                         artifact=self._artifact(url, "budget_exhausted", session_ref))
             # 4. Credential-forwarding rule: attach the session's auth headers ONLY
             #    when this hop is the session's own origin. Cross-origin -> no creds.
+            credential_destination = bool(
+                session and ScopePolicy.origin_of(url) in session.allowed_origins)
             send_headers = {k: v for k, v in headers.items()
                             if k.lower() not in _CREDENTIAL_HEADERS
-                            or ctx.scope.same_origin(url, origin0)}
-            if session and ctx.scope.same_origin(url, origin0):
+                            or credential_destination}
+            if session and credential_destination:
                 for k, v in session.headers.items():
                     send_headers.setdefault(k, v)
-            client = session.client(ctx.timeout) if session else ctx.default_client()
+            client = (session.client(ctx.timeout)
+                      if session and credential_destination else ctx.default_client())
             try:
                 resp = await client.request(method, url, headers=send_headers or None,
                                             content=body if isinstance(body, str) else None)
@@ -270,6 +307,8 @@ class Executor:
 
             if resp.status_code in _REDIRECT_CODES and resp.headers.get("location") and _hop < max_redirects:
                 nxt = urljoin(url, resp.headers["location"])
+                if not ctx.scope.same_origin(url, nxt):
+                    body = None
                 if resp.status_code in _REDIRECT_TO_GET:
                     method, body = "GET", None
                 headers = {}          # drop one-shot headers; creds re-decided by same-origin next hop
@@ -295,6 +334,7 @@ class RunContext:
     cancel: CancelToken
     sessions: SessionManager
     config: dict = field(default_factory=dict)
+    cache_namespace: str = ""
     timeout: float = 15.0
     _default_client: httpx.AsyncClient | None = None
 
@@ -305,12 +345,19 @@ class RunContext:
         # A FRESH gate per run (never the process-global default) -- the #3 isolation
         # fix: authorization state is per run, so two runs cannot contaminate each
         # other's mutation budgets or audit log.
+        resolved_run_id = run_id or uuid.uuid4().hex
+        config_snapshot = deepcopy(config or {})
+        configured_namespace = str(
+            ((config_snapshot.get("runs", {}) or {}).get("cache_namespace") or "")
+        )
         return cls(
-            run_id=run_id or uuid.uuid4().hex,
+            run_id=resolved_run_id,
             scope=ScopePolicy(allowed_hosts=frozenset((h or "").lower() for h in (allowed_hosts or []))),
             gate=SafetyGate(SafetyGateConfig.from_dict(gate_config or {})),
             budget=RequestBudget(max_requests), cancel=CancelToken(),
-            sessions=SessionManager(), config=config or {}, timeout=timeout)
+            sessions=SessionManager(), config=config_snapshot,
+            cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
+                             if configured_namespace else resolved_run_id), timeout=timeout)
 
     def default_client(self) -> httpx.AsyncClient:
         if self._default_client is None:

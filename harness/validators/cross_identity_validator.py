@@ -212,15 +212,16 @@ class CrossIdentityValidator(Validator):
         self.run_context = run_context
 
     def _object_ref(self, url: str) -> str:
-        """The object identity used to look up ownership facts. The URL path is a
-        stable per-object key; the ownership-recording side uses the same convention."""
-        return urlparse(url).path or url
+        import principals
+        run_id = self.run_context.run_id if self.run_context is not None else ""
+        return principals.object_reference(url, run_id=run_id)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         # Reuse the access-control gate's markers so the two never drift.
         return access_control_gate._is_access_control_class(finding.vulnerability_class)
 
-    async def _probe(self, url: str, headers: dict) -> identity_compare.Probe:
+    async def _probe(self, url: str, headers: dict,
+                     session_ref: str | None = None) -> identity_compare.Probe:
         """Live GET. A method seam so unit tests can replace it with a canned
         responder and never touch the network. When a RunContext is configured (T03)
         the send goes through its Executor -- one policy path (scope + gate + budget,
@@ -230,7 +231,7 @@ class CrossIdentityValidator(Validator):
             from run_context import TypedRequest
             out = await self.run_context.executor().execute(
                 TypedRequest("GET", url, headers=dict(headers or {})),
-                capability=self.name, session_ref=None)
+                capability=self.name, session_ref=session_ref)
             if out.outcome == "error":
                 raise RuntimeError(out.error or "probe transport error")
             if not out.executed:   # out_of_scope / blocked / budget / cancelled -> not reached
@@ -241,6 +242,29 @@ class CrossIdentityValidator(Validator):
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
             resp = await client.get(url, headers=headers or None)
         return identity_compare.Probe(resp.status_code, resp.text)
+
+    def _run_identities(self, host: str) -> list[dict]:
+        if self.run_context is None:
+            return identity_headers.identities_for_host(host)
+        return [{"name": s.name or s.principal_id, "role": s.role,
+                 "headers": dict(s.headers), "session_ref": s.session_id,
+                 "principal_id": s.principal_id, "principal": s.principal}
+                for s in self.run_context.sessions.all()
+                if s.principal_id != "anonymous"]
+
+    def _anonymous_session_ref(self) -> str | None:
+        if self.run_context is None:
+            return None
+        for session in self.run_context.sessions.all():
+            if session.principal_id == "anonymous":
+                return session.session_id
+        return None
+
+    async def _probe_identity(self, url: str, ident: dict) -> identity_compare.Probe:
+        session_ref = ident.get("session_ref")
+        if session_ref is None:
+            return await self._probe(url, ident["headers"])
+        return await self._probe(url, ident["headers"], session_ref)
 
     def _skip(self, fc: str, why: str) -> ValidationResult:
         return ValidationResult(validator=self.name, status="skipped", finding_class=fc, summary=why)
@@ -272,7 +296,7 @@ class CrossIdentityValidator(Validator):
         for ident in idents:
             if _PRIVILEGED_ROLE.search(ident.get("role", "") or ""):
                 try:
-                    admin_probe = await self._probe(exchange.url, ident["headers"])
+                    admin_probe = await self._probe_identity(exchange.url, ident)
                 except Exception:
                     admin_probe = None
                 if admin_probe is not None:
@@ -286,7 +310,7 @@ class CrossIdentityValidator(Validator):
             if _PRIVILEGED_ROLE.search(ident.get("role", "") or ""):
                 continue  # an admin reaching an admin function is expected, not a bypass
             try:
-                attempt = await self._probe(exchange.url, ident["headers"])
+                attempt = await self._probe_identity(exchange.url, ident)
             except Exception:
                 continue
             considered += 1
@@ -337,7 +361,9 @@ class CrossIdentityValidator(Validator):
         if (exchange.method or "GET").upper() != "GET":
             return self._skip(fc, "cross-identity replay is GET-only (safe); a mutating request is not replayed here")
         host = urlparse(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.run_context is not None and not self.run_context.scope.in_scope(exchange.url):
+            return self._skip(fc, f"host {host!r} is outside the run scope")
+        if self.run_context is None and self.allowed_hosts and host not in self.allowed_hosts:
             return self._skip(fc, f"host {host!r} is outside server.allowed_hosts scope")
         object_scoped = has_object_identifier(exchange.url)
         function_level = not object_scoped and is_admin_namespaced(exchange.url)
@@ -348,7 +374,7 @@ class CrossIdentityValidator(Validator):
                                   "not admin-namespaced, so it is not a function-level (BFLA) "
                                   "candidate either; cross-identity needs an object reference to swap "
                                   "or an admin-namespaced function to reach")
-        idents = identity_headers.identities_for_host(host)
+        idents = self._run_identities(host)
         if not idents:
             return self._skip(fc, "no identities configured for this host -- supply another identity's "
                                   "session headers via POST /identities/session-headers (Autorize-style)")
@@ -368,7 +394,11 @@ class CrossIdentityValidator(Validator):
 
         candidate = identity_compare.Probe(exchange.response_status or 0, exchange.response_body or "")
         try:
-            anon = await self._probe(exchange.url, {})
+            anon_ref = self._anonymous_session_ref()
+            if self.run_context is not None and anon_ref is None:
+                return self._skip(fc, "run has no explicit anonymous session")
+            anon = (await self._probe(exchange.url, {}, anon_ref)
+                    if anon_ref is not None else await self._probe(exchange.url, {}))
         except Exception as e:  # network/scope error -- degrade, never crash the pipeline
             return ValidationResult(validator=self.name, status="error", finding_class=fc,
                                     summary=f"anonymous baseline probe failed: {e}")
@@ -382,9 +412,10 @@ class CrossIdentityValidator(Validator):
 
         considered = 0
         rejects = 0
+        authorized = 0
         for ident in idents_distinct[:self.max_identities]:
             try:
-                attempt = await self._probe(exchange.url, ident["headers"])
+                attempt = await self._probe_identity(exchange.url, ident)
             except Exception:
                 continue
             considered += 1
@@ -399,22 +430,16 @@ class CrossIdentityValidator(Validator):
                 # response-similarity verdict (it neither invents nor suppresses).
                 if self.ownership is not None:
                     import principals as _pr
-                    accessor = _pr.Principal(
-                        id=ident.get("name") or ident.get("role") or "unknown",
+                    accessor = ident.get("principal") or _pr.Principal(
+                        id=ident.get("principal_id") or ident.get("name")
+                           or ident.get("role") or "unknown",
                         role=ident.get("role", "user"),
-                        trust=_pr.TRUST_BY_ROLE.get((ident.get("role") or "").lower(), 1))
+                        trust=_pr.TRUST_BY_ROLE.get((ident.get("role") or "").lower(), 1),
+                        provisional=True)
                     if self.ownership.authorization(accessor, self._object_ref(exchange.url)) \
                             == _pr.AuthzDecision.AUTHORIZED:
-                        return ValidationResult(
-                            validator=self.name, status="not_confirmed", finding_class=fc,
-                            confidence=0.3, confirmed=False,
-                            summary=f"OBSERVATION (not confirmed): {ident['name']!r} reached "
-                                    f"{exchange.url}, but ownership provenance shows this access is "
-                                    f"AUTHORIZED (own / shared / public object) -- authorized sharing is "
-                                    f"not a broken-object-authorization crossing.",
-                            evidence=f"OwnershipLedger: {ident.get('name')!r} is entitled to "
-                                     f"{self._object_ref(exchange.url)!r}; a cross-identity 2xx here is "
-                                     f"expected, not a bug.")
+                        authorized += 1
+                        continue
                 return ValidationResult(
                     validator=self.name, status="confirmed", finding_class=fc,
                     confidence=ev.confidence, confirmed=True,
@@ -424,6 +449,15 @@ class CrossIdentityValidator(Validator):
 
         if considered == 0:
             return self._skip(fc, "no configured identity probe could be sent")
+        if authorized:
+            return ValidationResult(
+                validator=self.name, status="not_confirmed", finding_class=fc,
+                confidence=0.3, confirmed=False,
+                summary=f"OBSERVATION (not confirmed): {authorized} authorized principal(s) reached "
+                        f"{exchange.url} with explicit ownership/share/public permission; "
+                        f"all {considered} configured principals were still evaluated.",
+                evidence=f"OwnershipLedger authorized {authorized} of {considered} tested "
+                         f"principal(s) for {self._object_ref(exchange.url)!r}.")
         if rejects == considered:
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.8, confirmed=False,

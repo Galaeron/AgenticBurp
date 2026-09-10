@@ -12,8 +12,9 @@ Older session narratives are in git history / `archive/`; this file is deliberat
 ## ►► PARALLEL TRACK — Opus, branch `astra-t05-t08` (T05/T06/T08) ◄◄
 
 Branched off `codex/astra-review-fixes` @ `e24ca7f` in worktree
-`.worktrees/astra-t05-t08`, so this coverage/issue/transport track and the identity
-track below do not collide (reconcile by merge). Treated the identity contracts
+`.worktrees/astra-t05-t08`; the identity track through `5f0522a` (F07 run identity,
+session/credential isolation, and ownership preservation) is now reconciled here.
+Treated the identity contracts
 (`evidence.TestCaseRef`/`ProofRecord`/`Verdict`) + case/proof identity (T01
 F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
 
@@ -50,11 +51,13 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   now `(fingerprint,case_id)` so retests persist + export shows full proof history; R09
   verdict by exact proof id; R10 class-keyed invariant + honest artifacts; R11 guard
   reworded module-granular. See EXECUTION_LOG "Review response".
-- **Verification:** full stdlib discovery after all three tickets — **1,653 tests OK,
-  2 skipped**, exit 0 (1,581 baseline + 72 new; zero real failures). No model / browser /
+- **Verification:** pre-reconciliation full discovery was **1,671 tests OK, 2 skipped**.
+  After merging the identity track through `5f0522a` and binding coverage proofs to its
+  invocation-local `RunContext`, the combined focused matrix is **279 tests OK** and full
+  stdlib discovery is **1,685 tests OK, 2 skipped**, exit 0, 317.988s. No model / browser /
   container / blind-target / live run performed — all hermetic.
-- **Still owed:** merge into `WorkingSunday` (reconcile with the identity track's
-  orchestrator/run-context edits); a fresh live max-coverage VulnCorp run to move any
+- **Still owed:** merge the reconciled branch into `WorkingSunday`; a fresh live
+  max-coverage VulnCorp run to move any
   numbers. New live behavior is flag-gated OFF, so live recall is unchanged until enabled.
 
 ---
@@ -79,6 +82,34 @@ finding; the class-wide assignment was removed. Old proof rows retain their pre-
 case hash. Focused evidence/engagement/transport checks: **79 tests OK**. Full stdlib
 discovery: **1,581 tests OK, 2 skipped**, 314.376s. T01 is now complete against the
 reviewed F02/F03/F06 requirements; invocation-local run identity (T03 F07) is next.
+
+**T03 F07 complete:** the server job manifest now owns an invocation-local
+`RunContext`, and that immutable run ID is passed into engagement/captured-exchange
+analysis and exact proof construction. The singleton lazy run ID was removed.
+Configuration is deep-snapshotted, cache namespaces are salted by run ID, request
+budgets/cancellation are per context, API cancellation signals the context, and owned
+clients close with the job lifecycle. Focused cache/context/proof/manifest/API checks:
+**80 tests OK**. Full stdlib discovery: **1,585 tests OK, 2 skipped**, 287.529s.
+T03 F04/F05 session and credential isolation is next.
+
+**T03 F04/F05 complete:** graph authorization now registers every principal and an
+explicit anonymous session in its invocation context; cross-identity probes no longer
+read process-global identities on that path. Unknown session references and credential
+headers without a session fail before transport. Credential-bearing sessions require
+declared normalized origins; unauthorized initial destinations are blocked, and
+cross-origin redirects receive neither session cookies nor retained request bodies.
+Focused authorization integration: **73 tests OK**; focused real transport: **18 tests
+OK**. Full stdlib discovery: **1,591 tests OK, 2 skipped**, 289.004s. T02 F08–F10
+principal metadata and ownership semantics are next.
+
+**T02 F08–F10 complete:** identity re-save uses an additive UPSERT and preserves
+tenant, permissions, and trust metadata. Run sessions carry authoritative `Principal`
+objects into ownership checks. Object references include run, normalized application
+origin, explicit tenant state, path, and the unmodified query selection. Authorized
+access is recorded per principal and evaluation continues, so it cannot suppress a
+later unauthorized case. Focused principal/ownership/transport/API checks: **84 tests
+OK**. Full stdlib discovery: **1,595 tests OK, 2 skipped**, 294.398s. T03 F01
+production wiring and transport behavior is next.
 
 **2026-09-10 review-only addendum:** Source inspected at HEAD `8b5c6e1`;
 implementation handoff saved to

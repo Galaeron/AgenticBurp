@@ -871,14 +871,28 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     if not req.base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
     import role_crawl
+    from run_context import RunContext
+    from urllib.parse import urlsplit
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
-                                    headers=r.get("headers") or {}, name=r.get("name"))
+                                    headers=r.get("headers") or {}, name=r.get("name"),
+                                    tenant=r.get("tenant"),
+                                    expected_permissions=frozenset(
+                                        r.get("expected_permissions") or []))
              for r in (req.roles or [])] or [role_crawl.RoleSession(role="anonymous", headers={})]
     job_id = _uuid.uuid4().hex[:12]
     runs_cfg = (config.get("runs", {}) or {})
+    target_host = (urlsplit(req.base_url).hostname or "").lower()
+    allowed_hosts = set(orchestrator.allowed_hosts or [])
+    if target_host:
+        allowed_hosts.add(target_host)
+    run_context = RunContext.create(
+        run_id=job_id, allowed_hosts=allowed_hosts,
+        gate_config=config.get("validators", {}) or {},
+        max_requests=runs_cfg.get("max_requests"), config=config,
+        timeout=float(runs_cfg.get("request_timeout_seconds", 15.0)))
     manifest = _run_manifest.RunManifest.start(
         run_id=job_id, target_identifier=host, config=config,
-        cache_namespace=runs_cfg.get("cache_namespace"), output_dir=runs_cfg.get("output_dir"),
+        cache_namespace=run_context.cache_namespace, output_dir=runs_cfg.get("output_dir"),
         model_versions={"coordinator": orchestrator.coordinator_model,
                         "agents": sorted({getattr(a, "model", "")
                                           for a in orchestrator.agent_manager.agents.values()
@@ -886,15 +900,20 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     job: dict = {"job_id": job_id, "host": host, "base_url": req.base_url,
                  "status": "running", "task": None, "result": None, "error": None,
                  "started_at": _time.time(), "finished_at": None,
-                 "manifest_path": str(manifest.path)}
+                 "manifest_path": str(manifest.path), "run_context": run_context}
 
     async def _run():
         try:
-            job["result"] = await orchestrator.investigate_engagement(
-                req.base_url, roles,
-                max_nodes=max(1, min(req.max_nodes, 100)),
-                step_budget=max(1, min(req.step_budget, 64)),
-                max_chain_rounds=max(0, min(req.max_chain_rounds, 10)))
+            async with run_context:
+                job["result"] = await orchestrator.investigate_engagement(
+                    req.base_url, roles,
+                    max_nodes=max(1, min(req.max_nodes, 100)),
+                    step_budget=max(1, min(req.step_budget, 64)),
+                    max_chain_rounds=max(0, min(req.max_chain_rounds, 10)),
+                    run_context=run_context)
+            job["result"].setdefault("run_id", run_context.run_id)
+            job["result"].setdefault("cache_namespace", run_context.cache_namespace)
+            job["result"].setdefault("request_count", run_context.budget.used)
             job["status"] = "done"
             manifest.finish("done", result=job["result"])
         except asyncio.CancelledError:
@@ -947,6 +966,9 @@ async def engagement_investigate_cancel(host: str, job_id: str,
         raise HTTPException(status_code=404, detail="unknown job")
     task = job.get("task")
     if task is not None and not task.done():
+        context = job.get("run_context")
+        if context is not None:
+            context.cancel.cancel()
         task.cancel()
         if job["status"] == "running":
             job["status"] = "cancelling"

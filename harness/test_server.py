@@ -539,8 +539,37 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         self.assertEqual(done["result"]["summary"]["endpoint_count"], 3)
         manifest = json.loads(Path(done["manifest_path"]).read_text(encoding="utf-8"))
         self.assertEqual(manifest["completion_status"], "done")
-        self.assertEqual(manifest["cache_namespace"], "test-isolated")
-        self.assertIsNone(manifest["request_count"])
+        self.assertEqual(manifest["cache_namespace"], f"test-isolated:{job_id}")
+        self.assertEqual(manifest["request_count"], 0)
+
+    def test_manifest_id_is_passed_in_an_invocation_local_context(self):
+        from unittest.mock import patch
+        seen = []
+
+        async def capture(*args, **kwargs):
+            ctx = kwargs["run_context"]
+            seen.append((ctx.run_id, ctx.cache_namespace, ctx.config))
+            return {"summary": {}}
+
+        self.server.config["runs"]["cache_namespace"] = "job-cache"
+        with patch.object(self.server.orchestrator, "investigate_engagement", new=capture):
+            starts = [self.client.post(
+                "/engagement/shop.test/investigate",
+                json={"base_url": "http://localhost:5002"}) for _ in range(2)]
+            done = [self._poll(
+                f"/engagement/shop.test/investigate/{r.json()['job_id']}", {"done", "error"})
+                for r in starts]
+
+        self.assertEqual([d["status"] for d in done], ["done", "done"])
+        job_ids = [r.json()["job_id"] for r in starts]
+        self.assertEqual({item[0] for item in seen}, set(job_ids))
+        self.assertEqual({item[1] for item in seen},
+                         {f"job-cache:{job_id}" for job_id in job_ids})
+        self.assertIsNot(seen[0][2], seen[1][2])
+        for item, job_id in zip(seen, job_ids):
+            manifest = json.loads(Path(
+                self.server._INVESTIGATE_JOBS[job_id]["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(item[0], manifest["run_id"])
 
     def test_cancel_running_job(self):
         from unittest.mock import patch

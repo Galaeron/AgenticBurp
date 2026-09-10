@@ -229,7 +229,7 @@ class ExchangeCache:
         )
 
     @classmethod
-    def compute_exchange_hash(cls, exchange: HttpExchange) -> str:
+    def compute_exchange_hash(cls, exchange: HttpExchange, namespace: str = "") -> str:
         """
         Compute a content-based hash for an HTTP exchange.
         
@@ -247,6 +247,7 @@ class ExchangeCache:
         
         # Create a hashable representation
         hashable = {
+            "namespace": namespace,
             "url": exchange.url,
             "method": exchange.method,
             "request_headers": req_headers,
@@ -267,6 +268,7 @@ class ExchangeCache:
         current_model: str,
         current_prompt_versions: dict[str, str],
         bypass: bool = False,
+        namespace: str = "",
     ) -> Optional[AnalysisResponse]:
         """
         Get a cached analysis result for the given exchange.
@@ -286,7 +288,7 @@ class ExchangeCache:
                 self._save_stats_to_db()
             return None
         
-        exchange_hash = self.compute_exchange_hash(exchange)
+        exchange_hash = self.compute_exchange_hash(exchange, namespace)
         
         with self._lock:
             try:
@@ -356,6 +358,7 @@ class ExchangeCache:
         response: AnalysisResponse,
         model: str,
         prompt_versions: dict[str, str],
+        namespace: str = "",
     ) -> None:
         """
         Store an analysis result in the cache.
@@ -369,7 +372,7 @@ class ExchangeCache:
         if not self._enabled:
             return
         
-        exchange_hash = self.compute_exchange_hash(exchange)
+        exchange_hash = self.compute_exchange_hash(exchange, namespace)
         
         with self._lock:
             try:

@@ -320,7 +320,10 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
 
     def test_parameter_case_coordinates_reach_the_proof(self):
         from coverage_model import CHECKS_BY_ID, CaseKey
+        from run_context import RunContext
         orch = Orchestrator(_test_config())
+        ctx = RunContext.create(run_id="coverage-run-A", config=_test_config(),
+                                allowed_hosts=["localhost"])
         check = CHECKS_BY_ID["WSTG-INPV-05"]  # SQLi, parameter phase
         ex = SimpleNamespace(method="POST", url="http://localhost/api/search",
                              request_body="search=x&sort=y")
@@ -328,7 +331,8 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
                               summary="injection at search", evidence="' OR 1=1", confidence=0.99)
         ck = CaseKey("query", "search", 0, "", "search")
         proof_id, case_id = asyncio.run(orch._coverage_proof(
-            identity="user", check=check, exchange=ex, result=res, case_key=ck))
+            identity="user", check=check, exchange=ex, result=res, case_key=ck,
+            run_context=ctx))
         self.assertTrue(proof_id and case_id)
         rows = store.proofs_for_case(case_id)
         self.assertTrue(rows, "coverage proof was not persisted")
@@ -337,19 +341,25 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
         self.assertEqual(case["parameter_name"], "search")
         self.assertEqual(case["check_id"], "WSTG-INPV-05")
         self.assertEqual(case["principal_id"], "user")
+        self.assertEqual(case["run_id"], "coverage-run-A")
         self.assertEqual(rows[0]["verdict"], "confirmed")
 
     def test_repeated_occurrence_folds_into_proof_name(self):
         from coverage_model import CHECKS_BY_ID, CaseKey
+        from run_context import RunContext
         orch = Orchestrator(_test_config())
+        ctx = RunContext.create(run_id="coverage-run-B", config=_test_config(),
+                                allowed_hosts=["localhost"])
         check = CHECKS_BY_ID["WSTG-INPV-05"]
         ex = SimpleNamespace(method="GET", url="http://localhost/x?id=1&id=2", request_body="")
         res = SimpleNamespace(validator="sqlmap", status="not_confirmed", confirmed=False,
                               summary="", evidence="", confidence=0.0)
         _, case0 = asyncio.run(orch._coverage_proof(
-            identity="user", check=check, exchange=ex, result=res, case_key=CaseKey("query", "id", 0)))
+            identity="user", check=check, exchange=ex, result=res,
+            case_key=CaseKey("query", "id", 0), run_context=ctx))
         _, case1 = asyncio.run(orch._coverage_proof(
-            identity="user", check=check, exchange=ex, result=res, case_key=CaseKey("query", "id", 1)))
+            identity="user", check=check, exchange=ex, result=res,
+            case_key=CaseKey("query", "id", 1), run_context=ctx))
         self.assertNotEqual(case0, case1)  # occurrence -> distinct proof cases
         self.assertEqual(store.proofs_for_case(case1)[0]["case"]["parameter_name"], "id[occ:1]")
 

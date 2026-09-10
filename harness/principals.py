@@ -38,8 +38,28 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from urllib.parse import urlsplit
 
 ANON = "anonymous"
+
+
+def object_reference(url: str, *, run_id: str = "", tenant: str | None = None) -> str:
+    """Namespace a concrete object selection by run and application origin.
+
+    The raw query is retained so repeated parameters and their order remain part
+    of the selected object identity. Fragments are client-side and excluded.
+    """
+    parsed = urlsplit(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    port_value = parsed.port
+    port = "" if (scheme == "http" and port_value in (None, 80)) or \
+        (scheme == "https" and port_value in (None, 443)) else f":{port_value}"
+    origin = f"{scheme}://{host}{port}" if scheme and host else "unknown-app"
+    resource = parsed.path or "/"
+    if parsed.query:
+        resource += "?" + parsed.query
+    return f"run:{run_id or 'legacy'}|app:{origin}|tenant:{tenant or '?'}|resource:{resource}"
 
 # Coarse trust levels. Deliberately explicit integers, not a role-name lookup, so
 # modules stop disagreeing on ordering. A higher number is MORE privileged, but
