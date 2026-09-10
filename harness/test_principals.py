@@ -8,6 +8,7 @@ never inferred from role rank.
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 import time
@@ -156,6 +157,79 @@ class OwnershipStoreTests(unittest.TestCase):
         meta = store.get_identity_principal_meta("alice")
         self.assertEqual(meta["tenant"], "A")
         self.assertIn("item:7", meta["permissions"])
+
+
+class CrossIdentityOwnershipWiringTests(unittest.TestCase):
+    """T02b production wiring: the cross-identity validator consults ownership
+    before confirming, so authorized sharing / a public object is not reported as
+    BOLA, while an unknown-ownership crossing still confirms. The response-compare
+    is forced to CONFIRMED so the OWNERSHIP gate is what's under test."""
+
+    def setUp(self):
+        import identity_compare
+        import identity_headers
+        self._ih = identity_headers.identities_for_host
+        self._ev = identity_compare.evaluate
+        # One DISTINCT other identity (bob); the captured source carries no auth.
+        identity_headers.identities_for_host = lambda host: [
+            {"name": "bob", "role": "user", "headers": {"Cookie": "sess=bob"}}]
+
+        class _Ev:
+            verdict = identity_compare.Verdict.CONFIRMED
+            confidence = 0.9
+            summary = "reached another identity's object"
+            detail = "d"
+
+        identity_compare.evaluate = lambda *a, **k: _Ev()
+
+    def tearDown(self):
+        import identity_compare
+        import identity_headers
+        identity_headers.identities_for_host = self._ih
+        identity_compare.evaluate = self._ev
+
+    def _validator(self, ownership=None):
+        from validators.cross_identity_validator import CrossIdentityValidator
+        v = CrossIdentityValidator(allowed_hosts=["t.local"], ownership=ownership)
+
+        async def _fake_probe(url, headers):
+            import identity_compare
+            return identity_compare.Probe(200, "SECRET owner data 1234567890")  # substantive 2xx
+
+        v._probe = _fake_probe
+        return v
+
+    def _run(self, v):
+        from models import Finding, HttpExchange
+        finding = Finding(vulnerability_class="idor", confidence=0.7, summary="s",
+                          evidence="e", suggested_test="t", basis="derived")
+        ex = HttpExchange(url="http://t.local/api/items/7", method="GET",
+                          response_status=200, response_body="SECRET owner data")
+        return asyncio.run(v.validate(finding, ex))
+
+    def test_confirms_without_ownership(self):
+        res = self._run(self._validator(ownership=None))
+        self.assertEqual(res.status, "confirmed")
+        self.assertTrue(res.confirmed)
+
+    def test_authorized_sharing_is_not_confirmed(self):
+        led = OwnershipLedger()
+        led.record(OwnershipFact(object_ref="/api/items/7", owner_principal_id="alice",
+                                 shared_with=frozenset({"bob"})))
+        res = self._run(self._validator(ownership=led))
+        self.assertEqual(res.status, "not_confirmed")
+        self.assertFalse(res.confirmed)
+        self.assertIn("authorized", (res.summary + res.evidence).lower())
+
+    def test_public_object_is_not_confirmed(self):
+        led = OwnershipLedger()
+        led.record(OwnershipFact(object_ref="/api/items/7", public=True))
+        self.assertFalse(self._run(self._validator(ownership=led)).confirmed)
+
+    def test_unknown_ownership_still_confirms(self):
+        led = OwnershipLedger()  # no fact -> UNKNOWN -> must not suppress a real crossing
+        res = self._run(self._validator(ownership=led))
+        self.assertEqual(res.status, "confirmed")
 
 
 if __name__ == "__main__":

@@ -194,10 +194,20 @@ class CrossIdentityValidator(Validator):
     active = True  # sends live requests; only runs when validators.active_enabled
 
     def __init__(self, allowed_hosts: list[str] | None = None,
-                 timeout: float = 10.0, max_identities: int = 3):
+                 timeout: float = 10.0, max_identities: int = 3, ownership=None):
         self.allowed_hosts = set(allowed_hosts or [])
         self.timeout = timeout
         self.max_identities = max_identities
+        # T02: an optional principals.OwnershipLedger. When supplied, a would-be
+        # BOLA confirmation is checked against observed ownership first, so the
+        # object's owner, an explicitly-shared principal, or a public object is NOT
+        # reported as a boundary crossing. Default None keeps pre-T02 behavior.
+        self.ownership = ownership
+
+    def _object_ref(self, url: str) -> str:
+        """The object identity used to look up ownership facts. The URL path is a
+        stable per-object key; the ownership-recording side uses the same convention."""
+        return urlparse(url).path or url
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         # Reuse the access-control gate's markers so the two never drift.
@@ -361,6 +371,30 @@ class CrossIdentityValidator(Validator):
             ev = identity_compare.evaluate(
                 "authorization_boundary_compare", False, candidate, candidate, attempt, anon)
             if ev.verdict == identity_compare.Verdict.CONFIRMED:
+                # T02 ownership gate: reaching another identity's object is only a
+                # crossing if that identity was NOT entitled to it. If observed
+                # ownership shows AUTHORIZED access (own / explicitly shared /
+                # public), this is authorized sharing, not BOLA -> observation, not
+                # a confirmation. UNKNOWN ownership falls through to the existing
+                # response-similarity verdict (it neither invents nor suppresses).
+                if self.ownership is not None:
+                    import principals as _pr
+                    accessor = _pr.Principal(
+                        id=ident.get("name") or ident.get("role") or "unknown",
+                        role=ident.get("role", "user"),
+                        trust=_pr.TRUST_BY_ROLE.get((ident.get("role") or "").lower(), 1))
+                    if self.ownership.authorization(accessor, self._object_ref(exchange.url)) \
+                            == _pr.AuthzDecision.AUTHORIZED:
+                        return ValidationResult(
+                            validator=self.name, status="not_confirmed", finding_class=fc,
+                            confidence=0.3, confirmed=False,
+                            summary=f"OBSERVATION (not confirmed): {ident['name']!r} reached "
+                                    f"{exchange.url}, but ownership provenance shows this access is "
+                                    f"AUTHORIZED (own / shared / public object) -- authorized sharing is "
+                                    f"not a broken-object-authorization crossing.",
+                            evidence=f"OwnershipLedger: {ident.get('name')!r} is entitled to "
+                                     f"{self._object_ref(exchange.url)!r}; a cross-identity 2xx here is "
+                                     f"expected, not a bug.")
                 return ValidationResult(
                     validator=self.name, status="confirmed", finding_class=fc,
                     confidence=ev.confidence, confirmed=True,
