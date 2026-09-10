@@ -98,7 +98,7 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(site.routing, ti.ROUTING_EXECUTOR)
         by_mod = {s.module: s for s in ti.TRANSPORT_SITES}
         for module in ("role_crawl.py", "crawler.py", "api_surface_discovery.py",
-                       "feature_workflow.py"):
+                       "feature_workflow.py", "scope_discovery.py"):
             self.assertEqual(by_mod[module].routing, ti.ROUTING_EXECUTOR)
 
     def test_summary_is_consistent(self):

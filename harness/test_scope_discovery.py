@@ -5,6 +5,8 @@ import httpx
 
 import scope_discovery
 from models import Finding, HttpExchange
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 
 
 def _confirmed_finding(vulnerability_class="sqli"):
@@ -119,6 +121,25 @@ class DiscoverFromScopeChangeTests(unittest.IsolatedAsyncioTestCase):
                 allowed_hosts=["target.invalid"],
             )
         self.assertEqual(result, [])
+
+    async def test_run_context_routes_actual_scope_probe_as_triggering_session(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=1,
+                                gate_config={"active_enabled": True})
+        ctx.sessions.register("source", "source", {"Authorization": "Bearer abc123"},
+                              allowed_origins=[ScopePolicy.origin_of(fixture.base)])
+        exchange = _exchange(fixture.base + "/trigger")
+        try:
+            result = await scope_discovery.discover_from_scope_change(
+                exchange, [_confirmed_finding()],
+                self._config(candidate_paths=["/new-surface"]),
+                allowed_hosts=["127.0.0.1"], run_context=ctx)
+            self.assertEqual(len(result), 1)
+            self.assertEqual(ctx.budget.used, 1)
+            self.assertEqual(fixture.httpd.received[0]["authorization"], "Bearer abc123")
+        finally:
+            await ctx.aclose()
+            fixture.close()
 
 
 if __name__ == "__main__":

@@ -77,6 +77,7 @@ async def discover_from_scope_change(
     findings: list[Finding],
     config: dict,
     allowed_hosts: list[str],
+    run_context=None,
 ) -> list[HttpExchange]:
     """
     Given the exchange just analyzed and the findings it produced, decide
@@ -115,7 +116,9 @@ async def discover_from_scope_change(
     }
 
     discovered: list[HttpExchange] = []
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+    client = None if run_context is not None else httpx.AsyncClient(
+        timeout=10.0, follow_redirects=False)
+    try:
         for path in candidate_paths[:max_requests]:
             candidate_url = base + path
             if not is_host_allowed(candidate_url, allowed_hosts):
@@ -124,9 +127,22 @@ async def discover_from_scope_change(
                 )
                 continue
             try:
-                import global_throttle
-                await global_throttle.acquire()
-                resp = await client.get(candidate_url, headers=carried_headers)
+                if run_context is not None:
+                    from run_context import TypedRequest
+                    session_ref, request_headers = run_context.sessions.bind_headers(carried_headers)
+                    outcome = await run_context.executor().execute(
+                        TypedRequest("GET", candidate_url, headers=request_headers),
+                        capability="scope_discovery", session_ref=session_ref)
+                    if not outcome.ok:
+                        continue
+                    status, response_headers, response_body = (
+                        outcome.status, outcome.headers, outcome.body)
+                else:
+                    import global_throttle
+                    await global_throttle.acquire()
+                    resp = await client.get(candidate_url, headers=carried_headers)
+                    status, response_headers, response_body = (
+                        resp.status_code, dict(resp.headers), resp.text)
             except httpx.HTTPError as e:
                 log.debug("scope_discovery: %s unreachable (%s) -- normal, not an error", candidate_url, e)
                 continue
@@ -136,11 +152,14 @@ async def discover_from_scope_change(
                 method="GET",
                 request_headers={"Host": parsed.netloc, **carried_headers},
                 request_body="",
-                response_status=resp.status_code,
-                response_headers=dict(resp.headers),
-                response_body=resp.text,
+                response_status=status,
+                response_headers=dict(response_headers or {}),
+                response_body=response_body or "",
                 analyst_note=f"Autonomous discovery, triggered by a confirmed finding on {exchange.url}",
             ))
+    finally:
+        if client is not None:
+            await client.aclose()
 
     if discovered:
         log.info(
