@@ -1234,6 +1234,22 @@ class Orchestrator:
         from validators.toctou_validator import ToctouValidator
         from models import Finding
         host = urlsplit(base_url).hostname or ""
+        if run_context is not None:
+            from run_context import ScopePolicy
+            permitted_origin = ScopePolicy.origin_of(base_url)
+            for index, r in enumerate(roles):
+                principal_id = r.principal_id()
+                session_id = ("anonymous" if not r.headers and principal_id == "anonymous"
+                              else f"principal:{index}:{principal_id}")
+                run_context.sessions.register(
+                    session_id, principal_id, dict(r.headers or {}),
+                    allowed_origins=[permitted_origin], role=r.role,
+                    name=r.name or principal_id)
+            if not any(s.principal_id == "anonymous"
+                       for s in run_context.sessions.all()):
+                run_context.sessions.register(
+                    "anonymous", "anonymous", allowed_origins=[permitted_origin],
+                    role="anonymous", name="anonymous")
         for r in roles:
             if r.headers:
                 # Register under a DISTINCT principal id (R10): two same-role users
@@ -1244,7 +1260,8 @@ class Orchestrator:
         _xval = CrossIdentityValidator(
             allowed_hosts=self.allowed_hosts,
             timeout=float(_xid_cfg.get("timeout", 10.0)),
-            max_identities=int(_xid_cfg.get("max_identities", 3)))
+            max_identities=int(_xid_cfg.get("max_identities", 3)),
+            run_context=run_context)
         _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts)
         _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts)
         _ssrf = SsrfValidator(allowed_hosts=self.allowed_hosts)

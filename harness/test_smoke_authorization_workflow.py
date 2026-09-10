@@ -69,6 +69,12 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
                                 request_headers={"Authorization": f"Bearer {source_token}"},
                                 response_status=r.status_code, response_body=r.text)
         ctx = RunContext.create(allowed_hosts=[HOST], max_requests=25, gate_config={"active_enabled": True})
+        for name, tok in identities:
+            ctx.sessions.register(
+                f"principal:{name}", name, {"Authorization": f"Bearer {tok}"},
+                allowed_origins=[fx.base], role="user", name=name)
+        ctx.sessions.register("anonymous", "anonymous", allowed_origins=[fx.base],
+                              role="anonymous", name="anonymous")
         v = CrossIdentityValidator(allowed_hosts=[HOST], run_context=ctx, ownership=ledger)
         finding = Finding(vulnerability_class="idor", confidence=0.6, summary="possible idor",
                           evidence="", suggested_test="", basis="derived")

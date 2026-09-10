@@ -39,6 +39,16 @@ clients close with the job lifecycle. Focused cache/context/proof/manifest/API c
 **80 tests OK**. Full stdlib discovery: **1,585 tests OK, 2 skipped**, 287.529s.
 T03 F04/F05 session and credential isolation is next.
 
+**T03 F04/F05 complete:** graph authorization now registers every principal and an
+explicit anonymous session in its invocation context; cross-identity probes no longer
+read process-global identities on that path. Unknown session references and credential
+headers without a session fail before transport. Credential-bearing sessions require
+declared normalized origins; unauthorized initial destinations are blocked, and
+cross-origin redirects receive neither session cookies nor retained request bodies.
+Focused authorization integration: **73 tests OK**; focused real transport: **18 tests
+OK**. Full stdlib discovery: **1,591 tests OK, 2 skipped**, 289.004s. T02 F08–F10
+principal metadata and ownership semantics are next.
+
 **2026-09-10 review-only addendum:** Source inspected at HEAD `8b5c6e1`;
 implementation handoff saved to
 [`reviews/review-Astra-Medium-10-09-06-30/IMPLEMENTATION_HANDOFF.md`](reviews/review-Astra-Medium-10-09-06-30/IMPLEMENTATION_HANDOFF.md).

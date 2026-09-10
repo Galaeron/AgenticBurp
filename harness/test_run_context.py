@@ -23,10 +23,12 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _record(self):
+        length = int(self.headers.get("Content-Length") or 0)
         self.server.received.append({
             "path": self.path.split("?", 1)[0], "method": self.command,
             "authorization": self.headers.get("Authorization"),
             "cookie": self.headers.get("Cookie"),
+            "body": self.rfile.read(length).decode("utf-8", "replace") if length else "",
         })
 
     def _reply(self, status, body=b"", headers=None):
@@ -50,7 +52,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._record()
-        self._reply(200, b"posted")
+        if self.path.split("?", 1)[0] == "/redirect":
+            self._reply(self.server.redirect_status, b"", {"Location": self.server.redirect_location})
+        else:
+            self._reply(200, b"posted")
 
 
 class _Fixture:
@@ -58,6 +63,7 @@ class _Fixture:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.httpd.received = []
         self.httpd.redirect_location = ""
+        self.httpd.redirect_status = 302
         self.port = self.httpd.server_address[1]
         self._t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self._t.start()
@@ -107,6 +113,14 @@ class ScopeAndIsolationTests(unittest.TestCase):
     def test_scope_fails_closed_on_empty_allowlist(self):
         empty = ScopePolicy()
         self.assertFalse(empty.in_scope("http://anything.test/"))
+
+    def test_origin_normalizes_default_ports_but_not_distinct_ports(self):
+        self.assertEqual(ScopePolicy.origin_of("http://A.test/x"),
+                         ScopePolicy.origin_of("http://a.test:80/y"))
+        self.assertEqual(ScopePolicy.origin_of("https://a.test/x"),
+                         ScopePolicy.origin_of("https://a.test:443/y"))
+        self.assertNotEqual(ScopePolicy.origin_of("https://a.test/x"),
+                            ScopePolicy.origin_of("https://a.test:444/y"))
 
     def test_out_of_scope_request_is_never_sent(self):
         ctx = _ctx()
@@ -172,6 +186,36 @@ class GateBudgetCancelTests(unittest.TestCase):
         self.assertEqual(asyncio.run(scenario()).outcome, "cancelled")
         self.assertEqual(self.srv.paths(), [])
 
+    def test_unknown_session_reference_is_rejected_without_send(self):
+        ctx = _ctx()
+
+        async def scenario():
+            out = await ctx.executor().execute(
+                TypedRequest("GET", f"{self.srv.base}/unknown"), capability="probe",
+                session_ref="missing")
+            await ctx.aclose()
+            return out
+
+        out = asyncio.run(scenario())
+        self.assertEqual(out.outcome, "unknown_session")
+        self.assertFalse(out.executed)
+        self.assertEqual(self.srv.paths(), [])
+
+    def test_credentials_without_session_are_rejected(self):
+        ctx = _ctx()
+
+        async def scenario():
+            out = await ctx.executor().execute(
+                TypedRequest("GET", f"{self.srv.base}/leak",
+                             headers={"Authorization": "Bearer SECRET"}),
+                capability="probe")
+            await ctx.aclose()
+            return out
+
+        out = asyncio.run(scenario())
+        self.assertEqual(out.outcome, "blocked")
+        self.assertEqual(self.srv.paths(), [])
+
 
 class CookieAndRedirectTests(unittest.TestCase):
     def setUp(self):
@@ -182,8 +226,8 @@ class CookieAndRedirectTests(unittest.TestCase):
 
     def test_cookies_do_not_cross_sessions(self):
         ctx = _ctx()
-        ctx.sessions.register("s1", "alice")
-        ctx.sessions.register("s2", "bob")
+        ctx.sessions.register("s1", "alice", allowed_origins=[self.srv.base])
+        ctx.sessions.register("s2", "bob", allowed_origins=[self.srv.base])
 
         async def scenario():
             ex = ctx.executor()
@@ -223,7 +267,8 @@ class CookieAndRedirectTests(unittest.TestCase):
         try:
             self.srv.httpd.redirect_location = f"http://127.0.0.1:{other.port}/collect"
             ctx = _ctx()
-            ctx.sessions.register("s1", "alice", headers={"Authorization": "Bearer SECRET"})
+            ctx.sessions.register("s1", "alice", headers={"Authorization": "Bearer SECRET"},
+                                  allowed_origins=[self.srv.base])
 
             async def scenario():
                 await ctx.executor().execute(
@@ -236,6 +281,70 @@ class CookieAndRedirectTests(unittest.TestCase):
             self.assertEqual(first["authorization"], "Bearer SECRET")   # own origin: creds sent
             self.assertEqual(len(collected), 1)
             self.assertIsNone(collected[0]["authorization"])            # cross-origin: creds stripped
+        finally:
+            other.close()
+
+    def test_cookie_jar_not_used_on_unauthorized_redirect_origin(self):
+        other = _Fixture()
+        try:
+            self.srv.httpd.redirect_location = f"http://127.0.0.1:{other.port}/collect"
+            ctx = _ctx()
+            ctx.sessions.register("s1", "alice", allowed_origins=[self.srv.base])
+
+            async def scenario():
+                ex = ctx.executor()
+                await ex.execute(TypedRequest("GET", f"{self.srv.base}/set-cookie"),
+                                 capability="probe", session_ref="s1")
+                out = await ex.execute(TypedRequest("GET", f"{self.srv.base}/redirect"),
+                                       capability="probe", session_ref="s1")
+                await ctx.aclose()
+                return out
+
+            self.assertEqual(asyncio.run(scenario()).outcome, "ok")
+            collected = [r for r in other.httpd.received if r["path"] == "/collect"]
+            self.assertEqual(len(collected), 1)
+            self.assertIsNone(collected[0]["cookie"])
+        finally:
+            other.close()
+
+    def test_session_cannot_be_started_on_different_allowed_origin(self):
+        other = _Fixture()
+        try:
+            ctx = _ctx()
+            ctx.sessions.register("s1", "alice", headers={"Authorization": "Bearer SECRET"},
+                                  allowed_origins=[self.srv.base])
+
+            async def scenario():
+                out = await ctx.executor().execute(
+                    TypedRequest("GET", f"{other.base}/collect"), capability="probe",
+                    session_ref="s1")
+                await ctx.aclose()
+                return out
+
+            out = asyncio.run(scenario())
+            self.assertEqual(out.outcome, "blocked")
+            self.assertEqual(other.paths(), [])
+        finally:
+            other.close()
+
+    def test_cross_origin_redirect_does_not_forward_request_body(self):
+        other = _Fixture()
+        try:
+            self.srv.httpd.redirect_status = 307
+            self.srv.httpd.redirect_location = f"http://127.0.0.1:{other.port}/collect"
+            ctx = _ctx()
+            ctx.sessions.register("s1", "alice", allowed_origins=[self.srv.base])
+
+            async def scenario():
+                out = await ctx.executor().execute(
+                    TypedRequest("POST", f"{self.srv.base}/redirect", body="secret=form-value"),
+                    capability="probe", session_ref="s1")
+                await ctx.aclose()
+                return out
+
+            self.assertEqual(asyncio.run(scenario()).outcome, "ok")
+            self.assertEqual(other.httpd.received[0]["method"], "POST")
+            self.assertEqual(other.httpd.received[0]["body"], "")
         finally:
             other.close()
 
@@ -256,10 +365,13 @@ class CrossIdentityExecutorMigrationTests(unittest.TestCase):
 
     def test_probe_sends_through_executor_and_counts_budget(self):
         ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=5)
+        ctx.sessions.register("alice-session", "alice", headers={"Authorization": "Bearer X"},
+                              allowed_origins=[self.srv.base])
         v = self._validator(ctx)
 
         async def scenario():
-            p = await v._probe(f"{self.srv.base}/probe", {"Authorization": "Bearer X"})
+            p = await v._probe(f"{self.srv.base}/probe", {"Authorization": "Bearer X"},
+                               "alice-session")
             await ctx.aclose()
             return p
 

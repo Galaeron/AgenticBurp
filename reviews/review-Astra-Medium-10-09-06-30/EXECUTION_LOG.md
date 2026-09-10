@@ -131,3 +131,34 @@
   and HTTP API production-boundary tests. No model, browser/container, blind target, or
   live engagement run was performed. T03 F04/F05 credential isolation is next; broad
   executor wiring remains intentionally assigned to F01.
+
+## T03 F04/F05 — session and credential isolation
+
+- Baseline: `d077c74`; commit subject: `fix(t03): isolate sessions and credentials`
+  (this focused commit).
+- Production path: `investigate_engagement` registers each supplied role plus anonymous
+  in the invocation's `SessionManager` and constructs its cross-identity validator with
+  that context. The validator uses those run-local sessions rather than the global
+  identity-header registry.
+- Transport policy: session references are mandatory for credential-bearing requests
+  and unknown references fail closed before a send. Credential sessions require an
+  explicit allowed-origin set. Default HTTP/HTTPS ports normalize consistently while
+  different ports remain different origins. Unauthorized initial destinations are
+  blocked; cross-origin redirect hops use the anonymous/default cookie jar and drop
+  retained bodies as well as credential headers.
+- Regression/negative controls use loopback target counters: cookies remain isolated
+  across principals; an authenticated cookie cannot reach a different origin; a session
+  cannot start at an unauthorized origin; unknown sessions and unbound credentials send
+  nothing; and a 307 cross-origin hop receives no original body.
+- Initial focused authorization run — exit 1, **73 tests run in 12.445s**, 16 failures.
+  Existing validator test doubles accepted the legacy two-argument probe signature, and
+  the T04 smoke still seeded the retired global identity registry. The compatibility
+  adapter now calls legacy test seams with two arguments, while the T04 smoke explicitly
+  registers run sessions.
+- Corrected focused authorization/investigation/T04 run — exit 0, **73 tests OK in
+  12.516s**. Focused actual-transport executor run after redirect-body coverage — exit 0,
+  **18 tests OK in 8.783s**.
+- Full stdlib discovery — exit 0, **1,591 tests OK, 2 skipped, in 289.004s**.
+- No external target, model, browser, or container run was performed. Broad role-crawl,
+  registry, and remaining validator transport wiring belongs to T03 F01/T08 and is not
+  claimed here.
