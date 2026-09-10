@@ -6,6 +6,8 @@ from unittest.mock import patch
 import global_throttle
 import role_crawl
 from role_crawl import RoleSession, _distinct_discovery_roles, _feature_key
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 
 
 class DiscoverySweepRoleSelectionTests(unittest.TestCase):
@@ -135,6 +137,45 @@ class RoleCrawlTests(unittest.TestCase):
         with patch("crawler.crawl", _fake_crawl([])):
             r = asyncio.run(role_crawl.crawl_roles("http://shop.test/", [], allowed_hosts=["shop.test"]))
         self.assertTrue(any("no roles" in e for e in r.errors))
+
+    def test_run_context_requires_explicit_session_mapping(self):
+        ctx = RunContext.create(allowed_hosts=["shop.test"])
+        with patch("crawler.crawl", _fake_crawl(["/x"])):
+            r = asyncio.run(role_crawl.crawl_roles(
+                "http://shop.test/", [RoleSession("user", {})],
+                allowed_hosts=["shop.test"], run_context=ctx))
+        self.assertEqual(r.endpoints, [])
+        self.assertIn("explicit session reference", r.errors[0])
+
+    def test_access_matrix_replay_uses_run_context_real_transport(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=2,
+            gate_config={"active_enabled": True})
+        origin = ScopePolicy.origin_of(fixture.base)
+        ctx.sessions.register("alice", "alice", {"Authorization": "Bearer alice"},
+                              allowed_origins=[origin], role="user")
+        ctx.sessions.register("bob", "bob", {"Authorization": "Bearer bob"},
+                              allowed_origins=[origin], role="user")
+        roles = [RoleSession("alice", {"Authorization": "ignored"}),
+                 RoleSession("bob", {"Authorization": "ignored"})]
+
+        async def scenario():
+            with patch("crawler.crawl", _fake_crawl(["/matrix"])):
+                result = await role_crawl.crawl_roles(
+                    fixture.base, roles, allowed_hosts=["127.0.0.1"],
+                    run_context=ctx, session_refs=["alice", "bob"])
+            await ctx.aclose()
+            return result
+
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.endpoints[0].by_role, {"alice": 200, "bob": 200})
+            self.assertEqual([r["authorization"] for r in fixture.httpd.received],
+                             ["Bearer alice", "Bearer bob"])
+            self.assertEqual(ctx.budget.used, 2)
+        finally:
+            fixture.close()
 
     def test_cross_identity_same_object_flags_bola(self):
         # Same object id returns identical data to user AND admin -> BOLA finding.

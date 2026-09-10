@@ -46,11 +46,26 @@ async def build_engagement(
     max_endpoints: int = 150,
     discovery_max_probes: int = 6000,
     id_fill: str = "1",
+    run_context=None,
 ) -> tuple[engagement.EngagementState, role_crawl.RoleCrawlResult]:
     """Discover + build the access matrix + fuse into an EngagementState.
 
     Returns (state, raw_role_crawl_result). `state.worklist()` is the prioritised
     ranking; the raw result carries the endpoints, candidates and IDOR findings."""
+    session_refs = None
+    if run_context is not None:
+        from run_context import ScopePolicy
+        permitted_origin = ScopePolicy.origin_of(base_url)
+        session_refs = []
+        for index, role in enumerate(roles):
+            principal_id = role.principal_id()
+            session_id = ("anonymous" if not role.headers and principal_id == "anonymous"
+                          else f"principal:{index}:{principal_id}")
+            run_context.sessions.register(
+                session_id, principal_id, dict(role.headers or {}),
+                allowed_origins=[permitted_origin], role=role.role,
+                name=role.name or principal_id, principal=role.to_principal())
+            session_refs.append(session_id)
     result = await role_crawl.crawl_roles(
         base_url, roles,
         allowed_hosts=allowed_hosts,
@@ -58,6 +73,8 @@ async def build_engagement(
         id_fill=id_fill,
         active_discovery=True,
         discovery_max_probes=discovery_max_probes,
+        run_context=run_context,
+        session_refs=session_refs,
     )
 
     state = engagement.EngagementState(host=host or _host_of(base_url))

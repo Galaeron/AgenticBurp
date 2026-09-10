@@ -1145,7 +1145,7 @@ class Orchestrator:
         import role_crawl
         state, rc = await engagement_builder.build_engagement(
             base_url, roles, allowed_hosts=self.allowed_hosts,
-            discovery_max_probes=discovery_max_probes)
+            discovery_max_probes=discovery_max_probes, run_context=run_context)
 
         # R30: operational failures in the additive phases below are caught so one
         # broken phase can't sink the run -- but they must not vanish silently. Each
@@ -1243,23 +1243,6 @@ class Orchestrator:
         from models import Finding
         host = urlsplit(base_url).hostname or ""
         if run_context is not None:
-            from run_context import ScopePolicy
-            permitted_origin = ScopePolicy.origin_of(base_url)
-            for index, r in enumerate(roles):
-                principal_id = r.principal_id()
-                session_id = ("anonymous" if not r.headers and principal_id == "anonymous"
-                              else f"principal:{index}:{principal_id}")
-                run_context.sessions.register(
-                    session_id, principal_id, dict(r.headers or {}),
-                    allowed_origins=[permitted_origin], role=r.role,
-                    name=r.name or principal_id, principal=r.to_principal())
-            if not any(s.principal_id == "anonymous"
-                       for s in run_context.sessions.all()):
-                run_context.sessions.register(
-                    "anonymous", "anonymous", allowed_origins=[permitted_origin],
-                    role="anonymous", name="anonymous",
-                    principal=role_crawl.RoleSession(
-                        role="anonymous", headers={}).to_principal())
             declarations = ((self.config.get("engagement", {}) or {})
                             .get("declared_workflows", []))
             if declarations:
@@ -1533,7 +1516,8 @@ class Orchestrator:
             if len(derived) < 2:
                 break
             st2, rc2 = await engagement_builder.build_engagement(
-                base_url, derived, allowed_hosts=self.allowed_hosts, discovery_max_probes=discovery_max_probes)
+                base_url, derived, allowed_hosts=self.allowed_hosts,
+                discovery_max_probes=discovery_max_probes, run_context=run_context)
             # Phase 0.1: content-level review of the re-crawl's captures too, so a
             # response reachable only as the newly-leaked identity is reviewed.
             await review_captured_exchanges(self, st2, getattr(rc2, "captured", None))

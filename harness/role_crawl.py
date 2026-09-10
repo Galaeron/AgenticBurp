@@ -197,10 +197,19 @@ class RoleCrawlResult:
         }
 
 
-async def _probe(method: str, url: str, headers: dict, timeout: float) -> tuple[int | None, str, dict]:
+async def _probe(method: str, url: str, headers: dict, timeout: float, *,
+                 run_context=None, session_ref: str | None = None) -> tuple[int | None, str, dict]:
     if not method:
         method = "GET"
     try:
+        if run_context is not None:
+            from run_context import TypedRequest
+            outcome = await run_context.executor().execute(
+                TypedRequest(method=method, url=url), capability="role_crawl",
+                session_ref=session_ref)
+            if not outcome.ok:
+                return None, f"request {outcome.outcome}: {outcome.error}", {}
+            return outcome.status, outcome.body or "", dict(outcome.headers or {})
         await global_throttle.acquire()
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             resp = await client.request(method, url, headers=headers or None)
@@ -223,6 +232,8 @@ async def crawl_roles(
     active_discovery: bool = False,
     discovery_max_probes: int = 6000,
     max_captured: int = 200,
+    run_context=None,
+    session_refs: list[str | None] | None = None,
 ) -> RoleCrawlResult:
     """Crawl `base_url` once per role, union the surface, probe every endpoint
     with every role, and derive auth-bypass + IDOR candidates from the matrix.
@@ -239,6 +250,9 @@ async def crawl_roles(
     result = RoleCrawlResult(base_url=base_url, roles=[r.role for r in roles])
     if not roles:
         result.errors.append("no roles supplied")
+        return result
+    if run_context is not None and (session_refs is None or len(session_refs) != len(roles)):
+        result.errors.append("run_context requires one explicit session reference per role")
         return result
 
     # 1. Discover the surface, per role (authenticated pages/JS may reveal more).
@@ -304,8 +318,10 @@ async def crawl_roles(
         if not map_._host_allowed(url, allowed_hosts):
             continue
         access = EndpointAccess(method="GET", path=path)
-        for r in roles:
-            status, body, resp_headers = await _probe("GET", url, r.norm_headers(), timeout)
+        for role_index, r in enumerate(roles):
+            status, body, resp_headers = await _probe(
+                "GET", url, r.norm_headers(), timeout, run_context=run_context,
+                session_ref=session_refs[role_index] if session_refs is not None else None)
             access.by_role[r.role] = status
             substantive = map_._substantive(status, body)
             if substantive:
