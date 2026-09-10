@@ -37,10 +37,12 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   keep ALL members, redacted `export_issue`/`replay_view`. `store.all_host_findings`
   surfaces method+case coords; `report_generator` uses the issue key + renders issue
   IDs + `export_issues_for_host`. Operator root-cause merge + Burp replay = T10.
-- **T08 (`e1ac8e9`) — inventory + audit only.** `transport_inventory.py` (32 sites,
-  **23 target routing gaps** owned/named) + `test_transport_inventory` (module-granular)
-  + `T08_TRANSPORT_INVENTORY.md`. The actual per-site executor migration and per-oracle
-  re-qualification remain OPEN (feeds identity F01 role_crawl, F04 cross_identity).
+- **T08 in progress (`e1ac8e9`, `693b4c8`..`546def9`).** The enforced inventory
+  remains 32 sites and is down from **23 to 17 target routing gaps**. Production
+  role-matrix, crawler, API-surface, feature-workflow, scope-expansion,
+  cross-identity, CSRF, and verb-tamper sends now use invocation-local executor
+  sessions. Legacy standalone paths remain compatible. CSRF/verb oracles remain
+  observation-only; transport qualification did not promote confirmation claims.
 - **Review round (IMPLEMENTATION_REVIEW_T05_T08.md) — all 11 findings addressed**, each
   with a paired regression; reviewer's `review_t05_t08_checks.py` diagnostics all corrected.
   Key fixes: R01 per-input attribution no longer fabricated (leg drives once per cell at
@@ -70,6 +72,14 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   Skip/repeat/switch variants execute through policy; resume preserves prerequisites;
   failure/cancel cleanup is explicit; actual transport has vulnerable/patched skip,
   exact-two-send repeat, and cross-principal independent-read controls.
+
+- **Pause checkpoint (2026-09-10):** clean focused commits through `546def9`.
+  Latest focused gates: role/engagement/investigation **39 OK**; CSRF/verb/context
+  **105 OK**; discovery/context **88 OK** plus added actual crawler/surface controls
+  **47 OK**; feature workflow **29 OK**; scope/context **30 OK**; inventory **10 OK**.
+  The last full suite remains the post-T07 **1,708 OK, 2 skipped** result above;
+  no full-suite claim has been made after T08a–f. Resume sequentially at
+  `missing_auth_probe.py`, then remaining validator/orchestrator transports.
 
 ---
 

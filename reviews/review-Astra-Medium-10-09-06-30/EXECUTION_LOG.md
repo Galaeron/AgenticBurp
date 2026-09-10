@@ -367,3 +367,22 @@ visibility/contract refinements, not correctness fabrications.
 - No external target, real model, browser, or container run was performed. Ownership
   facts are still supplied by fixture/operator provenance; the harness does not infer
   ownership or tenant membership from URL or role labels.
+## 2026-09-10 — T08 executor migration pause checkpoint
+
+- Commits `693b4c8` through `546def9` route the production role access matrix,
+  crawler, API surface discovery, feature workflow crawl, autonomous scope
+  expansion, CSRF replay, and verb-tamper probes through invocation-local
+  `RunContext` sessions. The already-reviewed cross-identity route is reconciled
+  as executor-routed.
+- Actual-loopback controls verify credential isolation/binding and shared request
+  budget consumption. Negative controls verify missing session mappings and
+  unregistered credentials fail closed with zero sends. Redirect behavior inherits
+  the executor's per-hop scope checks.
+- Focused results: 39 OK (role/engagement), 105 OK (CSRF/verb/context), 88 OK
+  (discovery/context), 47 OK (crawler/surface), 29 OK (feature workflow), 30 OK
+  (scope/context), and 10 OK (inventory). All final focused invocations exited 0.
+- Inventory: 32 sites, 17 remaining target routing gaps (previously 23).
+- No external target/model/browser/container run. The latest full discovery remains
+  the post-T07 result: 1,708 OK, 2 skipped; a post-T08 full suite is still owed.
+- Resume: migrate `missing_auth_probe.py` next, then capability validators and the
+  residual orchestrator/agent paths one at a time with actual and negative controls.
