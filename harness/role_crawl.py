@@ -99,6 +99,11 @@ class RoleSession:
     role: str                 # "anonymous" | "user" | "admin" | "service" | free label
     headers: dict             # real captured session headers; empty/none for anonymous
     name: str | None = None   # explicit principal id (username) when the tester supplies one
+    # T02/R27: operator-declared identity metadata, kept distinct from the
+    # credential. tenant is never inferred from a URL or role label, and
+    # expected_permissions are declared by the tester/fixture, never role rank.
+    tenant: str | None = None
+    expected_permissions: frozenset = frozenset()
 
     def norm_headers(self) -> dict:
         return dict(self.headers or {})
@@ -118,6 +123,20 @@ class RoleSession:
             return self.role or "anonymous"
         import hashlib
         return f"{self.role}#{hashlib.sha256(cred.encode()).hexdigest()[:8]}"
+
+    def to_principal(self):
+        """Adapt this session to a durable principals.Principal (T02). The id is
+        stable across credential renewal (it uses the explicit name, or the role
+        for anonymous, never the current cookie/token); an id that could only be
+        derived from a credential hash is flagged `provisional` so callers do not
+        treat it as an authoritative account or merge/split people on it."""
+        import principals
+        provisional = not self.name and bool(self.headers)  # id came from a credential hash
+        trust = principals.TRUST_BY_ROLE.get((self.role or "").lower(), 1)
+        return principals.Principal(
+            id=self.principal_id(), role=self.role or "user", trust=trust, tenant=self.tenant,
+            expected_permissions=frozenset(self.expected_permissions or ()),
+            provisional=provisional, label=self.name or self.role or "")
 
 
 @dataclass

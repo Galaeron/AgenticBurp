@@ -142,6 +142,22 @@ CREATE INDEX IF NOT EXISTS idx_proof_case ON proof_records(case_id);
 CREATE INDEX IF NOT EXISTS idx_proof_run ON proof_records(run_id);
 """
 
+# Astra T02: observed object-ownership facts (who owns / can reach an object), with
+# provenance. Additive; unknown ownership is simply absent (never guessed). The
+# principal metadata (tenant/permissions/trust) is added to the existing identities
+# table via migration in _connect() -- reusing that storage, not a second registry.
+_PRINCIPAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ownership_facts (
+    object_ref TEXT PRIMARY KEY,
+    owner_principal_id TEXT NOT NULL DEFAULT '',
+    tenant TEXT,
+    shared_with_json TEXT NOT NULL DEFAULT '[]',
+    public INTEGER NOT NULL DEFAULT 0,
+    provenance TEXT NOT NULL DEFAULT '',
+    observed_at REAL NOT NULL
+);
+"""
+
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(_DB_PATH, timeout=10.0)
@@ -153,6 +169,7 @@ def _connect() -> sqlite3.Connection:
     conn.executescript(_COVERAGE_SCHEMA)
     conn.executescript(_IDENTITY_SCHEMA)
     conn.executescript(_EVIDENCE_SCHEMA)
+    conn.executescript(_PRINCIPAL_SCHEMA)
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -192,6 +209,18 @@ def _connect() -> sqlite3.Connection:
     if "owasp_category" not in cols:
         conn.execute("ALTER TABLE findings ADD COLUMN owasp_category TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_fingerprint ON findings(fingerprint)")
+
+    # T02: additive principal metadata on the existing identities table (reuse the
+    # store, don't fork a second identity registry). Old rows default to unknown
+    # tenant / no declared permissions / trust=1.
+    ident_cols = {row[1] for row in conn.execute("PRAGMA table_info(identities)")}
+    for col, ddl in [
+        ("tenant", "ALTER TABLE identities ADD COLUMN tenant TEXT"),
+        ("permissions_json", "ALTER TABLE identities ADD COLUMN permissions_json TEXT NOT NULL DEFAULT '[]'"),
+        ("trust", "ALTER TABLE identities ADD COLUMN trust INTEGER NOT NULL DEFAULT 1"),
+    ]:
+        if col not in ident_cols:
+            conn.execute(ddl)
 
     # Cross-run finding suppression -- see suppress_finding()'s docstring
     # for the workflow this exists for. Keyed on the same `fingerprint`
@@ -980,5 +1009,78 @@ def sessions_for_host(host: str) -> list[dict]:
         ).fetchall()
         return [{"session_id": r[0], "identity_id": r[1], "identity_name": r[2], "identity_role": r[3],
                  "host": r[4], "exchange_hash": r[5], "label": r[6], "created_at": r[7]} for r in rows]
+    finally:
+        conn.close()
+
+
+# --- T02: object-ownership facts + identity principal metadata --------------
+
+def save_ownership_fact(fact) -> None:
+    """Persist an observed OwnershipFact (T02). `fact` is a principals.OwnershipFact.
+    INSERT OR REPLACE by object_ref: the latest observation of an object's ownership
+    supersedes an earlier one (ownership can change as the crawl learns more)."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO ownership_facts "
+            "(object_ref, owner_principal_id, tenant, shared_with_json, public, provenance, observed_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (fact.object_ref, fact.owner_principal_id, fact.tenant,
+             json.dumps(sorted(fact.shared_with)), int(fact.public), fact.provenance, fact.observed_at))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ownership_row_to_dict(row) -> dict:
+    return {"object_ref": row[0], "owner_principal_id": row[1], "tenant": row[2],
+            "shared_with": json.loads(row[3] or "[]"), "public": bool(row[4]),
+            "provenance": row[5], "observed_at": row[6]}
+
+
+def get_ownership_fact(object_ref: str) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT object_ref, owner_principal_id, tenant, shared_with_json, public, provenance, "
+            "observed_at FROM ownership_facts WHERE object_ref = ?", (object_ref,)).fetchone()
+        return _ownership_row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def ownership_facts_all() -> list[dict]:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT object_ref, owner_principal_id, tenant, shared_with_json, public, provenance, "
+            "observed_at FROM ownership_facts").fetchall()
+        return [_ownership_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_identity_principal_meta(identity_id: str, *, tenant: str | None = None,
+                                permissions=None, trust: int = 1) -> None:
+    """Attach T02 principal metadata (tenant / declared permissions / trust) to an
+    existing identity row -- additive, reusing the identities table. Permissions and
+    tenant are operator-supplied facts, never inferred from role rank or URL."""
+    conn = _connect()
+    try:
+        conn.execute("UPDATE identities SET tenant = ?, permissions_json = ?, trust = ? WHERE id = ?",
+                     (tenant, json.dumps(sorted(permissions or [])), int(trust), identity_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_identity_principal_meta(identity_id: str) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT tenant, permissions_json, trust FROM identities WHERE id = ?",
+                           (identity_id,)).fetchone()
+        if not row:
+            return None
+        return {"tenant": row[0], "permissions": json.loads(row[1] or "[]"), "trust": row[2]}
     finally:
         conn.close()
