@@ -261,6 +261,70 @@ class CoverageTracker:
                 evidence=(getattr(res, "evidence", "") or "")[:200])
         return n
 
+    def expand_parameter_cases(self, endpoints: dict[str, dict], *,
+                               driveable: set[str] | None = None,
+                               per_cell_budget: int = 8) -> int:
+        """Enumerate the concrete input cases under each applicable+pending leg cell
+        (T05). A PARAMETER-phase check fans out over the endpoint template's real
+        inputs (query/body/object-id); a domain/endpoint check, or a parameter check
+        on an endpoint with no captured inputs, gets the single NO_PARAMETER_CASE so
+        it is still exercised. Bounded per cell so a wide body cannot fan out
+        unboundedly; over-budget cases stay visible (SKIPPED), never counted as
+        tested. Returns the number of cases registered (added + budget-skipped)."""
+        from coverage_model import Phase, NO_PARAMETER_CASE, derive_input_cases_from_template
+        total = 0
+        for (ident, ep_key, check) in self.pending_leg_cells(driveable):
+            ep = endpoints.get(ep_key) or {}
+            cases = []
+            if check.phase == Phase.PARAMETER:
+                cases = derive_input_cases_from_template(ep.get("template"))
+            if not cases:
+                cases = [NO_PARAMETER_CASE]
+            res = self.matrix.expand_cases(ident, ep_key, check.id, cases,
+                                           budget_remaining=per_cell_budget)
+            total += res["added"] + res["budget_skipped"]
+        return total
+
+    async def drive_coverage_cases(self, run_case, *, driveable: set[str] | None = None,
+                                   budget: int = 80) -> int:
+        """Fire each PENDING child case via the injected async
+        `run_case(identity, method, path, check, case_key) -> result` (result
+        exposing .status/.summary/..., or None to skip), recording the REAL
+        per-case outcome (T05). This is the case-granular analogue of
+        `drive_coverage_legs`: confirming one input marks only THAT case, never its
+        siblings. Bounded by `budget`. Returns cases driven."""
+        _STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.NOT_DETECTED,
+                   "controlled_negative": CellStatus.CONTROLLED_NEGATIVE,
+                   "blocked": CellStatus.BLOCKED, "inconclusive": CellStatus.INCONCLUSIVE,
+                   "skipped": CellStatus.SKIPPED, "error": CellStatus.ERROR}
+        n = 0
+        for (ident, ep_key, check_id, ck) in self.matrix.pending_cases():
+            if n >= budget:
+                break
+            check = CHECKS_BY_ID.get(check_id)
+            if not check or check.confirmation not in _LEG_CONFIRMATIONS:
+                continue
+            if driveable is not None and check.confirmation not in driveable:
+                continue
+            method, _, path = ep_key.partition(" ")
+            try:
+                res = await run_case(ident, method, path, check, ck)
+            except Exception as e:  # a leg blowing up must not sink coverage
+                log.debug("drive_coverage_cases: %s on %s [%s] failed: %s",
+                          check.confirmation, ep_key, ck.label(), e)
+                continue
+            if res is None:
+                continue
+            n += 1
+            status = _STATUS.get(getattr(res, "status", ""), CellStatus.NOT_DETECTED)
+            self.matrix.record_case(
+                ident, ep_key, check_id, ck, status=status,
+                reason=(getattr(res, "summary", "") or f"{check.confirmation} case driven off the matrix")[:180],
+                confidence=getattr(res, "confidence", None),
+                validator=getattr(res, "validator", None) or check.confirmation,
+                evidence=(getattr(res, "evidence", "") or "")[:200])
+        return n
+
     def finalize_pending_reasons(self, investigated_keys: set[str] | None = None) -> int:
         """Give remaining applicable-pending cells an explicit reason so the
         'not tested + why' audit is complete (I5). A leg-backed check on an
@@ -272,6 +336,10 @@ class CoverageTracker:
         n = 0
         for (ident, ep_key, check_id), cell in list(self.matrix.cells().items()):
             if cell.status != CellStatus.PENDING:
+                continue
+            # A cell whose detail lives in child cases (T05) is left to aggregate
+            # from them; the honest per-case reasons are in `cases_not_tested`.
+            if self.matrix.has_cases(ident, ep_key, check_id):
                 continue
             check = CHECKS_BY_ID.get(check_id)
             if check and check.confirmation in _LEG_CONFIRMATIONS:
@@ -289,6 +357,9 @@ class CoverageTracker:
     def report(self) -> dict:
         s = self.matrix.summary()
         s["not_tested"] = self.matrix.not_tested()
+        # T05: the case-granular "not tested + why" (pending/budget-skipped/blocked
+        # child cases). Empty when no case layer was populated -- fully additive.
+        s["cases_not_tested"] = self.matrix.cases_not_tested()
         return s
 
 
@@ -304,6 +375,9 @@ def endpoint_view(state) -> dict[str, dict]:
             "reachable_roles": ep.reachable_roles,
             "object_scoped": ep.object_scoped,
             "findings": ep.findings,
+            # T05: the captured request template, so the case layer can derive the
+            # endpoint's concrete inputs (query/body/object-id) rather than invent them.
+            "template": getattr(ep, "template", None),
         }
     return out
 
@@ -349,4 +423,31 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["legs_driven"] = driven
+    return report
+
+
+async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[str] | None = None,
+                                      budget: int = 80, per_cell_case_budget: int = 8,
+                                      investigated_keys: set[str] | None = None) -> dict:
+    """Case-granular coverage driving (T05/R26): enumerate each applicable leg
+    cell's concrete input cases from the endpoint template, then fire a leg PER
+    CASE via `run_case(identity, method, path, check, case_key)` and record the
+    real per-case outcome. Confirming one input marks only that case; siblings the
+    driver did not reach stay visible and honestly pending (never read as tested).
+
+    Distinct from `build_coverage_driven` (which drives once per cell): this is the
+    finer-grained path the orchestrator uses when parameter-level coverage is
+    enabled. Async because driving sends live traffic through `run_case`."""
+    tracker = CoverageTracker()
+    endpoints = endpoint_view(state)
+    identities = sorted({getattr(r, "role", str(r)) for r in (roles or [])}) or ["anonymous"]
+    tracker.build(endpoints, identities)
+    tracker.record_findings_from_state(endpoints, identities)
+    enumerated = tracker.expand_parameter_cases(
+        endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
+    driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget)
+    tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
+    report = tracker.report()
+    report["cases_enumerated"] = enumerated
+    report["cases_driven"] = driven
     return report

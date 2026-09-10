@@ -135,10 +135,13 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         cache._cache = cls._orig_cache
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
-    def _run(self, vulnerable: bool, drive: bool = False, max_nodes: int = 4):
+    def _run(self, vulnerable: bool, drive: bool = False, max_nodes: int = 4,
+             case_drive: bool = False):
         orch = Orchestrator(_test_config())
-        if drive:
+        if drive or case_drive:
             orch.engagement_coverage_drive = True  # I1 matrix-driver on
+        if case_drive:
+            orch.engagement_coverage_case_drive = True  # T05: per-input case driving
         # No agent probe should be needed (the node derives no specialty), but stub
         # it so a stray derivation can't reach for a real model.
         orch.run_active_probe = AsyncMock(return_value={
@@ -224,6 +227,58 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         result = self._run(vulnerable=False, drive=True, max_nodes=0)
         self.assertEqual(self._worklist_confirmed_jwt(result), [])
 
+    @staticmethod
+    def _proof_rows():
+        """All persisted proof rows (run_id, case_id, check_id, param loc/name,
+        verdict) -- read straight from the store DB the test scoped to a temp file."""
+        import store
+        conn = store._connect()
+        try:
+            return conn.execute(
+                "SELECT run_id, case_id, check_id, parameter_location, parameter_name, "
+                "verdict FROM proof_records").fetchall()
+        finally:
+            conn.close()
+
+    def test_coverage_case_driver_binds_case_proofs_end_to_end(self):
+        """T05/R26 end-to-end: with case driving on, the coverage DRIVER runs its
+        legs and each one persists a CASE-BOUND proof (stable run_id + case_id) to
+        the T01 store -- proving a coverage-driven attempt flows a case id to the
+        proof store, not merely a matrix cell. (The JWT here is confirmed by the
+        separate PROACTIVE path, so the driver's own legs are the coverage
+        cross_identity/auth_sequence attempts.)"""
+        before = len(self._proof_rows())
+        result = self._run(vulnerable=True, case_drive=True, max_nodes=0)
+        cov = result.get("coverage") or {}
+        self.assertIn("cases_driven", cov, "case-driven coverage path did not run")
+        self.assertGreaterEqual(cov.get("cases_enumerated", 0), 1)
+        self.assertGreaterEqual(cov.get("cases_driven", 0), 1)
+        rows = self._proof_rows()[before:]
+        self.assertTrue(rows, "the case-driven path persisted no proof records")
+        # every coverage-driven proof carries a real run + case identity
+        self.assertTrue(all(r[0] and r[1] and r[2] for r in rows),
+                        "a coverage-driven proof has an empty run_id/case_id/check_id")
+
+    def test_coverage_case_driver_reports_pending_cases_honestly(self):
+        """T05: the case-granular report exposes an honest per-case not-tested list;
+        every entry carries a reason (the I5 audit guarantee at case granularity)."""
+        result = self._run(vulnerable=True, case_drive=True)
+        cov = result.get("coverage") or {}
+        self.assertIn("cases_not_tested", cov)
+        self.assertTrue(all(c.get("reason") for c in cov.get("cases_not_tested", [])))
+
+    def test_coverage_case_driver_never_fabricates_a_confirmed_proof(self):
+        """Negative control: a secure server yields no coverage-driven confirmation,
+        so the driven legs persist only non-confirmed (inconclusive) proofs -- the
+        case path never fabricates a confirmed verdict."""
+        before = {r[1] for r in self._proof_rows()}  # case_ids seen before
+        self._run(vulnerable=False, case_drive=True, max_nodes=0)
+        # No proof minted in THIS run (not seen before) may be 'confirmed'.
+        for run_id, case_id, check_id, ploc, pname, verdict in self._proof_rows():
+            if case_id not in before:
+                self.assertNotEqual(verdict, "confirmed",
+                                    f"case path fabricated a confirmed proof for {check_id}")
+
     def test_operational_failure_is_surfaced_as_degraded(self):
         # R30: a phase that blows up is caught (never sinks the run) but must be
         # SURFACED -- the result declares degraded + records the error, rather than
@@ -247,6 +302,56 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
             self._confirmed_jwt(result), [],
             "Smoke test is not testing confirmation: a secure (signature-verifying) "
             "server was still reported as a confirmed JWT forgery.")
+
+
+class CoverageProofCoordinatesTest(unittest.TestCase):
+    """T05/R26: the coverage-driven proof carries the CONCRETE parameter case
+    coordinates, so a per-parameter coverage confirmation is a per-parameter T01
+    proof (not an endpoint-wide one). Focused unit test of Orchestrator._coverage_proof."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="cov_proof_")
+        self._orig_db = store._DB_PATH
+        store._DB_PATH = Path(self._tmp) / "state.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._orig_db
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_parameter_case_coordinates_reach_the_proof(self):
+        from coverage_model import CHECKS_BY_ID, CaseKey
+        orch = Orchestrator(_test_config())
+        check = CHECKS_BY_ID["WSTG-INPV-05"]  # SQLi, parameter phase
+        ex = SimpleNamespace(method="POST", url="http://localhost/api/search",
+                             request_body="search=x&sort=y")
+        res = SimpleNamespace(validator="sqlmap", status="confirmed", confirmed=True,
+                              summary="injection at search", evidence="' OR 1=1", confidence=0.99)
+        ck = CaseKey("query", "search", 0, "", "search")
+        proof_id, case_id = asyncio.run(orch._coverage_proof(
+            identity="user", check=check, exchange=ex, result=res, case_key=ck))
+        self.assertTrue(proof_id and case_id)
+        rows = store.proofs_for_case(case_id)
+        self.assertTrue(rows, "coverage proof was not persisted")
+        case = rows[0]["case"]
+        self.assertEqual(case["parameter_location"], "query")
+        self.assertEqual(case["parameter_name"], "search")
+        self.assertEqual(case["check_id"], "WSTG-INPV-05")
+        self.assertEqual(case["principal_id"], "user")
+        self.assertEqual(rows[0]["verdict"], "confirmed")
+
+    def test_repeated_occurrence_folds_into_proof_name(self):
+        from coverage_model import CHECKS_BY_ID, CaseKey
+        orch = Orchestrator(_test_config())
+        check = CHECKS_BY_ID["WSTG-INPV-05"]
+        ex = SimpleNamespace(method="GET", url="http://localhost/x?id=1&id=2", request_body="")
+        res = SimpleNamespace(validator="sqlmap", status="not_confirmed", confirmed=False,
+                              summary="", evidence="", confidence=0.0)
+        _, case0 = asyncio.run(orch._coverage_proof(
+            identity="user", check=check, exchange=ex, result=res, case_key=CaseKey("query", "id", 0)))
+        _, case1 = asyncio.run(orch._coverage_proof(
+            identity="user", check=check, exchange=ex, result=res, case_key=CaseKey("query", "id", 1)))
+        self.assertNotEqual(case0, case1)  # occurrence -> distinct proof cases
+        self.assertEqual(store.proofs_for_case(case1)[0]["case"]["parameter_name"], "id[1]")
 
 
 if __name__ == "__main__":

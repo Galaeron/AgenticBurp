@@ -246,5 +246,105 @@ class DriveLegsTests(unittest.TestCase):
         self.assertTrue(all(nt.get("reason") for nt in report["not_tested"]))
 
 
+class CasesDrivenTests(unittest.TestCase):
+    """T05: case-granular driving -- fan a parameter leg out over the endpoint's
+    real inputs, drive per case, and keep un-run siblings honestly pending."""
+
+    def _state(self):
+        st = _state_with([
+            ("GET", "/api/tickets/{id}", {"reachable_roles": ["user"]}),  # IDOR (endpoint phase)
+            ("POST", "/api/search", {"reachable_roles": ["user"]}),        # SQLi/XSS (parameter phase)
+        ])
+        # attach a captured template carrying two distinct query inputs
+        st.endpoints["POST /api/search"].template = {
+            "method": "POST", "query": "search=x&sort=y", "body": "",
+            "content_type": "", "object_id": None}
+        return st
+
+    def test_expand_parameter_cases_fans_out_over_inputs(self):
+        st = self._state()
+        t = CoverageTracker()
+        eps = endpoint_view(st)
+        t.build(eps, ["user"])
+        t.expand_parameter_cases(eps, per_cell_budget=8)
+        # SQLi (parameter phase) -> one case per query input
+        sqli_cases = t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-05")
+        names = sorted(ck.parameter_name for ck, _ in sqli_cases)
+        self.assertEqual(names, ["search", "sort"])
+        # IDOR (endpoint phase) -> a single explicit no-parameter case
+        idor_cases = t.matrix.cases_for_cell("user", "GET /api/tickets/{id}", "WSTG-ATHZ-04")
+        self.assertEqual(len(idor_cases), 1)
+        self.assertTrue(idor_cases[0][0].is_no_parameter)
+
+    def test_confirm_one_input_leaves_sibling_pending(self):
+        import asyncio
+        st = self._state()
+        t = CoverageTracker()
+        eps = endpoint_view(st)
+        t.build(eps, ["user"])
+        t.expand_parameter_cases(eps, per_cell_budget=8)
+
+        class _Res:
+            def __init__(self, s): self.status = s; self.summary = "x"; self.confidence = 0.9; self.evidence = "e"; self.validator = "v"
+
+        async def run_case(identity, method, path, check, case_key):
+            if check.id == "WSTG-INPV-05" and case_key.parameter_name == "search":
+                return _Res("confirmed")
+            return None  # do NOT drive the sort sibling (leave it pending)
+
+        driven = asyncio.run(t.drive_coverage_cases(run_case, budget=100))
+        self.assertGreaterEqual(driven, 1)
+        # the search case is confirmed; the cell shows risk ...
+        self.assertEqual(t.matrix.get("user", "POST /api/search", "WSTG-INPV-05").status,
+                         CellStatus.CONFIRMED)
+        # ... but the sort sibling is still pending (not tested)
+        pending_names = {c["parameter_name"] for c in t.matrix.cases_not_tested()}
+        self.assertIn("sort", pending_names)
+
+    def test_build_coverage_cases_driven_reports_pending_honestly(self):
+        import asyncio
+        from coverage_tracker import build_coverage_cases_driven
+        st = self._state()
+
+        class _Res:
+            status = "not_confirmed"; summary = ""; confidence = None; evidence = ""; validator = "v"
+
+        async def run_case(identity, method, path, check, case_key):
+            # only drive the SQLi 'search' input; everything else stays pending
+            if check.id == "WSTG-INPV-05" and case_key.parameter_name == "search":
+                return _Res()
+            return None
+
+        report = asyncio.run(build_coverage_cases_driven(
+            st, [type("R", (), {"role": "user"})()], run_case, budget=100))
+        self.assertIn("cases_enumerated", report)
+        self.assertIn("cases_driven", report)
+        self.assertGreaterEqual(report["cases_enumerated"], 2)
+        self.assertEqual(report["cases_driven"], 1)
+        # every not-tested case carries a reason (I5 at case granularity)
+        self.assertTrue(all(c.get("reason") for c in report["cases_not_tested"]))
+        # Under the SQLi check specifically: 'sort' stays pending, 'search' (driven)
+        # does not. ('search' remains pending under the OTHER parameter checks it was
+        # also enumerated for -- correctly, since only SQLi was driven on it.)
+        nt = {(c["endpoint"], c["check"], c["parameter_name"]) for c in report["cases_not_tested"]}
+        self.assertIn(("POST /api/search", "WSTG-INPV-05", "sort"), nt)
+        self.assertNotIn(("POST /api/search", "WSTG-INPV-05", "search"), nt)
+
+    def test_per_cell_budget_bounds_fanout(self):
+        st = _state_with([("POST", "/api/x", {"reachable_roles": ["user"]})])
+        st.endpoints["POST /api/x"].template = {
+            "method": "POST", "query": "a=1&b=2&c=3&d=4", "body": "",
+            "content_type": "", "object_id": None}
+        t = CoverageTracker()
+        eps = endpoint_view(st)
+        t.build(eps, ["user"])
+        t.expand_parameter_cases(eps, per_cell_budget=2)
+        cases = t.matrix.cases_for_cell("user", "POST /api/x", "WSTG-INPV-05")
+        pending = [r for _ck, r in cases if r.status == CellStatus.PENDING]
+        skipped = [r for _ck, r in cases if r.status == CellStatus.SKIPPED]
+        self.assertEqual(len(pending), 2)   # only 2 attempted within budget
+        self.assertEqual(len(skipped), 2)   # the rest visible + budget-skipped
+
+
 if __name__ == "__main__":
     unittest.main()

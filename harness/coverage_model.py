@@ -703,6 +703,19 @@ class CoverageMatrix:
                        check_id: str) -> list[tuple[CaseKey, CellResult]]:
         return list(self._cases.get((identity, endpoint_key, check_id), {}).values())
 
+    def has_cases(self, identity: str, endpoint_key: str, check_id: str) -> bool:
+        return bool(self._cases.get((identity, endpoint_key, check_id)))
+
+    def pending_cases(self) -> list[tuple[str, str, str, CaseKey]]:
+        """(identity, endpoint_key, check_id, CaseKey) for every child case still
+        PENDING -- the case-granular work-program the driver fires."""
+        out: list[tuple[str, str, str, CaseKey]] = []
+        for (i, e, c), bucket in self._cases.items():
+            for _cid, (ck, res) in bucket.items():
+                if res.status == CellStatus.PENDING:
+                    out.append((i, e, c, ck))
+        return out
+
     def _aggregate_cell(self, key: tuple[str, str, str]) -> None:
         """Roll the child-case statuses up into the parent cell (T05).
 
