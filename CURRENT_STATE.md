@@ -9,6 +9,46 @@ Older session narratives are in git history / `archive/`; this file is deliberat
 
 ---
 
+## ►► PARALLEL TRACK — Opus, branch `astra-t05-t08` (T05/T06/T08) ◄◄
+
+Branched off `codex/astra-review-fixes` @ `e24ca7f` in worktree
+`.worktrees/astra-t05-t08`, so this coverage/issue/transport track and the identity
+track below do not collide (reconcile by merge). Treated the identity contracts
+(`evidence.TestCaseRef`/`ProofRecord`/`Verdict`) + case/proof identity (T01
+F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
+
+- **Env reconciliation (READ if tests won't run):** the prior env (CPython 3.12 +
+  `.review-deps`) was not reproducible — only 3.14 was installed and `.review-deps`
+  is cp312. Installed 3.12.10 (`py install 3.12`) + a `typing_extensions==4.16.0`
+  scratchpad shim (the bundled one lacks `sentinel` for the newer anyio). Runner:
+  `pythoncore-3.12-64\python.exe`, `PYTHONPATH=<shim>;<.review-deps>`, from `harness/`.
+  Baseline on `e24ca7f` reconciled to the codex count: **1,581 OK, 2 skipped**.
+- **T05/R26 (`fdc50bb`,`e9a9d76`) — DONE.** Concrete per-input/per-state coverage
+  case keys aligned to `TestCaseRef` (`coverage_model.CaseKey` + child-case layer +
+  aggregation "one confirmed child marks risk, never endpoint completion" + new
+  controlled_negative/blocked/inconclusive statuses); `coverage_tracker`
+  case-granular driving; `orchestrator._coverage_proof` persists a case-bound proof
+  per driven leg. Default-OFF flags `coverage_drive_cases`/`coverage_case_budget`
+  gate the new live path (existing coverage semantics unchanged). Per-validator
+  PARAMETER attribution left to T08 oracle work.
+- **T06 (`04f6d32`) — DONE.** `issues.py`: run-independent stable issue IDs over a
+  conservative key (family+method+class+affected-input+read/write boundary), issues
+  keep ALL members, redacted `export_issue`/`replay_view`. `store.all_host_findings`
+  surfaces method+case coords; `report_generator` uses the issue key + renders issue
+  IDs + `export_issues_for_host`. Operator root-cause merge + Burp replay = T10.
+- **T08 (`e1ac8e9`) — inventory + audit only.** `transport_inventory.py` (32 sites,
+  **23 target routing gaps** owned/named) + `test_transport_inventory` enforcement +
+  `T08_TRANSPORT_INVENTORY.md`. The actual per-site executor migration and per-oracle
+  re-qualification remain OPEN (feeds identity F01 role_crawl, F04 cross_identity).
+- **Verification:** full stdlib discovery after all three tickets — **1,653 tests OK,
+  2 skipped**, exit 0 (1,581 baseline + 72 new; zero real failures). No model / browser /
+  container / blind-target / live run performed — all hermetic.
+- **Still owed:** merge into `WorkingSunday` (reconcile with the identity track's
+  orchestrator/run-context edits); a fresh live max-coverage VulnCorp run to move any
+  numbers. New live behavior is flag-gated OFF, so live recall is unchanged until enabled.
+
+---
+
 ## ►► SESSION-17 STATE (READ FIRST) ◄◄
 
 **2026-09-10 implementation continuation from `9fdbb11`:** Work continues on

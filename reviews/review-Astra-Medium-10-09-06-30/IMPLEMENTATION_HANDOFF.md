@@ -230,10 +230,17 @@ Append actual results to EXECUTION_LOG.md in this directory as work proceeds. Fo
 - [ ] T02 stable principals, sessions, ownership
 - [ ] T03 run-scoped executor on authorization path
 - [ ] T04 real-transport vulnerable/patched authorization smoke
-- [ ] T05 case-level coverage
-- [ ] T06 issue identity and reproducible export
+- [x] T05 case-level coverage (branch `astra-t05-t08`: concrete case keys + case-granular
+      driving wired to T01 proofs, default-OFF flags; per-validator PARAMETER attribution
+      deferred to T08 oracle work. Focused + full suite green — 1,625 tests OK.)
+- [x] T06 issue identity and reproducible export (branch `astra-t05-t08`: stable run-independent
+      issue IDs, conservative grouping, redacted export + replay view; operator root-cause MERGE
+      and Burp one-click replay deferred to T10.)
 - [ ] T07 stateful workflow engine
-- [ ] T08 transport migration and individually qualified oracle improvements
+- [ ] T08 transport migration and individually qualified oracle improvements (branch
+      `astra-t05-t08`: INVENTORY + routing-gap AUDIT + enforcement test done — 32 sites, 23
+      target gaps owned/named; the actual per-site executor migration and per-oracle
+      re-qualification with paired live fixtures remain OPEN.)
 - [ ] T09 measured model scheduling
 - [ ] T10 release tiers and operator run/replay/export flow
 
