@@ -145,6 +145,7 @@ class ManagedSession:
     allowed_origins: frozenset = frozenset()
     role: str = "user"
     name: str = ""
+    principal: object | None = None
     generation: int = 0
     _client: httpx.AsyncClient | None = None
 
@@ -165,13 +166,14 @@ class SessionManager:
         self._by_id: dict[str, ManagedSession] = {}
 
     def register(self, session_id: str, principal_id: str, headers: dict | None = None, *,
-                 allowed_origins=None, role: str = "user", name: str = "") -> ManagedSession:
+                 allowed_origins=None, role: str = "user", name: str = "",
+                 principal=None) -> ManagedSession:
         normalized = frozenset(ScopePolicy.origin_of(o) for o in (allowed_origins or []))
         if headers and not normalized:
             raise ValueError("credential-bearing sessions require an explicit allowed origin")
         s = ManagedSession(session_id=session_id, principal_id=principal_id,
                            headers=dict(headers or {}), allowed_origins=normalized,
-                           role=role, name=name or principal_id)
+                           role=role, name=name or principal_id, principal=principal)
         self._by_id[session_id] = s
         return s
 

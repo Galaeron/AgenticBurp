@@ -874,7 +874,10 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     from run_context import RunContext
     from urllib.parse import urlsplit
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
-                                    headers=r.get("headers") or {}, name=r.get("name"))
+                                    headers=r.get("headers") or {}, name=r.get("name"),
+                                    tenant=r.get("tenant"),
+                                    expected_permissions=frozenset(
+                                        r.get("expected_permissions") or []))
              for r in (req.roles or [])] or [role_crawl.RoleSession(role="anonymous", headers={})]
     job_id = _uuid.uuid4().hex[:12]
     runs_cfg = (config.get("runs", {}) or {})

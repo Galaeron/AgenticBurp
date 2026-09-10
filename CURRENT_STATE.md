@@ -49,6 +49,15 @@ Focused authorization integration: **73 tests OK**; focused real transport: **18
 OK**. Full stdlib discovery: **1,591 tests OK, 2 skipped**, 289.004s. T02 F08–F10
 principal metadata and ownership semantics are next.
 
+**T02 F08–F10 complete:** identity re-save uses an additive UPSERT and preserves
+tenant, permissions, and trust metadata. Run sessions carry authoritative `Principal`
+objects into ownership checks. Object references include run, normalized application
+origin, explicit tenant state, path, and the unmodified query selection. Authorized
+access is recorded per principal and evaluation continues, so it cannot suppress a
+later unauthorized case. Focused principal/ownership/transport/API checks: **84 tests
+OK**. Full stdlib discovery: **1,595 tests OK, 2 skipped**, 294.398s. T03 F01
+production wiring and transport behavior is next.
+
 **2026-09-10 review-only addendum:** Source inspected at HEAD `8b5c6e1`;
 implementation handoff saved to
 [`reviews/review-Astra-Medium-10-09-06-30/IMPLEMENTATION_HANDOFF.md`](reviews/review-Astra-Medium-10-09-06-30/IMPLEMENTATION_HANDOFF.md).

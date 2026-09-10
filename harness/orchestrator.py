@@ -1244,12 +1244,14 @@ class Orchestrator:
                 run_context.sessions.register(
                     session_id, principal_id, dict(r.headers or {}),
                     allowed_origins=[permitted_origin], role=r.role,
-                    name=r.name or principal_id)
+                    name=r.name or principal_id, principal=r.to_principal())
             if not any(s.principal_id == "anonymous"
                        for s in run_context.sessions.all()):
                 run_context.sessions.register(
                     "anonymous", "anonymous", allowed_origins=[permitted_origin],
-                    role="anonymous", name="anonymous")
+                    role="anonymous", name="anonymous",
+                    principal=role_crawl.RoleSession(
+                        role="anonymous", headers={}).to_principal())
         for r in roles:
             if r.headers:
                 # Register under a DISTINCT principal id (R10): two same-role users

@@ -162,3 +162,36 @@
 - No external target, model, browser, or container run was performed. Broad role-crawl,
   registry, and remaining validator transport wiring belongs to T03 F01/T08 and is not
   claimed here.
+
+## T02 F08/F09/F10 — principal metadata and ownership semantics
+
+- Baseline: `792f6b9`; commit subject: `fix(t02): preserve principal ownership cases`
+  (this focused commit).
+- Persistence: `save_identity` now uses `INSERT ... ON CONFLICT DO UPDATE` for legacy
+  identity fields rather than replacing the row, so tenant, permissions JSON, and trust
+  metadata survive credential/profile updates.
+- Production identity path: API role inputs retain tenant and declared permissions;
+  engagement session registration attaches the authoritative `RoleSession.to_principal`
+  result. Cross-identity ownership checks consume that object rather than rebuilding a
+  name/role-only principal.
+- Ownership identity: `principals.object_reference` namespaces concrete selections by
+  run ID, normalized application origin, explicit tenant state, path, and raw query.
+  Query order/repetition remains part of the selection, preventing `/item?id=1` and
+  `/item?id=2`, different targets, or different runs from sharing an ownership fact.
+- Aggregation: an explicitly authorized owner/share/public/permission case increments a
+  per-principal outcome and evaluation continues. A later unauthorized principal can
+  still confirm the crossing; the final observation states how many configured
+  principals were evaluated instead of claiming all were denied.
+- First focused run — exit 1, **78 tests run in 13.837s**, 8 errors from an incorrectly
+  scoped `authorized` accumulator. Second run — exit 1, **78 tests run in 13.850s**, one
+  wording assertion failure. Both were corrected before a pass was recorded.
+- Final focused principal/identity/cross-identity/T04/transport/API run — exit 0,
+  **84 tests OK in 14.901s**.
+- Full stdlib discovery — exit 0, **1,595 tests OK, 2 skipped, in 294.398s**.
+- Negative controls: identity metadata survives a second save; raw query selection,
+  run, and target variants produce distinct references; a declared permission survives
+  the validator adapter; Bob's authorized share does not prevent Carol's unauthorized
+  case from running and confirming.
+- No external target, real model, browser, or container run was performed. Ownership
+  facts are still supplied by fixture/operator provenance; the harness does not infer
+  ownership or tenant membership from URL or role labels.

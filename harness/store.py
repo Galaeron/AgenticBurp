@@ -954,7 +954,11 @@ def save_identity(identity) -> None:
     conn = _connect()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO identities (id, name, role, notes, created_at) VALUES (?, ?, ?, ?, ?)",
+            """INSERT INTO identities (id, name, role, notes, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 name=excluded.name, role=excluded.role, notes=excluded.notes,
+                 created_at=excluded.created_at""",
             (
                 identity.id, identity.name,
                 # `hasattr(..., "value")` fallback: defensive, not currently

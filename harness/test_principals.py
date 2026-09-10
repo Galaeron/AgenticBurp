@@ -74,6 +74,13 @@ class AuthorizationMatrixTests(unittest.TestCase):
         self.ledger.record(OwnershipFact(object_ref="item:blank"))
         self.assertEqual(self.ledger.authorization(BOB, "item:blank"), AuthzDecision.UNKNOWN)
 
+    def test_object_references_are_scoped_and_preserve_query_selection(self):
+        a = principals.object_reference("https://shop.test/item?id=1&id=2", run_id="r1")
+        b = principals.object_reference("https://shop.test/item?id=2&id=1", run_id="r1")
+        other_run = principals.object_reference("https://shop.test/item?id=1&id=2", run_id="r2")
+        other_target = principals.object_reference("https://other.test/item?id=1&id=2", run_id="r1")
+        self.assertEqual(len({a, b, other_run, other_target}), 4)
+
 
 class PrincipalAndSessionTests(unittest.TestCase):
     def test_session_renew_keeps_principal_stable(self):
@@ -158,6 +165,20 @@ class OwnershipStoreTests(unittest.TestCase):
         self.assertEqual(meta["tenant"], "A")
         self.assertIn("item:7", meta["permissions"])
 
+    def test_resaving_identity_preserves_principal_metadata(self):
+        ident = SimpleNamespace(id="alice", name="Alice", role="user", notes="old",
+                                created_at=time.time())
+        store.save_identity(ident)
+        store.set_identity_principal_meta(
+            "alice", tenant="A", permissions=["item:7"], trust=3)
+        updated = SimpleNamespace(id="alice", name="Alice Updated", role="admin",
+                                  notes="new", created_at=ident.created_at)
+        store.save_identity(updated)
+        meta = store.get_identity_principal_meta("alice")
+        self.assertEqual(meta["tenant"], "A")
+        self.assertEqual(meta["permissions"], ["item:7"])
+        self.assertEqual(meta["trust"], 3)
+
 
 class CrossIdentityOwnershipWiringTests(unittest.TestCase):
     """T02b production wiring: the cross-identity validator consults ownership
@@ -214,7 +235,8 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
 
     def test_authorized_sharing_is_not_confirmed(self):
         led = OwnershipLedger()
-        led.record(OwnershipFact(object_ref="/api/items/7", owner_principal_id="alice",
+        led.record(OwnershipFact(object_ref=principals.object_reference(
+            "http://t.local/api/items/7"), owner_principal_id="alice",
                                  shared_with=frozenset({"bob"})))
         res = self._run(self._validator(ownership=led))
         self.assertEqual(res.status, "not_confirmed")
@@ -223,13 +245,77 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
 
     def test_public_object_is_not_confirmed(self):
         led = OwnershipLedger()
-        led.record(OwnershipFact(object_ref="/api/items/7", public=True))
+        led.record(OwnershipFact(object_ref=principals.object_reference(
+            "http://t.local/api/items/7"), public=True))
         self.assertFalse(self._run(self._validator(ownership=led)).confirmed)
 
     def test_unknown_ownership_still_confirms(self):
         led = OwnershipLedger()  # no fact -> UNKNOWN -> must not suppress a real crossing
         res = self._run(self._validator(ownership=led))
         self.assertEqual(res.status, "confirmed")
+
+    def test_authorized_principal_does_not_suppress_later_unauthorized_case(self):
+        from run_context import RunContext
+        from validators.cross_identity_validator import CrossIdentityValidator
+        ctx = RunContext.create(run_id="ownership-run", allowed_hosts=["t.local"])
+        origin = "http://t.local"
+        ctx.sessions.register("bob-session", "bob", {"Cookie": "bob"},
+                              allowed_origins=[origin], role="user", name="bob",
+                              principal=BOB)
+        ctx.sessions.register("carol-session", "carol", {"Cookie": "carol"},
+                              allowed_origins=[origin], role="user", name="carol",
+                              principal=CAROL)
+        ctx.sessions.register("anonymous", "anonymous", allowed_origins=[origin],
+                              role="anonymous", principal=ANON)
+        led = OwnershipLedger()
+        ref = principals.object_reference(
+            "http://t.local/api/items/7", run_id="ownership-run")
+        led.record(OwnershipFact(object_ref=ref, owner_principal_id="alice",
+                                 shared_with=frozenset({"bob"})))
+        validator = CrossIdentityValidator(run_context=ctx, ownership=led)
+        seen = []
+
+        async def _fake_probe(url, headers, session_ref=None):
+            import identity_compare
+            seen.append(session_ref)
+            return identity_compare.Probe(
+                401 if session_ref == "anonymous" else 200,
+                "denied" if session_ref == "anonymous" else "SECRET owner data 1234567890")
+
+        validator._probe = _fake_probe
+        result = self._run(validator)
+        self.assertTrue(result.confirmed)
+        self.assertIn("bob-session", seen)
+        self.assertIn("carol-session", seen)
+
+    def test_authoritative_declared_permission_survives_validator_adapter(self):
+        from run_context import RunContext
+        from validators.cross_identity_validator import CrossIdentityValidator
+        url = "http://t.local/api/items/7"
+        ctx = RunContext.create(run_id="permission-run", allowed_hosts=["t.local"])
+        permitted = Principal(id="ops", role="admin", trust=3,
+                              expected_permissions=frozenset({principals.object_reference(
+                                  url, run_id="permission-run")}))
+        ctx.sessions.register("ops-session", "ops", {"Cookie": "ops"},
+                              allowed_origins=["http://t.local"], role="admin",
+                              principal=permitted)
+        ctx.sessions.register("anonymous", "anonymous", allowed_origins=["http://t.local"],
+                              role="anonymous", principal=ANON)
+        led = OwnershipLedger()
+        led.record(OwnershipFact(object_ref=principals.object_reference(
+            url, run_id="permission-run"), owner_principal_id="alice"))
+        validator = CrossIdentityValidator(run_context=ctx, ownership=led)
+
+        async def _fake_probe(url, headers, session_ref=None):
+            import identity_compare
+            return identity_compare.Probe(
+                401 if session_ref == "anonymous" else 200,
+                "denied" if session_ref == "anonymous" else "SECRET owner data 1234567890")
+
+        validator._probe = _fake_probe
+        result = self._run(validator)
+        self.assertFalse(result.confirmed)
+        self.assertIn("authorized", result.summary.lower())
 
 
 if __name__ == "__main__":

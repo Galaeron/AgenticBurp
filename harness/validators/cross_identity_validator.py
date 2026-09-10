@@ -212,9 +212,9 @@ class CrossIdentityValidator(Validator):
         self.run_context = run_context
 
     def _object_ref(self, url: str) -> str:
-        """The object identity used to look up ownership facts. The URL path is a
-        stable per-object key; the ownership-recording side uses the same convention."""
-        return urlparse(url).path or url
+        import principals
+        run_id = self.run_context.run_id if self.run_context is not None else ""
+        return principals.object_reference(url, run_id=run_id)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         # Reuse the access-control gate's markers so the two never drift.
@@ -248,7 +248,7 @@ class CrossIdentityValidator(Validator):
             return identity_headers.identities_for_host(host)
         return [{"name": s.name or s.principal_id, "role": s.role,
                  "headers": dict(s.headers), "session_ref": s.session_id,
-                 "principal_id": s.principal_id}
+                 "principal_id": s.principal_id, "principal": s.principal}
                 for s in self.run_context.sessions.all()
                 if s.principal_id != "anonymous"]
 
@@ -412,6 +412,7 @@ class CrossIdentityValidator(Validator):
 
         considered = 0
         rejects = 0
+        authorized = 0
         for ident in idents_distinct[:self.max_identities]:
             try:
                 attempt = await self._probe_identity(exchange.url, ident)
@@ -429,22 +430,16 @@ class CrossIdentityValidator(Validator):
                 # response-similarity verdict (it neither invents nor suppresses).
                 if self.ownership is not None:
                     import principals as _pr
-                    accessor = _pr.Principal(
-                        id=ident.get("name") or ident.get("role") or "unknown",
+                    accessor = ident.get("principal") or _pr.Principal(
+                        id=ident.get("principal_id") or ident.get("name")
+                           or ident.get("role") or "unknown",
                         role=ident.get("role", "user"),
-                        trust=_pr.TRUST_BY_ROLE.get((ident.get("role") or "").lower(), 1))
+                        trust=_pr.TRUST_BY_ROLE.get((ident.get("role") or "").lower(), 1),
+                        provisional=True)
                     if self.ownership.authorization(accessor, self._object_ref(exchange.url)) \
                             == _pr.AuthzDecision.AUTHORIZED:
-                        return ValidationResult(
-                            validator=self.name, status="not_confirmed", finding_class=fc,
-                            confidence=0.3, confirmed=False,
-                            summary=f"OBSERVATION (not confirmed): {ident['name']!r} reached "
-                                    f"{exchange.url}, but ownership provenance shows this access is "
-                                    f"AUTHORIZED (own / shared / public object) -- authorized sharing is "
-                                    f"not a broken-object-authorization crossing.",
-                            evidence=f"OwnershipLedger: {ident.get('name')!r} is entitled to "
-                                     f"{self._object_ref(exchange.url)!r}; a cross-identity 2xx here is "
-                                     f"expected, not a bug.")
+                        authorized += 1
+                        continue
                 return ValidationResult(
                     validator=self.name, status="confirmed", finding_class=fc,
                     confidence=ev.confidence, confirmed=True,
@@ -454,6 +449,15 @@ class CrossIdentityValidator(Validator):
 
         if considered == 0:
             return self._skip(fc, "no configured identity probe could be sent")
+        if authorized:
+            return ValidationResult(
+                validator=self.name, status="not_confirmed", finding_class=fc,
+                confidence=0.3, confirmed=False,
+                summary=f"OBSERVATION (not confirmed): {authorized} authorized principal(s) reached "
+                        f"{exchange.url} with explicit ownership/share/public permission; "
+                        f"all {considered} configured principals were still evaluated.",
+                evidence=f"OwnershipLedger authorized {authorized} of {considered} tested "
+                         f"principal(s) for {self._object_ref(exchange.url)!r}.")
         if rejects == considered:
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.8, confirmed=False,
