@@ -92,11 +92,13 @@ class RoutingAuditTests(unittest.TestCase):
             self.assertEqual(by_mod[mod].scope, ti.SCOPE_EGRESS)
         self.assertEqual(by_mod["ollama_client.py"].scope, ti.SCOPE_LLM)
 
-    def test_cross_identity_gap_is_flagged(self):
-        # The review's F04 gap must be explicit in the audit (partial T03 migration).
+    def test_migrated_identity_and_discovery_paths_are_executor_routed(self):
         site = {s.module: s for s in ti.TRANSPORT_SITES}["validators/cross_identity_validator.py"]
-        self.assertTrue(site.is_routing_gap)
-        self.assertIn("session", site.gap.lower())
+        self.assertFalse(site.is_routing_gap)
+        self.assertEqual(site.routing, ti.ROUTING_EXECUTOR)
+        by_mod = {s.module: s for s in ti.TRANSPORT_SITES}
+        for module in ("role_crawl.py", "crawler.py", "api_surface_discovery.py"):
+            self.assertEqual(by_mod[module].routing, ti.ROUTING_EXECUTOR)
 
     def test_summary_is_consistent(self):
         s = ti.summary()

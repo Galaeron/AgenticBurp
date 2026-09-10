@@ -31,7 +31,7 @@ to the registry is inventory, NOT executor-policy enforcement -- the actual
 migration of a gap onto the run-scoped executor is tracked separately by each
 site's `owner`/`gap`.
 
-This is inventory + audit only: it changes no transport behavior.
+The inventory began as an audit and is updated as each production route migrates.
 """
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ SCOPE_INFRA = "infra"
 # Current routing of the site.
 ROUTING_ADAPTER = "adapter"     # this IS the routed transport (executor/gate/tool_runner/browser_driver)
 ROUTING_GATED = "gated"         # target send that passes through the SafetyGate/GatedAsyncClient
+ROUTING_EXECUTOR = "executor"   # production path uses the invocation RunContext executor
 ROUTING_DIRECT = "direct"       # a direct send NOT (yet) on the executor -- a routing gap if target-scoped
 
 
@@ -110,18 +111,18 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="agents", note="Ollama chat/tags transport; model plane, not target."),
 
     # ---- target: discovery / crawl (routing gaps -- not yet on the executor) ----
-    TransportSite("api_surface_discovery.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+    TransportSite("api_surface_discovery.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
-                  gap="surface discovery sends directly; route through the executor so "
-                      "discovery hops are scope-checked and captured as artifacts."),
-    TransportSite("crawler.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+                  note="production role discovery uses the run executor; legacy standalone "
+                       "callers retain a direct compatibility path."),
+    TransportSite("crawler.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
-                  gap="crawl sends directly (follow_redirects=True) -- redirect hops are "
-                      "not scope-gated by the executor."),
-    TransportSite("role_crawl.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+                  note="production role crawl routes page/script fetches through the run "
+                       "executor, including manual scope-checked redirects."),
+    TransportSite("role_crawl.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (F01/T03)",
-                  gap="role crawl remains on old transport (review F01); it should source "
-                      "identities from the run and send per-session through the executor."),
+                  note="production access-matrix probes bind each principal to an isolated "
+                       "run session; direct transport remains compatibility-only."),
     TransportSite("scope_discovery.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="astra-identity (T03/T08)",
                   gap="scope-probe sends directly; migrate to the executor's scope check."),
@@ -145,11 +146,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     # Mutating legs pass through the SafetyGate/GatedAsyncClient; read-only legs open
     # their own client. Full migration to the run-scoped executor (per-session
     # isolation, cancellation, artifact capture) is F01/F04/T08 follow-on.
-    TransportSite("validators/cross_identity_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+    TransportSite("validators/cross_identity_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (F04/T03)",
-                  gap="partially migrated (T03): even with a context it sends session_ref=None "
-                      "so identities share one cookie jar and read process-global headers (F04). "
-                      "Bind every identity/anon call to isolated session state from the run."),
+                  note="production graph validation binds every identity and anonymous replay "
+                       "to isolated RunContext sessions; legacy registry use remains compatible."),
     TransportSite("validators/jwt_forge_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="read-only forge+replay; opens its own client."),
     TransportSite("validators/rate_limit_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
