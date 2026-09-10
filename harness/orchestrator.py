@@ -1188,7 +1188,7 @@ class Orchestrator:
                 feature_caps = await engagement_builder.feature_crawl_captures(
                     base_url, roles, allowed_hosts=self.allowed_hosts,
                     submit_forms=_get_gate().config.allow_mutating_replay,
-                    seed_paths=discovered_paths)
+                    seed_paths=discovered_paths, run_context=run_context)
                 # make the workflow surface visible to prioritisation + coverage,
                 # then run the same content-level review as discovery captures.
                 for ex in feature_caps:

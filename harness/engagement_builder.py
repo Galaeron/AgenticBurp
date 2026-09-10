@@ -98,6 +98,7 @@ async def feature_crawl_captures(
     max_depth: int = 3,
     max_captured: int = 200,
     seed_paths: list[str] | None = None,
+    run_context=None,
 ) -> list:
     """Run the stateful feature-workflow crawl (feature_workflow.crawl_features) as
     each DISTINCT-feature role and union the captured exchanges.
@@ -125,12 +126,18 @@ async def feature_crawl_captures(
     def _h(*parts: str) -> str:
         return hashlib.sha1("\x00".join(parts).encode("utf-8", "ignore")).hexdigest()[:12]
 
-    fx = fetch_fn or feature_workflow.default_fetch_fn(allowed_hosts)
     sweep_roles = role_crawl._distinct_discovery_roles(roles) if roles else []
     seen: set[tuple] = set()
     out: list = []
     for r in sweep_roles:
         try:
+            if fetch_fn is not None:
+                fx = fetch_fn
+            elif run_context is not None:
+                session_ref, _ = run_context.sessions.bind_headers(r.norm_headers())
+                fx = feature_workflow.run_context_fetch_fn(run_context, session_ref)
+            else:
+                fx = feature_workflow.default_fetch_fn(allowed_hosts)
             res = await feature_workflow.crawl_features(
                 base_url, r.role, r.norm_headers(), fetch_fn=fx,
                 allowed_hosts=allowed_hosts, submit_forms=submit_forms,

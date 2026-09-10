@@ -126,10 +126,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("scope_discovery.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="astra-identity (T03/T08)",
                   gap="scope-probe sends directly; migrate to the executor's scope check."),
-    TransportSite("feature_workflow.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+    TransportSite("feature_workflow.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T07)",
-                  gap="stateful workflow crawl fetches directly; the T07 workflow engine "
-                      "routes steps through the executor with per-session state."),
+                  note="production stateful feature crawl and declared T07 workflows route "
+                       "through the executor with per-session state; direct fetch is legacy."),
     TransportSite("missing_auth_probe.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="astra-identity (T03/T08)",
                   gap="unauthenticated-access probe sends directly."),

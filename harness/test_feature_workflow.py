@@ -3,6 +3,8 @@ authenticated role and capturing the credential-bearing, workflow-shaped
 exchanges route-guessing can't reach."""
 import asyncio
 import unittest
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 
 import feature_workflow as fw
 
@@ -226,6 +228,31 @@ class CrossSeedTests(unittest.TestCase):
         paths = [urlsplit(e.url).path for e in caps]
         self.assertIn("/web/admin", paths)
         self.assertIn("/web/admin/tools", paths)
+
+
+class RunContextFeatureTransportTests(unittest.TestCase):
+    def test_actual_feature_fetch_uses_session_and_budget(self):
+        import feature_workflow
+        fixture = _Fixture()
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=1,
+                                gate_config={"active_enabled": True})
+        ctx.sessions.register("user", "user", {"Authorization": "Bearer feature"},
+                              allowed_origins=[ScopePolicy.origin_of(fixture.base)])
+        fetch = feature_workflow.run_context_fetch_fn(ctx, "user")
+        async def scenario():
+            result = await feature_workflow.crawl_features(
+                fixture.base, "user", {"Authorization": "Bearer feature"},
+                fetch_fn=fetch, allowed_hosts=["127.0.0.1"], max_steps=1)
+            await ctx.aclose()
+            return result
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.steps, 1)
+            self.assertEqual(len(result.captured), 1)
+            self.assertEqual(ctx.budget.used, 1)
+            self.assertEqual(fixture.httpd.received[0]["authorization"], "Bearer feature")
+        finally:
+            fixture.close()
 
 
 if __name__ == "__main__":

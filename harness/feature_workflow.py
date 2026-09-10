@@ -360,3 +360,24 @@ def default_fetch_fn(allowed_hosts: list[str] | None = None, *, timeout: float =
             return await client.request(m, url, headers=req_headers or None, content=body or None)
 
     return _fetch
+
+
+def run_context_fetch_fn(run_context, session_ref: str | None, *,
+                         validator_name: str = "feature_workflow"):
+    """Production fetch adapter backed by one invocation's Executor."""
+    from types import SimpleNamespace
+    from run_context import TypedRequest
+
+    async def _fetch(method, url, req_headers, body):
+        safe_headers = {k: v for k, v in (req_headers or {}).items()
+                        if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
+        outcome = await run_context.executor().execute(
+            TypedRequest((method or "GET").upper(), url, headers=safe_headers,
+                         body=body or None),
+            capability=validator_name, session_ref=session_ref)
+        if not outcome.ok:
+            raise RuntimeError(f"transport declined: {outcome.outcome}")
+        return SimpleNamespace(status_code=outcome.status, text=outcome.body,
+                               headers=outcome.headers)
+
+    return _fetch
