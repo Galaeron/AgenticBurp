@@ -493,6 +493,19 @@ CHECK_CATALOG: tuple[Check, ...] = (
     Check("WSTG-CONF-02", "Security headers", Phase.DOMAIN,
           "misconfig", _always_applicable, "recon",
           "Check X-Frame-Options, X-Content-Type-Options, etc."),
+    # The genuine WSTG-CONF-09. It is a host/deployment file-permission review, not
+    # something a black-box HTTP client can confirm -- so it is a MANUAL check.
+    Check("WSTG-CONF-09", "Test File Permission", Phase.DOMAIN,
+          "misconfig", _always_applicable, "manual",
+          "Verify server files/directories use least privilege (config, key material, "
+          "backups, source not world-readable/writable). Requires host access.",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-CONF-09",
+                          "https://owasp.org/www-project-web-security-testing-guide/v42/"
+                          "4-Web_Application_Security_Testing/"
+                          "02-Configuration_and_Deployment_Management_Testing/09-Test_File_Permission",
+                          "Test File Permission", version="4.2"),
+          )),
 
     # === ENDPOINT phase ===
     Check("WSTG-ATHZ-04", "IDOR / Broken Object-Level Authorization", Phase.ENDPOINT,

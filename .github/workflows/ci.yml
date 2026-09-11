@@ -48,6 +48,7 @@ jobs:
           test_smoke_authorization_workflow
           test_smoke_phase0_capture_review
           test_mass_assignment_slice
+          test_open_redirect_slice
           test_coverage_manifest
       - name: Requirement-coverage gate (declared automated aspects must be a fresh pass)
         working-directory: harness

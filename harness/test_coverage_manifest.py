@@ -288,9 +288,11 @@ class ModelExtensionTests(unittest.TestCase):
         # It must NOT falsely claim a WSTG id anywhere.
         self.assertTrue(all(e.catalog != "WSTG" for e in c.external_refs))
 
-    def test_wstg_conf_09_is_not_mass_assignment(self):
-        # WSTG-CONF-09 ("Test File Permission") is no longer mislabelled as mass assignment.
-        self.assertNotIn("WSTG-CONF-09", CHECKS_BY_ID)
+    def test_wstg_conf_09_is_test_file_permission_not_mass_assignment(self):
+        # WSTG-CONF-09 now carries its GENUINE OWASP meaning, not mass assignment.
+        self.assertIn("WSTG-CONF-09", CHECKS_BY_ID)
+        self.assertEqual(CHECKS_BY_ID["WSTG-CONF-09"].name, "Test File Permission")
+        self.assertNotEqual(CHECKS_BY_ID["WSTG-CONF-09"].vulnerability_class, "api_security")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,44 @@ Older session narratives are in git history / `archive/`; this file is deliberat
 
 ---
 
+## ►► PARALLEL TRACK — Opus, branch `astra-wstg-coverage-slice` (WSTG requirement coverage) ◄◄
+
+Branched off `astra-integration`. Adds a **requirement-coverage manifest** kept
+deliberately SEPARATE from the per-run `CoverageMatrix`, plus two deterministic
+vertical slices. **Not merged.** Commits: `294162c` (scaffold), `1052149` (review
+fixes), + a catalog-expansion commit.
+
+- **New modules:** `harness/coverage_manifest.py` (security-requirement ⇄
+  regression-test ledger: WSTG/OWASP refs, applicability+rationale, per-aspect
+  status, run-bound evidence, `--check` gate) and `harness/coverage_evidence_case.py`
+  (`EvidenceCase` records pass/fail/skip THROUGH the runner into a git-ignored,
+  run-id-bound `harness/.coverage_runs/<run_id>/`). `coverage_model.Check` gained
+  `external_refs` + `is_wstg()`/`reference_label()`.
+- **Two slices** (local fixture + REAL validator + evidence, over loopback HTTP):
+  mass assignment (`AV-MASSASSIGN-01`, `SequenceValidator`) and open redirect
+  (`WSTG-INPV-17`, `OpenRedirectValidator`). Each has 3 labelled aspects:
+  patched-fixture invariant, harness confirmation on vulnerable, harness controlled
+  negative on patched. Report: 38 requirements, 2 `covered_partial` (6 passing
+  aspects), 3 `gap_manual`, 33 `gap_unimplemented` — all gaps flagged.
+- **The #0 trap this closes:** a committed passing artifact previously satisfied the
+  gate WITHOUT the test running. Now evidence is written fresh per run, bound to the
+  commit/run id, and the gate FAILS with no fresh evidence; a failed/skipped run
+  records that. Identity/schema/duplicate are validated; every declared automated
+  aspect is gated INDEPENDENTLY.
+- **WSTG-CONF-09 correction:** it is "Test File Permission" (manual, WSTG v4.2 ref),
+  NOT mass assignment — the reviewer's catch. Mass assignment now carries the
+  internal id `AV-MASSASSIGN-01` with OWASP-API/Academy `external_refs`.
+- **CI (`.github/workflows/ci.yml`):** PR runs the SMOKE SUBSET only (full suite →
+  new nightly job — the real per-PR saving); coverage report + evidence uploaded
+  with `always()`; the `--check` gate enforces fresh passing evidence.
+- **Verify:** `cd harness && python -m unittest test_coverage_manifest
+  test_mass_assignment_slice test_open_redirect_slice` then `python
+  coverage_manifest.py --check`. Full stdlib discovery: **1,782 OK**, exit 0
+  (hermetic; no model/live run). All 8 reviewer findings addressed with regressions.
+- **Owed:** merge decision; broaden the catalog with more slices.
+
+---
+
 ## ►► PARALLEL TRACK — Opus, branch `astra-t05-t08` (T05/T06/T08) ◄◄
 
 Branched off `codex/astra-review-fixes` @ `e24ca7f` in worktree

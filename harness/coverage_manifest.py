@@ -171,6 +171,15 @@ _ASPECT_CONFIRM = ("harness SequenceValidator confirms mass assignment on the vu
 _ASPECT_CONTROL = ("harness SequenceValidator returns a controlled negative on the "
                    "patched fixture")
 
+# ---- the open-redirect vertical slice (WSTG-INPV-17, a genuine WSTG id) ----
+_OR = "WSTG-INPV-17"
+_ASPECT_OR_INVARIANT = ("patched login neutralises an off-origin next and never issues "
+                        "an off-origin redirect")
+_ASPECT_OR_CONFIRM = ("harness OpenRedirectValidator confirms open redirect on the "
+                      "vulnerable fixture (off-origin Location)")
+_ASPECT_OR_CONTROL = ("harness OpenRedirectValidator returns a controlled negative on the "
+                      "patched fixture")
+
 REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
     TestSpec(_MASS,
              "test_mass_assignment_slice.MassAssignmentSliceTest."
@@ -187,14 +196,46 @@ REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
              "test_harness_sequence_validator_controlled_negative_on_patched",
              _ASPECT_CONTROL, mode="automated", label="harness_control",
              evidence_file=evidence_basename(_MASS, _ASPECT_CONTROL)),
+
+    # open redirect (WSTG-INPV-17)
+    TestSpec(_OR,
+             "test_open_redirect_slice.OpenRedirectSliceTest."
+             "test_patched_neutralises_off_origin_redirect",
+             _ASPECT_OR_INVARIANT, mode="automated", label="fixture_invariant",
+             evidence_file=evidence_basename(_OR, _ASPECT_OR_INVARIANT)),
+    TestSpec(_OR,
+             "test_open_redirect_slice.OpenRedirectSliceTest."
+             "test_harness_validator_confirms_vulnerable",
+             _ASPECT_OR_CONFIRM, mode="automated", label="harness_confirmation",
+             evidence_file=evidence_basename(_OR, _ASPECT_OR_CONFIRM)),
+    TestSpec(_OR,
+             "test_open_redirect_slice.OpenRedirectSliceTest."
+             "test_harness_validator_controlled_negative_on_patched",
+             _ASPECT_OR_CONTROL, mode="automated", label="harness_control",
+             evidence_file=evidence_basename(_OR, _ASPECT_OR_CONTROL)),
+
+    # Manual checks: genuinely need a human / host access, so they are declared MANUAL
+    # (a flagged gap, never automated coverage) rather than left as silent
+    # "unimplemented". CSRF and file-upload oracles were retired to manual
+    # (ORACLE_RETIREMENTS.md); file-permission needs host access.
+    TestSpec("WSTG-CONF-09", "", "server files/directories are least-privilege "
+             "(host-level review)", mode="manual", label="manual"),
+    TestSpec("WSTG-SESS-05", "", "state-changing requests carry anti-CSRF protection "
+             "(manual PoC / analyst review)", mode="manual", label="manual"),
+    TestSpec("WSTG-BUSL-09", "", "upload endpoints validate type/size/content "
+             "(manual review)", mode="manual", label="manual"),
 )
 
-# Public aliases the slice's test module references at decoration time, so the test's
+# Public aliases the slice test modules reference at decoration time, so each test's
 # @evidence_for aspects stay in lock-step with the declared specs above.
 MASS_ASSIGNMENT_CHECK_ID = _MASS
 ASPECT_MASS_INVARIANT = _ASPECT_INVARIANT
 ASPECT_MASS_CONFIRM = _ASPECT_CONFIRM
 ASPECT_MASS_CONTROL = _ASPECT_CONTROL
+OPEN_REDIRECT_CHECK_ID = _OR
+ASPECT_OR_INVARIANT = _ASPECT_OR_INVARIANT
+ASPECT_OR_CONFIRM = _ASPECT_OR_CONFIRM
+ASPECT_OR_CONTROL = _ASPECT_OR_CONTROL
 
 
 # ---------------------------------------------------------------------------
