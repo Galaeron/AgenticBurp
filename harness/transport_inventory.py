@@ -179,8 +179,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/oauth_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="redirect_uri exact-match probe uses per-dispatch "
                        "invocation scope, budget, cancellation and executor routing."),
-    TransportSite("validators/header_injection_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="CRLF/header-injection probe."),
+    TransportSite("validators/header_injection_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="bounded CRLF query probes use per-dispatch invocation "
+                       "scope, budget, cancellation and executor routing."),
     TransportSite("validators/http_request_smuggling_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation",
                   note="CL/TE desync; needs a raw-protocol adapter (T08) -- ordinary HTTP "

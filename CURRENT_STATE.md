@@ -131,6 +131,11 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   policy. Real loopback one-send and off-scope zero-send controls pass. Broader
   executor/evidence/confirmation/smoke matrix: **120 OK**. Inventory is **8**
   target routing gaps; passive OAuth checks and oracle semantics are unchanged.
+- **T08p implemented:** bounded CRLF/header-injection query probes now use the
+  per-dispatch executor with run scope, budget, cancellation, and redirect
+  policy. Actual one-send and off-scope zero-send controls pass. Combined
+  validator/executor/evidence/confirmation/smoke matrix: **122 OK**. Inventory
+  is **7** target routing gaps; the marker-header oracle is unchanged.
 
 ---
 

@@ -498,3 +498,17 @@ visibility/contract refinements, not correctness fabrications.
 - Inventory reconciliation: 32 sites, **8 target routing gaps**. Concurrent
   coverage-model/CI changes were explicitly left untouched; active S19 was not
   altered and no new live/model/browser/container run was started.
+
+## 2026-09-11 — T08p header-injection transport
+
+- Bounded CRLF query probes now route through the invocation executor with
+  scope enforcement, request budget, cancellation, and configured redirect
+  policy. The marker-header confirmation oracle and standalone compatibility
+  path are unchanged.
+- Actual loopback control verifies one request and one budget unit. Off-scope
+  negative control verifies no request and zero budget use.
+- Header/OAuth/inventory/executor/evidence/confirmation/smoke matrix: exit 0,
+  **122 tests OK in 16.899s**. Existing smoke socket ResourceWarnings were
+  non-failing.
+- Inventory reconciliation: 32 sites, **7 target routing gaps**. Concurrent
+  coverage files and active S19 were untouched.
