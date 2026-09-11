@@ -189,8 +189,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/recon_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="crawl/common-file/fingerprint fetches use per-dispatch "
                        "invocation scope, budget, cancellation and executor routing."),
-    TransportSite("validators/subdomain_takeover_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="dangling-record fingerprint fetch."),
+    TransportSite("validators/subdomain_takeover_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="provider fingerprint fetch uses per-dispatch invocation "
+                       "scope, budget, cancellation and executor routing."),
     TransportSite("validators/web_cache_poisoning_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="unkeyed-input cache probe."),
 

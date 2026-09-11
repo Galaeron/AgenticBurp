@@ -542,3 +542,17 @@ visibility/contract refinements, not correctness fabrications.
   non-failing.
 - Inventory reconciliation: 32 sites, **5 target routing gaps**. Concurrent
   coverage files and active S19 were untouched.
+
+## 2026-09-11 — T08s subdomain-takeover transport
+
+- Provider fingerprint fetches now route through the invocation executor.
+  Referenced third-party hosts therefore require explicit run scope and obey
+  request budget, cancellation, and redirect policy. The provider fingerprint
+  list and confirmation oracle are unchanged.
+- Actual loopback control verifies one request and one budget unit. Off-scope
+  negative control verifies no request and zero budget use.
+- Static compilation passed. Takeover/inventory/executor/evidence/confirmation/
+  smoke matrix: exit 0, **120 tests OK in 16.396s**. Existing smoke socket
+  ResourceWarnings were non-failing.
+- Inventory reconciliation: 32 sites, **4 target routing gaps**. Concurrent
+  coverage files and active S19 were untouched.

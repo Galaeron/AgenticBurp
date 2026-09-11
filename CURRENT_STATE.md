@@ -148,6 +148,11 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   and redirect policy. Actual loopback one-send and off-scope zero-send controls
   pass. Combined transport/safety/evidence/confirmation/smoke matrix: **168 OK**;
   inventory is **5** routing gaps. Recon result semantics were unchanged.
+- **T08s implemented:** subdomain-provider fingerprint fetches now use the
+  per-dispatch executor, so referenced third-party hosts must be explicitly in
+  run scope and obey budget, cancellation, and redirect policy. Compilation and
+  **120 tests OK**; real loopback one-send and off-scope zero-send controls pass.
+  Inventory is **4** routing gaps; fingerprint/oracle semantics are unchanged.
 
 ---
 

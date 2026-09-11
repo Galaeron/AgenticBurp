@@ -93,9 +93,11 @@ class SubdomainTakeoverValidator(Validator):
     finding_classes = {"subdomain_takeover", "subdomain takeover", "dangling dns", "dangling_dns"}
     active = True
 
-    def __init__(self, timeout: float = 15.0, max_redirects: int = 3):
+    def __init__(self, timeout: float = 15.0, max_redirects: int = 3,
+                 run_context=None):
         self.timeout = timeout
         self.max_redirects = max_redirects
+        self.run_context = run_context
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -204,15 +206,30 @@ class SubdomainTakeoverValidator(Validator):
 
         return sorted(candidates)[:5]  # bounded: don't fan out unboundedly on a busy page
 
+    def _fingerprint_url(self, host: str) -> str:
+        return f"https://{host}/"
+
     async def _check_fingerprint(self, host: str) -> TakeoverTestResult:
-        url = f"https://{host}/"
+        url = self._fingerprint_url(host)
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout, follow_redirects=True, max_redirects=self.max_redirects,
-            ) as client:
-                import global_throttle
-                await global_throttle.acquire()
-                response = await client.get(url, headers={"User-Agent": self.user_agent})
+            if self.run_context is not None:
+                from types import SimpleNamespace
+                from run_context import TypedRequest
+                outcome = await self.run_context.executor().execute(
+                    TypedRequest("GET", url, headers={"User-Agent": self.user_agent}),
+                    capability=self.get_name(), max_redirects=self.max_redirects)
+                if not outcome.ok:
+                    raise httpx.TransportError(outcome.error or outcome.outcome)
+                response = SimpleNamespace(status_code=outcome.status,
+                                           text=outcome.body, headers=outcome.headers)
+            else:
+                async with httpx.AsyncClient(
+                    timeout=self.timeout, follow_redirects=True,
+                    max_redirects=self.max_redirects,
+                ) as client:
+                    import global_throttle
+                    await global_throttle.acquire()
+                    response = await client.get(url, headers={"User-Agent": self.user_agent})
         except Exception as e:
             log.debug(f"Fingerprint fetch failed for {host}: {e}")
             return TakeoverTestResult(
