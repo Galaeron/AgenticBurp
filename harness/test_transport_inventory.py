@@ -100,6 +100,7 @@ class RoutingAuditTests(unittest.TestCase):
         for module in ("role_crawl.py", "crawler.py", "api_surface_discovery.py",
                        "feature_workflow.py", "scope_discovery.py"):
             self.assertEqual(by_mod[module].routing, ti.ROUTING_EXECUTOR)
+        self.assertEqual(by_mod["missing_auth_probe.py"].routing, ti.ROUTING_EXECUTOR)
 
     def test_summary_is_consistent(self):
         s = ti.summary()

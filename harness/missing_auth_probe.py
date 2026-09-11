@@ -149,8 +149,17 @@ def _strip_auth(headers: dict[str, str] | None) -> dict[str, str]:
     return out
 
 
-async def _send(method: str, url: str, headers: dict[str, str], timeout: float) -> tuple[int | None, str]:
+async def _send(method: str, url: str, headers: dict[str, str], timeout: float, *,
+                run_context=None, session_ref: str | None = None) -> tuple[int | None, str]:
     try:
+        if run_context is not None:
+            from run_context import TypedRequest
+            outcome = await run_context.executor().execute(
+                TypedRequest(method, url, headers=headers),
+                capability="missing_auth_probe", session_ref=session_ref)
+            if not outcome.ok:
+                return None, f"request {outcome.outcome}: {outcome.error}"
+            return outcome.status, outcome.body or ""
         await global_throttle.acquire()
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             resp = await client.request(method, url, headers=headers)
@@ -206,6 +215,7 @@ async def probe(
     id_fill: str = "1",
     timeout: float = 15.0,
     gate: SafetyGate | None = None,
+    run_context=None,
 ) -> ProbeOutcome:
     """Probe one endpoint for missing authentication.
 
@@ -232,14 +242,16 @@ async def probe(
         if not include_mutating:
             outcome.note = f"mutating method {method} not probed (include_mutating is off)"
             return outcome
-        gate = gate or get_default_gate()
-        decision = gate.authorize(validator_name="missing_auth_probe", method=method, url=url)
-        if not decision.allowed:
-            outcome.note = f"blocked by safety gate: {decision.reason}"
-            return outcome
+        if run_context is None:
+            gate = gate or get_default_gate()
+            decision = gate.authorize(validator_name="missing_auth_probe", method=method, url=url)
+            if not decision.allowed:
+                outcome.note = f"blocked by safety gate: {decision.reason}"
+                return outcome
 
     unauth_headers = _strip_auth(baseline_headers)
-    status, body = await _send(method, url, unauth_headers, timeout)
+    status, body = await _send(method, url, unauth_headers, timeout,
+                               run_context=run_context)
     if status is None:
         outcome.classification = "error"
         outcome.note = body
@@ -257,7 +269,18 @@ async def probe(
     if send_garbage_token:
         garb_headers = dict(unauth_headers)
         garb_headers["Authorization"] = _GARBAGE_TOKEN
-        g_status, g_body = await _send(method, url, garb_headers, timeout)
+        garbage_ref = None
+        if run_context is not None:
+            from run_context import ScopePolicy
+            garbage_ref = "missing-auth:garbage"
+            run_context.sessions.register(
+                garbage_ref, garbage_ref, {"Authorization": _GARBAGE_TOKEN},
+                allowed_origins=[ScopePolicy.origin_of(url)], role="negative-control")
+            garb_headers = {k: v for k, v in garb_headers.items()
+                            if k.lower() != "authorization"}
+        g_status, g_body = await _send(
+            method, url, garb_headers, timeout, run_context=run_context,
+            session_ref=garbage_ref)
         if g_status is not None:
             outcome.garbage_status = g_status
             outcome.garbage_len = len((g_body or "").strip())

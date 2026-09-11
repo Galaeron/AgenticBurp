@@ -131,9 +131,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="astra-identity (T07)",
                   note="production stateful feature crawl and declared T07 workflows route "
                        "through the executor with per-session state; direct fetch is legacy."),
-    TransportSite("missing_auth_probe.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+    TransportSite("missing_auth_probe.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
-                  gap="unauthenticated-access probe sends directly."),
+                  note="API probes run in a bounded invocation context; anonymous and garbage-token "
+                       "controls use distinct executor session state."),
     TransportSite("iterative_agent.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="agents (T09)",
                   gap="agent tool-fetch sends directly; route through the executor so "

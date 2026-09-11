@@ -211,8 +211,9 @@ class MissingAuthProbeEndpointTests(unittest.TestCase):
         class _Resp:
             def __init__(self, status, text):
                 self.status_code, self.text = status, text
+                self.headers = {}
 
-        async def fake_request(_self, method, url, headers=None):
+        async def fake_request(_self, method, url, headers=None, content=None):
             entry = mapping.get((method.upper(), url))
             if entry is None:
                 return _Resp(404, "")

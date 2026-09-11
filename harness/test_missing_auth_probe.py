@@ -7,6 +7,8 @@ import global_throttle
 import missing_auth_probe as map_
 from js_endpoint_extractor import CallShape
 from safety_gate import SafetyGate, SafetyGateConfig
+from run_context import RunContext
+from test_run_context import _Fixture
 
 
 class _Resp:
@@ -166,6 +168,46 @@ class MissingAuthProbeTests(unittest.TestCase):
             o = asyncio.run(map_.probe(self.BASE, ("GET", "/x"), allowed_hosts=["t.test"]))
         self.assertEqual(o.classification, "error")
         self.assertIsNone(o.finding)
+
+    def test_run_context_actual_anonymous_probe_has_no_credentials(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=1,
+                                gate_config={"active_enabled": True})
+        async def scenario():
+            result = await map_.probe(
+                fixture.base, ("GET", "/public-data"),
+                allowed_hosts=["127.0.0.1"],
+                baseline_headers={"Authorization": "Bearer real"},
+                send_garbage_token=False, run_context=ctx)
+            await ctx.aclose()
+            return result
+        try:
+            outcome = asyncio.run(scenario())
+            self.assertEqual(outcome.classification, "missing_auth")
+            self.assertIsNone(fixture.httpd.received[0]["authorization"])
+            self.assertEqual(ctx.budget.used, 1)
+        finally:
+            fixture.close()
+
+    def test_run_context_blocked_mutation_sends_nothing(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=1,
+            gate_config={"active_enabled": True, "allow_mutating_replay": False})
+        async def scenario():
+            result = await map_.probe(
+                fixture.base, ("POST", "/change"),
+                allowed_hosts=["127.0.0.1"], include_mutating=True,
+                send_garbage_token=False, run_context=ctx)
+            await ctx.aclose()
+            return result
+        try:
+            outcome = asyncio.run(scenario())
+            self.assertEqual(outcome.classification, "error")
+            self.assertEqual(fixture.httpd.received, [])
+            self.assertEqual(ctx.budget.used, 0)
+        finally:
+            fixture.close()
 
     # --- batch ---
     def test_batch_dedupes_and_collects_findings(self):

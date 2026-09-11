@@ -426,23 +426,41 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
 
     if not shapes and req.discover:
         import crawler
-        crawl = await crawler.crawl(
-            req.base_url, headers=req.headers or {}, allowed_hosts=orchestrator.allowed_hosts,
-            max_pages=max(1, min(req.max_pages, 200)),
-        )
+        from run_context import RunContext, ScopePolicy
+        async with RunContext.create(
+                allowed_hosts=orchestrator.allowed_hosts,
+                gate_config=(orchestrator.config.get("validators", {}) or {}),
+                max_requests=max(1, min(req.max_pages, 200))) as crawl_context:
+            session_ref = None
+            if req.headers:
+                session_ref = "probe-missing-auth:source"
+                crawl_context.sessions.register(
+                    session_ref, session_ref, dict(req.headers),
+                    allowed_origins=[ScopePolicy.origin_of(req.base_url)])
+            crawl = await crawler.crawl(
+                req.base_url, headers=req.headers or {}, allowed_hosts=orchestrator.allowed_hosts,
+                max_pages=max(1, min(req.max_pages, 200)), run_context=crawl_context,
+                session_ref=session_ref)
         shapes.extend(CallShape("GET", p) for p in sorted(crawl.endpoints))
 
     if not shapes:
         raise HTTPException(status_code=400, detail="no call_shapes, paths, or discoverable endpoints to probe")
 
-    outcomes = await missing_auth_probe.probe_call_shapes(
-        req.base_url, shapes,
-        allowed_hosts=orchestrator.allowed_hosts,
-        baseline_headers=req.headers or None,
-        send_garbage_token=req.send_garbage_token,
-        include_mutating=req.include_mutating,
-        expected_protected=req.expected_protected,
-    )
+    from run_context import RunContext
+    sends_per_shape = 2 if req.send_garbage_token else 1
+    async with RunContext.create(
+            allowed_hosts=orchestrator.allowed_hosts,
+            gate_config=(orchestrator.config.get("validators", {}) or {}),
+            max_requests=max(1, len(shapes) * sends_per_shape)) as probe_context:
+        outcomes = await missing_auth_probe.probe_call_shapes(
+            req.base_url, shapes,
+            allowed_hosts=orchestrator.allowed_hosts,
+            baseline_headers=req.headers or None,
+            send_garbage_token=req.send_garbage_token,
+            include_mutating=req.include_mutating,
+            expected_protected=req.expected_protected,
+            run_context=probe_context,
+        )
     findings = missing_auth_probe.findings_from(outcomes)
     return {
         "base_url": req.base_url,
