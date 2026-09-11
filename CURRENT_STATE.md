@@ -116,6 +116,11 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   zero-send controls pass. Focused matrix: **117 OK**; broader SQLMap,
   safety, evidence, confirmation, and smoke matrix: **187 OK**. Inventory is
   **11** target routing gaps. No live result was inferred from these tests.
+- **T08m implemented:** registry CORS probes now use per-dispatch run scope,
+  budget, cancellation, redirect policy, and executor routing. Real loopback
+  one-send/one-budget and off-scope zero-send controls pass. Focused matrix:
+  **77 OK**; broader executor/evidence/confirmation/smoke matrix: **120 OK**.
+  Inventory is **10** target routing gaps; CORS oracle semantics were unchanged.
 
 ---
 

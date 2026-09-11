@@ -170,8 +170,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                        "boolean-probe fallback uses the invocation executor."),
     TransportSite("validators/api_security_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_GATED,
                   owner="confirmation", note="mass-assignment/BOLA checks; mutating sends via the gate."),
-    TransportSite("validators/cors_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="read-only CORS preflight/probe."),
+    TransportSite("validators/cors_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="registry CORS probes use per-dispatch invocation "
+                       "scope, budget, cancellation and executor routing."),
     TransportSite("validators/csp_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="read-only header fetch."),
     TransportSite("validators/oauth_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,

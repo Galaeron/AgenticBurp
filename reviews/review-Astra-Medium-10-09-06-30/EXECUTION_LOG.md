@@ -455,3 +455,17 @@ visibility/contract refinements, not correctness fabrications.
   and smoke-fixture socket ResourceWarnings were non-failing.
 - Inventory reconciliation: 32 sites, **11 target routing gaps**. Active S19 was
   untouched; no new live/model/browser/container run was started.
+
+## 2026-09-11 — T08m CORS transport
+
+- Registry CORS requests now route through the invocation executor, including
+  per-hop scope, request budget, cancellation, and configured redirect limits.
+  Existing direct transport remains only for standalone calls without context.
+- Actual loopback control verifies one GET and one budget unit. The off-scope
+  negative control verifies no target request and zero budget consumption.
+- Focused CORS/inventory/registry/evidence/confirmation matrix: exit 0,
+  **77 tests OK in 3.916s**. Broader executor/cache/smoke matrix: exit 0,
+  **120 tests OK in 16.136s**. Existing smoke socket ResourceWarnings were
+  non-failing.
+- Inventory reconciliation: 32 sites, **10 target routing gaps**. CORS oracle
+  behavior was not promoted or otherwise changed; active S19 was untouched.

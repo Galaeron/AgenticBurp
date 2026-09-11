@@ -63,9 +63,11 @@ class CorsValidator(Validator):
     finding_classes = {"cors", "cors misconfiguration", "cross-origin resource sharing"}
     active = True
     
-    def __init__(self, timeout: float = 10.0, max_redirects: int = 5):
+    def __init__(self, timeout: float = 10.0, max_redirects: int = 5,
+                 run_context=None):
         self.timeout = timeout
         self.max_redirects = max_redirects
+        self.run_context = run_context
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -220,6 +222,17 @@ class CorsValidator(Validator):
         headers["User-Agent"] = self.user_agent
 
         try:
+            if self.run_context is not None:
+                from run_context import TypedRequest
+                outcome = await self.run_context.executor().execute(
+                    TypedRequest(method, url, headers=headers),
+                    capability=self.get_name(),
+                    max_redirects=self.max_redirects if follow_redirects else 0)
+                if not outcome.ok:
+                    return None
+                return httpx.Response(
+                    outcome.status or 0, content=(outcome.body or "").encode(),
+                    headers=outcome.headers, request=httpx.Request(method, url))
             import global_throttle
             await global_throttle.acquire()
             async with httpx.AsyncClient(
