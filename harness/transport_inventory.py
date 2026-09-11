@@ -152,8 +152,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="astra-identity (F04/T03)",
                   note="production graph validation binds every identity and anonymous replay "
                        "to isolated RunContext sessions; legacy registry use remains compatible."),
-    TransportSite("validators/jwt_forge_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="read-only forge+replay; opens its own client."),
+    TransportSite("validators/jwt_forge_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="graph forge/control replays use isolated ephemeral "
+                       "sessions through the invocation executor; legacy registry path remains."),
     TransportSite("validators/rate_limit_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="authorize-burst replay; provisional oracle."),
     TransportSite("validators/toctou_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,

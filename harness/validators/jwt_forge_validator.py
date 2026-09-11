@@ -132,9 +132,11 @@ class JwtForgeValidator(Validator):
                        "authentication_bypass", "broken_authentication", "weak_token"}
     active = True
 
-    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0):
+    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
+                 run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        self.run_context = run_context
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         # Fire on a jwt-ish finding OR whenever the request actually carries a JWT
@@ -148,6 +150,23 @@ class JwtForgeValidator(Validator):
 
     async def _probe(self, url: str, headers: dict) -> tuple[int | None, str]:
         try:
+            if self.run_context is not None:
+                from run_context import ScopePolicy, TypedRequest
+                credential_headers = {k: v for k, v in headers.items()
+                                      if k.lower() in ("authorization", "cookie", "proxy-authorization")}
+                session_ref = "jwt-forge:" + hashlib.sha256(
+                    repr(sorted(credential_headers.items())).encode()).hexdigest()[:16]
+                self.run_context.sessions.register(
+                    session_ref, session_ref, credential_headers,
+                    allowed_origins=[ScopePolicy.origin_of(url)], role="negative-control")
+                request_headers = {k: v for k, v in headers.items()
+                                   if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
+                outcome = await self.run_context.executor().execute(
+                    TypedRequest("GET", url, headers=request_headers),
+                    capability=self.name, session_ref=session_ref)
+                if not outcome.ok:
+                    return None, ""
+                return outcome.status, outcome.body or ""
             await global_throttle.acquire()
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
                 r = await client.get(url, headers=headers or None)

@@ -1266,7 +1266,8 @@ class Orchestrator:
             max_identities=int(_xid_cfg.get("max_identities", 3)),
             run_context=run_context)
         _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts)
-        _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts)
+        _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts,
+                                 run_context=run_context)
         _ssrf = SsrfValidator(allowed_hosts=self.allowed_hosts)
         _xxe = XxeValidator(allowed_hosts=self.allowed_hosts)
         _cmdi = CommandInjectionValidator(allowed_hosts=self.allowed_hosts)

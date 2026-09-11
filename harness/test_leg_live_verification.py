@@ -328,6 +328,21 @@ class LiveLegVerificationTest(unittest.TestCase):
         res = self._run_ex(v, self._jwt_exchange("/jwt/kid-safe"), "jwt")
         self.assertNotEqual(res.status, "confirmed")
 
+    def test_jwt_kid_confusion_through_run_context(self):
+        from run_context import RunContext
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=8,
+            gate_config={"active_enabled": True})
+        validator = JwtForgeValidator(allowed_hosts=["127.0.0.1"], run_context=ctx)
+        async def scenario():
+            result = await validator.validate(
+                _finding("jwt"), self._jwt_exchange("/jwt/kid"))
+            await ctx.aclose()
+            return result
+        result = asyncio.run(scenario())
+        self.assertEqual(result.status, "confirmed")
+        self.assertGreaterEqual(ctx.budget.used, 2)
+
 
     # --- Browser XSS (Playwright, real Chromium) --------------------------------
     @unittest.skipUnless(browser_driver.playwright_available(),
