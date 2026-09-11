@@ -65,9 +65,11 @@ class OAuthValidator(Validator):
     finding_classes = {"oauth", "oauth2", "oidc", "openid connect"}
     active = True
 
-    def __init__(self, timeout: float = 10.0, max_redirects: int = 0):
+    def __init__(self, timeout: float = 10.0, max_redirects: int = 0,
+                 run_context=None):
         self.timeout = timeout
         self.max_redirects = max_redirects
+        self.run_context = run_context
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -251,15 +253,26 @@ class OAuthValidator(Validator):
         probe_url = urlunparse(parsed._replace(query=urlencode(flat_qs)))
 
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
-            ) as client:
-                import global_throttle
-                await global_throttle.acquire()
-                response = await client.request(
-                    "GET", probe_url,  # authorize endpoints are GET by spec; never replay the captured method
-                    headers={"User-Agent": self.user_agent},
-                )
+            if self.run_context is not None:
+                from types import SimpleNamespace
+                from run_context import TypedRequest
+                outcome = await self.run_context.executor().execute(
+                    TypedRequest("GET", probe_url, headers={"User-Agent": self.user_agent}),
+                    capability=self.get_name(), max_redirects=self.max_redirects)
+                if not outcome.ok:
+                    raise httpx.TransportError(outcome.error or outcome.outcome)
+                response = SimpleNamespace(status_code=outcome.status,
+                                           headers=outcome.headers)
+            else:
+                async with httpx.AsyncClient(
+                    timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
+                ) as client:
+                    import global_throttle
+                    await global_throttle.acquire()
+                    response = await client.request(
+                        "GET", probe_url,  # authorize endpoints are GET by spec; never replay the captured method
+                        headers={"User-Agent": self.user_agent},
+                    )
         except Exception as e:
             log.debug(f"redirect_uri probe failed: {e}")
             return OAuthTestResult("Redirect URI Validation", True, "low",

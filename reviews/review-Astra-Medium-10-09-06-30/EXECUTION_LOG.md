@@ -483,3 +483,18 @@ visibility/contract refinements, not correctness fabrications.
   were non-failing.
 - Inventory reconciliation: 32 sites, **9 target routing gaps**. Active S19 was
   untouched and no new live/model/browser/container run was started.
+
+## 2026-09-11 — T08o OAuth/OIDC transport
+
+- The one active OAuth redirect_uri exact-match probe now routes through the
+  invocation executor with scope, request budget, cancellation, and configured
+  redirect policy. Passive state/PKCE/token checks and oracle behavior are
+  unchanged; standalone context-free use retains compatibility transport.
+- Actual loopback control verifies one request and one budget unit. The
+  off-scope negative control verifies no request and zero budget use.
+- OAuth/inventory/executor/evidence/confirmation/smoke matrix: exit 0,
+  **120 tests OK in 15.742s**. Existing smoke socket ResourceWarnings were
+  non-failing.
+- Inventory reconciliation: 32 sites, **8 target routing gaps**. Concurrent
+  coverage-model/CI changes were explicitly left untouched; active S19 was not
+  altered and no new live/model/browser/container run was started.

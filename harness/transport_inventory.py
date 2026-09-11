@@ -176,8 +176,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/csp_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="fresh CSP/framing header fetch uses per-dispatch "
                        "invocation scope, budget, cancellation and redirect policy."),
-    TransportSite("validators/oauth_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="OAuth/OIDC endpoint probes."),
+    TransportSite("validators/oauth_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="redirect_uri exact-match probe uses per-dispatch "
+                       "invocation scope, budget, cancellation and executor routing."),
     TransportSite("validators/header_injection_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="CRLF/header-injection probe."),
     TransportSite("validators/http_request_smuggling_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,

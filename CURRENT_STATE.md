@@ -126,6 +126,11 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   redirects. Real loopback one-send and off-scope zero-send controls pass. The
   combined CSP/CORS/executor/evidence/confirmation/smoke matrix is **122 OK**;
   inventory is **9** target routing gaps. Header oracle semantics were unchanged.
+- **T08o implemented:** OAuth/OIDC redirect-uri exact-match probes now use the
+  per-dispatch executor with run scope, budget, cancellation, and redirect
+  policy. Real loopback one-send and off-scope zero-send controls pass. Broader
+  executor/evidence/confirmation/smoke matrix: **120 OK**. Inventory is **8**
+  target routing gaps; passive OAuth checks and oracle semantics are unchanged.
 
 ---
 
