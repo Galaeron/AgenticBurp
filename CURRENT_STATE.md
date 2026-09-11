@@ -81,6 +81,20 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   no full-suite claim has been made after T08a–f. Resume sequentially at
   `missing_auth_probe.py`, then remaining validator/orchestrator transports.
 
+- **2026-09-11 continuation on `astra-integration`:** T08g–i (`ec450a3`,
+  `6d99cd1`, `ddfa95f`) migrate missing-auth anonymous/garbage controls, JWT
+  forge/control probes, and rate-limit bursts to invocation-local executor
+  sessions. Inventory is now **14 target routing gaps** (from 23 initially).
+  Focused final gates: missing-auth/API/context **39 OK**, JWT actual+negative
+  controls **6 OK** (broader confirmation matrix **92 OK, 2 skipped**), rate-limit
+  matrix **75 OK**, inventory **10 OK** after each slice. The rate-limit oracle
+  remains observation-only/provisional.
+- **Live S19 status:** `testing/vulncorp-helpdesk/maxrun/` contains the live run.
+  Pass 1 completed all **37/37** captured exchanges and wrote the intermediate
+  result after **5,946.5s**; Pass 2 `investigate_engagement` is still running as
+  of this checkpoint, so `investigate` is null and no final coverage/recall claim
+  is reconciled yet. Do not stop or restart its Python/target processes.
+
 ---
 
 ## ►► SESSION-17 STATE (READ FIRST) ◄◄

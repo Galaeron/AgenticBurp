@@ -386,3 +386,19 @@ visibility/contract refinements, not correctness fabrications.
   the post-T07 result: 1,708 OK, 2 skipped; a post-T08 full suite is still owed.
 - Resume: migrate `missing_auth_probe.py` next, then capability validators and the
   residual orchestrator/agent paths one at a time with actual and negative controls.
+## 2026-09-11 — T08g–i and live-run reconciliation
+
+- `ec450a3`: missing-auth API probing uses bounded RunContexts; anonymous and
+  garbage-token requests have distinct session state. Actual negative control
+  confirms blocked mutation sends zero requests and consumes zero budget.
+- `6d99cd1`: JWT garbage/forge variants use isolated ephemeral sessions through
+  the executor. Actual vulnerable `kid` fixture confirms; fixed-secret control
+  remains silent.
+- `ddfa95f`: rate-limit replay uses the invocation gate, session, budget and
+  executor. Three-send actual transport control passed; oracle remains explicitly
+  observation-only.
+- Final focused gates: 39 OK; 6 OK (plus 92 OK, 2 skipped broader confirmation);
+  75 OK; inventory 10 OK. Inventory now 14 target routing gaps.
+- S19 live run is not complete: pass 1 finished 37/37 in 5,946.5s, while pass 2
+  remains active. Its intermediate JSON has `investigate: null`; final coverage
+  and recall are therefore not yet reconciled.
