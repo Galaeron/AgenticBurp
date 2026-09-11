@@ -161,8 +161,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/toctou_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="graph authority reads and concurrent write burst use "
                        "the invocation gate, session binding, budget and executor; provisional oracle."),
-    TransportSite("validators/race_condition_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="concurrent-request differential."),
+    TransportSite("validators/race_condition_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="registry validation binds a per-dispatch run context; "
+                       "concurrent burst uses its gate, session, budget and executor."),
     TransportSite("validators/sqlmap.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation",
                   note="container leg via tool_runner; a direct httpx boolean-probe fallback "

@@ -102,6 +102,13 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   target routing gaps. One earlier broad invocation reported 67 tests with one
   loader error because `test_confirmation_routing` does not exist; no product
   failure was hidden, and the corrected named-module run exited 0.
+- **T08k implemented:** registry race-condition bursts use invocation-local
+  transport. Context is attached to per-dispatch validator copies, preserving
+  shared-registry concurrency isolation and the public two-argument registry
+  seam. Real loopback session/budget and denied zero-send controls pass. Final
+  broader matrix: **155 OK**; inventory is **12** target routing gaps. An initial
+  broader run exposed 12 compatibility-seam errors and was corrected before this
+  result; no live claim changed.
 
 ---
 

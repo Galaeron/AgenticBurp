@@ -357,6 +357,20 @@ class ValidatorRegistry:
         return [v for v in self.validators.values()
                 if v.applies(finding, exchange) and (not v.active or self.active_enabled)]
 
+    def bind_run_context(self, validators, run_context):
+        """Return invocation-bound copies without changing for_finding's public seam."""
+        # Registry instances are shared by an Orchestrator and may serve concurrent
+        # invocations. Bind context on shallow per-dispatch copies, never by mutating
+        # the registered singleton validator.
+        import copy
+        bound = []
+        for validator in validators:
+            if hasattr(validator, "run_context"):
+                validator = copy.copy(validator)
+                validator.run_context = run_context
+            bound.append(validator)
+        return bound
+
     def passive_validators(self) -> list[Validator]:
         """Return validators that can run without sending any network traffic
         (active=False). Used by the universal header audit to scan every

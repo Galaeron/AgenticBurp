@@ -72,10 +72,12 @@ class RaceConditionValidator(Validator):
     finding_classes = {"race_condition", "race condition", "toctou", "time of check to time of use"}
     active = True
 
-    def __init__(self, timeout: float = 15.0, max_redirects: int = 0, burst_size: int = _BURST_SIZE):
+    def __init__(self, timeout: float = 15.0, max_redirects: int = 0,
+                 burst_size: int = _BURST_SIZE, run_context=None):
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.burst_size = burst_size
+        self.run_context = run_context
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -133,7 +135,8 @@ class RaceConditionValidator(Validator):
                        if k.lower() not in ("content-length", "host")}
             headers.setdefault("User-Agent", self.user_agent)
 
-            gate_decision = get_default_gate().authorize_burst(
+            gate = self.run_context.gate if self.run_context is not None else get_default_gate()
+            gate_decision = gate.authorize_burst(
                 validator_name=self.get_name(), method=exchange.method, url=exchange.url,
                 requested_burst_size=self.burst_size, body=exchange.request_body,
             )
@@ -148,6 +151,20 @@ class RaceConditionValidator(Validator):
 
             async def fire_one():
                 try:
+                    if self.run_context is not None:
+                        from types import SimpleNamespace
+                        from run_context import TypedRequest
+                        from .transport import bind_session
+                        session_ref, request_headers = bind_session(self.run_context, headers)
+                        result = await self.run_context.executor().execute(
+                            TypedRequest(exchange.method, exchange.url,
+                                         headers=request_headers,
+                                         body=exchange.request_body or None),
+                            capability=self.get_name(), session_ref=session_ref)
+                        if not result.ok:
+                            return None
+                        return SimpleNamespace(status_code=result.status, text=result.body,
+                                               headers=result.headers)
                     async with httpx.AsyncClient(
                         timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
                     ) as client:

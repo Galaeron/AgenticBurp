@@ -420,3 +420,22 @@ visibility/contract refinements, not correctness fabrications.
   sockets were emitted; no assertion failed.
 - Inventory reconciliation: 32 sites, **13 target routing gaps** (down from 14).
   No new live/model/browser/container run was started; active S19 was untouched.
+
+## 2026-09-11 — T08k race-condition transport
+
+- Registry race-condition bursts route through the invocation gate, bound
+  session, budget, cancellation, and executor. The shared registry validator is
+  never mutated: `bind_run_context` returns shallow per-dispatch copies.
+- Preserved the original two-argument `for_finding` interface for lightweight
+  registries/plugins. The first broad run exposed this compatibility requirement:
+  exit 1, **155 tests run, 12 errors**, all from test registries rejecting the
+  initially-added keyword argument. Moving binding to the optional hook fixed it.
+- Actual-loopback controls verify exactly 3 authenticated sends and budget units;
+  mutating-replay denial verifies zero sends and zero budget. A separate control
+  proves two contexts bind to distinct copies while the registry object remains
+  context-free.
+- Initial focused matrix: exit 0, **56 tests OK in 2.899s**. Corrected broader
+  registry/evidence/confirmation/smoke matrix: exit 0, **155 tests OK in 7.296s**.
+  Existing smoke-fixture socket ResourceWarnings remain non-failing.
+- Inventory reconciliation: 32 sites, **12 target routing gaps**. Active S19 was
+  untouched and no new live/model/browser/container run was started.
