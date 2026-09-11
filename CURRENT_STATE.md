@@ -121,6 +121,11 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   one-send/one-budget and off-scope zero-send controls pass. Focused matrix:
   **77 OK**; broader executor/evidence/confirmation/smoke matrix: **120 OK**.
   Inventory is **10** target routing gaps; CORS oracle semantics were unchanged.
+- **T08n implemented:** CSP/clickjacking fresh-header fetches now use the
+  per-dispatch executor with run scope, budget, cancellation, and bounded manual
+  redirects. Real loopback one-send and off-scope zero-send controls pass. The
+  combined CSP/CORS/executor/evidence/confirmation/smoke matrix is **122 OK**;
+  inventory is **9** target routing gaps. Header oracle semantics were unchanged.
 
 ---
 

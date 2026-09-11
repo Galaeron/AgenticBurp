@@ -469,3 +469,17 @@ visibility/contract refinements, not correctness fabrications.
   non-failing.
 - Inventory reconciliation: 32 sites, **10 target routing gaps**. CORS oracle
   behavior was not promoted or otherwise changed; active S19 was untouched.
+
+## 2026-09-11 — T08n CSP/clickjacking transport
+
+- Fresh CSP/framing header requests now route through the invocation executor,
+  carrying per-hop scope enforcement, budget, cancellation, and the validator's
+  redirect limit. Standalone context-free calls retain the direct compatibility
+  path; CSP and framing oracles are unchanged.
+- Actual loopback control verifies one request and one budget unit. Off-scope
+  control verifies no request and zero budget use.
+- Combined CSP/CORS/inventory/executor/evidence/confirmation/smoke matrix:
+  exit 0, **122 tests OK in 16.892s**. Existing smoke socket ResourceWarnings
+  were non-failing.
+- Inventory reconciliation: 32 sites, **9 target routing gaps**. Active S19 was
+  untouched and no new live/model/browser/container run was started.

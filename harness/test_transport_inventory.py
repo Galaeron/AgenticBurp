@@ -112,6 +112,8 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(by_mod["validators/sqlmap.py"].routing, ti.ROUTING_EXECUTOR)
         self.assertEqual(by_mod["validators/cors_validator.py"].routing,
                          ti.ROUTING_EXECUTOR)
+        self.assertEqual(by_mod["validators/csp_validator.py"].routing,
+                         ti.ROUTING_EXECUTOR)
 
     def test_summary_is_consistent(self):
         s = ti.summary()

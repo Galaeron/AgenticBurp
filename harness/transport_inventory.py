@@ -173,8 +173,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/cors_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="registry CORS probes use per-dispatch invocation "
                        "scope, budget, cancellation and executor routing."),
-    TransportSite("validators/csp_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="read-only header fetch."),
+    TransportSite("validators/csp_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="fresh CSP/framing header fetch uses per-dispatch "
+                       "invocation scope, budget, cancellation and redirect policy."),
     TransportSite("validators/oauth_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="OAuth/OIDC endpoint probes."),
     TransportSite("validators/header_injection_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
