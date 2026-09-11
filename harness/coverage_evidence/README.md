@@ -1,30 +1,29 @@
 # coverage_evidence/
 
-Machine-generated evidence artifacts for the requirement-coverage manifest
-([`../coverage_manifest.py`](../coverage_manifest.py)).
+Documentation only. **No pass/fail artifacts are committed here** — that was the
+original mistake (a committed passing artifact let the coverage gate go green without
+the test ever running, and a later failed/skipped run could not invalidate it).
 
-Each `*.json` file is written by a deterministic regression test on the path where
-its security assertions actually held (see `coverage_manifest.write_evidence`). The
-manifest reconciles these artifacts against `REQUIREMENT_TESTS` to compute
-requirement coverage — kept deliberately separate from test outcomes:
+Evidence is now written FRESH per run into a **run-specific, git-ignored directory**
+and bound to the run/commit id:
 
-- A passing test yields only **partial** coverage of a WSTG requirement (the one
-  aspect it exercises), never "complete".
-- **Missing evidence, a skipped/failed test, or a manual-only check never counts as
-  covered.** Coverage is computed from these artifacts, not from a test merely
-  existing — delete an artifact and its requirement reverts to a gap.
+- Location: `harness/.coverage_runs/<run_id>/` by default, or the path in
+  `COVERAGE_EVIDENCE_DIR`. `run_id` is `COVERAGE_RUN_ID` (CI sets it to the commit
+  sha) or the current git HEAD.
+- Written by the **test runner**, not the test body: a regression test subclasses
+  `coverage_evidence_case.EvidenceCase` and marks a method with `@evidence_for(...)`.
+  The runner stamps the actual outcome (`pass` / `fail` / `skipped`) — so a failed or
+  skipped test records that, and never leaves a stale `pass` behind.
+- Each artifact separates a reproducible `observation` block from per-run `execution`
+  metadata (status, `run_id`, timestamp), and carries a `schema_version`.
 
-Artifacts are deterministic (sorted keys, no wall clock, seeded fixture markers), so
-a green re-run reproduces byte-identical files and leaves the working tree clean.
-Regenerate by running the owning test, e.g.:
-
-```bash
-cd harness && python -m unittest test_mass_assignment_slice
-```
-
-View the reconciled report:
+The gate (`coverage_manifest.py --check`) reconciles ONLY artifacts whose `run_id`
+matches the current run, requires an exact non-empty `test_id` match, validates the
+schema, and rejects duplicates — so nothing but a real, fresh pass counts as coverage.
 
 ```bash
-cd harness && python coverage_manifest.py            # Markdown report
-cd harness && python coverage_manifest.py --check     # non-zero if a declared automated check lost coverage
+# regenerate this run's evidence, then reconcile + gate it
+cd harness
+python -m unittest test_mass_assignment_slice
+python coverage_manifest.py --check
 ```

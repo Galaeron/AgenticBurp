@@ -1,0 +1,8 @@
+# Per-run coverage evidence (written fresh by the test runner, bound to the run id).
+# Never committed -- a committed passing artifact could satisfy the coverage gate
+# without the test actually running. See coverage_evidence/README.md.
+.coverage_runs/
+
+# Generated coverage reports (CI artifacts, not source).
+coverage_report.md
+coverage_report.json

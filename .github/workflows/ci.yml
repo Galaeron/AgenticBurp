@@ -5,21 +5,25 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # Nightly full suite (07:00 UTC). The `nightly` job below runs the whole
-    # unittest discovery; the `fast` job carries the per-PR signal.
+    # Nightly full suite (07:00 UTC). Per-PR runs the fast smoke subset only; the
+    # whole unittest suite runs here on a schedule (fast-subset-per-PR / full-nightly).
     - cron: "0 7 * * *"
 
+# Bind coverage evidence to the commit so a stale artifact from another run can never
+# satisfy the gate; the writer (tests) and the gate reconcile the same run id.
+env:
+  COVERAGE_RUN_ID: ${{ github.sha }}
+
 jobs:
-  # Fast tier: runs on every push/PR. A quick end-to-end SMOKE SUBSET first (the
-  # detection/investigate/authorization/mass-assignment slices + the coverage
-  # manifest) so a broken pipeline goes red in seconds, THEN the full unittest
-  # suite. The smoke subset is the "green tests, dead pipeline" tripwire; if
-  # detection regresses to zero it fails here even though the mocked tests pass.
+  # Fast tier (every push/PR): the SMOKE SUBSET only -- the detection/investigate/
+  # authorization/mass-assignment slices + the coverage manifest. This is the genuine
+  # per-PR saving: the full unittest suite is NOT run here (it runs nightly), so a PR
+  # gets a fast pipeline-liveness signal. The smoke subset is the "green tests, dead
+  # pipeline" tripwire, and it also generates this run's fresh coverage evidence.
   #
-  # windows-latest + Python 3.14 match the environment the lock was frozen from
-  # (the project runs on Windows); pin the lock, not a floating resolve.
+  # windows-latest + Python 3.14 match the environment the lock was frozen from.
   fast:
-    name: Fast tier (PR smoke subset + full unit suite)
+    name: Fast tier (PR smoke subset + coverage gate)
     if: github.event_name != 'schedule'
     runs-on: windows-latest
     steps:
@@ -31,7 +35,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r harness/requirements.lock
-      - name: PR smoke suite (fast signal, includes the mass-assignment slice)
+      - name: Clean this run's evidence dir (fresh, run-bound)
+        working-directory: harness
+        run: python -c "import shutil; shutil.rmtree('.coverage_runs', ignore_errors=True)"
+      - name: PR smoke subset (fast signal, writes this run's coverage evidence)
         working-directory: harness
         run: >-
           python -m unittest
@@ -42,19 +49,31 @@ jobs:
           test_smoke_phase0_capture_review
           test_mass_assignment_slice
           test_coverage_manifest
-      - name: Full unit suite (includes end-to-end detection smoke test)
-        working-directory: harness
-        run: python -m unittest discover -p "test_*.py"
-      - name: Requirement-coverage gate (declared automated checks must be covered)
+      - name: Requirement-coverage gate (declared automated aspects must be a fresh pass)
         working-directory: harness
         run: python coverage_manifest.py --check
+      - name: Generate coverage report (always, for diagnostics)
+        if: always()
+        working-directory: harness
+        run: |
+          python coverage_manifest.py > coverage_report.md
+          python coverage_manifest.py --json > coverage_report.json
+      - name: Upload coverage evidence + report (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-evidence-fast-${{ github.run_id }}
+          path: |
+            harness/.coverage_runs/**
+            harness/coverage_report.md
+            harness/coverage_report.json
+          if-no-files-found: warn
       - name: Score math self-test (no model/fixture needed)
         working-directory: testing
         run: python -m unittest test_score
 
-  # Nightly tier: the full unittest suite on a schedule (also runnable on demand
-  # via workflow_dispatch), plus the requirement-coverage report. This is the
-  # "full suite nightly" half of fast-subset-per-PR / full-suite-nightly.
+  # Nightly tier (schedule + on-demand): the WHOLE unittest suite, then the coverage
+  # gate + report. This is the "full suite nightly" half.
   nightly:
     name: Nightly tier (full suite + coverage report)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -68,21 +87,39 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r harness/requirements.lock
-      - name: Full unit suite
+      - name: Clean this run's evidence dir
+        working-directory: harness
+        run: python -c "import shutil; shutil.rmtree('.coverage_runs', ignore_errors=True)"
+      - name: Full unit suite (writes this run's coverage evidence)
         working-directory: harness
         run: python -m unittest discover -p "test_*.py"
-      - name: Requirement-coverage report + gate
+      - name: Requirement-coverage gate
         working-directory: harness
         run: python coverage_manifest.py --check
+      - name: Generate coverage report (always, for diagnostics)
+        if: always()
+        working-directory: harness
+        run: |
+          python coverage_manifest.py > coverage_report.md
+          python coverage_manifest.py --json > coverage_report.json
+      - name: Upload coverage evidence + report (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-evidence-nightly-${{ github.run_id }}
+          path: |
+            harness/.coverage_runs/**
+            harness/coverage_report.md
+            harness/coverage_report.json
+          if-no-files-found: warn
       - name: Score math self-test
         working-directory: testing
         run: python -m unittest test_score
 
-  # Scored tier: enforces the precision/recall floor. It needs a local model
-  # runner (Ollama + GPU) and the built detection fixture, so it cannot run on a
-  # stock GitHub-hosted runner. Left disabled until SESSION_4_PLAN.md T2
-  # (score.py + fixture + published floor) is complete; then point it at a
-  # self-hosted GPU runner and flip `if:` to a real condition.
+  # Scored tier: enforces the precision/recall floor. It needs a local model runner
+  # (Ollama + GPU) and the built detection fixture, so it cannot run on a stock
+  # GitHub-hosted runner. Left disabled until SESSION_4_PLAN.md T2 is complete; then
+  # point it at a self-hosted GPU runner and flip `if:` to a real condition.
   scored:
     name: Scored tier (precision/recall floor) [needs self-hosted GPU]
     if: ${{ false }}

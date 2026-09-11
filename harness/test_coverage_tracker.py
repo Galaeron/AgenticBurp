@@ -17,8 +17,9 @@ class ClassMappingTests(unittest.TestCase):
         # free-text access-control the canonicaliser returns None for
         self.assertIn("WSTG-ATHZ-04", self.t.checks_for_class("IDOR/BOLA"))
         self.assertTrue(self.t.checks_for_class("Broken Function-Level Authorization"))
-        # mass assignment -> api_security check
-        self.assertIn("WSTG-CONF-09", self.t.checks_for_class("mass_assignment"))
+        # mass assignment -> api_security check (internal id; WSTG-CONF-09 is a
+        # different requirement -- "Test File Permission")
+        self.assertIn("AV-MASSASSIGN-01", self.t.checks_for_class("mass_assignment"))
 
     def test_unknown_class_maps_to_nothing(self):
         self.assertEqual(self.t.checks_for_class("totally-made-up-class"), [])

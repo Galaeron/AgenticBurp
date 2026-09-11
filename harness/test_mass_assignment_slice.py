@@ -1,27 +1,29 @@
 """
-WSTG-CONF-09 mass-assignment vertical slice -- deterministic regression over ACTUAL HTTP.
+Mass-assignment vertical slice (internal id AV-MASSASSIGN-01) -- deterministic
+regression over ACTUAL HTTP.
 
-This is the reference regression the requirement-coverage manifest points at
-(coverage_manifest.REQUIREMENT_TESTS). It proves ONE aspect of the requirement:
+This is the reference regression the requirement-coverage manifest points at. It is a
+LOCAL FIXTURE self-test plus two harness-leg checks -- explicitly NOT application-wide
+or pipeline coverage. Each coverage-bearing test is a SEPARATE aspect with its own
+evidence artifact and semantic label (fixture_invariant / harness_confirmation /
+harness_control), so one passing artifact never stands in for the others (issue 5).
 
-    THE PROTECTED-FIELD INVARIANT: an ordinary update must leave server-controlled
-    fields (`role`, `is_admin`, `account_balance`, `id`) UNCHANGED -- verified by an
-    INDEPENDENT re-read of persisted state, not the write's own echo.
+Aspects (each emits its own evidence via the runner, not the test body -- issue 2):
 
-It runs against a local, isolated `MassAssignmentFixture` (vulnerable/patched), and:
+  1. fixture_invariant   -- the PATCHED fixture leaves server-controlled fields
+                            (`role`, `is_admin`, `account_balance`, `id`) unchanged
+                            under an ordinary update, verified by an INDEPENDENT
+                            re-read of persisted state. (A vulnerable-mode control
+                            proves the assertion discriminates.)
+  2. harness_confirmation -- the REAL SequenceValidator confirms mass assignment on
+                            the vulnerable fixture over the socket.
+  3. harness_control      -- the REAL SequenceValidator returns a controlled negative
+                            on the patched fixture.
 
-  1. asserts the invariant holds on the PATCHED server even when the update tries to
-     set protected fields, verifying persisted state via a fresh GET;
-  2. NEGATIVE CONTROL: the SAME update on the VULNERABLE server violates the invariant
-     -- proving the assertion discriminates (not a plumbing tautology);
-  3. drives the REAL harness `SequenceValidator` (write->re-read differential) over the
-     socket: CONFIRMED on vulnerable, controlled-negative on patched;
-  4. emits a deterministic evidence artifact the coverage manifest reconciles.
-
-Reproducible + hermetic: no model, no network beyond loopback, no clock/randomness in
-assertions (seeded fixture markers), bounded timeouts, explicit assertions only. State
-resets per fixture instance. The safety gate + throttle are configured per test and
-reset in tearDown so nothing leaks into the rest of the suite.
+Reproducible + hermetic: no model, loopback only, seeded fixture markers, bounded
+timeouts, explicit assertions. The global throttle AND the safety gate are saved in
+setUp and restored via addCleanup so a failure never leaks either into the suite
+(issue 7).
 """
 from __future__ import annotations
 
@@ -30,10 +32,10 @@ import unittest
 
 import httpx
 
-import coverage_manifest
+import coverage_manifest as cm
 import global_throttle
 import safety_gate
-from coverage_manifest import TestStatus
+from coverage_evidence_case import EvidenceCase, evidence_for
 from models import Finding, HttpExchange
 from testing_fixtures.mass_assignment import (
     MassAssignmentFixture, PROTECTED_FIELDS, WRITABLE_FIELDS,
@@ -48,23 +50,24 @@ VALIDATE_TIMEOUT = 15.0   # hard ceiling on the whole validator coroutine
 # would try to smuggle in. A correct API applies only the writable field.
 _ATTACK_BODY = {"username": "attacker", "role": "admin", "is_admin": True,
                 "account_balance": 999999}
-
-_TEST_ID = ("test_mass_assignment_slice.MassAssignmentSliceTest."
-            "test_patched_upholds_protected_field_invariant")
 _INVARIANT = ("an ordinary update must leave server-controlled fields "
               "(role, is_admin, account_balance, id) unchanged")
 
 
-class MassAssignmentSliceTest(unittest.TestCase):
+class MassAssignmentSliceTest(EvidenceCase):
     def setUp(self):
+        # Save the previous throttle config and restore it via cleanup (issue 7):
+        # cleanups run even if the test fails, so we never leak `configure(0)`.
+        st = global_throttle.throttle.stats()
+        prev_rate = st["rate_per_second"] if st["enabled"] else 0.0
+        prev_burst = st["burst"] if st["enabled"] else None
+        self.addCleanup(lambda: global_throttle.configure(prev_rate, prev_burst))
         global_throttle.configure(0)
-        safety_gate.reset_default_gate()
-        # Mutating replay is opt-in (the stricter flag) -- the SequenceValidator's
-        # write step needs it; the invariant assertions use only GET/PATCH via httpx.
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
 
-    def tearDown(self):
+        # Same for the process-wide safety gate.
+        self.addCleanup(safety_gate.reset_default_gate)
         safety_gate.reset_default_gate()
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
 
     def _fixture(self, mode):
         fx = MassAssignmentFixture(mode)
@@ -79,33 +82,22 @@ class MassAssignmentSliceTest(unittest.TestCase):
     def _patch(url, body):
         return httpx.patch(url, json=body, timeout=HTTP_TIMEOUT)
 
-    # --- 1. the protected-field invariant (the PASS regression) ------------
+    # --- aspect 1: the protected-field invariant (fixture self-test) -------
 
+    @evidence_for(check_id=cm.MASS_ASSIGNMENT_CHECK_ID, aspect=cm.ASPECT_MASS_INVARIANT,
+                  label="fixture_invariant", invariant=_INVARIANT)
     def test_patched_upholds_protected_field_invariant(self):
         fx = self._fixture("patched")
         url = fx.user_url("1")
 
         before = self._get(url).json()
-        # Ordinary update that also tries to set protected fields.
-        patch_resp = self._patch(url, _ATTACK_BODY)
+        patch_resp = self._patch(url, _ATTACK_BODY)   # ordinary update + smuggled fields
         self.assertEqual(patch_resp.status_code, 200)
-        # INDEPENDENT re-read of persisted state -- not the write's echo.
-        after = self._get(url).json()
+        after = self._get(url).json()                 # INDEPENDENT re-read of persisted state
 
-        # Invariant: every server-controlled field is UNCHANGED.
-        for f in sorted(PROTECTED_FIELDS):
-            self.assertEqual(after.get(f), before.get(f),
-                             f"protected field {f!r} changed under an ordinary update "
-                             f"({before.get(f)!r} -> {after.get(f)!r}) -- mass assignment")
-        # And the legitimately-writable field DID change, proving the update was
-        # processed (the server is not just rejecting the request wholesale).
-        self.assertEqual(after.get("username"), "attacker")
-        self.assertNotEqual(after.get("username"), before.get("username"))
-        # The per-instance marker anchors this to THIS fixture (no accidental oracle).
-        self.assertEqual(after.get("marker"), fx.marker("1"))
-
-        # Emit the deterministic evidence artifact the coverage manifest reconciles.
-        observed = {
+        # Record the reproducible observation BEFORE asserting, so evidence carries it
+        # even when nothing goes wrong (the status is stamped by the runner).
+        self.record_observation({
             "protected_before": {k: before.get(k) for k in sorted(PROTECTED_FIELDS)},
             "protected_after": {k: after.get(k) for k in sorted(PROTECTED_FIELDS)},
             "writable_field": "username",
@@ -113,37 +105,29 @@ class MassAssignmentSliceTest(unittest.TestCase):
             "writable_after": after.get("username"),
             "attack_body_keys": sorted(_ATTACK_BODY),
             "verified_by": "independent GET re-read of persisted state",
-        }
-        path = coverage_manifest.write_evidence(
-            check_id="WSTG-CONF-09", test_id=_TEST_ID,
-            aspect=coverage_manifest.REQUIREMENT_TESTS[0].aspect,
-            status=TestStatus.PASS, invariant=_INVARIANT,
-            reason="patched server left all server-controlled fields unchanged after an "
-                   "ordinary update carrying privileged fields; verified by re-read",
-            observed=observed)
-        self.assertTrue(path.exists())
-        # The written artifact must reconcile to passing partial coverage.
-        loaded = coverage_manifest.load_evidence(coverage_manifest.EVIDENCE_DIR)
-        rec = loaded.get(("WSTG-CONF-09", coverage_manifest.REQUIREMENT_TESTS[0].aspect))
-        self.assertIsNotNone(rec, "evidence artifact was not written where the manifest reads it")
-        self.assertEqual(rec.status, TestStatus.PASS)
+        })
 
-    # --- 2. negative control: the invariant is violated when vulnerable ----
+        for f in sorted(PROTECTED_FIELDS):
+            self.assertEqual(after.get(f), before.get(f),
+                             f"protected field {f!r} changed under an ordinary update "
+                             f"({before.get(f)!r} -> {after.get(f)!r}) -- mass assignment")
+        # The legitimately-writable field DID change (not a blanket rejection).
+        self.assertEqual(after.get("username"), "attacker")
+        self.assertNotEqual(after.get("username"), before.get("username"))
+        self.assertEqual(after.get("marker"), fx.marker("1"))  # anchors to THIS fixture
 
     def test_vulnerable_violates_invariant_control(self):
+        # Control (not itself coverage): proves the invariant assertion discriminates.
         fx = self._fixture("vulnerable")
         url = fx.user_url("1")
         before = self._get(url).json()
         self.assertEqual(self._patch(url, _ATTACK_BODY).status_code, 200)
         after = self._get(url).json()
-        # The vulnerable server DID accept the privileged fields and PERSISTED them.
         self.assertEqual(after.get("role"), "admin")
         self.assertIs(after.get("is_admin"), True)
         self.assertNotEqual(after.get("role"), before.get("role"),
                             "control is inert: the vulnerable server did not actually "
                             "change a protected field, so the invariant test proves nothing")
-
-    # --- 3. an ordinary update still applies the writable fields -----------
 
     def test_patched_applies_writable_fields(self):
         fx = self._fixture("patched")
@@ -152,13 +136,11 @@ class MassAssignmentSliceTest(unittest.TestCase):
         after = self._get(url).json()
         self.assertEqual(after.get("username"), "bob")
         self.assertEqual(after.get("email"), "bob@example.test")
-        self.assertEqual(WRITABLE_FIELDS, frozenset({"username", "email"}))  # documents the whitelist
+        self.assertEqual(WRITABLE_FIELDS, frozenset({"username", "email"}))
 
-    # --- 4. the REAL harness confirmation leg over the socket --------------
+    # --- aspects 2 & 3: the REAL harness confirmation leg over the socket ---
 
     def _run_sequence_validator(self, fx):
-        # A captured ordinary write; the SequenceValidator augments it with privileged
-        # fields and confirms via an independent re-read differential.
         exchange = HttpExchange(
             url=fx.user_url("1"), method="PATCH",
             request_headers={"Content-Type": "application/json"},
@@ -174,41 +156,48 @@ class MassAssignmentSliceTest(unittest.TestCase):
 
         return asyncio.run(scenario())
 
+    @evidence_for(check_id=cm.MASS_ASSIGNMENT_CHECK_ID, aspect=cm.ASPECT_MASS_CONFIRM,
+                  label="harness_confirmation")
     def test_harness_sequence_validator_confirms_vulnerable(self):
         fx = self._fixture("vulnerable")
         res = self._run_sequence_validator(fx)
+        after = self._get(fx.user_url("1")).json()
+        self.record_observation({"validator": res.validator, "status": res.status,
+                                 "confirmed": res.confirmed, "is_admin_after": after.get("is_admin")})
         self.assertEqual(res.status, "confirmed")
         self.assertTrue(res.confirmed)
-        # A privileged field actually persisted, proven by the independent re-read.
-        self.assertEqual(self._get(fx.user_url("1")).json().get("is_admin"), True)
+        self.assertEqual(after.get("is_admin"), True)  # a privileged field persisted
 
+    @evidence_for(check_id=cm.MASS_ASSIGNMENT_CHECK_ID, aspect=cm.ASPECT_MASS_CONTROL,
+                  label="harness_control")
     def test_harness_sequence_validator_controlled_negative_on_patched(self):
         fx = self._fixture("patched")
         res = self._run_sequence_validator(fx)
+        after = self._get(fx.user_url("1")).json()
+        self.record_observation({"validator": res.validator, "status": res.status,
+                                 "confirmed": res.confirmed, "role_after": after.get("role"),
+                                 "is_admin_after": after.get("is_admin")})
         self.assertEqual(res.status, "not_confirmed")
         self.assertFalse(res.confirmed)
-        # The controlled negative is real: the write ran but nothing escalated.
-        after = self._get(fx.user_url("1")).json()
         self.assertEqual(after.get("role"), "user")
         self.assertIs(after.get("is_admin"), False)
 
-    # --- 5. reproducibility + isolation ------------------------------------
+    # --- reproducibility + isolation (plain hygiene tests) -----------------
 
     def test_seeded_markers_are_reproducible(self):
         a = MassAssignmentFixture("patched", seed=42)
         self.addCleanup(a.close)
         b = MassAssignmentFixture("patched", seed=42)
         self.addCleanup(b.close)
-        self.assertEqual(a.marker("1"), b.marker("1"))  # same seed -> same marker
+        self.assertEqual(a.marker("1"), b.marker("1"))
         c = MassAssignmentFixture("patched", seed=43)
         self.addCleanup(c.close)
-        self.assertNotEqual(a.marker("1"), c.marker("1"))  # different seed -> different marker
+        self.assertNotEqual(a.marker("1"), c.marker("1"))
 
     def test_state_resets_between_instances(self):
         fx1 = self._fixture("vulnerable")
         self._patch(fx1.user_url("1"), {"role": "admin"})
         self.assertEqual(self._get(fx1.user_url("1")).json().get("role"), "admin")
-        # A fresh instance starts from the seeded baseline -- no state bleed.
         fx2 = MassAssignmentFixture("vulnerable", seed=1729)
         self.addCleanup(fx2.close)
         self.assertEqual(self._get(fx2.user_url("1")).json().get("role"), "user")

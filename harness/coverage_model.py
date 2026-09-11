@@ -398,17 +398,34 @@ ApplicabilityPredicate = Callable[[dict], tuple[bool, str]]
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class ExternalRef:
+    """An independently-verified external reference for a check.
+
+    Kept structured (not a bare string) so a report can distinguish a genuine WSTG
+    test id from an OWASP-API entry or an Academy topic, and so we never encode a
+    catalog id we cannot stand behind. `catalog` names the source (e.g. "WSTG",
+    "OWASP API Security Top 10 2023", "PortSwigger Academy"); `ref` is the id within
+    it (e.g. "WSTG-INPV-05", "API3:2023") or "" for a URL-only reference."""
+    catalog: str
+    ref: str = ""
+    url: str = ""
+    title: str = ""
+    version: str = ""
+
+
+@dataclass(frozen=True)
 class Check:
     """A single security check in the catalog.
 
-    The `id` is a *versioned* WSTG reference: the stable WSTG test id plus the
-    `wstg_version` it is anchored to (WSTG ids are stable within a release but the
-    catalog is pinned to a specific one so a reference never silently drifts). The
-    optional `academy_url` is a full PortSwigger Academy topic URL used as a scenario
-    reference for building the local regression fixtures -- Academy/WSTG are *reference
-    catalogs* here, not an exploitation runner.
+    The `id` is the check's PRIMARY identifier. For checks that map cleanly onto a
+    WSTG test it is the versioned WSTG id (the stable WSTG id + `wstg_version` it is
+    anchored to). For a scenario with NO clean WSTG mapping (e.g. mass assignment,
+    which is an API-layer issue with no dedicated WSTG v4.2 test) it is an INTERNAL
+    `AV-*` id, and the real external sources live in `external_refs` -- so the catalog
+    never falsely labels a scenario with a WSTG id that means something else. WSTG and
+    Academy are *reference catalogs* here, not an exploitation runner.
     """
-    id: str                              # e.g. "WSTG-INPV-05"
+    id: str                              # e.g. "WSTG-INPV-05" or internal "AV-MASSASSIGN-01"
     name: str                            # human-readable
     phase: Phase
     vulnerability_class: str             # maps to categories.canonicalize
@@ -417,7 +434,8 @@ class Check:
     description: str = ""
     academy_ref: str = ""                # PortSwigger Academy topic name if applicable
     academy_url: str = ""                # optional full Academy topic URL (scenario reference)
-    wstg_version: str = "4.2"            # the WSTG release the id is versioned against
+    wstg_version: str = "4.2"            # the WSTG release a genuine WSTG id is anchored to
+    external_refs: tuple[ExternalRef, ...] = ()   # independently-verified external sources
 
     def applies(self, endpoint: dict) -> tuple[bool, str]:
         """Deterministic applicability + the rationale for WHY it applies or doesn't."""
@@ -426,10 +444,20 @@ class Check:
     def canonical_class(self) -> str | None:
         return canonicalize(self.vulnerability_class)
 
+    def is_wstg(self) -> bool:
+        """Whether the primary id is a genuine WSTG test id."""
+        return self.id.startswith("WSTG-")
+
+    def reference_label(self) -> str:
+        """A human label for the primary id: versioned for a genuine WSTG id, else the
+        internal id marked as such (external sources are in `external_refs`)."""
+        if self.is_wstg():
+            return f"{self.id} (WSTG v{self.wstg_version})"
+        return f"{self.id} (internal scenario)"
+
+    # Back-compat alias; only meaningful for genuine WSTG ids.
     def wstg_ref(self) -> str:
-        """The versioned WSTG reference for reports/audits, e.g.
-        "WSTG-CONF-09 (WSTG v4.2)"."""
-        return f"{self.id} (WSTG v{self.wstg_version})"
+        return self.reference_label()
 
 
 # ---------------------------------------------------------------------------
@@ -510,11 +538,25 @@ CHECK_CATALOG: tuple[Check, ...] = (
     Check("WSTG-ERRH-01", "Error handling / stack traces", Phase.ENDPOINT,
           "info_disclosure", _always_applicable, "recon",
           "Trigger errors and check for verbose stack traces / debug info"),
-    Check("WSTG-CONF-09", "Mass assignment", Phase.ENDPOINT,
+    # Mass assignment is an API-layer scenario with NO dedicated WSTG v4.2 test
+    # (WSTG-CONF-09 is "Test File Permission" -- a different thing), so it carries an
+    # internal id and its real sources live in external_refs. See coverage_manifest.
+    Check("AV-MASSASSIGN-01", "Mass assignment (server-controlled field protection)", Phase.ENDPOINT,
           "api_security", _accepts_body, "sequence",
-          "Send extra fields in requests and check if they persist",
-          "Mass assignment",
-          academy_url="https://portswigger.net/web-security/api-testing/lab-exploiting-mass-assignment-vulnerabilities"),
+          "An ordinary update must not let a client set server-controlled fields "
+          "(role, is_admin, balance); send those fields and verify they do not persist.",
+          academy_ref="Mass assignment",
+          external_refs=(
+              ExternalRef("PortSwigger Academy", "",
+                          "https://portswigger.net/web-security/api-testing/lab-exploiting-mass-assignment-vulnerabilities",
+                          "Exploiting mass assignment vulnerabilities"),
+              ExternalRef("OWASP API Security Top 10 2023", "API3:2023",
+                          "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/",
+                          "Broken Object Property Level Authorization (subsumes mass assignment)"),
+              ExternalRef("OWASP API Security Top 10 2019", "API6:2019",
+                          "https://owasp.org/API-Security/editions/2019/en/0xa6-mass-assignment/",
+                          "Mass Assignment"),
+          )),
     Check("WSTG-BUSV-04", "HTTP request smuggling", Phase.ENDPOINT,
           "http_request_smuggling", _accepts_body, "http_request_smuggling",
           "Test CL/TE and TE/CL desync",

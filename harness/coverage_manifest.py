@@ -1,49 +1,88 @@
 """
-Requirement-coverage manifest -- WSTG requirements ⇄ regression tests + evidence.
+Requirement-coverage manifest -- security requirements ⇄ regression tests + evidence.
 
 This is deliberately SEPARATE from `coverage_model.CoverageMatrix`:
 
 - `CoverageMatrix` is the per-RUN outcome substrate (identity × endpoint × check
   cells filled by what a live engagement actually did on a target).
-- This module is the per-REPO *requirement coverage* ledger: which WSTG
-  requirements have an isolated, deterministic regression test standing behind
-  them, what that test's last recorded outcome was, and where its evidence lives.
+- This module is the per-REPO *requirement coverage* ledger: which requirements have
+  an isolated regression test standing behind them, what that test's outcome was IN
+  THE CURRENT RUN, and where its evidence lives.
 
-The two must not be conflated, and the guiding rule here is the improving-notes
-one:
+Guiding rules (each one is a fix for a real hole the reviewer found):
 
-    **A passing test does not prove an entire requirement is covered.**
+- **A passing test proves only the aspect it exercises, never a whole requirement.**
+  A requirement with a passing aspect is `covered_partial`; every other aspect
+  (failed / skipped / missing / manual) stays visible as a residual gap, INCLUDING
+  under a partially-covered requirement.
+- **Evidence is bound to the current run.** Every artifact records a `run_id`; the
+  gate only trusts artifacts whose `run_id` matches this run and lives in a
+  run-specific directory. A stale passing artifact from a previous run can NOT
+  satisfy a new run, and a failed/skipped execution overwrites the old verdict.
+- **Outcomes come from the test runner, not the test body** (`coverage_evidence_case`):
+  a fail or skip is recorded as such, so "the test did not run / did not pass" is
+  never silently a pass.
+- **Identity must match exactly.** Evidence with an empty or mismatched `test_id`,
+  an unsupported schema, or a duplicate file for one aspect is rejected -- it never
+  counts as covered.
+- **Reproducible observations are separate from execution metadata.** The `observation`
+  block (what the fixture showed) is reproducible; the `execution` block (status,
+  run id, timestamp) is per-run.
 
-So a requirement with a passing regression test is reported as ``covered_partial``
-(the specific *aspect* the test exercises), never "complete" -- the scenarios the
-test does not touch stay visible as residual gaps. And, crucially:
-
-    **Missing evidence or a skipped/failed/manual test never counts as covered.**
-
-Coverage is computed *from evidence artifacts on disk*, not from the mere
-existence of a test function: if the artifact is absent, the requirement is a gap,
-full stop. A regression test writes its artifact (via `write_evidence`) only on the
-path where its assertions actually held, so the artifact's presence is meaningful.
-
-Report vocabulary (the improving-notes set): pass / fail / skipped / manual /
-not_applicable, plus `not_implemented` flagged SEPARATELY as a missing-implementation
-gap (a requirement with no wired automated test at all).
+Report vocabulary: pass / fail / skipped / manual / not_applicable, plus
+`not_implemented` flagged SEPARATELY (a declared automated aspect with no fresh
+evidence, or a requirement with no test at all).
 """
 from __future__ import annotations
 
+import functools
 import json
+import os
 import re
+import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
 from coverage_model import CHECKS_BY_ID, CHECK_CATALOG, Check
 
-# Committed evidence directory -- the regression tests write their artifacts here,
-# and `reconcile()` reads them back. Kept under harness/ so it travels with the
-# code and CI checkout. Deterministic filenames + deterministic content mean a
-# green re-run leaves the working tree clean.
-EVIDENCE_DIR = Path(__file__).resolve().parent / "coverage_evidence"
+SCHEMA_VERSION = 1
+_HARNESS = Path(__file__).resolve().parent
+
+
+# ---------------------------------------------------------------------------
+# Run identity + run-specific evidence directory (freshness -- issue 2)
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=1)
+def current_run_id() -> str:
+    """A stable identifier for THIS run/commit, shared by the test-writer process
+    and the gate process. Prefers an explicit `COVERAGE_RUN_ID` (CI sets it to the
+    commit sha), else the current git HEAD, else a clearly-marked local fallback.
+    Cached so the writer and a same-process reader agree."""
+    env = os.environ.get("COVERAGE_RUN_ID")
+    if env:
+        return env.strip()
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(_HARNESS),
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "local-unknown-run"
+
+
+def run_evidence_dir(run_id: str | None = None) -> Path:
+    """The run-specific evidence directory. An explicit `COVERAGE_EVIDENCE_DIR` wins
+    (CI points both steps at one fresh path); otherwise a per-run subdir under
+    `.coverage_runs/` (git-ignored). Keying by run id keeps runs from bleeding into
+    each other without any shared mutable committed directory."""
+    env = os.environ.get("COVERAGE_EVIDENCE_DIR")
+    if env:
+        return Path(env)
+    return _HARNESS / ".coverage_runs" / (run_id or current_run_id())
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +96,10 @@ class TestStatus(str, Enum):
     SKIPPED = "skipped"
     MANUAL = "manual"                 # verified/handled by a human, not automated
     NOT_APPLICABLE = "not_applicable"
-    NOT_IMPLEMENTED = "not_implemented"  # no wired test / no evidence artifact found
+    NOT_IMPLEMENTED = "not_implemented"  # no fresh evidence for a declared automated aspect
 
     @classmethod
-    def coerce(cls, value: str) -> "TestStatus":
+    def coerce(cls, value) -> "TestStatus":
         try:
             return cls(str(value).strip().lower())
         except ValueError:
@@ -70,18 +109,16 @@ class TestStatus(str, Enum):
 
 # A test outcome counts toward requirement coverage ONLY if it is a real pass.
 _COVERING_STATUSES = frozenset({TestStatus.PASS})
-# Statuses that are gaps but are NOT "missing implementation".
-_GAP_STATUSES = frozenset({TestStatus.FAIL, TestStatus.SKIPPED, TestStatus.MANUAL})
 
 
 class RequirementStatus(str, Enum):
     """The coverage rollup for a WHOLE requirement -- distinct from TestStatus."""
-    COVERED_PARTIAL = "covered_partial"   # ≥1 aspect has passing evidence (never "complete")
+    COVERED_PARTIAL = "covered_partial"   # ≥1 aspect has fresh passing evidence (never "complete")
     GAP_FAILED = "gap_failed"             # a wired test is failing
     GAP_SKIPPED = "gap_skipped"           # a wired test is skipped / evidence missing
     GAP_MANUAL = "gap_manual"             # only manual verification is declared
     GAP_UNIMPLEMENTED = "gap_unimplemented"  # no wired test at all (missing implementation)
-    NOT_APPLICABLE = "not_applicable"     # requirement declared N/A for the target class
+    NOT_APPLICABLE = "not_applicable"     # requirement declared N/A for the target, with rationale
 
 
 # ---------------------------------------------------------------------------
@@ -90,24 +127,28 @@ class RequirementStatus(str, Enum):
 
 @dataclass(frozen=True)
 class TestSpec:
-    """A repo-declared link from a WSTG requirement to a regression test.
+    """A repo-declared link from a requirement to a regression test.
 
-    `aspect` names the *specific* scenario of the requirement the test exercises,
-    so the report can honestly say "this aspect is covered" rather than "the whole
-    requirement is covered". `kind` is "automated" (an evidence artifact is expected)
-    or "manual" (a documented human-verification step -- always a gap for automated
-    coverage, surfaced under `manual`)."""
+    `aspect` names the SPECIFIC scenario the test exercises (so the report says "this
+    aspect is covered", never "the requirement is covered"). `mode` is "automated" (a
+    fresh evidence artifact is expected) or "manual" (a documented human step -- always
+    a gap for automated coverage). `label` is the semantic kind of evidence
+    (e.g. "fixture_invariant", "harness_confirmation") so a fixture self-test is never
+    presented as application-wide or pipeline coverage (issue 5)."""
     check_id: str
-    test_id: str            # "module.TestClass.test_method"
+    test_id: str            # "module.TestClass.test_method" (must match the runner's)
     aspect: str
-    kind: str = "automated"       # "automated" | "manual"
-    evidence_file: str = ""       # basename under EVIDENCE_DIR (automated specs)
+    mode: str = "automated"       # "automated" | "manual"
+    label: str = "automated"      # semantic evidence kind
+    evidence_file: str = ""       # basename under the evidence dir (automated specs)
 
     def __post_init__(self):
         if self.check_id not in CHECKS_BY_ID:
-            raise ValueError(f"TestSpec references unknown WSTG check id {self.check_id!r}")
-        if self.kind not in ("automated", "manual"):
-            raise ValueError(f"TestSpec.kind must be 'automated' or 'manual', got {self.kind!r}")
+            raise ValueError(f"TestSpec references unknown check id {self.check_id!r}")
+        if self.mode not in ("automated", "manual"):
+            raise ValueError(f"TestSpec.mode must be 'automated' or 'manual', got {self.mode!r}")
+        if self.mode == "automated" and not self.test_id:
+            raise ValueError("an automated TestSpec must declare a non-empty test_id")
 
 
 def _slug(text: str) -> str:
@@ -121,98 +162,138 @@ def evidence_basename(check_id: str, aspect: str) -> str:
     return f"{check_id}__{_slug(aspect)}.json"
 
 
-# The registry. One entry per (requirement, aspect). Grows as regression tests are
-# added; today it carries the mass-assignment vertical slice. Everything else in the
-# catalog with no entry is surfaced by `reconcile()` as a GAP_UNIMPLEMENTED, which is
-# the honest "requirement checklist, gaps flagged" the improving notes ask for.
-_MASS_ASSIGNMENT_ASPECT = (
-    "PATCH ordinary update leaves server-controlled fields unchanged "
-    "(verified by an independent re-read)"
-)
+# ---- the mass-assignment vertical slice (internal id, external refs in catalog) ----
+_MASS = "AV-MASSASSIGN-01"
+_ASPECT_INVARIANT = ("patched fixture leaves server-controlled fields unchanged under "
+                     "an ordinary update (independent re-read)")
+_ASPECT_CONFIRM = ("harness SequenceValidator confirms mass assignment on the vulnerable "
+                   "fixture (write then independent re-read differential)")
+_ASPECT_CONTROL = ("harness SequenceValidator returns a controlled negative on the "
+                   "patched fixture")
 
 REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
-    TestSpec(
-        check_id="WSTG-CONF-09",
-        test_id="test_mass_assignment_slice.MassAssignmentSliceTest."
-                "test_patched_upholds_protected_field_invariant",
-        aspect=_MASS_ASSIGNMENT_ASPECT,
-        kind="automated",
-        evidence_file=evidence_basename("WSTG-CONF-09", _MASS_ASSIGNMENT_ASPECT),
-    ),
+    TestSpec(_MASS,
+             "test_mass_assignment_slice.MassAssignmentSliceTest."
+             "test_patched_upholds_protected_field_invariant",
+             _ASPECT_INVARIANT, mode="automated", label="fixture_invariant",
+             evidence_file=evidence_basename(_MASS, _ASPECT_INVARIANT)),
+    TestSpec(_MASS,
+             "test_mass_assignment_slice.MassAssignmentSliceTest."
+             "test_harness_sequence_validator_confirms_vulnerable",
+             _ASPECT_CONFIRM, mode="automated", label="harness_confirmation",
+             evidence_file=evidence_basename(_MASS, _ASPECT_CONFIRM)),
+    TestSpec(_MASS,
+             "test_mass_assignment_slice.MassAssignmentSliceTest."
+             "test_harness_sequence_validator_controlled_negative_on_patched",
+             _ASPECT_CONTROL, mode="automated", label="harness_control",
+             evidence_file=evidence_basename(_MASS, _ASPECT_CONTROL)),
 )
+
+# Public aliases the slice's test module references at decoration time, so the test's
+# @evidence_for aspects stay in lock-step with the declared specs above.
+MASS_ASSIGNMENT_CHECK_ID = _MASS
+ASPECT_MASS_INVARIANT = _ASPECT_INVARIANT
+ASPECT_MASS_CONFIRM = _ASPECT_CONFIRM
+ASPECT_MASS_CONTROL = _ASPECT_CONTROL
 
 
 # ---------------------------------------------------------------------------
-# Evidence artifacts
+# Applicability declarations (issue 6): explicit, with rationale
+# ---------------------------------------------------------------------------
+
+# check_id -> (applicable, rationale). Absent means "applicable by default". A
+# declaration here is the honest, auditable place to record a scope-based exclusion
+# (e.g. "no XML endpoints in scope"); it is intentionally empty in the shipped repo
+# so we never fabricate a scope claim -- the mechanism is exercised by the tests.
+REQUIREMENT_APPLICABILITY: dict[str, tuple[bool, str]] = {}
+
+
+def applicability_of(check_id: str,
+                     table: dict[str, tuple[bool, str]] | None = None) -> tuple[bool, str]:
+    table = REQUIREMENT_APPLICABILITY if table is None else table
+    if check_id in table:
+        return table[check_id]
+    return (True, "applicable by default; no scope-based exclusion declared")
+
+
+# ---------------------------------------------------------------------------
+# Evidence artifacts (reproducible observation vs per-run execution -- issue 2)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class EvidenceRecord:
-    """One test's recorded outcome, as written to / read from an evidence artifact."""
     check_id: str
-    test_id: str
     aspect: str
     status: TestStatus
+    kind: str = "automated"
     invariant: str = ""
+    observation: dict = field(default_factory=dict)   # reproducible
+    # execution metadata (per-run):
+    test_id: str = ""
+    run_id: str = ""
+    recorded_at: str = ""
     reason: str = ""
-    observed: dict = field(default_factory=dict)
-    wstg_version: str = ""
-    academy_url: str = ""
-    # `run_label` is a caller-supplied, deterministic marker (NOT a wall clock),
-    # so a committed artifact stays byte-stable across reproducible re-runs.
-    run_label: str = "deterministic-regression"
-    path: str = ""       # filled on load; not part of the on-disk body
+    schema_version: int = SCHEMA_VERSION
+    # runtime-only:
+    path: str = ""
+    conflict: bool = False
+    invalid_reason: str = ""
 
     def to_dict(self) -> dict:
         return {
+            "schema_version": self.schema_version,
             "check_id": self.check_id,
-            "test_id": self.test_id,
             "aspect": self.aspect,
-            "status": self.status.value,
+            "kind": self.kind,
             "invariant": self.invariant,
-            "reason": self.reason,
-            "observed": self.observed,
-            "wstg_version": self.wstg_version,
-            "academy_url": self.academy_url,
-            "run_label": self.run_label,
+            "observation": self.observation,
+            "execution": {
+                "test_id": self.test_id,
+                "status": self.status.value,
+                "run_id": self.run_id,
+                "recorded_at": self.recorded_at,
+                "reason": self.reason,
+            },
         }
 
     @classmethod
     def from_dict(cls, d: dict, *, path: str = "") -> "EvidenceRecord":
+        ex = d.get("execution") or {}
         return cls(
             check_id=str(d.get("check_id", "")),
-            test_id=str(d.get("test_id", "")),
             aspect=str(d.get("aspect", "")),
-            status=TestStatus.coerce(d.get("status", "")),
+            status=TestStatus.coerce(ex.get("status", "")),
+            kind=str(d.get("kind", "automated")),
             invariant=str(d.get("invariant", "")),
-            reason=str(d.get("reason", "")),
-            observed=d.get("observed") or {},
-            wstg_version=str(d.get("wstg_version", "")),
-            academy_url=str(d.get("academy_url", "")),
-            run_label=str(d.get("run_label", "deterministic-regression")),
+            observation=d.get("observation") or {},
+            test_id=str(ex.get("test_id", "")),
+            run_id=str(ex.get("run_id", "")),
+            recorded_at=str(ex.get("recorded_at", "")),
+            reason=str(ex.get("reason", "")),
+            schema_version=d.get("schema_version"),
             path=path,
         )
 
 
-def write_evidence(*, check_id: str, test_id: str, aspect: str, status,
-                   invariant: str = "", reason: str = "", observed: dict | None = None,
-                   evidence_dir: Path | str = EVIDENCE_DIR,
-                   run_label: str = "deterministic-regression") -> Path:
-    """Write a regression test's evidence artifact deterministically and return its
-    path. Content is sorted-key JSON with no wall clock, so a green re-run of a
-    deterministic test produces byte-identical output (clean working tree). Pulls the
-    versioned WSTG ref + Academy URL from the catalog so the artifact is self-describing."""
+def write_evidence(*, check_id: str, aspect: str, status, test_id: str,
+                   kind: str = "automated", invariant: str = "", reason: str = "",
+                   observation: dict | None = None, run_id: str | None = None,
+                   recorded_at: str | None = None,
+                   evidence_dir: Path | str | None = None) -> Path:
+    """Write a regression test's evidence artifact for the CURRENT run and return its
+    path. The observation block is reproducible; the execution block binds the record
+    to `run_id` (defaults to the current run) with a timestamp. Writes into the
+    run-specific dir by default."""
     if check_id not in CHECKS_BY_ID:
-        raise ValueError(f"evidence references unknown WSTG check id {check_id!r}")
+        raise ValueError(f"evidence references unknown check id {check_id!r}")
     st = status if isinstance(status, TestStatus) else TestStatus.coerce(status)
-    check = CHECKS_BY_ID[check_id]
+    rid = run_id or current_run_id()
     rec = EvidenceRecord(
-        check_id=check_id, test_id=test_id, aspect=aspect, status=st,
-        invariant=invariant, reason=reason, observed=observed or {},
-        wstg_version=check.wstg_version, academy_url=check.academy_url,
-        run_label=run_label,
-    )
-    d = Path(evidence_dir)
+        check_id=check_id, aspect=aspect, status=st, kind=kind, invariant=invariant,
+        observation=observation or {}, test_id=test_id, run_id=rid,
+        recorded_at=recorded_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        reason=reason)
+    d = Path(evidence_dir) if evidence_dir is not None else run_evidence_dir(rid)
     d.mkdir(parents=True, exist_ok=True)
     path = d / evidence_basename(check_id, aspect)
     path.write_text(json.dumps(rec.to_dict(), indent=2, sort_keys=True) + "\n",
@@ -220,24 +301,51 @@ def write_evidence(*, check_id: str, test_id: str, aspect: str, status,
     return path
 
 
-def load_evidence(evidence_dir: Path | str = EVIDENCE_DIR) -> dict[tuple[str, str], EvidenceRecord]:
-    """Load every evidence artifact under `evidence_dir`, keyed by (check_id, aspect).
-    A malformed artifact is skipped (it can never satisfy coverage -- absence of a
-    valid record is a gap, never a pass)."""
-    out: dict[tuple[str, str], EvidenceRecord] = {}
-    d = Path(evidence_dir)
+def load_evidence(evidence_dir: Path | str | None = None, *,
+                  run_id: str | None = None) -> dict[tuple[str, str], EvidenceRecord]:
+    """Load evidence artifacts, keyed by (check_id, aspect), enforcing:
+
+    - **freshness**: when `run_id` is given, artifacts from a DIFFERENT run are
+      ignored entirely (a stale pass can never satisfy the gate -- issue 2);
+    - **schema validation**: a wrong/absent `schema_version` is surfaced as an
+      invalid FAIL record, never a pass (issue 3);
+    - **no duplicates**: two artifacts for one aspect become a conflict FAIL rather
+      than letting the last file silently win (issue 3).
+    """
+    d = Path(evidence_dir) if evidence_dir is not None else run_evidence_dir(run_id)
+    buckets: dict[tuple[str, str], list[EvidenceRecord]] = {}
     if not d.is_dir():
-        return out
+        return {}
     for p in sorted(d.glob("*.json")):
         try:
             body = json.loads(p.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             continue
-        if not isinstance(body, dict) or not body.get("check_id"):
+        if not isinstance(body, dict) or not body.get("check_id") or body.get("aspect") is None:
             continue
         rel = p.relative_to(d.parent) if d.parent in p.parents else p
         rec = EvidenceRecord.from_dict(body, path=rel.as_posix())
-        out[(rec.check_id, rec.aspect)] = rec
+        # Freshness FIRST: a record from another run is not part of this run at all.
+        if run_id is not None and rec.run_id != run_id:
+            continue
+        # Schema validation (on records that survived freshness).
+        if rec.schema_version != SCHEMA_VERSION:
+            rec.conflict = True
+            rec.status = TestStatus.FAIL
+            rec.invalid_reason = f"unsupported schema_version {rec.schema_version!r} (expected {SCHEMA_VERSION})"
+        buckets.setdefault((rec.check_id, rec.aspect), []).append(rec)
+
+    out: dict[tuple[str, str], EvidenceRecord] = {}
+    for key, recs in buckets.items():
+        if len(recs) == 1:
+            out[key] = recs[0]
+        else:
+            conflict = EvidenceRecord(
+                check_id=key[0], aspect=key[1], status=TestStatus.FAIL, conflict=True,
+                invalid_reason=f"{len(recs)} duplicate evidence artifacts for this aspect "
+                               f"({', '.join(sorted(r.path for r in recs))}) -- refusing to let one win",
+                path=";".join(sorted(r.path for r in recs)))
+            out[key] = conflict
     return out
 
 
@@ -246,42 +354,46 @@ def load_evidence(evidence_dir: Path | str = EVIDENCE_DIR) -> dict[tuple[str, st
 # ---------------------------------------------------------------------------
 
 def _resolve_spec(spec: TestSpec, evidence: dict) -> dict:
-    """Resolve one TestSpec to a concrete outcome, reading its evidence artifact.
-
-    The status here is the TEST outcome (pass/fail/...). A manual spec is always
-    reported MANUAL. An automated spec's outcome comes ONLY from a present, matching
-    evidence artifact; a missing artifact is NOT_IMPLEMENTED (never a pass)."""
-    if spec.kind == "manual":
-        return {"test_id": spec.test_id, "aspect": spec.aspect, "kind": "manual",
-                "status": TestStatus.MANUAL, "evidence_path": None,
+    """Resolve one TestSpec to a concrete TEST outcome, reading its evidence artifact.
+    Requires an EXACT, non-empty identity match (issue 3) and rejects conflicts."""
+    base = {"test_id": spec.test_id, "aspect": spec.aspect, "mode": spec.mode,
+            "label": spec.label}
+    if spec.mode == "manual":
+        return {**base, "status": TestStatus.MANUAL, "evidence_path": None,
                 "reason": "manual verification step -- no automated regression evidence"}
     rec = evidence.get((spec.check_id, spec.aspect))
     if rec is None:
-        return {"test_id": spec.test_id, "aspect": spec.aspect, "kind": "automated",
-                "status": TestStatus.NOT_IMPLEMENTED, "evidence_path": None,
-                "reason": "no evidence artifact on disk -- the regression test has not "
-                          "produced passing evidence (never counted as covered)"}
-    # A recorded pass must be backed by a matching test_id, else the artifact is stale.
-    if rec.status == TestStatus.PASS and spec.test_id and rec.test_id and rec.test_id != spec.test_id:
-        return {"test_id": spec.test_id, "aspect": spec.aspect, "kind": "automated",
-                "status": TestStatus.FAIL, "evidence_path": rec.path,
-                "reason": f"evidence test_id {rec.test_id!r} does not match declared "
-                          f"{spec.test_id!r} (stale/mismatched artifact)"}
-    return {"test_id": spec.test_id, "aspect": spec.aspect, "kind": "automated",
-            "status": rec.status, "evidence_path": rec.path,
+        return {**base, "status": TestStatus.NOT_IMPLEMENTED, "evidence_path": None,
+                "reason": "no fresh evidence artifact for this run -- the regression test "
+                          "did not execute and pass in this run (never counted as covered)"}
+    if rec.conflict:
+        return {**base, "status": TestStatus.FAIL, "evidence_path": rec.path,
+                "reason": rec.invalid_reason or "invalid/duplicate evidence artifact"}
+    # Exact, NON-EMPTY identity match required -- an empty or mismatched test_id fails.
+    if not rec.test_id or rec.test_id != spec.test_id:
+        return {**base, "status": TestStatus.FAIL, "evidence_path": rec.path,
+                "reason": f"evidence test_id {rec.test_id!r} does not exactly match declared "
+                          f"{spec.test_id!r} (empty or mismatched identity)"}
+    return {**base, "status": rec.status, "evidence_path": rec.path,
             "reason": rec.reason or f"evidence status={rec.status.value}"}
 
 
-def _rollup(check: Check, resolved: list[dict]) -> dict:
+def _rollup(check: Check, resolved: list[dict], applicable: bool, rationale: str) -> dict:
     """Roll resolved specs up into a single requirement-coverage verdict."""
     covered = [r for r in resolved if r["status"] in _COVERING_STATUSES]
     covered_aspects = [r["aspect"] for r in covered]
+    # Residual gaps: every resolved aspect that did NOT contribute passing evidence --
+    # retained EVEN when the requirement is partially covered (issue 6).
+    residual = [{"aspect": r["aspect"], "label": r["label"], "status": r["status"].value,
+                 "reason": r["reason"]}
+                for r in resolved if r["status"] not in _COVERING_STATUSES]
 
-    if not resolved:
+    if not applicable:
+        status = RequirementStatus.NOT_APPLICABLE
+    elif not resolved:
         status = RequirementStatus.GAP_UNIMPLEMENTED
     elif covered:
-        # A pass covers only its aspect -- NEVER the whole requirement.
-        status = RequirementStatus.COVERED_PARTIAL
+        status = RequirementStatus.COVERED_PARTIAL  # a pass covers only its aspect
     elif any(r["status"] == TestStatus.FAIL for r in resolved):
         status = RequirementStatus.GAP_FAILED
     elif any(r["status"] in (TestStatus.SKIPPED, TestStatus.NOT_IMPLEMENTED) for r in resolved):
@@ -291,52 +403,63 @@ def _rollup(check: Check, resolved: list[dict]) -> dict:
     else:
         status = RequirementStatus.GAP_SKIPPED
 
-    # Residual gaps: every resolved spec that did NOT contribute passing evidence,
-    # PLUS the always-true honest note that untested scenarios of the requirement
-    # remain even when one aspect passed (partial, never complete).
-    residual = [{"aspect": r["aspect"], "status": r["status"].value, "reason": r["reason"]}
-                for r in resolved if r["status"] not in _COVERING_STATUSES]
     note = ""
     if status == RequirementStatus.COVERED_PARTIAL:
-        note = ("partial coverage: the passing aspect(s) are verified; other scenarios "
-                "of this requirement are not exercised by a regression test yet")
+        note = ("partial coverage: the passing aspect(s) are verified; other scenarios of "
+                "this requirement are not exercised yet (see residual_gaps)")
 
     return {
         "check_id": check.id,
         "name": check.name,
-        "wstg_ref": check.wstg_ref(),
-        "wstg_version": check.wstg_version,
+        "ref": check.reference_label(),
+        "is_wstg": check.is_wstg(),
+        "wstg_version": check.wstg_version if check.is_wstg() else "",
         "phase": check.phase.value,
         "confirmation": check.confirmation,
-        "academy_ref": check.academy_ref,
-        "academy_url": check.academy_url,
+        "external_refs": [{"catalog": e.catalog, "ref": e.ref, "url": e.url, "title": e.title}
+                          for e in check.external_refs],
+        "applicability": {"applicable": applicable, "rationale": rationale},
         "requirement_status": status.value,
         "covered_aspects": covered_aspects,
         "residual_gaps": residual,
         "note": note,
-        "tests": [{"test_id": r["test_id"], "aspect": r["aspect"], "kind": r["kind"],
-                   "status": r["status"].value, "evidence_path": r["evidence_path"],
-                   "reason": r["reason"]} for r in resolved],
+        "tests": [{"test_id": r["test_id"], "aspect": r["aspect"], "mode": r["mode"],
+                   "label": r["label"], "status": r["status"].value,
+                   "evidence_path": r["evidence_path"], "reason": r["reason"]}
+                  for r in resolved],
     }
 
 
+def _is_gap(req: dict) -> bool:
+    """A requirement belongs in the top-level gaps list if it is not N/A and has any
+    unresolved aspect -- INCLUDING a partially-covered requirement with a failing or
+    missing sibling aspect (issue 6)."""
+    if req["requirement_status"] == RequirementStatus.NOT_APPLICABLE.value:
+        return False
+    if req["requirement_status"] == RequirementStatus.COVERED_PARTIAL.value:
+        return bool(req["residual_gaps"])
+    return True
+
+
 def reconcile(specs: tuple[TestSpec, ...] = REQUIREMENT_TESTS, *,
-              evidence_dir: Path | str = EVIDENCE_DIR,
-              checks: tuple[Check, ...] = CHECK_CATALOG) -> dict:
-    """Reconcile the declared specs + on-disk evidence into a requirement-coverage
-    report over the WHOLE catalog. Requirements with no spec are surfaced as
-    GAP_UNIMPLEMENTED so the checklist is complete and gaps are explicit."""
-    evidence = load_evidence(evidence_dir)
+              evidence_dir: Path | str | None = None, run_id: str | None = None,
+              checks: tuple[Check, ...] = CHECK_CATALOG,
+              applicability: dict[str, tuple[bool, str]] | None = None) -> dict:
+    """Reconcile declared specs + this run's evidence into a requirement-coverage
+    report over the whole catalog. `run_id` defaults to the current run (so only
+    fresh evidence counts); pass an explicit one in tests."""
+    rid = run_id if run_id is not None else current_run_id()
+    evidence = load_evidence(evidence_dir, run_id=rid)
     by_check: dict[str, list[TestSpec]] = {}
     for spec in specs:
         by_check.setdefault(spec.check_id, []).append(spec)
 
     requirements: list[dict] = []
     for check in checks:
+        applicable, rationale = applicability_of(check.id, applicability)
         resolved = [_resolve_spec(s, evidence) for s in by_check.get(check.id, [])]
-        requirements.append(_rollup(check, resolved))
+        requirements.append(_rollup(check, resolved, applicable, rationale))
 
-    # Totals -- requirement-level (coverage) and test-level (outcomes), kept separate.
     req_by_status: dict[str, int] = {}
     for r in requirements:
         req_by_status[r["requirement_status"]] = req_by_status.get(r["requirement_status"], 0) + 1
@@ -346,47 +469,47 @@ def reconcile(specs: tuple[TestSpec, ...] = REQUIREMENT_TESTS, *,
             test_by_status[t["status"]] = test_by_status.get(t["status"], 0) + 1
 
     covered_partial = req_by_status.get(RequirementStatus.COVERED_PARTIAL.value, 0)
+    not_applicable = req_by_status.get(RequirementStatus.NOT_APPLICABLE.value, 0)
     total_reqs = len(requirements)
+    gaps = [r for r in requirements if _is_gap(r)]
     return {
+        "run_id": rid,
         "totals": {
             "requirements": total_reqs,
+            "applicable": total_reqs - not_applicable,
+            "not_applicable": not_applicable,
             "covered_partial": covered_partial,
-            # honest denominator: coverage is partial-by-construction, so this is
-            # "requirements with ANY passing regression evidence", not "% done".
-            "gaps": total_reqs - covered_partial - req_by_status.get(
-                RequirementStatus.NOT_APPLICABLE.value, 0),
+            "gaps": len(gaps),
             "requirement_status_counts": req_by_status,
             "test_status_counts": test_by_status,
         },
         "requirements": requirements,
-        # Convenience slices for the report / CI gate.
-        "gaps": [r for r in requirements
-                 if r["requirement_status"] not in (RequirementStatus.COVERED_PARTIAL.value,
-                                                     RequirementStatus.NOT_APPLICABLE.value)],
+        "gaps": gaps,
         "unimplemented": [r["check_id"] for r in requirements
                           if r["requirement_status"] == RequirementStatus.GAP_UNIMPLEMENTED.value],
         "manual": [r["check_id"] for r in requirements
                    if r["requirement_status"] == RequirementStatus.GAP_MANUAL.value],
+        "not_applicable": [r["check_id"] for r in requirements
+                           if r["requirement_status"] == RequirementStatus.NOT_APPLICABLE.value],
     }
 
 
 def declared_coverage_ok(report: dict) -> tuple[bool, list[str]]:
-    """CI gate helper: every requirement that has an AUTOMATED spec declared must
-    actually be covered by passing evidence. Returns (ok, problems). A requirement
-    with no spec (GAP_UNIMPLEMENTED) or a manual-only one is a KNOWN gap, not a
-    regression -- it does not fail this gate; a declared automated test that is
-    failing or has lost its evidence DOES."""
+    """CI gate: EVERY declared automated aspect must be a fresh pass -- checked
+    INDEPENDENTLY per aspect, so one passing aspect can never hide a failing sibling
+    (issue 1). Manual aspects and requirements declared not-applicable are known,
+    non-regression states and are skipped."""
     problems: list[str] = []
     for r in report.get("requirements", []):
-        automated = [t for t in r["tests"] if t["kind"] == "automated"]
-        if not automated:
+        if r["requirement_status"] == RequirementStatus.NOT_APPLICABLE.value:
             continue
-        if r["requirement_status"] != RequirementStatus.COVERED_PARTIAL.value:
-            for t in automated:
-                if t["status"] != TestStatus.PASS.value:
-                    problems.append(
-                        f"{r['check_id']} :: {t['aspect']}: declared automated test "
-                        f"{t['test_id']} is '{t['status']}' ({t['reason']})")
+        for t in r["tests"]:
+            if t["mode"] != "automated":
+                continue
+            if t["status"] != TestStatus.PASS.value:
+                problems.append(
+                    f"{r['check_id']} :: [{t['label']}] {t['aspect']}: declared automated "
+                    f"test {t['test_id']} is '{t['status']}' ({t['reason']})")
     return (not problems), problems
 
 
@@ -394,40 +517,46 @@ def render_markdown(report: dict) -> str:
     """Render the requirement-coverage report as Markdown for a human / CI log."""
     t = report["totals"]
     lines = [
-        "# WSTG requirement-coverage report",
+        "# Requirement-coverage report",
         "",
-        "_Requirement coverage is tracked SEPARATELY from test outcomes: a passing "
-        "test proves only the aspect it exercises, never the whole requirement. "
-        "Missing evidence, skipped, failed, and manual checks never count as covered._",
+        f"_Run id: `{report.get('run_id', '')}`. Requirement coverage is tracked "
+        "SEPARATELY from test outcomes: a passing test proves only the aspect it "
+        "exercises, never the whole requirement. Only FRESH evidence from this run "
+        "counts; missing / skipped / failed / manual never count as covered._",
         "",
-        f"- Requirements in catalog: **{t['requirements']}**",
-        f"- With passing regression evidence (partial coverage): **{t['covered_partial']}**",
-        f"- Gaps (unimplemented / manual / skipped / failed): **{t['gaps']}**",
+        f"- Requirements in catalog: **{t['requirements']}** "
+        f"(applicable **{t['applicable']}**, not-applicable **{t['not_applicable']}**)",
+        f"- With fresh passing regression evidence (partial coverage): **{t['covered_partial']}**",
+        f"- Gaps (unimplemented / manual / skipped / failed / residual): **{t['gaps']}**",
         "",
         f"- Requirement status counts: `{t['requirement_status_counts']}`",
         f"- Test outcome counts: `{t['test_status_counts']}`",
         "",
         "## Requirements",
         "",
-        "| WSTG ref | Name | Requirement status | Tests (status) | Evidence |",
+        "| Ref | Name | Requirement status | Aspects (label: status) | Evidence |",
         "| --- | --- | --- | --- | --- |",
     ]
     for r in report["requirements"]:
         if r["tests"]:
-            tests_cell = "<br>".join(f"{t['status']}: {t['test_id'].split('.')[-1]}"
-                                     for t in r["tests"])
-            ev_cell = "<br>".join(t["evidence_path"] or "-" for t in r["tests"])
+            tests_cell = "<br>".join(f"{x['label']}: {x['status']}" for x in r["tests"])
+            ev_cell = "<br>".join(x["evidence_path"] or "-" for x in r["tests"])
         else:
             tests_cell, ev_cell = "-", "-"
-        lines.append(
-            f"| {r['wstg_ref']} | {r['name']} | {r['requirement_status']} "
-            f"| {tests_cell} | {ev_cell} |")
+        lines.append(f"| {r['ref']} | {r['name']} | {r['requirement_status']} "
+                     f"| {tests_cell} | {ev_cell} |")
     if report.get("gaps"):
-        lines += ["", "## Gaps (flagged)", ""]
+        lines += ["", "## Gaps (flagged, incl. residual aspects under partial coverage)", ""]
         for g in report["gaps"]:
-            lines.append(f"- **{g['wstg_ref']} {g['name']}** — {g['requirement_status']}")
+            lines.append(f"- **{g['ref']} {g['name']}** — {g['requirement_status']}")
             for rg in g["residual_gaps"]:
-                lines.append(f"  - {rg['status']}: {rg['aspect']} — {rg['reason']}")
+                lines.append(f"  - [{rg['label']}] {rg['status']}: {rg['aspect']} — {rg['reason']}")
+    na = [r for r in report["requirements"]
+          if r["requirement_status"] == RequirementStatus.NOT_APPLICABLE.value]
+    if na:
+        lines += ["", "## Not applicable (declared, with rationale)", ""]
+        for r in na:
+            lines.append(f"- **{r['ref']} {r['name']}** — {r['applicability']['rationale']}")
     return "\n".join(lines) + "\n"
 
 
@@ -435,15 +564,18 @@ if __name__ == "__main__":  # pragma: no cover - manual/CI invocation
     import argparse
     import sys
 
-    ap = argparse.ArgumentParser(description="WSTG requirement-coverage report")
-    ap.add_argument("--evidence-dir", default=str(EVIDENCE_DIR))
+    ap = argparse.ArgumentParser(description="Requirement-coverage report")
+    ap.add_argument("--evidence-dir", default=None,
+                    help="evidence directory (default: this run's run-specific dir)")
+    ap.add_argument("--run-id", default=None,
+                    help="run id to reconcile against (default: current run/commit)")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of Markdown")
     ap.add_argument("--check", action="store_true",
-                    help="exit non-zero if a declared automated requirement is not "
-                         "covered by passing evidence")
+                    help="exit non-zero if a declared automated aspect is not a fresh pass")
     args = ap.parse_args()
 
-    rep = reconcile(evidence_dir=args.evidence_dir)
+    rid = args.run_id if args.run_id is not None else current_run_id()
+    rep = reconcile(evidence_dir=args.evidence_dir, run_id=rid)
     print(json.dumps(rep, indent=2) if args.json else render_markdown(rep))
     if args.check:
         ok, problems = declared_coverage_ok(rep)
