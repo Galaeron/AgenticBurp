@@ -109,6 +109,13 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   broader matrix: **155 OK**; inventory is **12** target routing gaps. An initial
   broader run exposed 12 compatibility-seam errors and was corrected before this
   result; no live claim changed.
+- **T08l implemented:** SQLMap's Docker/tool-runner path remains unchanged;
+  only its direct boolean-differential fallback now uses invocation-bound
+  sessions and executor policy. The validator's preflight mutation decision
+  also uses the invocation gate. Real loopback identity/budget and denied POST
+  zero-send controls pass. Focused matrix: **117 OK**; broader SQLMap,
+  safety, evidence, confirmation, and smoke matrix: **187 OK**. Inventory is
+  **11** target routing gaps. No live result was inferred from these tests.
 
 ---
 

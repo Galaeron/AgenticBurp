@@ -439,3 +439,19 @@ visibility/contract refinements, not correctness fabrications.
   Existing smoke-fixture socket ResourceWarnings remain non-failing.
 - Inventory reconciliation: 32 sites, **12 target routing gaps**. Active S19 was
   untouched and no new live/model/browser/container run was started.
+
+## 2026-09-11 — T08l SQLMap fallback transport
+
+- Preserved the pinned SQLMap container/tool-runner adapter exactly as-is. The
+  dependency-free boolean/error differential fallback now sends through the
+  invocation executor with matching-session credential binding; non-GET
+  preflight authorization uses the invocation gate rather than the singleton.
+- Actual loopback control verifies two GET variants, two budget units, and the
+  bound bearer credential. The denied POST control verifies the first executor
+  decision blocks before transport, with zero requests and zero budget used.
+- Focused SQLMap/safety/inventory/validator matrix: exit 0, **117 tests OK in
+  7.918s**. Broader SQLMap, safety, evidence, confirmation, cache, and smoke
+  matrix: exit 0, **187 tests OK in 13.481s**. Existing asyncio timing notices
+  and smoke-fixture socket ResourceWarnings were non-failing.
+- Inventory reconciliation: 32 sites, **11 target routing gaps**. Active S19 was
+  untouched; no new live/model/browser/container run was started.

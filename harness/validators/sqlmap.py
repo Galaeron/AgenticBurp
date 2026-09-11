@@ -217,7 +217,8 @@ class SqlmapValidator(Validator):
     active = True
 
     def __init__(self, binary: str = "sqlmap", timeout_seconds: int = 90,
-                 level: int = 1, risk: int = 1, container_image: str | None = None):
+                 level: int = 1, risk: int = 1, container_image: str | None = None,
+                 run_context=None):
         self.binary = binary
         self.timeout_seconds = timeout_seconds
         self.level = max(1, min(level, 2))
@@ -228,6 +229,7 @@ class SqlmapValidator(Validator):
         # the image. The loopback target is rewritten to host.docker.internal so
         # the container reaches the same service the host means by localhost.
         self.container_image = container_image
+        self.run_context = run_context
 
     @staticmethod
     def _raw_request(exchange: HttpExchange) -> str:
@@ -285,7 +287,8 @@ class SqlmapValidator(Validator):
             # side effects; anything else requires the same explicit,
             # separate opt-in the rest of this harness's mutating-replay
             # techniques require.
-            gate_decision = get_default_gate().authorize(
+            gate = self.run_context.gate if self.run_context is not None else get_default_gate()
+            gate_decision = gate.authorize(
                 validator_name=self.name, method=exchange.method, url=exchange.url,
                 body=exchange.request_body,
             )
@@ -619,16 +622,36 @@ class SqlmapValidator(Validator):
             label = f"{location}:{param}"
             cmd_desc = [f"boolean-probe {exchange.method.upper()} {exchange.url} param={label}"]
             try:
-                import global_throttle
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
-                    await global_throttle.acquire()
-                    resp_a = await client.request(
-                        exchange.method.upper(), target_a, headers=headers, content=body_a,
-                    )
-                    await global_throttle.acquire()
-                    resp_b = await client.request(
-                        exchange.method.upper(), target_b, headers=headers, content=body_b,
-                    )
+                if self.run_context is not None:
+                    from run_context import TypedRequest
+                    from .transport import bind_session
+
+                    async def routed(url, probe_body):
+                        session_ref, request_headers = bind_session(self.run_context, headers)
+                        outcome = await self.run_context.executor().execute(
+                            TypedRequest(exchange.method.upper(), url,
+                                         headers=request_headers, body=probe_body or None),
+                            capability="sqlmap_boolean_probe", session_ref=session_ref)
+                        if not outcome.ok:
+                            raise httpx.TransportError(outcome.error or outcome.outcome)
+                        return httpx.Response(
+                            outcome.status or 0, content=(outcome.body or "").encode(),
+                            headers=outcome.headers,
+                            request=httpx.Request(exchange.method.upper(), url))
+
+                    resp_a = await routed(target_a, body_a)
+                    resp_b = await routed(target_b, body_b)
+                else:
+                    import global_throttle
+                    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                        await global_throttle.acquire()
+                        resp_a = await client.request(
+                            exchange.method.upper(), target_a, headers=headers, content=body_a,
+                        )
+                        await global_throttle.acquire()
+                        resp_b = await client.request(
+                            exchange.method.upper(), target_b, headers=headers, content=body_b,
+                        )
             except httpx.HTTPError as e:
                 errors.append(f"{label}: probe failed ({e})")
                 continue

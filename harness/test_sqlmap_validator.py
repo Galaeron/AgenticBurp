@@ -5,6 +5,8 @@ import httpx
 
 from models import Finding, HttpExchange
 from safety_gate import get_default_gate, reset_default_gate
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 from validators.sqlmap import (
     SqlmapValidator,
     _json_top_level_params,
@@ -131,6 +133,47 @@ class InferredContentTypeTests(unittest.TestCase):
 class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
     def _validator(self):
         return SqlmapValidator(binary="sqlmap")
+
+    async def test_run_context_actual_probe_preserves_session_and_budget(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=2,
+                                gate_config={"active_enabled": True})
+        ctx.sessions.register("user", "user", {"Authorization": "Bearer sql"},
+                              allowed_origins=[ScopePolicy.origin_of(fixture.base)])
+        validator = SqlmapValidator(
+            binary="sqlmap", run_context=ctx)
+        exchange = HttpExchange(
+            url=fixture.base + "/search?q=one", method="GET",
+            request_headers={"Authorization": "Bearer sql"}, response_status=200)
+        try:
+            result = await validator._boolean_probe_fallback(_finding(), exchange)
+            self.assertEqual(result.status, "not_confirmed")
+            self.assertEqual(ctx.budget.used, 2)
+            self.assertEqual(len(fixture.httpd.received), 2)
+            self.assertTrue(all(r["authorization"] == "Bearer sql"
+                                for r in fixture.httpd.received))
+        finally:
+            await ctx.aclose()
+            fixture.close()
+
+    async def test_run_context_denied_mutating_probe_sends_nothing(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=2,
+            gate_config={"active_enabled": True, "allow_mutating_replay": False})
+        validator = SqlmapValidator(binary="sqlmap", run_context=ctx)
+        exchange = HttpExchange(
+            url=fixture.base + "/search", method="POST",
+            request_headers={"Content-Type": "application/json"},
+            request_body='{"q":"one"}', response_status=200)
+        try:
+            result = await validator._boolean_probe_fallback(_finding(), exchange)
+            self.assertEqual(result.status, "error")
+            self.assertEqual(ctx.budget.used, 0)
+            self.assertEqual(fixture.httpd.received, [])
+        finally:
+            await ctx.aclose()
+            fixture.close()
 
     async def test_no_mutable_parameter_returns_none_without_any_network_call(self):
         v = self._validator()

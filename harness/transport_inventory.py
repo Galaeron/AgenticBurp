@@ -164,10 +164,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/race_condition_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="registry validation binds a per-dispatch run context; "
                        "concurrent burst uses its gate, session, budget and executor."),
-    TransportSite("validators/sqlmap.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+    TransportSite("validators/sqlmap.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation",
-                  note="container leg via tool_runner; a direct httpx boolean-probe fallback "
-                       "when Docker is unavailable."),
+                  note="container leg remains isolated behind tool_runner; its direct HTTP "
+                       "boolean-probe fallback uses the invocation executor."),
     TransportSite("validators/api_security_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_GATED,
                   owner="confirmation", note="mass-assignment/BOLA checks; mutating sends via the gate."),
     TransportSite("validators/cors_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
