@@ -402,3 +402,21 @@ visibility/contract refinements, not correctness fabrications.
 - S19 live run is not complete: pass 1 finished 37/37 in 5,946.5s, while pass 2
   remains active. Its intermediate JSON has `investigate: null`; final coverage
   and recall are therefore not yet reconciled.
+
+## 2026-09-11 — T08j TOCTOU transport
+
+- Graph TOCTOU validation now routes baseline/verify reads and the concurrent
+  authority-write burst through the invocation RunContext. Credential headers
+  bind to the matching session; the run gate, budget, cancellation, and evidence
+  policy apply to every request. Legacy registry invocation remains compatible.
+- Added real loopback controls: the permitted path performs exactly 4 POSTs plus
+  2 reads, preserves the bound bearer identity, and consumes exactly 6 requests;
+  the denied-mutation path performs zero POSTs and consumes only its baseline GET.
+- Focused TOCTOU + inventory run: exit 0, **19 tests OK in 1.249s**.
+- First broad command: exit 1, **67 tests run**, solely because the named module
+  `test_confirmation_routing` does not exist. Corrected broad confirmation,
+  cache, precondition, smoke, TOCTOU, and inventory matrix: exit 0,
+  **108 tests OK in 6.171s**. Existing ResourceWarnings from two smoke fixture
+  sockets were emitted; no assertion failed.
+- Inventory reconciliation: 32 sites, **13 target routing gaps** (down from 14).
+  No new live/model/browser/container run was started; active S19 was untouched.

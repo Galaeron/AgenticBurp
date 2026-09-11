@@ -2,11 +2,15 @@
 reads and a mocked concurrent burst. The distinguishing oracle: a privileged
 field flips ONLY under concurrency (>=2 clean successes) + an independent re-read."""
 import asyncio
+import json
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from models import Finding, HttpExchange
 from safety_gate import get_default_gate, reset_default_gate
+from run_context import RunContext, ScopePolicy
 from validators.toctou_validator import ToctouValidator
 
 
@@ -29,6 +33,52 @@ def _resp(status=200, text="ok"):
     return r
 
 
+class _StateHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _reply(self, status, body):
+        payload = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        self.server.received.append(("GET", self.headers.get("Authorization")))
+        self._reply(200, json.dumps({"role": self.server.role}))
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.server.received.append(("POST", self.headers.get("Authorization")))
+        if self.server.allow_flip:
+            self.server.role = body.get("role", self.server.role)
+        self._reply(200, '{"ok":true}')
+
+
+class _StateFixture:
+    def __init__(self, *, allow_flip=True):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _StateHandler)
+        self.httpd.received = []
+        self.httpd.role = "user"
+        self.httpd.allow_flip = allow_flip
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.port}/account"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
 class ToctouTests(unittest.TestCase):
     def setUp(self):
         reset_default_gate()
@@ -46,6 +96,54 @@ class ToctouTests(unittest.TestCase):
         v = ToctouValidator(allowed_hosts=["target.test"])
         r = asyncio.run(v.validate(_finding(), _ex(url="http://evil.test/x")))
         self.assertEqual(r.status, "skipped")
+
+    def test_run_context_actual_transport_preserves_session_and_budget(self):
+        fixture = _StateFixture()
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=6,
+            gate_config={"active_enabled": True, "allow_mutating_replay": True,
+                         "max_burst_size": 4})
+        ctx.sessions.register("user", "user", {"Authorization": "Bearer race"},
+                              allowed_origins=[ScopePolicy.origin_of(fixture.url)])
+        validator = ToctouValidator(
+            allowed_hosts=["127.0.0.1"], burst_size=4, run_context=ctx)
+
+        async def scenario():
+            result = await validator.validate(
+                _finding(), _ex(url=fixture.url, headers={"Authorization": "Bearer race"}))
+            await ctx.aclose()
+            return result
+
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.status, "confirmed")
+            self.assertEqual(ctx.budget.used, 6)
+            self.assertEqual([m for m, _ in fixture.httpd.received].count("POST"), 4)
+            self.assertTrue(all(auth == "Bearer race" for _, auth in fixture.httpd.received))
+        finally:
+            fixture.close()
+
+    def test_run_context_denied_burst_sends_no_mutation(self):
+        fixture = _StateFixture()
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=6,
+            gate_config={"active_enabled": True, "allow_mutating_replay": False,
+                         "max_burst_size": 4})
+        validator = ToctouValidator(
+            allowed_hosts=["127.0.0.1"], burst_size=4, run_context=ctx)
+
+        async def scenario():
+            result = await validator.validate(_finding(), _ex(url=fixture.url))
+            await ctx.aclose()
+            return result
+
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.status, "skipped")
+            self.assertEqual([m for m, _ in fixture.httpd.received].count("POST"), 0)
+            self.assertEqual(ctx.budget.used, 1)  # baseline GET only
+        finally:
+            fixture.close()
 
     def test_skip_when_burst_ceiling_below_two(self):
         reset_default_gate()

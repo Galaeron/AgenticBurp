@@ -105,6 +105,8 @@ class RoutingAuditTests(unittest.TestCase):
                          ti.ROUTING_EXECUTOR)
         self.assertEqual(by_mod["validators/rate_limit_validator.py"].routing,
                          ti.ROUTING_EXECUTOR)
+        self.assertEqual(by_mod["validators/toctou_validator.py"].routing,
+                         ti.ROUTING_EXECUTOR)
 
     def test_summary_is_consistent(self):
         s = ti.summary()

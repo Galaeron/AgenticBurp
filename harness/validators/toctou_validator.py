@@ -24,8 +24,9 @@ Tying the confirmation to an independent re-read of the authority state (not jus
 a success count) is what makes this a privilege-escalation race rather than a
 generic "succeeded twice", and deterministic rather than an agent narrating a
 race. Fully code-built: no LLM composes the requests. The burst is authorised once
-through the safety gate's authorize_burst (needs allow_mutating_replay + a raised
-max_burst_size), then fired via a plain client -- the race_condition pattern.
+through the run's safety gate authorize_burst (needs allow_mutating_replay + a
+raised max_burst_size), then fired through its executor. Standalone registry
+callers retain the legacy direct-client compatibility path.
 """
 from __future__ import annotations
 
@@ -63,10 +64,11 @@ class ToctouValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 burst_size: int = 12):
+                 burst_size: int = 12, run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self.burst_size = burst_size
+        self.run_context = run_context
 
     def _json_object(self, body: str):
         try:
@@ -88,6 +90,19 @@ class ToctouValidator(Validator):
                                 confirmed=False, summary=why)
 
     async def _get_json(self, url, headers):
+        if self.run_context is not None:
+            from run_context import TypedRequest
+            from .transport import bind_session
+            session_ref, request_headers = bind_session(self.run_context, headers)
+            result = await self.run_context.executor().execute(
+                TypedRequest("GET", url, headers=request_headers),
+                capability=self.name, session_ref=session_ref)
+            if not result.ok:
+                return result.status, None
+            try:
+                return result.status, json.loads(result.body or "")
+            except (ValueError, TypeError):
+                return result.status, None
         await global_throttle.acquire()
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False,
                                      verify=False) as client:
@@ -149,7 +164,8 @@ class ToctouValidator(Validator):
             content = urlencode(merged)
 
         # 2. authorise + fire the concurrent burst.
-        decision = get_default_gate().authorize_burst(
+        gate = self.run_context.gate if self.run_context is not None else get_default_gate()
+        decision = gate.authorize_burst(
             validator_name=self.name, method=method, url=exchange.url,
             requested_burst_size=self.burst_size, body=content)
         if not decision.allowed:
@@ -161,6 +177,18 @@ class ToctouValidator(Validator):
 
         async def fire_one():
             try:
+                if self.run_context is not None:
+                    from types import SimpleNamespace
+                    from run_context import TypedRequest
+                    from .transport import bind_session
+                    session_ref, request_headers = bind_session(self.run_context, headers)
+                    result = await self.run_context.executor().execute(
+                        TypedRequest(method, exchange.url, headers=request_headers, body=content),
+                        capability=self.name, session_ref=session_ref)
+                    if not result.ok:
+                        return None
+                    return SimpleNamespace(status_code=result.status, text=result.body,
+                                           headers=result.headers)
                 await global_throttle.acquire()
                 async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False,
                                              verify=False) as client:

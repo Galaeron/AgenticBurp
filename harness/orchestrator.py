@@ -1282,7 +1282,8 @@ class Orchestrator:
                                    run_context=run_context)
         _reset = ResetTokenValidator(allowed_hosts=self.allowed_hosts)
         _domxss = DomXssValidator(allowed_hosts=self.allowed_hosts)
-        _toctou = ToctouValidator(allowed_hosts=self.allowed_hosts)
+        _toctou = ToctouValidator(allowed_hosts=self.allowed_hosts,
+                                  run_context=run_context)
 
         # Memoisation cache: avoid re-running the same validator on the same
         # endpoint during one investigate_engagement() call. Keyed by

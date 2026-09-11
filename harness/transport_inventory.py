@@ -158,8 +158,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/rate_limit_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="session-bound replay burst uses invocation gate, "
                        "budget and executor; oracle remains observation-only/provisional."),
-    TransportSite("validators/toctou_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="concurrent authority-write race; provisional oracle."),
+    TransportSite("validators/toctou_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="graph authority reads and concurrent write burst use "
+                       "the invocation gate, session binding, budget and executor; provisional oracle."),
     TransportSite("validators/race_condition_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="concurrent-request differential."),
     TransportSite("validators/sqlmap.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,

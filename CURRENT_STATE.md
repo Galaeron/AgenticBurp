@@ -94,6 +94,14 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   result after **5,946.5s**; Pass 2 `investigate_engagement` is still running as
   of this checkpoint, so `investigate` is null and no final coverage/recall claim
   is reconciled yet. Do not stop or restart its Python/target processes.
+- **T08j implemented:** graph TOCTOU authority
+  reads and concurrent writes now use the invocation-local gate, bound session,
+  request budget, and executor; standalone registry callers retain the legacy
+  compatibility path. Real loopback positive and denied-mutation controls pass.
+  Corrected focused confirmation/smoke matrix: **108 OK**; inventory is **13**
+  target routing gaps. One earlier broad invocation reported 67 tests with one
+  loader error because `test_confirmation_routing` does not exist; no product
+  failure was hidden, and the corrected named-module run exited 0.
 
 ---
 
