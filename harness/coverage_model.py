@@ -399,7 +399,15 @@ ApplicabilityPredicate = Callable[[dict], tuple[bool, str]]
 
 @dataclass(frozen=True)
 class Check:
-    """A single security check in the catalog."""
+    """A single security check in the catalog.
+
+    The `id` is a *versioned* WSTG reference: the stable WSTG test id plus the
+    `wstg_version` it is anchored to (WSTG ids are stable within a release but the
+    catalog is pinned to a specific one so a reference never silently drifts). The
+    optional `academy_url` is a full PortSwigger Academy topic URL used as a scenario
+    reference for building the local regression fixtures -- Academy/WSTG are *reference
+    catalogs* here, not an exploitation runner.
+    """
     id: str                              # e.g. "WSTG-INPV-05"
     name: str                            # human-readable
     phase: Phase
@@ -407,13 +415,21 @@ class Check:
     applicability: ApplicabilityPredicate
     confirmation: str                    # "sqlmap" | "cross_identity" | "agent" | "manual" | ...
     description: str = ""
-    academy_ref: str = ""                # PortSwigger Academy topic if applicable
+    academy_ref: str = ""                # PortSwigger Academy topic name if applicable
+    academy_url: str = ""                # optional full Academy topic URL (scenario reference)
+    wstg_version: str = "4.2"            # the WSTG release the id is versioned against
 
     def applies(self, endpoint: dict) -> tuple[bool, str]:
+        """Deterministic applicability + the rationale for WHY it applies or doesn't."""
         return self.applicability(endpoint)
 
     def canonical_class(self) -> str | None:
         return canonicalize(self.vulnerability_class)
+
+    def wstg_ref(self) -> str:
+        """The versioned WSTG reference for reports/audits, e.g.
+        "WSTG-CONF-09 (WSTG v4.2)"."""
+        return f"{self.id} (WSTG v{self.wstg_version})"
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +513,8 @@ CHECK_CATALOG: tuple[Check, ...] = (
     Check("WSTG-CONF-09", "Mass assignment", Phase.ENDPOINT,
           "api_security", _accepts_body, "sequence",
           "Send extra fields in requests and check if they persist",
-          "Mass assignment"),
+          "Mass assignment",
+          academy_url="https://portswigger.net/web-security/api-testing/lab-exploiting-mass-assignment-vulnerabilities"),
     Check("WSTG-BUSV-04", "HTTP request smuggling", Phase.ENDPOINT,
           "http_request_smuggling", _accepts_body, "http_request_smuggling",
           "Test CL/TE and TE/CL desync",
