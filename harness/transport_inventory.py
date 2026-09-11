@@ -182,10 +182,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/header_injection_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="bounded CRLF query probes use per-dispatch invocation "
                        "scope, budget, cancellation and executor routing."),
-    TransportSite("validators/http_request_smuggling_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+    TransportSite("validators/http_request_smuggling_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation",
-                  note="CL/TE desync; needs a raw-protocol adapter (T08) -- ordinary HTTP "
-                       "anomalies do not qualify it."),
+                  note="ordinary-HTTP anomaly sampler uses invocation policy/executor; raw CL/TE "
+                       "framing is still unsupported and therefore never qualifies confirmation."),
     TransportSite("validators/recon_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="read-only recon fetches (.git/.env/docs)."),
     TransportSite("validators/subdomain_takeover_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,

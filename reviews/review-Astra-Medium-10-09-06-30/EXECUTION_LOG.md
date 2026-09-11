@@ -512,3 +512,19 @@ visibility/contract refinements, not correctness fabrications.
   non-failing.
 - Inventory reconciliation: 32 sites, **7 target routing gaps**. Concurrent
   coverage files and active S19 were untouched.
+
+## 2026-09-11 — T08q request-smuggling sampler transport
+
+- The existing ordinary-httpx anomaly sampler now routes through invocation
+  scope, mutation authorization, budget, cancellation, and executor policy.
+  This does not add raw framing: CL/TE desync remains unqualified and the
+  validator continues to emit candidate/not-confirmed only. A framing-capable
+  adapter plus paired front-end/back-end fixture is still required for proof.
+- Actual loopback control verifies one POST and one budget unit. Denied-mutation
+  negative control verifies no request and zero budget use.
+- First invocation's full test body passed, but an accidental PowerShell `$?`
+  assignment emitted a shell setup error; it is not the canonical result. Clean
+  rerun: exit 0, **166 tests OK in 16.982s**. Existing smoke socket warnings were
+  non-failing.
+- Inventory reconciliation: 32 sites, **6 target routing gaps**. Concurrent
+  coverage files and active S19 were untouched.

@@ -136,6 +136,13 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   policy. Actual one-send and off-scope zero-send controls pass. Combined
   validator/executor/evidence/confirmation/smoke matrix: **122 OK**. Inventory
   is **7** target routing gaps; the marker-header oracle is unchanged.
+- **T08q implemented:** the HTTP-smuggling validator's existing ordinary-HTTP
+  anomaly sampler now uses invocation scope, mutation gate, budget, cancellation,
+  and executor routing. It remains explicitly **not confirmed** because this is
+  not raw-framing transport or paired-proxy proof. Real loopback one-send and
+  denied-mutation zero-send controls pass. Clean matrix: **166 OK**; inventory
+  is **6** routing gaps. An earlier identical test body passed but its shell
+  preamble emitted a read-only-variable error; the clean rerun is canonical.
 
 ---
 
