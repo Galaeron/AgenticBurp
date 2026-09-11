@@ -68,9 +68,11 @@ class WebCachePoisoningValidator(Validator):
     finding_classes = {"web_cache_poisoning", "cache poisoning", "web cache poisoning", "cache_poisoning"}
     active = True
 
-    def __init__(self, timeout: float = 15.0, max_redirects: int = 5):
+    def __init__(self, timeout: float = 15.0, max_redirects: int = 5,
+                 run_context=None):
         self.timeout = timeout
         self.max_redirects = max_redirects
+        self.run_context = run_context
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -172,6 +174,16 @@ class WebCachePoisoningValidator(Validator):
         headers = dict(headers or {})
         headers.setdefault("User-Agent", self.user_agent)
         try:
+            if self.run_context is not None:
+                from run_context import TypedRequest
+                outcome = await self.run_context.executor().execute(
+                    TypedRequest(method, url, headers=headers),
+                    capability=self.get_name(), max_redirects=self.max_redirects)
+                if not outcome.ok:
+                    return None
+                return httpx.Response(
+                    outcome.status or 0, content=(outcome.body or "").encode(),
+                    headers=outcome.headers, request=httpx.Request(method, url))
             async with httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
             ) as client:

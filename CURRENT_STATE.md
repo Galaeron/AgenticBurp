@@ -153,6 +153,11 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   run scope and obey budget, cancellation, and redirect policy. Compilation and
   **120 tests OK**; real loopback one-send and off-scope zero-send controls pass.
   Inventory is **4** routing gaps; fingerprint/oracle semantics are unchanged.
+- **T08t implemented:** cacheability, unkeyed-header, follow-up, and deceptive-
+  path probes now use per-dispatch executor policy. Real loopback one-send and
+  off-scope zero-send controls pass; compilation plus **122 tests OK**. The
+  validator remains candidate/not-confirmed because it still lacks a distinct
+  second-client retrieval proof. Inventory is **3** routing gaps.
 
 ---
 

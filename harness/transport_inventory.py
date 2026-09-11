@@ -192,8 +192,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/subdomain_takeover_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="provider fingerprint fetch uses per-dispatch invocation "
                        "scope, budget, cancellation and executor routing."),
-    TransportSite("validators/web_cache_poisoning_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="unkeyed-input cache probe."),
+    TransportSite("validators/web_cache_poisoning_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="cacheability/unkeyed/deception probes use per-dispatch "
+                       "invocation scope, budget, cancellation and executor routing."),
 
     # ---- target: raw socket ----
     TransportSite("validators/websocket_validator.py", CHANNEL_SOCKET, SCOPE_TARGET, ROUTING_DIRECT,

@@ -124,6 +124,8 @@ class RoutingAuditTests(unittest.TestCase):
                          ti.ROUTING_EXECUTOR)
         self.assertEqual(by_mod["validators/subdomain_takeover_validator.py"].routing,
                          ti.ROUTING_EXECUTOR)
+        self.assertEqual(by_mod["validators/web_cache_poisoning_validator.py"].routing,
+                         ti.ROUTING_EXECUTOR)
 
     def test_summary_is_consistent(self):
         s = ti.summary()

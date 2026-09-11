@@ -556,3 +556,18 @@ visibility/contract refinements, not correctness fabrications.
   ResourceWarnings were non-failing.
 - Inventory reconciliation: 32 sites, **4 target routing gaps**. Concurrent
   coverage files and active S19 were untouched.
+
+## 2026-09-11 — T08t web-cache transport
+
+- Cacheability, unkeyed-header, clean follow-up, and deceptive-path requests
+  now route through invocation scope, request budget, cancellation, and redirect
+  policy. Standalone context-free use retains direct compatibility transport.
+- Actual loopback control verifies one request and one budget unit. Off-scope
+  negative control verifies no request and zero budget use.
+- The oracle remains candidate/not-confirmed: this transport migration does not
+  fabricate the missing distinct-client cached-retrieval proof.
+- Static compilation passed. Cache/takeover/inventory/executor/evidence/
+  confirmation/smoke matrix: exit 0, **122 tests OK in 17.138s**. Existing smoke
+  socket ResourceWarnings were non-failing.
+- Inventory reconciliation: 32 sites, **3 target routing gaps**. Concurrent
+  coverage files and active S19 were untouched.
