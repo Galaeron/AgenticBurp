@@ -143,6 +143,11 @@ F02/F03/F06) as settled. **Not yet merged into `WorkingSunday`.**
   denied-mutation zero-send controls pass. Clean matrix: **166 OK**; inventory
   is **6** routing gaps. An earlier identical test body passed but its shell
   preamble emitted a read-only-variable error; the clean rerun is canonical.
+- **T08r implemented:** recon crawl, common-file, and technology-fingerprint
+  fetches now share the per-dispatch run executor, scope, budget, cancellation,
+  and redirect policy. Actual loopback one-send and off-scope zero-send controls
+  pass. Combined transport/safety/evidence/confirmation/smoke matrix: **168 OK**;
+  inventory is **5** routing gaps. Recon result semantics were unchanged.
 
 ---
 

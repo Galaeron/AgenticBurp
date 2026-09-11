@@ -90,10 +90,12 @@ class ReconValidator(Validator):
     finding_classes = {"recon", "reconnaissance", "attack surface mapping", "attack map"}
     active = True
     
-    def __init__(self, timeout: float = 15.0, max_redirects: int = 10, max_depth: int = 5):
+    def __init__(self, timeout: float = 15.0, max_redirects: int = 10,
+                 max_depth: int = 5, run_context=None):
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.max_depth = max_depth  # Crawl depth
+        self.run_context = run_context
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -103,11 +105,12 @@ class ReconValidator(Validator):
         self.discovered_urls: set[str] = set()
     
     async def __aenter__(self):
-        self.client = httpx.AsyncClient(
-            timeout=self.timeout,
-            follow_redirects=False,
-            max_redirects=self.max_redirects,
-        )
+        if self.run_context is None:
+            self.client = httpx.AsyncClient(
+                timeout=self.timeout,
+                follow_redirects=False,
+                max_redirects=self.max_redirects,
+            )
         return self
     
     async def __aexit__(self, *args):
@@ -457,6 +460,16 @@ class ReconValidator(Validator):
         headers['User-Agent'] = self.user_agent
         
         try:
+            if self.run_context is not None:
+                from run_context import TypedRequest
+                outcome = await self.run_context.executor().execute(
+                    TypedRequest(method, url, headers=headers),
+                    capability=self.get_name(), max_redirects=self.max_redirects)
+                if not outcome.ok:
+                    return None
+                return httpx.Response(
+                    outcome.status or 0, content=(outcome.body or "").encode(),
+                    headers=outcome.headers, request=httpx.Request(method, url))
             if not self.client:
                 self.client = httpx.AsyncClient(
                     timeout=self.timeout,

@@ -120,6 +120,8 @@ class RoutingAuditTests(unittest.TestCase):
                          ti.ROUTING_EXECUTOR)
         self.assertEqual(by_mod["validators/http_request_smuggling_validator.py"].routing,
                          ti.ROUTING_EXECUTOR)
+        self.assertEqual(by_mod["validators/recon_validator.py"].routing,
+                         ti.ROUTING_EXECUTOR)
 
     def test_summary_is_consistent(self):
         s = ti.summary()

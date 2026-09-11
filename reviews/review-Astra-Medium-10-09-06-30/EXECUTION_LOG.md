@@ -528,3 +528,17 @@ visibility/contract refinements, not correctness fabrications.
   non-failing.
 - Inventory reconciliation: 32 sites, **6 target routing gaps**. Concurrent
   coverage files and active S19 were untouched.
+
+## 2026-09-11 — T08r recon transport
+
+- Recon's central fetch seam now routes crawl pages, common discovery files,
+  and technology fingerprints through invocation scope, request budget,
+  cancellation, and redirect policy. Standalone context-free use retains the
+  direct compatibility path; recon result semantics are unchanged.
+- Actual loopback control verifies one request and one budget unit. Off-scope
+  negative control verifies no request and zero budget use.
+- Recon/smuggling/inventory/safety/evidence/confirmation/smoke matrix: exit 0,
+  **168 tests OK in 17.808s**. Existing smoke socket ResourceWarnings were
+  non-failing.
+- Inventory reconciliation: 32 sites, **5 target routing gaps**. Concurrent
+  coverage files and active S19 were untouched.

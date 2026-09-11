@@ -186,8 +186,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="confirmation",
                   note="ordinary-HTTP anomaly sampler uses invocation policy/executor; raw CL/TE "
                        "framing is still unsupported and therefore never qualifies confirmation."),
-    TransportSite("validators/recon_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="read-only recon fetches (.git/.env/docs)."),
+    TransportSite("validators/recon_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="crawl/common-file/fingerprint fetches use per-dispatch "
+                       "invocation scope, budget, cancellation and executor routing."),
     TransportSite("validators/subdomain_takeover_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="dangling-record fingerprint fetch."),
     TransportSite("validators/web_cache_poisoning_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
