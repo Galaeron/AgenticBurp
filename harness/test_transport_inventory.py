@@ -103,6 +103,8 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(by_mod["missing_auth_probe.py"].routing, ti.ROUTING_EXECUTOR)
         self.assertEqual(by_mod["validators/jwt_forge_validator.py"].routing,
                          ti.ROUTING_EXECUTOR)
+        self.assertEqual(by_mod["validators/rate_limit_validator.py"].routing,
+                         ti.ROUTING_EXECUTOR)
 
     def test_summary_is_consistent(self):
         s = ti.summary()

@@ -10,6 +10,8 @@ from models import Finding, HttpExchange
 from safety_gate import SafetyGate, SafetyGateConfig, get_default_gate, reset_default_gate
 from validators.rate_limit_validator import RateLimitValidator
 from validators.reset_token_validator import ResetTokenValidator, analyze_tokens, _max_entropy_bits
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 
 
 def _finding(vc):
@@ -147,6 +149,31 @@ class ResetTokenValidatorTests(unittest.TestCase):
 class RateLimitValidatorTests(unittest.TestCase):
     def tearDown(self):
         reset_default_gate()
+
+    def test_run_context_actual_burst_uses_session_and_budget(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=3,
+            gate_config={"active_enabled": True, "allow_mutating_replay": True,
+                         "max_burst_size": 3})
+        ctx.sessions.register("user", "user", {"Authorization": "Bearer rate"},
+                              allowed_origins=[ScopePolicy.origin_of(fixture.base)])
+        validator = RateLimitValidator(
+            allowed_hosts=["127.0.0.1"], min_attempts=3, run_context=ctx)
+        exchange = _ex(url=fixture.base + "/login", headers={"Authorization": "Bearer rate"})
+        async def scenario():
+            result = await validator.validate(_finding("rate_limit"), exchange)
+            await ctx.aclose()
+            return result
+        try:
+            result = asyncio.run(scenario())
+            self.assertEqual(result.status, "not_confirmed")
+            self.assertEqual(ctx.budget.used, 3)
+            self.assertEqual(len(fixture.httpd.received), 3)
+            self.assertTrue(all(r["authorization"] == "Bearer rate"
+                                for r in fixture.httpd.received))
+        finally:
+            fixture.close()
 
     def _gate(self, burst):
         reset_default_gate()

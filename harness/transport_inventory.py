@@ -155,8 +155,9 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/jwt_forge_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="graph forge/control replays use isolated ephemeral "
                        "sessions through the invocation executor; legacy registry path remains."),
-    TransportSite("validators/rate_limit_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="confirmation", note="authorize-burst replay; provisional oracle."),
+    TransportSite("validators/rate_limit_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="confirmation", note="session-bound replay burst uses invocation gate, "
+                       "budget and executor; oracle remains observation-only/provisional."),
     TransportSite("validators/toctou_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="confirmation", note="concurrent authority-write race; provisional oracle."),
     TransportSite("validators/race_condition_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,

@@ -51,10 +51,11 @@ class RateLimitValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 min_attempts: int = 5):
+                 min_attempts: int = 5, run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self.min_attempts = max(2, int(min_attempts))
+        self.run_context = run_context
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if not super().applies(finding, exchange):
@@ -80,7 +81,8 @@ class RateLimitValidator(Validator):
             return self._skip(f"host {host!r} out of scope")
         method = (exchange.method or "POST").upper()
 
-        decision = get_default_gate().authorize_burst(
+        gate = self.run_context.gate if self.run_context is not None else get_default_gate()
+        decision = gate.authorize_burst(
             validator_name=self.name, method=method, url=exchange.url,
             requested_burst_size=self.min_attempts, body=exchange.request_body)
         if not decision.allowed:
@@ -93,17 +95,32 @@ class RateLimitValidator(Validator):
 
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("content-length", "host")}
-        content = exchange.request_body.encode() if exchange.request_body else None
+        content = exchange.request_body or None
         completed = 0
         statuses: dict[int, int] = {}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False,
-                                         verify=False) as client:
+            client = None if self.run_context is not None else httpx.AsyncClient(
+                timeout=self.timeout, follow_redirects=False, verify=False)
+            try:
                 for _ in range(allowed):
-                    await global_throttle.acquire()
                     try:
-                        resp = await client.request(method, exchange.url,
-                                                    headers=headers or None, content=content)
+                        if self.run_context is not None:
+                            from types import SimpleNamespace
+                            from run_context import TypedRequest
+                            from .transport import bind_session
+                            session_ref, request_headers = bind_session(self.run_context, headers)
+                            result = await self.run_context.executor().execute(
+                                TypedRequest(method, exchange.url, headers=request_headers,
+                                             body=content),
+                                capability=self.name, session_ref=session_ref)
+                            if not result.ok:
+                                continue
+                            resp = SimpleNamespace(status_code=result.status,
+                                                   text=result.body, headers=result.headers)
+                        else:
+                            await global_throttle.acquire()
+                            resp = await client.request(method, exchange.url,
+                                                        headers=headers or None, content=content)
                     except httpx.HTTPError:
                         continue
                     completed += 1
@@ -115,6 +132,9 @@ class RateLimitValidator(Validator):
                                     f"the endpoint IS limited.",
                             evidence=f"Attempt {completed} returned a throttle signal "
                                      f"(status/Retry-After/marker). Status distribution: {statuses}.")
+            finally:
+                if client is not None:
+                    await client.aclose()
         except Exception as e:
             return self._skip(f"burst failed: {e.__class__.__name__}")
 

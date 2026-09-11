@@ -1278,7 +1278,8 @@ class Orchestrator:
         _deser = DeserializationOobValidator(allowed_hosts=self.allowed_hosts)
         _auth = AuthSequenceValidator(allowed_hosts=self.allowed_hosts)
         _sxss = StoredXssValidator(allowed_hosts=self.allowed_hosts)
-        _rate = RateLimitValidator(allowed_hosts=self.allowed_hosts)
+        _rate = RateLimitValidator(allowed_hosts=self.allowed_hosts,
+                                   run_context=run_context)
         _reset = ResetTokenValidator(allowed_hosts=self.allowed_hosts)
         _domxss = DomXssValidator(allowed_hosts=self.allowed_hosts)
         _toctou = ToctouValidator(allowed_hosts=self.allowed_hosts)
