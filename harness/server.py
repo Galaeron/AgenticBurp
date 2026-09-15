@@ -113,9 +113,15 @@ async def health():
 @app.get("/telemetry")
 async def telemetry():
     import coordinator
+    import telemetry as _telemetry
+    # W-11: the diagnostics snapshot answers "why did this target produce
+    # zero/few findings?" -- swallowed-exception counts (a validator crashing on
+    # every exchange, a header audit that failed), scope-denial events, and the
+    # coordinator fail-open counters -- without reading server logs.
     return {
         "coordinator_fail_open": coordinator.fail_open_stats(),
         "effort_budget": orchestrator.effort_status().model_dump() if hasattr(orchestrator, "effort_status") else {},
+        "diagnostics": _telemetry.snapshot(),
     }
 
 
