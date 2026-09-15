@@ -68,6 +68,14 @@ class TransportSite:
     owner: str
     note: str = ""
     gap: str = ""               # the specific remaining migration gap (target+direct only)
+    # Whether this module constructs its OWN httpx client (matched by
+    # scan_http_client_modules). Fully routed HTTP consumers that only send
+    # through GatedAsyncClient / the run executor -- e.g. cors_validator after
+    # W-1 removed its raw fallback -- set this False: they are real HTTP
+    # transport sites worth auditing, but they delegate client construction to
+    # the routed adapter, so the scan-vs-registry check must not expect to find
+    # an httpx.AsyncClient(...) in their source.
+    constructs_client: bool = True
 
     @property
     def is_routing_gap(self) -> bool:
@@ -171,8 +179,11 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     TransportSite("validators/api_security_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_GATED,
                   owner="confirmation", note="mass-assignment/BOLA checks; mutating sends via the gate."),
     TransportSite("validators/cors_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
-                  owner="confirmation", note="registry CORS probes use per-dispatch invocation "
-                       "scope, budget, cancellation and executor routing."),
+                  owner="confirmation", constructs_client=False,
+                  note="registry CORS probes use per-dispatch invocation scope, budget, "
+                       "cancellation and executor routing. W-1 removed the raw httpx fallback: "
+                       "the no-run_context path now sends through GatedAsyncClient, so this "
+                       "module no longer constructs its own client."),
     TransportSite("validators/csp_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", note="fresh CSP/framing header fetch uses per-dispatch "
                        "invocation scope, budget, cancellation and redirect policy."),
@@ -239,7 +250,12 @@ def scan_http_client_modules(root: str | None = None) -> set[str]:
 
 
 def http_modules_in_registry() -> set[str]:
-    return {s.module for s in TRANSPORT_SITES if s.channel == CHANNEL_HTTP}
+    # Only modules that construct their OWN httpx client are expected to be
+    # found by scan_http_client_modules(); fully routed consumers
+    # (constructs_client=False) send through the gate/executor adapter and
+    # deliberately have no client of their own to scan.
+    return {s.module for s in TRANSPORT_SITES
+            if s.channel == CHANNEL_HTTP and s.constructs_client}
 
 
 def routing_gaps() -> tuple[TransportSite, ...]:

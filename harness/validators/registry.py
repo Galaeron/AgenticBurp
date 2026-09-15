@@ -67,6 +67,7 @@ class ValidatorRegistry:
             self.validators["cors"] = CorsValidator(
                 timeout=float(cors_cfg.get("timeout", 10.0)),
                 max_redirects=int(cors_cfg.get("max_redirects", 5)),
+                allowed_hosts=config.get("server", {}).get("allowed_hosts", []),
             )
         
         # Recon validator

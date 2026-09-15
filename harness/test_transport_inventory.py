@@ -54,6 +54,17 @@ class InventoryEnforcementTests(unittest.TestCase):
         self.assertGreaterEqual(occurrences, 1)
         self.assertIn(sample, ti.scan_http_client_modules(root))  # counted once regardless of N
 
+    def test_cors_validator_no_longer_constructs_its_own_client(self):
+        """W-1: the CORS validator's raw httpx fallback was removed; it now
+        sends only through the gate/executor. Recorded in the inventory as an
+        executor-routed HTTP site that does not construct its own client, and
+        the source must contain no httpx.AsyncClient(...) construction."""
+        by_mod = {s.module: s for s in ti.TRANSPORT_SITES}
+        cors = by_mod["validators/cors_validator.py"]
+        self.assertFalse(cors.constructs_client)
+        self.assertEqual(cors.routing, ti.ROUTING_EXECUTOR)
+        self.assertNotIn("validators/cors_validator.py", ti.scan_http_client_modules())
+
     def test_http_sites_actually_use_httpx(self):
         root = ti.harness_dir()
         for site in ti.TRANSPORT_SITES:

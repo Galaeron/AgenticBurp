@@ -19,9 +19,11 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import httpx
 
+from safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
@@ -64,15 +66,27 @@ class CorsValidator(Validator):
     active = True
     
     def __init__(self, timeout: float = 10.0, max_redirects: int = 5,
-                 run_context=None):
+                 run_context=None, allowed_hosts: list[str] | None = None):
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.run_context = run_context
+        # Scope guard: like ssrf/xxe/etc., refuse to probe a host outside the
+        # configured engagement scope. Passed from the registry
+        # (server.allowed_hosts). Empty means "not scoped here" -- the central
+        # backstop in orchestrator dispatch (W-2) still applies.
+        self.allowed_hosts = allowed_hosts or []
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-    
+
+    def _skip(self, why: str) -> ValidationResult:
+        return ValidationResult(
+            validator=self.get_name(), status="skipped",
+            finding_class="cors", confidence=0.0, confirmed=False,
+            summary=why, evidence="", raw_output="",
+        )
+
     def get_name(self) -> str:
         return "cors_validator"
     
@@ -124,7 +138,13 @@ class CorsValidator(Validator):
         
         tests = []
         vulnerable = False
-        
+
+        # Scope guard (defense-in-depth with the central backstop): never send
+        # crafted-Origin probes to a host outside the configured engagement.
+        host = urlparse(exchange.url).hostname or ""
+        if self.allowed_hosts and host not in self.allowed_hosts:
+            return self._skip(f"host {host!r} out of scope")
+
         # Extract base URL for testing
         base_url = self._get_base_url(exchange.url)
         if not base_url:
@@ -235,17 +255,21 @@ class CorsValidator(Validator):
                     headers=outcome.headers, request=httpx.Request(method, url))
             import global_throttle
             await global_throttle.acquire()
-            async with httpx.AsyncClient(
+            # No run_context (e.g. the header-audit or a standalone path): route
+            # through the SafetyGate rather than a raw client, so this validator
+            # can never send an ungated request when active mode is on. CORS
+            # probes are GET/OPTIONS only (see _test_preflight_bypass), so the
+            # gate admits them without allow_mutating_replay.
+            async with GatedAsyncClient(
+                get_default_gate(), self.get_name(),
                 timeout=self.timeout,
                 follow_redirects=follow_redirects,
                 max_redirects=self.max_redirects,
             ) as client:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=headers,
-                )
-                return response
+                return await client.request(method, url, headers=headers)
+        except SafetyGateBlocked as e:
+            log.debug(f"CORS request blocked by safety gate: {e}")
+            return None
         except Exception as e:
             log.debug(f"Request failed: {e}")
             return None
@@ -406,19 +430,21 @@ class CorsValidator(Validator):
     
     async def _test_preflight_bypass(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if preflight can be bypassed."""
-        # Try sending actual request without preflight
-        # Some servers return CORS headers even without preflight
-        
+        # Whether the server hands back per-origin CORS headers on a plain
+        # ("simple") request that browsers never preflight is method-INDEPENDENT
+        # -- it depends on the Origin, not the verb -- so we probe with GET and
+        # never send a mutating method (a POST here was an ungated state-changing
+        # request to the target; see W-1). The OPTIONS preflight below is also
+        # non-mutating.
         test_origin = "https://evil-attacker.com"
         headers = {
             "Origin": test_origin,
-            "Content-Type": "application/json",
         }
-        
-        # Try POST with JSON (which normally requires preflight)
+
+        # Simple GET carrying the attacker Origin -- browsers do not preflight it.
         response = await self._send_request(
             exchange.url,
-            method="POST",
+            method="GET",
             headers=headers,
         )
         
@@ -442,7 +468,7 @@ class CorsValidator(Validator):
                 passed=False,
                 severity="medium",
                 detail="Server returns CORS headers without proper preflight validation",
-                evidence=f"POST with JSON returned Access-Control-Allow-Origin: {acao}",
+                evidence=f"Simple GET with attacker Origin returned Access-Control-Allow-Origin: {acao}",
                 vulnerable=True,
             )
         

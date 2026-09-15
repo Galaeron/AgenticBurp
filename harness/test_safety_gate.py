@@ -254,6 +254,56 @@ class TestDefaultGateSingleton(unittest.TestCase):
         self.assertFalse(g2.config.active_enabled)
 
 
+# Validator source files verified to route any mutating-capable live send
+# through the SafetyGate (GatedAsyncClient / authorize_burst) or sqlmap's own
+# gate call. Shared by the exchange.method check and the hardcoded-mutating-
+# method-literal check below. Membership here is a claim that the file's
+# mutating sends are gate-routed -- most are re-verified in
+# test_the_gate_routed_exceptions_actually_route_through_the_gate.
+_GATE_ROUTED_EXCEPTIONS = {
+    "api_security_validator.py", "race_condition_validator.py", "sqlmap.py",
+    # ssrf/xxe replay the request as a live (possibly mutating) send but
+    # route it through GatedAsyncClient -- verified in
+    # test_the_gate_routed_exceptions_actually_route_through_the_gate.
+    "ssrf_validator.py", "xxe_validator.py",
+    # command_injection/ssti replay the captured method for their
+    # injection payload but likewise route through GatedAsyncClient.
+    "command_injection_validator.py", "ssti_validator.py",
+    # path_traversal/open_redirect replay the captured method for their
+    # file-read / redirect-follow probe, gate-routed.
+    "path_traversal_validator.py", "open_redirect_validator.py",
+    # sequence replays the captured mutating method for its write step
+    # (bracketed by GET reads), gate-routed.
+    "sequence_validator.py",
+    # deserialization_oob replays the captured method carrying the pickle
+    # beacon, gate-routed + self-gated on allow_mutating_replay.
+    "deserialization_oob_validator.py",
+    # auth_sequence replays the captured auth method (login/register) for
+    # its multi-request flow, gate-routed + self-gated.
+    "auth_sequence_validator.py",
+    # stored_xss replays the captured write method to plant the payload,
+    # gate-routed + self-gated on allow_mutating_replay.
+    "stored_xss_validator.py",
+    # verb_tamper sends alternate safe methods + override headers, gate-routed.
+    "verb_tamper_validator.py",
+    # csrf replays the mutating request without the CSRF token, gate-routed
+    # + self-gated on allow_mutating_replay.
+    "csrf_validator.py",
+    # file_upload sends a POST upload, gate-routed + self-gated.
+    "file_upload_validator.py",
+    # rate_limit replays the captured auth method N times via authorize_burst.
+    "rate_limit_validator.py",
+    # toctou fires a concurrent burst of the captured mutating method via
+    # authorize_burst.
+    "toctou_validator.py",
+    # reset_token hardcodes method="POST" for its reset trigger but sends it
+    # through GatedAsyncClient (self-gated on allow_mutating_replay) -- it
+    # matches the mutating-method-literal check below, not the exchange.method
+    # one, and is verified gate-routed there.
+    "reset_token_validator.py",
+}
+
+
 class TestNoValidatorBypassesTheGate(unittest.TestCase):
     """
     These tests read the actual validator source files and fail the
@@ -280,47 +330,8 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
         """
         import re
         # Files allowed to reference exchange.method for a live send,
-        # because they route it through SafetyGate first.
-        gate_routed_exceptions = {"api_security_validator.py", "race_condition_validator.py", "sqlmap.py",
-                                  # ssrf/xxe replay the request as a live (possibly mutating) send but
-                                  # route it through GatedAsyncClient -- verified in
-                                  # test_the_gate_routed_exceptions_actually_route_through_the_gate.
-                                  "ssrf_validator.py", "xxe_validator.py",
-                                  # command_injection/ssti replay the captured method for their
-                                  # injection payload but likewise route through GatedAsyncClient
-                                  # (same verification below).
-                                  "command_injection_validator.py", "ssti_validator.py",
-                                  # path_traversal/open_redirect replay the captured method for their
-                                  # file-read / redirect-follow probe, gate-routed (verified below).
-                                  "path_traversal_validator.py", "open_redirect_validator.py",
-                                  # sequence replays the captured mutating method for its write step
-                                  # (bracketed by GET reads), gate-routed (verified below).
-                                  "sequence_validator.py",
-                                  # deserialization_oob replays the captured method carrying the
-                                  # pickle beacon, gate-routed + self-gated on allow_mutating_replay.
-                                  "deserialization_oob_validator.py",
-                                  # auth_sequence replays the captured auth method (login/register)
-                                  # for its multi-request flow, gate-routed + self-gated on
-                                  # allow_mutating_replay.
-                                  "auth_sequence_validator.py",
-                                  # stored_xss replays the captured write method to plant the
-                                  # payload, gate-routed + self-gated on allow_mutating_replay.
-                                  "stored_xss_validator.py",
-                                  # verb_tamper sends alternate safe methods + override headers,
-                                  # gate-routed.
-                                  "verb_tamper_validator.py",
-                                  # csrf replays the mutating request without the CSRF token,
-                                  # gate-routed + self-gated on allow_mutating_replay.
-                                  "csrf_validator.py",
-                                  # file_upload sends a POST upload, gate-routed + self-gated
-                                  # on allow_mutating_replay.
-                                  "file_upload_validator.py",
-                                  # rate_limit replays the captured auth method N times via
-                                  # authorize_burst (like race_condition) -- verified below.
-                                  "rate_limit_validator.py",
-                                  # toctou fires a concurrent burst of the captured mutating
-                                  # method via authorize_burst (like race_condition) -- verified below.
-                                  "toctou_validator.py"}
+        # because they route it through SafetyGate first (shared module set).
+        gate_routed_exceptions = _GATE_ROUTED_EXCEPTIONS
         # Files whose exchange.method reference is provably not a live
         # send at all -- verified by reading the code, not assumed.
         inert_usage_exceptions = {
@@ -376,6 +387,35 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
                           "13 validators blindly replay a captured mutating method:\n" +
                           "\n".join(violations))
 
+    def test_no_validator_hardcodes_a_mutating_method_for_an_ungated_send(self):
+        """
+        The exchange.method grep above is blind to a HARDCODED mutating
+        method: a literal `method="POST"` for a live send sails straight
+        past it -- which is exactly how the CORS preflight-bypass POST
+        (W-1) shipped an ungated state-changing request to the target and
+        was not caught. This flags any hardcoded POST/PUT/PATCH/DELETE in a
+        validator outside the set of files verified to route such sends
+        through the SafetyGate. On the pre-W-1 tree cors_validator.py
+        (raw httpx, not gate-routed) would be the violation.
+        """
+        import re
+        pat = re.compile(r'method\s*=\s*["\'](POST|PUT|PATCH|DELETE)', re.IGNORECASE)
+        violations = []
+        for path in self._validator_files():
+            if path.name == "__init__.py" or path.name in _GATE_ROUTED_EXCEPTIONS:
+                continue
+            text = path.read_text()
+            for match in pat.finditer(text):
+                line_no = text[:match.start()].count("\n") + 1
+                violations.append(f"{path.name}:{line_no}: {text.splitlines()[line_no - 1].strip()}")
+        self.assertEqual(
+            violations, [],
+            "Found validator(s) hardcoding a mutating HTTP method for a live send outside "
+            "the gate-routed allowlist. A literal method=\"POST\"/\"PUT\"/\"PATCH\"/\"DELETE\" "
+            "must either be sent through GatedAsyncClient/authorize_burst (then added to "
+            "_GATE_ROUTED_EXCEPTIONS with a note) or replaced with a safe read-only probe:\n" +
+            "\n".join(violations))
+
     def test_the_gate_routed_exceptions_actually_route_through_the_gate(self):
         import pathlib
         here = pathlib.Path(__file__).parent
@@ -409,7 +449,10 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
                      "command_injection_validator.py", "ssti_validator.py",
                      "path_traversal_validator.py", "open_redirect_validator.py",
                      "sequence_validator.py", "deserialization_oob_validator.py",
-                     "auth_sequence_validator.py", "stored_xss_validator.py"):
+                     "auth_sequence_validator.py", "stored_xss_validator.py",
+                     # reset_token hardcodes method="POST" (mutating-literal
+                     # check), so verify it too routes through the gate.
+                     "reset_token_validator.py"):
             src = (here / "validators" / name).read_text()
             self.assertIn("GatedAsyncClient", src,
                           f"{name} replays exchange.method but doesn't route through GatedAsyncClient")
