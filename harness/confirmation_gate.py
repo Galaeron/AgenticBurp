@@ -278,6 +278,56 @@ def is_confirmable_class(vuln_class: str | None) -> bool:
     return any(marker in lowered for marker in CONFIRMABLE_CLASS_MARKERS)
 
 
+# --------------------------------------------------------------------------- #
+# W-7: explicit finding lifecycle states, surfaced to the operator so the UI
+# shows CONFIRMED vs not at a glance instead of asking a reader to interpret a
+# raw confidence number ("unconfirmed != confirmed in the UI"). Derived from the
+# confirmed flag plus the review verdict the suppression gate / cross-identity
+# reject / critique already set -- one canonical mapping for the findings API,
+# the report, and the Burp tab.
+# --------------------------------------------------------------------------- #
+STATE_CONFIRMED = "CONFIRMED"
+STATE_SUSPECTED = "SUSPECTED"
+STATE_LEAD = "LEAD"
+
+# Verdicts meaning a reliable check had its shot and the finding did not hold up
+# (a live-verified leg refuted it or could not run a negative, a cross-identity
+# reject, or a critique rejection) -> demoted, weakest actionable state.
+_LEAD_VERDICTS = frozenset({
+    "unconfirmed_hypothesis",   # REFUTED: a live-verified leg ran and stayed silent
+    "inconclusive_unverified",  # live-verified leg for the class, but none ran a negative
+    "downgraded",               # cross-identity reject cap (every other identity denied)
+    "rejected",                 # adversarial critique rejected the hypothesis
+})
+
+
+def lifecycle_state(confirmed: bool, review_verdict: str | None = "") -> str:
+    """Map (confirmed, review_verdict) to a CONFIRMED / SUSPECTED / LEAD state.
+
+    CONFIRMED: a deterministic leg proved it -- ships at true severity.
+    SUSPECTED: a plausible, still-open hypothesis (no leg for the class, or a
+      not-yet-live-verified leg) -- kept visible, capped, awaiting verification.
+    LEAD: a reliable check had its shot and the finding did not hold (likely a
+      false positive, or unverifiable) -- demoted, lowest actionable.
+    """
+    if confirmed:
+        return STATE_CONFIRMED
+    if (review_verdict or "").lower() in _LEAD_VERDICTS:
+        return STATE_LEAD
+    return STATE_SUSPECTED
+
+
+def finding_lifecycle_state(finding) -> str:
+    """lifecycle_state for a Finding object or a finding dict."""
+    if isinstance(finding, dict):
+        confirmed = bool(finding.get("confirmed", False))
+        verdict = finding.get("review_verdict", "") or ""
+    else:
+        confirmed = bool(getattr(finding, "confirmed", False))
+        verdict = getattr(finding, "review_verdict", "") or ""
+    return lifecycle_state(confirmed, verdict)
+
+
 def leg_tier(vuln_class: str | None, live_verified_markers: frozenset | None = None) -> str:
     """Verification tier of the confirmation leg for a class:
     "live" (a live-verified leg exists), "provisional" (a leg exists but is only

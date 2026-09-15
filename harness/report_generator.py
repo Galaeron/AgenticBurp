@@ -122,6 +122,8 @@ class ReportFinding:
     parameter_location: str = ""
     parameter_name: str = ""
     issue_id: str = ""
+    # W-7: explicit CONFIRMED/SUSPECTED/LEAD state (from confirmation_gate).
+    lifecycle_state: str = "SUSPECTED"
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
@@ -146,6 +148,8 @@ def _from_store_dict(d: dict) -> ReportFinding:
         parameter_name=d.get("parameter_name", "") or "",
         issue_id=("" if vc.startswith("potential-attack-chain:")
                   else issues.issue_id_for(issues.issue_key(d))),
+        lifecycle_state=d.get("lifecycle_state")
+        or __import__("confirmation_gate").finding_lifecycle_state(d),
     )
 
 
@@ -389,9 +393,20 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     return "\n".join(lines)
 
 
+_STATE_BADGE = {
+    "CONFIRMED": "✅ CONFIRMED",
+    # SUSPECTED: a still-open hypothesis (no leg, or a not-yet-live-verified
+    # leg). LEAD: a reliable check had its shot and it did not hold -- likely a
+    # false positive or unverifiable. Both are unconfirmed, but they are not the
+    # same thing to an analyst deciding what to look at first (W-7).
+    "SUSPECTED": "❓ SUSPECTED (unconfirmed)",
+    "LEAD": "🔻 LEAD (demoted, unconfirmed)",
+}
+
+
 def _render_finding(f: ReportFinding) -> list[str]:
     lines = []
-    status = "✅ CONFIRMED" if f.confirmed else "❓ UNCONFIRMED"
+    status = _STATE_BADGE.get(f.lifecycle_state, "❓ SUSPECTED (unconfirmed)")
     lines.append(f"### {f.vulnerability_class} -- {f.url}")
     lines.append("")
     lines.append(f"**Status:** {status} &nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)} "

@@ -702,7 +702,7 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
             """SELECT f.url, f.vulnerability_class, f.severity, f.confidence, f.summary,
                       f.evidence, f.suggested_test, f.owasp_category, f.basis, f.confirmed,
                       f.agent, f.fingerprint, f.finding_id, f.case_id, f.proof_id,
-                      f.method,
+                      f.method, f.review_verdict,
                       (SELECT parameter_location FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       (SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1),
@@ -718,15 +718,21 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
     # method + the finding's case coordinates (parameter_location/parameter_name/
     # principal_id, from its linked proof) are surfaced for T06 issue grouping and
     # export -- additive keys; existing consumers read by name and are unaffected.
+    import confirmation_gate
     results = [
         {"url": u, "vulnerability_class": vc, "severity": sev, "confidence": conf, "summary": s,
          "evidence": ev, "suggested_test": st, "owasp_category": oc, "basis": basis,
          "confirmed": bool(confirmed), "agent": agent, "fingerprint": fp,
          "finding_id": finding_id, "case_id": case_id, "proof_id": proof_id,
-         "method": method or "", "parameter_location": ploc or "", "parameter_name": pname or "",
+         "method": method or "", "review_verdict": rv or "",
+         # W-7: explicit CONFIRMED/SUSPECTED/LEAD state so the findings API, the
+         # report and the Burp tab can show status at a glance rather than a raw
+         # confidence number.
+         "lifecycle_state": confirmation_gate.lifecycle_state(bool(confirmed), rv),
+         "parameter_location": ploc or "", "parameter_name": pname or "",
          "principal_id": principal or "", "suppressed": bool(suppressed)}
         for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
-             finding_id, case_id, proof_id, method, ploc, pname, principal, suppressed) in rows
+             finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed) in rows
     ]
     if not include_suppressed:
         results = [r for r in results if not r["suppressed"]]

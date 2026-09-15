@@ -68,10 +68,19 @@ class TestReportStructure(unittest.TestCase):
         report = generate_markdown_report("example.com", findings)
         self.assertIn("✅ CONFIRMED", report)
 
-    def test_unconfirmed_status_badge_present(self):
+    def test_suspected_status_badge_present(self):
+        # W-7: an open unconfirmed hypothesis renders as SUSPECTED, not a bare
+        # "UNCONFIRMED" -- distinct from a demoted LEAD.
         findings = [sample(confirmed=False)]
         report = generate_markdown_report("example.com", findings)
-        self.assertIn("❓ UNCONFIRMED", report)
+        self.assertIn("❓ SUSPECTED", report)
+
+    def test_lead_status_badge_present(self):
+        # W-7: an unconfirmed finding a reliable leg refuted renders as LEAD.
+        f = sample(confirmed=False)
+        f["review_verdict"] = "unconfirmed_hypothesis"
+        report = generate_markdown_report("example.com", [f])
+        self.assertIn("🔻 LEAD", report)
 
     def test_assumed_basis_gets_a_warning_callout(self):
         findings = [sample(basis="assumed")]
