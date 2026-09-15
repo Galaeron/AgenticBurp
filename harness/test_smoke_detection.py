@@ -61,18 +61,24 @@ _SQLI_FINDING = {
 
 # Unambiguous SQLi shape: a MySQL error in the body plus a quote-broken id param.
 # Both are strong fast-path signals, so routing selects sqli without any LLM call.
-_SQLI_EXCHANGE = HttpExchange(
-    url="http://localhost/api/items?id=1'",
-    method="GET",
-    request_headers={"User-Agent": "smoke-test"},
-    request_body="",
-    response_status=500,
-    response_headers={"Content-Type": "application/json"},
-    response_body=(
-        '{"error": "You have an error in your SQL syntax; check the manual that '
-        "corresponds to your MySQL server version for the right syntax near '1''\"}"
-    ),
-)
+# Parametrized by host so persistence tests can use a private host and not
+# collide in the class-scoped state DB (store keys findings by host).
+def _sqli_exchange(host: str = "localhost") -> HttpExchange:
+    return HttpExchange(
+        url=f"http://{host}/api/items?id=1'",
+        method="GET",
+        request_headers={"User-Agent": "smoke-test"},
+        request_body="",
+        response_status=500,
+        response_headers={"Content-Type": "application/json"},
+        response_body=(
+            '{"error": "You have an error in your SQL syntax; check the manual that '
+            "corresponds to your MySQL server version for the right syntax near '1''\"}"
+        ),
+    )
+
+
+_SQLI_EXCHANGE = _sqli_exchange()
 
 
 class _StubOllama:
@@ -113,7 +119,12 @@ def _test_config() -> dict:
     cfg.setdefault("package_registry_checks", {})["enabled"] = False
     cfg.setdefault("iterative_agent", {})["enabled"] = False
     cfg.setdefault("engagement", {})["auto_escalate"] = False
-    cfg.setdefault("server", {})["allowed_hosts"] = ["localhost", "127.0.0.1"]
+    cfg.setdefault("server", {})["allowed_hosts"] = [
+        "localhost", "127.0.0.1",
+        # Private hosts used only by the persistence-stage tests, so their
+        # findings live under a host of their own in the class-scoped state DB.
+        "persist-pos.smoke-test.local", "persist-neg.smoke-test.local",
+    ]
     return cfg
 
 
@@ -195,6 +206,67 @@ class SmokeDetectionTest(unittest.TestCase):
             sql_findings, [],
             "Smoke test is not actually testing detection: a SQL finding appeared even though "
             "the model returned nothing.",
+        )
+
+    def test_finding_is_persisted_with_api_shape(self):
+        """PERSISTENCE + read-back stage (W-10 coverage gap).
+
+        A finding that survives analyze() but never reaches the store -- or
+        persists malformed -- would pass the spine test above yet be invisible
+        to every operator surface: the findings API, ``/report`` and the Burp
+        panel all read back through ``store.all_host_findings``. This asserts
+        the surviving finding lands there with the fields those surfaces need.
+        Uses a private host so it does not depend on the order of the other
+        tests that write to the class-scoped state DB.
+        """
+        exchange = _sqli_exchange("persist-pos.smoke-test.local")
+        orch = _build(detect=True)
+        resp = asyncio.run(orch.analyze(exchange, bypass_cache=True))
+        self.assertTrue(
+            [f for f in self._findings(resp) if f.vulnerability_class == _SQLI_CLASS],
+            "precondition failed: finding did not survive analyze()",
+        )
+
+        persisted = store.all_host_findings(exchange.url)
+        sqli_rows = [r for r in persisted if r["vulnerability_class"] == _SQLI_CLASS]
+        self.assertTrue(
+            sqli_rows,
+            "PERSISTENCE STAGE DROPPED THE FINDING: it survived analyze() but is not in "
+            "store.all_host_findings() -- the findings API, /report and the Burp panel all "
+            "read from here, so the operator would never see it.",
+        )
+        row = sqli_rows[0]
+        for key in ("url", "method", "vulnerability_class", "severity",
+                    "confidence", "summary", "evidence", "agent", "fingerprint"):
+            self.assertIn(key, row, f"persisted finding is missing API field {key!r}")
+        # url/method are structural and preserved verbatim.
+        self.assertEqual(row["url"], exchange.url)
+        self.assertEqual(row["method"], exchange.method)
+        # severity/confidence are legitimately ADJUSTED by gating (an
+        # unconfirmed model finding is demoted -- the behavior W-7 formalizes),
+        # so assert they are well-formed, not that they equal the stub's input.
+        self.assertIn(
+            str(row["severity"]).lower(),
+            {"info", "informational", "low", "medium", "high", "critical"},
+            f"persisted severity is not a recognized level: {row['severity']!r}",
+        )
+        self.assertIsInstance(row["confidence"], (int, float))
+        self.assertGreaterEqual(row["confidence"], 0.0)
+        self.assertLessEqual(row["confidence"], 1.0)
+        self.assertTrue(row["summary"], "persisted finding has an empty summary")
+        self.assertTrue(row["fingerprint"], "persisted finding has no fingerprint")
+
+    def test_negative_control_nothing_persisted_when_model_silent(self):
+        """The persistence stage must be clean in the negative control too:
+        model silent -> no sqli row in the store for that host."""
+        exchange = _sqli_exchange("persist-neg.smoke-test.local")
+        orch = _build(detect=False)
+        asyncio.run(orch.analyze(exchange, bypass_cache=True))
+        persisted = store.all_host_findings(exchange.url)
+        self.assertEqual(
+            [r for r in persisted if r["vulnerability_class"] == _SQLI_CLASS],
+            [],
+            "a sqli finding was persisted even though the model returned nothing.",
         )
 
 
