@@ -46,16 +46,6 @@ checklist, not a claim that the offline diagnostics close production contracts.
   verified-issue metrics require labels plus matching evidence; historical cache
   rescoring declares itself historical and cannot satisfy a fresh end-to-end gate.
 
-- **W-13 — prove and accurately scope the configured resource bound.** The
-  semaphore is created per `AgentManager` (`harness/agent_manager.py:58-61`) and
-  wraps `run_multiple_agents` work (`harness/agent_manager.py:438-470`). The test
-  calls that method directly (`harness/test_agent_concurrency.py:47-68`), not its
-  orchestrator/server caller, and does not overlap two exchanges/jobs. Smallest
-  expectation: inert work submitted through the real caller across two concurrent
-  exchanges demonstrates the configured peak; documentation calls the guarantee
-  manager-scoped/process-scoped only if the tested lifecycle actually shares one
-  manager, otherwise per invocation/exchange as observed.
-
 ## Verified and removed from the open checklist
 
 - **W-14 implementation/default contract is present.** Cloud-primary and cloud
@@ -66,3 +56,12 @@ checklist, not a claim that the offline diagnostics close production contracts.
   (`harness/coordinator.py:62-78`). No production change is requested. Any future
   comparative operational-cost or efficacy claim still requires an evaluation;
   unchanged defaults alone are not that evidence.
+
+- **W-13 resource-bound contract is now verified.** The semaphore and method
+  documentation state that the limit is scoped to one shared `AgentManager`, not
+  all managers or the Ollama process (`harness/agent_manager.py:47-65`,
+  `harness/agent_manager.py:437-446`), and the configuration comment uses the same
+  scope (`harness/config.yaml:20-29`). The caller-level regression overlaps two
+  top-level `Orchestrator.analyze()` calls, four inert jobs total, and asserts an
+  exact combined peak of two (`harness/test_agent_concurrency.py:113-185`). The
+  direct manager controls remain (`harness/test_agent_concurrency.py:52-111`).

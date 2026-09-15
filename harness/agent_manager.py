@@ -46,7 +46,11 @@ class AgentManager:
         self._agent_configs = config.get("agents", {})
         self._plugin_system = None
 
-        # Bound how many agents run concurrently against Ollama at once.
+        # Bound how many agents run concurrently against Ollama through THIS
+        # AgentManager instance.  The application orchestrator owns one manager,
+        # so its semaphore is shared by overlapping exchanges/jobs routed through
+        # that orchestrator.  Separately constructed managers have independent
+        # ceilings: this is not a process-global or Ollama-server-wide guarantee.
         # Unbounded concurrency (the old behavior) means every dispatched
         # agent -- up to all 36 if the coordinator fails open -- fires an
         # inference request simultaneously. On memory-constrained GPUs
@@ -437,7 +441,9 @@ class AgentManager:
         Run multiple agents on an exchange concurrently, bounded by
         `concurrency.max_parallel_agents` in config (see __init__) so a
         large dispatch doesn't fire every agent's inference request at
-        once and exhaust GPU memory.
+        once and exhaust GPU memory. The bound is manager-scoped and therefore
+        also covers simultaneous calls for different exchanges when they share
+        this manager; it does not coordinate separate manager instances.
 
         Args:
             agent_names: List of agent names to run
