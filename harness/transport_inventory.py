@@ -56,6 +56,7 @@ SCOPE_INFRA = "infra"
 ROUTING_ADAPTER = "adapter"     # this IS the routed transport (executor/gate/tool_runner/browser_driver)
 ROUTING_GATED = "gated"         # target send that passes through the SafetyGate/GatedAsyncClient
 ROUTING_EXECUTOR = "executor"   # production path uses the invocation RunContext executor
+ROUTING_CAPABILITY_ADAPTER = "capability_adapter"  # non-HTTP adapter applies equivalent run policy
 ROUTING_DIRECT = "direct"       # a direct send NOT (yet) on the executor -- a routing gap if target-scoped
 
 
@@ -208,10 +209,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                        "invocation scope, budget, cancellation and executor routing."),
 
     # ---- target: raw socket ----
-    TransportSite("validators/websocket_validator.py", CHANNEL_SOCKET, SCOPE_TARGET, ROUTING_DIRECT,
+    TransportSite("validators/websocket_validator.py", CHANNEL_SOCKET, SCOPE_TARGET, ROUTING_CAPABILITY_ADAPTER,
                   owner="confirmation",
-                  note="hand-rolled WebSocket upgrade over socket+ssl (no ws library); "
-                       "CSWSH origin check. Its own raw-socket adapter, not httpx."),
+                  note="raw WebSocket Upgrade adapter applies invocation scope, cancellation, "
+                       "gate, budget, and registered-session cookie policy before connect."),
 )
 
 
