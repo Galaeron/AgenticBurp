@@ -64,8 +64,10 @@ class WebsocketValidator(Validator):
                         "cross site websocket hijacking"}
     active = True
 
-    def __init__(self, timeout: float = 10.0, max_redirects: int = 0):
+    def __init__(self, timeout: float = 10.0, max_redirects: int = 0,
+                 run_context=None):
         self.timeout = timeout
+        self.run_context = run_context
 
     def get_name(self) -> str:
         return "websocket_validator"
@@ -175,6 +177,12 @@ class WebsocketValidator(Validator):
         raw_request = "\r\n".join(request_lines).encode()
 
         try:
+            policy_error = self._authorize_raw_handshake(ws_url, cookie_header)
+            if policy_error:
+                return WebsocketTestResult(
+                    "CSWSH Handshake Probe", True, "low",
+                    f"Handshake blocked before transport: {policy_error}", "",
+                    checked=False, vulnerable=False)
             sock = socket.create_connection((host, port), timeout=self.timeout)
             if parsed.scheme == "wss":
                 ctx = ssl.create_default_context()
@@ -208,6 +216,33 @@ class WebsocketValidator(Validator):
             "handshake requirements (e.g. a required custom header/token) also being the reason",
             f"Response status line: {status_line}", vulnerable=False,
         )
+
+    def _authorize_raw_handshake(self, ws_url: str, cookie_header: str | None) -> str:
+        """Apply RunContext policy before the capability-specific raw socket send."""
+        if self.run_context is None:
+            return ""
+        http_url = (ws_url.replace("ws://", "http://", 1)
+                    if ws_url.startswith("ws://")
+                    else ws_url.replace("wss://", "https://", 1))
+        ctx = self.run_context
+        if ctx.cancel.cancelled:
+            return "run cancelled"
+        if not ctx.scope.in_scope(http_url):
+            return "destination is out of scope"
+        if cookie_header:
+            session_ref, _ = ctx.sessions.bind_headers({"Cookie": cookie_header})
+            session = ctx.sessions.get(session_ref)
+            if session is None:
+                return "credential-bearing handshake requires a registered session"
+            if ctx.scope.origin_of(http_url) not in session.allowed_origins:
+                return "session is not authorized for the requested destination"
+        decision = ctx.gate.authorize(
+            validator_name=self.get_name(), method="GET", url=http_url)
+        if not decision.allowed:
+            return decision.reason
+        if not ctx.budget.reserve(1):
+            return "request budget exhausted"
+        return ""
 
     def _build_raw_output(self, tests: list[WebsocketTestResult]) -> str:
         import json

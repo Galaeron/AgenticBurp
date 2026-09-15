@@ -571,3 +571,22 @@ visibility/contract refinements, not correctness fabrications.
   socket ResourceWarnings were non-failing.
 - Inventory reconciliation: 32 sites, **3 target routing gaps**. Concurrent
   coverage files and active S19 were untouched.
+
+## 2026-09-15 — T08u WebSocket capability adapter
+
+- The raw WebSocket Upgrade path cannot use the HTTP executor without losing
+  handshake semantics. It now has a capability-specific pre-connect policy
+  adapter: ws/wss is normalized to http/https for run scope, then cancellation,
+  the run gate, atomic request budget, and registered-session cookie ownership
+  are enforced before any socket is opened.
+- Real TCP controls verify a spoofed-Origin handshake consumes exactly one budget
+  unit; a registered cookie is preserved; off-scope and unregistered-cookie
+  cases open zero connections and consume zero budget.
+- Static compilation passed. Isolated WebSocket/inventory/validator/executor gate:
+  exit 0, **53 tests OK in 10.952s**.
+- A broader 122-test invocation failed with 11 pre-existing errors in the dirty
+  concurrent `orchestrator.py`: test-built orchestrators lack its newly referenced
+  `max_concurrent_validations`. The WebSocket tests themselves passed. This slice
+  did not edit that file or claim a broad green result.
+- Inventory reconciliation: 32 sites, **2 target routing gaps**. `CURRENT_STATE.md`
+  was not edited because it has concurrent user-owned changes.

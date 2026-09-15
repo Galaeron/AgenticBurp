@@ -94,6 +94,8 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(by_mod["tool_runner.py"].channel, ti.CHANNEL_CONTAINER)
         self.assertEqual(by_mod["browser_driver.py"].channel, ti.CHANNEL_BROWSER)
         self.assertEqual(by_mod["validators/websocket_validator.py"].channel, ti.CHANNEL_SOCKET)
+        self.assertEqual(by_mod["validators/websocket_validator.py"].routing,
+                         ti.ROUTING_CAPABILITY_ADAPTER)
 
     def test_egress_and_llm_are_not_target_scoped(self):
         # public advisory/registry APIs and the model plane must NOT be counted as
