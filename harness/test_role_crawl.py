@@ -256,7 +256,7 @@ class RoleCrawlEndpointTests(unittest.TestCase):
         self.server_module = server_module
         server_module.orchestrator.allowed_hosts = ["shop.test"]
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def test_endpoint_runs(self):
         with patch("crawler.crawl", _fake_crawl(["/api/report"])), \

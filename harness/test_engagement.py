@@ -264,7 +264,7 @@ class StoreAndEndpointTests(unittest.TestCase):
     def test_engagement_endpoint(self):
         import server as server_module
         from fastapi.testclient import TestClient
-        client = TestClient(server_module.app)
+        client = TestClient(server_module.app, base_url="http://localhost")
         st = EngagementState(host="shop.test")
         st.ingest_role_crawl({"endpoints": [
             {"method": "GET", "path": "/rest/admin", "by_role": {"anonymous": 200},

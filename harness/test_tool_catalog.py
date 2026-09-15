@@ -83,7 +83,7 @@ class ToolEndpointTests(unittest.TestCase):
     def setUp(self):
         import server as server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def test_get_tools_grouped(self):
         r = self.client.get("/tools")

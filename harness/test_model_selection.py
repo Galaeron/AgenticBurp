@@ -91,7 +91,7 @@ class ModelEndpointTests(unittest.TestCase):
         import server as server_module
         self.server_module = server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def test_get_models_merges_cloud(self):
         from unittest.mock import AsyncMock, patch

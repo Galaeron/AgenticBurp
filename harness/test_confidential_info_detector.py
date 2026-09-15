@@ -101,7 +101,7 @@ class ScanEndpointTests(unittest.TestCase):
     def setUp(self):
         import server as server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def test_scan_confidential_endpoint_redacts(self):
         secret = "AKIAIOSFODNN7EXAMPLE"

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from models import (AnalysisRequest, AnalysisResponse, ValidationSubmission, EstimateRequest, EffortStatus,
                      IdentityCreateRequest, SessionCreateRequest, SuppressFindingRequest,
@@ -67,6 +68,25 @@ if not _is_loopback(_SERVER_HOST) and not _BEARER_TOKEN:
         "Refusing non-loopback harness.server.host without authentication. "
         "Set server.auth_token or HARNESS_BEARER_TOKEN, or bind to 127.0.0.1."
     )
+
+
+# W-4: DNS-rebinding / Host-header defense. On the default loopback deploy the
+# JSON endpoints are otherwise protected only by accidental CORS-preflight, and
+# GET endpoints (/report, /settings, ...) are simple cross-origin requests any
+# visited web page can trigger; DNS rebinding defeats the loopback assumption
+# for everything. TrustedHostMiddleware rejects (400) any request whose Host
+# header is not in this allowlist -- a rebound attacker.com no longer matches.
+# NOTE: this is the set of hostnames the HARNESS SERVER itself answers to, a
+# different thing from server.allowed_hosts (which is the TARGET scope the
+# harness may probe). Override with server.trusted_hosts (e.g. ["*"] behind a
+# trusted reverse proxy).
+_TRUSTED_HOSTS = list(
+    config.get("server", {}).get("trusted_hosts")
+    or ["127.0.0.1", "localhost", "::1"]
+)
+if _SERVER_HOST not in _TRUSTED_HOSTS and "*" not in _TRUSTED_HOSTS:
+    _TRUSTED_HOSTS.append(_SERVER_HOST)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_TRUSTED_HOSTS)
 
 
 def _require_auth(authorization: str | None) -> None:

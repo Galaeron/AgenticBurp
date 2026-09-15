@@ -70,7 +70,7 @@ class KnowledgeEndpointTests(unittest.TestCase):
         store._DB_PATH = Path(self.tmp.name) / "t.db"
         import server as server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def tearDown(self):
         store._DB_PATH = self.orig

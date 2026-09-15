@@ -34,7 +34,7 @@ class SuppressionEndpointTests(unittest.TestCase):
         import server as server_module
         importlib.reload(server_module)
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def tearDown(self):
         store._DB_PATH = self._original_db_path
@@ -138,7 +138,7 @@ class PrioritizeEndpointTests(unittest.TestCase):
         importlib.reload(server_module)
         self.server_module = server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def tearDown(self):
         store._DB_PATH = self._original_db_path
@@ -201,7 +201,7 @@ class MissingAuthProbeEndpointTests(unittest.TestCase):
         server_module.orchestrator.allowed_hosts = ["t.test"]
         global_throttle.configure(0)
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def tearDown(self):
         store._DB_PATH = self._original_db_path
@@ -265,7 +265,7 @@ class ActiveProbeEndpointTests(unittest.TestCase):
         self.server_module = server_module
         server_module.orchestrator.allowed_hosts = ["shop.test"]
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def tearDown(self):
         store._DB_PATH = self._original_db_path
@@ -324,7 +324,7 @@ class RetryAgentsEndpointTests(unittest.TestCase):
         importlib.reload(server_module)
         self.server_module = server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def tearDown(self):
         store._DB_PATH = self._original_db_path
@@ -456,7 +456,7 @@ class SettingsValidatorToggleEndpointTests(unittest.TestCase):
         importlib.reload(server_module)
         self.server_module = server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def tearDown(self):
         store._DB_PATH = self._original_db_path
@@ -509,7 +509,7 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         self.server.config["runs"] = {"output_dir": self._tmpdir.name,
                                        "cache_namespace": "test-isolated"}
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app)
+        self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def tearDown(self):
         store._DB_PATH = self._original_db_path
@@ -605,6 +605,47 @@ class InvestigateJobEndpointTests(unittest.TestCase):
             listing = self.client.get("/engagement/shop.test/investigate")
         self.assertEqual(listing.status_code, 200)
         self.assertGreaterEqual(len(listing.json()["jobs"]), 1)
+
+
+class HostHeaderDefenseTests(unittest.TestCase):
+    """W-4: DNS-rebinding / Host-header defense. Any request whose Host is not
+    a trusted (loopback) host must be rejected before it reaches an endpoint,
+    so a rebound attacker.com pointed at 127.0.0.1 cannot drive the harness."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
+        import importlib
+        import server as server_module
+        importlib.reload(server_module)
+        from fastapi.testclient import TestClient
+        self.server_module = server_module
+        self.TestClient = TestClient
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def test_untrusted_host_header_is_rejected(self):
+        client = self.TestClient(self.server_module.app, base_url="http://attacker.com")
+        resp = client.get("/health")
+        self.assertEqual(resp.status_code, 400,
+                         "a request with Host: attacker.com must be rejected (DNS-rebinding defense)")
+
+    def test_loopback_host_still_works(self):
+        for host in ("http://localhost", "http://127.0.0.1"):
+            client = self.TestClient(self.server_module.app, base_url=host)
+            resp = client.get("/health")
+            self.assertEqual(resp.status_code, 200,
+                             f"loopback client {host} must still reach the harness")
+
+    def test_untrusted_host_rejected_on_get_report_too(self):
+        # GET endpoints are the simple-cross-origin ones a visited page can hit;
+        # the defense must cover them, not just the JSON POSTs.
+        client = self.TestClient(self.server_module.app, base_url="http://evil.example")
+        resp = client.get("/report", params={"url": "http://localhost/x"})
+        self.assertEqual(resp.status_code, 400)
 
 
 if __name__ == "__main__":
