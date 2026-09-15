@@ -203,6 +203,17 @@ class CircuitBreaker:
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Exit the circuit breaker context."""
         async with self._lock:
+            # Release the half-open trial slot this request occupied, so
+            # half_open_max_requests gates *concurrent* trial requests rather
+            # than the *total* ever admitted. Without this, a breaker whose
+            # success_threshold exceeds half_open_max_requests (e.g. the
+            # defaults, 3 > 1) could never accumulate enough sequential
+            # successes to close: after one trial it would stay HALF_OPEN
+            # forever, rejecting every request and defeating the module's
+            # stated self-healing design principle.
+            if self._half_open_requests > 0:
+                self._half_open_requests -= 1
+
             # Update stats
             self._stats.total_requests += 1
             self._stats.consecutive_failures = self._consecutive_failures

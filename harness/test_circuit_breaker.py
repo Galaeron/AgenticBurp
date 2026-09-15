@@ -18,9 +18,9 @@ from circuit_breaker import (
 )
 
 
-class TestCircuitBreaker(unittest.TestCase):
+class TestCircuitBreaker(unittest.IsolatedAsyncioTestCase):
     """Test the CircuitBreaker class."""
-    
+
     def setUp(self):
         """Set up test circuit breaker."""
         self.config = CircuitBreakerConfig(
@@ -139,29 +139,34 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertEqual(self.breaker.state, CircuitState.CLOSED)
     
     async def test_half_open_max_requests(self):
-        """HALF_OPEN state should limit concurrent requests."""
+        """HALF_OPEN state should limit *concurrent* trial requests."""
         # Trip the circuit
         async def failing_request():
             raise ValueError("Test error")
-        
+
         for _ in range(self.config.failure_threshold):
             try:
                 async with self.breaker:
                     await failing_request()
             except ValueError:
                 pass
-        
+
         # Wait for timeout
         await asyncio.sleep(self.config.timeout_seconds + 0.1)
-        
-        # Enter HALF_OPEN state
+
+        # Enter HALF_OPEN and hold the single trial slot open; a *concurrent*
+        # second entry (before the first exits and releases the slot) must be
+        # rejected because half_open_max_requests == 1.
+        async with self.breaker:
+            self.assertEqual(self.breaker.state, CircuitState.HALF_OPEN)
+            with self.assertRaises(CircuitOpenError):
+                async with self.breaker:
+                    pass
+
+        # After the slot is released, a subsequent sequential request is
+        # admitted again (the gate is on concurrency, not total count).
         async with self.breaker:
             pass
-        
-        # Try to make another request - should fail
-        with self.assertRaises(CircuitOpenError):
-            async with self.breaker:
-                pass
     
     async def test_half_open_failure_resets_to_open(self):
         """Failure in HALF_OPEN state should reset to OPEN."""
@@ -346,15 +351,19 @@ class TestCircuitBreakerRegistry(unittest.TestCase):
     def test_reset_all(self):
         """reset_all should reset all circuit breakers."""
         registry = CircuitBreakerRegistry()
-        
-        breaker1 = registry.get("breaker1")
-        breaker2 = registry.get("breaker2")
-        
+
+        # Explicit threshold: the default failure_threshold is 5, so tripping
+        # three times would never open the breakers and this test would assert
+        # nothing meaningful.
+        config = CircuitBreakerConfig(failure_threshold=3, timeout_seconds=1.0)
+        breaker1 = registry.get("breaker1", config)
+        breaker2 = registry.get("breaker2", config)
+
         # Trip both breakers
         async def trip():
             async def failing_request():
                 raise ValueError("Test error")
-            
+
             for breaker in [breaker1, breaker2]:
                 for _ in range(3):
                     try:
@@ -376,47 +385,6 @@ class TestCircuitBreakerRegistry(unittest.TestCase):
         self.assertTrue(breaker1.is_closed)
         self.assertTrue(breaker2.is_closed)
 
-
-    async def test_reset_all(self):
-        """reset_all should reset all circuit breakers."""
-        from circuit_breaker import CircuitBreakerConfig
-        
-        registry = CircuitBreakerRegistry()
-        config = CircuitBreakerConfig(failure_threshold=3, timeout_seconds=1.0)
-        
-        breaker1 = registry.get("breaker1", config)
-        breaker2 = registry.get("breaker2", config)
-        
-        # Trip both breakers
-        async def failing_request():
-            raise ValueError("Test error")
-        
-        # Trip breaker1
-        for _ in range(3):
-            try:
-                async with breaker1:
-                    await failing_request()
-            except ValueError:
-                pass
-        
-        # Trip breaker2
-        for _ in range(3):
-            try:
-                async with breaker2:
-                    await failing_request()
-            except ValueError:
-                pass
-        
-        # Both should be open
-        self.assertTrue(breaker1.is_open)
-        self.assertTrue(breaker2.is_open)
-        
-        # Reset all
-        registry.reset_all()
-        
-        # Both should be closed
-        self.assertTrue(breaker1.is_closed)
-        self.assertTrue(breaker2.is_closed)
 
 class TestGlobalRegistry(unittest.TestCase):
     """Test the global registry functions."""

@@ -20,9 +20,9 @@ from rate_limiter import (
 )
 
 
-class TestRateLimiter(unittest.TestCase):
+class TestRateLimiter(unittest.IsolatedAsyncioTestCase):
     """Test the RateLimiter class."""
-    
+
     def test_token_bucket_allow(self):
         """Token bucket should allow requests when tokens are available."""
         config = RateLimitConfig(
