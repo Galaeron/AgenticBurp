@@ -352,11 +352,35 @@ class ValidatorRegistry:
             "registered": sorted(self.validators.keys()),
         }
 
+    def _auto_cross_identity(self):
+        # W-12: lazily build the auto-armed cross-identity validator once and
+        # reuse it (bind_run_context copies it per-dispatch like the others).
+        if getattr(self, "_auto_xid", None) is None:
+            self._auto_xid = self._build_cross_identity()
+        return self._auto_xid
+
     def for_finding(self, finding, exchange):
         if not self.enabled:
             return []
-        return [v for v in self.validators.values()
-                if v.applies(finding, exchange) and (not v.active or self.active_enabled)]
+        matched = [v for v in self.validators.values()
+                   if v.applies(finding, exchange) and (not v.active or self.active_enabled)]
+        # W-12: within an active, scoped engagement, auto-arm cross-identity for
+        # applicable object-scoped requests when registered identities exist for
+        # the host -- no separate cross_identity.enabled opt-in required.
+        # Applicability is automatic; authorization to SEND stays explicit: BOTH
+        # active_enabled AND tester-supplied identities for the host are required
+        # here, so with no active engagement or no identities, nothing fires.
+        # Only auto-armed when it is not already explicitly registered (avoids a
+        # duplicate and leaves the runtime toggle / config opt-in untouched).
+        if self.active_enabled and "cross_identity" not in self.validators:
+            import identity_headers
+            from urllib.parse import urlsplit
+            host = urlsplit(exchange.url).hostname or ""
+            if identity_headers.has_identities(host):
+                xid = self._auto_cross_identity()
+                if xid.applies(finding, exchange):
+                    matched.append(xid)
+        return matched
 
     def bind_run_context(self, validators, run_context):
         """Return invocation-bound copies without changing for_finding's public seam."""
