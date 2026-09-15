@@ -10,6 +10,46 @@ from models import HttpExchange, Finding, TestPlan, ValidationSubmission
 
 _DB_PATH = Path(__file__).parent / "harness_state.db"
 
+# W-9: bump when finding_fingerprint's formula changes, so _connect re-fingerprints
+# existing rows once (guarded by PRAGMA user_version).
+_FINGERPRINT_ALGO_VERSION = 2
+
+
+def _normalize_endpoint(url: str) -> str:
+    """Endpoint identity with volatile query VALUES stripped but structure kept:
+    scheme://netloc/path plus the sorted set of query PARAM NAMES. So ?id=1 and
+    ?id=2 collapse to the same endpoint, while ?a= and ?b= stay distinct."""
+    from urllib.parse import urlsplit, parse_qsl
+    parts = urlsplit(url or "")
+    names = sorted({k for k, _ in parse_qsl(parts.query, keep_blank_values=True)})
+    query = ("?" + ",".join(names)) if names else ""
+    return f"{parts.scheme}://{parts.netloc}{parts.path}{query}"
+
+
+def finding_fingerprint(host: str, method: str, url: str, vulnerability_class: str,
+                        *, parameter_location: str = "", parameter_name: str = "",
+                        principal_id: str = "") -> str:
+    """Stable STRUCTURAL identity for a finding (W-9).
+
+    Keyed on canonical vulnerability class + host + normalized endpoint +
+    parameter/object + identity context -- deliberately NOT the LLM-written
+    summary. The old formula hashed `summary`, so re-running with differently
+    worded prose for the same underlying issue produced a different
+    fingerprint, defeating suppression and duplicating findings. Two runs that
+    word the same issue differently now hash identically.
+    """
+    from categories import canonicalize
+    check = canonicalize(vulnerability_class) or (vulnerability_class or "").lower()
+    return hashlib.sha256("\x1f".join([
+        host or "",
+        (method or "").upper(),
+        _normalize_endpoint(url),
+        check,
+        (parameter_location or "").lower(),
+        (parameter_name or "").lower(),
+        principal_id or "",
+    ]).encode("utf-8")).hexdigest()
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS findings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,9 +238,9 @@ def _connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE findings ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
     if "fingerprint" not in cols:
         conn.execute("ALTER TABLE findings ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''")
-        rows = conn.execute("SELECT id, host, method, url, vulnerability_class, summary FROM findings WHERE fingerprint = ''").fetchall()
+        rows = conn.execute("SELECT id, host, method, url, vulnerability_class FROM findings WHERE fingerprint = ''").fetchall()
         for row in rows:
-            fid = hashlib.sha256("\x1f".join([row[1], row[2].upper(), row[3], row[4], row[5]]).encode("utf-8")).hexdigest()
+            fid = finding_fingerprint(row[1], row[2], row[3], row[4])
             conn.execute("UPDATE findings SET fingerprint = ? WHERE id = ?", (fid, row[0]))
     if "model" not in cols:
         conn.execute("ALTER TABLE findings ADD COLUMN model TEXT NOT NULL DEFAULT ''")
@@ -229,6 +269,24 @@ def _connect() -> sqlite3.Connection:
     conn.execute("DROP INDEX IF EXISTS idx_findings_fingerprint")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_fingerprint_case "
                  "ON findings(fingerprint, case_id)")
+
+    # W-9: re-fingerprint rows written by the old summary-based formula so they
+    # dedup consistently with new writes. Guarded by PRAGMA user_version so it
+    # runs once per DB, and after the unique index exists. UPDATE OR IGNORE: if a
+    # recomputed (fingerprint, case_id) would collide with an existing row, skip
+    # it (it keeps its old fingerprint) rather than erroring on the unique index.
+    # Old rows are re-keyed structurally (host/method/endpoint/class); parameter
+    # and identity coordinates live in proof_records, not the findings table, so
+    # migrated rows use the coordinate-free structure -- enough to drop the
+    # summary volatility this migration exists to remove.
+    if conn.execute("PRAGMA user_version").fetchone()[0] < _FINGERPRINT_ALGO_VERSION:
+        for row in conn.execute(
+            "SELECT id, host, method, url, vulnerability_class FROM findings"
+        ).fetchall():
+            new_fp = finding_fingerprint(row[1], row[2], row[3], row[4])
+            conn.execute("UPDATE OR IGNORE findings SET fingerprint = ? WHERE id = ?",
+                         (new_fp, row[0]))
+        conn.execute(f"PRAGMA user_version = {_FINGERPRINT_ALGO_VERSION}")
 
     # T02: additive principal metadata on the existing identities table (reuse the
     # store, don't fork a second identity registry). Old rows default to unknown
@@ -297,9 +355,12 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
     try:
         rows = []
         for f in findings:
-            fingerprint = hashlib.sha256(
-                "\x1f".join([host, exchange.method.upper(), exchange.url, f.vulnerability_class, f.summary]).encode("utf-8")
-            ).hexdigest()
+            fingerprint = finding_fingerprint(
+                host, exchange.method, exchange.url, f.vulnerability_class,
+                parameter_location=getattr(f, "parameter_location", "") or "",
+                parameter_name=getattr(f, "parameter_name", "") or "",
+                principal_id=getattr(f, "principal_id", "") or "",
+            )
             rows.append((host, exchange.url, exchange.method, agent_name, f.vulnerability_class,
                          f.severity, f.confidence, f.summary, f.basis, f.evidence, f.suggested_test,
                          f.owasp_category, f.review_verdict, int(f.confirmed), fingerprint,
