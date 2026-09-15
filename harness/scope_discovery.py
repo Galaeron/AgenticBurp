@@ -29,6 +29,7 @@ on this whole exchange indicate a scope change," which needs to look
 across all of an exchange's findings at once.
 """
 from __future__ import annotations
+import ipaddress
 import logging
 from urllib.parse import urlparse
 
@@ -39,26 +40,91 @@ from models import Finding, HttpExchange
 
 log = logging.getLogger("harness.scope_discovery")
 
+_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
-def is_host_allowed(url: str, allowed_hosts: list[str]) -> bool:
-    """Same hostname-match logic as orchestrator.analyze()'s own
-    server.allowed_hosts check (urlparse(url).hostname only, port
-    stripped -- see that function's own comment on this exact limitation).
-    Extracted so it can be applied per-URL here too, not just once at
-    analyze()'s entry -- found live, this session, that nothing previously
-    re-checked a URL a validator (or a new discovery feature) constructs
-    after that single entry-point check. An empty allowed_hosts list means
-    "no application-level scope restriction configured" (matches
-    orchestrator.py's own `if self.allowed_hosts:` behavior), NOT "nothing
-    is allowed" -- deliberately fails open the same way the existing check
-    already does, so this doesn't become a stricter, inconsistent second
-    scope policy.
+
+def _parse_allow_entry(entry: str):
+    """Parse one allowed_hosts entry into (scheme, host, port, network).
+
+    Supported, all backward compatible with the historical bare-host form:
+      host                     -> host (and its subdomains), any scheme/port
+      host:port                -> only that port
+      scheme://host[:port]     -> also constrain the scheme
+      1.2.3.4  or  10.0.0.0/24 -> single IP / CIDR network match
+
+    Any field left None is an unconstrained wildcard for that dimension, so a
+    plain "example.com" behaves exactly as before (matches every port/scheme).
+    """
+    entry = (entry or "").strip().lower()
+    if not entry:
+        return (None, None, None, None)
+    scheme = None
+    if "://" in entry:
+        scheme, entry = entry.split("://", 1)
+        scheme = scheme or None
+    # CIDR / bare-IP network first: a CIDR's '/' would otherwise be mistaken for
+    # a path separator below.
+    try:
+        return (scheme, None, None, ipaddress.ip_network(entry, strict=False))
+    except ValueError:
+        pass
+    entry = entry.split("/", 1)[0]  # drop any path
+    port = None
+    host = entry
+    if entry.count(":") == 1:  # host:port (bare IPv6 literals are not a scope form)
+        maybe_host, maybe_port = entry.rsplit(":", 1)
+        if maybe_port.isdigit():
+            host, port = maybe_host, int(maybe_port)
+    host = host.lstrip("*.")
+    return (scheme, host or None, port, None)
+
+
+def is_host_allowed(url: str, allowed_hosts: list[str], *, active_mode: bool = False) -> bool:
+    """Decide whether `url`'s host is within the configured engagement scope.
+
+    Matching understands scheme + host + port + CIDR (see _parse_allow_entry),
+    while a bare "example.com" entry keeps its historical meaning: that host and
+    its subdomains on any scheme/port. Extracted so it can be applied per-URL,
+    not just once at analyze()'s entry -- nothing otherwise re-checked a URL a
+    validator or discovery feature constructs after that single check.
+
+    Empty `allowed_hosts` means "no application-level scope configured". In
+    PASSIVE mode that fails open (historical behavior -- passive analysis sends
+    nothing), but in ACTIVE mode (`active_mode=True`) it fails CLOSED (W-17):
+    dispatching live probes against an undeclared scope is precisely what must
+    never happen by default. Passive callers omit `active_mode`, so their
+    behavior is unchanged.
     """
     if not allowed_hosts:
+        return not active_mode
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return False
+    url_port = parsed.port
+    url_scheme = (parsed.scheme or "").lower()
+    try:
+        url_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        url_ip = None
+    for entry in allowed_hosts:
+        scheme, host, port, network = _parse_allow_entry(entry)
+        if scheme and url_scheme and scheme != url_scheme:
+            continue
+        if network is not None:
+            if url_ip is not None and url_ip in network:
+                return True
+            continue
+        if not host:
+            continue
+        if not (hostname == host or hostname.endswith("." + host)):
+            continue
+        if port is not None:
+            effective = url_port if url_port is not None else _DEFAULT_PORTS.get(url_scheme)
+            if effective != port:
+                continue
         return True
-    hostname = (urlparse(url).hostname or "").lower()
-    allowed = {h.lower().lstrip("*.") for h in allowed_hosts}
-    return bool(hostname) and any(hostname == h or hostname.endswith("." + h) for h in allowed)
+    return False
 
 
 def _should_trigger(findings: list[Finding], trigger_categories: list[str]) -> bool:

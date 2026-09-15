@@ -37,6 +37,55 @@ class IsHostAllowedTests(unittest.TestCase):
     def test_subdomain_of_allowed_host_allowed(self):
         self.assertTrue(scope_discovery.is_host_allowed("https://api.target.invalid/x", ["target.invalid"]))
 
+    # --- W-17: fail closed in active mode when no scope is configured ---
+    def test_empty_allowed_hosts_fails_open_in_passive_mode(self):
+        self.assertTrue(scope_discovery.is_host_allowed(
+            "https://anything.invalid/x", [], active_mode=False))
+
+    def test_empty_allowed_hosts_fails_closed_in_active_mode(self):
+        self.assertFalse(scope_discovery.is_host_allowed(
+            "https://anything.invalid/x", [], active_mode=True))
+
+    def test_configured_scope_active_mode_still_matches(self):
+        # active_mode changes only the empty-scope decision; a configured scope
+        # is honored identically in both modes.
+        self.assertTrue(scope_discovery.is_host_allowed(
+            "https://target.invalid/x", ["target.invalid"], active_mode=True))
+        self.assertFalse(scope_discovery.is_host_allowed(
+            "https://evil.invalid/x", ["target.invalid"], active_mode=True))
+
+    # --- W-17: port precision (bare host still matches any port) ---
+    def test_bare_host_matches_any_port(self):
+        self.assertTrue(scope_discovery.is_host_allowed("http://localhost:5002/x", ["localhost"]))
+        self.assertTrue(scope_discovery.is_host_allowed("http://localhost:11434/x", ["localhost"]))
+
+    def test_host_port_entry_matches_only_that_port(self):
+        self.assertTrue(scope_discovery.is_host_allowed("http://localhost:5002/x", ["localhost:5002"]))
+        # A scope pinned to :5002 must NOT authorize Ollama on :11434 or the
+        # harness itself on :8787 -- the "localhost authorizes all local
+        # services" gap W-17 closes.
+        self.assertFalse(scope_discovery.is_host_allowed("http://localhost:11434/x", ["localhost:5002"]))
+        self.assertFalse(scope_discovery.is_host_allowed("http://localhost:8787/x", ["localhost:5002"]))
+
+    def test_host_port_entry_matches_scheme_default_port(self):
+        # https://target with no explicit port == :443, so a :443 entry matches.
+        self.assertTrue(scope_discovery.is_host_allowed("https://target.invalid/x", ["target.invalid:443"]))
+        self.assertFalse(scope_discovery.is_host_allowed("https://target.invalid/x", ["target.invalid:8443"]))
+
+    # --- W-17: scheme precision ---
+    def test_scheme_qualified_entry_matches_only_that_scheme(self):
+        self.assertTrue(scope_discovery.is_host_allowed("https://target.invalid/x", ["https://target.invalid"]))
+        self.assertFalse(scope_discovery.is_host_allowed("http://target.invalid/x", ["https://target.invalid"]))
+
+    # --- W-17: CIDR / IP matching ---
+    def test_cidr_entry_matches_ip_in_range(self):
+        self.assertTrue(scope_discovery.is_host_allowed("http://10.0.0.7:8080/x", ["10.0.0.0/24"]))
+        self.assertFalse(scope_discovery.is_host_allowed("http://10.0.1.7:8080/x", ["10.0.0.0/24"]))
+
+    def test_bare_ip_entry_matches_exactly(self):
+        self.assertTrue(scope_discovery.is_host_allowed("http://127.0.0.1:5002/x", ["127.0.0.1"]))
+        self.assertFalse(scope_discovery.is_host_allowed("http://127.0.0.2:5002/x", ["127.0.0.1"]))
+
 
 class DiscoverFromScopeChangeTests(unittest.IsolatedAsyncioTestCase):
     """
