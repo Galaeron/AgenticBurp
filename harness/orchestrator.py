@@ -1076,6 +1076,7 @@ class Orchestrator:
         model: str = "",
         step_budget: int | None = None,
         on_step=None,
+        run_context=None,
     ) -> dict:
         """Drive the iterative agent (F4) against one captured exchange, then
         integrate its result through F2 (pivot_memory): hold the findings as
@@ -1101,6 +1102,7 @@ class Orchestrator:
         agent = IterativeAgent(
             self.ollama, chosen_model, self.allowed_hosts,
             max_steps=self.iterative_agent_max_steps,
+            run_context=run_context,
         )
 
         # Publish each step to the live feed (V1), and still call any caller-
@@ -1216,7 +1218,9 @@ class Orchestrator:
             telemetry.record_swallowed_exception("universal_header_audit", e)
 
         async def _probe(exchange, hypothesis, specialty, sb):
-            return await self.run_active_probe(exchange, hypothesis, specialty, step_budget=sb)
+            return await self.run_active_probe(
+                exchange, hypothesis, specialty, step_budget=sb,
+                run_context=run_context)
 
         # Cross-identity confirmation for the investigation path: register the
         # roles as replay identities and confirm access-control findings the

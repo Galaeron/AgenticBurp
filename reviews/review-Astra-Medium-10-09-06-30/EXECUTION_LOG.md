@@ -590,3 +590,19 @@ visibility/contract refinements, not correctness fabrications.
   did not edit that file or claim a broad green result.
 - Inventory reconciliation: 32 sites, **2 target routing gaps**. `CURRENT_STATE.md`
   was not edited because it has concurrent user-owned changes.
+
+## 2026-09-15 — T08v iterative-agent transport
+
+- Graph investigations now pass their invocation RunContext into each iterative
+  agent. The standalone `/active-probe` API creates a bounded context, registers
+  captured credentials to their exact origin, and closes the context after use.
+- Each agent-driven request now uses session binding plus executor scope, gate,
+  request budget, cancellation, redirect, and evidence policy. Context-free unit
+  and standalone compatibility remains available.
+- Real loopback control verifies a bound bearer credential and exactly one budget
+  unit. Unknown credentials fail closed with zero sends and zero budget use.
+- Static compilation passed. Iterative/inventory/executor/API/smoke matrix:
+  exit 0, **96 tests OK in 19.979s**.
+- Inventory reconciliation: 32 sites, **1 target routing gap** (`orchestrator.py`).
+  Work was performed in isolated branch `codex/t08-final` to avoid the dirty main
+  checkout's user-owned orchestrator/config/state edits.

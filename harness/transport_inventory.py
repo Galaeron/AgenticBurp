@@ -144,10 +144,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="astra-identity (T03/T08)",
                   note="API probes run in a bounded invocation context; anonymous and garbage-token "
                        "controls use distinct executor session state."),
-    TransportSite("iterative_agent.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="agents (T09)",
-                  gap="agent tool-fetch sends directly; route through the executor so "
-                      "agent-driven hops obey scope/budget/cancellation."),
+    TransportSite("iterative_agent.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="agents (T08/T09)",
+                  note="production investigation and API probes use invocation scope, session "
+                       "binding, gate, budget, cancellation and executor routing."),
     TransportSite("orchestrator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="astra-identity (T03/T08)",
                   gap="second-order/discovery-confirm/coverage-seed sends open ad-hoc "

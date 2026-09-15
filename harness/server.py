@@ -521,10 +521,24 @@ async def active_probe(req: ActiveProbeRequest, authorization: str | None = Head
     if not orchestrator.iterative_agent_enabled:
         raise HTTPException(status_code=403, detail="iterative_agent is disabled in config.yaml")
     try:
-        return await orchestrator.run_active_probe(
-            req.exchange, req.hypothesis, req.specialty,
-            model=req.model or "", step_budget=req.step_budget or None,
-        )
+        from run_context import RunContext, ScopePolicy
+        budget = req.step_budget or orchestrator.iterative_agent_max_steps
+        async with RunContext.create(
+                allowed_hosts=orchestrator.allowed_hosts,
+                gate_config=(orchestrator.config.get("validators", {}) or {}),
+                max_requests=max(1, budget), config=orchestrator.config) as probe_context:
+            credential_headers = {
+                k: v for k, v in (req.exchange.request_headers or {}).items()
+                if k.lower() in ("authorization", "cookie", "proxy-authorization")}
+            if credential_headers:
+                probe_context.sessions.register(
+                    "active-probe:captured", "active-probe:captured", credential_headers,
+                    allowed_origins=[ScopePolicy.origin_of(req.exchange.url)])
+            return await orchestrator.run_active_probe(
+                req.exchange, req.hypothesis, req.specialty,
+                model=req.model or "", step_budget=req.step_budget or None,
+                run_context=probe_context,
+            )
     except Exception as e:
         log.exception("Unhandled error during active probe")
         return JSONResponse(status_code=500, content={"error": str(e)})

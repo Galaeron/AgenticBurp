@@ -150,13 +150,14 @@ Rules:
 
 class IterativeAgent:
     def __init__(self, ollama, model: str, allowed_hosts: list[str], *, temperature: float = 0.2,
-                 max_steps: int = 250):
+                 max_steps: int = 250, run_context=None):
         self.ollama = ollama
         self.model = model
         self.allowed_hosts = allowed_hosts or []
         self.temperature = temperature
         self.max_steps = max_steps
-        self.gate = get_default_gate()
+        self.run_context = run_context
+        self.gate = run_context.gate if run_context is not None else get_default_gate()
 
     def _host_allowed(self, url: str) -> bool:
         if not self.allowed_hosts:
@@ -218,6 +219,16 @@ class IterativeAgent:
         or (None, reason-blocked)."""
         if not self._host_allowed(url):
             return None, f"blocked: {urlsplit(url).hostname} out of scope"
+        if self.run_context is not None:
+            from run_context import TypedRequest
+            from validators.transport import bind_session
+            session_ref, request_headers = bind_session(self.run_context, headers)
+            outcome = await self.run_context.executor().execute(
+                TypedRequest(method, url, headers=request_headers, body=body or None),
+                capability="iterative_agent", session_ref=session_ref)
+            if not outcome.ok:
+                return None, f"request blocked: {outcome.error or outcome.outcome}"
+            return outcome.status, (outcome.body or "")[:_MAX_RESP_CHARS]
         if method != "GET":
             decision = self.gate.authorize(validator_name="iterative_agent", method=method, url=url, body=body)
             if not decision.allowed:

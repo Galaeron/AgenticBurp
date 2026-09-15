@@ -6,6 +6,8 @@ from unittest.mock import patch
 from models import HttpExchange
 from iterative_agent import IterativeAgent
 import safety_gate
+from run_context import RunContext, ScopePolicy
+from test_run_context import _Fixture
 
 
 class _ScriptedOllama:
@@ -72,6 +74,40 @@ class IterativeAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(r.findings), 1)
         self.assertEqual(r.findings[0].vulnerability_class, "sqli")
         self.assertFalse(r.findings[0].confirmed)  # LLM reasoning never sets confirmed
+
+    async def test_run_context_actual_send_preserves_session_and_budget(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=1,
+                                gate_config={"active_enabled": True})
+        ctx.sessions.register("user", "user", {"Authorization": "Bearer iterative"},
+                              allowed_origins=[ScopePolicy.origin_of(fixture.base)])
+        agent = IterativeAgent(_ScriptedOllama([]), "m", ["127.0.0.1"], run_context=ctx)
+        try:
+            status, _ = await agent._execute(
+                "GET", fixture.base + "/probe", {"Authorization": "Bearer iterative"}, "")
+            self.assertEqual(status, 200)
+            self.assertEqual(ctx.budget.used, 1)
+            self.assertEqual(len(fixture.httpd.received), 1)
+            self.assertEqual(fixture.httpd.received[0]["authorization"], "Bearer iterative")
+        finally:
+            await ctx.aclose()
+            fixture.close()
+
+    async def test_run_context_unknown_credential_sends_nothing(self):
+        fixture = _Fixture()
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=1,
+                                gate_config={"active_enabled": True})
+        agent = IterativeAgent(_ScriptedOllama([]), "m", ["127.0.0.1"], run_context=ctx)
+        try:
+            status, reason = await agent._execute(
+                "GET", fixture.base + "/probe", {"Authorization": "Bearer unknown"}, "")
+            self.assertIsNone(status)
+            self.assertIn("session", reason)
+            self.assertEqual(ctx.budget.used, 0)
+            self.assertEqual(fixture.httpd.received, [])
+        finally:
+            await ctx.aclose()
+            fixture.close()
 
     async def test_step_budget_bounds_the_loop(self):
         # Always mutate, never stop -> must halt at step_budget.
