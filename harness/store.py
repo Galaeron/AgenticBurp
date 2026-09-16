@@ -12,7 +12,7 @@ _DB_PATH = Path(__file__).parent / "harness_state.db"
 
 # W-9: bump when finding_fingerprint's formula changes, so _connect re-fingerprints
 # existing rows once (guarded by PRAGMA user_version).
-_FINGERPRINT_ALGO_VERSION = 2
+_FINGERPRINT_ALGO_VERSION = 3
 
 
 def _normalize_endpoint(url: str) -> str:
@@ -46,7 +46,10 @@ def finding_fingerprint(host: str, method: str, url: str, vulnerability_class: s
         _normalize_endpoint(url),
         check,
         (parameter_location or "").lower(),
-        (parameter_name or "").lower(),
+        # W-9: parameter_name is a case-sensitive input identity (e.g. `userId`
+        # vs `userid` are distinct fields on many APIs) -- do not fold its case,
+        # unlike parameter_location which is a fixed, case-irrelevant enum.
+        parameter_name or "",
         principal_id or "",
     ]).encode("utf-8")).hexdigest()
 

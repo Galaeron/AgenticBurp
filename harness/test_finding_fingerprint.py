@@ -81,6 +81,37 @@ class FindingFingerprintTests(unittest.TestCase):
             store.finding_fingerprint(*base, principal_id="bob"),
         )
 
+    def test_parameter_name_is_case_sensitive(self):
+        """W-9: `userId` and `userid` are frequently distinct fields on the same
+        API (a path/object id vs. an unrelated lowercase field) -- collapsing
+        them into one fingerprint would merge two different findings and let a
+        suppression on one silently swallow the other."""
+        base = ("target.test", "GET", "https://target.test/x", "idor")
+        self.assertNotEqual(
+            store.finding_fingerprint(*base, parameter_name="userId"),
+            store.finding_fingerprint(*base, parameter_name="userid"),
+        )
+
+    def test_case_distinct_findings_persist_as_two_rows(self):
+        ex = _ex(url="https://target.test/api/items")
+        store.persist_findings(ex, "idor", [_f(vuln_class="idor", summary="a", parameter_name="userId")])
+        store.persist_findings(ex, "idor", [_f(vuln_class="idor", summary="b", parameter_name="userid")])
+        rows = store.all_host_findings(ex.url)
+        self.assertEqual(len(rows), 2, "case-distinct parameter names must not dedup into one finding")
+        self.assertEqual(len({r["fingerprint"] for r in rows}), 2)
+
+    def test_suppression_does_not_leak_across_case_variants(self):
+        ex = _ex(url="https://target.test/api/items")
+        fp_upper = store.finding_fingerprint(*("target.test", "GET", ex.url, "idor"), parameter_name="userId")
+        fp_lower = store.finding_fingerprint(*("target.test", "GET", ex.url, "idor"), parameter_name="userid")
+        self.assertNotEqual(fp_upper, fp_lower)
+        store.persist_findings(ex, "idor", [_f(vuln_class="idor", summary="a", parameter_name="userId")])
+        store.persist_findings(ex, "idor", [_f(vuln_class="idor", summary="b", parameter_name="userid")])
+        store.suppress_finding(fp_upper, reason="reviewed, expected")
+        remaining = store.all_host_findings(ex.url)
+        self.assertEqual(len(remaining), 1, "suppressing one case variant must not suppress its sibling")
+        self.assertEqual(remaining[0]["fingerprint"], fp_lower)
+
 
 if __name__ == "__main__":
     unittest.main()
