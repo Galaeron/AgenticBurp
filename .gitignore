@@ -11,6 +11,13 @@ config.local.yaml
 harness/*.db
 harness/run-output/
 
+# Runtime SQLite DBs anywhere under testing/ (W-19): regenerable fixtures, and a
+# captured target DB like helpdesk.db is a planted-vuln fixture, never source.
+testing/**/*.db
+
+# Stray runtime logs (server.log, tool logs) -- runtime artifacts, never source.
+*.log
+
 # score.py results (regenerable from the fixture)
 testing/**/scorecard.json
 testing/**/fixture/
