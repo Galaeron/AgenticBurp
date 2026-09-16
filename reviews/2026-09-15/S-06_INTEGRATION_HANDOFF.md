@@ -4,47 +4,64 @@ Reverified against integrated revision
 `0dc6a523d56cd7268f6f50b46399d5dc4c998a46`. This is a production-owner
 checklist, not a claim that the offline diagnostics close production contracts.
 
-## Remaining owner checks
+**Update:** the four items below were implemented directly on
+`reconciliation-backlog` (commits `e2b7ee7`, `54ebc49`, `79535ed`, `4c1cb63`,
+following the `codex/supplemental-evidence` merge at `e4f02df`), each re-verified
+against the current integrated revision first (W-9/W-24/W-23/W-8/W-13/W-14 had
+all landed since this handoff's original base, and were re-checked before
+touching anything). Full harness suite green after every commit (1902 -> 1912
+tests). Kept here, retitled, as the audit trail this handoff exists to leave.
 
-- **W-7/W-24 — enforce evidence at every confirmation consumer.** Structured
-  proofs exist and the validator path persists exact case/proof links
-  (`harness/store.py:552-630`, `harness/test_evidence.py:288-316`), but persisted
-  findings still have an independent boolean (`harness/store.py:69-75`) and the
-  report converts that boolean directly (`harness/report_generator.py:142`). The
-  detection scorer consumes class strings only (`testing/score.py:92-137`), so it
-  cannot score proof-backed issues. Smallest expectation: a finding with
-  `confirmed=true` and no exact matching confirmed proof must remain an
-  unverifiable claim in persistence/API/export and must not enter a metric named
-  verified-issue precision or recall; an inconclusive proof must remain distinct
-  from a controlled negative.
+## Resolved
 
-- **W-9 — preserve case-sensitive input identity through migration and
-  suppression.** The current fingerprint lowercases `parameter_name`
-  (`harness/store.py:30-50`), so `userId` and `userid` collide. Migration
-  re-fingerprints rows (`harness/store.py:276-289`) while suppressions are keyed
-  only by fingerprint (`harness/store.py:303-313`, `harness/store.py:762-807`).
-  Append-only proof history itself is already covered and is not reopened
-  (`harness/store.py:158-185`, `harness/test_issues.py:217-227`). Smallest
-  expectation: two otherwise identical findings whose input names differ only by
-  case retain distinct identities after migration; a pre-migration suppression
-  still applies to its intended finding and to no collision sibling.
+- **W-7/W-24 — enforce evidence at every confirmation consumer.** Root cause:
+  two of three sites building `Finding` objects from raw, untrusted LLM JSON
+  (`harness/agents/base_agent.py`, `harness/orchestrator_detect.py`'s
+  `_attempt_rediscovery`, whose own prompt says "ALREADY CONFIRMED") passed the
+  parsed dict straight to `Finding(**f)` with no override, unlike
+  `iterative_agent.py` which already forced `confirmed=False`. A model echoing a
+  `"confirmed": true` key would mint a persisted, proof-less confirmation that
+  never touched `orchestrator_confirm.py`'s validator/proof pipeline. Fixed by
+  stripping `confirmed` at both ingestion sites; only `orchestrator_confirm.py`
+  may now set it True, always alongside a linked `proof_id`/`case_id`. Tests:
+  `harness/test_base_agent.py::SelfReportedConfirmationTests`,
+  `harness/test_rediscovery_confirmation.py`.
 
-- **W-11 — bind saved diagnostics to an invocation.** Telemetry explicitly uses
-  process-global counters (`harness/telemetry.py:1-25`) and returns an unscoped
-  snapshot (`harness/telemetry.py:68-92`); `/telemetry` exposes it without an
-  invocation identifier (`harness/server.py:110-126`). Existing tests reset global
-  state between cases (`harness/test_telemetry.py:22-62`) but do not prove
-  concurrent isolation. Smallest expectation: two overlapping inert run contexts
-  record distinct diagnostic events and each saved explanation contains only its
-  own run ID/events; uninstrumented sites are explicitly reported as partial.
+- **W-9 — preserve case-sensitive input identity.** `finding_fingerprint()`
+  lower-cased `parameter_name` alongside `parameter_location`, so
+  `userId`/`userid` collided (suppressing one silently swallowed the other).
+  Fixed: `parameter_location` still folds (fixed enum), `parameter_name` no
+  longer does; `_FINGERPRINT_ALGO_VERSION` bumped per the documented
+  bump-on-formula-change contract (the migration's own recompute is
+  coordinate-free, so it does not retroactively fix old rows' parameter case --
+  this closes the bug for all findings persisted from here forward). Tests:
+  `harness/test_finding_fingerprint.py::test_parameter_name_is_case_sensitive`,
+  `::test_case_distinct_findings_persist_as_two_rows`,
+  `::test_suppression_does_not_leak_across_case_variants`.
 
-- **W-8/W-23 — separate detection scoring from verified-issue evaluation and bind
-  freshness.** `testing/score.py:2-16` defines exchange-level raw detection, and
-  its only wired mode is cached fixture scoring (`testing/score.py:203-227`). It
-  has no invocation/revision/artifact-hash contract and no proof resolution.
-  Smallest expectation: output names raw detection precision/recall separately;
-  verified-issue metrics require labels plus matching evidence; historical cache
-  rescoring declares itself historical and cannot satisfy a fresh end-to-end gate.
+- **W-11 — bind saved diagnostics to an invocation.** Telemetry counters are
+  now bucketed by run_id via a `contextvars.ContextVar` (`bind_current_run`),
+  which asyncio isolates per-Task without a matching unbind on every exit path.
+  `Orchestrator.analyze()` binds `run_context.run_id` at entry.
+  `snapshot()`/`events()`/`swallowed_exceptions()`/`reset()` all take an
+  optional `run_id`; omitted, they keep the old process-wide aggregate but now
+  say so explicitly (`"scope": "process"`, a `runs_observed` count) instead of
+  silently presenting a process-wide number as one run's explanation.
+  `/telemetry` gained a `run_id` query param. Test proving the real caller:
+  `harness/test_telemetry.py::TelemetryInvocationBindingTests::test_two_overlapping_analyze_calls_bind_distinct_run_ids`
+  (two concurrent `Orchestrator.analyze()` calls, distinct run_ids observed,
+  each run's events isolated).
+
+- **W-8/W-23 — separate detection scoring from verified-issue evaluation and
+  bind freshness.** `testing/score.py` only ever matched a label against
+  `vulnerability_class` strings -- it has no path to a `proof_id`/`case_id`, so
+  it cannot produce a verified-issue metric at all. Report/table/CI-gate
+  messages now explicitly say `"metric_scope": "raw_detection"` / "NOT
+  verified-issue" so the two can't be conflated. Neither wired mode
+  (`--from-cache`, `--refresh`) carries an invocation/revision/artifact-hash
+  manifest, so `provenance.freshness` is stamped `historical_cache_rescore` or
+  `live_refresh_no_manifest_binding` -- deliberately never `fresh_end_to_end`.
+  Tests: `testing/test_score.py::MetricScopeTest`.
 
 ## Verified and removed from the open checklist
 
