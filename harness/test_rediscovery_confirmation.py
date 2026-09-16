@@ -36,6 +36,8 @@ class RediscoveryConfirmationTests(unittest.TestCase):
                 "suggested_test": "t",
                 "basis": "derived",
                 "confirmed": True,
+                "proof_id": "model-supplied-id",
+                "case_id": "model-supplied-case",
             }]},
             prompt_tokens=10, completion_tokens=10,
         ))
@@ -47,8 +49,10 @@ class RediscoveryConfirmationTests(unittest.TestCase):
 
         self.assertIsNotNone(report)
         self.assertEqual(len(report.findings), 1)
-        self.assertFalse(report.findings[0].confirmed,
-                          "rediscovery must discard an LLM's self-reported 'confirmed'")
+        f = report.findings[0]
+        self.assertFalse(f.confirmed, "rediscovery must discard an LLM's self-reported 'confirmed'")
+        self.assertEqual(f.proof_id, "", "rediscovery must discard an LLM's self-reported 'proof_id' (R02)")
+        self.assertEqual(f.case_id, "", "rediscovery must discard an LLM's self-reported 'case_id' (R02)")
 
 
 if __name__ == "__main__":

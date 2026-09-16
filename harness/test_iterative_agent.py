@@ -76,6 +76,27 @@ class IterativeAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.findings[0].vulnerability_class, "sqli")
         self.assertFalse(r.findings[0].confirmed)  # LLM reasoning never sets confirmed
 
+    async def test_self_reported_authority_fields_are_stripped(self):
+        """R02: an agent's raw finding dict can carry ANY key the model
+        chooses to write. proof_id/case_id/review_verdict must be discarded
+        exactly like confirmed -- none of them are earned by model output."""
+        ollama = _ScriptedOllama([
+            {"action": "mutate", "location": "query", "param": "q", "value": "' OR '1'='1"},
+            {"action": "stop", "verdict": "found", "thought": "error surfaced",
+             "finding": {"vulnerability_class": "sqli", "confidence": 0.85, "severity": "high",
+                         "summary": "SQLi in q", "evidence": "db error", "suggested_test": "x",
+                         "basis": "derived", "confirmed": True, "proof_id": "model-supplied-id",
+                         "case_id": "model-supplied-case", "review_verdict": "validator-confirmed"}},
+        ])
+        agent = IterativeAgent(ollama, "m", ["localhost"])
+        with patch("httpx.AsyncClient.request", return_value=_Resp(500, "SQL syntax error")):
+            r = await agent.run(_exchange(), "SQLi in q", "sqli")
+        f = r.findings[0]
+        self.assertFalse(f.confirmed)
+        self.assertEqual(f.proof_id, "")
+        self.assertEqual(f.case_id, "")
+        self.assertIsNone(f.review_verdict)
+
     async def test_step_budget_bounds_the_loop(self):
         # Always mutate, never stop -> must halt at step_budget.
         ollama = _ScriptedOllama([{"action": "mutate", "location": "query", "param": "q", "value": f"p{i}"}

@@ -225,13 +225,19 @@ class SelfReportedConfirmationTests(unittest.TestCase):
                 "suggested_test": "t",
                 "basis": "derived",
                 "confirmed": True,
+                "proof_id": "model-supplied-id",
+                "case_id": "model-supplied-case",
+                "review_verdict": "validator-confirmed",
             }],
         })
         exchange = HttpExchange(url="https://a.test/x", method="GET")
         report = asyncio.run(agent.run(exchange, max_body_chars=1000))
         self.assertEqual(len(report.findings), 1)
-        self.assertFalse(report.findings[0].confirmed,
-                          "an agent's self-reported 'confirmed' must be discarded on ingestion")
+        f = report.findings[0]
+        self.assertFalse(f.confirmed, "an agent's self-reported 'confirmed' must be discarded on ingestion")
+        self.assertEqual(f.proof_id, "", "an agent must not be able to mint its own proof_id (R02)")
+        self.assertEqual(f.case_id, "", "an agent must not be able to mint its own case_id (R02)")
+        self.assertIsNone(f.review_verdict, "an agent must not be able to forge a review_verdict (R02)")
 
 
 if __name__ == "__main__":

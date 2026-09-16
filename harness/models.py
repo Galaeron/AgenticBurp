@@ -88,6 +88,33 @@ class Finding(BaseModel):
     case_id: str = ""
 
 
+# R02: fields this harness's own deterministic pipeline owns -- the
+# orchestrator's confirmation/proof linkage (orchestrator_confirm.py), its
+# critique pass, and attribution.py's relabeling. A specialist agent's raw
+# JSON is untrusted model output; if it echoes any of these key names (all
+# appear throughout this harness's own prompts, docs, and prior findings
+# shown back to the model), that must never become a persisted authority
+# claim with no harness-side origin. Every call site that builds a Finding
+# from raw parsed agent JSON must route it through sanitize_agent_finding
+# first -- see harness/agents/base_agent.py, harness/iterative_agent.py,
+# harness/orchestrator_detect.py's _attempt_rediscovery.
+AGENT_AUTHORITY_FIELDS = frozenset({
+    "confirmed", "proof_id", "case_id", "review_verdict", "review_note",
+    "original_confidence", "original_severity", "original_vulnerability_class",
+    "shape_inconsistent",
+})
+
+
+def sanitize_agent_finding(raw: dict) -> dict:
+    """Strip every harness-owned authority field (R02) from one raw finding
+    dict parsed from an agent's JSON output, before it is passed to
+    Finding(**...). Pydantic silently ignores unrecognized keys rather than
+    rejecting them, so an unlisted field the model invents is harmless on
+    its own; this only removes the specific REAL fields that would
+    otherwise grant unearned authority."""
+    return {k: v for k, v in raw.items() if k not in AGENT_AUTHORITY_FIELDS}
+
+
 class AgentReport(BaseModel):
     agent: str
     model: str

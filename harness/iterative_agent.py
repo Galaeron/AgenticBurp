@@ -38,7 +38,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx  # noqa: F401 -- HTTP transport site; sends now go via run_context.TargetTransport
 
 from harness import global_throttle
-from harness.models import Finding, HttpExchange
+from harness.models import Finding, HttpExchange, sanitize_agent_finding
 from harness.safety_gate import get_default_gate
 from harness.run_context import transport_for  # W-16: the single TargetTransport
 # Reuse the exact, tested mutation helpers the sqlmap validator already uses --
@@ -302,7 +302,7 @@ class IterativeAgent:
                 fd = action.get("finding")
                 if result.stop_reason == "found" and isinstance(fd, dict):
                     try:
-                        result.findings.append(Finding(**{**fd, "confirmed": False}))
+                        result.findings.append(Finding(**sanitize_agent_finding(fd)))
                     except Exception as e:
                         log.debug("iterative_agent: malformed finding on stop: %s", e)
                 result.handoff_note = action.get("thought", "") or result.handoff_note
