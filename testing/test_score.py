@@ -60,5 +60,31 @@ class ScoreMathTest(unittest.TestCase):
         self.assertEqual(by["A03:Injection"]["fp"], 1)
 
 
+class MetricScopeTest(unittest.TestCase):
+    """W-8/W-23: this scorer only matches labels against vulnerability_class
+    strings -- it never resolves a proof_id/case_id -- so its output must be
+    unambiguously labeled raw detection, never verified-issue, and the CLI
+    table/gate must say so too."""
+
+    def test_report_declares_raw_detection_scope(self):
+        rep = score.score({"TP1": ["sql_injection"]})
+        self.assertEqual(rep["metric_scope"], "raw_detection")
+        self.assertEqual(score.METRIC_SCOPE, "raw_detection")
+
+    def test_format_table_names_the_scope_and_disclaims_verified_issue(self):
+        rep = score.score({"TP1": ["sql_injection"]})
+        table = score.format_table(rep, "test-target", "m")
+        self.assertIn("raw_detection", table)
+        self.assertIn("NOT verified-issue", table)
+
+    def test_cache_only_run_is_labeled_historical(self):
+        self.assertEqual(score.freshness_label(refresh=False), "historical_cache_rescore")
+
+    def test_refreshed_run_is_not_labeled_fresh_end_to_end(self):
+        label = score.freshness_label(refresh=True)
+        self.assertEqual(label, "live_refresh_no_manifest_binding")
+        self.assertNotEqual(label, "fresh_end_to_end")
+
+
 if __name__ == "__main__":
     unittest.main()

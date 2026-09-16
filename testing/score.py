@@ -88,12 +88,28 @@ def classify(vulnerability_class: str) -> str | None:
     return None
 
 
+# W-8/W-23: this scorer answers ONE question -- did the harness produce a
+# finding of the right CLASS for a labeled exchange? It never looks at a
+# proof_id/case_id, so it cannot tell a proof-backed confirmation from a bare
+# vulnerability_class string. Its precision/recall is exchange-level raw
+# detection, not verified-issue precision/recall (that would require each
+# counted finding to resolve to matching evidence -- see
+# evaluation_integrity/evidence_audit.py, which is the offline reader built
+# for that distinct question). Every report this module produces is tagged
+# with this constant so a consumer cannot mistake one metric for the other.
+METRIC_SCOPE = "raw_detection"
+
+
 def score(labeled_findings: dict[str, list[str]],
           label_category: dict[str, str] | None = None) -> dict:
     """Pure scoring. `labeled_findings` maps each exchange label to the list of
     vulnerability_class strings the harness produced for it (TN* labels are
     benign; a label absent from `label_category` and not TP-mapped is benign).
-    Returns per-category precision/recall/F1 + a micro-averaged overall."""
+    Returns per-category precision/recall/F1 + a micro-averaged overall.
+
+    These are RAW DETECTION metrics (label vs. vulnerability_class string
+    only -- see METRIC_SCOPE). They are not, and must not be reported as,
+    verified-issue precision/recall."""
     label_category = label_category or _LABEL_CATEGORY
     predicted = {lab: set(filter(None, (classify(c) for c in classes)))
                  for lab, classes in labeled_findings.items()}
@@ -131,6 +147,7 @@ def score(labeled_findings: dict[str, list[str]],
     micro_r = TP / (TP + FN) if (TP + FN) else 0.0
     micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) else 0.0
     return {
+        "metric_scope": METRIC_SCOPE,
         "per_category": rows,
         "overall": {"precision": round(micro_p, 3), "recall": round(micro_r, 3),
                     "f1": round(micro_f1, 3), "tp": TP, "fp": FP, "fn": FN},
@@ -138,7 +155,8 @@ def score(labeled_findings: dict[str, list[str]],
 
 
 def format_table(report: dict, corpus: str, model: str) -> str:
-    lines = [f"# Detection scorecard -- corpus={corpus} model={model}", "",
+    lines = [f"# Detection scorecard ({report.get('metric_scope', METRIC_SCOPE)}, "
+             f"NOT verified-issue) -- corpus={corpus} model={model}", "",
              f"{'category':<30}{'support':>8}{'prec':>7}{'recall':>8}{'f1':>7}"]
     for r in report["per_category"]:
         def s(x): return "  n/a" if x is None else f"{x:.3f}"
@@ -199,6 +217,14 @@ def _model_from_config() -> str:
         return "unknown"
 
 
+def freshness_label(refresh: bool) -> str:
+    """W-8/W-23: neither of score.py's two paths carries an invocation/
+    revision/artifact-hash manifest (see evaluation_integrity/provenance.py
+    for that contract), so neither may claim to be a fresh end-to-end
+    pipeline run -- only the honest label differs between them."""
+    return "live_refresh_no_manifest_binding" if refresh else "historical_cache_rescore"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Per-OWASP-category detection scorer.")
     ap.add_argument("--corpus", default="test-target", help="corpus name (provenance label)")
@@ -226,8 +252,19 @@ def main() -> int:
     model = _model_from_config()
     labeled = asyncio.run(_collect_from_fixture(None, args.refresh, args.corpus, args.conf, args.min_severity))
     report = score(labeled)
+    # W-8/W-23: `--from-cache` (the only wired mode) reads detection_fixture.py's
+    # saved cache; `--refresh` forces a live re-run of every label through the
+    # real agents, but even then this has no manifest binding (invocation id,
+    # git revision, config fingerprint -- see evaluation_integrity/provenance.py
+    # for that contract) tying the result to a specific build. Neither path may
+    # be reported as a fresh end-to-end efficacy claim; only the honest label
+    # differs.
+    freshness = freshness_label(args.refresh)
     report["provenance"] = {"corpus": args.corpus, "model": model, "n_exchanges": len(labeled),
-                            "conf_gate": args.conf, "min_severity": args.min_severity}
+                            "conf_gate": args.conf, "min_severity": args.min_severity,
+                            "freshness": freshness,
+                            "freshness_note": "not a fresh end-to-end pipeline run; "
+                                              "no invocation/revision/artifact-hash manifest is bound to this result"}
 
     print(format_table(report, args.corpus, f"{model} @conf>={args.conf},sev>={args.min_severity}"))
     if args.json:
@@ -236,12 +273,12 @@ def main() -> int:
 
     failed = False
     if args.fail_under_recall is not None and report["overall"]["recall"] < args.fail_under_recall:
-        print(f"\nFAIL: overall recall {report['overall']['recall']:.3f} < floor {args.fail_under_recall}",
-              file=sys.stderr)
+        print(f"\nFAIL: overall RAW DETECTION recall {report['overall']['recall']:.3f} < floor "
+              f"{args.fail_under_recall} ({freshness})", file=sys.stderr)
         failed = True
     if args.fail_under_precision is not None and report["overall"]["precision"] < args.fail_under_precision:
-        print(f"\nFAIL: overall precision {report['overall']['precision']:.3f} < floor "
-              f"{args.fail_under_precision}", file=sys.stderr)
+        print(f"\nFAIL: overall RAW DETECTION precision {report['overall']['precision']:.3f} < floor "
+              f"{args.fail_under_precision} ({freshness})", file=sys.stderr)
         failed = True
     return 1 if failed else 0
 
