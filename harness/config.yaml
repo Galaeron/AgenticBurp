@@ -43,6 +43,13 @@ concurrency:
   # timeout ceiling. 1 fully serializes agent dispatch (slower wall-clock
   # per exchange, but eliminates GPU contention as a variable entirely).
   max_parallel_agents: 1
+  # W-13: caps read from this one block instead of magic numbers in the dispatch
+  # code. max_concurrent_validations bounds the per-exchange validator fan-out
+  # (asyncio.gather is capped at this many in-flight probes); early_termination_
+  # batch_size is how many agents run in the first batch before the early-
+  # termination check decides whether to run the rest.
+  max_concurrent_validations: 6
+  early_termination_batch_size: 3
 
 # The coordinator decides which specialist agents to dispatch to, and
 # synthesizes their findings into a final report. Use a stronger local
@@ -53,6 +60,13 @@ concurrency:
 coordinator:
   model: "qwen3:8b"
   temperature: 0.1
+  # W-14: how routing fails open when the coordinator returns nothing or errors.
+  # "all" (default) fires every available agent -- recall-safe but the most
+  # expensive, least predictable path. "curated" fires a high-value, shape-keyed
+  # subset instead (the "easiest to miss" core + fast_path's shape matches),
+  # cutting the blast radius. Kept "all" by default: flipping to "curated" is a
+  # recall trade-off that should be gated on the repeated/blind eval (W-23).
+  fail_open_mode: "all"
   # Cloud-primary routing (SESSION_HANDOVER.md §7). DEFAULT OFF -- when false,
   # routing is exactly the legacy behavior (deterministic fast_path first,
   # local coordinator LLM fallback). When true, the cloud model routes FIRST
