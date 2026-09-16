@@ -49,6 +49,23 @@ def load_config() -> dict:
         if local:
             _deep_merge(cfg, local)
             log.info("load_config: merged local overrides from config.local.yaml")
+    # W-20: validate the MERGED config and record its fingerprint at startup.
+    # Non-fatal (errors are logged, not raised) so a running server is never taken
+    # down by config linting, but a typo'd knob or an incoherent safety
+    # combination (allow_mutating_replay without active_enabled) is surfaced
+    # loudly instead of failing silently, and the fingerprint ties a run to
+    # exactly which configuration produced it.
+    try:
+        import config_schema
+        result = config_schema.validate_config(cfg)
+        for err in result.errors:
+            log.error("config validation: %s", err)
+        for warn in result.warnings:
+            log.warning("config validation: %s", warn)
+        log.info("load_config: effective config fingerprint %s",
+                 config_schema.config_fingerprint(cfg))
+    except Exception as e:
+        log.warning("load_config: config validation skipped (%s)", e)
     return cfg
 
 
