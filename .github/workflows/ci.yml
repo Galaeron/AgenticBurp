@@ -117,13 +117,20 @@ jobs:
         working-directory: testing
         run: python -m unittest test_score
 
-  # Scored tier: enforces the precision/recall floor. It needs a local model runner
-  # (Ollama + GPU) and the built detection fixture, so it cannot run on a stock
-  # GitHub-hosted runner. Left disabled until SESSION_4_PLAN.md T2 is complete; then
-  # point it at a self-hosted GPU runner and flip `if:` to a real condition.
+  # Scored tier: enforces the precision AND recall floor (W-8). It needs a local
+  # model runner (Ollama + GPU) and the built detection fixture, so it runs only
+  # on a [self-hosted, gpu] runner. Rather than `if: false`, it is now armed on
+  # demand -- a manual workflow_dispatch, the nightly schedule, or a PR labeled
+  # "run-scored" -- so it can gate a PR without forcing every stock PR (which has
+  # no GPU runner) to wait. Attach the self-hosted GPU runner to make it execute;
+  # W-23 makes this the CI enforcement point for the repeated/blind eval program.
   scored:
     name: Scored tier (precision/recall floor) [needs self-hosted GPU]
-    if: ${{ false }}
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event_name == 'schedule'
+      || (github.event_name == 'pull_request'
+          && contains(github.event.pull_request.labels.*.name, 'run-scored'))
     runs-on: [self-hosted, gpu]
     steps:
       - uses: actions/checkout@v4
@@ -131,6 +138,11 @@ jobs:
         with:
           python-version: "3.14"
       - run: pip install -r harness/requirements.lock
-      - name: Score against the pinned corpus and enforce the recall floor
+      - name: Score against the pinned corpus and enforce the recall + precision floors
         working-directory: testing
-        run: python score.py --corpus test-target --from-cache --fail-under-recall 0.80
+        # Precision floor is meaningful now that W-7 (lifecycle demotion) and W-9
+        # (structural dedup) have landed -- unconfirmed hypotheses no longer ship
+        # as confirmed, and duplicate prose no longer inflates counts.
+        run: >-
+          python score.py --corpus test-target --from-cache
+          --fail-under-recall 0.80 --fail-under-precision 0.50
