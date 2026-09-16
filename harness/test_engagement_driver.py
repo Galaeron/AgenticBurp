@@ -87,7 +87,7 @@ class DriverPlanTests(unittest.TestCase):
         class _Resp:
             status_code = 200; headers = {}; text = "{}"
 
-        async def fake_get(self, url, **kw):
+        async def fake_request(self, method, url, **kw):  # W-16: transport uses .request
             fetched.append(url)
             return _Resp()
 
@@ -96,7 +96,7 @@ class DriverPlanTests(unittest.TestCase):
             return AnalysisResponse(coordinator_model="m", dispatched_agents=[], agent_reports=[],
                                     summary="", test_plans=[])
         try:
-            with patch("httpx.AsyncClient.get", fake_get), \
+            with patch("httpx.AsyncClient.request", fake_request), \
                  patch.object(self.orch, "analyze", fake_analyze):
                 r = asyncio.run(self.orch.run_engagement(
                     "shop.test", "http://shop.test/", max_targets=5, max_rounds=3, execute=True))
@@ -117,7 +117,7 @@ class DriverPlanTests(unittest.TestCase):
             headers = {}
             text = '{"data":1}'
 
-        async def fake_get(self, url, **kw):
+        async def fake_request(self, method, url, **kw):  # W-16: transport uses .request
             return _Resp()
 
         # analyze is heavy (real agents) -- stub it; we're testing the driver loop.
@@ -126,7 +126,7 @@ class DriverPlanTests(unittest.TestCase):
             return AnalysisResponse(coordinator_model="m", dispatched_agents=[], agent_reports=[],
                                     summary="", test_plans=[])
         try:
-            with patch("httpx.AsyncClient.get", fake_get), \
+            with patch("httpx.AsyncClient.request", fake_request), \
                  patch.object(self.orch, "analyze", fake_analyze):
                 r = asyncio.run(self.orch.run_engagement(
                     "shop.test", "http://shop.test/", max_targets=3, max_rounds=2, execute=True))

@@ -22,9 +22,12 @@ class _ScriptedOllama:
 
 
 class _Resp:
-    def __init__(self, status, text=""):
+    def __init__(self, status, text="", headers=None):
         self.status_code = status
         self.text = text
+        # W-16: sends now go through run_context.TargetTransport, which inspects
+        # response headers (e.g. for redirect handling), so the mock must carry them.
+        self.headers = headers or {}
 
 
 def _exchange():

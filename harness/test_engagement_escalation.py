@@ -11,6 +11,10 @@ from engagement import EngagementState
 class _Resp:
     def __init__(self, status):
         self.status_code = status
+        self.text = ""
+        # W-16: the credential probe now sends via run_context.TargetTransport, which
+        # inspects response headers (redirect handling), so the mock must carry them.
+        self.headers = {}
 
 
 def _cred_cap(url="http://shop.test/login"):
@@ -42,11 +46,11 @@ class AutoEscalateGuardTests(unittest.TestCase):
                 crawl_spy.append(True)
             return _FakeCrawlResult()
 
-        async def fake_get(self, url, headers=None, **kw):
+        async def fake_request(self, method, url, headers=None, **kw):  # W-16: transport uses .request
             return _Resp(verify_status)
 
         with patch("role_crawl.crawl_roles", fake_crawl), \
-             patch("httpx.AsyncClient.get", fake_get):
+             patch("httpx.AsyncClient.request", fake_request):
             asyncio.run(self.orch._auto_escalate("shop.test", "http://shop.test/login", caps, st))
 
     def test_verified_credential_triggers_crawl(self):

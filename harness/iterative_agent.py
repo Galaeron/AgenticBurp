@@ -35,11 +35,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
-import httpx
+import httpx  # noqa: F401 -- HTTP transport site; sends now go via run_context.TargetTransport
 
 import global_throttle
 from models import Finding, HttpExchange
 from safety_gate import get_default_gate
+from run_context import transport_for  # W-16: the single TargetTransport
 # Reuse the exact, tested mutation helpers the sqlmap validator already uses --
 # same bounded "change one param value on the captured request" envelope.
 from validators.sqlmap import (
@@ -158,12 +159,6 @@ class IterativeAgent:
         self.max_steps = max_steps
         self.gate = get_default_gate()
 
-    def _host_allowed(self, url: str) -> bool:
-        if not self.allowed_hosts:
-            return True
-        host = (urlsplit(url).hostname or "").lower()
-        return any(host == h.lower() or host.endswith("." + h.lower()) for h in self.allowed_hosts)
-
     def _build_request(self, exchange: HttpExchange, action: dict, headers_state: dict) -> tuple:
         """Translate a constrained action into (method, url, headers, body),
         derived from the captured exchange. Returns (None, reason) if invalid."""
@@ -214,21 +209,30 @@ class IterativeAgent:
                 "path": _path_id_values(exchange.url)}
 
     async def _execute(self, method, url, headers, body) -> tuple:
-        """Scope-check + safety-gate + throttle + send. Returns (status, text)
-        or (None, reason-blocked)."""
-        if not self._host_allowed(url):
-            return None, f"blocked: {urlsplit(url).hostname} out of scope"
-        if method != "GET":
-            decision = self.gate.authorize(validator_name="iterative_agent", method=method, url=url, body=body)
-            if not decision.allowed:
-                return None, f"blocked by safety gate: {decision.reason}"
+        """Scope-check + safety-gate + throttle + send, all through the single
+        TargetTransport (W-16). Returns (status, text) or (None, reason-blocked).
+
+        Scope, gate, and budget are enforced ONCE inside the transport (no separate
+        pre-check that could disagree or double-count a mutating send). A standalone
+        context carries this agent's own SafetyGate so mutating-method decisions are
+        unchanged, and its scope is is_host_allowed(self.allowed_hosts) -- a superset
+        of the old host/subdomain check. send_creds forwards any captured credential
+        headers; max_redirects=0 keeps the old follow_redirects=False behaviour."""
+        _tt, _ctx = transport_for(None, allowed_hosts=self.allowed_hosts, gate=self.gate)
         try:
             await global_throttle.acquire()
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
-                resp = await client.request(method, url, headers=headers, content=body or None)
-            return resp.status_code, (resp.text or "")[:_MAX_RESP_CHARS]
-        except httpx.HTTPError as e:
-            return None, f"request failed: {e.__class__.__name__}"
+            out = await _tt.send_creds(method, url, capability="iterative_agent",
+                                       headers=headers, body=body, max_redirects=0)
+            if out.outcome == "out_of_scope":
+                return None, f"blocked: {urlsplit(url).hostname} out of scope"
+            if out.outcome == "blocked":
+                return None, f"blocked by safety gate: {out.error}"
+            if not out.ok:
+                return None, f"request failed: {out.error or out.outcome}"
+            return out.status, (out.body or "")[:_MAX_RESP_CHARS]
+        finally:
+            if _ctx is not None:
+                await _ctx.aclose()
 
     async def run(self, exchange: HttpExchange, hypothesis: str, specialty: str,
                   step_budget: int = 250, effort_budget: "EffortBudget | None" = None,

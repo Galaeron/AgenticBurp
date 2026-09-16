@@ -18,10 +18,13 @@ Three defects this closes, together:
     are blocked before the destination is ever contacted, and credentials are not
     forwarded across an origin boundary.
 
-  - **R15 (settings not authoritative):** one `Executor` routes every migrated send
+  - **R15 (settings not authoritative):** one `TargetTransport` (the class formerly
+    named `Executor`; that name is kept as an alias) routes every migrated send
     through the SAME gate decision, scope check, and budget -- scripts, API, and the
     graph all get identical allowed actions instead of each constructing validators
-    and clients their own way.
+    and clients their own way. As of W-16 the orchestrator's second-order /
+    discovery-confirm reads and the iterative agent are on it too, and callers with
+    no run of their own reach it via `standalone_context()` / `transport_for()`.
 
 Backward compatible: nothing here runs unless a caller builds a RunContext and uses
 its executor. Browser/container adapters are T08, not claimed here. Cookie jars are
@@ -83,6 +86,29 @@ class ScopePolicy:
 
     def same_origin(self, a: str, b: str) -> bool:
         return self.origin_of(a) == self.origin_of(b)
+
+
+@dataclass(frozen=True)
+class HostAllowScope(ScopePolicy):
+    """A ScopePolicy whose `in_scope` delegates to `scope_discovery.is_host_allowed`.
+
+    W-16: when a send that was previously guarded by a raw
+    `scope_discovery.is_host_allowed(url, allowed_hosts)` check is migrated onto the
+    single TargetTransport, its reachability must not change. The strict base
+    ScopePolicy is exact-host + fail-CLOSED on an empty allow-list; is_host_allowed
+    is subdomain/CIDR/scheme/port aware and fail-OPEN on an empty list in passive
+    mode. This subclass keeps the base same_origin/origin_of but restores the
+    is_host_allowed reachability so full-closure routing is behaviour-preserving.
+
+    `hosts` is the ORIGINAL list (kept as a tuple so the dataclass stays hashable);
+    the base `allowed_hosts` frozenset is left empty and unused by this subclass.
+    """
+    hosts: tuple = ()
+    active_mode: bool = False
+
+    def in_scope(self, url: str) -> bool:
+        import scope_discovery
+        return scope_discovery.is_host_allowed(url, list(self.hosts), active_mode=self.active_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -246,9 +272,63 @@ class ExecutionOutcome:
 # Executor -- the single policy-bearing send path (R15/R17)
 # ---------------------------------------------------------------------------
 
-class Executor:
+class TargetTransport:
+    """The single policy-bearing send path for target-directed traffic (R15/R17,
+    W-16). Every target send -- scripts, API, the graph loop, discovery, the
+    confirmation legs, and (W-16) the orchestrator's second-order/discovery-confirm
+    reads and the iterative agent -- goes through `execute()`/`send()` so scope, the
+    safety gate, the request budget, credential-forwarding, manual redirects, and
+    evidence capture are applied in ONE place. Constructed from a RunContext;
+    `RunContext.target_transport()` (alias `.executor()`) is the usual entry, and
+    `standalone_context()` builds a minimal RunContext for callers that have no run
+    of their own so they can still take this one path instead of a raw client.
+    """
+
     def __init__(self, ctx: "RunContext"):
         self.ctx = ctx
+
+    async def send(self, method: str, url: str, *, capability: str,
+                   session_ref: str | None = None, headers: dict | None = None,
+                   body: str | None = None, case_ref: str = "",
+                   max_redirects: int = 5,
+                   allow_cancelled_cleanup: bool = False) -> "ExecutionOutcome":
+        """Convenience wrapper over execute() for a single (method, url) send, so a
+        raw `httpx` call site can migrate to the transport in one line. Pass
+        max_redirects=0 to match a raw client's follow_redirects=False."""
+        return await self.execute(
+            TypedRequest(method=(method or "GET").upper(), url=url,
+                         headers=dict(headers or {}), body=body),
+            capability=capability, session_ref=session_ref, case_ref=case_ref,
+            max_redirects=max_redirects, allow_cancelled_cleanup=allow_cancelled_cleanup)
+
+    async def send_creds(self, method: str, url: str, *, capability: str,
+                         headers: dict | None = None, body: str | None = None,
+                         case_ref: str = "", max_redirects: int = 0) -> "ExecutionOutcome":
+        """Send while forwarding any credential headers (Authorization/Cookie/...).
+
+        The transport fails closed on a credential-bearing send with no session
+        reference. This resolves the supplied credentials to an already-registered
+        session (SessionManager.bind_headers); if none owns them, it registers an
+        EPHEMERAL session scoped to the URL's origin. Net behaviour matches a raw
+        client that simply sent the credentials to `url` -- but now the send still
+        takes the one policy path (scope + gate + budget + evidence). Defaults to
+        max_redirects=0 to match a raw client's follow_redirects=False.
+        """
+        hdrs = dict(headers or {})
+        cred = {k: v for k, v in hdrs.items() if k.lower() in _CREDENTIAL_HEADERS}
+        session_ref = None
+        if cred:
+            session_ref, non_cred = self.ctx.sessions.bind_headers(hdrs)
+            if session_ref is None:
+                sid = f"w16-ephemeral-{uuid.uuid4().hex[:8]}"
+                self.ctx.sessions.register(sid, sid, headers=cred, allowed_origins=[url])
+                session_ref = sid
+                non_cred = {k: v for k, v in hdrs.items()
+                            if k.lower() not in _CREDENTIAL_HEADERS}
+            hdrs = non_cred
+        return await self.send(method, url, capability=capability, session_ref=session_ref,
+                               headers=hdrs, body=body, case_ref=case_ref,
+                               max_redirects=max_redirects)
 
     def _artifact(self, url: str, outcome: str, session_ref: str | None,
                   status: int | None = None) -> "evidence.ExchangeArtifact":
@@ -345,6 +425,46 @@ class Executor:
                                 artifact=self._artifact(url, "redirect_limit", session_ref))
 
 
+# Back-compat alias: TargetTransport was named Executor through Astra T03-T08. The
+# 37 `.executor()` call sites and the existing `Executor(...)` references keep working.
+Executor = TargetTransport
+
+
+def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
+                       active_mode: bool = False, timeout: float = 15.0,
+                       max_requests: int | None = None) -> "RunContext":
+    """A minimal RunContext for a caller that has no run of its own but still wants
+    the ONE TargetTransport path instead of a raw httpx client (W-16 full closure).
+
+    Its scope is a HostAllowScope, so a send previously guarded by
+    `scope_discovery.is_host_allowed(url, allowed_hosts)` keeps EXACTLY its old
+    reachability. Pass `gate` to reuse the caller's existing SafetyGate (e.g. the
+    iterative agent's) so mutating-method decisions are unchanged; otherwise a fresh
+    per-context gate is used. The caller owns the returned context and must aclose()
+    it (or use `transport_for`, which reports ownership)."""
+    rc = RunContext.create(allowed_hosts=allowed_hosts, config=config, timeout=timeout,
+                           max_requests=max_requests)
+    rc.scope = HostAllowScope(hosts=tuple((h or "") for h in (allowed_hosts or [])),
+                              active_mode=active_mode)
+    if gate is not None:
+        rc.gate = gate
+    return rc
+
+
+def transport_for(run_context, *, allowed_hosts, config: dict | None = None, gate=None,
+                  active_mode: bool = False, timeout: float = 15.0):
+    """Return (transport, owned_context) for a call site that may or may not have a
+    run of its own. If `run_context` is provided, its TargetTransport is used and
+    owned_context is None (the caller must NOT close the shared run). Otherwise a
+    `standalone_context` is built and returned as owned_context, which the caller
+    must aclose() when done."""
+    if run_context is not None:
+        return run_context.target_transport(), None
+    rc = standalone_context(allowed_hosts, config=config, gate=gate,
+                            active_mode=active_mode, timeout=timeout)
+    return rc.target_transport(), rc
+
+
 # ---------------------------------------------------------------------------
 # RunContext -- the per-run bundle
 # ---------------------------------------------------------------------------
@@ -389,8 +509,11 @@ class RunContext:
                                                      timeout=self.timeout, cookies=httpx.Cookies())
         return self._default_client
 
-    def executor(self) -> Executor:
-        return Executor(self)
+    def target_transport(self) -> "TargetTransport":
+        return TargetTransport(self)
+
+    def executor(self) -> "TargetTransport":   # back-compat name for target_transport()
+        return self.target_transport()
 
     async def aclose(self) -> None:
         if self._default_client is not None:

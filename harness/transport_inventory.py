@@ -1,14 +1,15 @@
 """transport_inventory.py -- the auditable inventory of every outbound-transport
 call-site in the harness (Astra T08, inventory + routing-gap audit).
 
-The T03 run-scoped executor (`run_context.Executor`, fronted by
-`safety_gate.GatedAsyncClient`) is meant to become the ONE policy-aware transport
-for target-directed traffic: scope enforced before every hop, per-session cookie
-jars, credential-forwarding rules, mutation ceilings, cancellation, and captured
-outcome artifacts. Migrating every send to it is incremental (T03 -> T08); the
-danger is that a NEW direct send is added and silently bypasses the gate/executor
--- exactly the "green tests, dead pipeline" failure mode this project guards
-against, one channel down.
+The run-scoped `run_context.TargetTransport` (the class formerly named `Executor`,
+fronted by `safety_gate.GatedAsyncClient`) is THE ONE policy-aware transport for
+target-directed traffic: scope enforced before every hop, per-session cookie jars,
+credential-forwarding rules, mutation ceilings, cancellation, and captured outcome
+artifacts. As of W-16 every target-directed send is on it -- `routing_gaps()` is
+empty (the migration ran T03 -> T08 -> W-16). The danger this module still guards
+against is that a NEW direct send is added and silently bypasses the
+gate/transport -- exactly the "green tests, dead pipeline" failure mode this
+project guards against, one channel down.
 
 This module makes the transport surface *auditable*, with a MODULE-granular guard:
 
@@ -144,16 +145,19 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="astra-identity (T03/T08)",
                   note="API probes run in a bounded invocation context; anonymous and garbage-token "
                        "controls use distinct executor session state."),
-    TransportSite("iterative_agent.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="agents (T09)",
-                  gap="agent tool-fetch sends directly; route through the executor so "
-                      "agent-driven hops obey scope/budget/cancellation."),
-    TransportSite("orchestrator_chain.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
-                  owner="astra-identity (T03/T08)",
-                  gap="second-order/discovery-confirm/coverage-seed sends open ad-hoc "
-                      "clients; route through the executor and carry the run's evidence sink. "
-                      "(These target-directed sends moved here from orchestrator.py in the "
-                      "W-15 decomposition; the ChainMixin owns the investigate_engagement path.)"),
+    TransportSite("iterative_agent.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="agents (T09/W-16)", constructs_client=False,
+                  note="W-16: the agent's send->observe loop (_execute) now routes every "
+                       "hop through the single TargetTransport (run_context.transport_for), "
+                       "so scope, the safety gate, budget, and evidence apply in one place. "
+                       "It no longer constructs its own httpx client."),
+    TransportSite("orchestrator_chain.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="astra-identity (T03/T08/W-16)", constructs_client=False,
+                  note="W-16: the ChainMixin's target sends -- the engagement-driver GET, the "
+                       "credential probe, and the investigate_engagement second-order / "
+                       "discovery-confirm reads -- all route through the single TargetTransport "
+                       "(this run's when present, else a standalone one). No direct httpx client "
+                       "remains, closing the last graph-loop routing gap."),
 
     # ---- target: confirmation legs (validators) ----
     # Mutating legs pass through the SafetyGate/GatedAsyncClient; read-only legs open

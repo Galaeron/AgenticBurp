@@ -66,13 +66,27 @@ class InventoryEnforcementTests(unittest.TestCase):
         self.assertNotIn("validators/cors_validator.py", ti.scan_http_client_modules())
 
     def test_http_sites_actually_use_httpx(self):
+        """An HTTP site must actually do HTTP -- catch a module mis-classified as
+        HTTP. A site that constructs its OWN client references httpx directly. A
+        fully-routed site (constructs_client=False, e.g. cors_validator after W-1 or
+        orchestrator_chain/iterative_agent after W-16) delegates client construction
+        to the run-scoped transport, so it must instead reference that transport."""
         root = ti.harness_dir()
+        routed_markers = ("run_context", "transport_for", "target_transport",
+                          "TargetTransport", "GatedAsyncClient")
         for site in ti.TRANSPORT_SITES:
             if site.channel != ti.CHANNEL_HTTP:
                 continue
             with open(os.path.join(root, site.module), encoding="utf-8") as f:
                 text = f.read()
-            self.assertIn("httpx", text, f"{site.module} is listed as http but never imports httpx")
+            if site.constructs_client:
+                self.assertIn("httpx", text,
+                              f"{site.module} constructs its own client but never imports httpx")
+            else:
+                self.assertTrue(
+                    "httpx" in text or any(m in text for m in routed_markers),
+                    f"{site.module} is a routed HTTP site but references neither httpx "
+                    f"nor the run-scoped transport")
 
 
 class RoutingAuditTests(unittest.TestCase):
@@ -145,6 +159,19 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(s["total_sites"], len(ti.TRANSPORT_SITES))
         self.assertEqual(s["routing_gaps"], len(ti.routing_gaps()))
         self.assertGreater(s["by_scope"].get(ti.SCOPE_TARGET, 0), 0)
+
+    def test_w16_no_target_routing_gaps_remain(self):
+        """W-16 full closure: every target-directed send is on the single
+        TargetTransport, so the inventory has ZERO routing gaps. The last two
+        migrated modules are executor-routed and construct no client of their own."""
+        self.assertEqual(list(ti.routing_gaps()), [],
+                         f"unexpected routing gaps: {[s.module for s in ti.routing_gaps()]}")
+        by_mod = {s.module: s for s in ti.TRANSPORT_SITES}
+        for mod in ("orchestrator_chain.py", "iterative_agent.py"):
+            self.assertEqual(by_mod[mod].routing, ti.ROUTING_EXECUTOR)
+            self.assertFalse(by_mod[mod].constructs_client)
+            self.assertFalse(by_mod[mod].is_routing_gap)
+            self.assertNotIn(mod, ti.scan_http_client_modules())  # no direct httpx client
 
 
 if __name__ == "__main__":

@@ -10,6 +10,11 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 from __future__ import annotations
 
 from orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+# W-16: the single TargetTransport. Imported by name (not as the module) because
+# investigate_engagement has a `run_context` parameter that would shadow the module;
+# `transport_for(run_context, ...)` then reads as "use this run's transport, or a
+# standalone one when it is None".
+from run_context import transport_for
 
 
 class ChainMixin:
@@ -107,24 +112,36 @@ class ChainMixin:
             funded = [t for t in plan["targets"]
                       if t["action"] != "deferred" and t["method"].upper() == "GET"]
             analyzed: list[dict] = []
-            for t in funded:
-                url = origin + t["path"].replace("{id}", "1")
-                if url in seen_urls or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
-                    continue
-                seen_urls.add(url)
-                try:
-                    await global_throttle.acquire()
-                    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
-                        resp = await client.get(url)
-                    exchange = HttpExchange(
-                        url=url, method="GET", request_headers={}, request_body="",
-                        response_status=resp.status_code, response_headers=dict(resp.headers),
-                        response_body=(resp.text or "")[: self.max_body_chars])
-                    result = await self.analyze(exchange)
-                    n = len([f for r in result.agent_reports for f in r.findings])
-                    analyzed.append({"url": url, "findings": n})
-                except Exception as e:
-                    analyzed.append({"url": url, "error": e.__class__.__name__})
+            # W-16: the driver's target GETs go through the single TargetTransport.
+            # No run of its own, so a standalone context (scope == is_host_allowed,
+            # so reachability is unchanged); one transport reused across the round.
+            _tt, _owned = transport_for(
+                None, allowed_hosts=self.allowed_hosts, config=self.config)
+            try:
+                for t in funded:
+                    url = origin + t["path"].replace("{id}", "1")
+                    if url in seen_urls or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
+                        continue
+                    seen_urls.add(url)
+                    try:
+                        await global_throttle.acquire()
+                        out = await _tt.send("GET", url, capability="engagement_execute",
+                                             max_redirects=0)  # match follow_redirects=False
+                        if not out.ok:
+                            analyzed.append({"url": url, "error": out.error or out.outcome})
+                            continue
+                        exchange = HttpExchange(
+                            url=url, method="GET", request_headers={}, request_body="",
+                            response_status=out.status, response_headers=dict(out.headers),
+                            response_body=(out.body or "")[: self.max_body_chars])
+                        result = await self.analyze(exchange)
+                        n = len([f for r in result.agent_reports for f in r.findings])
+                        analyzed.append({"url": url, "findings": n})
+                    except Exception as e:
+                        analyzed.append({"url": url, "error": e.__class__.__name__})
+            finally:
+                if _owned is not None:
+                    await _owned.aclose()
             # SUMMARIZE this round (the condensed feedback the next plan reacts to).
             rounds.append(self._summarize_round(rnd, host, analyzed))
             if not analyzed:  # nothing new was funded/runnable -> converged
@@ -219,13 +236,22 @@ class ChainMixin:
         a full crawl."""
         if not headers or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
             return False
+        # W-16: the credential probe goes through the single TargetTransport. It is a
+        # one-off throwaway send, so a standalone context; send_creds forwards the
+        # learned credential (ephemeral session scoped to the URL's origin), matching
+        # a raw client that just sent it to `url`. max_redirects=0 == follow_redirects=False.
+        _tt, _owned = transport_for(
+            None, allowed_hosts=self.allowed_hosts, config=self.config)
         try:
             await global_throttle.acquire()
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-                resp = await client.get(url, headers=headers)
-            return resp.status_code < 400
-        except httpx.HTTPError:
+            out = await _tt.send_creds("GET", url, capability="credential_probe",
+                                       headers=headers, max_redirects=0)
+            return bool(out.ok and out.status is not None and out.status < 400)
+        except Exception:
             return False
+        finally:
+            if _owned is not None:
+                await _owned.aclose()
 
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
@@ -435,13 +461,24 @@ class ChainMixin:
             if access_control_gate._is_access_control_class(vc):
                 # populate the candidate baseline: the probe role's own response.
                 if exchange.response_status is None and scope_discovery.is_host_allowed(exchange.url, self.allowed_hosts):
+                    # W-16: baseline read through the single TargetTransport (this run's
+                    # when present, else a standalone one). send_creds forwards the probe
+                    # role's own credentials; max_redirects=0 == follow_redirects=False.
+                    _tt, _owned = transport_for(run_context, allowed_hosts=self.allowed_hosts,
+                                                config=self.config)
                     try:
                         await global_throttle.acquire()
-                        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False, verify=False) as client:
-                            resp = await client.get(exchange.url, headers=exchange.request_headers or None)
-                        exchange.response_status, exchange.response_body = resp.status_code, (resp.text or "")
-                    except httpx.HTTPError:
+                        out = await _tt.send_creds("GET", exchange.url,
+                                                   capability="access_control_baseline",
+                                                   headers=exchange.request_headers, max_redirects=0)
+                        if not out.ok:
+                            return
+                        exchange.response_status, exchange.response_body = out.status, (out.body or "")
+                    except Exception:
                         return
+                    finally:
+                        if _owned is not None:
+                            await _owned.aclose()
                 try:
                     _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9)
                 except Exception:
@@ -682,13 +719,20 @@ class ChainMixin:
                     # other identity explicitly.
                     hdrs = _plant_headers if headers is None else headers
                     hdrs = {k: v for k, v in (hdrs or {}).items() if (k or "").lower() != "content-type"}
+                    # W-16: second-order read through the single TargetTransport (this run's
+                    # when present, else standalone). send_creds forwards the read identity's
+                    # credentials; max_redirects=0 == follow_redirects=False.
+                    _tt, _owned = transport_for(run_context, allowed_hosts=self.allowed_hosts,
+                                                config=self.config)
                     try:
-                        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False,
-                                                     verify=False) as c:
-                            r = await c.get(b_url, headers=hdrs or None)
-                        return r.text or ""
+                        out = await _tt.send_creds("GET", b_url, capability="second_order_read",
+                                                   headers=hdrs, max_redirects=0)
+                        return (out.body or "") if out.ok else ""
                     except Exception:
                         return ""
+                    finally:
+                        if _owned is not None:
+                            await _owned.aclose()
 
                 async def _confirm_sqli(a_url, b_url):
                     return await _so.confirm_second_order_sqli(
