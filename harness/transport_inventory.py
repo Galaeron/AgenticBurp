@@ -148,10 +148,12 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="agents (T09)",
                   gap="agent tool-fetch sends directly; route through the executor so "
                       "agent-driven hops obey scope/budget/cancellation."),
-    TransportSite("orchestrator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
+    TransportSite("orchestrator_chain.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_DIRECT,
                   owner="astra-identity (T03/T08)",
                   gap="second-order/discovery-confirm/coverage-seed sends open ad-hoc "
-                      "clients; route through the executor and carry the run's evidence sink."),
+                      "clients; route through the executor and carry the run's evidence sink. "
+                      "(These target-directed sends moved here from orchestrator.py in the "
+                      "W-15 decomposition; the ChainMixin owns the investigate_engagement path.)"),
 
     # ---- target: confirmation legs (validators) ----
     # Mutating legs pass through the SafetyGate/GatedAsyncClient; read-only legs open
