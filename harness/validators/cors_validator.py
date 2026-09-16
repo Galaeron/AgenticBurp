@@ -23,11 +23,11 @@ from urllib.parse import urlparse
 
 import httpx
 
-from safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.cors")
 
@@ -98,8 +98,8 @@ class CorsValidator(Validator):
     
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
         """Generate a test plan for CORS validation."""
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -243,7 +243,7 @@ class CorsValidator(Validator):
 
         try:
             if self.run_context is not None:
-                from run_context import TypedRequest
+                from harness.run_context import TypedRequest
                 outcome = await self.run_context.executor().execute(
                     TypedRequest(method, url, headers=headers),
                     capability=self.get_name(),
@@ -253,7 +253,7 @@ class CorsValidator(Validator):
                 return httpx.Response(
                     outcome.status or 0, content=(outcome.body or "").encode(),
                     headers=outcome.headers, request=httpx.Request(method, url))
-            import global_throttle
+            from harness import global_throttle
             await global_throttle.acquire()
             # No run_context (e.g. the header-audit or a standalone path): route
             # through the SafetyGate rather than a raw client, so this validator

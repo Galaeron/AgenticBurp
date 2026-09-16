@@ -2,7 +2,7 @@
 Tests for the prompt validation module.
 """
 import unittest
-from prompt_validator import (
+from harness.prompt_validator import (
     PromptValidator,
     ValidationConfig,
     ValidationError,
@@ -322,7 +322,7 @@ class TestRealAgentSystemPromptsPassValidation(unittest.TestCase):
     """
 
     def test_common_rules_boilerplate_passes_system_prompt_validation(self):
-        import agents.base_agent as ba
+        import harness.agents.base_agent as ba
         # Must not raise -- this exact call, with this exact text, is
         # what silently failed for every agent before the fix.
         result = validate_system_prompt(ba._COMMON_RULES)
@@ -339,8 +339,8 @@ class TestRealAgentSystemPromptsPassValidation(unittest.TestCase):
         """
         import yaml
         from pathlib import Path
-        from agent_manager import AgentManager
-        from ollama_client import OllamaClient
+        from harness.agent_manager import AgentManager
+        from harness.ollama_client import OllamaClient
 
         with open(Path(__file__).parent / "config.yaml") as f:
             config = yaml.safe_load(f)

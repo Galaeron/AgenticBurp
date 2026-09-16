@@ -37,20 +37,20 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx  # noqa: F401 -- HTTP transport site; sends now go via run_context.TargetTransport
 
-import global_throttle
-from models import Finding, HttpExchange
-from safety_gate import get_default_gate
-from run_context import transport_for  # W-16: the single TargetTransport
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import get_default_gate
+from harness.run_context import transport_for  # W-16: the single TargetTransport
 # Reuse the exact, tested mutation helpers the sqlmap validator already uses --
 # same bounded "change one param value on the captured request" envelope.
-from validators.sqlmap import (
+from harness.validators.sqlmap import (
     _mutate_query_param, _mutate_json_param, _mutate_form_param,
     _query_top_level_params, _json_top_level_params, _form_top_level_params,
     _looks_like_json, _content_type_of,
 )
 
 if TYPE_CHECKING:
-    from effort import EffortBudget
+    from harness.effort import EffortBudget
 
 log = logging.getLogger("harness.iterative_agent")
 
@@ -281,7 +281,7 @@ class IterativeAgent:
                 if effort_budget is not None:
                     r = await self.ollama.chat_json_metered(
                         model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
-                    from effort import CallKind
+                    from harness.effort import CallKind
                     effort_budget.record(CallKind.ESCALATION, self.model, r.prompt_tokens, r.completion_tokens)
                     action = r.data
                 else:

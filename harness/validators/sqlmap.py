@@ -9,11 +9,11 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import httpx
 
-from models import Finding, HttpExchange, TestPlan
-from planner import exchange_fingerprint
-from categories import canonicalize
+from harness.models import Finding, HttpExchange, TestPlan
+from harness.planner import exchange_fingerprint
+from harness.categories import canonicalize
 from .base import Validator, ValidationResult
-from safety_gate import get_default_gate
+from harness.safety_gate import get_default_gate
 
 # General-purpose parameter enumeration/mutation for the boolean-probe
 # fallback below (see _boolean_probe_fallback's own docstring for why it
@@ -415,7 +415,7 @@ class SqlmapValidator(Validator):
             # denied-flag invariant holds regardless of how the process is spawned.
             run_cmd = cmd
             if self.container_image:
-                import tool_runner
+                from harness import tool_runner
                 if tool_runner.available()[0]:
                     args = list(cmd[1:])  # drop self.binary; the image entrypoint IS sqlmap
                     for i in range(1, len(args)):
@@ -623,7 +623,7 @@ class SqlmapValidator(Validator):
             cmd_desc = [f"boolean-probe {exchange.method.upper()} {exchange.url} param={label}"]
             try:
                 if self.run_context is not None:
-                    from run_context import TypedRequest
+                    from harness.run_context import TypedRequest
                     from .transport import bind_session
 
                     async def routed(url, probe_body):
@@ -642,7 +642,7 @@ class SqlmapValidator(Validator):
                     resp_a = await routed(target_a, body_a)
                     resp_b = await routed(target_b, body_b)
                 else:
-                    import global_throttle
+                    from harness import global_throttle
                     async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
                         await global_throttle.acquire()
                         resp_a = await client.request(

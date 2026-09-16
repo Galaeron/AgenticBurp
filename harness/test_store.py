@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import store
-from models import HttpExchange, Finding, TestPlan, ValidationSubmission
+from harness import store
+from harness.models import HttpExchange, Finding, TestPlan, ValidationSubmission
 
 
 class TestFindingsPersistenceRoundTrip(unittest.TestCase):

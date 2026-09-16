@@ -36,10 +36,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-import risk_allocator
-from effort import CallKind, EffortLedger
-from engagement import normalize_path
-from categories import canonicalize
+from harness import risk_allocator
+from harness.effort import CallKind, EffortLedger
+from harness.engagement import normalize_path
+from harness.categories import canonicalize
 
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -127,7 +127,7 @@ class ReportFinding:
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
-    import issues
+    from harness import issues
     vc = d.get("vulnerability_class", "")
     return ReportFinding(
         url=d.get("url", ""),
@@ -149,7 +149,8 @@ def _from_store_dict(d: dict) -> ReportFinding:
         issue_id=("" if vc.startswith("potential-attack-chain:")
                   else issues.issue_id_for(issues.issue_key(d))),
         lifecycle_state=d.get("lifecycle_state")
-        or __import__("confirmation_gate").finding_lifecycle_state(d),
+        or __import__("harness.confirmation_gate",
+                      fromlist=["finding_lifecycle_state"]).finding_lifecycle_state(d),
     )
 
 
@@ -254,7 +255,7 @@ def _dedup_key(f: "ReportFinding") -> tuple:
     while keeping two SQLi inputs on one endpoint -- and a read vs a write -- as
     distinct issues. It is exactly `issues.issue_key`, so the report's collapse and
     the issue export agree by construction."""
-    import issues
+    from harness import issues
     return issues.issue_key({
         "url": f.url, "method": f.method, "vulnerability_class": f.vulnerability_class,
         "parameter_location": f.parameter_location, "parameter_name": f.parameter_name})
@@ -468,7 +469,7 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     since this function is also used as a standalone script entry point
     with no orchestrator in scope.
     """
-    import store
+    from harness import store
     findings = store.all_host_findings(url)  # excludes suppressed, by default
     all_including_suppressed = store.all_host_findings(url, include_suppressed=True)
     suppressed_count = len(all_including_suppressed) - len(findings)
@@ -482,7 +483,7 @@ def issue_exports(findings: list[dict], proofs_by_case: dict | None = None) -> l
     counterpart to the Markdown report: it keeps EVERY affected case/instance
     (not just a winner + count) and links case/proof ids, so an issue exported
     from one run maps to the same issue id on a patched-fixture retest."""
-    import issues
+    from harness import issues
     grouped = issues.group_findings_into_issues(findings)
     return [issues.export_issue(i, proofs_by_case=proofs_by_case) for i in grouped]
 
@@ -492,7 +493,7 @@ def export_issues_for_host(url: str) -> list[dict]:
     exports, enriched with the FULL append-only proof-attempt history per case
     (store.proofs_for_case) -- so every attempt, including a patched-fixture retest,
     is preserved with its own proof id and verdict (T06 history preservation)."""
-    import store
+    from harness import store
     findings = store.all_host_findings(url)
     proofs_by_case: dict = {}
     for f in findings:

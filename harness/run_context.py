@@ -40,8 +40,8 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-import evidence
-from safety_gate import SafetyGate, SafetyGateConfig
+from harness import evidence
+from harness.safety_gate import SafetyGate, SafetyGateConfig
 
 # Redirect status codes and the ones that rewrite the method to GET.
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
@@ -107,7 +107,7 @@ class HostAllowScope(ScopePolicy):
     active_mode: bool = False
 
     def in_scope(self, url: str) -> bool:
-        import scope_discovery
+        from harness import scope_discovery
         return scope_discovery.is_host_allowed(url, list(self.hosts), active_mode=self.active_mode)
 
 

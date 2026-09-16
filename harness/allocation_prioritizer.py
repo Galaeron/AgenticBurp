@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import re
 
-from ollama_client import OllamaClient, OllamaError
+from harness.ollama_client import OllamaClient, OllamaError
 
 log = logging.getLogger("harness.allocation_prioritizer")
 

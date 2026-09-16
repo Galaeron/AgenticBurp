@@ -26,7 +26,7 @@ from enum import Enum
 from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
-from categories import canonicalize
+from harness.categories import canonicalize
 
 
 # ---------------------------------------------------------------------------

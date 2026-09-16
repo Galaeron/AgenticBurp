@@ -77,7 +77,7 @@ def snapshot() -> dict:
         ev = dict(_events)
     fail_open = {}
     try:
-        import coordinator
+        from harness import coordinator
         fail_open = coordinator.fail_open_stats()
     except Exception:
         pass

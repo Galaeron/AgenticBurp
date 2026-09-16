@@ -26,10 +26,10 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 import httpx
 
 from .base import Validator, ValidationResult
-from safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.api_security")
 
@@ -81,8 +81,8 @@ class ApiSecurityValidator(Validator):
         return "local_tool"
 
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
 
         # Plan ID must incorporate the FULL exchange, not just the URL --
@@ -189,7 +189,7 @@ class ApiSecurityValidator(Validator):
                 get_default_gate(), self.get_name(),
                 timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
             ) as client:
-                import global_throttle
+                from harness import global_throttle
                 await global_throttle.acquire()
                 response = await client.request(
                     exchange.method, exchange.url,
@@ -245,7 +245,7 @@ class ApiSecurityValidator(Validator):
             async with httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
             ) as client:
-                import global_throttle
+                from harness import global_throttle
                 await global_throttle.acquire()
                 response = await client.request(
                     "GET", probe_url,  # pagination is inherently a read operation; never replay the captured method

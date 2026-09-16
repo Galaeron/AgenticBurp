@@ -28,9 +28,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import global_throttle
-from models import Finding, HttpExchange
-from safety_gate import get_default_gate
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import get_default_gate
 from .base import Validator, ValidationResult
 
 # Language / signals that a rate limit or lockout DID engage -- any of these on
@@ -106,7 +106,7 @@ class RateLimitValidator(Validator):
                     try:
                         if self.run_context is not None:
                             from types import SimpleNamespace
-                            from run_context import TypedRequest
+                            from harness.run_context import TypedRequest
                             from .transport import bind_session
                             session_ref, request_headers = bind_session(self.run_context, headers)
                             result = await self.run_context.executor().execute(

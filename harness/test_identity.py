@@ -1,6 +1,6 @@
 import unittest
 import tempfile, os
-import identity as identity_mod
+import harness.identity as identity_mod
 
 
 class IdentityDataclassTests(unittest.TestCase):
@@ -20,7 +20,7 @@ class IdentityDataclassTests(unittest.TestCase):
 
 class StorePersistenceTests(unittest.TestCase):
     def setUp(self):
-        import store
+        from harness import store
         self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self._tmp.close()
         self._orig_path = store._DB_PATH

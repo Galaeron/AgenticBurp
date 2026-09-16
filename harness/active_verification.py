@@ -26,11 +26,11 @@ import hashlib
 import logging
 from dataclasses import dataclass
 
-import payload_library
-import store
-from models import TestPlan, ValidationSubmission
-from ollama_client import OllamaClient, OllamaError
-from retry_policy import Action, Attempt, AttemptStatus, RetryPolicy
+from harness import payload_library
+from harness import store
+from harness.models import TestPlan, ValidationSubmission
+from harness.ollama_client import OllamaClient, OllamaError
+from harness.retry_policy import Action, Attempt, AttemptStatus, RetryPolicy
 
 log = logging.getLogger("harness.active_verification")
 

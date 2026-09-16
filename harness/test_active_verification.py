@@ -13,10 +13,10 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock
 
-import store
-import active_verification
-from models import TestPlan, ValidationSubmission
-from ollama_client import OllamaError
+from harness import store
+from harness import active_verification
+from harness.models import TestPlan, ValidationSubmission
+from harness.ollama_client import OllamaError
 
 
 def _make_plan(category="xss", severity="high", confidence=0.7, escalated=False,

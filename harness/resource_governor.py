@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from effort import EffortBudget, EffortLedger
+    from harness.effort import EffortBudget, EffortLedger
 
 # How much impact each severity carries when the budget can't cover everything.
 # Impact is the primary allocation signal: a fixed budget should buy down the
@@ -227,7 +227,7 @@ def estimate_round_cost(
     available (falls back to effort.py's labeled priors otherwise). One round =
     `avg_agents_per_round` agent dispatches plus a `critique_fraction` share of a
     critique pass."""
-    from effort import CallKind
+    from harness.effort import CallKind
     agent = ledger.average_tokens(CallKind.AGENT_DISPATCH)
     critique = ledger.average_tokens(CallKind.CRITIQUE)
     return int(avg_agents_per_round * agent + critique_fraction * critique)

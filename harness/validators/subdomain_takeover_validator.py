@@ -32,7 +32,7 @@ import httpx
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.subdomain_takeover")
 
@@ -113,8 +113,8 @@ class SubdomainTakeoverValidator(Validator):
         return "local_tool"
 
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -214,7 +214,7 @@ class SubdomainTakeoverValidator(Validator):
         try:
             if self.run_context is not None:
                 from types import SimpleNamespace
-                from run_context import TypedRequest
+                from harness.run_context import TypedRequest
                 outcome = await self.run_context.executor().execute(
                     TypedRequest("GET", url, headers={"User-Agent": self.user_agent}),
                     capability=self.get_name(), max_redirects=self.max_redirects)
@@ -227,7 +227,7 @@ class SubdomainTakeoverValidator(Validator):
                     timeout=self.timeout, follow_redirects=True,
                     max_redirects=self.max_redirects,
                 ) as client:
-                    import global_throttle
+                    from harness import global_throttle
                     await global_throttle.acquire()
                     response = await client.get(url, headers={"User-Agent": self.user_agent})
         except Exception as e:

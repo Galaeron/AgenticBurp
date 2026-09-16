@@ -8,10 +8,10 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from models import Finding, HttpExchange
-from safety_gate import get_default_gate, reset_default_gate
-from run_context import RunContext, ScopePolicy
-from validators.toctou_validator import ToctouValidator
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import get_default_gate, reset_default_gate
+from harness.run_context import RunContext, ScopePolicy
+from harness.validators.toctou_validator import ToctouValidator
 
 
 def _finding(vc="toctou"):
@@ -155,8 +155,8 @@ class ToctouTests(unittest.TestCase):
         self.assertEqual(r.status, "skipped")
         self.assertIn("max_burst_size", r.summary)
 
-    @patch("validators.toctou_validator.httpx.AsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.toctou_validator.httpx.AsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_confirms_when_field_flips_under_concurrency(self, _t, mock_cls):
         v = ToctouValidator(allowed_hosts=["target.test"], burst_size=4)
         reads = iter([(200, {"role": "user"}),      # baseline: not privileged
@@ -173,8 +173,8 @@ class ToctouTests(unittest.TestCase):
         self.assertTrue(r.confirmed)
         self.assertIn("role", r.summary)
 
-    @patch("validators.toctou_validator.httpx.AsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.toctou_validator.httpx.AsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_single_success_is_mass_assign_not_race(self, _t, mock_cls):
         # field flips, but only ONE concurrent request succeeds cleanly (rest
         # rejected) -> that's mass-assignment (sequence's case), not a race.
@@ -195,8 +195,8 @@ class ToctouTests(unittest.TestCase):
         self.assertEqual(r.status, "not_confirmed")
         self.assertIn("mass-assignment", r.summary)
 
-    @patch("validators.toctou_validator.httpx.AsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.toctou_validator.httpx.AsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_not_confirmed_when_no_flip(self, _t, mock_cls):
         v = ToctouValidator(allowed_hosts=["target.test"], burst_size=4)
         reads = iter([(200, {"role": "user"}), (200, {"role": "user"})])  # never flips
@@ -210,7 +210,7 @@ class ToctouTests(unittest.TestCase):
         self.assertEqual(r.status, "not_confirmed")
 
     def test_registered_and_active(self):
-        from validators.registry import ValidatorRegistry
+        from harness.validators.registry import ValidatorRegistry
         reg = ValidatorRegistry({"validators": {"active_enabled": True}})
         self.assertIn("toctou", reg.validators)
         self.assertTrue(reg.validators["toctou"].active)

@@ -1,5 +1,5 @@
 import unittest
-from safety_gate import (
+from harness.safety_gate import (
     SafetyGate, SafetyGateConfig, ActionRiskTier, GatedAsyncClient,
     SafetyGateBlocked, HARD_MAX_BURST_SIZE, get_default_gate, reset_default_gate,
 )

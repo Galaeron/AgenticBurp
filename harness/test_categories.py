@@ -12,7 +12,7 @@ meant they got no test plan at all, or fell into an overly-permissive
 fallback path instead of their correct one.
 """
 import unittest
-from categories import canonicalize
+from harness.categories import canonicalize
 
 
 class CanonicalizeNormalizationTests(unittest.TestCase):

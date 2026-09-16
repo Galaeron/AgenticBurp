@@ -3,10 +3,10 @@ authenticated role and capturing the credential-bearing, workflow-shaped
 exchanges route-guessing can't reach."""
 import asyncio
 import unittest
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
 
-import feature_workflow as fw
+import harness.feature_workflow as fw
 
 
 class _Resp:
@@ -172,8 +172,8 @@ class BuilderIntegrationTests(unittest.TestCase):
     role and unions/dedups the exchanges."""
 
     def test_unions_and_dedups_across_roles(self):
-        import engagement_builder
-        from role_crawl import RoleSession
+        from harness import engagement_builder
+        from harness.role_crawl import RoleSession
 
         # a shared public index (same body to all roles) + a per-role page
         async def app_fetch(method, url, headers, body):
@@ -206,8 +206,8 @@ class CrossSeedTests(unittest.TestCase):
     not just /."""
 
     def test_seed_paths_reach_deeper_surface(self):
-        import engagement_builder
-        from role_crawl import RoleSession
+        from harness import engagement_builder
+        from harness.role_crawl import RoleSession
 
         async def app_fetch(method, url, headers, body):
             from urllib.parse import urlsplit
@@ -232,7 +232,7 @@ class CrossSeedTests(unittest.TestCase):
 
 class RunContextFeatureTransportTests(unittest.TestCase):
     def test_actual_feature_fetch_uses_session_and_budget(self):
-        import feature_workflow
+        from harness import feature_workflow
         fixture = _Fixture()
         ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=1,
                                 gate_config={"active_enabled": True})

@@ -3,8 +3,8 @@ clickjacking/missing-header observer findings below the medium operating point,
 recall-safe, never deleting a finding."""
 import unittest
 
-from models import AgentReport, Finding
-import header_noise_gate as g
+from harness.models import AgentReport, Finding
+import harness.header_noise_gate as g
 
 
 def _f(vc, severity="medium", confirmed=False):

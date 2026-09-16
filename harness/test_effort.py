@@ -1,5 +1,5 @@
 import unittest
-from effort import (
+from harness.effort import (
     BudgetMode, CallKind, EffortLedger, EffortBudget,
     UrlEstimateInput, estimate_for_urls, _DEFAULT_TOKEN_ESTIMATE,
 )

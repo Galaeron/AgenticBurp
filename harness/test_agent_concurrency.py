@@ -15,7 +15,7 @@ config value is read correctly.
 import asyncio
 import unittest
 
-from agent_manager import AgentManager
+from harness.agent_manager import AgentManager
 
 
 class DummyOllama:
@@ -58,7 +58,7 @@ class TestAgentConcurrencyLimit(unittest.TestCase):
             peak_in_flight["value"] = max(peak_in_flight["value"], current_in_flight["count"])
             await asyncio.sleep(0.05)  # hold the "slot" long enough for overlap to be observable
             current_in_flight["count"] -= 1
-            from models import AgentReport
+            from harness.models import AgentReport
             return AgentReport(agent=name, model="test", findings=[])
 
         manager.run_agent_async = fake_run_agent_async
@@ -77,7 +77,7 @@ class TestAgentConcurrencyLimit(unittest.TestCase):
 
         async def fake_run_agent_async(name, exchange, max_body_chars, prior_context):
             await asyncio.sleep(0.01)
-            from models import AgentReport
+            from harness.models import AgentReport
             return AgentReport(agent=name, model="test", findings=[])
 
         manager.run_agent_async = fake_run_agent_async

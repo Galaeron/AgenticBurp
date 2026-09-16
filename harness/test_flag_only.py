@@ -3,8 +3,8 @@ automated confirmation leg is surfaced for human verification -- never
 fake-confirmed, never dropped."""
 import unittest
 
-import engagement
-from engagement import needs_human_review, EngagementState
+from harness import engagement
+from harness.engagement import needs_human_review, EngagementState
 
 
 class NeedsHumanReviewTests(unittest.TestCase):

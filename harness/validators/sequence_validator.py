@@ -38,11 +38,11 @@ from urllib.parse import urlsplit, parse_qsl, urlencode
 
 import httpx
 
-import global_throttle
-from models import Finding, HttpExchange
-from safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
-from validators.sqlmap import _looks_like_json, _content_type_of
+from harness.validators.sqlmap import _looks_like_json, _content_type_of
 
 # Canonical privilege/authority fields to inject. value = the privileged value.
 _PRIV_FIELDS = {

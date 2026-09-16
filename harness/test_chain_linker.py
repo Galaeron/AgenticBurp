@@ -2,8 +2,8 @@
 written into the engagement graph. Deterministic, no network."""
 import unittest
 
-import engagement
-import chain_linker
+from harness import engagement
+from harness import chain_linker
 
 
 def _state():
@@ -83,7 +83,7 @@ class ChainInputProvenanceTests(unittest.TestCase):
     which defeated the Phase-3.5 speculative-chain tagging)."""
 
     def test_provenance_survives_projection(self):
-        import attribution
+        from harness import attribution
         proj = chain_linker._chain_input([
             {"url": "http://t/a", "vulnerability_class": "idor", "confirmed": True,
              "basis": "derived", "evidence": "proof", "identity": "user"},

@@ -16,11 +16,11 @@ import re
 from urllib.parse import urlparse, urlsplit
 
 import httpx
-import global_throttle
-import host_dep_dedup
+from harness import global_throttle
+from harness import host_dep_dedup
 
-from ollama_client import OllamaClient, OllamaError
-from models import (
+from harness.ollama_client import OllamaClient, OllamaError
+from harness.models import (
     HttpExchange,
     AnalysisResponse,
     AgentReport,
@@ -29,26 +29,26 @@ from models import (
     EffortStatus,
     ComponentCandidate,
 )
-import store
-import evidence
-import chaining
-import planner
-import effort
-from effort import BudgetMode, CallKind, EffortBudget
-import security
-import cache
-import fast_path
-import scope_discovery
-import credential_endpoint_detector
-from agent_manager import AgentManager
-import coordinator
-from coordinator import Coordinator
-from analysis_pipeline import AnalysisPipeline
-from github_advisories import GitHubAdvisoryClient
-from package_registry_checks import PackageRegistryClient
-from kev_check import KevClient
-from validators import ValidatorRegistry
-from models import ValidationReport, ValidationSubmission
+from harness import store
+from harness import evidence
+from harness import chaining
+from harness import planner
+from harness import effort
+from harness.effort import BudgetMode, CallKind, EffortBudget
+from harness import security
+from harness import cache
+from harness import fast_path
+from harness import scope_discovery
+from harness import credential_endpoint_detector
+from harness.agent_manager import AgentManager
+from harness import coordinator
+from harness.coordinator import Coordinator
+from harness.analysis_pipeline import AnalysisPipeline
+from harness.github_advisories import GitHubAdvisoryClient
+from harness.package_registry_checks import PackageRegistryClient
+from harness.kev_check import KevClient
+from harness.validators import ValidatorRegistry
+from harness.models import ValidationReport, ValidationSubmission
 
 log = logging.getLogger("harness.orchestrator")
 
@@ -173,7 +173,7 @@ Return an empty findings list if you found nothing beyond the known advisory.
 
 
 def _exchange_text(exchange: HttpExchange) -> str:
-    from exchange_text import exchange_text
+    from harness.exchange_text import exchange_text
     return exchange_text(exchange)
 
 
@@ -219,7 +219,7 @@ def _jwt_identity(node: dict, roles):
     """The lowest-trust reachable identity carrying a JWT (a broken verifier proven
     from the weakest role is the stronger result), or None. Falls back to any
     JWT-carrying identity when the node lists no reachable roles."""
-    import worklist_investigator
+    from harness import worklist_investigator
     reach = node.get("reachable_roles") or []
     reachable = sorted((r for r in roles if r.role in reach),
                        key=lambda r: worklist_investigator._trust(r.role))
@@ -366,7 +366,7 @@ def _has_url_param(exchange: HttpExchange) -> bool:
 
 def _has_injectable_param(exchange: HttpExchange) -> bool:
     """Any query/body parameter to inject a shell/template payload into."""
-    from validators.injection_targets import param_targets
+    from harness.validators.injection_targets import param_targets
     return bool(param_targets(exchange))
 
 
@@ -374,13 +374,13 @@ def _has_file_shape(exchange: HttpExchange) -> bool:
     """A file/path-shaped parameter, or a file-ish path segment (e.g. /uploads/<id>).
     Reuses the path-traversal validator's own detectors so the routing decision and
     the leg's own targeting never drift."""
-    from validators.path_traversal_validator import _file_shaped, _fileish_segment
+    from harness.validators.path_traversal_validator import _file_shaped, _fileish_segment
     return bool(_file_shaped(exchange)) or _fileish_segment(exchange.url)
 
 
 def _has_redirect_param(exchange: HttpExchange) -> bool:
     """A redirect-shaped parameter to point off-origin."""
-    from validators.open_redirect_validator import _redirect_params
+    from harness.validators.open_redirect_validator import _redirect_params
     return bool(_redirect_params(exchange))
 
 
@@ -388,7 +388,7 @@ def _has_pickle_shape(exchange: HttpExchange) -> bool:
     """A cookie/param whose value base64-decodes to pickle bytes -- a
     deserialization sink. Reuses the deser leg's own detector so routing and the
     leg never drift."""
-    from validators.deserialization_oob_validator import DeserializationOobValidator
+    from harness.validators.deserialization_oob_validator import DeserializationOobValidator
     return bool(DeserializationOobValidator()._sink_candidates(exchange))
 
 
@@ -405,7 +405,7 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
     The xxe/ssrf legs need a real body/param, which route-discovery seeds don't
     carry, so they fire only on a captured exchange that actually has that shape
     (real Burp use) -- never as a blind guess from a bare route."""
-    import worklist_investigator
+    from harness import worklist_investigator
     method = (node.get("method") or "GET").upper()
     legs: list[tuple[str, HttpExchange]] = []
     if node.get("object_scoped") and method == "GET":
@@ -571,7 +571,7 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
     if not audit_validators:
         return 0
 
-    from validators.verbose_error_validator import (
+    from harness.validators.verbose_error_validator import (
         findings_from_exchange as _ve_findings,
         extract_disclosed_paths,
     )
@@ -627,7 +627,7 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
         # Feed disclosed paths from verbose errors back into discovery
         disclosed = extract_disclosed_paths(ex)
         if disclosed:
-            import engagement as _eng
+            import harness.engagement as _eng
             for p in disclosed:
                 state._ep("GET", _eng.normalize_path(p))
 

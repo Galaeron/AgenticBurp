@@ -5,7 +5,7 @@ import unittest
 import tempfile
 import os
 import json
-from audit_logger import (
+from harness.audit_logger import (
     AuditLogger,
     AuditEvent,
     AuditEventType,

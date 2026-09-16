@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-from models import HttpExchange, Finding, TestPlan, ValidationSubmission
+from harness.models import HttpExchange, Finding, TestPlan, ValidationSubmission
 
 _DB_PATH = Path(__file__).parent / "harness_state.db"
 
@@ -38,7 +38,7 @@ def finding_fingerprint(host: str, method: str, url: str, vulnerability_class: s
     fingerprint, defeating suppression and duplicating findings. Two runs that
     word the same issue differently now hash identically.
     """
-    from categories import canonicalize
+    from harness.categories import canonicalize
     check = canonicalize(vulnerability_class) or (vulnerability_class or "").lower()
     return hashlib.sha256("\x1f".join([
         host or "",
@@ -564,7 +564,7 @@ def persist_proof_record(proof) -> tuple[bool, str]:
     keyed on the per-attempt proof_id, so re-persisting is idempotent and a later
     weaker attempt never overwrites an earlier stronger proof of the same case
     (best_proof_for_case selects the strongest)."""
-    from evidence import ProofRecord  # local import: evidence has no store dependency
+    from harness.evidence import ProofRecord  # local import: evidence has no store dependency
     if not isinstance(proof, ProofRecord):
         return False, "not a ProofRecord"
     if not proof.case.consistent:
@@ -626,7 +626,7 @@ def best_proof_for_case(case_id: str) -> dict | None:
     """The strongest proof attempt for a case (confirmed > controlled_negative >
     inconclusive/blocked > error; ties break to the most recent). A later weaker
     attempt never displaces an earlier stronger one."""
-    from evidence import Verdict
+    from harness.evidence import Verdict
     proofs = proofs_for_case(case_id)
     if not proofs:
         return None
@@ -718,7 +718,7 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
     # method + the finding's case coordinates (parameter_location/parameter_name/
     # principal_id, from its linked proof) are surfaced for T06 issue grouping and
     # export -- additive keys; existing consumers read by name and are unaffected.
-    import confirmation_gate
+    from harness import confirmation_gate
     results = [
         {"url": u, "vulnerability_class": vc, "severity": sev, "confidence": conf, "summary": s,
          "evidence": ev, "suggested_test": st, "owasp_category": oc, "basis": basis,
@@ -926,7 +926,7 @@ def mark_chain_detected(url: str, signature: str) -> None:
 #   not_dispatched  - no exchange on this host ever triggered this specialist at all
 #   not_applicable  - analyst override; see set_coverage_override
 
-from categories import CANONICAL_CATEGORIES  # noqa: E402  (kept near point of use)
+from harness.categories import CANONICAL_CATEGORIES  # noqa: E402  (kept near point of use)
 
 _NO_ACTIVE_VALIDATOR = {"misconfig", "ai_llm", "supply_chain"}
 

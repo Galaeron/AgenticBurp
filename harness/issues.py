@@ -29,8 +29,8 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-from categories import canonicalize
-from engagement import normalize_path
+from harness.categories import canonicalize
+from harness.engagement import normalize_path
 
 _ISSUE_VERSION = 1
 

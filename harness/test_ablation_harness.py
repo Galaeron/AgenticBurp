@@ -3,8 +3,8 @@ mean +/- variance across repeats -- verified without a live model via a stub
 runner."""
 import unittest
 
-import ablation_harness as ah
-from ablation_harness import RunMetrics, Variant, run_ablation
+import harness.ablation_harness as ah
+from harness.ablation_harness import RunMetrics, Variant, run_ablation
 
 
 class VariantDefinitionTests(unittest.TestCase):

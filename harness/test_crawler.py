@@ -3,10 +3,10 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-import global_throttle
-import crawler
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
+from harness import global_throttle
+from harness import crawler
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
 
 
 class _Resp:

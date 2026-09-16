@@ -36,12 +36,12 @@ import yaml
 
 _HARNESS = Path(__file__).resolve().parent
 
-import store
-import cache
-import coordinator
-from orchestrator import Orchestrator
-from models import HttpExchange
-from ollama_client import OllamaResult
+from harness import store
+from harness import cache
+from harness import coordinator
+from harness.orchestrator import Orchestrator
+from harness.models import HttpExchange
+from harness.ollama_client import OllamaResult
 
 
 # An XML-accepting request with NO query string and NO url-shaped param, so the

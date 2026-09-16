@@ -35,7 +35,7 @@ from .reset_token_validator import ResetTokenValidator
 from .dom_xss_validator import DomXssValidator
 from .toctou_validator import ToctouValidator
 from .verbose_error_validator import VerboseErrorValidator
-from safety_gate import get_default_gate, reset_default_gate
+from harness.safety_gate import get_default_gate, reset_default_gate
 
 
 class ValidatorRegistry:
@@ -373,7 +373,7 @@ class ValidatorRegistry:
         # Only auto-armed when it is not already explicitly registered (avoids a
         # duplicate and leaves the runtime toggle / config opt-in untouched).
         if self.active_enabled and "cross_identity" not in self.validators:
-            import identity_headers
+            from harness import identity_headers
             from urllib.parse import urlsplit
             host = urlsplit(exchange.url).hostname or ""
             if identity_headers.has_identities(host):

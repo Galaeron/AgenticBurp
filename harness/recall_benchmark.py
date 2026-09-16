@@ -30,8 +30,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-import categories
-from engagement import normalize_path
+from harness import categories
+from harness.engagement import normalize_path
 
 CONFIRMED = "confirmed"
 DETECTED = "detected_unconfirmed"

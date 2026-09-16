@@ -7,9 +7,9 @@ is deliberately the piece the historical "green tests, dead pipeline" failures
 lived in: routing code that no test ever ran."""
 import unittest
 
-from models import HttpExchange
-from role_crawl import RoleSession
-from orchestrator import (
+from harness.models import HttpExchange
+from harness.role_crawl import RoleSession
+from harness.orchestrator import (
     shape_precondition_legs,
     shape_precondition_findings,
     confirmation_cache_key,

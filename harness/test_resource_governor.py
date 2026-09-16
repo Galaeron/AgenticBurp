@@ -1,8 +1,8 @@
 """Tests for F5 per-vulnerability resource governance."""
 import unittest
 
-import resource_governor as rg
-from effort import EffortBudget, EffortLedger, BudgetMode, CallKind
+import harness.resource_governor as rg
+from harness.effort import EffortBudget, EffortLedger, BudgetMode, CallKind
 
 
 def _cand(id, vc, sev, conf=0.5, url="https://t.test/x", priority=None):

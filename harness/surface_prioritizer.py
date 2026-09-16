@@ -18,8 +18,8 @@ job once the analyst picks a candidate off the ranked list.
 from __future__ import annotations
 import logging
 
-from models import PrioritizeRequestItem, PrioritizeResultItem
-from ollama_client import OllamaClient, OllamaError
+from harness.models import PrioritizeRequestItem, PrioritizeResultItem
+from harness.ollama_client import OllamaClient, OllamaError
 
 log = logging.getLogger("harness.surface_prioritizer")
 

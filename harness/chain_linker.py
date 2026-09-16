@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import logging
 
-import access_control_gate
-import chaining
-import engagement as eng
+from harness import access_control_gate
+from harness import chaining
+import harness.engagement as eng
 
 log = logging.getLogger("harness.chain_linker")
 
@@ -48,7 +48,7 @@ def _canon_class(vc: str) -> str:
             return "idor"
         return "broken_access_control"
     try:
-        from categories import canonicalize
+        from harness.categories import canonicalize
         return canonicalize(vc) or low
     except Exception:
         return low

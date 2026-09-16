@@ -4,9 +4,9 @@ and only then. Applicability is automatic; authorization to send stays explicit
 (active_enabled AND identities for the host)."""
 import unittest
 
-import identity_headers
-from validators.registry import ValidatorRegistry
-from models import Finding, HttpExchange
+from harness import identity_headers
+from harness.validators.registry import ValidatorRegistry
+from harness.models import Finding, HttpExchange
 
 
 def _reg(active=True):

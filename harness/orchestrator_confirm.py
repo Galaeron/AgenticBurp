@@ -9,7 +9,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
-from orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 
 
 class ConfirmMixin:
@@ -37,9 +37,9 @@ class ConfirmMixin:
             raise RuntimeError(
                 "iterative agent is disabled (set iterative_agent.enabled in config.yaml)")
 
-        from iterative_agent import IterativeAgent
-        import pivot_memory
-        import activity_feed
+        from harness.iterative_agent import IterativeAgent
+        from harness import pivot_memory
+        from harness import activity_feed
 
         # Phase 4 cloud-coordinator seam: the iterative agent's reasoning runs on
         # the cloud model when the seam is toggled on (else local).
@@ -91,7 +91,7 @@ class ConfirmMixin:
         effort budget -- the loop stops the moment any of them says no. Every
         round's real token cost (measured from the ledger delta) is charged to
         the per-vuln spend so the caps mean tokens, not just call counts."""
-        import resource_governor
+        from harness import resource_governor
         if agent_class not in self.agent_manager.agents:
             raise ValueError(f"unknown agent class {agent_class!r}")
 
@@ -146,11 +146,11 @@ class ConfirmMixin:
         try:
             _template_id = evidence._short(
                 (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
-            from categories import canonicalize as _canon
+            from harness.categories import canonicalize as _canon
             check_id = check.id or _canon(check.vulnerability_class) or (check.vulnerability_class or "")
             ck = case_key
             if run_context is None:
-                from run_context import RunContext
+                from harness.run_context import RunContext
                 run_context = RunContext.create(
                     config=self.config, allowed_hosts=self.allowed_hosts)
             case = evidence.TestCaseRef.make(
@@ -215,21 +215,21 @@ class ConfirmMixin:
             )
             # W-11: a run producing no confirmations because everything was out
             # of scope should say so at /telemetry, not silently.
-            import telemetry
+            from harness import telemetry
             telemetry.record_event("validator_dispatch_scope_denied")
             return [], []
         jobs = []
         plans: list = []
         metas: list = []  # (finding, validator, exact case) parallel to jobs
         if run_context is None:
-            from run_context import RunContext
+            from harness.run_context import RunContext
             run_context = RunContext.create(
                 allowed_hosts=getattr(self, "allowed_hosts", []),
                 config=getattr(self, "config", {}))
         _run_id = run_context.run_id
         _template_id = evidence._short(
             (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
-        from categories import canonicalize as _vf_canon
+        from harness.categories import canonicalize as _vf_canon
 
         def _case_for(finding, report, report_index: int, finding_index: int):
             check = _vf_canon(finding.vulnerability_class) or (finding.vulnerability_class or "")
@@ -278,7 +278,7 @@ class ConfirmMixin:
                 # W-11: count the crashed leg so a run where a validator throws on
                 # every exchange (and thus confirms nothing) is visible at
                 # /telemetry, not just in the logs.
-                import telemetry
+                from harness import telemetry
                 telemetry.record_swallowed_exception(
                     f"validator_dispatch.{getattr(validator, 'name', 'validator')}", result)
                 # Preserve the operational failure as an ERROR proof (R30/T01): a

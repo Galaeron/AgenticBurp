@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from categories import canonicalize
+from harness.categories import canonicalize
 
 
 @dataclass(frozen=True)

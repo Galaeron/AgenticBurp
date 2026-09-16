@@ -9,8 +9,8 @@ import hmac
 import json
 import unittest
 
-import secret_disclosure
-from models import HttpExchange
+from harness import secret_disclosure
+from harness.models import HttpExchange
 
 
 def _b64(obj) -> str:

@@ -1,7 +1,7 @@
 import unittest
 
-import credential_endpoint_detector as ced
-from models import HttpExchange
+import harness.credential_endpoint_detector as ced
+from harness.models import HttpExchange
 
 
 class DetectCredentialSubmissionTests(unittest.TestCase):

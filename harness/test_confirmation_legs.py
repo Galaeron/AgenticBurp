@@ -7,12 +7,12 @@ import unittest
 import urllib.request
 from unittest.mock import patch
 
-import collaborator
-from models import Finding, HttpExchange
-from validators.jwt_forge_validator import (JwtForgeValidator, _JWT_RE, _b64url_decode,
+from harness import collaborator
+from harness.models import Finding, HttpExchange
+from harness.validators.jwt_forge_validator import (JwtForgeValidator, _JWT_RE, _b64url_decode,
                                             _b64url_encode, _forge_alg_none)
-from validators.ssrf_validator import SsrfValidator
-from validators.xxe_validator import XxeValidator
+from harness.validators.ssrf_validator import SsrfValidator
+from harness.validators.xxe_validator import XxeValidator
 
 
 def _f(vc):
@@ -135,12 +135,12 @@ class _GateAllowsMutating(unittest.TestCase):
     """The ssrf/xxe sends are mutating POSTs -> the safety gate must be armed to
     allow a mutating replay, else it (correctly) blocks them."""
     def setUp(self):
-        import safety_gate
+        from harness import safety_gate
         safety_gate.reset_default_gate()
         safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
 
     def tearDown(self):
-        import safety_gate
+        from harness import safety_gate
         safety_gate.reset_default_gate()
 
 

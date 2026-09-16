@@ -13,7 +13,7 @@ import os
 import re
 import unittest
 
-import transport_inventory as ti
+import harness.transport_inventory as ti
 
 
 class InventoryEnforcementTests(unittest.TestCase):

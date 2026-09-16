@@ -28,9 +28,9 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl
 
 import httpx
 
-import global_throttle
-from models import Finding, HttpExchange
-from safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
 from .injection_targets import param_targets, mutate, replay_headers
 

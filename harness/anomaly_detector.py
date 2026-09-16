@@ -25,7 +25,7 @@ from typing import Optional, Any
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
-from models import HttpExchange, Finding
+from harness.models import HttpExchange, Finding
 
 
 @dataclass

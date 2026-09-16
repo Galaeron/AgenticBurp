@@ -14,7 +14,7 @@ Covers the handoff's explicit test matrix:
 """
 import unittest
 
-import issues
+from harness import issues
 
 
 def F(url, vc, *, method="GET", ploc="", pname="", confirmed=False, severity="high",
@@ -267,20 +267,22 @@ class StoreExportIntegrationTests(unittest.TestCase):
     issue through the store path -- the T06 'reproducible export' Done criterion."""
 
     def setUp(self):
-        import tempfile, store
+        import tempfile
+        from harness import store
         from pathlib import Path
         self._tmp = tempfile.mkdtemp(prefix="issues_")
         self._orig = store._DB_PATH
         store._DB_PATH = Path(self._tmp) / "state.db"
 
     def tearDown(self):
-        import shutil, store
+        import shutil
+        from harness import store
         store._DB_PATH = self._orig
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_export_issues_for_host_links_a_persisted_proof(self):
-        import store, evidence, report_generator
-        from models import HttpExchange, Finding
+        from harness import store, evidence, report_generator
+        from harness.models import HttpExchange, Finding
         # a case + confirmed proof (the T05/T01 identity)
         case = evidence.TestCaseRef.make(run_id="run1", request_template_id="tmpl1",
                                          check_id="WSTG-ATHZ-04", principal_id="user",
@@ -313,8 +315,8 @@ class StoreExportIntegrationTests(unittest.TestCase):
         self.assertIn(exp["issue_id"], exp["retest"])
 
     def test_retest_survives_storage_as_one_issue_with_both_attempts(self):  # R08
-        import store, evidence, report_generator
-        from models import HttpExchange, Finding
+        from harness import store, evidence, report_generator
+        from harness.models import HttpExchange, Finding
         ex = HttpExchange(url="https://shop.example.com/api/tickets/1", method="GET",
                           request_headers={}, request_body="")
 

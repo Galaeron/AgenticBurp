@@ -4,20 +4,20 @@ import logging
 import os
 import secrets
 import yaml
-import store
-import active_verification
-import surface_prioritizer
+from harness import store
+from harness import active_verification
+from harness import surface_prioritizer
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from models import (AnalysisRequest, AnalysisResponse, ValidationSubmission, EstimateRequest, EffortStatus,
+from harness.models import (AnalysisRequest, AnalysisResponse, ValidationSubmission, EstimateRequest, EffortStatus,
                      IdentityCreateRequest, SessionCreateRequest, SuppressFindingRequest,
                      PrioritizeRequest, PrioritizeResponse, PrioritizeResultItem, HttpExchange)
-import identity as identity_mod
-from orchestrator import Orchestrator
+import harness.identity as identity_mod
+from harness.orchestrator import Orchestrator
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("harness.server")
@@ -56,7 +56,7 @@ def load_config() -> dict:
     # loudly instead of failing silently, and the fingerprint ties a run to
     # exactly which configuration produced it.
     try:
-        import config_schema
+        from harness import config_schema
         result = config_schema.validate_config(cfg)
         for err in result.errors:
             log.error("config validation: %s", err)
@@ -118,7 +118,7 @@ def _require_auth(authorization: str | None) -> None:
 
 @app.get("/health")
 async def health():
-    import coordinator
+    from harness import coordinator
     return {
         "status": "ok",
         "coordinator_model": orchestrator.coordinator_model,
@@ -129,8 +129,8 @@ async def health():
 
 @app.get("/telemetry")
 async def telemetry():
-    import coordinator
-    import telemetry as _telemetry
+    from harness import coordinator
+    import harness.telemetry as _telemetry
     # W-11: the diagnostics snapshot answers "why did this target produce
     # zero/few findings?" -- swallowed-exception counts (a validator crashing on
     # every exchange, a header audit that failed), scope-denial events, and the
@@ -156,7 +156,7 @@ async def report(url: str, authorization: str | None = Header(default=None)):
     of unconfirmed findings for real, in-session token-spend data.
     """
     _require_auth(authorization)
-    import report_generator
+    from harness import report_generator
     markdown = await __import__("asyncio").to_thread(
         report_generator.generate_report_for_host, url, orchestrator.effort_budget.ledger,
     )
@@ -294,7 +294,7 @@ async def crawl_endpoint(req: CrawlRequest, authorization: str | None = Header(d
     max_pages/max_depth. Drives the Burp "Crawl" button; returns the discovered
     endpoints for the site map / attack-surface tab."""
     _require_auth(authorization)
-    import crawler
+    from harness import crawler
     result = await crawler.crawl(
         req.base_url,
         headers=req.headers or {},
@@ -391,7 +391,7 @@ async def set_identity_session_headers(req: SessionHeadersRequest, authorization
     properly-restricted 200. Requires validators.cross_identity.enabled +
     validators.active_enabled."""
     _require_auth(authorization)
-    import identity_headers
+    from harness import identity_headers
     identity_headers.set_identity(req.host, req.name, req.headers, req.role)
     return {"ok": True, "host": req.host,
             "identities": [i["name"] for i in identity_headers.identities_for_host(req.host)]}
@@ -407,7 +407,7 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
     flow. Scope-gated to server.allowed_hosts, throttled, bounded by
     max_endpoints. Credentials arrive per call and are never persisted."""
     _require_auth(authorization)
-    import role_crawl
+    from harness import role_crawl
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
                                     headers=r.get("headers") or {})
              for r in req.roles]
@@ -457,8 +457,8 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
     GET), or set `discover` to crawl base_url first. Returns per-endpoint
     outcomes plus the missing_authentication findings."""
     _require_auth(authorization)
-    import missing_auth_probe
-    from js_endpoint_extractor import CallShape
+    from harness import missing_auth_probe
+    from harness.js_endpoint_extractor import CallShape
 
     shapes: list[CallShape] = []
     for cs in req.call_shapes:
@@ -468,8 +468,8 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
     shapes.extend(CallShape("GET", p) for p in req.paths if p)
 
     if not shapes and req.discover:
-        import crawler
-        from run_context import RunContext, ScopePolicy
+        from harness import crawler
+        from harness.run_context import RunContext, ScopePolicy
         async with RunContext.create(
                 allowed_hosts=orchestrator.allowed_hosts,
                 gate_config=(orchestrator.config.get("validators", {}) or {}),
@@ -489,7 +489,7 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
     if not shapes:
         raise HTTPException(status_code=400, detail="no call_shapes, paths, or discoverable endpoints to probe")
 
-    from run_context import RunContext
+    from harness.run_context import RunContext
     sends_per_shape = 2 if req.send_garbage_token else 1
     async with RunContext.create(
             allowed_hosts=orchestrator.allowed_hosts,
@@ -617,7 +617,7 @@ async def get_settings(authorization: str | None = Header(default=None)):
     the default per-vulnerability retry budget. Reflects the live values, which
     a request may have changed since startup."""
     _require_auth(authorization)
-    import global_throttle
+    from harness import global_throttle
     p = orchestrator.retry_budget_policy
     return {
         "throttle": global_throttle.throttle.stats(),
@@ -656,7 +656,7 @@ async def update_settings(req: SettingsRequest, authorization: str | None = Head
     _require_auth(authorization)
     changed: dict = {}
     if req.throttle_rps is not None:
-        import global_throttle
+        from harness import global_throttle
         global_throttle.configure(max(0.0, float(req.throttle_rps)))
         changed["throttle"] = global_throttle.throttle.stats()
     if req.retry_budget:
@@ -727,7 +727,7 @@ async def scan_confidential(exchange: HttpExchange, authorization: str | None = 
     """Deterministic confidential-info scan (A4) of one response: secrets, PII,
     and internal-infra leakage, with every value REDACTED. Regex, no model."""
     _require_auth(authorization)
-    import confidential_info_detector
+    from harness import confidential_info_detector
     matches = confidential_info_detector.scan_response(exchange)
     findings = confidential_info_detector.findings_from_exchange(exchange)
     return {
@@ -768,7 +768,7 @@ async def tools_catalog(category: str = "", vulnerability_class: str = "",
     category. `vulnerability_class` -> the tools relevant to that class;
     `category` -> just that category's tools."""
     _require_auth(authorization)
-    import tool_catalog
+    from harness import tool_catalog
     if vulnerability_class:
         return {"tools": [t.to_dict() for t in tool_catalog.recommend_for(vulnerability_class, limit=20)]}
     grouped = tool_catalog.by_category()
@@ -791,7 +791,7 @@ async def tools_recommend(req: ToolRecommendRequest, authorization: str | None =
     for, why, and a command templated to the target -- the 'agent needs a tool,
     return it to the user' path."""
     _require_auth(authorization)
-    import tool_catalog
+    from harness import tool_catalog
     if req.findings:
         recs = tool_catalog.recommendations_for_findings(req.findings)
     elif req.vulnerability_class:
@@ -806,7 +806,7 @@ def _update_engagement(host: str, apply_fn) -> None:
     """Load the host's engagement snapshot, apply an ingest function, save it.
     Defensive: engagement is a convenience layer over the primary result, so a
     store hiccup here must never fail the endpoint that called it."""
-    import engagement
+    from harness import engagement
     try:
         st = engagement.EngagementState.from_dict(store.load_engagement(host) or {"host": host})
         apply_fn(st)
@@ -822,7 +822,7 @@ async def engagement_view(host: str, limit: int = 25, authorization: str | None 
     matrix, and findings so far -- the one picture the discrete capabilities feed.
     Empty until a crawl / analysis has populated it."""
     _require_auth(authorization)
-    import engagement
+    from harness import engagement
     snap = await __import__("asyncio").to_thread(store.load_engagement, host)
     if not snap:
         return {"host": host, "endpoint_count": 0, "worklist": [], "summary": {"host": host, "endpoint_count": 0}}
@@ -875,7 +875,7 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
     worklist. This is the closed loop the tester drives -- run it as a newly
     obtained identity and the new surface it can reach re-enters the ranking."""
     _require_auth(authorization)
-    import role_crawl, engagement
+    from harness import role_crawl, engagement
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")), headers=r.get("headers") or {})
              for r in req.roles]
     if not roles:
@@ -903,7 +903,7 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
 # (roadmap Phase 2) and is an explicit follow-up. Jobs live in-process.
 import uuid as _uuid
 import time as _time
-import run_manifest as _run_manifest
+import harness.run_manifest as _run_manifest
 
 _INVESTIGATE_JOBS: dict[str, dict] = {}
 
@@ -931,8 +931,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     _require_auth(authorization)
     if not req.base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
-    import role_crawl
-    from run_context import RunContext
+    from harness import role_crawl
+    from harness.run_context import RunContext
     from urllib.parse import urlsplit
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
                                     headers=r.get("headers") or {}, name=r.get("name"),
@@ -1043,7 +1043,7 @@ async def activity(since: int = 0, limit: int = 100, authorization: str | None =
     `dropped` count if you fell behind the buffer. `since=0` (default) returns a
     recent snapshot to prime the view."""
     _require_auth(authorization)
-    import activity_feed
+    from harness import activity_feed
     if since <= 0:
         return activity_feed.snapshot(limit=limit)
     return activity_feed.since(since)
@@ -1148,7 +1148,7 @@ async def list_suppressions(authorization: str | None = Header(default=None)):
 async def cache_stats(authorization: str | None = Header(default=None)):
     """Get cache statistics (hits, misses, hit rate, etc.)."""
     _require_auth(authorization)
-    import cache
+    from harness import cache
     stats = cache.get_cache().stats()
     return {
         "cache_enabled": cache.get_cache().is_enabled(),
@@ -1161,7 +1161,7 @@ async def cache_stats(authorization: str | None = Header(default=None)):
 async def cache_clear(authorization: str | None = Header(default=None)):
     """Clear all cached analysis results."""
     _require_auth(authorization)
-    import cache
+    from harness import cache
     cache.get_cache().clear()
     return {"status": "ok", "message": "Cache cleared"}
 
@@ -1170,7 +1170,7 @@ async def cache_clear(authorization: str | None = Header(default=None)):
 async def cache_enable(authorization: str | None = Header(default=None)):
     """Enable caching."""
     _require_auth(authorization)
-    import cache
+    from harness import cache
     cache.get_cache().set_enabled(True)
     return {"status": "ok", "cache_enabled": True}
 
@@ -1179,15 +1179,17 @@ async def cache_enable(authorization: str | None = Header(default=None)):
 async def cache_disable(authorization: str | None = Header(default=None)):
     """Disable caching."""
     _require_auth(authorization)
-    import cache
+    from harness import cache
     cache.get_cache().set_enabled(False)
     return {"status": "ok", "cache_enabled": False}
 
 
 if __name__ == "__main__":
     import uvicorn
+    # W-18: harness is now a package -- run as `python -m harness.server` (or
+    # `uvicorn harness.server:app`) from the repository root.
     uvicorn.run(
-        "server:app",
+        "harness.server:app",
         host=config["server"]["host"],
         port=config["server"]["port"],
         reload=False,

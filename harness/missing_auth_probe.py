@@ -43,10 +43,10 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import global_throttle
-from js_endpoint_extractor import CallShape
-from models import Finding
-from safety_gate import SafetyGate, get_default_gate
+from harness import global_throttle
+from harness.js_endpoint_extractor import CallShape
+from harness.models import Finding
+from harness.safety_gate import SafetyGate, get_default_gate
 
 log = logging.getLogger("harness.missing_auth_probe")
 
@@ -153,7 +153,7 @@ async def _send(method: str, url: str, headers: dict[str, str], timeout: float, 
                 run_context=None, session_ref: str | None = None) -> tuple[int | None, str]:
     try:
         if run_context is not None:
-            from run_context import TypedRequest
+            from harness.run_context import TypedRequest
             outcome = await run_context.executor().execute(
                 TypedRequest(method, url, headers=headers),
                 capability="missing_auth_probe", session_ref=session_ref)
@@ -271,7 +271,7 @@ async def probe(
         garb_headers["Authorization"] = _GARBAGE_TOKEN
         garbage_ref = None
         if run_context is not None:
-            from run_context import ScopePolicy
+            from harness.run_context import ScopePolicy
             garbage_ref = "missing-auth:garbage"
             run_context.sessions.register(
                 garbage_ref, garbage_ref, {"Authorization": _GARBAGE_TOKEN},

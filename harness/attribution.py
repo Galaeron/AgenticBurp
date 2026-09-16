@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import re
 
-import categories
-from recall_benchmark import confirmation_leg_of
+from harness import categories
+from harness.recall_benchmark import confirmation_leg_of
 
 # The class each confirmation leg is authoritative for -- the leg proved THIS
 # class, whatever the agent had labelled the finding.
@@ -114,7 +114,7 @@ def shape_consistent(finding_class, exchange) -> bool:
     # Reuse the orchestrator's own shape predicates so routing and this sanity
     # check never drift. Lazy import: orchestrator is already loaded at call time
     # and importing it at module top would be circular.
-    from orchestrator import (_accepts_xml, _has_url_param, _has_injectable_param,
+    from harness.orchestrator import (_accepts_xml, _has_url_param, _has_injectable_param,
                               _has_file_shape, _has_redirect_param)
     if canon in ("sqli", "command_injection", "ssti", "nosql", "xss"):
         return _has_injectable_param(exchange)

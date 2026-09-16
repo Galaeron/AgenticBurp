@@ -8,8 +8,8 @@ header value, a query value, or a resource id.
 import json
 import unittest
 
-from models import HttpExchange
-from feature_projection import project_exchange
+from harness.models import HttpExchange
+from harness.feature_projection import project_exchange
 
 
 class ProjectionSignalTests(unittest.TestCase):

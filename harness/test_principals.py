@@ -16,10 +16,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-import principals
-import store
-from principals import AuthzDecision, OwnershipFact, OwnershipLedger, Principal, Session
-from role_crawl import RoleSession
+from harness import principals
+from harness import store
+from harness.principals import AuthzDecision, OwnershipFact, OwnershipLedger, Principal, Session
+from harness.role_crawl import RoleSession
 
 # Principals for the matrix (tenant + declared permissions are operator facts).
 ALICE = Principal(id="alice", role="user", trust=1, tenant="A")
@@ -187,8 +187,8 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
     is forced to CONFIRMED so the OWNERSHIP gate is what's under test."""
 
     def setUp(self):
-        import identity_compare
-        import identity_headers
+        from harness import identity_compare
+        from harness import identity_headers
         self._ih = identity_headers.identities_for_host
         self._ev = identity_compare.evaluate
         # One DISTINCT other identity (bob); the captured source carries no auth.
@@ -204,24 +204,24 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
         identity_compare.evaluate = lambda *a, **k: _Ev()
 
     def tearDown(self):
-        import identity_compare
-        import identity_headers
+        from harness import identity_compare
+        from harness import identity_headers
         identity_headers.identities_for_host = self._ih
         identity_compare.evaluate = self._ev
 
     def _validator(self, ownership=None):
-        from validators.cross_identity_validator import CrossIdentityValidator
+        from harness.validators.cross_identity_validator import CrossIdentityValidator
         v = CrossIdentityValidator(allowed_hosts=["t.local"], ownership=ownership)
 
         async def _fake_probe(url, headers):
-            import identity_compare
+            from harness import identity_compare
             return identity_compare.Probe(200, "SECRET owner data 1234567890")  # substantive 2xx
 
         v._probe = _fake_probe
         return v
 
     def _run(self, v):
-        from models import Finding, HttpExchange
+        from harness.models import Finding, HttpExchange
         finding = Finding(vulnerability_class="idor", confidence=0.7, summary="s",
                           evidence="e", suggested_test="t", basis="derived")
         ex = HttpExchange(url="http://t.local/api/items/7", method="GET",
@@ -255,8 +255,8 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
         self.assertEqual(res.status, "confirmed")
 
     def test_authorized_principal_does_not_suppress_later_unauthorized_case(self):
-        from run_context import RunContext
-        from validators.cross_identity_validator import CrossIdentityValidator
+        from harness.run_context import RunContext
+        from harness.validators.cross_identity_validator import CrossIdentityValidator
         ctx = RunContext.create(run_id="ownership-run", allowed_hosts=["t.local"])
         origin = "http://t.local"
         ctx.sessions.register("bob-session", "bob", {"Cookie": "bob"},
@@ -276,7 +276,7 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
         seen = []
 
         async def _fake_probe(url, headers, session_ref=None):
-            import identity_compare
+            from harness import identity_compare
             seen.append(session_ref)
             return identity_compare.Probe(
                 401 if session_ref == "anonymous" else 200,
@@ -289,8 +289,8 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
         self.assertIn("carol-session", seen)
 
     def test_authoritative_declared_permission_survives_validator_adapter(self):
-        from run_context import RunContext
-        from validators.cross_identity_validator import CrossIdentityValidator
+        from harness.run_context import RunContext
+        from harness.validators.cross_identity_validator import CrossIdentityValidator
         url = "http://t.local/api/items/7"
         ctx = RunContext.create(run_id="permission-run", allowed_hosts=["t.local"])
         permitted = Principal(id="ops", role="admin", trust=3,
@@ -307,7 +307,7 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
         validator = CrossIdentityValidator(run_context=ctx, ownership=led)
 
         async def _fake_probe(url, headers, session_ref=None):
-            import identity_compare
+            from harness import identity_compare
             return identity_compare.Probe(
                 401 if session_ref == "anonymous" else 200,
                 "denied" if session_ref == "anonymous" else "SECRET owner data 1234567890")

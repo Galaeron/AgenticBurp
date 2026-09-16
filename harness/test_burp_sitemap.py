@@ -4,8 +4,8 @@ URL param) preserved -- the whole reason to import a human's browsing."""
 import base64
 import unittest
 
-import burp_sitemap
-import engagement
+from harness import burp_sitemap
+from harness import engagement
 
 
 def _item_xml(method, path, request_raw, response_raw, *, host="target.test",
@@ -148,7 +148,7 @@ class ExchangeTests(unittest.TestCase):
             allowed_hosts=["target.test"])
         self.assertEqual(len(exs), 1)
         # the deser leg's own sink detector must see the pickle cookie
-        from validators.deserialization_oob_validator import DeserializationOobValidator
+        from harness.validators.deserialization_oob_validator import DeserializationOobValidator
         sinks = DeserializationOobValidator()._sink_candidates(exs[0])
         self.assertTrue(any(loc == "cookie" for loc, _ in sinks),
                         "imported pickle cookie was not recognised as a deser sink")

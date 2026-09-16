@@ -10,10 +10,10 @@ had never run against anything, mocked or real, before this file existed.
 import unittest
 from unittest.mock import AsyncMock
 
-import coordinator
-from coordinator import Coordinator
-from models import HttpExchange
-from ollama_client import OllamaError, OllamaResult
+from harness import coordinator
+from harness.coordinator import Coordinator
+from harness.models import HttpExchange
+from harness.ollama_client import OllamaError, OllamaResult
 
 
 def _exchange(url="https://example.test/about", method="GET"):

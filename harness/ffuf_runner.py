@@ -19,8 +19,8 @@ import json
 import logging
 from dataclasses import dataclass, field
 
-import tool_runner
-from api_surface_discovery import Route
+from harness import tool_runner
+from harness.api_surface_discovery import Route
 
 logger = logging.getLogger(__name__)
 

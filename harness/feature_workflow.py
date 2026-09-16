@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlencode
 
-from models import HttpExchange
+from harness.models import HttpExchange
 
 log = logging.getLogger("harness.feature_workflow")
 
@@ -342,9 +342,9 @@ def default_fetch_fn(allowed_hosts: list[str] | None = None, *, timeout: float =
     the same allow_mutating_replay authorisation as every other active leg; GETs
     use a plain client. Returned as a closure so `crawl_features` stays
     network-agnostic and fully unit-testable with an in-memory double."""
-    import global_throttle
+    from harness import global_throttle
     import httpx
-    from safety_gate import GatedAsyncClient, get_default_gate
+    from harness.safety_gate import GatedAsyncClient, get_default_gate
 
     _gate = gate or get_default_gate()
 
@@ -366,7 +366,7 @@ def run_context_fetch_fn(run_context, session_ref: str | None, *,
                          validator_name: str = "feature_workflow"):
     """Production fetch adapter backed by one invocation's Executor."""
     from types import SimpleNamespace
-    from run_context import TypedRequest
+    from harness.run_context import TypedRequest
 
     async def _fetch(method, url, req_headers, body):
         safe_headers = {k: v for k, v in (req_headers or {}).items()

@@ -6,10 +6,10 @@ import unittest
 from urllib.parse import urlsplit, parse_qsl
 from unittest.mock import patch
 
-from models import Finding, HttpExchange
-from categories import canonicalize
-from validators.path_traversal_validator import PathTraversalValidator
-from validators.open_redirect_validator import OpenRedirectValidator, _SENTINEL_HOST
+from harness.models import Finding, HttpExchange
+from harness.categories import canonicalize
+from harness.validators.path_traversal_validator import PathTraversalValidator
+from harness.validators.open_redirect_validator import OpenRedirectValidator, _SENTINEL_HOST
 
 
 def _f(vc):
@@ -26,12 +26,12 @@ class _Resp:
 
 class _GateActive(unittest.TestCase):
     def setUp(self):
-        import safety_gate
+        from harness import safety_gate
         safety_gate.reset_default_gate()
         safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
 
     def tearDown(self):
-        import safety_gate
+        from harness import safety_gate
         safety_gate.reset_default_gate()
 
 

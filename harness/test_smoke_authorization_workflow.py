@@ -21,15 +21,15 @@ from pathlib import Path
 
 import httpx
 
-import engagement
-import evidence
-import identity_headers
-import principals
-import store
-from models import Finding, HttpExchange
-from run_context import RunContext
-from validators.cross_identity_validator import CrossIdentityValidator
-from testing_fixtures.authorization_workflow import AuthorizationWorkflowFixture
+from harness import engagement
+from harness import evidence
+from harness import identity_headers
+from harness import principals
+from harness import store
+from harness.models import Finding, HttpExchange
+from harness.run_context import RunContext
+from harness.validators.cross_identity_validator import CrossIdentityValidator
+from harness.testing_fixtures.authorization_workflow import AuthorizationWorkflowFixture
 
 HOST = "127.0.0.1"
 

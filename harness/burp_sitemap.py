@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
-from models import HttpExchange
+from harness.models import HttpExchange
 
 log = logging.getLogger("harness.burp_sitemap")
 
@@ -313,7 +313,7 @@ def seed_engagement_state(state, exchanges: list[HttpExchange]) -> int:
     confirmation legs need, so callers should ALSO run these exchanges through
     analyze()/the precondition legs; this just makes the surface visible for
     prioritisation."""
-    import engagement as eng
+    import harness.engagement as eng
     n = 0
     for ex in exchanges or []:
         path = eng.normalize_path(ex.url)

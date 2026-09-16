@@ -24,7 +24,7 @@ import httpx
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.header_injection")
 
@@ -78,8 +78,8 @@ class HeaderInjectionValidator(Validator):
         return "local_tool"
 
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -181,7 +181,7 @@ class HeaderInjectionValidator(Validator):
         try:
             if self.run_context is not None:
                 from types import SimpleNamespace
-                from run_context import TypedRequest
+                from harness.run_context import TypedRequest
                 outcome = await self.run_context.executor().execute(
                     TypedRequest("GET", probe_url, headers={"User-Agent": self.user_agent}),
                     capability=self.get_name(), max_redirects=self.max_redirects)
@@ -193,7 +193,7 @@ class HeaderInjectionValidator(Validator):
                 async with httpx.AsyncClient(
                     timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
                 ) as client:
-                    import global_throttle
+                    from harness import global_throttle
                     await global_throttle.acquire()
                     response = await client.request(
                         "GET", probe_url,  # only query params are tested; never replay the captured method

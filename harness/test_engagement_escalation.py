@@ -3,9 +3,9 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-import global_throttle
-import task_graph
-from engagement import EngagementState
+from harness import global_throttle
+from harness import task_graph
+from harness.engagement import EngagementState
 
 
 class _Resp:
@@ -31,7 +31,7 @@ class _FakeCrawlResult:
 class AutoEscalateGuardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import server as server_module
+        import harness.server as server_module
         cls.orch = server_module.orchestrator
 
     def setUp(self):
@@ -49,7 +49,7 @@ class AutoEscalateGuardTests(unittest.TestCase):
         async def fake_request(self, method, url, headers=None, **kw):  # W-16: transport uses .request
             return _Resp(verify_status)
 
-        with patch("role_crawl.crawl_roles", fake_crawl), \
+        with patch("harness.role_crawl.crawl_roles", fake_crawl), \
              patch("httpx.AsyncClient.request", fake_request):
             asyncio.run(self.orch._auto_escalate("shop.test", "http://shop.test/login", caps, st))
 
@@ -70,7 +70,7 @@ class AutoEscalateGuardTests(unittest.TestCase):
     def test_already_escalated_identity_deduped(self):
         st = EngagementState(host="shop.test")
         # pre-create + complete the recrawl task for this identity
-        import engagement
+        from harness import engagement
         cap = _cred_cap()
         st.apply_capabilities([cap], cap["source_url"])
         tid = task_graph.make_id("recrawl_as_derived",

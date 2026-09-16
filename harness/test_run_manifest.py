@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from run_manifest import RunManifest, config_fingerprint, redact
+from harness.run_manifest import RunManifest, config_fingerprint, redact
 
 
 class RunManifestTests(unittest.TestCase):

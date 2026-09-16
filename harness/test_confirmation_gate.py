@@ -1,6 +1,6 @@
 import unittest
-from models import AgentReport, Finding, ValidationReport
-from confirmation_gate import is_confirmable_class, apply_confirmation_suppression, leg_tier
+from harness.models import AgentReport, Finding, ValidationReport
+from harness.confirmation_gate import is_confirmable_class, apply_confirmation_suppression, leg_tier
 
 
 def _finding(vc, severity="high", confidence=0.85, confirmed=False):
@@ -167,7 +167,7 @@ class TestLegAwareThreeState(unittest.TestCase):
     def test_explicit_override_still_promotes_provisional_subclass(self):
         """The Phase-2 promotion seam must still work: an explicit override that
         names dom_xss promotes it to live (R09 must not break deliberate promotion)."""
-        from confirmation_gate import LIVE_VERIFIED_MARKERS
+        from harness.confirmation_gate import LIVE_VERIFIED_MARKERS
         self.assertEqual(leg_tier("dom_xss"), "provisional")
         promoted = LIVE_VERIFIED_MARKERS | {"dom_xss"}
         self.assertEqual(leg_tier("dom_xss", live_verified_markers=promoted), "live")
@@ -208,7 +208,7 @@ class TestLegAwareThreeState(unittest.TestCase):
     def test_override_promotes_a_provisional_leg_to_refuted(self):
         # rate_limit is still provisional -> UNPROVEN (medium); an operator passes
         # it in the live set to promote to REFUTED (low).
-        from confirmation_gate import LIVE_VERIFIED_MARKERS
+        from harness.confirmation_gate import LIVE_VERIFIED_MARKERS
         base = _apply(_finding("rate_limit", severity="high"))
         self.assertEqual(base.severity, "medium")  # provisional today
         promoted = LIVE_VERIFIED_MARKERS | {"rate_limit"}

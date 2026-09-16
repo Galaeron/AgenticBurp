@@ -28,7 +28,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from models import HttpExchange, AgentReport
+    from harness.models import HttpExchange, AgentReport
 
 # Response statuses that constitute a denial -- direct evidence the access
 # control under test actually blocked this request. 404 is deliberately

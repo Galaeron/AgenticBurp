@@ -31,10 +31,10 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import crawler
-import global_throttle
-import missing_auth_probe as map_
-from models import Finding, HttpExchange
+from harness import crawler
+from harness import global_throttle
+import harness.missing_auth_probe as map_
+from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.role_crawl")
 
@@ -130,7 +130,7 @@ class RoleSession:
         for anonymous, never the current cookie/token); an id that could only be
         derived from a credential hash is flagged `provisional` so callers do not
         treat it as an authoritative account or merge/split people on it."""
-        import principals
+        from harness import principals
         provisional = not self.name and bool(self.headers)  # id came from a credential hash
         trust = principals.TRUST_BY_ROLE.get((self.role or "").lower(), 1)
         return principals.Principal(
@@ -203,7 +203,7 @@ async def _probe(method: str, url: str, headers: dict, timeout: float, *,
         method = "GET"
     try:
         if run_context is not None:
-            from run_context import TypedRequest
+            from harness.run_context import TypedRequest
             outcome = await run_context.executor().execute(
                 TypedRequest(method=method, url=url), capability="role_crawl",
                 session_ref=session_ref)
@@ -274,7 +274,7 @@ async def crawl_roles(
     # per-role ACCESS is the probe step below. Concrete ids are templated to {id}.
     if active_discovery:
         try:
-            from api_surface_discovery import SurfaceDiscovery
+            from harness.api_surface_discovery import SurfaceDiscovery
             # Sweep discovery AS each distinct-feature authenticated role, not just
             # the single highest-trust one: role feature-sets differ (an agent-only
             # integrations/webhook endpoint is 404/403 for admin), so a one-identity

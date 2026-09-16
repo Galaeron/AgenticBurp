@@ -82,7 +82,7 @@ class Provenance:
         fp = config_fingerprint
         if not fp and config is not None:
             try:
-                import config_schema
+                from harness import config_schema
                 fp = config_schema.config_fingerprint(config)
             except Exception:
                 fp = ""

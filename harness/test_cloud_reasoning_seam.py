@@ -5,8 +5,8 @@ when the seam is toggled on AND a cloud_model is configured -- default off, sinc
 enabling it sends real exchange content off-host."""
 import unittest
 
-import coordinator
-import orchestrator as orch_mod
+from harness import coordinator
+import harness.orchestrator as orch_mod
 
 
 def _cfg(cloud_reasoning=False, cloud_model="cloud-frontier", model="qwen3:8b"):

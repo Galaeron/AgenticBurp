@@ -15,7 +15,7 @@ import types
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import browser_driver
+from harness import browser_driver
 
 
 def _fake_playwright():
@@ -94,8 +94,8 @@ class FactoryTest(unittest.TestCase):
 
 class ValidatorThreadingTest(unittest.TestCase):
     def test_validator_threads_cdp_endpoint_to_driver(self):
-        from models import Finding, HttpExchange
-        from validators.browser_xss_validator import BrowserXssValidator
+        from harness.models import Finding, HttpExchange
+        from harness.validators.browser_xss_validator import BrowserXssValidator
 
         v = BrowserXssValidator(allowed_hosts=["localhost"], cdp_endpoint="ws://c:3000")
         captured = {}
@@ -104,7 +104,7 @@ class ValidatorThreadingTest(unittest.TestCase):
             captured["cdp"] = cdp_endpoint
             return None  # -> validator returns "skipped"; we only assert threading
 
-        import browser_driver as bd
+        import harness.browser_driver as bd
         with patch.object(bd, "default_driver", side_effect=fake_default_driver), \
              patch.object(bd, "available", return_value=(False, "unavailable")):
             f = Finding(vulnerability_class="xss", confidence=0.5, summary="x",
@@ -120,7 +120,7 @@ class ExtraHeadersAndCookiesTests(unittest.TestCase):
     """R25: splitting an identity's headers into Playwright's two channels."""
 
     def test_authorization_goes_to_extra_headers_cookie_to_cookies(self):
-        from browser_driver import _extra_headers_and_cookies
+        from harness.browser_driver import _extra_headers_and_cookies
         extra, cookies = _extra_headers_and_cookies(
             {"Authorization": "Bearer alice", "Cookie": "session=abc; theme=dark"},
             "https://shop.test/x")
@@ -130,7 +130,7 @@ class ExtraHeadersAndCookiesTests(unittest.TestCase):
         self.assertTrue(all(c["domain"] == "shop.test" for c in cookies))
 
     def test_none_headers_yield_anonymous(self):
-        from browser_driver import _extra_headers_and_cookies
+        from harness.browser_driver import _extra_headers_and_cookies
         extra, cookies = _extra_headers_and_cookies(None, "https://shop.test/x")
         self.assertIsNone(extra)
         self.assertEqual(cookies, [])

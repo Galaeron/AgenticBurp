@@ -7,10 +7,10 @@ import json
 import unittest
 from unittest.mock import patch
 
-from models import Finding, HttpExchange
-from validators.command_injection_validator import CommandInjectionValidator
-from validators.ssti_validator import SstiValidator, _PRODUCT, _EXPR
-from validators.injection_targets import param_targets
+from harness.models import Finding, HttpExchange
+from harness.validators.command_injection_validator import CommandInjectionValidator
+from harness.validators.ssti_validator import SstiValidator, _PRODUCT, _EXPR
+from harness.validators.injection_targets import param_targets
 
 
 def _f(vc):
@@ -35,12 +35,12 @@ async def _noop_request(self, method, url, content=None, headers=None, **kw):
 
 class _GateAllowsMutating(unittest.TestCase):
     def setUp(self):
-        import safety_gate
+        from harness import safety_gate
         safety_gate.reset_default_gate()
         safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
 
     def tearDown(self):
-        import safety_gate
+        from harness import safety_gate
         safety_gate.reset_default_gate()
 
 

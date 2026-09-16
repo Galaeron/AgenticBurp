@@ -3,7 +3,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-import tool_runner as tr
+import harness.tool_runner as tr
 
 
 class LocalhostRewriteTests(unittest.TestCase):

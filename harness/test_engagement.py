@@ -1,9 +1,9 @@
 """Tests for the engagement spine (shared surface model + fused rating)."""
 import unittest
 
-import engagement
-from engagement import EngagementState, SurfaceEndpoint, normalize_path, template_from_exchange
-from models import HttpExchange
+from harness import engagement
+from harness.engagement import EngagementState, SurfaceEndpoint, normalize_path, template_from_exchange
+from harness.models import HttpExchange
 
 
 class NormalizeTests(unittest.TestCase):
@@ -240,7 +240,8 @@ class BusinessLogicTests(unittest.TestCase):
 
 class StoreAndEndpointTests(unittest.TestCase):
     def setUp(self):
-        import tempfile, store
+        import tempfile
+        from harness import store
         from pathlib import Path
         self.tmp = tempfile.TemporaryDirectory()
         self.orig = store._DB_PATH
@@ -262,7 +263,7 @@ class StoreAndEndpointTests(unittest.TestCase):
         self.assertIsNone(self.store.load_engagement("nope.test"))
 
     def test_engagement_endpoint(self):
-        import server as server_module
+        import harness.server as server_module
         from fastapi.testclient import TestClient
         client = TestClient(server_module.app, base_url="http://localhost")
         st = EngagementState(host="shop.test")

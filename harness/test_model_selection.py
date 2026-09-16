@@ -3,7 +3,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from ollama_client import OllamaClient
+from harness.ollama_client import OllamaClient
 
 
 class ListModelsClientTests(unittest.TestCase):
@@ -45,7 +45,7 @@ class OrchestratorModelSelectionTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import server as server_module
+        import harness.server as server_module
         cls.orch = server_module.orchestrator
 
     def test_set_coordinator_model(self):
@@ -88,7 +88,7 @@ class OrchestratorModelSelectionTests(unittest.TestCase):
 
 class ModelEndpointTests(unittest.TestCase):
     def setUp(self):
-        import server as server_module
+        import harness.server as server_module
         self.server_module = server_module
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")
@@ -124,7 +124,7 @@ class ModelEndpointTests(unittest.TestCase):
         self.assertIn("retry_budget", r.json())
 
     def test_update_settings_throttle_and_retry(self):
-        import global_throttle
+        from harness import global_throttle
         orig_policy = self.server_module.orchestrator.retry_budget_policy
         try:
             r = self.client.post("/settings", json={"throttle_rps": 5.0,

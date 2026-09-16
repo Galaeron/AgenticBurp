@@ -37,13 +37,13 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import global_throttle
-from models import Finding, HttpExchange
-from safety_gate import get_default_gate
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import get_default_gate
 from .base import Validator, ValidationResult
 # reuse the sequence leg's authority-field machinery so routing/detection agree
 from .sequence_validator import _PRIV_FIELDS, _AUTHORITY_RE, _walk, _is_priv, _present_privileged
-from validators.sqlmap import _looks_like_json, _content_type_of
+from harness.validators.sqlmap import _looks_like_json, _content_type_of
 
 log = logging.getLogger("harness.validators.toctou")
 
@@ -91,7 +91,7 @@ class ToctouValidator(Validator):
 
     async def _get_json(self, url, headers):
         if self.run_context is not None:
-            from run_context import TypedRequest
+            from harness.run_context import TypedRequest
             from .transport import bind_session
             session_ref, request_headers = bind_session(self.run_context, headers)
             result = await self.run_context.executor().execute(
@@ -179,7 +179,7 @@ class ToctouValidator(Validator):
             try:
                 if self.run_context is not None:
                     from types import SimpleNamespace
-                    from run_context import TypedRequest
+                    from harness.run_context import TypedRequest
                     from .transport import bind_session
                     session_ref, request_headers = bind_session(self.run_context, headers)
                     result = await self.run_context.executor().execute(

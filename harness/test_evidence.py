@@ -14,9 +14,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import evidence
-import store
-from evidence import ExchangeArtifact, ProofLedger, ProofRecord, TestCaseRef, Verdict
+from harness import evidence
+from harness import store
+from harness.evidence import ExchangeArtifact, ProofLedger, ProofRecord, TestCaseRef, Verdict
 
 
 def _case(**over) -> TestCaseRef:
@@ -232,7 +232,7 @@ class _FakeValidator:
     async def validate(self, finding, exchange):
         if self._raise:
             raise RuntimeError("boom")
-        from validators.base import ValidationResult
+        from harness.validators.base import ValidationResult
         return ValidationResult(validator=self.name, status=self._status,
                                 finding_class=finding.vulnerability_class,
                                 confidence=0.9 if self._confirmed else 0.2,
@@ -270,17 +270,17 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _exchange(self):
-        from models import HttpExchange
+        from harness.models import HttpExchange
         return HttpExchange(url="http://t.local/api/item?id=1", method="GET")
 
     def _reports(self, *classes):
-        from models import AgentReport, Finding
+        from harness.models import AgentReport, Finding
         findings = [Finding(vulnerability_class=c, confidence=0.7, summary="s", evidence="e",
                             suggested_test="t", basis="derived") for c in classes]
         return [AgentReport(agent="a", model="m", findings=findings)]
 
     def _run(self, reports, exchange, registry):
-        import orchestrator
+        from harness import orchestrator
         orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
         orch.validator_registry = registry
         return asyncio.run(orch._validate_findings(exchange, reports))
@@ -317,7 +317,7 @@ class ValidateFindingsWiringTests(unittest.TestCase):
 
     def test_persistence_rejection_is_surfaced_and_not_returned_as_durable(self):
         reg = _FakeRegistry({"sqli": _FakeValidator("sqlmap", "confirmed", True)})
-        with patch("store.persist_proof_record", return_value=(False, "disk_unavailable")):
+        with patch("harness.store.persist_proof_record", return_value=(False, "disk_unavailable")):
             vreports, proofs = self._run(self._reports("sqli"), self._exchange(), reg)
         self.assertEqual(proofs, [])
         self.assertEqual(vreports[0].status, "error")
@@ -331,7 +331,7 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         self.assertEqual(len({p["case"]["case_id"] for p in proofs}), 2)
 
     def test_same_class_findings_keep_exact_outcomes(self):
-        from models import AgentReport, Finding
+        from harness.models import AgentReport, Finding
         a = Finding(vulnerability_class="sqli", confidence=0.7, summary="confirmed-case",
                     evidence="parameter id", suggested_test="t", basis="derived",
                     parameter_location="query", parameter_name="id")
@@ -348,7 +348,7 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         self.assertEqual([p["verdict"] for p in proofs], ["confirmed", "inconclusive"])
 
     def test_principal_and_request_variant_are_case_coordinates(self):
-        from models import AgentReport, Finding
+        from harness.models import AgentReport, Finding
         findings = [
             Finding(vulnerability_class="idor", confidence=0.7, summary="confirmed-case",
                     evidence="e", suggested_test="t", basis="derived",
@@ -381,9 +381,9 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         self.assertEqual((vreports, proofs), ([], []))
 
     def test_back_to_back_invocations_keep_distinct_proof_namespaces(self):
-        from run_context import RunContext
+        from harness.run_context import RunContext
         reg = _FakeRegistry({"sqli": _FakeValidator("sqlmap", "confirmed", True)})
-        import orchestrator
+        from harness import orchestrator
         orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
         orch.validator_registry = reg
 
@@ -402,8 +402,8 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         self.assertNotEqual(first["case"]["case_id"], second["case"]["case_id"])
 
     def test_overlapping_invocations_do_not_mutate_orchestrator_run_id(self):
-        from run_context import RunContext
-        import orchestrator
+        from harness.run_context import RunContext
+        from harness import orchestrator
         orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
         orch.validator_registry = _FakeRegistry(
             {"sqli": _FakeValidator("sqlmap", "confirmed", True)})
@@ -417,7 +417,7 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         async def scenario():
             return await asyncio.gather(one("overlap-a"), one("overlap-b"))
 
-        with patch("store.persist_proof_record", return_value=(True, "")):
+        with patch("harness.store.persist_proof_record", return_value=(True, "")):
             observed = asyncio.run(scenario())
         self.assertEqual(set(observed), {"overlap-a", "overlap-b"})
         self.assertFalse(hasattr(orch, "run_id"))

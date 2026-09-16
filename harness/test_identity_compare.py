@@ -1,6 +1,6 @@
 import unittest
 
-from identity_compare import Probe, Verdict, MATCH_THRESHOLD, evaluate, similarity
+from harness.identity_compare import Probe, Verdict, MATCH_THRESHOLD, evaluate, similarity
 
 
 class IdentityCompareLogicTests(unittest.TestCase):

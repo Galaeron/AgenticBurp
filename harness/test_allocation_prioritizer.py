@@ -3,9 +3,9 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock
 
-import allocation_prioritizer as ap
-from ollama_client import OllamaError
-from resource_governor import AllocationCandidate
+import harness.allocation_prioritizer as ap
+from harness.ollama_client import OllamaError
+from harness.resource_governor import AllocationCandidate
 
 
 def _c(id, vc="idor", sev="high", conf=0.5, url="https://t.test/api/users/42"):

@@ -3,8 +3,8 @@ import socketserver
 import threading
 import unittest
 
-from run_context import RunContext, ScopePolicy
-from validators.websocket_validator import WebsocketValidator
+from harness.run_context import RunContext, ScopePolicy
+from harness.validators.websocket_validator import WebsocketValidator
 
 
 class _HandshakeHandler(socketserver.BaseRequestHandler):

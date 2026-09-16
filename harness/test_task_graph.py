@@ -1,8 +1,8 @@
 """Tests for the penetration task graph (VulnBot-style dependency DAG)."""
 import unittest
 
-import task_graph
-from task_graph import TaskGraph, READY, BLOCKED, DONE, FAILED, SKIPPED
+from harness import task_graph
+from harness.task_graph import TaskGraph, READY, BLOCKED, DONE, FAILED, SKIPPED
 
 
 class TaskGraphTests(unittest.TestCase):
@@ -91,7 +91,7 @@ class TaskGraphTests(unittest.TestCase):
         self.assertEqual(g.tasks["analyze:x"].status, READY)
 
     def test_optional_round_trips(self):
-        from task_graph import Task
+        from harness.task_graph import Task
         t = Task(id="recon:x", kind="recon", target="x", optional=True)
         self.assertTrue(Task.from_dict(t.to_dict()).optional)
 

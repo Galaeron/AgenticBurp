@@ -28,7 +28,7 @@ import httpx
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.web_cache_poisoning")
 
@@ -88,8 +88,8 @@ class WebCachePoisoningValidator(Validator):
         return "local_tool"
 
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -175,7 +175,7 @@ class WebCachePoisoningValidator(Validator):
         headers.setdefault("User-Agent", self.user_agent)
         try:
             if self.run_context is not None:
-                from run_context import TypedRequest
+                from harness.run_context import TypedRequest
                 outcome = await self.run_context.executor().execute(
                     TypedRequest(method, url, headers=headers),
                     capability=self.get_name(), max_redirects=self.max_redirects)
@@ -187,7 +187,7 @@ class WebCachePoisoningValidator(Validator):
             async with httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
             ) as client:
-                import global_throttle
+                from harness import global_throttle
                 await global_throttle.acquire()
                 return await client.request(method, url, headers=headers)
         except Exception as e:

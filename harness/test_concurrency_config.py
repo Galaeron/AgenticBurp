@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from orchestrator import Orchestrator, bounded_gather
+from harness.orchestrator import Orchestrator, bounded_gather
 
 _HARNESS = Path(__file__).resolve().parent
 

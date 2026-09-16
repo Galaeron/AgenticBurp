@@ -3,9 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import store
-import knowledge
-from models import HttpExchange
+from harness import store
+from harness import knowledge
+from harness.models import HttpExchange
 
 
 def _ex(url="https://shop.test/rest/products/search?q=1", body=""):
@@ -68,7 +68,7 @@ class KnowledgeEndpointTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.orig = store._DB_PATH
         store._DB_PATH = Path(self.tmp.name) / "t.db"
-        import server as server_module
+        import harness.server as server_module
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")
 

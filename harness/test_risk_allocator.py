@@ -1,5 +1,5 @@
 import unittest
-from risk_allocator import RiskScore, rank, allocate_retry_budget
+from harness.risk_allocator import RiskScore, rank, allocate_retry_budget
 
 
 class RiskScoreTests(unittest.TestCase):

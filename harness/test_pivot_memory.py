@@ -5,9 +5,9 @@ import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import store
-import pivot_memory
-from models import Finding, HttpExchange
+from harness import store
+from harness import pivot_memory
+from harness.models import Finding, HttpExchange
 
 
 @dataclass

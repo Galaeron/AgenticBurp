@@ -17,8 +17,8 @@ from unittest.mock import MagicMock
 
 import yaml
 
-from orchestrator import Orchestrator
-from models import AgentReport, Finding, HttpExchange
+from harness.orchestrator import Orchestrator
+from harness.models import AgentReport, Finding, HttpExchange
 
 _HARNESS = Path(__file__).resolve().parent
 

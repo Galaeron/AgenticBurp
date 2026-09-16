@@ -1,6 +1,6 @@
 """Tests for JS/HTML endpoint extraction (sitemap population)."""
 import unittest
-from js_endpoint_extractor import extract_endpoints, extract_call_shapes
+from harness.js_endpoint_extractor import extract_endpoints, extract_call_shapes
 
 
 class JsEndpointExtractorTests(unittest.TestCase):

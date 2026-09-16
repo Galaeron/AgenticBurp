@@ -1,9 +1,9 @@
 import asyncio
 import unittest
 
-from api_surface_discovery import SurfaceDiscovery, _is_not_found, _paths_from_spec
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
+from harness.api_surface_discovery import SurfaceDiscovery, _is_not_found, _paths_from_spec
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
 
 # Flask/Werkzeug wraps an unknown route as a 500 carrying this marker; the oracle
 # must read that as "route does not exist" just like a bare 404.
@@ -406,8 +406,8 @@ class FfufIntegrationTests(unittest.TestCase):
         """When ffuf is available, its routes appear in the result tagged 'ffuf'."""
         import json as _json
         from unittest.mock import patch
-        from ffuf_runner import FfufResult
-        from api_surface_discovery import Route as R
+        from harness.ffuf_runner import FfufResult
+        from harness.api_surface_discovery import Route as R
 
         ffuf_routes = [R(path="/api/login", status=200, length=50, source="ffuf"),
                        R(path="/api/secret", status=403, length=10, source="ffuf")]
@@ -418,8 +418,8 @@ class FfufIntegrationTests(unittest.TestCase):
                               prefixes=["/api/"], collections=[], nouns=["login"],
                               actions=[], sensitive_files=[])
 
-        with patch("ffuf_runner.ffuf_available", return_value=(True, "ok")), \
-             patch("ffuf_runner.ffuf_discover", return_value=mock_result):
+        with patch("harness.ffuf_runner.ffuf_available", return_value=(True, "ok")), \
+             patch("harness.ffuf_runner.ffuf_discover", return_value=mock_result):
             res = _run(disc)
 
         self.assertIn("/api/login", res.paths())
@@ -436,7 +436,7 @@ class FfufIntegrationTests(unittest.TestCase):
                               prefixes=["/api/"], collections=[], nouns=["health"],
                               actions=[], sensitive_files=[])
 
-        with patch("ffuf_runner.ffuf_available", return_value=(False, "no docker")):
+        with patch("harness.ffuf_runner.ffuf_available", return_value=(False, "no docker")):
             res = _run(disc)
 
         self.assertIn("/api/health", res.paths())
@@ -452,7 +452,7 @@ class FfufIntegrationTests(unittest.TestCase):
                               actions=[], sensitive_files=[])
         disc.use_ffuf = False
 
-        with patch("ffuf_runner.ffuf_available") as mock_avail:
+        with patch("harness.ffuf_runner.ffuf_available") as mock_avail:
             res = _run(disc)
             mock_avail.assert_not_called()
 
@@ -461,8 +461,8 @@ class FfufIntegrationTests(unittest.TestCase):
     def test_ffuf_routes_not_duplicated_by_python_sweep(self):
         """A path found by ffuf isn't re-probed by the Python wordlist sweep."""
         from unittest.mock import patch
-        from ffuf_runner import FfufResult
-        from api_surface_discovery import Route as R
+        from harness.ffuf_runner import FfufResult
+        from harness.api_surface_discovery import Route as R
 
         ffuf_routes = [R(path="/api/login", status=200, length=50, source="ffuf")]
         mock_result = FfufResult(routes=ffuf_routes, returncode=0)
@@ -479,8 +479,8 @@ class FfufIntegrationTests(unittest.TestCase):
                          prefixes=["/api/"], collections=[], nouns=["login"],
                          actions=[], sensitive_files=[])
 
-        with patch("ffuf_runner.ffuf_available", return_value=(True, "ok")), \
-             patch("ffuf_runner.ffuf_discover", return_value=mock_result):
+        with patch("harness.ffuf_runner.ffuf_available", return_value=(True, "ok")), \
+             patch("harness.ffuf_runner.ffuf_discover", return_value=mock_result):
             res = _run(disc)
 
         login_route = next(r for r in res.routes if r.path == "/api/login")

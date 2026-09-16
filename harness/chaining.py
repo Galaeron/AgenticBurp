@@ -1,8 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from models import Finding
-from categories import canonicalize, all_known_phrases
+from harness.models import Finding
+from harness.categories import canonicalize, all_known_phrases
 import re
 
 # Sorted longest-first so a substring match prefers the most specific
@@ -480,7 +480,7 @@ def detect(host_findings: list[dict]) -> list[Finding]:
         # (basis assumed/recalled) inherits that input's uncertainty -- possibly a
         # mislabel -- so tag it speculative rather than presenting it as a clean
         # rule match. Confirmed-or-observed inputs keep the standard confidence.
-        import attribution
+        from harness import attribution
         speculative = [f for f in (a, b) if attribution.chain_input_speculative(f)]
         is_speculative = bool(speculative)
         spec_note = ""

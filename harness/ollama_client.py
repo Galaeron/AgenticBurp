@@ -5,10 +5,10 @@ import re
 import httpx
 from dataclasses import dataclass
 
-import prompt_validator
-import circuit_breaker
-import rate_limiter
-import audit_logger
+from harness import prompt_validator
+from harness import circuit_breaker
+from harness import rate_limiter
+from harness import audit_logger
 
 log = logging.getLogger("harness.ollama_client")
 

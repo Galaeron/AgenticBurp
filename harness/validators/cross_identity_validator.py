@@ -33,10 +33,10 @@ from urllib.parse import urlparse, parse_qs
 
 import httpx
 
-import access_control_gate
-import identity_compare
-import identity_headers
-from models import Finding, HttpExchange
+from harness import access_control_gate
+from harness import identity_compare
+from harness import identity_headers
+from harness.models import Finding, HttpExchange
 from .base import Validator, ValidationResult
 
 # A path segment that looks like an OBJECT IDENTIFIER (the thing an IDOR swaps):
@@ -212,7 +212,7 @@ class CrossIdentityValidator(Validator):
         self.run_context = run_context
 
     def _object_ref(self, url: str) -> str:
-        import principals
+        from harness import principals
         run_id = self.run_context.run_id if self.run_context is not None else ""
         return principals.object_reference(url, run_id=run_id)
 
@@ -228,7 +228,7 @@ class CrossIdentityValidator(Validator):
         redirects re-checked per hop); a policy-declined send is reported as
         'not reached' (status 0), never a crash."""
         if self.run_context is not None:
-            from run_context import TypedRequest
+            from harness.run_context import TypedRequest
             out = await self.run_context.executor().execute(
                 TypedRequest("GET", url, headers=dict(headers or {})),
                 capability=self.name, session_ref=session_ref)
@@ -237,7 +237,7 @@ class CrossIdentityValidator(Validator):
             if not out.executed:   # out_of_scope / blocked / budget / cancelled -> not reached
                 return identity_compare.Probe(0, "")
             return identity_compare.Probe(out.status or 0, out.body or "")
-        import global_throttle
+        from harness import global_throttle
         await global_throttle.acquire()
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
             resp = await client.get(url, headers=headers or None)
@@ -429,7 +429,7 @@ class CrossIdentityValidator(Validator):
                 # a confirmation. UNKNOWN ownership falls through to the existing
                 # response-similarity verdict (it neither invents nor suppresses).
                 if self.ownership is not None:
-                    import principals as _pr
+                    import harness.principals as _pr
                     accessor = ident.get("principal") or _pr.Principal(
                         id=ident.get("principal_id") or ident.get("name")
                            or ident.get("role") or "unknown",

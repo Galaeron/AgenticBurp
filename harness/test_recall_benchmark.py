@@ -7,11 +7,11 @@ the adapter is under test -- guarding the integration risk that a Finding
 carries no url of its own, so the endpoint context must be stamped in."""
 import unittest
 
-import recall_benchmark as rb
-from recall_benchmark import (PlantedVuln, score_run, confirmation_leg_of,
+import harness.recall_benchmark as rb
+from harness.recall_benchmark import (PlantedVuln, score_run, confirmation_leg_of,
                               findings_from_analysis, findings_from_engagement,
                               CONFIRMED, DETECTED, MISSED, EARNED, LUCKY, UNKNOWN)
-from models import HttpExchange, Finding, AgentReport, AnalysisResponse
+from harness.models import HttpExchange, Finding, AgentReport, AnalysisResponse
 
 
 class LegExtractionTests(unittest.TestCase):

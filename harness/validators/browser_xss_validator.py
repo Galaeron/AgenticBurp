@@ -24,8 +24,8 @@ import logging
 import secrets
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-import global_throttle
-from models import Finding, HttpExchange
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
 from .base import Validator, ValidationResult
 
 log = logging.getLogger("harness.browser_xss_validator")
@@ -97,7 +97,7 @@ class BrowserXssValidator(Validator):
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         driver = self._driver
         if driver is None:
-            import browser_driver
+            from harness import browser_driver
             driver = browser_driver.default_driver(cdp_endpoint=self.cdp_endpoint)
             if driver is None:
                 _, reason = browser_driver.available(self.cdp_endpoint)

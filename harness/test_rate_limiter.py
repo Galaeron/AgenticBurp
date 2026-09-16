@@ -4,7 +4,7 @@ Tests for the rate limiter module.
 import unittest
 import asyncio
 import time
-from rate_limiter import (
+from harness.rate_limiter import (
     RateLimiter,
     RateLimitConfig,
     RateLimitStrategy,

@@ -29,7 +29,7 @@ import json
 import logging
 from typing import Optional
 
-from models import HttpExchange
+from harness.models import HttpExchange
 
 log = logging.getLogger("harness.fast_path")
 

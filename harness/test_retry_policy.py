@@ -1,5 +1,5 @@
 import unittest
-from retry_policy import RetryPolicy, Attempt, AttemptStatus, Action
+from harness.retry_policy import RetryPolicy, Attempt, AttemptStatus, Action
 
 
 def default_attempt(status, payload="p", confidence=0.0):

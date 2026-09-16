@@ -5,7 +5,7 @@ test-local logic inside test_blind_negatives; they now live in harness code and
 are exercised here by calling that code directly."""
 import unittest
 
-from host_dep_dedup import is_passive_banner, cap_passive_banner_severity
+from harness.host_dep_dedup import is_passive_banner, cap_passive_banner_severity
 
 
 class PassiveBannerClassificationTests(unittest.TestCase):

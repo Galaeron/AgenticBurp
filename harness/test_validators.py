@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from models import Finding, HttpExchange, TestPlan
-from validators.sqlmap import SqlmapValidator
-from validators.registry import ValidatorRegistry
+from harness.models import Finding, HttpExchange, TestPlan
+from harness.validators.sqlmap import SqlmapValidator
+from harness.validators.registry import ValidatorRegistry
 
 
 class FakeProc:
@@ -100,7 +100,7 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(result.status, "confirmed")
 
     def test_sqlmap_container_mode_wraps_in_docker_and_rewrites_localhost(self):
-        import tool_runner
+        from harness import tool_runner
         loopback_ex = HttpExchange(
             url="http://127.0.0.1:5002/api/item?id=7", method="GET",
             request_headers={"User-Agent": "t"}, response_status=200, response_body="x")
@@ -110,7 +110,7 @@ class ValidatorTests(unittest.TestCase):
             captured["cmd"] = cmd
             return FakeProc()
         with patch("subprocess.run", fake_run), \
-             patch("tool_runner.available", return_value=(True, "ok")):
+             patch("harness.tool_runner.available", return_value=(True, "ok")):
             asyncio.run(validator.validate(self.finding, loopback_ex))
         cmd = captured["cmd"]
         self.assertEqual(cmd[:3], [tool_runner.DOCKER, "run", "--rm"])   # ran in a container
@@ -321,7 +321,7 @@ class CorsWildcardGateTests(unittest.TestCase):
     combination MUST still confirm."""
 
     def setUp(self):
-        from validators.cors_validator import CorsValidator
+        from harness.validators.cors_validator import CorsValidator
         self.validator = CorsValidator()
         self.exchange = HttpExchange(
             url="https://example.test/api/products",

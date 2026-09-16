@@ -22,13 +22,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import coverage_manifest as cm
-from coverage_evidence_case import EvidenceCase, evidence_for
-from coverage_manifest import (
+import harness.coverage_manifest as cm
+from harness.coverage_evidence_case import EvidenceCase, evidence_for
+from harness.coverage_manifest import (
     RequirementStatus, TestSpec, TestStatus, declared_coverage_ok, load_evidence,
     reconcile, render_markdown, write_evidence,
 )
-from coverage_model import CHECKS_BY_ID
+from harness.coverage_model import CHECKS_BY_ID
 
 RUN = "RUN_UNDER_TEST"
 

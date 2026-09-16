@@ -32,7 +32,7 @@ from pathlib import Path
 import sqlite3
 from threading import Lock
 
-from models import HttpExchange, AnalysisResponse
+from harness.models import HttpExchange, AnalysisResponse
 
 log = logging.getLogger("harness.cache")
 

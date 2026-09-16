@@ -9,8 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import store
-from models import HttpExchange, Finding
+from harness import store
+from harness.models import HttpExchange, Finding
 
 
 def _f(vuln_class="sqli", summary="s", parameter_name="", parameter_location=""):

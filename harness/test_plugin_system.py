@@ -9,13 +9,8 @@ This test suite verifies that the plugin system correctly:
 5. Works with the agent manager
 """
 import pytest
-import sys
-import os
 
-# Add harness to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from agents.plugin import (
+from harness.agents.plugin import (
     AgentPluginSystem,
     AgentMetadata,
     PluginSource,
@@ -23,7 +18,7 @@ from agents.plugin import (
     reset_plugin_system,
     ENTRY_POINT_GROUP,
 )
-from agents.base_agent import BaseAgent
+from harness.agents.base_agent import BaseAgent
 
 
 @pytest.fixture
@@ -324,7 +319,7 @@ class TestAgentManagerIntegration:
 
     def test_agent_manager_initialization(self, mock_ollama, mock_config):
         """Test that AgentManager uses the plugin system."""
-        from agent_manager import AgentManager
+        from harness.agent_manager import AgentManager
         
         # Create agent manager
         manager = AgentManager(mock_config, mock_ollama)
@@ -337,7 +332,7 @@ class TestAgentManagerIntegration:
 
     def test_agent_manager_list_all_agents(self, mock_ollama, mock_config):
         """Test listing all agents through AgentManager."""
-        from agent_manager import AgentManager
+        from harness.agent_manager import AgentManager
         
         manager = AgentManager(mock_config, mock_ollama)
         
@@ -352,7 +347,7 @@ class TestAgentManagerIntegration:
 
     def test_agent_manager_get_agent_metadata(self, mock_ollama, mock_config):
         """Test getting agent metadata through AgentManager."""
-        from agent_manager import AgentManager
+        from harness.agent_manager import AgentManager
         
         manager = AgentManager(mock_config, mock_ollama)
         

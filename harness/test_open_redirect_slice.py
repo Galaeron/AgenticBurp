@@ -25,13 +25,13 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import coverage_manifest as cm
-import global_throttle
-import safety_gate
-from coverage_evidence_case import EvidenceCase, evidence_for
-from models import Finding, HttpExchange
-from testing_fixtures.open_redirect import OpenRedirectFixture
-from validators.open_redirect_validator import OpenRedirectValidator
+import harness.coverage_manifest as cm
+from harness import global_throttle
+from harness import safety_gate
+from harness.coverage_evidence_case import EvidenceCase, evidence_for
+from harness.models import Finding, HttpExchange
+from harness.testing_fixtures.open_redirect import OpenRedirectFixture
+from harness.validators.open_redirect_validator import OpenRedirectValidator
 
 HOST = "127.0.0.1"
 HTTP_TIMEOUT = 5.0

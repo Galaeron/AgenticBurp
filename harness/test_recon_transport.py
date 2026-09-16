@@ -2,9 +2,9 @@
 import asyncio
 import unittest
 
-from run_context import RunContext
-from test_run_context import _Fixture
-from validators.recon_validator import ReconValidator
+from harness.run_context import RunContext
+from harness.test_run_context import _Fixture
+from harness.validators.recon_validator import ReconValidator
 
 
 class ReconTransportTests(unittest.TestCase):

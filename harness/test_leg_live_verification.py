@@ -31,20 +31,20 @@ from pathlib import Path
 
 from werkzeug.serving import make_server
 
-import global_throttle
-import safety_gate
-from models import Finding, HttpExchange
-from validators.ssti_validator import SstiValidator
-from validators.open_redirect_validator import OpenRedirectValidator
-from validators.ssrf_validator import SsrfValidator
-from validators.sequence_validator import SequenceValidator
-from validators.command_injection_validator import CommandInjectionValidator
-from validators.deserialization_oob_validator import DeserializationOobValidator
-from validators.auth_sequence_validator import AuthSequenceValidator
-from validators.stored_xss_validator import StoredXssValidator
-from validators.jwt_forge_validator import JwtForgeValidator
-from validators.browser_xss_validator import BrowserXssValidator
-import browser_driver
+from harness import global_throttle
+from harness import safety_gate
+from harness.models import Finding, HttpExchange
+from harness.validators.ssti_validator import SstiValidator
+from harness.validators.open_redirect_validator import OpenRedirectValidator
+from harness.validators.ssrf_validator import SsrfValidator
+from harness.validators.sequence_validator import SequenceValidator
+from harness.validators.command_injection_validator import CommandInjectionValidator
+from harness.validators.deserialization_oob_validator import DeserializationOobValidator
+from harness.validators.auth_sequence_validator import AuthSequenceValidator
+from harness.validators.stored_xss_validator import StoredXssValidator
+from harness.validators.jwt_forge_validator import JwtForgeValidator
+from harness.validators.browser_xss_validator import BrowserXssValidator
+from harness import browser_driver
 
 _FIXTURE = (Path(__file__).resolve().parent.parent
             / "testing" / "leg-verification" / "vuln_fixture.py")
@@ -329,7 +329,7 @@ class LiveLegVerificationTest(unittest.TestCase):
         self.assertNotEqual(res.status, "confirmed")
 
     def test_jwt_kid_confusion_through_run_context(self):
-        from run_context import RunContext
+        from harness.run_context import RunContext
         ctx = RunContext.create(
             allowed_hosts=["127.0.0.1"], max_requests=8,
             gate_config={"active_enabled": True})

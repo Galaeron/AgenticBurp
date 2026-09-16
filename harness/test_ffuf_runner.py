@@ -3,8 +3,8 @@ import json
 import unittest
 from unittest.mock import patch, MagicMock
 
-import ffuf_runner
-from api_surface_discovery import Route
+from harness import ffuf_runner
+from harness.api_surface_discovery import Route
 
 
 class BuildArgsTests(unittest.TestCase):
@@ -121,20 +121,20 @@ class ParseSilentLinesTests(unittest.TestCase):
 class AvailabilityTests(unittest.TestCase):
     """ffuf_available checks Docker + image presence."""
 
-    @patch("tool_runner.available", return_value=(True, "ok"))
-    @patch("tool_runner.image_present", return_value=True)
+    @patch("harness.tool_runner.available", return_value=(True, "ok"))
+    @patch("harness.tool_runner.image_present", return_value=True)
     def test_available(self, _img, _dock):
         ok, reason = ffuf_runner.ffuf_available()
         self.assertTrue(ok)
 
-    @patch("tool_runner.available", return_value=(False, "no docker"))
+    @patch("harness.tool_runner.available", return_value=(False, "no docker"))
     def test_no_docker(self, _dock):
         ok, reason = ffuf_runner.ffuf_available()
         self.assertFalse(ok)
         self.assertIn("docker", reason.lower())
 
-    @patch("tool_runner.available", return_value=(True, "ok"))
-    @patch("tool_runner.image_present", return_value=False)
+    @patch("harness.tool_runner.available", return_value=(True, "ok"))
+    @patch("harness.tool_runner.image_present", return_value=False)
     def test_no_image(self, _img, _dock):
         ok, reason = ffuf_runner.ffuf_available()
         self.assertFalse(ok)
@@ -145,7 +145,7 @@ class RunSyncTests(unittest.TestCase):
     """run_sync with mocked tool_runner.run -- never touches Docker."""
 
     def _mock_run(self, stdout="", stderr="", rc=0):
-        return patch("tool_runner.run", return_value=(rc, stdout, stderr))
+        return patch("harness.tool_runner.run", return_value=(rc, stdout, stderr))
 
     def test_success_json(self):
         line = json.dumps({"input": {"FUZZ": "api/login"}, "status": 200, "length": 42})
@@ -175,13 +175,13 @@ class RunSyncTests(unittest.TestCase):
         self.assertEqual(len(result.routes), 1)
 
     def test_exception_handled(self):
-        with patch("tool_runner.run", side_effect=Exception("boom")):
+        with patch("harness.tool_runner.run", side_effect=Exception("boom")):
             result = ffuf_runner.run_sync("http://localhost:5002")
         self.assertIsNotNone(result.error)
         self.assertIn("boom", result.error)
 
     def test_headers_forwarded(self):
-        with patch("tool_runner.run", return_value=(0, "", "")) as mock_run:
+        with patch("harness.tool_runner.run", return_value=(0, "", "")) as mock_run:
             ffuf_runner.run_sync("http://localhost:5002",
                                  headers={"Authorization": "Bearer t"})
         args_passed = mock_run.call_args[0][1]
@@ -205,7 +205,7 @@ class NegativeControlTests(unittest.TestCase):
         # run_sync won't reach the parser when rc!=0 and stdout is empty.
 
     def test_run_sync_error_produces_no_routes(self):
-        with patch("tool_runner.run", return_value=(1, "", "error")):
+        with patch("harness.tool_runner.run", return_value=(1, "", "error")):
             result = ffuf_runner.run_sync("http://localhost:5002")
         self.assertEqual(result.routes, [])
         self.assertIsNotNone(result.error)
@@ -225,7 +225,7 @@ class StrictSilentParseTests(unittest.TestCase):
         self.assertEqual(paths, ["/api/real-endpoint"])
 
     def test_used_fallback_flag_surfaced(self):
-        import tool_runner
+        from harness import tool_runner
         from unittest.mock import patch
         with patch.object(tool_runner, "run", return_value=(0, "api/x\n", "")):
             result = ffuf_runner.run_sync("http://t.test")

@@ -16,8 +16,8 @@ The handoff's explicit test list is annotated inline.
 """
 import unittest
 
-import evidence
-from coverage_model import (
+from harness import evidence
+from harness.coverage_model import (
     CaseKey, CellStatus, CoverageMatrix, NO_PARAMETER_CASE,
     derive_input_cases, derive_input_cases_from_template, _json_pointers,
 )

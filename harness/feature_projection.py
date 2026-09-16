@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse, parse_qsl
 
 if TYPE_CHECKING:
-    from models import HttpExchange
+    from harness.models import HttpExchange
 
 
 # A path segment that is "just an id" -- numeric, uuid, or long hex/base64ish.

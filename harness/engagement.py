@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 try:
-    from categories import canonicalize as _canon
+    from harness.categories import canonicalize as _canon
 except Exception:  # pragma: no cover - categories is always present in the harness
     def _canon(x):  # type: ignore
         return (x or "").lower().strip() or None
@@ -335,7 +335,7 @@ def needs_human_review(finding_class: str, url: str) -> dict | None:
     if business_logic_review(finding_class, url) is not None:
         return None
     try:
-        from confirmation_gate import leg_tier
+        from harness.confirmation_gate import leg_tier
         tier = leg_tier(finding_class)
     except Exception:  # pragma: no cover - confirmation_gate always importable
         tier = "none"
@@ -393,7 +393,7 @@ class EngagementState:
     graph: "object" = None
 
     def __post_init__(self):
-        import task_graph
+        from harness import task_graph
         if self.graph is None:
             self.graph = task_graph.TaskGraph()
 
@@ -530,7 +530,7 @@ class EngagementState:
         """Fold detected capabilities into the task graph as a DEPENDENCY chain.
         Returns the subset that are `credential` type (carrying ephemeral headers)
         so the caller can act on them in-process -- these are NOT stored."""
-        import task_graph
+        from harness import task_graph
         credential_caps: list = []
         for cap in caps or []:
             if cap.get("type") == "credential":
@@ -566,7 +566,7 @@ class EngagementState:
         return credential_caps
 
     def resolve_action(self, kind: str, target: str) -> None:
-        import task_graph
+        from harness import task_graph
         self.graph.mark_by(kind, target, task_graph.DONE)
 
     def flag_business_logic(self, finding_class: str, url: str) -> bool:
@@ -624,7 +624,7 @@ class EngagementState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "EngagementState":
-        import task_graph
+        from harness import task_graph
         st = cls(host=d.get("host", ""))
         for k, v in (d.get("endpoints", {}) or {}).items():
             st.endpoints[k] = SurfaceEndpoint.from_dict(v)

@@ -2,9 +2,9 @@
 import asyncio
 import unittest
 
-from run_context import RunContext
-from test_run_context import _Fixture
-from validators.subdomain_takeover_validator import SubdomainTakeoverValidator
+from harness.run_context import RunContext
+from harness.test_run_context import _Fixture
+from harness.validators.subdomain_takeover_validator import SubdomainTakeoverValidator
 
 
 class _LoopbackValidator(SubdomainTakeoverValidator):

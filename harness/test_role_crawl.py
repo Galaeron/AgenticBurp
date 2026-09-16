@@ -3,11 +3,11 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-import global_throttle
-import role_crawl
-from role_crawl import RoleSession, _distinct_discovery_roles, _feature_key
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
+from harness import global_throttle
+from harness import role_crawl
+from harness.role_crawl import RoleSession, _distinct_discovery_roles, _feature_key
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
 
 
 class DiscoverySweepRoleSelectionTests(unittest.TestCase):
@@ -53,7 +53,7 @@ def _auth_of(headers):
 def _fake_crawl(endpoints):
     async def fake(base_url, headers=None, allowed_hosts=None, max_pages=40, max_depth=2,
                    timeout=15.0, **kwargs):
-        from crawler import CrawlResult
+        from harness.crawler import CrawlResult
         r = CrawlResult(base_url=base_url)
         r.endpoints = set(endpoints)
         return r
@@ -82,7 +82,7 @@ class RoleCrawlTests(unittest.TestCase):
 
     def _run(self, endpoints, matrix, roles, **kw):
         kw.setdefault("allowed_hosts", ["shop.test"])
-        with patch("crawler.crawl", _fake_crawl(endpoints)), \
+        with patch("harness.crawler.crawl", _fake_crawl(endpoints)), \
              patch("httpx.AsyncClient.request", _fake_probe(matrix)):
             return asyncio.run(role_crawl.crawl_roles("http://shop.test/", roles, **kw))
 
@@ -135,13 +135,13 @@ class RoleCrawlTests(unittest.TestCase):
         self.assertEqual(by["user"], 200)
 
     def test_empty_roles_errors(self):
-        with patch("crawler.crawl", _fake_crawl([])):
+        with patch("harness.crawler.crawl", _fake_crawl([])):
             r = asyncio.run(role_crawl.crawl_roles("http://shop.test/", [], allowed_hosts=["shop.test"]))
         self.assertTrue(any("no roles" in e for e in r.errors))
 
     def test_run_context_requires_explicit_session_mapping(self):
         ctx = RunContext.create(allowed_hosts=["shop.test"])
-        with patch("crawler.crawl", _fake_crawl(["/x"])):
+        with patch("harness.crawler.crawl", _fake_crawl(["/x"])):
             r = asyncio.run(role_crawl.crawl_roles(
                 "http://shop.test/", [RoleSession("user", {})],
                 allowed_hosts=["shop.test"], run_context=ctx))
@@ -162,7 +162,7 @@ class RoleCrawlTests(unittest.TestCase):
                  RoleSession("bob", {"Authorization": "ignored"})]
 
         async def scenario():
-            with patch("crawler.crawl", _fake_crawl(["/matrix"])):
+            with patch("harness.crawler.crawl", _fake_crawl(["/matrix"])):
                 result = await role_crawl.crawl_roles(
                     fixture.base, roles, allowed_hosts=["127.0.0.1"],
                     run_context=ctx, session_refs=["alice", "bob"])
@@ -252,14 +252,14 @@ class RoleCrawlTests(unittest.TestCase):
 
 class RoleCrawlEndpointTests(unittest.TestCase):
     def setUp(self):
-        import server as server_module
+        import harness.server as server_module
         self.server_module = server_module
         server_module.orchestrator.allowed_hosts = ["shop.test"]
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")
 
     def test_endpoint_runs(self):
-        with patch("crawler.crawl", _fake_crawl(["/api/report"])), \
+        with patch("harness.crawler.crawl", _fake_crawl(["/api/report"])), \
              patch("httpx.AsyncClient.request", _fake_probe({"/api/report": lambda a: (200, '{"x":1}')})):
             resp = self.client.post("/crawl-roles", json={
                 "base_url": "http://shop.test/",
@@ -276,13 +276,14 @@ class RoleCrawlEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_endpoint_registers_identities(self):
-        import tempfile, store
+        import tempfile
+        from harness import store
         from pathlib import Path
         tmp = tempfile.TemporaryDirectory()
         orig = store._DB_PATH
         store._DB_PATH = Path(tmp.name) / "t.db"
         try:
-            with patch("crawler.crawl", _fake_crawl(["/api/orders/{id}"])), \
+            with patch("harness.crawler.crawl", _fake_crawl(["/api/orders/{id}"])), \
                  patch("httpx.AsyncClient.request", _fake_probe({"/api/orders/1": lambda a: (200, '{"o":1}')})):
                 resp = self.client.post("/crawl-roles", json={
                     "base_url": "http://shop.test/",
@@ -293,7 +294,7 @@ class RoleCrawlEndpointTests(unittest.TestCase):
             names = {i["name"] for i in body["registered_identities"]}
             self.assertEqual(names, {"rolecrawl:user", "rolecrawl:admin"})
             # persisted + idempotent: a second run registers none new
-            with patch("crawler.crawl", _fake_crawl(["/api/orders/{id}"])), \
+            with patch("harness.crawler.crawl", _fake_crawl(["/api/orders/{id}"])), \
                  patch("httpx.AsyncClient.request", _fake_probe({"/api/orders/1": lambda a: (200, '{"o":1}')})):
                 resp2 = self.client.post("/crawl-roles", json={
                     "base_url": "http://shop.test/",

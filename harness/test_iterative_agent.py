@@ -3,9 +3,9 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from models import HttpExchange
-from iterative_agent import IterativeAgent
-import safety_gate
+from harness.models import HttpExchange
+from harness.iterative_agent import IterativeAgent
+from harness import safety_gate
 
 
 class _ScriptedOllama:
@@ -193,13 +193,13 @@ class IterativeAgentTests(unittest.IsolatedAsyncioTestCase):
 
 class PathMutationHelperTests(unittest.TestCase):
     def test_path_id_values_lists_id_segments(self):
-        from iterative_agent import _path_id_values
+        from harness.iterative_agent import _path_id_values
         self.assertEqual(_path_id_values("http://h/api/tickets/1"), ["1"])
         self.assertEqual(_path_id_values("http://h/api/tickets/1/comments/5"), ["1", "5"])
         self.assertEqual(_path_id_values("http://h/api/users/me"), [])  # non-id segment ignored
 
     def test_mutate_path_segment_replaces_first_match(self):
-        from iterative_agent import _mutate_path_segment
+        from harness.iterative_agent import _mutate_path_segment
         self.assertEqual(_mutate_path_segment("http://h/api/tickets/1", "1", "2"),
                          "http://h/api/tickets/2")
         self.assertEqual(_mutate_path_segment("http://h/api/tickets/1?x=1", "1", "9"),

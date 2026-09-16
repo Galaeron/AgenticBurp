@@ -8,10 +8,10 @@ from unittest.mock import patch
 
 import httpx
 
-import global_throttle
-import safety_gate
-from models import Finding, HttpExchange
-from validators.sequence_validator import SequenceValidator, _is_priv
+from harness import global_throttle
+from harness import safety_gate
+from harness.models import Finding, HttpExchange
+from harness.validators.sequence_validator import SequenceValidator, _is_priv
 
 
 class _Resp:

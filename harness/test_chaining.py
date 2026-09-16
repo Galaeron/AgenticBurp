@@ -1,6 +1,6 @@
 import unittest
-from chaining import detect, _tags_for
-from categories import CANONICAL_CATEGORIES
+from harness.chaining import detect, _tags_for
+from harness.categories import CANONICAL_CATEGORIES
 
 
 def finding(url, vulnerability_class, summary="", severity="medium", confidence=0.8):
@@ -201,7 +201,7 @@ class TestChainRuleCoverageIsDocumented(unittest.TestCase):
     })
 
     def test_categories_with_no_chain_rule_are_the_known_documented_set(self):
-        from chaining import _RULES
+        from harness.chaining import _RULES
         tags_in_rules = set()
         for rule in _RULES:
             tags_in_rules.add(rule.tag_a)
@@ -257,7 +257,7 @@ class TestChainDetectionBasics(unittest.TestCase):
 
 class TestDiscoveryChainCandidates(unittest.TestCase):
     def test_post_write_plus_get_read_produces_candidate(self):
-        from chaining import discovery_chain_candidates
+        from harness.chaining import discovery_chain_candidates
         exchanges = [
             {"method": "POST", "url": "http://t/api/comments", "request_body": '{"text":"hi"}',
              "response_status": 200, "response_headers": {}},
@@ -270,7 +270,7 @@ class TestDiscoveryChainCandidates(unittest.TestCase):
         self.assertEqual(pairs[0]["read_url"], "http://t/api/posts/1")
 
     def test_same_url_not_paired(self):
-        from chaining import discovery_chain_candidates
+        from harness.chaining import discovery_chain_candidates
         exchanges = [
             {"method": "POST", "url": "http://t/api/x", "request_body": '{"a":1}',
              "response_status": 200, "response_headers": {}},
@@ -281,7 +281,7 @@ class TestDiscoveryChainCandidates(unittest.TestCase):
         self.assertEqual(pairs, [])
 
     def test_get_only_no_candidates(self):
-        from chaining import discovery_chain_candidates
+        from harness.chaining import discovery_chain_candidates
         exchanges = [
             {"method": "GET", "url": "http://t/a", "request_body": "",
              "response_status": 200, "response_headers": {"Content-Type": "text/html"}},
@@ -296,7 +296,7 @@ class TestDiscoveryChainCandidates(unittest.TestCase):
         html read is a stored-XSS candidate, a json read a generic second-order
         one -- so the consumer can route each to the RIGHT oracle instead of
         force-routing everything to SQLi (which the previous code did)."""
-        from chaining import discovery_chain_candidates
+        from harness.chaining import discovery_chain_candidates
         html = discovery_chain_candidates([
             {"method": "POST", "url": "http://t/api/comments", "request_body": '{"t":"x"}',
              "response_status": 200, "response_headers": {}},

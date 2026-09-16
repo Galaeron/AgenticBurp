@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from coverage_model import CHECKS_BY_ID, CHECK_CATALOG, Check
+from harness.coverage_model import CHECKS_BY_ID, CHECK_CATALOG, Check
 
 SCHEMA_VERSION = 1
 _HARNESS = Path(__file__).resolve().parent

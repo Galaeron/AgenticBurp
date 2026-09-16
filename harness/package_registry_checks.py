@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from models import ComponentCandidate
+from harness.models import ComponentCandidate
 
 log = logging.getLogger("harness.package_registry_checks")
 

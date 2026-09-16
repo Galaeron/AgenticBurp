@@ -34,9 +34,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import global_throttle
-import missing_auth_probe as map_
-from models import Finding, HttpExchange
+from harness import global_throttle
+import harness.missing_auth_probe as map_
+from harness.models import Finding, HttpExchange
 from .base import Validator, ValidationResult
 
 _JWT_RE = re.compile(r"\b(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)\b")
@@ -151,7 +151,7 @@ class JwtForgeValidator(Validator):
     async def _probe(self, url: str, headers: dict) -> tuple[int | None, str]:
         try:
             if self.run_context is not None:
-                from run_context import ScopePolicy, TypedRequest
+                from harness.run_context import ScopePolicy, TypedRequest
                 credential_headers = {k: v for k, v in headers.items()
                                       if k.lower() in ("authorization", "cookie", "proxy-authorization")}
                 session_ref = "jwt-forge:" + hashlib.sha256(

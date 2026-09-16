@@ -2,8 +2,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from models import Finding, HttpExchange, TestPlan
-from categories import canonicalize
+from harness.models import Finding, HttpExchange, TestPlan
+from harness.categories import canonicalize
 
 
 @dataclass

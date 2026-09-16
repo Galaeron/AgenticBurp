@@ -250,7 +250,7 @@ class SurfaceDiscovery:
         if not _host_in_scope(url, self.allowed_hosts):
             return None
         if self.run_context is not None:
-            from run_context import TypedRequest
+            from harness.run_context import TypedRequest
             request_headers = {k: v for k, v in self.headers.items()
                                if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
             outcome = await self.run_context.executor().execute(
@@ -259,7 +259,7 @@ class SurfaceDiscovery:
             if not outcome.ok:
                 return None
             return outcome.status or 0, outcome.body or "", outcome.headers.get("Allow", "")
-        import global_throttle
+        from harness import global_throttle
         await global_throttle.acquire()
         try:
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
@@ -367,7 +367,7 @@ class SurfaceDiscovery:
                 # (paths x methods x parameters) is available via
                 # openapi_ingest.operations_from_spec for callers that target
                 # parameters -- the reach win over a bare path list.
-                import openapi_ingest
+                from harness import openapi_ingest
                 methods_by_path = openapi_ingest.methods_by_path(r[1])
                 for path in _paths_from_spec(r[1]):
                     self._seen.setdefault(path, Route(
@@ -456,7 +456,7 @@ class SurfaceDiscovery:
         """Run ffuf in a container and seed its discovered routes into _seen.
         Returns the number of routes found. Fails silently (returns 0) when
         Docker or the image is absent."""
-        import ffuf_runner
+        from harness import ffuf_runner
         ok, reason = ffuf_runner.ffuf_available(self.ffuf_image)
         if not ok:
             result.errors.append(f"ffuf skipped: {reason}")
@@ -543,7 +543,7 @@ class SurfaceDiscovery:
             discovery even when the surface isn't a JSON API.
           - id enumeration: a JSON list/object's `id` fields -> id-scoped siblings.
         All work off the SAME fetch, so this is one GET per seed."""
-        import js_endpoint_extractor as jse
+        import harness.js_endpoint_extractor as jse
         seeds = [p for p, r in list(self._seen.items()) if 200 <= r.status < 300]
         for p in seeds:
             if not self._budget_left():

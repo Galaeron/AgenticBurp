@@ -9,9 +9,9 @@ from unittest.mock import patch
 
 import httpx
 
-from advisory_snapshot import AdvisorySnapshot
-from github_advisories import GitHubAdvisoryClient, AdvisoryMatch
-from models import ComponentCandidate
+from harness.advisory_snapshot import AdvisorySnapshot
+from harness.github_advisories import GitHubAdvisoryClient, AdvisoryMatch
+from harness.models import ComponentCandidate
 
 
 _ENTRIES = [

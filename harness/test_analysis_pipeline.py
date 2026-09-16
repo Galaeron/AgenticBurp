@@ -11,8 +11,8 @@ future audit.
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-from analysis_pipeline import AnalysisPipeline
-from models import AgentReport, ComponentCandidate, Finding, HttpExchange
+from harness.analysis_pipeline import AnalysisPipeline
+from harness.models import AgentReport, ComponentCandidate, Finding, HttpExchange
 
 
 def _make_pipeline(ollama_client=None) -> AnalysisPipeline:
@@ -28,7 +28,7 @@ def _make_pipeline(ollama_client=None) -> AnalysisPipeline:
 
 
 def _make_report(finding: Finding):
-    from models import AgentReport
+    from harness.models import AgentReport
     return AgentReport(agent="test_agent", model="m", findings=[finding])
 
 
@@ -90,7 +90,7 @@ class CritiqueUsesInjectedClientTests(unittest.IsolatedAsyncioTestCase):
         (which would silently reintroduce the unshared-breaker bug even
         though the constructor-level fix looks complete).
         """
-        import analysis_pipeline as ap_module
+        import harness.analysis_pipeline as ap_module
 
         fake_client = MagicMock()
         fake_result = MagicMock()
@@ -106,7 +106,7 @@ class CritiqueUsesInjectedClientTests(unittest.IsolatedAsyncioTestCase):
         exchange = HttpExchange(url="https://example.com/x", method="GET")
         reports = [_make_report(_make_finding(confidence=0.9))]
 
-        with unittest.mock.patch("ollama_client.OllamaClient") as mock_cls:
+        with unittest.mock.patch("harness.ollama_client.OllamaClient") as mock_cls:
             await pipeline._critique(exchange, reports)
             mock_cls.assert_not_called()
 

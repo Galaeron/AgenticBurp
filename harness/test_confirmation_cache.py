@@ -4,8 +4,8 @@ import hashlib
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from models import Finding, HttpExchange
-from validators.base import ValidationResult
+from harness.models import Finding, HttpExchange
+from harness.validators.base import ValidationResult
 
 
 def _exchange(url="http://target.test/api/users", method="GET", status=200,

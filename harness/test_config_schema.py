@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-import config_schema
+from harness import config_schema
 
 _HARNESS = Path(__file__).resolve().parent
 

@@ -4,7 +4,7 @@ Tests for the circuit breaker module.
 import unittest
 import asyncio
 import time
-from circuit_breaker import (
+from harness.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerConfig,
     CircuitBreakerStats,
@@ -438,12 +438,12 @@ class TestGetOllamaCircuitBreakerIsShared(unittest.TestCase):
     def setUp(self):
         # Each test gets a clean global registry so state from other
         # tests (or import order) can't leak in.
-        import circuit_breaker as cb_module
+        import harness.circuit_breaker as cb_module
         self._original_registry = cb_module._registry
         cb_module._registry = None
 
     def tearDown(self):
-        import circuit_breaker as cb_module
+        import harness.circuit_breaker as cb_module
         cb_module._registry = self._original_registry
 
     def test_two_calls_with_same_name_return_the_same_breaker(self):
@@ -475,7 +475,7 @@ class TestGetOllamaCircuitBreakerIsShared(unittest.TestCase):
         OllamaCircuitBreaker("ollama") directly instead of
         get_ollama_circuit_breaker("ollama").
         """
-        from ollama_client import OllamaClient
+        from harness.ollama_client import OllamaClient
         c1 = OllamaClient(base_url="http://example.invalid")
         c2 = OllamaClient(base_url="http://example.invalid")
         self.assertIs(c1.circuit_breaker, c2.circuit_breaker)

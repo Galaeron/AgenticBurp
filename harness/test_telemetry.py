@@ -13,10 +13,10 @@ from unittest.mock import MagicMock
 
 import yaml
 
-import store
-import telemetry
-from orchestrator import Orchestrator
-from models import AgentReport, Finding, HttpExchange
+from harness import store
+from harness import telemetry
+from harness.orchestrator import Orchestrator
+from harness.models import AgentReport, Finding, HttpExchange
 
 _HARNESS = Path(__file__).resolve().parent
 
@@ -112,7 +112,7 @@ class TelemetryEndpointTests(unittest.TestCase):
         self._orig = store._DB_PATH
         store._DB_PATH = Path(self._tmp.name) / "state.db"
         import importlib
-        import server as server_module
+        import harness.server as server_module
         importlib.reload(server_module)
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")

@@ -1,6 +1,6 @@
 import asyncio
-from models import HttpExchange, Finding
-import planner, store
+from harness.models import HttpExchange, Finding
+from harness import planner, store
 
 def test_plan_binds_to_exchange_hash():
     e=HttpExchange(url="https://example.test/item?id=1", method="GET",
@@ -24,7 +24,7 @@ def test_confirmation_requires_matching_typed_executor(monkeypatch, tmp_path):
               suggested_test="compare identities", basis="derived")
     plan=planner.plans_for_findings(e,[f])[0]
     store.persist_test_plans(e,[plan])
-    bad=__import__('models').ValidationSubmission(plan_id=plan.id, status="confirmed", confidence=.9, confirmed=True,
+    bad=__import__('harness.models', fromlist=['ValidationSubmission']).ValidationSubmission(plan_id=plan.id, status="confirmed", confidence=.9, confirmed=True,
         summary="x", evidence="y", executor="burp:arbitrary", source_exchange_hash=plan.source_exchange_hash)
     ok, reason=store.persist_validation_submission(bad)
     assert not ok and "executor" in reason
@@ -42,7 +42,7 @@ def test_non_confirmation_capability_cannot_confirm(monkeypatch, tmp_path):
               suggested_test="timing differential", basis="derived")
     plan=planner.plans_for_findings(e,[f])[0]
     store.persist_test_plans(e,[plan])
-    sub=__import__('models').ValidationSubmission(plan_id=plan.id, status="confirmed", confidence=.9, confirmed=True,
+    sub=__import__('harness.models', fromlist=['ValidationSubmission']).ValidationSubmission(plan_id=plan.id, status="confirmed", confidence=.9, confirmed=True,
         summary="x", evidence="y", executor=f"burp:{plan.capability}", source_exchange_hash=plan.source_exchange_hash)
     ok, reason=store.persist_validation_submission(sub)
     assert not ok and "cannot mark" in reason

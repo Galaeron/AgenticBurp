@@ -1,6 +1,6 @@
 from .base_agent import BaseAgent
-from anomaly_detector import detector, Anomaly
-from models import Finding
+from harness.anomaly_detector import detector, Anomaly
+from harness.models import Finding
 
 
 class AnomalyAgent(BaseAgent):
@@ -89,7 +89,7 @@ The first few exchanges may not produce useful findings.
         findings = detector.generate_findings(anomalies)
         
         # Return as an agent report
-        from models import AgentReport
+        from harness.models import AgentReport
         return AgentReport(
             agent=self.name,
             model=self.model,

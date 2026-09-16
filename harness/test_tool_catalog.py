@@ -1,8 +1,8 @@
 """Tests for the A3 tool catalog + recommendation mechanism."""
 import unittest
 
-import tool_catalog as tc
-from models import Finding
+import harness.tool_catalog as tc
+from harness.models import Finding
 
 
 class CatalogTests(unittest.TestCase):
@@ -81,7 +81,7 @@ class RecommendationTests(unittest.TestCase):
 
 class ToolEndpointTests(unittest.TestCase):
     def setUp(self):
-        import server as server_module
+        import harness.server as server_module
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")
 

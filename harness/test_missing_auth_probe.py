@@ -3,12 +3,12 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-import global_throttle
-import missing_auth_probe as map_
-from js_endpoint_extractor import CallShape
-from safety_gate import SafetyGate, SafetyGateConfig
-from run_context import RunContext
-from test_run_context import _Fixture
+from harness import global_throttle
+import harness.missing_auth_probe as map_
+from harness.js_endpoint_extractor import CallShape
+from harness.safety_gate import SafetyGate, SafetyGateConfig
+from harness.run_context import RunContext
+from harness.test_run_context import _Fixture
 
 
 class _Resp:

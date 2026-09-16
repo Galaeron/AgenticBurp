@@ -1,8 +1,8 @@
 """Tests for the deterministic access-control response gate."""
 import unittest
 
-from models import HttpExchange, AgentReport, Finding
-from access_control_gate import apply_access_control_response_gate, _CAPPED_CONFIDENCE
+from harness.models import HttpExchange, AgentReport, Finding
+from harness.access_control_gate import apply_access_control_response_gate, _CAPPED_CONFIDENCE
 
 
 def _ex(status):

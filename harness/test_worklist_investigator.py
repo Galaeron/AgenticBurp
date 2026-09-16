@@ -4,9 +4,9 @@ The probe (iterative agent + network) is stubbed; the driver logic is under test
 import asyncio
 import unittest
 
-import engagement
-import worklist_investigator as wi
-from role_crawl import RoleSession
+from harness import engagement
+import harness.worklist_investigator as wi
+from harness.role_crawl import RoleSession
 
 
 ROLES = [RoleSession("anonymous", {}),

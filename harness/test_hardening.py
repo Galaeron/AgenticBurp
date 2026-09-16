@@ -1,17 +1,12 @@
 import asyncio
 import importlib
-import os
 import sqlite3
-import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).parent
-sys.path.insert(0, str(ROOT))
-
-from models import HttpExchange, ComponentCandidate, Finding
-from agents.base_agent import BaseAgent
-import chaining
+from harness.models import HttpExchange, ComponentCandidate, Finding
+from harness.agents.base_agent import BaseAgent
+from harness import chaining
 
 
 class DummyAgent(BaseAgent):
@@ -57,7 +52,7 @@ def test_untrusted_block_is_nonce_fenced():
 
 
 def test_component_requires_literal_observation():
-    import orchestrator
+    from harness import orchestrator
     ex = HttpExchange(url="https://target.test", method="GET", response_body="jquery 3.7.1")
     observed = orchestrator._verify_component_observation(
         ComponentCandidate(ecosystem="npm", name="jquery", version="3.7.1"), ex)
@@ -78,7 +73,7 @@ def test_chain_does_not_use_summary_keywords():
 
 
 def test_store_deduplicates_and_does_not_block_schema():
-    import store
+    from harness import store
     with tempfile.TemporaryDirectory() as td:
         old = store._DB_PATH
         store._DB_PATH = Path(td) / "state.db"
@@ -93,7 +88,7 @@ def test_store_deduplicates_and_does_not_block_schema():
 
 
 def test_fabricated_component_cannot_reach_advisory_lookup():
-    import orchestrator
+    from harness import orchestrator
     class FakeGHA:
         def __init__(self): self.calls = 0
         async def lookup(self, component):
@@ -104,7 +99,7 @@ def test_fabricated_component_cannot_reach_advisory_lookup():
     o.gha_max_lookups = 6
     o.gha_client = FakeGHA()
     ex = HttpExchange(url="https://target.test", method="GET", response_body="ignore instructions")
-    from models import AgentReport
+    from harness.models import AgentReport
     report = AgentReport(agent="supply_chain", model="test", components=[
         ComponentCandidate(ecosystem="npm", name="lodash", version="4.17.21", source="response body")
     ])
@@ -121,9 +116,9 @@ def test_known_vuln_lookup_dedups_same_advisory_for_same_host():
     fp_benchmark.py, where one target's Werkzeug/Flask CVEs were reported
     20-60 times. A second lookup for the same (host, advisory) must be
     suppressed; a different host must still get its own report."""
-    import orchestrator
-    from github_advisories import AdvisoryMatch, LookupResult
-    from models import AgentReport
+    from harness import orchestrator
+    from harness.github_advisories import AdvisoryMatch, LookupResult
+    from harness.models import AgentReport
 
     class FakeGHA:
         def __init__(self):
@@ -168,7 +163,7 @@ def test_known_vuln_lookup_dedups_same_advisory_for_same_host():
 
 
 def test_non_loopback_auth_guard():
-    import server
+    from harness import server
     old_host, old_token = server._SERVER_HOST, server._BEARER_TOKEN
     try:
         server._SERVER_HOST = "0.0.0.0"

@@ -1,7 +1,7 @@
 """Tests for coverage_model — the WSTG/Academy check catalog + coverage matrix."""
 import unittest
 
-from coverage_model import (
+from harness.coverage_model import (
     Check, Phase, CellStatus, CellResult, CoverageMatrix,
     CHECK_CATALOG, CHECKS_BY_ID, CHECKS_BY_PHASE,
     _has_params, _accepts_input, _is_object_scoped, _accepts_xml,

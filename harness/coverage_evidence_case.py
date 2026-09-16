@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import unittest
 
-import coverage_manifest as cm
+import harness.coverage_manifest as cm
 
 log = logging.getLogger("harness.coverage_evidence_case")
 

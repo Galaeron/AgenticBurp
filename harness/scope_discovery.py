@@ -35,8 +35,8 @@ from urllib.parse import urlparse
 
 import httpx
 
-from categories import canonicalize
-from models import Finding, HttpExchange
+from harness.categories import canonicalize
+from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.scope_discovery")
 
@@ -194,7 +194,7 @@ async def discover_from_scope_change(
                 continue
             try:
                 if run_context is not None:
-                    from run_context import TypedRequest
+                    from harness.run_context import TypedRequest
                     session_ref, request_headers = run_context.sessions.bind_headers(carried_headers)
                     outcome = await run_context.executor().execute(
                         TypedRequest("GET", candidate_url, headers=request_headers),
@@ -204,7 +204,7 @@ async def discover_from_scope_change(
                     status, response_headers, response_body = (
                         outcome.status, outcome.headers, outcome.body)
                 else:
-                    import global_throttle
+                    from harness import global_throttle
                     await global_throttle.acquire()
                     resp = await client.get(candidate_url, headers=carried_headers)
                     status, response_headers, response_body = (

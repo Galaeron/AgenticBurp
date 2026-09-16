@@ -18,9 +18,9 @@ a host as on the hundredth.
 """
 import unittest
 
-from anomaly_detector import AnomalyDetector
-from agents.anomaly_agent import AnomalyAgent
-from models import HttpExchange
+from harness.anomaly_detector import AnomalyDetector
+from harness.agents.anomaly_agent import AnomalyAgent
+from harness.models import HttpExchange
 
 
 def _exchange(url="https://example.test/api/x", method="GET", **kwargs):

@@ -1,6 +1,6 @@
 import unittest
-from models import Finding, HttpExchange
-from planner import plans_for_findings
+from harness.models import Finding, HttpExchange
+from harness.planner import plans_for_findings
 
 class PlannerTests(unittest.TestCase):
     def setUp(self):

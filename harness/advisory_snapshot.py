@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 
-from github_advisories import AdvisoryMatch
+from harness.github_advisories import AdvisoryMatch
 
 
 class AdvisorySnapshot:

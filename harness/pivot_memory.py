@@ -40,14 +40,14 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import chaining
-import knowledge
-import planner
-import store
-from models import Finding, HttpExchange, TestPlan
+from harness import chaining
+from harness import knowledge
+from harness import planner
+from harness import store
+from harness.models import Finding, HttpExchange, TestPlan
 
 if TYPE_CHECKING:
-    from iterative_agent import IterativeResult
+    from harness.iterative_agent import IterativeResult
 
 log = logging.getLogger("harness.pivot_memory")
 

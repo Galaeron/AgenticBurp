@@ -8,10 +8,10 @@ exercised end-to-end deterministically.
 import asyncio
 import unittest
 
-import identity_headers
-import identity_compare
-from validators.cross_identity_validator import CrossIdentityValidator
-from models import Finding, HttpExchange
+from harness import identity_headers
+from harness import identity_compare
+from harness.validators.cross_identity_validator import CrossIdentityValidator
+from harness.models import Finding, HttpExchange
 
 
 def _finding(cls="insecure_direct_object_reference"):
@@ -97,7 +97,7 @@ class CrossIdentityValidatorTest(unittest.TestCase):
         self.assertIn("object identifier", r.summary)
 
     def test_has_object_identifier(self):
-        from validators.cross_identity_validator import has_object_identifier
+        from harness.validators.cross_identity_validator import has_object_identifier
         self.assertTrue(has_object_identifier("http://h/api/users/2/profile"))
         self.assertTrue(has_object_identifier("http://h/api/orders/1"))
         self.assertTrue(has_object_identifier("http://h/api/tickets/a1b2c3d4e5f6"))
@@ -110,7 +110,7 @@ class CrossIdentityValidatorTest(unittest.TestCase):
         # Named (non-numeric) object ids after a collection noun: the /users/alice
         # case _ID_SEGMENT can't catch. These ARE swappable objects -> cross-identity
         # should fire.
-        from validators.cross_identity_validator import has_object_identifier
+        from harness.validators.cross_identity_validator import has_object_identifier
         self.assertTrue(has_object_identifier("http://h/users/alice"))
         self.assertTrue(has_object_identifier("http://h/api/v1/tickets/support-42"))
         self.assertTrue(has_object_identifier("http://h/api/users/alice/orders"))
@@ -121,7 +121,7 @@ class CrossIdentityValidatorTest(unittest.TestCase):
         # id when it's a self-reference, a route verb, or a nested sub-collection.
         # Each of these must stay False or the TN3 (/users/me) false positive class
         # comes back.
-        from validators.cross_identity_validator import has_object_identifier
+        from harness.validators.cross_identity_validator import has_object_identifier
         for url in [
             "http://h/api/users/me",          # self-reference
             "http://h/users/self",            # self-reference
@@ -181,7 +181,7 @@ class CrossIdentityValidatorTest(unittest.TestCase):
         self.assertIn("distinct principal", r.summary.lower())
 
     def test_role_session_principal_id_distinguishes_same_role(self):
-        from role_crawl import RoleSession
+        from harness.role_crawl import RoleSession
         alice = RoleSession(role="user", headers={"Authorization": "Bearer alice"})
         bob = RoleSession(role="user", headers={"Authorization": "Bearer bob"})
         self.assertNotEqual(alice.principal_id(), bob.principal_id())

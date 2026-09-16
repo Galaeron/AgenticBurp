@@ -6,9 +6,9 @@ observation-only until a framing-capable adapter and paired proxy fixture exist.
 import asyncio
 import unittest
 
-from run_context import RunContext
-from test_run_context import _Fixture
-from validators.http_request_smuggling_validator import HttpRequestSmugglingValidator
+from harness.run_context import RunContext
+from harness.test_run_context import _Fixture
+from harness.validators.http_request_smuggling_validator import HttpRequestSmugglingValidator
 
 
 class SmugglingTransportTests(unittest.TestCase):

@@ -23,7 +23,7 @@ import logging
 from typing import TYPE_CHECKING, Type
 
 if TYPE_CHECKING:
-    from ollama_client import OllamaClient
+    from harness.ollama_client import OllamaClient
     from .base_agent import BaseAgent
 
 log = logging.getLogger("harness.agents")

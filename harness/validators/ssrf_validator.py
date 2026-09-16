@@ -19,12 +19,12 @@ from urllib.parse import urlsplit, parse_qsl
 
 import httpx
 
-import collaborator as _collab
-import global_throttle
-from models import Finding, HttpExchange
-from safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+import harness.collaborator as _collab
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
-from validators.sqlmap import (_mutate_query_param, _mutate_json_param, _mutate_form_param,
+from harness.validators.sqlmap import (_mutate_query_param, _mutate_json_param, _mutate_form_param,
                                _looks_like_json, _content_type_of)
 
 _URL_PARAM_NAMES = {"url", "uri", "target", "callback", "webhook", "dest", "destination",

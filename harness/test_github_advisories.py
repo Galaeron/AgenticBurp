@@ -17,8 +17,8 @@ from unittest.mock import patch, AsyncMock
 
 import httpx
 
-from github_advisories import GitHubAdvisoryClient, _ECOSYSTEM_MAP, _FALLBACK_ECOSYSTEM
-from models import ComponentCandidate
+from harness.github_advisories import GitHubAdvisoryClient, _ECOSYSTEM_MAP, _FALLBACK_ECOSYSTEM
+from harness.models import ComponentCandidate
 
 
 def _mock_response(status_code: int, json_body=None, text: str = ""):

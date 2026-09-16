@@ -18,7 +18,7 @@ import httpx
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.http_request_smuggling")
 
@@ -98,8 +98,8 @@ class HttpRequestSmugglingValidator(Validator):
     
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
         """Generate a test plan for HRS validation."""
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -544,7 +544,7 @@ class HttpRequestSmugglingValidator(Validator):
         
         try:
             if self.run_context is not None:
-                from run_context import TypedRequest
+                from harness.run_context import TypedRequest
                 outcome = await self.run_context.executor().execute(
                     TypedRequest(method, url, headers=headers, body=body or None),
                     capability=self.get_name(), max_redirects=self.max_redirects)

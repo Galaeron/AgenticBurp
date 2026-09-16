@@ -26,9 +26,9 @@ from __future__ import annotations
 import logging
 from urllib.parse import urlsplit
 
-import engagement
-import role_crawl
-from role_crawl import RoleSession
+from harness import engagement
+from harness import role_crawl
+from harness.role_crawl import RoleSession
 
 log = logging.getLogger("harness.engagement_builder")
 
@@ -54,7 +54,7 @@ async def build_engagement(
     ranking; the raw result carries the endpoints, candidates and IDOR findings."""
     session_refs = None
     if run_context is not None:
-        from run_context import ScopePolicy
+        from harness.run_context import ScopePolicy
         permitted_origin = ScopePolicy.origin_of(base_url)
         session_refs = []
         for index, role in enumerate(roles):
@@ -120,7 +120,7 @@ async def feature_crawl_captures(
     Returns a list of `HttpExchange` (model objects, ready for
     review_captured_exchanges)."""
     import hashlib
-    import feature_workflow
+    from harness import feature_workflow
     from urllib.parse import urlsplit
 
     def _h(*parts: str) -> str:
@@ -168,7 +168,7 @@ async def execute_declared_workflows(workflows, run_context) -> list:
     Accepts config-shaped dictionaries or already-validated Workflow records and
     executes each through the invocation's existing RunContext.
     """
-    import workflow_engine
+    from harness import workflow_engine
     results = []
     for declaration in workflows or []:
         workflow = (declaration if isinstance(declaration, workflow_engine.Workflow)

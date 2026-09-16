@@ -3,7 +3,7 @@ import asyncio
 import time
 import unittest
 
-from global_throttle import GlobalRequestThrottle
+from harness.global_throttle import GlobalRequestThrottle
 
 
 class GlobalThrottleTests(unittest.TestCase):

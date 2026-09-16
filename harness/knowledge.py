@@ -1,7 +1,7 @@
 from __future__ import annotations
 import re
 
-from models import HttpExchange
+from harness.models import HttpExchange
 
 # A deliberately small, hand-written methodology corpus -- not a copy of
 # any external text (OWASP Testing Guide, PortSwigger docs, etc; those
@@ -123,7 +123,7 @@ def _external_notes() -> list[dict]:
     accumulated experience, not just the model's weights). Best-effort: a store
     hiccup degrades to the built-in corpus alone, never an error."""
     try:
-        import store
+        from harness import store
         rows = store.list_knowledge_notes()
     except Exception:
         return []
@@ -142,7 +142,7 @@ def remember_finding(vulnerability_class: str, url: str, evidence: str = "") -> 
     so future analyses of similar surface get grounded in what already worked
     here. Returns whether a new note was stored."""
     try:
-        import store
+        from harness import store
         from urllib.parse import urlsplit
         path = urlsplit(url).path or "/"
         note = (f"On this engagement, {vulnerability_class} was CONFIRMED at a "

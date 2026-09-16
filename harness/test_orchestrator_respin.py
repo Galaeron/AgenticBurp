@@ -11,9 +11,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from orchestrator import Orchestrator
-from models import HttpExchange, AgentReport, Finding
-from effort import EffortBudget, BudgetMode, CallKind
+from harness.orchestrator import Orchestrator
+from harness.models import HttpExchange, AgentReport, Finding
+from harness.effort import EffortBudget, BudgetMode, CallKind
 
 
 def _finding(conf):

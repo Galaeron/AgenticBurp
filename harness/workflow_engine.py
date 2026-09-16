@@ -220,7 +220,7 @@ async def execute_workflow(workflow: Workflow, run_context, *, initial_values=No
     cancellation. A 401 is classified as session expiry and may invoke the bounded
     refresh callback; a 403 is access denial and is never refreshed.
     """
-    from run_context import TypedRequest
+    from harness.run_context import TypedRequest
 
     if resume and (resume.workflow_id != workflow.id or resume.version != workflow.version):
         raise ValueError("resume record belongs to a different workflow/version")

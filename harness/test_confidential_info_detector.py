@@ -1,8 +1,8 @@
 """Tests for the A4 confidential-info response detector."""
 import unittest
 
-import confidential_info_detector as cid
-from models import HttpExchange
+import harness.confidential_info_detector as cid
+from harness.models import HttpExchange
 
 
 def _ex(body="", headers=None):
@@ -99,7 +99,7 @@ class FindingTests(unittest.TestCase):
 
 class ScanEndpointTests(unittest.TestCase):
     def setUp(self):
-        import server as server_module
+        import harness.server as server_module
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")
 

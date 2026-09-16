@@ -40,11 +40,11 @@ plus the assembly. Behavior is unchanged -- the methods moved verbatim and every
 """
 from __future__ import annotations
 
-from orchestrator_helpers import *  # noqa: F401,F403  (re-export shared namespace)
-from orchestrator_detect import DetectMixin
-from orchestrator_confirm import ConfirmMixin
-from orchestrator_chain import ChainMixin
-from orchestrator_report import ReportMixin
+from harness.orchestrator_helpers import *  # noqa: F401,F403  (re-export shared namespace)
+from harness.orchestrator_detect import DetectMixin
+from harness.orchestrator_confirm import ConfirmMixin
+from harness.orchestrator_chain import ChainMixin
+from harness.orchestrator_report import ReportMixin
 
 
 class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
@@ -104,7 +104,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         _snap_path = gha_cfg.get("snapshot_path")
         if _snap_path:
             try:
-                from advisory_snapshot import AdvisorySnapshot
+                from harness.advisory_snapshot import AdvisorySnapshot
                 _snapshot = AdvisorySnapshot.from_file(_snap_path)
                 log.info("Loaded offline advisory snapshot from %s (%d advisories)",
                          _snap_path, len(_snapshot))
@@ -143,7 +143,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # from config. Default 0 = unlimited, so this is a no-op unless the
         # tester set a ceiling (via config or the Burp setting). Governs the
         # aggregate request rate every active path sends at the target.
-        import global_throttle
+        from harness import global_throttle
         _throttle_cfg = config.get("throttle", {}) or {}
         global_throttle.configure(_throttle_cfg.get("max_requests_per_second", 0))
 
@@ -208,7 +208,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # Per-vulnerability resource governance -- F5. The default policy for
         # how much one vulnerability may consume (retries/agents/tokens); a
         # /retry-agents request can tighten or loosen it per call.
-        import resource_governor
+        from harness import resource_governor
         self.retry_budget_policy = resource_governor.VulnBudgetPolicy.from_dict(
             config.get("retry_budget", {}))
 

@@ -3,8 +3,8 @@ composition rules that identify the plant->trigger (A,B) candidate pairs."""
 import asyncio
 import unittest
 
-import second_order
-import chaining
+from harness import second_order
+from harness import chaining
 
 
 # --- V22: second-order SQLi boolean differential -----------------------------

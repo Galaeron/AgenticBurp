@@ -5,11 +5,11 @@ similar endpoints differing in exactly one property, asserting the label's
 plausibility lands on the one that actually has that shape."""
 import unittest
 
-import attribution
-from attribution import (relabel_confirmed_finding, shape_consistent,
+from harness import attribution
+from harness.attribution import (relabel_confirmed_finding, shape_consistent,
                          chain_input_speculative, annotate_shape_inconsistent)
-from models import HttpExchange, Finding
-import chaining
+from harness.models import HttpExchange, Finding
+from harness import chaining
 
 
 class RelabelTests(unittest.TestCase):

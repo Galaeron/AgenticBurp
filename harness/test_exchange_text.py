@@ -11,8 +11,8 @@ implementation for this one to drift from.
 """
 import unittest
 
-from exchange_text import exchange_text
-from models import HttpExchange
+from harness.exchange_text import exchange_text
+from harness.models import HttpExchange
 
 
 def _exchange_with_note(note: str) -> HttpExchange:
@@ -60,7 +60,7 @@ class OrchestratorDelegatesToSharedFunctionTests(unittest.TestCase):
     """
 
     def test_orchestrator_matches_the_shared_function_directly(self):
-        import orchestrator
+        from harness import orchestrator
 
         ex = _exchange_with_note("some analyst note with a version string 4.17.21")
 

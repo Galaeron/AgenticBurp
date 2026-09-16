@@ -10,7 +10,7 @@ to do with it. Agents now fall back to a dedicated `agent_defaults.model`
 """
 import unittest
 
-from agent_manager import AgentManager
+from harness.agent_manager import AgentManager
 
 
 class DummyOllama:

@@ -9,7 +9,7 @@ confirms from the previously-overconfirming input. See ORACLE_RETIREMENTS.md.
 import asyncio
 import unittest
 
-from models import Finding, HttpExchange
+from harness.models import Finding, HttpExchange
 
 
 def _f(cls, sev="high"):
@@ -19,7 +19,7 @@ def _f(cls, sev="high"):
 
 class PassiveDeserializationRetired(unittest.TestCase):
     def test_format_signature_is_observation_not_confirmation(self):
-        from validators.deserialization_validator import DeserializationValidator
+        from harness.validators.deserialization_validator import DeserializationValidator
         ex = HttpExchange(url="http://t/api", method="POST", request_headers={},
                           request_body='a:1:{i:0;s:3:"foo";}',  # PHP serialized format
                           response_status=200, response_headers={}, response_body="")

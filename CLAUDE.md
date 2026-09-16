@@ -175,14 +175,22 @@ false` only `deserialization` runs — the rest arm only once a live run turns a
 
 ## Commands
 
+Since **W-18** `harness/` is a proper package (`harness.*` absolute imports; see
+[`harness/__init__.py`](harness/__init__.py) + `[build-system]` in `pyproject.toml`).
+Run everything from the **repository root**, not from inside `harness/`:
+
 ```bash
-# full suite (run before trusting anything, after every change)
-cd harness && python -m unittest discover -p "test_*.py"
-# a focused module
-cd harness && python -m unittest test_orchestrator_precondition
+# full suite (run before trusting anything, after every change) -- from the REPO ROOT
+python -m unittest discover -t . -s harness -p "test_*.py"
+# a focused module (modules are harness.* now)
+python -m unittest harness.test_orchestrator_precondition
+# start the server
+python -m harness.server        # or: uvicorn harness.server:app
 ```
-A live max-coverage run is driven by a script named in `CURRENT_STATE.md` (kept in the
-scratchpad, not committed). Use a FRESH cache DB (hazard #4).
+The old `cd harness && python -m unittest discover` no longer works: the modules
+import each other as `harness.*`, so the repo root (not `harness/`) must be on
+`sys.path`. A live max-coverage run is driven by a script named in `CURRENT_STATE.md`
+(kept in the scratchpad, not committed). Use a FRESH cache DB (hazard #4).
 
 ## Handover protocol — keep onboarding cheap
 

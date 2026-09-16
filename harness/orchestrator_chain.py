@@ -9,12 +9,12 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
-from orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 # W-16: the single TargetTransport. Imported by name (not as the module) because
 # investigate_engagement has a `run_context` parameter that would shadow the module;
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
 # standalone one when it is None".
-from run_context import transport_for
+from harness.run_context import transport_for
 
 
 class ChainMixin:
@@ -27,7 +27,7 @@ class ChainMixin:
         endpoint's fused score IS its allocation priority, so the whole
         signal-fusion pipeline drives what gets budget. Pure planning: nothing is
         fetched or analyzed here."""
-        import engagement, resource_governor
+        from harness import engagement, resource_governor
         snap = await asyncio.to_thread(store.load_engagement, host)
         if not snap:
             return {"host": host, "targets": [], "guidance": ["no engagement state for this host yet -- "
@@ -159,7 +159,7 @@ class ChainMixin:
                 "detail": analyzed[:20]}
 
     async def _engagement_summary(self, host: str) -> dict:
-        import engagement
+        from harness import engagement
         snap = await asyncio.to_thread(store.load_engagement, host)
         return engagement.EngagementState.from_dict(snap or {"host": host}).summary()
 
@@ -179,8 +179,8 @@ class ChainMixin:
           3. CAP -- a hard per-host ceiling (engagement.max_auto_escalations) on
              how many escalations fire in this process lifetime.
         Plus the usual scope gate + throttle on every request."""
-        import engagement, role_crawl
-        import task_graph
+        from harness import engagement, role_crawl
+        from harness import task_graph
         parts = urlsplit(source_url)
         origin = f"{parts.scheme}://{parts.netloc}/"
 
@@ -267,10 +267,10 @@ class ChainMixin:
         `roles` is a list of role_crawl.RoleSession. Requires iterative_agent
         enabled (run_active_probe enforces it). `max_chain_rounds` bounds the
         Milestone-C closed loop (re-test AS a credential learned from a finding)."""
-        import engagement_builder
-        import worklist_investigator
-        import chain_linker
-        import role_crawl
+        from harness import engagement_builder
+        from harness import worklist_investigator
+        from harness import chain_linker
+        from harness import role_crawl
         state, rc = await engagement_builder.build_engagement(
             base_url, roles, allowed_hosts=self.allowed_hosts,
             discovery_max_probes=discovery_max_probes, run_context=run_context)
@@ -310,8 +310,8 @@ class ChainMixin:
         # to an authenticated read-only walk.
         if self.engagement_feature_crawl:
             try:
-                import engagement as _eng
-                from safety_gate import get_default_gate as _get_gate
+                import harness.engagement as _eng
+                from harness.safety_gate import get_default_gate as _get_gate
                 discovered_paths = [ep.path for ep in rc.endpoints] if rc.endpoints else None
                 feature_caps = await engagement_builder.feature_crawl_captures(
                     base_url, roles, allowed_hosts=self.allowed_hosts,
@@ -340,7 +340,7 @@ class ChainMixin:
         except Exception as e:
             log.warning("investigate_engagement: universal header audit failed: %s", e)
             _errors.append({"phase": "universal_header_audit", "error": f"{type(e).__name__}: {e}"})
-            import telemetry
+            from harness import telemetry
             telemetry.record_swallowed_exception("universal_header_audit", e)
 
         async def _probe(exchange, hypothesis, specialty, sb):
@@ -351,26 +351,26 @@ class ChainMixin:
         # iterative agent reaches -- turning its unconfirmed guesses into
         # deterministically CONFIRMED findings (via the Autorize-style replay), so
         # a proven bug lands as `validated` and outranks the model's claims.
-        import identity_headers
-        import access_control_gate
-        from validators.cross_identity_validator import CrossIdentityValidator
-        from validators.browser_xss_validator import BrowserXssValidator
-        from validators.jwt_forge_validator import JwtForgeValidator
-        from validators.ssrf_validator import SsrfValidator
-        from validators.xxe_validator import XxeValidator
-        from validators.command_injection_validator import CommandInjectionValidator
-        from validators.ssti_validator import SstiValidator
-        from validators.path_traversal_validator import PathTraversalValidator
-        from validators.open_redirect_validator import OpenRedirectValidator
-        from validators.sequence_validator import SequenceValidator
-        from validators.deserialization_oob_validator import DeserializationOobValidator
-        from validators.auth_sequence_validator import AuthSequenceValidator
-        from validators.stored_xss_validator import StoredXssValidator
-        from validators.rate_limit_validator import RateLimitValidator
-        from validators.reset_token_validator import ResetTokenValidator
-        from validators.dom_xss_validator import DomXssValidator
-        from validators.toctou_validator import ToctouValidator
-        from models import Finding
+        from harness import identity_headers
+        from harness import access_control_gate
+        from harness.validators.cross_identity_validator import CrossIdentityValidator
+        from harness.validators.browser_xss_validator import BrowserXssValidator
+        from harness.validators.jwt_forge_validator import JwtForgeValidator
+        from harness.validators.ssrf_validator import SsrfValidator
+        from harness.validators.xxe_validator import XxeValidator
+        from harness.validators.command_injection_validator import CommandInjectionValidator
+        from harness.validators.ssti_validator import SstiValidator
+        from harness.validators.path_traversal_validator import PathTraversalValidator
+        from harness.validators.open_redirect_validator import OpenRedirectValidator
+        from harness.validators.sequence_validator import SequenceValidator
+        from harness.validators.deserialization_oob_validator import DeserializationOobValidator
+        from harness.validators.auth_sequence_validator import AuthSequenceValidator
+        from harness.validators.stored_xss_validator import StoredXssValidator
+        from harness.validators.rate_limit_validator import RateLimitValidator
+        from harness.validators.reset_token_validator import ResetTokenValidator
+        from harness.validators.dom_xss_validator import DomXssValidator
+        from harness.validators.toctou_validator import ToctouValidator
+        from harness.models import Finding
         host = urlsplit(base_url).hostname or ""
         if run_context is not None:
             declarations = ((self.config.get("engagement", {}) or {})
@@ -420,7 +420,7 @@ class ChainMixin:
         # confirmation_cache_key() -- which includes the IDENTITY (auth headers)
         # and finding subtype, not just (validator, method, url, body), so a probe
         # AS one identity never returns a result computed AS another (R03).
-        from validators.base import ValidationResult as _VR
+        from harness.validators.base import ValidationResult as _VR
         _confirmation_cache: dict[tuple, _VR] = {}
 
         async def _cached_validate(validator, finding_obj, exchange):
@@ -683,8 +683,10 @@ class ChainMixin:
         # mutating write, so this is gated on allow_mutating_replay; inert by
         # default. Confirmed pairs fold in as confirmed findings.
         try:
-            import json as _json, chaining as _chaining, second_order as _so
-            from safety_gate import GatedAsyncClient as _GAC, get_default_gate as _gg2
+            import json as _json
+            import harness.chaining as _chaining
+            import harness.second_order as _so
+            from harness.safety_gate import GatedAsyncClient as _GAC, get_default_gate as _gg2
             if _gg2().config.allow_mutating_replay:
                 _MARK_FIELDS = ("q", "name", "value", "comment", "data", "note", "subject", "title")
                 # R13: plant AS an authenticated attacker/owner (never anonymously),
@@ -824,7 +826,7 @@ class ChainMixin:
         # not_detected. The coverage-driver path records live leg outcomes cell-by-cell.
         coverage: dict = {}
         try:
-            import coverage_tracker
+            from harness import coverage_tracker
             investigated_paths = {o.get("path") for o in outcomes if o.get("path")}
             investigated_keys = {k for k in state.endpoints
                                  if k.split(" ", 1)[-1] in investigated_paths}
@@ -832,9 +834,9 @@ class ChainMixin:
                 # I1 matrix-driver: build a confirmation->validator map (reusing the
                 # instances above + a few cheap extra legs) and actively fire each
                 # applicable leg-backed cell, recording the real leg status.
-                from validators.verb_tamper_validator import VerbTamperValidator
-                from validators.csrf_validator import CsrfValidator
-                from validators.file_upload_validator import FileUploadValidator
+                from harness.validators.verb_tamper_validator import VerbTamperValidator
+                from harness.validators.csrf_validator import CsrfValidator
+                from harness.validators.file_upload_validator import FileUploadValidator
                 _val_by_conf = {
                     "cross_identity": _xval, "jwt_forge": _jwt, "browser_xss": _bxss,
                     "stored_xss": _sxss, "ssrf": _ssrf, "xxe": _xxe,

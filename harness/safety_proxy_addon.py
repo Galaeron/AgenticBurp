@@ -125,7 +125,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-import safety_gate
+from harness import safety_gate
 
 if TYPE_CHECKING:
     from mitmproxy import http

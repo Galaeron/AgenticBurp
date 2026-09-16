@@ -2,8 +2,8 @@ import json
 import unittest
 from pathlib import Path
 
-from models import HttpExchange, AgentReport, Finding
-from confirmation_gate import apply_confirmation_suppression
+from harness.models import HttpExchange, AgentReport, Finding
+from harness.confirmation_gate import apply_confirmation_suppression
 
 
 class TestBlindNegativesRegression(unittest.TestCase):

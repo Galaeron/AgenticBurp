@@ -8,9 +8,9 @@ miss" core and never comes out empty.
 import asyncio
 import unittest
 
-from coordinator import Coordinator, _curated_fallback
-from models import HttpExchange
-from ollama_client import OllamaResult
+from harness.coordinator import Coordinator, _curated_fallback
+from harness.models import HttpExchange
+from harness.ollama_client import OllamaResult
 
 _AGENTS = ["sqli", "xss", "idor", "misconfig", "info_disclosure", "business_logic",
            "auth", "recon", "supply_chain", "ssrf", "xxe", "jwt", "csrf", "crypto"]

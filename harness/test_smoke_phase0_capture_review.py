@@ -38,13 +38,13 @@ import yaml
 
 _HARNESS = Path(__file__).resolve().parent
 
-import store
-import cache
-import coordinator
-import engagement
-from orchestrator import Orchestrator, review_captured_exchanges
-from models import HttpExchange
-from ollama_client import OllamaResult
+from harness import store
+from harness import cache
+from harness import coordinator
+from harness import engagement
+from harness.orchestrator import Orchestrator, review_captured_exchanges
+from harness.models import HttpExchange
+from harness.ollama_client import OllamaResult
 
 
 # An AWS access-key id shape (confidential_info_detector matches \bAKIA[0-9A-Z]{16}\b

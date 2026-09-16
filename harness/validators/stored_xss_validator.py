@@ -31,11 +31,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-import global_throttle
-from models import Finding, HttpExchange
-from safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
-from validators.sqlmap import _looks_like_json, _content_type_of
+from harness.validators.sqlmap import _looks_like_json, _content_type_of
 
 
 def _payloads(nonce: str) -> list[str]:
@@ -160,7 +160,7 @@ class StoredXssValidator(Validator):
         driver = self._driver
         try:
             if driver is None:
-                import browser_driver
+                from harness import browser_driver
                 driver = browser_driver.default_driver()
                 if driver is None:
                     return ""

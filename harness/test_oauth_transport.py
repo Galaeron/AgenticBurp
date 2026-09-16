@@ -2,10 +2,10 @@
 import asyncio
 import unittest
 
-from models import HttpExchange
-from run_context import RunContext
-from test_run_context import _Fixture
-from validators.oauth_validator import OAuthValidator
+from harness.models import HttpExchange
+from harness.run_context import RunContext
+from harness.test_run_context import _Fixture
+from harness.validators.oauth_validator import OAuthValidator
 
 
 def _exchange(base):

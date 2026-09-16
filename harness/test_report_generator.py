@@ -2,9 +2,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import store
-from models import HttpExchange, Finding
-from report_generator import generate_markdown_report, generate_report_for_host, _confidence_label, _basis_note
+from harness import store
+from harness.models import HttpExchange, Finding
+from harness.report_generator import generate_markdown_report, generate_report_for_host, _confidence_label, _basis_note
 
 
 def sample(url="https://example.com/api/x", vulnerability_class="sqli", severity="critical",
@@ -134,8 +134,8 @@ class TestReportStructure(unittest.TestCase):
     def test_every_canonical_category_has_a_remediation_hint(self):
         import sys
         sys.path.insert(0, ".")
-        from categories import CANONICAL_CATEGORIES
-        from report_generator import _REMEDIATION_HINTS
+        from harness.categories import CANONICAL_CATEGORIES
+        from harness.report_generator import _REMEDIATION_HINTS
         missing = [c for c in CANONICAL_CATEGORIES if c not in _REMEDIATION_HINTS and c != "ai_llm" and c != "anomaly"]
         self.assertEqual(missing, [], f"Categories with no remediation guidance: {missing}")
 
@@ -224,7 +224,7 @@ class TestCostAwareRankingOfUnconfirmedFindings(unittest.TestCase):
     """
 
     def _ledger_with_retry_cost(self, tokens: float) -> "EffortLedger":
-        from effort import EffortLedger, CallKind
+        from harness.effort import EffortLedger, CallKind
         ledger = EffortLedger()
         # Record one real VALIDATION_RETRY call so average_tokens returns
         # this real (if synthetic-for-the-test) measured value rather
@@ -305,7 +305,7 @@ class TestCostAwareRankingOfUnconfirmedFindings(unittest.TestCase):
         this case can no longer reach the ranker through it; test the ranker
         directly to keep the guard live.
         """
-        from report_generator import _rank_unconfirmed_by_value_density, ReportFinding
+        from harness.report_generator import _rank_unconfirmed_by_value_density, ReportFinding
 
         def rf(evidence, confidence):
             return ReportFinding(url="https://x/a", vulnerability_class="sqli", severity="critical",

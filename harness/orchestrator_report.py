@@ -8,7 +8,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
-from orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 
 
 class ReportMixin:
@@ -27,7 +27,7 @@ class ReportMixin:
         real observed averages (falls back to labeled priors before any real
         call). `candidates` are dicts: {id, vulnerability_class, url, severity,
         confidence, priority?}."""
-        import resource_governor
+        from harness import resource_governor
         policy = self.retry_budget_policy.merged_with(policy_overrides)
         cands = self._build_alloc_candidates(candidates)
         round_cost = resource_governor.estimate_round_cost(
@@ -37,7 +37,7 @@ class ReportMixin:
         return plan.to_dict()
 
     def _build_alloc_candidates(self, candidates: list[dict]) -> list:
-        import resource_governor
+        from harness import resource_governor
         return [
             resource_governor.AllocationCandidate(
                 id=str(c.get("id") or c.get("url") or i),
@@ -67,8 +67,8 @@ class ReportMixin:
         failure degrades the whole call to the static ranking. A candidate that
         already carries an explicit priority is left untouched (operator ordering
         wins over the model)."""
-        import resource_governor
-        import allocation_prioritizer
+        from harness import resource_governor
+        from harness import allocation_prioritizer
         policy = self.retry_budget_policy.merged_with(policy_overrides)
         cands = self._build_alloc_candidates(candidates)
 

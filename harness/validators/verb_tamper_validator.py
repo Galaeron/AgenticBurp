@@ -19,9 +19,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import global_throttle
-from models import Finding, HttpExchange
-from safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+from harness import global_throttle
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
 from .injection_targets import replay_headers
 
@@ -49,7 +49,7 @@ class VerbTamperValidator(Validator):
 
     async def _request(self, method: str, url: str, headers: dict):
         if self.run_context is not None:
-            from run_context import TypedRequest
+            from harness.run_context import TypedRequest
             from .transport import bind_session
             session_ref, request_headers = bind_session(self.run_context, headers)
             return await self.run_context.executor().execute(

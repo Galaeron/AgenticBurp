@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.crypto")
 
@@ -80,8 +80,8 @@ class CryptoValidator(Validator):
         return "local_tool"
 
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 

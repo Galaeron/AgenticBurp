@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
-from models import Finding, HttpExchange
+from harness.models import Finding, HttpExchange
 
 _PASSWORD_FIELD_RE = re.compile(r'["\']?(password|passwd|pwd)["\']?\s*[:=]', re.IGNORECASE)
 _IDENTIFIER_FIELD_RE = re.compile(r'["\']?(email|username|user|login|identifier)["\']?\s*[:=]', re.IGNORECASE)

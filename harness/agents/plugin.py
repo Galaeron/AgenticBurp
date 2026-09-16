@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Type
 
 if TYPE_CHECKING:
-    from ollama_client import OllamaClient
+    from harness.ollama_client import OllamaClient
     from .base_agent import BaseAgent
 
 log = logging.getLogger("harness.agents.plugin")
@@ -234,7 +234,7 @@ class AgentPluginSystem:
             
             # Try to import and check for Agent classes
             try:
-                module = importlib.import_module(f"agents.{name}")
+                module = importlib.import_module(f"{__package__}.{name}")  # harness.agents.<name>
                 
                 # Look for classes that inherit from BaseAgent
                 from .base_agent import BaseAgent
@@ -250,7 +250,7 @@ class AgentPluginSystem:
                         if agent_name and not agent_name.startswith('_'):
                             agents.append(AgentMetadata(
                                 name=agent_name,
-                                module_path=f"agents.{name}",
+                                module_path=f"{__package__}.{name}",  # harness.agents.<name>
                                 class_name=attr_name
                             ))
             except Exception as e:

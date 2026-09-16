@@ -25,8 +25,8 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-import global_throttle
-from js_endpoint_extractor import extract_endpoints
+from harness import global_throttle
+from harness.js_endpoint_extractor import extract_endpoints
 
 # <script src="..."> and bare .js references in HTML, to know which bundles to
 # fetch and mine.
@@ -109,7 +109,7 @@ async def crawl(
 
             try:
                 if run_context is not None:
-                    from run_context import TypedRequest
+                    from harness.run_context import TypedRequest
                     request_headers = {k: v for k, v in headers.items()
                                        if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
                     outcome = await run_context.executor().execute(

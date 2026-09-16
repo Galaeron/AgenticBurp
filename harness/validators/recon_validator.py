@@ -15,11 +15,11 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-import security
+from harness import security
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.recon")
 
@@ -128,8 +128,8 @@ class ReconValidator(Validator):
     
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
         """Generate a test plan for recon validation."""
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -461,7 +461,7 @@ class ReconValidator(Validator):
         
         try:
             if self.run_context is not None:
-                from run_context import TypedRequest
+                from harness.run_context import TypedRequest
                 outcome = await self.run_context.executor().execute(
                     TypedRequest(method, url, headers=headers),
                     capability=self.get_name(), max_redirects=self.max_redirects)
@@ -477,7 +477,7 @@ class ReconValidator(Validator):
                     max_redirects=self.max_redirects,
                 )
             
-            import global_throttle
+            from harness import global_throttle
             await global_throttle.acquire()
             response = await self.client.request(method, url, headers=headers)
             return response

@@ -9,8 +9,8 @@ These tests verify:
 5. Stats tracking works
 """
 import unittest
-from models import HttpExchange, AgentReport, Finding
-from fast_path import (
+from harness.models import HttpExchange, AgentReport, Finding
+from harness.fast_path import (
     select_agents_by_url,
     select_agents_by_query_params,
     select_agents_by_request_headers,
@@ -700,14 +700,14 @@ class TestFastPathSelection(unittest.TestCase):
         """The anomaly check covers the request body too, not just the
         response -- a negative quantity is suspicious the moment it's
         sent, before the server even responds."""
-        from fast_path import select_agents_by_body_anomalies
+        from harness.fast_path import select_agents_by_body_anomalies
         agents = select_agents_by_body_anomalies('{"quantity": -5}', "")
         self.assertIn("business_logic", agents)
 
     def test_positive_money_fields_do_not_trigger_anomaly(self):
         """A normal, positive price/quantity must not falsely trigger --
         this is a precision check on the new anomaly detector."""
-        from fast_path import select_agents_by_body_anomalies
+        from harness.fast_path import select_agents_by_body_anomalies
         agents = select_agents_by_body_anomalies("", '{"total_price": 69.0, "quantity": 2}')
         self.assertEqual(agents, set())
 
@@ -716,12 +716,12 @@ class TestFastPathSelection(unittest.TestCase):
         with money or quantity (e.g. a temperature or a coordinate)
         must not trigger -- the field name match is what makes this
         precise rather than a blanket 'any negative number' rule."""
-        from fast_path import select_agents_by_body_anomalies
+        from harness.fast_path import select_agents_by_body_anomalies
         agents = select_agents_by_body_anomalies("", '{"temperature_celsius": -5, "latitude": -12.3}')
         self.assertEqual(agents, set())
 
     def test_non_json_body_does_not_crash_anomaly_check(self):
-        from fast_path import select_agents_by_body_anomalies
+        from harness.fast_path import select_agents_by_body_anomalies
         agents = select_agents_by_body_anomalies("not json at all", "<html>also not json</html>")
         self.assertEqual(agents, set())
 
@@ -906,7 +906,7 @@ class TestFastPathSelector(unittest.TestCase):
     
     def test_early_termination_tracking(self):
         """Early terminations should be tracked."""
-        from models import AgentReport, Finding
+        from harness.models import AgentReport, Finding
         
         # Update config to allow early termination with 1 report
         self.selector.early_term_config = EarlyTerminationConfig(

@@ -31,12 +31,12 @@ import yaml
 
 _HARNESS = Path(__file__).resolve().parent
 
-import store
-import cache
-import engagement
-from orchestrator import Orchestrator
-from role_crawl import RoleSession
-from validators.jwt_forge_validator import _b64url_encode, _b64url_decode
+from harness import store
+from harness import cache
+from harness import engagement
+from harness.orchestrator import Orchestrator
+from harness.role_crawl import RoleSession
+from harness.validators.jwt_forge_validator import _b64url_encode, _b64url_decode
 import json
 
 
@@ -146,7 +146,7 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         # it so a stray derivation can't reach for a real model.
         orch.run_active_probe = AsyncMock(return_value={
             "iterative_result": {"stop_reason": "gave_up", "findings": []}, "integration": {}})
-        with patch("engagement_builder.build_engagement", side_effect=_canned_engagement), \
+        with patch("harness.engagement_builder.build_engagement", side_effect=_canned_engagement), \
              patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=_responder(vulnerable)):
             return asyncio.run(orch.investigate_engagement(
                 BASE_URL, ROLES, max_nodes=max_nodes, step_budget=4, max_chain_rounds=0))
@@ -231,7 +231,7 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
     def _proof_rows():
         """All persisted proof rows (run_id, case_id, check_id, param loc/name,
         verdict) -- read straight from the store DB the test scoped to a temp file."""
-        import store
+        from harness import store
         conn = store._connect()
         try:
             return conn.execute(
@@ -283,7 +283,7 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         # R30: a phase that blows up is caught (never sinks the run) but must be
         # SURFACED -- the result declares degraded + records the error, rather than
         # looking like a clean run that silently skipped coverage.
-        import coverage_tracker
+        from harness import coverage_tracker
         with patch.object(coverage_tracker, "build_coverage", side_effect=RuntimeError("boom")):
             result = self._run(vulnerable=True)
         self.assertTrue(result.get("degraded"))
@@ -306,7 +306,7 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
     def test_declared_workflow_runs_through_investigate_production_caller(self):
         """T07 wiring: the existing investigate job invokes the declared-workflow
         adapter with its invocation-local RunContext and returns the result."""
-        from run_context import RunContext
+        from harness.run_context import RunContext
         cfg = _test_config()
         cfg.setdefault("engagement", {})["declared_workflows"] = [{
             "id": "wf", "steps": [{"id": "read", "method": "GET",
@@ -317,8 +317,8 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         ctx = RunContext.create(run_id="workflow-run", config=cfg, allowed_hosts=["localhost"])
         fake = SimpleNamespace(to_dict=lambda: {"workflow_id": "wf", "version": 1,
                                                 "complete": True, "steps": []})
-        with patch("engagement_builder.build_engagement", side_effect=_canned_engagement), \
-             patch("engagement_builder.execute_declared_workflows",
+        with patch("harness.engagement_builder.build_engagement", side_effect=_canned_engagement), \
+             patch("harness.engagement_builder.execute_declared_workflows",
                    new_callable=AsyncMock, return_value=[fake]) as execute, \
              patch("httpx.AsyncClient.get", new_callable=AsyncMock,
                    side_effect=_responder(False)):
@@ -344,8 +344,8 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_parameter_case_coordinates_reach_the_proof(self):
-        from coverage_model import CHECKS_BY_ID, CaseKey
-        from run_context import RunContext
+        from harness.coverage_model import CHECKS_BY_ID, CaseKey
+        from harness.run_context import RunContext
         orch = Orchestrator(_test_config())
         ctx = RunContext.create(run_id="coverage-run-A", config=_test_config(),
                                 allowed_hosts=["localhost"])
@@ -370,8 +370,8 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
         self.assertEqual(rows[0]["verdict"], "confirmed")
 
     def test_repeated_occurrence_folds_into_proof_name(self):
-        from coverage_model import CHECKS_BY_ID, CaseKey
-        from run_context import RunContext
+        from harness.coverage_model import CHECKS_BY_ID, CaseKey
+        from harness.run_context import RunContext
         orch = Orchestrator(_test_config())
         ctx = RunContext.create(run_id="coverage-run-B", config=_test_config(),
                                 allowed_hosts=["localhost"])

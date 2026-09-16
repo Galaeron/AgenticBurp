@@ -3,10 +3,10 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-import scope_discovery
-from models import Finding, HttpExchange
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
+from harness import scope_discovery
+from harness.models import Finding, HttpExchange
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
 
 
 def _confirmed_finding(vulnerability_class="sqli"):

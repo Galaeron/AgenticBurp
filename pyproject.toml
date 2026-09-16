@@ -1,12 +1,19 @@
 # Project metadata, dependency declaration, and tooling config.
 #
-# NOTE ON PACKAGING: the harness/ modules are currently flat top-level imports
-# (`import store`, `import orchestrator`, ...), so this is intentionally NOT yet a
-# pip-installable distribution -- there is no [build-system] table, so nothing
-# tries to build a (broken) wheel. Producing a real distributable needs the
-# harness/ -> proper-package restructure (relative/absolute `harness.*` imports),
-# a follow-up tracked in SESSION_4_PLAN.md. Until then this file centralizes the
-# dependency pins (mirroring harness/requirements*.txt) and the test config.
+# PACKAGING (W-18): the harness/ modules are now a proper importable package with
+# absolute `harness.*` imports (was: flat `import store`, ...), so this IS a
+# pip-installable distribution -- the [build-system] table below builds a real
+# wheel via setuptools. Run the test suite from the repository ROOT:
+#
+#     python -m unittest discover -t . -s harness -p "test_*.py"
+#
+# (the old `cd harness && python -m unittest discover` no longer works, because the
+# modules import each other as `harness.*` and so need the repo root on sys.path).
+# The server runs as `python -m harness.server` or `uvicorn harness.server:app`.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "burp-llm-harness"
@@ -26,8 +33,13 @@ browser = ["playwright>=1.40"]   # browser XSS validator (lazy; skips if absent)
 proxy = ["mitmproxy==12.2.3"]    # safety proxy addon
 dev = ["pytest==9.1.1"]
 
+[tool.setuptools.packages.find]
+# The import package is `harness` (distribution name stays burp-llm-harness).
+# Picks up harness + harness.agents/validators/testing_fixtures via their __init__.py.
+include = ["harness*"]
+
 [tool.pytest.ini_options]
 # The suite is stdlib unittest; pytest can also run it. Discovery matches the
-# unittest pattern so `pytest harness` and `python -m unittest discover` agree.
+# unittest pattern so `pytest harness` and the unittest discover command agree.
 testpaths = ["harness"]
 python_files = ["test_*.py"]

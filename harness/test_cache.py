@@ -17,8 +17,8 @@ import json
 from pathlib import Path
 import threading
 
-from models import HttpExchange, AnalysisResponse, Finding, AgentReport
-from cache import ExchangeCache, CacheStats, CacheEntry
+from harness.models import HttpExchange, AnalysisResponse, Finding, AgentReport
+from harness.cache import ExchangeCache, CacheStats, CacheEntry
 
 
 class TestExchangeHashing(unittest.TestCase):

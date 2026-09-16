@@ -1,8 +1,8 @@
 """Tests for the verbose-error / stack-trace / debug-info detector."""
 import unittest
 
-from models import HttpExchange
-from validators.verbose_error_validator import (
+from harness.models import HttpExchange
+from harness.validators.verbose_error_validator import (
     scan_exchange, findings_from_exchange, extract_disclosed_paths,
 )
 

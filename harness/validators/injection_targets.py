@@ -11,8 +11,8 @@ the low-level primitives; this wraps them with enumeration and a body/URL rebuil
 """
 from __future__ import annotations
 
-from models import HttpExchange
-from validators.sqlmap import (
+from harness.models import HttpExchange
+from harness.validators.sqlmap import (
     _query_top_level_params, _json_top_level_params, _form_top_level_params,
     _mutate_query_param, _mutate_json_param, _mutate_form_param,
     _looks_like_json, _content_type_of,

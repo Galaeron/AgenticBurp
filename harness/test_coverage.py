@@ -17,10 +17,10 @@ _tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _tmp_db.close()
 os.environ["HARNESS_TEST_DB_PATH"] = _tmp_db.name
 
-import store  # noqa: E402
+from harness import store  # noqa: E402
 store._DB_PATH = __import__("pathlib").Path(_tmp_db.name)
 
-from models import HttpExchange, Finding, TestPlan, ValidationSubmission  # noqa: E402
+from harness.models import HttpExchange, Finding, TestPlan, ValidationSubmission  # noqa: E402
 
 
 def _exchange(url="https://target.test/basket/1"):
@@ -164,7 +164,7 @@ class CoverageLedgerTests(unittest.TestCase):
         self.assertEqual(auth["status"], "not_dispatched")
 
     def test_report_covers_every_canonical_category_exactly_once(self):
-        from categories import CANONICAL_CATEGORIES
+        from harness.categories import CANONICAL_CATEGORIES
         report = store.coverage_report("target.test")
         categories_seen = [r["category"] for r in report]
         self.assertEqual(sorted(categories_seen), sorted(CANONICAL_CATEGORIES))

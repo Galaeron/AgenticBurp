@@ -10,8 +10,8 @@ unnecessarily.
 """
 import unittest
 
-from models import HttpExchange
-from validators.recon_validator import ReconResult, ReconValidator
+from harness.models import HttpExchange
+from harness.validators.recon_validator import ReconResult, ReconValidator
 
 
 class SensitiveHeaderValueRedactionTests(unittest.TestCase):

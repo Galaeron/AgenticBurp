@@ -5,7 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
-from workflow_engine import (
+from harness.workflow_engine import (
     Assertion, Extractor, ExtractorKind, StepStatus, Workflow, WorkflowResult,
     WorkflowStep, bind_template, execute_misuse_variant, execute_workflow,
     extract_all, json_pointer, misuse_variants, MisuseVariant,
@@ -245,8 +245,8 @@ class RealTransportWorkflowTests(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         base = f"http://127.0.0.1:{server.server_port}"
-        from run_context import RunContext
-        import engagement_builder
+        from harness.run_context import RunContext
+        from harness import engagement_builder
         ctx = RunContext.create(allowed_hosts=["127.0.0.1"],
                                 gate_config={"active_enabled": True, "allow_mutating_replay": True})
         ctx.sessions.register("alice", "alice", {"Cookie": "session=alice"}, allowed_origins=[base])
@@ -265,7 +265,8 @@ class RealTransportWorkflowTests(unittest.TestCase):
           ]}
         try:
             if variant:
-                wf = __import__("workflow_engine").workflow_from_dict(declaration)
+                wf = __import__("harness.workflow_engine",
+                                fromlist=["workflow_from_dict"]).workflow_from_dict(declaration)
                 result = asyncio.run(execute_misuse_variant(
                     wf, variant, ctx, initial_values={"id":"1"}))
             else:

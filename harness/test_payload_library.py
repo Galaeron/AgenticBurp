@@ -1,5 +1,5 @@
 import unittest
-from payload_library import next_candidate, library_exhausted, llm_fallback_prompt, _LIBRARY
+from harness.payload_library import next_candidate, library_exhausted, llm_fallback_prompt, _LIBRARY
 
 
 class NextCandidateTests(unittest.TestCase):

@@ -2,9 +2,9 @@
 import asyncio
 import unittest
 
-from run_context import RunContext
-from test_run_context import _Fixture
-from validators.web_cache_poisoning_validator import WebCachePoisoningValidator
+from harness.run_context import RunContext
+from harness.test_run_context import _Fixture
+from harness.validators.web_cache_poisoning_validator import WebCachePoisoningValidator
 
 
 class WebCacheTransportTests(unittest.TestCase):

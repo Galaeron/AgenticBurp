@@ -13,7 +13,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from run_context import RunContext, ScopePolicy, TypedRequest
+from harness.run_context import RunContext, ScopePolicy, TypedRequest
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -360,7 +360,7 @@ class CrossIdentityExecutorMigrationTests(unittest.TestCase):
         self.srv.close()
 
     def _validator(self, ctx):
-        from validators.cross_identity_validator import CrossIdentityValidator
+        from harness.validators.cross_identity_validator import CrossIdentityValidator
         return CrossIdentityValidator(allowed_hosts=["127.0.0.1"], run_context=ctx)
 
     def test_probe_sends_through_executor_and_counts_budget(self):

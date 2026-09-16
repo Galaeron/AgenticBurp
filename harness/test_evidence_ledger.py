@@ -1,8 +1,8 @@
 """W-24: the append-only evidence ledger reconstructs a finding's causal chain."""
 import unittest
 
-import evidence_ledger as el
-from evidence_ledger import EventType, EvidenceLedger, LedgerEvent, Provenance
+import harness.evidence_ledger as el
+from harness.evidence_ledger import EventType, EvidenceLedger, LedgerEvent, Provenance
 
 
 class ProvenanceTests(unittest.TestCase):

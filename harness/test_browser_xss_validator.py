@@ -3,11 +3,11 @@ import asyncio
 import re
 import unittest
 
-import global_throttle
-import browser_driver
-from browser_driver import ExecutionObservation
-from models import Finding, HttpExchange
-from validators.browser_xss_validator import BrowserXssValidator
+from harness import global_throttle
+from harness import browser_driver
+from harness.browser_driver import ExecutionObservation
+from harness.models import Finding, HttpExchange
+from harness.validators.browser_xss_validator import BrowserXssValidator
 
 _NONCE = re.compile(r"HARNESSXSS[0-9a-f]+")
 

@@ -9,10 +9,10 @@ firing every agent on every exchange is observable.
 import asyncio
 import unittest
 
-import coordinator
-from coordinator import Coordinator
-from models import HttpExchange
-from ollama_client import OllamaResult
+from harness import coordinator
+from harness.coordinator import Coordinator
+from harness.models import HttpExchange
+from harness.ollama_client import OllamaResult
 
 _EXCHANGE = HttpExchange(
     url="http://localhost/x",

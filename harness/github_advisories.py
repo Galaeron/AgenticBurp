@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from models import ComponentCandidate
+from harness.models import ComponentCandidate
 
 log = logging.getLogger("harness.github_advisories")
 

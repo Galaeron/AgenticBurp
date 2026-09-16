@@ -30,10 +30,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from .base import Validator, ValidationResult
-from safety_gate import get_default_gate
+from harness.safety_gate import get_default_gate
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.race_condition")
 
@@ -93,8 +93,8 @@ class RaceConditionValidator(Validator):
         return "local_tool"
 
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -153,7 +153,7 @@ class RaceConditionValidator(Validator):
                 try:
                     if self.run_context is not None:
                         from types import SimpleNamespace
-                        from run_context import TypedRequest
+                        from harness.run_context import TypedRequest
                         from .transport import bind_session
                         session_ref, request_headers = bind_session(self.run_context, headers)
                         result = await self.run_context.executor().execute(

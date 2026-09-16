@@ -2,7 +2,7 @@ import json
 import unittest
 import httpx
 
-from ollama_client import OllamaClient, OllamaError, OllamaModelNotFoundError
+from harness.ollama_client import OllamaClient, OllamaError, OllamaModelNotFoundError
 
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -16,7 +16,7 @@ def _make_client(testcase: unittest.TestCase, handler) -> OllamaClient:
             kwargs["transport"] = httpx.MockTransport(handler)
             super().__init__(*args, **kwargs)
 
-    import ollama_client as mod
+    import harness.ollama_client as mod
     mod.httpx.AsyncClient = PatchedAsyncClient
     # httpx is a shared module object, so this assignment affects every transport
     # user in the process.  Restore it after EACH test; module cleanup registered
@@ -127,12 +127,12 @@ class ModelNotFoundDoesNotTripSharedBreakerTests(unittest.IsolatedAsyncioTestCas
     """
 
     def setUp(self):
-        import circuit_breaker as cb_module
+        import harness.circuit_breaker as cb_module
         self._original_registry = cb_module._registry
         cb_module._registry = None
 
     def tearDown(self):
-        import circuit_breaker as cb_module
+        import harness.circuit_breaker as cb_module
         cb_module._registry = self._original_registry
 
     async def test_404_raises_model_not_found_subclass(self):

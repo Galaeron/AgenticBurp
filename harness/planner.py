@@ -1,6 +1,6 @@
 from __future__ import annotations
-from models import Finding, HttpExchange, TestPlan
-from categories import canonicalize
+from harness.models import Finding, HttpExchange, TestPlan
+from harness.categories import canonicalize
 import hashlib
 
 # Declarative capabilities that the Burp execution plane can implement without

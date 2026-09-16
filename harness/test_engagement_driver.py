@@ -5,9 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import store
-import engagement
-from engagement import EngagementState
+from harness import store
+from harness import engagement
+from harness.engagement import EngagementState
 
 
 def _seed_state(host="shop.test"):
@@ -24,7 +24,7 @@ def _seed_state(host="shop.test"):
 class DriverPlanTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import server as server_module
+        import harness.server as server_module
         cls.orch = server_module.orchestrator
 
     def setUp(self):
@@ -77,7 +77,7 @@ class DriverPlanTests(unittest.TestCase):
     def test_replanning_loop_bounded_and_dedups(self):
         # The loop should not re-fetch the same target across rounds; with a
         # single funded endpoint it converges after one productive round.
-        import global_throttle
+        from harness import global_throttle
         global_throttle.configure(0)
         store.save_engagement("shop.test", _seed_state().to_dict())
         self.orch.allowed_hosts = ["shop.test"]
@@ -92,7 +92,7 @@ class DriverPlanTests(unittest.TestCase):
             return _Resp()
 
         async def fake_analyze(exchange, *a, **k):
-            from models import AnalysisResponse
+            from harness.models import AnalysisResponse
             return AnalysisResponse(coordinator_model="m", dispatched_agents=[], agent_reports=[],
                                     summary="", test_plans=[])
         try:
@@ -106,7 +106,7 @@ class DriverPlanTests(unittest.TestCase):
             self.orch.engagement_driver_execute = False
 
     def test_execute_runs_when_enabled(self):
-        import global_throttle
+        from harness import global_throttle
         global_throttle.configure(0)
         store.save_engagement("shop.test", _seed_state().to_dict())
         self.orch.allowed_hosts = ["shop.test"]
@@ -122,7 +122,7 @@ class DriverPlanTests(unittest.TestCase):
 
         # analyze is heavy (real agents) -- stub it; we're testing the driver loop.
         async def fake_analyze(exchange, *a, **k):
-            from models import AnalysisResponse
+            from harness.models import AnalysisResponse
             return AnalysisResponse(coordinator_model="m", dispatched_agents=[], agent_reports=[],
                                     summary="", test_plans=[])
         try:
@@ -142,7 +142,7 @@ class DriverEndpointTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.orig = store._DB_PATH
         store._DB_PATH = Path(self.tmp.name) / "t.db"
-        import server as server_module
+        import harness.server as server_module
         self.server_module = server_module
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")

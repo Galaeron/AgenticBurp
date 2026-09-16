@@ -2,11 +2,11 @@
 import asyncio
 import unittest
 
-from models import Finding, HttpExchange
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
-from validators.race_condition_validator import RaceConditionValidator
-from validators.registry import ValidatorRegistry
+from harness.models import Finding, HttpExchange
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
+from harness.validators.race_condition_validator import RaceConditionValidator
+from harness.validators.registry import ValidatorRegistry
 
 
 def _finding():

@@ -6,12 +6,12 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from models import Finding, HttpExchange
-from safety_gate import SafetyGate, SafetyGateConfig, get_default_gate, reset_default_gate
-from validators.rate_limit_validator import RateLimitValidator
-from validators.reset_token_validator import ResetTokenValidator, analyze_tokens, _max_entropy_bits
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import SafetyGate, SafetyGateConfig, get_default_gate, reset_default_gate
+from harness.validators.rate_limit_validator import RateLimitValidator
+from harness.validators.reset_token_validator import ResetTokenValidator, analyze_tokens, _max_entropy_bits
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
 
 
 def _finding(vc):
@@ -94,8 +94,8 @@ class ResetTokenValidatorTests(unittest.TestCase):
                                         _ex(url="http://evil.test/reset")))
         self.assertEqual(r.status, "skipped")
 
-    @patch("validators.reset_token_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.reset_token_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_sequential_tokens_are_observation_not_confirmed(self, _t, mock_cls):
         # RETIRED (review 2026-09-09): a small-sample predictability PATTERN is an
         # observation; confirming needs a holdout prediction/acceptance test.
@@ -113,8 +113,8 @@ class ResetTokenValidatorTests(unittest.TestCase):
         self.assertFalse(r.confirmed)
         self.assertIn("holdout", r.summary.lower())
 
-    @patch("validators.reset_token_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.reset_token_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_not_confirmed_strong_tokens(self, _t, mock_cls):
         toks = ["Zx9Ke2Lm4Np7Qr1St3Uv5Wx8Yz0Ab2Cd4Ef6Gh8Ij0",
                 "Kq2Lr4Mt6Nv8Pw0Qx2Ry4Sz6Ta8Ub0Vc2Wd4Xe6Yf8",
@@ -129,8 +129,8 @@ class ResetTokenValidatorTests(unittest.TestCase):
                                         _ex(url="http://target.test/api/reset")))
         self.assertEqual(r.status, "not_confirmed")
 
-    @patch("validators.reset_token_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.reset_token_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_skip_when_no_token_observable(self, _t, mock_cls):
         it = iter([_resp(200, '{"status":"sent"}')] * 3)
         client = AsyncMock()
@@ -192,8 +192,8 @@ class RateLimitValidatorTests(unittest.TestCase):
         self.assertEqual(r.status, "skipped")
         self.assertIn("below 2", r.summary)
 
-    @patch("validators.rate_limit_validator.httpx.AsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.rate_limit_validator.httpx.AsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_reduced_burst_is_observation_not_confirmed(self, _t, mock_cls):
         # RETIRED (review 2026-09-09): a small un-throttled burst is an observation,
         # never a confirmed rate-limit bypass.
@@ -209,8 +209,8 @@ class RateLimitValidatorTests(unittest.TestCase):
         self.assertFalse(r.confirmed)
         self.assertIn("observation", r.summary.lower())
 
-    @patch("validators.rate_limit_validator.httpx.AsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.rate_limit_validator.httpx.AsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_full_burst_no_throttle_is_observation_not_confirmed(self, _t, mock_cls):
         # RETIRED (review 2026-09-09): replaying a VALID request N times without a
         # 429 is an observation, not a confirmed lockout/rate-limit bypass.
@@ -226,8 +226,8 @@ class RateLimitValidatorTests(unittest.TestCase):
         self.assertFalse(r.confirmed)
         self.assertIn("observation", r.summary.lower())
 
-    @patch("validators.rate_limit_validator.httpx.AsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.rate_limit_validator.httpx.AsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_not_confirmed_when_429(self, _t, mock_cls):
         self._gate(20)
         v = RateLimitValidator(allowed_hosts=["target.test"], min_attempts=5)
@@ -258,7 +258,7 @@ class RateLimitValidatorTests(unittest.TestCase):
 
 class RegistryTests(unittest.TestCase):
     def test_new_legs_registered_and_active(self):
-        from validators.registry import ValidatorRegistry
+        from harness.validators.registry import ValidatorRegistry
         reg = ValidatorRegistry({"validators": {"active_enabled": True}})
         self.assertIn("rate_limit", reg.validators)
         self.assertIn("reset_token", reg.validators)
@@ -270,7 +270,7 @@ class RegistryTests(unittest.TestCase):
 
 class AuthSequenceRoutingTests(unittest.TestCase):
     def test_generic_broken_auth_on_login_runs_enum(self):
-        from validators.auth_sequence_validator import AuthSequenceValidator
+        from harness.validators.auth_sequence_validator import AuthSequenceValidator
         v = AuthSequenceValidator(allowed_hosts=["target.test"])
         checks = v._which_checks("broken_authentication",
                                    _ex(url="http://target.test/api/login",
@@ -279,7 +279,7 @@ class AuthSequenceRoutingTests(unittest.TestCase):
         self.assertIn("fixation", checks)
 
     def test_specific_enum_class_runs_only_enum(self):
-        from validators.auth_sequence_validator import AuthSequenceValidator
+        from harness.validators.auth_sequence_validator import AuthSequenceValidator
         v = AuthSequenceValidator(allowed_hosts=["target.test"])
         checks = v._which_checks("username_enumeration",
                                    _ex(url="http://target.test/api/login",
@@ -287,7 +287,7 @@ class AuthSequenceRoutingTests(unittest.TestCase):
         self.assertEqual(checks, ["enum"])
 
     def test_register_endpoint_runs_weak(self):
-        from validators.auth_sequence_validator import AuthSequenceValidator
+        from harness.validators.auth_sequence_validator import AuthSequenceValidator
         v = AuthSequenceValidator(allowed_hosts=["target.test"])
         checks = v._which_checks("broken_authentication",
                                    _ex(url="http://target.test/api/register",

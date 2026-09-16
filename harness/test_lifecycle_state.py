@@ -10,9 +10,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import confirmation_gate as cg
-import store
-from models import HttpExchange, Finding
+import harness.confirmation_gate as cg
+from harness import store
+from harness.models import HttpExchange, Finding
 
 
 class LifecycleStateMappingTests(unittest.TestCase):
@@ -75,7 +75,7 @@ class LifecycleStateAfterGateTests(unittest.TestCase):
     suppression gate demotes is never CONFIRMED and reads as LEAD/SUSPECTED."""
 
     def test_gate_demotion_yields_non_confirmed_state(self):
-        from models import AgentReport
+        from harness.models import AgentReport
         # A live-verified class (sqli) with a controlled negative -> REFUTED.
         f = Finding(vulnerability_class="sqli", confidence=0.9, severity="high",
                     summary="maybe sqli", evidence="e", suggested_test="t", basis="derived")

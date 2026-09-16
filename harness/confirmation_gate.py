@@ -32,7 +32,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from models import AgentReport, Finding, ValidationReport
+    from harness.models import AgentReport, Finding, ValidationReport
 
 log = logging.getLogger("harness.confirmation_gate")
 
@@ -360,7 +360,7 @@ def _controlled_negative_classes(validation_reports: list | None) -> set:
     separates a refutation ("a reliable leg ran and said no") from a leg that
     never produced a verdict (skipped / error / disabled / absent), which is NOT
     evidence of a false positive and must not be labelled as one."""
-    from categories import canonicalize
+    from harness.categories import canonicalize
     neg: set = set()
     for vr in validation_reports or []:
         status = (getattr(vr, "status", "") or "").lower()
@@ -400,7 +400,7 @@ def apply_confirmation_suppression(
     """
     demoted = 0
     negatives = _controlled_negative_classes(validation_reports)
-    from categories import canonicalize as _canon
+    from harness.categories import canonicalize as _canon
 
     for report in reports:
         for finding in report.findings:

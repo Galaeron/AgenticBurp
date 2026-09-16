@@ -3,11 +3,11 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from models import Finding, HttpExchange
-from safety_gate import get_default_gate, reset_default_gate
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
-from validators.sqlmap import (
+from harness.models import Finding, HttpExchange
+from harness.safety_gate import get_default_gate, reset_default_gate
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
+from harness.validators.sqlmap import (
     SqlmapValidator,
     _json_top_level_params,
     _mutate_json_param,
@@ -416,7 +416,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         v = SqlmapValidator(binary="sqlmap")
         exchange = _login_exchange()  # POST, 2xx baseline, password field
         same = httpx.Response(200, content=b"x" * 100, request=httpx.Request("POST", exchange.url))
-        with patch("validators.sqlmap.subprocess.run",
+        with patch("harness.validators.sqlmap.subprocess.run",
                    return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
              patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=same):
             result = await v.validate(_finding(), exchange)
@@ -430,7 +430,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         exchange = _login_exchange()
         big = httpx.Response(200, content=b"x" * 500, request=httpx.Request("POST", exchange.url))
         small = httpx.Response(401, content=b"y" * 5, request=httpx.Request("POST", exchange.url))
-        with patch("validators.sqlmap.subprocess.run",
+        with patch("harness.validators.sqlmap.subprocess.run",
                    return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
              patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[big, small]):
             result = await v.validate(_finding(), exchange)
@@ -442,7 +442,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         # If sqlmap DOES confirm, that result stands -- the secondary never runs.
         v = SqlmapValidator(binary="sqlmap")
         exchange = _login_exchange()
-        with patch("validators.sqlmap.subprocess.run",
+        with patch("harness.validators.sqlmap.subprocess.run",
                    return_value=_FakeProc(returncode=0, stdout="parameter is vulnerable")), \
              patch("httpx.AsyncClient.request", new_callable=AsyncMock) as mock_req:
             result = await v.validate(_finding(), exchange)
@@ -454,7 +454,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         v = SqlmapValidator(binary="sqlmap")
         url = "https://x.test/api/products?id=1"
         exchange = HttpExchange(url=url, method="GET", response_status=200)
-        with patch("validators.sqlmap.subprocess.run",
+        with patch("harness.validators.sqlmap.subprocess.run",
                    return_value=_FakeProc(returncode=1, stdout="not vulnerable")):
             result = await v.validate(_finding(), exchange)
         self.assertNotIn("--ignore-code", result.command)

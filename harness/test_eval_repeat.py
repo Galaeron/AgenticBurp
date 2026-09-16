@@ -1,7 +1,7 @@
 """W-23: repeated eval reports variance and gates on the mean, not one run."""
 import unittest
 
-from eval_repeat import EvalRun, run_repeated
+from harness.eval_repeat import EvalRun, run_repeated
 
 
 def _scorer(recalls, precisions):

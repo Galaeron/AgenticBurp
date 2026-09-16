@@ -2,9 +2,9 @@
 identity × endpoint × check matrix (I1/I2/I5)."""
 import unittest
 
-import engagement
-from coverage_tracker import CoverageTracker, build_coverage, endpoint_view
-from coverage_model import CellStatus
+from harness import engagement
+from harness.coverage_tracker import CoverageTracker, build_coverage, endpoint_view
+from harness.coverage_model import CellStatus
 
 
 class ClassMappingTests(unittest.TestCase):
@@ -172,7 +172,7 @@ class DriveLegsTests(unittest.TestCase):
 
     def _tracker(self):
         import asyncio
-        from coverage_tracker import CoverageTracker, endpoint_view
+        from harness.coverage_tracker import CoverageTracker, endpoint_view
         st = _state_with([
             ("GET", "/api/tickets/{id}", {"reachable_roles": ["user"]}),   # idor -> cross_identity
             ("POST", "/api/search", {"reachable_roles": ["user"]}),         # body-bearing -> sqli/xss/...
@@ -186,8 +186,8 @@ class DriveLegsTests(unittest.TestCase):
         t, _ = self._tracker()
         cells = t.pending_leg_cells()
         # every returned cell must be PENDING + have a deterministic-leg check
-        from coverage_model import CHECKS_BY_ID
-        from coverage_tracker import _LEG_CONFIRMATIONS
+        from harness.coverage_model import CHECKS_BY_ID
+        from harness.coverage_tracker import _LEG_CONFIRMATIONS
         self.assertTrue(cells)
         for ident, ep_key, check in cells:
             self.assertIn(check.confirmation, _LEG_CONFIRMATIONS)
@@ -208,7 +208,7 @@ class DriveLegsTests(unittest.TestCase):
 
         driven = asyncio.run(t.drive_coverage_legs(run_leg, budget=100))
         self.assertGreater(driven, 0)
-        from coverage_model import CellStatus
+        from harness.coverage_model import CellStatus
         idor_cell = t.matrix.get("user", "GET /api/tickets/{id}", "WSTG-ATHZ-04")
         self.assertEqual(idor_cell.status, CellStatus.CONFIRMED)
         # a driven-but-not-confirmed leg cell is NOT_DETECTED (attempted), not pending
@@ -231,7 +231,7 @@ class DriveLegsTests(unittest.TestCase):
 
     def test_build_coverage_driven_reports_legs_driven(self):
         import asyncio
-        from coverage_tracker import build_coverage_driven
+        from harness.coverage_tracker import build_coverage_driven
 
         class _Res:
             status = "not_confirmed"; summary = ""; confidence = None; evidence = ""; validator = "v"
@@ -252,8 +252,8 @@ class PrincipalIdentityTests(unittest.TestCase):
     identities -- role no longer collapses Alice and Bob into one column."""
 
     def test_same_role_principals_are_distinct_identities(self):
-        from role_crawl import RoleSession
-        from coverage_tracker import _identities_of
+        from harness.role_crawl import RoleSession
+        from harness.coverage_tracker import _identities_of
         roles = [RoleSession("user", {"Authorization": "Bearer A"}, name="alice"),
                  RoleSession("user", {"Authorization": "Bearer B"}, name="bob"),
                  RoleSession("anonymous", {})]
@@ -263,11 +263,11 @@ class PrincipalIdentityTests(unittest.TestCase):
         self.assertEqual(identity_roles["bob"], "user")
 
     def test_matrix_keeps_same_role_principals_separate(self):
-        from role_crawl import RoleSession
+        from harness.role_crawl import RoleSession
         st = _state_with([("GET", "/api/tickets/{id}", {"reachable_roles": ["user"]})])
         t = CoverageTracker()
         eps = endpoint_view(st)
-        from coverage_tracker import _identities_of
+        from harness.coverage_tracker import _identities_of
         identities, identity_roles = _identities_of([
             RoleSession("user", {"Authorization": "Bearer A"}, name="alice"),
             RoleSession("user", {"Authorization": "Bearer B"}, name="bob"),
@@ -356,7 +356,7 @@ class CasesDrivenTests(unittest.TestCase):
 
     def test_build_coverage_cases_driven_reports_pending_honestly(self):
         import asyncio
-        from coverage_tracker import build_coverage_cases_driven
+        from harness.coverage_tracker import build_coverage_cases_driven
         st = self._state()
 
         class _Res:

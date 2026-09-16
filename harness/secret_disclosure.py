@@ -25,7 +25,7 @@ import hmac
 import json
 import re
 
-from models import Finding, HttpExchange
+from harness.models import Finding, HttpExchange
 
 # JWT anywhere in a header/body/response: three base64url segments.
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}")

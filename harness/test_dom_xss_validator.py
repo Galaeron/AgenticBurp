@@ -8,10 +8,10 @@ import re
 import unittest
 from urllib.parse import urlsplit
 
-import global_throttle
-from browser_driver import ExecutionObservation
-from models import Finding, HttpExchange
-from validators.dom_xss_validator import DomXssValidator
+from harness import global_throttle
+from harness.browser_driver import ExecutionObservation
+from harness.models import Finding, HttpExchange
+from harness.validators.dom_xss_validator import DomXssValidator
 
 _NONCE = re.compile(r"HARNESSDOM[0-9a-f]+")
 
@@ -113,7 +113,7 @@ class DomXssValidatorTests(unittest.TestCase):
 
 class RegistryTests(unittest.TestCase):
     def test_dom_xss_registered_and_active(self):
-        from validators.registry import ValidatorRegistry
+        from harness.validators.registry import ValidatorRegistry
         reg = ValidatorRegistry({"validators": {"active_enabled": True}})
         self.assertIn("dom_xss", reg.validators)
         self.assertTrue(reg.validators["dom_xss"].active)

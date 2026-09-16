@@ -24,7 +24,7 @@ import httpx
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.csp")
 
@@ -88,8 +88,8 @@ class CspValidator(Validator):
         return "local_tool"
 
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -163,7 +163,7 @@ class CspValidator(Validator):
     async def _fetch_fresh_headers(self, exchange: HttpExchange) -> dict | None:
         try:
             if self.run_context is not None:
-                from run_context import TypedRequest
+                from harness.run_context import TypedRequest
                 outcome = await self.run_context.executor().execute(
                     TypedRequest("GET", exchange.url,
                                  headers={"User-Agent": self.user_agent}),
@@ -172,7 +172,7 @@ class CspValidator(Validator):
             async with httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=True, max_redirects=self.max_redirects,
             ) as client:
-                import global_throttle
+                from harness import global_throttle
                 await global_throttle.acquire()
                 response = await client.get(exchange.url, headers={"User-Agent": self.user_agent})
                 return dict(response.headers)

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 from .base import Validator, ValidationResult
 
 if TYPE_CHECKING:
-    from models import Finding, HttpExchange
+    from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.verbose_error")
 
@@ -89,8 +89,8 @@ class VerboseErrorValidator(Validator):
         return "local_analysis"
 
     def plan(self, finding: "Finding", exchange: "HttpExchange") -> Any:
-        from models import TestPlan
-        from categories import canonicalize
+        from harness.models import TestPlan
+        from harness.categories import canonicalize
         import hashlib
         import json
 
@@ -181,7 +181,7 @@ def scan_exchange(exchange: "HttpExchange") -> list[tuple[str, str, str]]:
 def findings_from_exchange(exchange: "HttpExchange") -> list:
     """Produce Finding objects for any verbose-error patterns in the exchange.
     Called from the orchestrator's deterministic-detector pass."""
-    from models import Finding
+    from harness.models import Finding
 
     matches = scan_exchange(exchange)
     if not matches:

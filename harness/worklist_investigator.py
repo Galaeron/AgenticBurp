@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from urllib.parse import urlsplit
 
-from models import HttpExchange
+from harness.models import HttpExchange
 
 log = logging.getLogger("harness.worklist_investigator")
 

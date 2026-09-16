@@ -1,8 +1,8 @@
 import unittest
 
-import surface_prioritizer
-from models import PrioritizeRequestItem
-from ollama_client import OllamaError
+from harness import surface_prioritizer
+from harness.models import PrioritizeRequestItem
+from harness.ollama_client import OllamaError
 
 
 class FakeOllama:

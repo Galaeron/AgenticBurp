@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import store
-from models import HttpExchange, Finding
+from harness import store
+from harness.models import HttpExchange, Finding
 
 
 class SuppressionEndpointTests(unittest.TestCase):
@@ -31,7 +31,7 @@ class SuppressionEndpointTests(unittest.TestCase):
         # place, and so re-importing per test doesn't accumulate state
         # across tests via Python's module cache.
         import importlib
-        import server as server_module
+        import harness.server as server_module
         importlib.reload(server_module)
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")
@@ -134,7 +134,7 @@ class PrioritizeEndpointTests(unittest.TestCase):
         store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
 
         import importlib
-        import server as server_module
+        import harness.server as server_module
         importlib.reload(server_module)
         self.server_module = server_module
         from fastapi.testclient import TestClient
@@ -192,8 +192,8 @@ class MissingAuthProbeEndpointTests(unittest.TestCase):
         store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
 
         import importlib
-        import global_throttle
-        import server as server_module
+        from harness import global_throttle
+        import harness.server as server_module
         importlib.reload(server_module)
         self.server_module = server_module
         # Scope the probe to a test host; the module-level orchestrator's
@@ -260,7 +260,7 @@ class ActiveProbeEndpointTests(unittest.TestCase):
         store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
 
         import importlib
-        import server as server_module
+        import harness.server as server_module
         importlib.reload(server_module)
         self.server_module = server_module
         server_module.orchestrator.allowed_hosts = ["shop.test"]
@@ -283,9 +283,9 @@ class ActiveProbeEndpointTests(unittest.TestCase):
 
     def test_enabled_runs_and_integrates(self):
         from unittest.mock import patch
-        import iterative_agent
-        from iterative_agent import IterativeResult
-        from models import Finding
+        from harness import iterative_agent
+        from harness.iterative_agent import IterativeResult
+        from harness.models import Finding
 
         self.server_module.orchestrator.iterative_agent_enabled = True
 
@@ -320,7 +320,7 @@ class RetryAgentsEndpointTests(unittest.TestCase):
         self._original_db_path = store._DB_PATH
         store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
         import importlib
-        import server as server_module
+        import harness.server as server_module
         importlib.reload(server_module)
         self.server_module = server_module
         from fastapi.testclient import TestClient
@@ -340,8 +340,8 @@ class RetryAgentsEndpointTests(unittest.TestCase):
 
     def test_retry_loop_stops_on_found(self):
         from unittest.mock import patch
-        from effort import CallKind
-        from models import AgentReport, Finding
+        from harness.effort import CallKind
+        from harness.models import AgentReport, Finding
         orch = self.server_module.orchestrator
         agent_class = next(iter(orch.agent_manager.agents))  # some real agent
 
@@ -370,7 +370,7 @@ class RetryAgentsEndpointTests(unittest.TestCase):
 
     def test_retry_loop_respects_retry_cap(self):
         from unittest.mock import patch
-        from models import AgentReport
+        from harness.models import AgentReport
         orch = self.server_module.orchestrator
         agent_class = next(iter(orch.agent_manager.agents))
 
@@ -404,7 +404,7 @@ class RetryAgentsEndpointTests(unittest.TestCase):
 
     def test_plan_allocation_llm_priority_reorders(self):
         from unittest.mock import AsyncMock, patch
-        import allocation_prioritizer
+        from harness import allocation_prioritizer
         # LLM ranks the low-severity xss ABOVE the critical rce (app context):
         # with no budget cap all are "full", but the ORDER follows priority.
         async def fake_rank(cands, ollama, model, temperature=0.1):
@@ -423,7 +423,7 @@ class RetryAgentsEndpointTests(unittest.TestCase):
 
     def test_plan_allocation_llm_failure_falls_back_to_static(self):
         from unittest.mock import AsyncMock, patch
-        import allocation_prioritizer
+        from harness import allocation_prioritizer
         async def empty_rank(cands, ollama, model, temperature=0.1):
             return {}  # model failed -> no scores
         with patch.object(allocation_prioritizer, "rank", AsyncMock(side_effect=empty_rank)):
@@ -452,7 +452,7 @@ class SettingsValidatorToggleEndpointTests(unittest.TestCase):
         store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
 
         import importlib
-        import server as server_module
+        import harness.server as server_module
         importlib.reload(server_module)
         self.server_module = server_module
         from fastapi.testclient import TestClient
@@ -503,7 +503,7 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         self._original_db_path = store._DB_PATH
         store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
         import importlib
-        import server as server_module
+        import harness.server as server_module
         importlib.reload(server_module)
         self.server = server_module
         self.server.config["runs"] = {"output_dir": self._tmpdir.name,
@@ -617,7 +617,7 @@ class HostHeaderDefenseTests(unittest.TestCase):
         self._original_db_path = store._DB_PATH
         store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
         import importlib
-        import server as server_module
+        import harness.server as server_module
         importlib.reload(server_module)
         from fastapi.testclient import TestClient
         self.server_module = server_module

@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import logging
 
-from categories import canonicalize
-from coverage_model import (
+from harness.categories import canonicalize
+from harness.coverage_model import (
     CHECK_CATALOG, CHECKS_BY_ID, Check, CellStatus, CellResult, CoverageMatrix,
 )
 
@@ -302,7 +302,7 @@ class CoverageTracker:
         it is still exercised. Bounded per cell so a wide body cannot fan out
         unboundedly; over-budget cases stay visible (SKIPPED), never counted as
         tested. Returns the number of cases registered (added + budget-skipped)."""
-        from coverage_model import Phase, NO_PARAMETER_CASE, derive_input_cases_from_template
+        from harness.coverage_model import Phase, NO_PARAMETER_CASE, derive_input_cases_from_template
         total = 0
         for (ident, ep_key, check) in self.pending_leg_cells(driveable):
             ep = endpoints.get(ep_key) or {}

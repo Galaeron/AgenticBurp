@@ -7,7 +7,7 @@ exercises the session/credential resolution, not a real socket.
 import asyncio
 import unittest
 
-import run_context as rc
+import harness.run_context as rc
 
 
 def _run(coro):

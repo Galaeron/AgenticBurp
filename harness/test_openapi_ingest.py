@@ -3,7 +3,7 @@
 import json
 import unittest
 
-import openapi_ingest as oi
+import harness.openapi_ingest as oi
 
 
 _OPENAPI3 = {

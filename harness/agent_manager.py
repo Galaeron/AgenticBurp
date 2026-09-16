@@ -12,9 +12,9 @@ import logging
 from typing import TYPE_CHECKING, Type
 
 if TYPE_CHECKING:
-    from ollama_client import OllamaClient
-    from models import HttpExchange, AgentReport
-    from agents.base_agent import BaseAgent
+    from harness.ollama_client import OllamaClient
+    from harness.models import HttpExchange, AgentReport
+    from harness.agents.base_agent import BaseAgent
 
 log = logging.getLogger("harness.agent_manager")
 
@@ -66,7 +66,7 @@ class AgentManager:
     def _get_plugin_system(self):
         """Get the plugin system instance."""
         if self._plugin_system is None:
-            from agents.plugin import get_plugin_system
+            from harness.agents.plugin import get_plugin_system
             self._plugin_system = get_plugin_system()
         return self._plugin_system
     
@@ -376,7 +376,7 @@ class AgentManager:
         agent = self.get_agent(name)
         if agent is None:
             log.warning(f"Agent {name} not found")
-            from models import AgentReport
+            from harness.models import AgentReport
             return AgentReport(
                 agent=name,
                 model="unknown",
@@ -416,7 +416,7 @@ class AgentManager:
         agent = self.get_agent(name)
         if agent is None:
             log.warning(f"Agent {name} not found")
-            from models import AgentReport
+            from harness.models import AgentReport
             return AgentReport(
                 agent=name,
                 model="unknown",
@@ -472,7 +472,7 @@ class AgentManager:
                 if isinstance(result, Exception):
                     log.error(f"Agent failed with exception: {result}")
                     # Create error report
-                    from models import AgentReport
+                    from harness.models import AgentReport
                     reports.append(AgentReport(
                         agent="unknown",
                         model="unknown",

@@ -15,8 +15,8 @@ from pathlib import Path
 
 from mitmproxy.test import tflow
 
-import safety_gate
-from safety_proxy_addon import (
+from harness import safety_gate
+from harness.safety_proxy_addon import (
     CombinedBurstTracker,
     ProxyConfigurationError,
     SafetyProxyAddon,

@@ -1,7 +1,7 @@
 """Tests for the V1 live activity feed."""
 import unittest
 
-from activity_feed import ActivityFeed
+from harness.activity_feed import ActivityFeed
 
 
 class ActivityFeedTests(unittest.TestCase):
@@ -60,8 +60,8 @@ class ActivityFeedTests(unittest.TestCase):
 
 class ActivityEndpointTests(unittest.TestCase):
     def setUp(self):
-        import server as server_module
-        import activity_feed
+        import harness.server as server_module
+        from harness import activity_feed
         activity_feed.feed.clear()
         self.af = activity_feed
         from fastapi.testclient import TestClient

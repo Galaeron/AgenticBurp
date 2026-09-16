@@ -1,15 +1,8 @@
 import unittest
-import sys
-import os
 
-# Add the harness directory to the path
-_harness_dir = os.path.dirname(os.path.abspath(__file__))
-if _harness_dir not in sys.path:
-    sys.path.insert(0, _harness_dir)
-
-from models import HttpExchange
-import security
-from agents.base_agent import BaseAgent
+from harness.models import HttpExchange
+from harness import security
+from harness.agents.base_agent import BaseAgent
 
 
 class RedactHeadersTests(unittest.TestCase):
@@ -116,7 +109,7 @@ class UserPromptRedactionTests(unittest.TestCase):
         self.assertIn("<script>document.cookie", prompt)  # the sink survived truncation
 
     def test_high_signal_slice_helper(self):
-        from agents.base_agent import _high_signal_slice
+        from harness.agents.base_agent import _high_signal_slice
         body = ("x" * 1000) + "Traceback (most recent call last): boom"
         self.assertIn("Traceback", _high_signal_slice(body, start=500))
         self.assertEqual(_high_signal_slice("nothing interesting here", start=0), "")
@@ -159,7 +152,7 @@ class RoutingPromptRedactionTests(unittest.TestCase):
         }
         
         # Import orchestrator after setting up path
-        import orchestrator
+        from harness import orchestrator
         
         # Create orchestrator with mocked ollama client
         orch = orchestrator.Orchestrator(config)

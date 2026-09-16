@@ -3,12 +3,12 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from models import Finding, HttpExchange
-from validators.verb_tamper_validator import VerbTamperValidator
-from validators.csrf_validator import CsrfValidator, _has_csrf_token, _session_cookie_samesite
-from validators.file_upload_validator import FileUploadValidator
-from run_context import RunContext, ScopePolicy
-from test_run_context import _Fixture
+from harness.models import Finding, HttpExchange
+from harness.validators.verb_tamper_validator import VerbTamperValidator
+from harness.validators.csrf_validator import CsrfValidator, _has_csrf_token, _session_cookie_samesite
+from harness.validators.file_upload_validator import FileUploadValidator
+from harness.run_context import RunContext, ScopePolicy
+from harness.test_run_context import _Fixture
 
 
 def _exchange(url="http://target.test/api/admin", method="GET", status=403,
@@ -47,8 +47,8 @@ class VerbTamperTests(unittest.TestCase):
         r = asyncio.run(self.v.validate(_finding(), ex))
         self.assertEqual(r.status, "skipped")
 
-    @patch("validators.verb_tamper_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.verb_tamper_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_method_bypass_is_observation_not_confirmed(self, _throttle, mock_client_cls):
         # RETIRED (review 2026-09-09): an alternate method returning 2xx is an
         # observation, not a confirmed authz bypass (may be ordinary routing).
@@ -69,13 +69,13 @@ class VerbTamperTests(unittest.TestCase):
     def test_mutating_methods_off_by_default(self):
         self.assertFalse(self.v.try_mutating_methods)
 
-    @patch("validators.verb_tamper_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.verb_tamper_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_mutating_bypass_is_observation_when_opted_in(self, _throttle, mock_client_cls):
         # V15: GET/POST denied but a mutating method (PUT/PATCH/DELETE) is open --
         # only tried under the explicit try_mutating_methods opt-in. RETIRED
         # (review 2026-09-09): this is an observation, not a confirmed bypass.
-        from safety_gate import reset_default_gate, get_default_gate
+        from harness.safety_gate import reset_default_gate, get_default_gate
         reset_default_gate()
         get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
         v = VerbTamperValidator(allowed_hosts=["target.test"], try_mutating_methods=True)
@@ -99,8 +99,8 @@ class VerbTamperTests(unittest.TestCase):
         self.assertFalse(r.confirmed)
         self.assertIn("mutating", r.summary.lower())
 
-    @patch("validators.verb_tamper_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.verb_tamper_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_not_confirmed_all_denied(self, _throttle, mock_client_cls):
         ex = _exchange(method="DELETE", status=401)
         mock_resp = MagicMock()
@@ -168,8 +168,8 @@ class CsrfValidatorTests(unittest.TestCase):
         self.assertEqual(r.status, "not_confirmed")
         self.assertIn("SameSite", r.summary)
 
-    @patch("validators.csrf_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.csrf_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_no_token_no_samesite_is_observation_not_confirmed(self, _throttle, mock_client_cls):
         # RETIRED (review 2026-09-09): a token-strip 2xx replay is an observation,
         # not confirmed CSRF (needs a cross-site browser PoC with ambient creds).
@@ -259,8 +259,8 @@ class RunContextTransportTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    @patch("validators.csrf_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.csrf_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_not_confirmed_replay_rejected(self, _throttle, mock_client_cls):
         ex = _exchange(method="POST", status=200, request_body="action=delete",
                        response_headers={"Set-Cookie": "session=abc; Path=/"})
@@ -296,8 +296,8 @@ class FileUploadTests(unittest.TestCase):
         r = asyncio.run(self.v.validate(_finding("file_upload"), ex))
         self.assertEqual(r.status, "skipped")
 
-    @patch("validators.file_upload_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.file_upload_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_not_confirmed_upload_rejected(self, _throttle, mock_client_cls):
         ex = _exchange(url="http://target.test/api/upload", method="POST", status=200)
         mock_resp = MagicMock()
@@ -311,8 +311,8 @@ class FileUploadTests(unittest.TestCase):
         r = asyncio.run(self.v.validate(_finding("file_upload"), ex))
         self.assertEqual(r.status, "not_confirmed")
 
-    @patch("validators.file_upload_validator.GatedAsyncClient")
-    @patch("global_throttle.acquire", new_callable=AsyncMock)
+    @patch("harness.validators.file_upload_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
     def test_confirmed_html_stored_and_served(self, _throttle, mock_client_cls):
         ex = _exchange(url="http://target.test/api/upload", method="POST", status=200)
         upload_resp = MagicMock()
@@ -338,7 +338,7 @@ class FileUploadTests(unittest.TestCase):
         mock_client_cls.return_value = mock_client
 
         # Patch the nonce to make marker predictable
-        import validators.file_upload_validator as fu_mod
+        import harness.validators.file_upload_validator as fu_mod
         orig_token_hex = None
         nonce = "deadbeef01234567"
 
@@ -359,18 +359,18 @@ class RealWrapperFileUploadTests(unittest.TestCase):
     before any upload request was sent. This test uses the real wrapper + gate."""
 
     def setUp(self):
-        import safety_gate
+        from harness import safety_gate
         safety_gate.reset_default_gate()
         safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
         self.v = FileUploadValidator(allowed_hosts=["target.test"])
 
     def tearDown(self):
-        import safety_gate
+        from harness import safety_gate
         safety_gate.reset_default_gate()
 
     def _validate_with(self, handler):
         import httpx
-        import validators.file_upload_validator as fu_mod
+        import harness.validators.file_upload_validator as fu_mod
         real_cls = fu_mod.GatedAsyncClient
 
         def _factory(gate, name, **kw):
@@ -380,7 +380,7 @@ class RealWrapperFileUploadTests(unittest.TestCase):
 
         ex = _exchange(url="http://target.test/api/upload", method="POST", status=200)
         with patch.object(fu_mod, "GatedAsyncClient", _factory), \
-                patch("global_throttle.acquire", new_callable=AsyncMock):
+                patch("harness.global_throttle.acquire", new_callable=AsyncMock):
             return asyncio.run(self.v.validate(_finding("file_upload"), ex))
 
     def test_confirmed_through_real_gated_wrapper(self):
@@ -413,7 +413,8 @@ class RealWrapperFileUploadTests(unittest.TestCase):
 
     def test_blocked_when_mutating_not_authorized(self):
         # With mutating replay OFF, the gate must block the POST -> skipped, not crash.
-        import safety_gate, httpx
+        import httpx
+        from harness import safety_gate
         safety_gate.reset_default_gate()
         safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": False})
 
@@ -453,14 +454,14 @@ class NegativeControlTests(unittest.TestCase):
 
 class RegistryTests(unittest.TestCase):
     def test_new_validators_registered(self):
-        from validators.registry import ValidatorRegistry
+        from harness.validators.registry import ValidatorRegistry
         reg = ValidatorRegistry({"validators": {"active_enabled": True}})
         self.assertIn("verb_tamper", reg.validators)
         self.assertIn("csrf", reg.validators)
         self.assertIn("file_upload", reg.validators)
 
     def test_new_validators_active(self):
-        from validators.registry import ValidatorRegistry
+        from harness.validators.registry import ValidatorRegistry
         reg = ValidatorRegistry({"validators": {"active_enabled": True}})
         self.assertTrue(reg.validators["verb_tamper"].active)
         self.assertTrue(reg.validators["csrf"].active)
