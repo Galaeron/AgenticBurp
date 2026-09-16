@@ -361,8 +361,18 @@ class SurfaceDiscovery:
             r = await self._raw("GET", sp)
             if r and not _is_not_found(r[0], r[1]) and r[0] == 200 and _looks_like_spec(r[1]):
                 result.spec_found = sp
+                # W-21: keep the METHODS the spec documents for each path (a spec
+                # route used to be recorded with methods=(), throwing away the
+                # verbs a validator needs to know). The full operation surface
+                # (paths x methods x parameters) is available via
+                # openapi_ingest.operations_from_spec for callers that target
+                # parameters -- the reach win over a bare path list.
+                import openapi_ingest
+                methods_by_path = openapi_ingest.methods_by_path(r[1])
                 for path in _paths_from_spec(r[1]):
-                    self._seen.setdefault(path, Route(path=path, status=0, source="spec"))
+                    self._seen.setdefault(path, Route(
+                        path=path, status=0,
+                        methods=methods_by_path.get(path, ()), source="spec"))
                 break
 
         # 2. wordlist: single-segment, bare and id-scoped, across prefixes.
