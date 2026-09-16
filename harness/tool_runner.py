@@ -73,11 +73,33 @@ def localhost_url(url: str) -> str:
     return urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
 
 
+# W-26: sandbox hardening applied to every container run. These constrain a
+# compromised or misbehaving tool WITHOUT restricting what an HTTP-making scanner
+# (sqlmap/ffuf) actually needs: drop every Linux capability and block privilege
+# escalation (an HTTP client needs neither), cap the process count and CPU/memory
+# so a fork bomb or runaway can't exhaust the host, and -- because docker_cmd
+# mounts nothing -- keep the mount surface empty. A read-only root filesystem is
+# deliberately NOT default here: sqlmap/ffuf write session/output files whose
+# paths must be tmpfs-mapped and verified per image on a live run first, so
+# enabling it blindly would silently break confirmation (green argv test, dead
+# tool). Pass harden=False to opt a specific run out.
+_HARDENING_FLAGS = [
+    "--security-opt", "no-new-privileges",
+    "--cap-drop", "ALL",
+    "--pids-limit", "256",
+    "--memory", "1g",
+    "--cpus", "2",
+]
+
+
 def docker_cmd(image: str, args: list[str], *, add_host: bool = True,
-               extra: list[str] | None = None) -> list[str]:
-    """The full `docker run` argv for `image` + `args`. Always ephemeral (--rm).
-    Pure/inspectable so callers (and tests) can assert on it without running it."""
+               extra: list[str] | None = None, harden: bool = True) -> list[str]:
+    """The full `docker run` argv for `image` + `args`. Always ephemeral (--rm)
+    and, by default, sandbox-hardened (W-26; see _HARDENING_FLAGS). Pure/
+    inspectable so callers (and tests) can assert on it without running it."""
     cmd = [DOCKER, "run", "--rm"]
+    if harden:
+        cmd += _HARDENING_FLAGS
     if add_host:
         cmd += ["--add-host", f"{_HOST_ALIAS}:host-gateway"]
     if extra:

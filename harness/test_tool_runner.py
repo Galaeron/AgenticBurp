@@ -37,6 +37,27 @@ class DockerCmdTests(unittest.TestCase):
         cmd = tr.docker_cmd("img:1", ["x"], add_host=False)
         self.assertNotIn("--add-host", cmd)
 
+    def test_sandbox_hardening_flags_present_by_default(self):
+        # W-26: drop caps, block privilege escalation, cap pids/cpu/memory.
+        cmd = tr.docker_cmd("img:1", ["x"])
+        self.assertIn("--cap-drop", cmd)
+        self.assertIn("ALL", cmd)
+        self.assertIn("--pids-limit", cmd)
+        self.assertIn("--memory", cmd)
+        self.assertIn("--cpus", cmd)
+        # --security-opt no-new-privileges pairs correctly
+        j = cmd.index("--security-opt")
+        self.assertEqual(cmd[j + 1], "no-new-privileges")
+        # hardening precedes the image and never intrudes on the tool args
+        self.assertLess(cmd.index("--cap-drop"), cmd.index("img:1"))
+
+    def test_sandbox_hardening_can_be_disabled(self):
+        cmd = tr.docker_cmd("img:1", ["x"], harden=False)
+        self.assertNotIn("--cap-drop", cmd)
+        self.assertNotIn("no-new-privileges", cmd)
+        # still ephemeral even without the extra hardening
+        self.assertIn("--rm", cmd)
+
 
 class AvailableTests(unittest.TestCase):
     def test_available_true_when_daemon_answers(self):
