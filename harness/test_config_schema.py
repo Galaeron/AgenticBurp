@@ -77,5 +77,26 @@ class FingerprintTests(unittest.TestCase):
                          config_schema.config_fingerprint(cfg2))
 
 
+class ParseValidatorsFlagsTests(unittest.TestCase):
+    """R01: this is the seam SafetyGateConfig.from_dict now routes through
+    instead of Python's naive bool(value)."""
+
+    def test_quoted_false_string_coerces_to_false(self):
+        flags = config_schema.parse_validators_flags({"active_enabled": "false"})
+        self.assertFalse(flags["active_enabled"])
+
+    def test_real_bool_true_coerces_to_true(self):
+        flags = config_schema.parse_validators_flags({"active_enabled": True})
+        self.assertTrue(flags["active_enabled"])
+
+    def test_ambiguous_string_raises(self):
+        with self.assertRaises(ValueError):
+            config_schema.parse_validators_flags({"allow_mutating_replay": "sort of"})
+
+    def test_missing_keys_default_false(self):
+        flags = config_schema.parse_validators_flags({})
+        self.assertEqual(flags, {"active_enabled": False, "allow_mutating_replay": False})
+
+
 if __name__ == "__main__":
     unittest.main()

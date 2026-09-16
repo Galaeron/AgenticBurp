@@ -62,6 +62,31 @@ class _ValidatorsSection(BaseModel):
     allow_mutating_replay: bool = False
 
 
+def parse_validators_flags(cfg: dict) -> dict:
+    """R01: the ONE place a raw `validators:` config dict is turned into real
+    booleans for safety-critical flags. `validate_config` below type-checks
+    the merged config through this same pydantic model, but historically
+    only used that check to emit warnings -- callers (SafetyGateConfig.from_dict)
+    kept reading the ORIGINAL untyped dict and applying Python's `bool(value)`,
+    where `bool("false")` is True (any nonempty string is truthy). A quoted
+    `active_enabled: "false"` in config.local.yaml was therefore accepted by
+    validation and interpreted as enabled by the gate constructor -- exactly
+    backwards from the operator's intent.
+
+    Pydantic's own (non-strict) bool coercion is used here instead: real
+    bools pass through, and the same string vocabulary YAML authors actually
+    write ("true"/"false"/"yes"/"no"/"on"/"off"/"1"/"0", case-insensitive) is
+    accepted -- but anything else (e.g. "disabled", "nope") raises rather
+    than silently guessing, so a genuinely ambiguous safety flag fails
+    startup/settings-update instead of shipping a wrong default.
+    """
+    try:
+        parsed = _ValidatorsSection.model_validate(cfg or {})
+    except Exception as e:
+        raise ValueError(f"invalid validators config: {e}") from e
+    return {"active_enabled": parsed.active_enabled, "allow_mutating_replay": parsed.allow_mutating_replay}
+
+
 class _CoordinatorSection(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str = ""

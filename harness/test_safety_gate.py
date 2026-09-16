@@ -5,6 +5,50 @@ from harness.safety_gate import (
 )
 
 
+class TestSafetyGateConfigFromDict(unittest.TestCase):
+    """R01: config validation parsed a typed view but `from_dict` re-read the
+    ORIGINAL untyped dict with Python's naive bool(value) -- where bool("false")
+    is True, since any nonempty string is truthy. A quoted `active_enabled:
+    "false"` in config.local.yaml was therefore interpreted as enabled."""
+
+    def test_quoted_false_string_is_not_interpreted_as_enabled(self):
+        cfg = SafetyGateConfig.from_dict({"active_enabled": "false", "allow_mutating_replay": "false"})
+        self.assertFalse(cfg.active_enabled)
+        self.assertFalse(cfg.allow_mutating_replay)
+
+    def test_quoted_true_string_is_interpreted_as_enabled(self):
+        cfg = SafetyGateConfig.from_dict({"active_enabled": "true", "allow_mutating_replay": "true"})
+        self.assertTrue(cfg.active_enabled)
+        self.assertTrue(cfg.allow_mutating_replay)
+
+    def test_real_booleans_pass_through_unchanged(self):
+        cfg = SafetyGateConfig.from_dict({"active_enabled": True, "allow_mutating_replay": False})
+        self.assertTrue(cfg.active_enabled)
+        self.assertFalse(cfg.allow_mutating_replay)
+
+    def test_missing_flags_default_to_disabled(self):
+        cfg = SafetyGateConfig.from_dict({})
+        self.assertFalse(cfg.active_enabled)
+        self.assertFalse(cfg.allow_mutating_replay)
+
+    def test_ambiguous_string_value_raises_instead_of_guessing(self):
+        with self.assertRaises(ValueError):
+            SafetyGateConfig.from_dict({"active_enabled": "disabled"})
+
+    def test_numeric_and_extended_vocabulary_strings_are_coerced(self):
+        # yes/no/on/off/1/0 are the same vocabulary an operator plausibly
+        # writes by hand and that pydantic's own lax bool validation accepts.
+        self.assertFalse(SafetyGateConfig.from_dict({"active_enabled": "no"}).active_enabled)
+        self.assertTrue(SafetyGateConfig.from_dict({"active_enabled": "yes"}).active_enabled)
+        self.assertFalse(SafetyGateConfig.from_dict({"active_enabled": "0"}).active_enabled)
+        self.assertTrue(SafetyGateConfig.from_dict({"active_enabled": "1"}).active_enabled)
+
+    def test_numeric_thresholds_still_come_from_raw_dict(self):
+        cfg = SafetyGateConfig.from_dict({"max_burst_size": 5, "max_mutating_requests_per_finding": 3})
+        self.assertEqual(cfg.max_burst_size, 5)
+        self.assertEqual(cfg.max_mutating_requests_per_finding, 3)
+
+
 class TestSafetyGateClassification(unittest.TestCase):
     def setUp(self):
         self.gate = SafetyGate(SafetyGateConfig())

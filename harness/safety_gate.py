@@ -115,9 +115,15 @@ class SafetyGateConfig:
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "SafetyGateConfig":
+        # R01: active_enabled/allow_mutating_replay are safety-critical -- route
+        # them through config_schema's strict bool coercion, not Python's naive
+        # bool(value) (bool("false") is True). See parse_validators_flags's
+        # docstring for the exact defect this closes.
+        from harness.config_schema import parse_validators_flags
+        flags = parse_validators_flags(cfg)
         return cls(
-            active_enabled=bool(cfg.get("active_enabled", False)),
-            allow_mutating_replay=bool(cfg.get("allow_mutating_replay", False)),
+            active_enabled=flags["active_enabled"],
+            allow_mutating_replay=flags["allow_mutating_replay"],
             max_burst_size=int(cfg.get("max_burst_size", 1)),
             max_mutating_requests_per_finding=int(cfg.get("max_mutating_requests_per_finding", 1)),
         )
