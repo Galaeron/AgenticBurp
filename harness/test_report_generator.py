@@ -379,5 +379,45 @@ class TestDuplicateCollapse(unittest.TestCase):
         self.assertIn("1 duplicate finding(s) were collapsed", report)
 
 
+class MarkdownRedactionTests(unittest.TestCase):
+    """R03: the Markdown report path shares no redaction with the structured
+    issue-export path (issues.redact/redact_url) -- a captured secret quoted
+    into url/summary/evidence/suggested_test survived here even though the
+    separate JSON export already masked it."""
+
+    def test_secret_query_param_in_url_is_redacted(self):
+        findings = [sample(url="https://example.com/api/x?token=abc123secret")]
+        report = generate_markdown_report("example.com", findings)
+        self.assertNotIn("abc123secret", report)
+
+    def test_authorization_header_in_evidence_is_redacted(self):
+        findings = [sample(evidence="Authorization: Bearer sekrit-token-value-12345")]
+        report = generate_markdown_report("example.com", findings)
+        self.assertNotIn("sekrit-token-value-12345", report)
+
+    def test_cookie_value_in_summary_is_redacted(self):
+        findings = [sample(summary="Response set Cookie: session=leaked-cookie-value-999")]
+        report = generate_markdown_report("example.com", findings)
+        self.assertNotIn("leaked-cookie-value-999", report)
+
+    def test_secret_in_suggested_test_is_redacted(self):
+        findings = [sample(suggested_test="Replay with header Authorization: Bearer replay-secret-777")]
+        report = generate_markdown_report("example.com", findings)
+        self.assertNotIn("replay-secret-777", report)
+
+    def test_non_secret_content_is_unaffected(self):
+        findings = [sample(summary="Ordinary SQLi in the id parameter", evidence="db error: syntax near ORDER")]
+        report = generate_markdown_report("example.com", findings)
+        self.assertIn("Ordinary SQLi in the id parameter", report)
+        self.assertIn("db error: syntax near ORDER", report)
+
+    def test_backtick_fence_in_evidence_cannot_escape_the_code_block(self):
+        # A literal ``` inside evidence must not prematurely close the fence
+        # and let the rest render as ordinary (attacker-influenced) Markdown.
+        findings = [sample(evidence="normal text\n```\ninjected heading\n# not actually a heading")]
+        report = generate_markdown_report("example.com", findings)
+        self.assertNotIn("```\ninjected heading", report)
+
+
 if __name__ == "__main__":
     unittest.main()

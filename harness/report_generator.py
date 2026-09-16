@@ -406,9 +406,22 @@ _STATE_BADGE = {
 
 
 def _render_finding(f: ReportFinding) -> list[str]:
+    # R03: this Markdown path did not share issues.py's redaction (redact/
+    # redact_url) with the structured issue-export path -- a captured
+    # ?token=... query string or an Authorization/Cookie-shaped value quoted
+    # into evidence/summary/suggested_test survived here even though the
+    # separate JSON export already masked it. Redact at this render boundary
+    # (not earlier in ReportFinding construction) so URL-based dedup/grouping
+    # upstream still sees the real, unredacted URL.
+    from harness import issues
+    url = issues.redact_url(f.url)
+    summary = issues.redact(f.summary)
+    evidence = issues.redact(f.evidence)
+    suggested_test = issues.redact(f.suggested_test)
+
     lines = []
     status = _STATE_BADGE.get(f.lifecycle_state, "❓ SUSPECTED (unconfirmed)")
-    lines.append(f"### {f.vulnerability_class} -- {f.url}")
+    lines.append(f"### {f.vulnerability_class} -- {url}")
     lines.append("")
     lines.append(f"**Status:** {status} &nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)} "
                  f"&nbsp;|&nbsp; **Confidence:** {f.confidence:.2f} ({_confidence_label(f.confidence)}) "
@@ -422,26 +435,30 @@ def _render_finding(f: ReportFinding) -> list[str]:
     if basis_note and f.basis != "derived":
         lines.append(f"> ⚠️ {basis_note}")
     lines.append("")
-    lines.append(f"**Description:** {f.summary}")
+    lines.append(f"**Description:** {summary}")
     lines.append("")
-    if f.evidence:
+    if evidence:
         lines.append("**Evidence:**")
         lines.append("```")
-        lines.append(f.evidence)
+        # R03: captured/model text inside a code fence must not be able to
+        # break OUT of that fence -- a literal ``` in evidence would close it
+        # early and let the rest render as ordinary (attacker-influenced)
+        # Markdown/HTML instead of a fenced block.
+        lines.append(evidence.replace("`", "'"))
         lines.append("```")
         lines.append("")
     # Weakness #5: keep the reproduction field ACTUAL reproduction, not remediation.
-    if f.suggested_test and not _looks_like_remediation(f.suggested_test):
-        lines.append(f"**Steps to reproduce:** {f.suggested_test}")
+    if suggested_test and not _looks_like_remediation(suggested_test):
+        lines.append(f"**Steps to reproduce:** {suggested_test}")
         lines.append("")
-    elif f.evidence:
+    elif evidence:
         lines.append("**Steps to reproduce:** replay the exact captured request/response shown in the "
                      "Evidence block above, as the identity/session it was captured under, and compare "
                      "the actual result against a secure baseline.")
         lines.append("")
     # A remediation-shaped suggested_test is surfaced as a fix note, never as repro.
-    if f.suggested_test and _looks_like_remediation(f.suggested_test):
-        lines.append(f"**Fix note (from the detector):** {f.suggested_test}")
+    if suggested_test and _looks_like_remediation(suggested_test):
+        lines.append(f"**Fix note (from the detector):** {suggested_test}")
         lines.append("")
     lines.append(f"**Suggested remediation:** {_remediation_for(f.vulnerability_class)} "
                  f"_(generic starting point -- verify against this target's actual implementation)_")
