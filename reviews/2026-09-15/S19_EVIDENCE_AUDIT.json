@@ -1,0 +1,4837 @@
+{
+  "audit_valid": true,
+  "coverage": {
+    "applicability": {
+      "declared": null,
+      "independently_established": null
+    },
+    "available": true,
+    "case_level": {
+      "attempted": 0,
+      "blocked": 0,
+      "controlled_negatives": 0,
+      "decisive_evidence": 0,
+      "failed": 0,
+      "inconclusive": 0,
+      "not_applicable": null,
+      "percentages": {
+        "attempted": {
+          "denominator": 0,
+          "numerator": 0,
+          "percent": null
+        },
+        "blocked": {
+          "denominator": 0,
+          "numerator": 0,
+          "percent": null
+        },
+        "controlled_negatives": {
+          "denominator": 0,
+          "numerator": 0,
+          "percent": null
+        },
+        "failed": {
+          "denominator": 0,
+          "numerator": 0,
+          "percent": null
+        },
+        "inconclusive": {
+          "denominator": 0,
+          "numerator": 0,
+          "percent": null
+        },
+        "not_applicable": {
+          "denominator": 0,
+          "numerator": null,
+          "percent": null
+        },
+        "positive_evidence": {
+          "denominator": 0,
+          "numerator": 0,
+          "percent": null
+        },
+        "skipped": {
+          "denominator": 0,
+          "numerator": 0,
+          "percent": null
+        },
+        "unknown": {
+          "denominator": 0,
+          "numerator": 0,
+          "percent": null
+        }
+      },
+      "positive_evidence": 0,
+      "reported_total": 0,
+      "skipped": 0,
+      "unknown": 0,
+      "warnings": []
+    },
+    "layers_combined": false,
+    "original_counts_preserved": true,
+    "request_level": {
+      "attempted": 387,
+      "blocked": 0,
+      "controlled_negatives": 0,
+      "decisive_evidence": 112,
+      "failed": 0,
+      "inconclusive": 0,
+      "not_applicable": 6999,
+      "percentages": {
+        "attempted": {
+          "denominator": 11438,
+          "numerator": 387,
+          "percent": 3.38
+        },
+        "blocked": {
+          "denominator": 11438,
+          "numerator": 0,
+          "percent": 0.0
+        },
+        "controlled_negatives": {
+          "denominator": 11438,
+          "numerator": 0,
+          "percent": 0.0
+        },
+        "failed": {
+          "denominator": 11438,
+          "numerator": 0,
+          "percent": 0.0
+        },
+        "inconclusive": {
+          "denominator": 11438,
+          "numerator": 0,
+          "percent": 0.0
+        },
+        "not_applicable": {
+          "denominator": 11438,
+          "numerator": 6999,
+          "percent": 61.19
+        },
+        "positive_evidence": {
+          "denominator": 11438,
+          "numerator": 112,
+          "percent": 0.98
+        },
+        "skipped": {
+          "denominator": 11438,
+          "numerator": 4052,
+          "percent": 35.43
+        },
+        "unknown": {
+          "denominator": 11438,
+          "numerator": 0,
+          "percent": 0.0
+        }
+      },
+      "positive_evidence": 112,
+      "reported_total": 11438,
+      "skipped": 4052,
+      "unknown": 0,
+      "warnings": []
+    },
+    "warnings": [
+      "some attempted request-level checks lack decisive evidence"
+    ]
+  },
+  "errors": [],
+  "evaluation_validity": "unknown",
+  "evidence": {
+    "confirmation_claims": 167,
+    "counts": {
+      "not_claimed": 211,
+      "unverifiable": 167
+    },
+    "diagnostics": [
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "1af6d463cdddf41d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "0a178f85dd32d90f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/0/findings/2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "74983e826d9db680",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "cf9cd0d151852386",
+        "confirmation_claimed": true,
+        "finding_id": "06663ae07e078c1b",
+        "named_validator_present": false,
+        "proof_id": "8bbe470c283c4074a152fb02ff48c816",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6476d7934b810c2c",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "5026f9348c248cbc",
+        "confirmation_claimed": true,
+        "finding_id": "96ffca4935765515",
+        "named_validator_present": false,
+        "proof_id": "f99155cafaf74f0386d4bf529ca830fa",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "7e09132d8e9ec6cb",
+        "confirmation_claimed": true,
+        "finding_id": "3553d445dfb2b819",
+        "named_validator_present": false,
+        "proof_id": "07025b55d2484c4d88af04ea0fc84ce7",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5fcb200f90da1780",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "d39fbb32e9240e50",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e073be27f0bbe21f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/1/findings/8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e0c6d555f06195f8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "28401a86bbd4c02b",
+        "confirmation_claimed": true,
+        "finding_id": "dd9be8fffb74a9b2",
+        "named_validator_present": false,
+        "proof_id": "860933746ad04065ae775ea4f8ee5721",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "56b4bc9739786e4d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "464ae5a1777002e9",
+        "confirmation_claimed": true,
+        "finding_id": "897c7a113bcc77e3",
+        "named_validator_present": false,
+        "proof_id": "c1544754f2a44fb68546643f8310ad76",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "a0cef100e16b3e31",
+        "confirmation_claimed": true,
+        "finding_id": "29319e30a63fd27f",
+        "named_validator_present": false,
+        "proof_id": "e70fd246ea934bf6957986d1a25b0176",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "9cb04c9f155c1655",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "194e0501aaebfb16",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "33e3eeaed925c359",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "595de562a15a92e2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/2/findings/9",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4f6e93b3057b4ced",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "0b6d81dcc01529b7",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "3606a4e6d1719e99",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/3/findings/3",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "f592de631d4a3eb5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "83eb63e506dff0d2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4e0d4ff6445a58b0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "b4eac20740768a3e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "e2b7f4f36a98e473",
+        "confirmation_claimed": true,
+        "finding_id": "0a9ef9407ac903e3",
+        "named_validator_present": false,
+        "proof_id": "edad9e81ece2477ca81518ec9af8d7ee",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "f8fc6f55ba0dd447",
+        "confirmation_claimed": true,
+        "finding_id": "9ce23150944a353e",
+        "named_validator_present": false,
+        "proof_id": "2127d25e3cbc473ea2ee6bf27f968b28",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "92fbce96862c8083",
+        "confirmation_claimed": true,
+        "finding_id": "1c0e20f856fcb4af",
+        "named_validator_present": false,
+        "proof_id": "5bf0aa1228e34da5886dc8e16533215f",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "a6c8bb4243268567",
+        "confirmation_claimed": true,
+        "finding_id": "6634aba310a59d69",
+        "named_validator_present": false,
+        "proof_id": "9afe8db47903450e8bd81d8b5b12e994",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "1278055dacd1de52",
+        "confirmation_claimed": true,
+        "finding_id": "78d72de3a059ba2f",
+        "named_validator_present": false,
+        "proof_id": "8f690c4e4f0f479dbba06aae42a212f4",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "b309bda30e06c939",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c2dd15effa6660ad",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "75000061a00fef99",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "7909b8a765328c26",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "7a963d698d82f303",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "51099b7b5265a497",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ae88c4182a693507",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "3b6d057e6a724d96",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/4/findings/17",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "17a14ce7463799d8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ec51ba1f2ec77240",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c89c95457acd7923",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "aa45e3916d376615",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "1e0c9bb1b7f1c2c1",
+        "confirmation_claimed": true,
+        "finding_id": "8c783b96bbcfc4b3",
+        "named_validator_present": false,
+        "proof_id": "60a6ac95a06146b9bb6bb05d9dbf813c",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "50e31a94e69c45c6",
+        "confirmation_claimed": true,
+        "finding_id": "c32d9ec44184d1fd",
+        "named_validator_present": false,
+        "proof_id": "12ca817976ed4aed805ba3b8fddd02a8",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "1c486c3234270491",
+        "confirmation_claimed": true,
+        "finding_id": "1c0e20f856fcb4af",
+        "named_validator_present": false,
+        "proof_id": "5b5575dab06c44e4b9191dc09b55ec86",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "02c3bcd8f8dd8664",
+        "confirmation_claimed": true,
+        "finding_id": "6634aba310a59d69",
+        "named_validator_present": false,
+        "proof_id": "c00e99fce74f4a2985035fbf61afb091",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "94083f15ba8ff290",
+        "confirmation_claimed": true,
+        "finding_id": "3165c916a858b178",
+        "named_validator_present": false,
+        "proof_id": "1db7ab4744aa45e3bae7a34ae214adc9",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "771e47f0b5311b6a",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5577c00e7753852e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "b6a06e9cf71bf33d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a2a3d3a47b8fcfed",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "2e56ae20462b234d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a233fc4ee87caf80",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "473ee201783e9597",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "31e871bb1d2fc128",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "0f55d1a4b574c396",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "f2f4d57e7f25f84a",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "2bae65af4c0f1fd2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "abbee674ce0c3c6d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "2449171d32d70e02",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/5/findings/22",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a2b3a148f0034dc0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "e12c55ceedc03dcb",
+        "confirmation_claimed": true,
+        "finding_id": "0d47389f198a19c7",
+        "named_validator_present": false,
+        "proof_id": "70e7769200de46ffbd7642f3c638cd17",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "674d61bf371abcaf",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "bd3d3beaed61d210",
+        "confirmation_claimed": true,
+        "finding_id": "db2721fd7e8bd788",
+        "named_validator_present": false,
+        "proof_id": "9be033d567d1407b8f0006bb6eb22ad0",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "46f25b9b36e70bad",
+        "confirmation_claimed": true,
+        "finding_id": "1c0e20f856fcb4af",
+        "named_validator_present": false,
+        "proof_id": "59e8fd7478f343709dab1b535b6eaf2f",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "8ec4e1e4d175fd1d",
+        "confirmation_claimed": true,
+        "finding_id": "0111b3259c30f3f7",
+        "named_validator_present": false,
+        "proof_id": "72ce8307f6a043239dfb0a00d9a4dc93",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "d23b53636bfdf04b",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "91dccbd5216da7ce",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/6/findings/8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "097d6eef6164c4bb",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a95a3c09cd306695",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ed382c8e9c040898",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c67f17fcfcb7f77e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "032f6ae75af19a86",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "de5313dfc1d863b7",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "90203f4f094ced2f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "03fe9ec083a87250",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c77db5c84110cebd",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "88686dfe4ea97c2e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "2caf31d780edea89",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/7/findings/11",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5a3a37ab640c2708",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "8aa551928cbd4a0b",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c70bf195caa4624b",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5f41fa080860cd6e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "d8e9a22b137926c9",
+        "confirmation_claimed": true,
+        "finding_id": "db4346f9739f8a9f",
+        "named_validator_present": false,
+        "proof_id": "829eeeb89b9642f3854dc637eb6abb43",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5cf6faf1070d9636",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "ea78835b5f4fb66b",
+        "confirmation_claimed": true,
+        "finding_id": "c50126f5b81b81be",
+        "named_validator_present": false,
+        "proof_id": "a059a619e9e343e6bbcd01836ce00fe3",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "27f1a6f88fbb167e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ffc1af4929fde3b4",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/8/findings/9",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "2174ef652726f596",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "86933e8f3782b90b",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "02eeff16d6475b9b",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "02e1b572f2527dee",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "3bd42687f2245611",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "fa04d6856b60c12e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "f5b4965eebf1690e",
+        "confirmation_claimed": true,
+        "finding_id": "0147529217b1675b",
+        "named_validator_present": false,
+        "proof_id": "da0241820fa04048bf5c32734bec3061",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ef3b946594fe900f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "3898d88a165d852e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "41a46829d3e34632",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c1c8d9e741a65718",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a021b9177f352058",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "f99db00442c78034",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/9/findings/13",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c39edc0927a21998",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "bc506c27e246c576",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "cb41867884678a86",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "0d39de0d97e6d5e5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/10/findings/4",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6be680162e5ebfb9",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "d961271095fdcb6f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "54312c05c15728f8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4e7316859be80bd9",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "f56aa4147118f2ad",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "cb6eb3f5570ca34e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "42d69d2f0e126034",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "1c1c73d53f3b2889",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "fd31b505c14a78df",
+        "confirmation_claimed": true,
+        "finding_id": "fe88a2f894253dd5",
+        "named_validator_present": false,
+        "proof_id": "ef80ccff74b141fdbd29abb3ca375477",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "0400c60f68b203d5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/11/findings/10",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/11/findings/11",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4a5d0134d1a51b1f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "8080d1985119d161",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/12/findings/2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "3d6adf0717c2327f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "1dfddcbdaac1aee7",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "20aa68a29800689d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4095ffa12c77be6c",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "b24b92d48476d68f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "15821296e889a3be",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/13/findings/6",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "d8c02ce6f1b06e1e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "9aee25f95b61c9b9",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "1db06d636c82ec68",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "75a01a4feae2e846",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "3b4f7f7733ab0a82",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6a8151e5bc128ed8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "38147bbfc0c3e31b",
+        "confirmation_claimed": true,
+        "finding_id": "b0793754f7d86cbf",
+        "named_validator_present": false,
+        "proof_id": "fbf710dcccaf4a2cb1f512259b81d757",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "62219bed99b9931a",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "cb068418c2502c38",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6c1d92402fdb551a",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "eee8a48193676372",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/14/findings/11",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "3d7f68e91a285d8d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "e458521173849e4c",
+        "confirmation_claimed": true,
+        "finding_id": "00723c8d30c08ee5",
+        "named_validator_present": false,
+        "proof_id": "9e56c751171f4c34ae66a1a08498ac8d",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4af7724e85f7f107",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "b307c6e6f6291c91",
+        "confirmation_claimed": true,
+        "finding_id": "617edf0ad2a2b84a",
+        "named_validator_present": false,
+        "proof_id": "a5d47cbe2dec4698b2f4d42bad3f16cd",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "d3220cb0f1196529",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "09ee5d2c2e2172b3",
+        "confirmation_claimed": true,
+        "finding_id": "082fd567ed9715ea",
+        "named_validator_present": false,
+        "proof_id": "1f00ffc816204a9a84ffadde678061a5",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "69955fe26575ec0f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/15/findings/7",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "84bc9597b85be86c",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "b6606d1c335f0c60",
+        "confirmation_claimed": true,
+        "finding_id": "793e36e8d9172c2c",
+        "named_validator_present": false,
+        "proof_id": "c9a5cef729634643a3cd15623ab07382",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "1ffd7b4d581e7c24",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "170e590740f1f2dd",
+        "confirmation_claimed": true,
+        "finding_id": "617edf0ad2a2b84a",
+        "named_validator_present": false,
+        "proof_id": "83dd498f8a6a464493f03180ed00096c",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c76101fb0f5cb45a",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "c5bed7ee8702ed89",
+        "confirmation_claimed": true,
+        "finding_id": "59ad6c23692f3430",
+        "named_validator_present": false,
+        "proof_id": "d99558b8f44842559399032fb4449ba2",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "7d30dd423136764f",
+        "confirmation_claimed": true,
+        "finding_id": "0bc17d6a5e699d17",
+        "named_validator_present": false,
+        "proof_id": "2306d98ee75c4cb1a84a8f423919d25d",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c1dea4f05f9d726e",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e8743b4a5c8ead7c",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/16/findings/9",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "42a122571a16854f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "b662ac11c1f89b5a",
+        "confirmation_claimed": true,
+        "finding_id": "703df2a4ff040755",
+        "named_validator_present": false,
+        "proof_id": "6fd79a9004cb4a52996aea9f758a3a59",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "2c683a4ac60b44a2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "0f3551d0fcb96f38",
+        "confirmation_claimed": true,
+        "finding_id": "ca12801c921f835a",
+        "named_validator_present": false,
+        "proof_id": "6a78ebbbbc0647ffa667e5eab74d421d",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "052b2123e3e45b91",
+        "confirmation_claimed": true,
+        "finding_id": "d041037bf100d82b",
+        "named_validator_present": false,
+        "proof_id": "f58a9c134013487ba938403376aadc30",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "2e4d2b4e88bc67c2",
+        "confirmation_claimed": true,
+        "finding_id": "54ab729084b22de9",
+        "named_validator_present": false,
+        "proof_id": "59370d99253a49bf9a1c7819a2776e9f",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "1789d37cdb3ea520",
+        "confirmation_claimed": true,
+        "finding_id": "1c5292e01613a737",
+        "named_validator_present": false,
+        "proof_id": "721c8803112841019b36c29458f2d132",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e8d9e22881a680c3",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "0835d5bff0849a3d",
+        "confirmation_claimed": true,
+        "finding_id": "494313cd974a49a4",
+        "named_validator_present": false,
+        "proof_id": "efd83b7c1e594752b506d7a42c961001",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5da39d76a409ce29",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/17/findings/10",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4d28d80564d33494",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "47bafcea966676c1",
+        "confirmation_claimed": true,
+        "finding_id": "f5025fc4e211ea66",
+        "named_validator_present": false,
+        "proof_id": "7458341780f7468886fadbc30d7c37e9",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ffefa1c6dd3074f5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "9d49c09a84741de3",
+        "confirmation_claimed": true,
+        "finding_id": "2b096aa4c72c3bd4",
+        "named_validator_present": false,
+        "proof_id": "15c6a19475a647fea71bba2cc4add829",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/18/findings/4",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e78c39c0fa8b573f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "9aee888824e5b090",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "95a582f9d5b57692",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "7fa8802ba3718aab",
+        "confirmation_claimed": true,
+        "finding_id": "05ed43edf8b04b00",
+        "named_validator_present": false,
+        "proof_id": "b214909bd4064858b6e377bac356f72f",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "c29d4c9807659b31",
+        "confirmation_claimed": true,
+        "finding_id": "90ff05eb734e6c8c",
+        "named_validator_present": false,
+        "proof_id": "84898798f31c443cbf611d2766d4d690",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "19dcb6537674c35f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "a6f3a46d93618c05",
+        "confirmation_claimed": true,
+        "finding_id": "fb6bdc4fbf3d7181",
+        "named_validator_present": false,
+        "proof_id": "8d44abaa3ba348db85b9dd0d992b95a8",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ca4e70bb8e8bb5c3",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "15df16aca57c6c29",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/19/findings/9",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "be3c550c1bd28575",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e7d8710b2a2ed774",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "80f84f744c67e77c",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a249434a23fdde59",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "a921f42363afcefe",
+        "confirmation_claimed": true,
+        "finding_id": "5b5437c60696e86d",
+        "named_validator_present": false,
+        "proof_id": "18360c04212e4e4a8102d8c0b0dc074d",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "c4223e52015ef7c3",
+        "confirmation_claimed": true,
+        "finding_id": "1f1a87cc54c8d776",
+        "named_validator_present": false,
+        "proof_id": "ca532a06c6ec4e058a80fdbd81f1f860",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "dc76809b7fb01832",
+        "confirmation_claimed": true,
+        "finding_id": "ab68fa78591ea0b7",
+        "named_validator_present": false,
+        "proof_id": "27a652e550c3430f9dbd4affe211ea09",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "b2e95f7a4d4a8480",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "b49a0a29294f15e0",
+        "confirmation_claimed": true,
+        "finding_id": "3be3cb8ac5c1baf9",
+        "named_validator_present": false,
+        "proof_id": "91e769a549db4e30bb66dbbbea8a687e",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "87e9b77de69431ed",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "d3af0625fe9553c9",
+        "confirmation_claimed": true,
+        "finding_id": "0818765f95be597e",
+        "named_validator_present": false,
+        "proof_id": "9d173f69fcc14685967692c3295b1b40",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e461e3f1f9f82769",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/20/findings/12",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "2c4ef4947ca1e2c6",
+        "confirmation_claimed": true,
+        "finding_id": "bb686e06a2e95b04",
+        "named_validator_present": false,
+        "proof_id": "93a0a43baf2e431fa42d8afde1c16a3e",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "d119a55a8d316bf7",
+        "confirmation_claimed": true,
+        "finding_id": "73481f77ef184622",
+        "named_validator_present": false,
+        "proof_id": "709499bbbf9449f4a8f0e32d7f912faa",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "096bdcd694a46123",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "ee07b048501c75cb",
+        "confirmation_claimed": true,
+        "finding_id": "b600e78a9b4e92fa",
+        "named_validator_present": false,
+        "proof_id": "89e4124a746141ec82192d5a0e7a4eb2",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6b878bbebfa49b1b",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "1f670487e397926f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "7a315cf35315cded",
+        "confirmation_claimed": true,
+        "finding_id": "fde53556351e55a7",
+        "named_validator_present": false,
+        "proof_id": "ca45cc600de04e35bf03728d3edf444d",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/21/findings/7",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "dd7c3dfb12ecc42b",
+        "confirmation_claimed": true,
+        "finding_id": "95865702e9d38e39",
+        "named_validator_present": false,
+        "proof_id": "f008be09be674f9db73836e5f1eb7b60",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4e4ee80e5fe3cc19",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "e9394a63895ff77a",
+        "confirmation_claimed": true,
+        "finding_id": "13a151ae8b537cd2",
+        "named_validator_present": false,
+        "proof_id": "4ebe34a2f4e44be0a79a3f8869daf1b7",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "258854961f6e3d8f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "7cd2e6ee142f7f31",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "0b7e16765e8ed6bd",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "7e5d6bc5198954df",
+        "confirmation_claimed": true,
+        "finding_id": "103656f6b9715cb2",
+        "named_validator_present": false,
+        "proof_id": "953042e31b9b4e5c9c6f7a598db94a3c",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "2b5829b0caa2f0a7",
+        "confirmation_claimed": true,
+        "finding_id": "f080a0ce1b7fdd36",
+        "named_validator_present": false,
+        "proof_id": "ae6df69ed0374169a6fd829363a3e8a8",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "18e783879d7321fd",
+        "confirmation_claimed": true,
+        "finding_id": "90de5ee35a85024b",
+        "named_validator_present": false,
+        "proof_id": "01c2366817a84e53bfbe5709702a7901",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "f5182a6576ddb369",
+        "confirmation_claimed": true,
+        "finding_id": "093a3dc374d2aa2f",
+        "named_validator_present": false,
+        "proof_id": "cc05c5e2d3994901b69e703b3d176556",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/22/findings/10",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/22/findings/11",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/22/findings/12",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "0620dee91e7fe9ed",
+        "confirmation_claimed": true,
+        "finding_id": "e745f3871db6fbc2",
+        "named_validator_present": false,
+        "proof_id": "25249b6128b543bda3b1af508cf9d4df",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a6ba32acaa905bbc",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "9e516cf85c97d325",
+        "confirmation_claimed": true,
+        "finding_id": "99eb87291f4cf38c",
+        "named_validator_present": false,
+        "proof_id": "9012fc1dc43d4e6b87678026722bbf47",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "88f0e6c7ffcd94e2",
+        "confirmation_claimed": true,
+        "finding_id": "d199cd18e8bf3cc4",
+        "named_validator_present": false,
+        "proof_id": "9c3790a7816d4d019bfaf59b2627c8bc",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e2f4fd9c8e7f3d70",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "3c9cbc3089203915",
+        "confirmation_claimed": true,
+        "finding_id": "7c2b961b3165cf14",
+        "named_validator_present": false,
+        "proof_id": "e99ab6cb509d42658079c9176985dc18",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "d7fa679514b0b63f",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5af5f1a477a27edc",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "ff2f5bfe3801f578",
+        "confirmation_claimed": true,
+        "finding_id": "f40f5efaaa906ebe",
+        "named_validator_present": false,
+        "proof_id": "fd31b8846cbe46fabaabe007971b8d8b",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "6e5a78c8d7196cbe",
+        "confirmation_claimed": true,
+        "finding_id": "88e061f0f20fc6bc",
+        "named_validator_present": false,
+        "proof_id": "103fab80af2f4f5bb446f7aaef3c1042",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "11f3b32999ea02ca",
+        "confirmation_claimed": true,
+        "finding_id": "384ae534676e8323",
+        "named_validator_present": false,
+        "proof_id": "4f3aade421ec442eb2b9d4fa3499b231",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "c1a8a8014e6f51a9",
+        "confirmation_claimed": true,
+        "finding_id": "c7609b82c1aab928",
+        "named_validator_present": false,
+        "proof_id": "02bd7ee113ba4b78bf7a70758a9bc78f",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "7f470b1ff3cd24f9",
+        "confirmation_claimed": true,
+        "finding_id": "f141f21579d2dd4e",
+        "named_validator_present": false,
+        "proof_id": "43c4b60c81674b80a3194a7341985432",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/23/findings/13",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/23/findings/14",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/23/findings/15",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "9183eaff0d011b8f",
+        "confirmation_claimed": true,
+        "finding_id": "8af9dfa1a9107933",
+        "named_validator_present": false,
+        "proof_id": "55e5406b187048c99da327def5e62548",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "01bba67c33b43cd4",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "5caf05a22a063837",
+        "confirmation_claimed": true,
+        "finding_id": "919b3181c1e5ecd7",
+        "named_validator_present": false,
+        "proof_id": "baa0b00813424d078a046311aa805eb6",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "24f66540c869eeb0",
+        "confirmation_claimed": true,
+        "finding_id": "b19653cbcf7cf0f5",
+        "named_validator_present": false,
+        "proof_id": "166128b825a54663b3adc5fd315f00ef",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "f79d709474a3c720",
+        "confirmation_claimed": true,
+        "finding_id": "e5bea9053ca3ca6f",
+        "named_validator_present": false,
+        "proof_id": "1e408f322c1d469abe9ac2fe72d3bbfa",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "41cb39ab3ca1e075",
+        "confirmation_claimed": true,
+        "finding_id": "934b6b1df708f6e2",
+        "named_validator_present": false,
+        "proof_id": "76dbc663bb3a46598a213ae7eb345a90",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e77b85f42a6737c5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "4c573f201ee475e7",
+        "confirmation_claimed": true,
+        "finding_id": "76042261edf83350",
+        "named_validator_present": false,
+        "proof_id": "5bfe9b32e0374b78a7e6e3b291200832",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "19e80785d80525c1",
+        "confirmation_claimed": true,
+        "finding_id": "1578d43fdb72f281",
+        "named_validator_present": false,
+        "proof_id": "0300ebcd03fc4a21ae3489b3f18a6042",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "911b1e31b5a9d2d6",
+        "confirmation_claimed": true,
+        "finding_id": "45953d40dccaf11c",
+        "named_validator_present": false,
+        "proof_id": "cc0edecb2dc042d58e69c7b7dd976f89",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "a06b6c5e70d457e4",
+        "confirmation_claimed": true,
+        "finding_id": "a6c17c3db31f1238",
+        "named_validator_present": false,
+        "proof_id": "e4357ba484b24fc980e187f7ff48cd83",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/24/findings/11",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/24/findings/12",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "761b891752805cd9",
+        "confirmation_claimed": true,
+        "finding_id": "95b76429b2d981f8",
+        "named_validator_present": false,
+        "proof_id": "7472ad85d8624c618d3789632ec56dbd",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "145a79dd13f6ee4c",
+        "confirmation_claimed": true,
+        "finding_id": "21363768f4ccb159",
+        "named_validator_present": false,
+        "proof_id": "2da026eec7fa48ddb2e68fee0717f2ba",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "0a5ba40390f53394",
+        "confirmation_claimed": true,
+        "finding_id": "c9a9505d7906d9d6",
+        "named_validator_present": false,
+        "proof_id": "c7b1fbf839f3410f982a4f469556b125",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "86cbf503ddb76b5b",
+        "confirmation_claimed": true,
+        "finding_id": "567705369c8070a5",
+        "named_validator_present": false,
+        "proof_id": "0d41e82ed2a2446f8f987eceaeae96dd",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "19f52a80db967078",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "b85328b854d1d141",
+        "confirmation_claimed": true,
+        "finding_id": "df4664ab6bf2a015",
+        "named_validator_present": false,
+        "proof_id": "934276508ef143aeb05909d8029835a2",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ca094bc4c15609f0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "8a05867867a39b67",
+        "confirmation_claimed": true,
+        "finding_id": "58199470ff016918",
+        "named_validator_present": false,
+        "proof_id": "96aee075259c4e42a8a9fed01ae3fee8",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "f27115f36b7f70ba",
+        "confirmation_claimed": true,
+        "finding_id": "d80bf3db17c3efaa",
+        "named_validator_present": false,
+        "proof_id": "0c5c3e588cc44b3eb71249d9a00b3a5e",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/25/findings/9",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "c2ac408b250352d1",
+        "confirmation_claimed": true,
+        "finding_id": "c4774130534cfc39",
+        "named_validator_present": false,
+        "proof_id": "f50b10ffad8946ba89524b4bdf421e9c",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "f1232715cfe32700",
+        "confirmation_claimed": true,
+        "finding_id": "0ee19b3c87f4767a",
+        "named_validator_present": false,
+        "proof_id": "54de2cc6d780431eafa2fb8d017b11d7",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "8310ce1df5459960",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "7dd0b02e15c42338",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "e854846c34cb996b",
+        "confirmation_claimed": true,
+        "finding_id": "5aec1fb70d467dff",
+        "named_validator_present": false,
+        "proof_id": "37cd1d9a7ff14f86a2d19a92fd201e7a",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/26/findings/5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "2fe1ad1f72bf0a03",
+        "confirmation_claimed": true,
+        "finding_id": "abf31bd10f4d983d",
+        "named_validator_present": false,
+        "proof_id": "262006ab02b74db7a14826668c8de69d",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "b68cf6ea4fc8259e",
+        "confirmation_claimed": true,
+        "finding_id": "9e60d8c3f917c1b3",
+        "named_validator_present": false,
+        "proof_id": "905513b01bc74d0e90840bdd62324e75",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "6cd30ce96ea36c01",
+        "confirmation_claimed": true,
+        "finding_id": "11ba3d17de146607",
+        "named_validator_present": false,
+        "proof_id": "b6b48f28f44a47c5bbd01b0a0a9bf34f",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "ed74aa4bb909ad09",
+        "confirmation_claimed": true,
+        "finding_id": "4cbf41084ec0b8d8",
+        "named_validator_present": false,
+        "proof_id": "1b01cb0b29b84bb482875c416a436028",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "4bc8693faa0da2d2",
+        "confirmation_claimed": true,
+        "finding_id": "f1bf01b2b7c04772",
+        "named_validator_present": false,
+        "proof_id": "98165b4c4abc4db08d77624babe4cd84",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "c658f86b6f92f28b",
+        "confirmation_claimed": true,
+        "finding_id": "f83beeae775a14e3",
+        "named_validator_present": false,
+        "proof_id": "cd1254e5ea6a46b59372e821dfb22d47",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "529c6910d71f1cd9",
+        "confirmation_claimed": true,
+        "finding_id": "80bc8750fe5db471",
+        "named_validator_present": false,
+        "proof_id": "d8087f9b52b542c583e448c444010645",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "ee638fd8d2f1f35f",
+        "confirmation_claimed": true,
+        "finding_id": "b80cfa12853bf225",
+        "named_validator_present": false,
+        "proof_id": "26b343ebdb0148e5bc570c4d2bcc06c5",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/27/findings/8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "a2ca3fd660ef81f2",
+        "confirmation_claimed": true,
+        "finding_id": "01593268d270d7de",
+        "named_validator_present": false,
+        "proof_id": "8792075ac98f4272be3cf23c1b128dc6",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "58a777c027af9a97",
+        "confirmation_claimed": true,
+        "finding_id": "61556b76a2969c3f",
+        "named_validator_present": false,
+        "proof_id": "ea7d2deb55864f0791f99060e6fe43ec",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "c58bc650cf74b962",
+        "confirmation_claimed": true,
+        "finding_id": "a6bdaf5c540a9ee9",
+        "named_validator_present": false,
+        "proof_id": "5dd8a940bf4549c6bd49aeaf942e1ec6",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "c6e5d872c85dcfbe",
+        "confirmation_claimed": true,
+        "finding_id": "fad82ca181cdacae",
+        "named_validator_present": false,
+        "proof_id": "dae01dc9134449eea2391c1005638a69",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "d59c3e3cb3441c32",
+        "confirmation_claimed": true,
+        "finding_id": "9d0c58240c0d66e5",
+        "named_validator_present": false,
+        "proof_id": "c4b67d72ec4b4e49bb8718d7da9c8fb2",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "4f9bd29d39b7f87e",
+        "confirmation_claimed": true,
+        "finding_id": "723402dda8520c31",
+        "named_validator_present": false,
+        "proof_id": "27fbb1b05cdb4c79a393fbb2ad6cae10",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "dbed7d5a600da63e",
+        "confirmation_claimed": true,
+        "finding_id": "e137399e1cde1b7a",
+        "named_validator_present": false,
+        "proof_id": "1e179677450c4e229d4f476802501019",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/28/findings/7",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "f23e1594c2629523",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "7a630e00a4ce463c",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "93eb3e0406889406",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "d2c6543b6db37e77",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5141d318d7521e20",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "08738eaec8aa064d",
+        "confirmation_claimed": true,
+        "finding_id": "230161ee5c42e0e9",
+        "named_validator_present": false,
+        "proof_id": "6bfb7d9cd2624eed822955cd487dbb21",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "7321ff0a3f25e3c2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "51f52ef48dce8bb5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": "3a1d773f0d52b1e4",
+        "confirmation_claimed": true,
+        "finding_id": "be2be7b8856484f3",
+        "named_validator_present": false,
+        "proof_id": "223f0f6b7d5c498ebe2e8556bbaa1274",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "f2d0cfaaf9f84324",
+        "confirmation_claimed": true,
+        "finding_id": "df6a3d634428ac60",
+        "named_validator_present": false,
+        "proof_id": "f61fd187f4c944e393a835c3d4b489cf",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/29/findings/10",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/29/findings/11",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/29/findings/12",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/29/findings/13",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "fd47b5b514c77d28",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "40de3682052580a2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "4ba84b4015d06ef6",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "732a69c645c293b4",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "90f778c4c595665d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/30/findings/5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "74919a4457143f17",
+        "confirmation_claimed": true,
+        "finding_id": "a11382b21c5c634e",
+        "named_validator_present": false,
+        "proof_id": "6d353586a3eb4091a577e480141df63c",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "289549de3f1176fa",
+        "confirmation_claimed": true,
+        "finding_id": "79a30c6e525d123f",
+        "named_validator_present": false,
+        "proof_id": "4a01bf4e6c494bee91b48eba87dfd371",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "a51763510486c182",
+        "confirmation_claimed": true,
+        "finding_id": "8d63e55611f5b887",
+        "named_validator_present": false,
+        "proof_id": "0d2477083aa1454083f4477acddc6b43",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "80c7c6a45402502b",
+        "confirmation_claimed": true,
+        "finding_id": "6ccc4d73aa3c4fee",
+        "named_validator_present": false,
+        "proof_id": "ddd7178d135b47fe95679fa3e427bb9b",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "380396603cab19a1",
+        "confirmation_claimed": true,
+        "finding_id": "92b46854859e57e7",
+        "named_validator_present": false,
+        "proof_id": "c6846c8e764549cbbab546ea6a304f7d",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "4b97b2a6c53c7a7b",
+        "confirmation_claimed": true,
+        "finding_id": "abc83b172463c37f",
+        "named_validator_present": false,
+        "proof_id": "e04bdfcbb30b438a92d6f6ade4450131",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "53ea6ae058c0eeca",
+        "confirmation_claimed": true,
+        "finding_id": "1729dac22c63d5a5",
+        "named_validator_present": false,
+        "proof_id": "dcf86d68c51041deab418ef538f1bac4",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "4a0970bc4728dd28",
+        "confirmation_claimed": true,
+        "finding_id": "73ea083f8fe12c7c",
+        "named_validator_present": false,
+        "proof_id": "0be12e9251e94bd0bfc60694c7160c89",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "aaa1d9f5d10cad0f",
+        "confirmation_claimed": true,
+        "finding_id": "a9d3c601b28eb110",
+        "named_validator_present": false,
+        "proof_id": "f21a61a017e249f4b6a8812d2bb263a3",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "928309f8550970a9",
+        "confirmation_claimed": true,
+        "finding_id": "f892216e3e52eb73",
+        "named_validator_present": false,
+        "proof_id": "7a71971391d040ab9aea332846cb2728",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": "481298e27165f1e2",
+        "confirmation_claimed": true,
+        "finding_id": "2ac03d031cfe516d",
+        "named_validator_present": false,
+        "proof_id": "6b424e0b970943c096f5718edac30b89",
+        "proof_reference_present": true,
+        "reasons": [
+          "proof reference is absent from the supplied artifact set"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/31/findings/11",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6076706067e2fcda",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "467457f3617bfcc4",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e2669cdcc0a1d019",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6a10877ee0c2ccea",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "9eb3073c59a895c6",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/32/findings/5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/32/findings/6",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "545b5bcd39aecc35",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ccc242b24c5e4852",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "8916ac0d25e4cb0b",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "2ea96ef08cac1d75",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "f543472ff1bcf44a",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "c532f985b9461dd7",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/33/findings/6",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "37c2eec80789e261",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6e686fa22f09a59a",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "416de4d7011f6623",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "326fc1f9bbfccf94",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ce64c33d598738dd",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/34/findings/5",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6d383346d5a5f8fc",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "2c8b5fe32ee05804",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "6e2fc4237ac38312",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5a1385c7475db928",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "ab70d2ec7c4aa0d4",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "5aad76ed0c813e84",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "b215555a69fe816d",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "9e8a60484997ae19",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "55ee9ec71c0b9a13",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "bfde5f2bff4478a8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/35/findings/10",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "f19286969a1957c6",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "3f4b93808e5734bb",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "497d463041342306",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "9d49a4b86a07b1ef",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "e0195bffc425802a",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "7a086bd2ffb16546",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a5691e0cfdd4e240",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "a31aa2425fdcebeb",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/analyze/36/findings/8",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/1/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/1/findings_detail/1",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/1/findings_detail/2",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/1/findings_detail/3",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/2/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/2/findings_detail/1",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/3/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/4/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/5/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/6/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/7/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/8/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": true,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/9/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "confirmation is a bare true boolean with no proof reference"
+        ],
+        "support": "unverifiable"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/10/findings_detail/0",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      },
+      {
+        "case_id": null,
+        "confirmation_claimed": false,
+        "finding_id": "maxcov_results_s19_full.json:/investigate/outcomes/10/findings_detail/1",
+        "named_validator_present": false,
+        "proof_id": null,
+        "proof_reference_present": false,
+        "reasons": [
+          "finding does not claim confirmation"
+        ],
+        "support": "not_claimed"
+      }
+    ],
+    "named_validator_references": 0,
+    "proof_references": 115,
+    "supported_confirmations": 0
+  },
+  "generated_at": "2026-09-15T21:07:53.850643+00:00",
+  "health": {
+    "evaluation_interval": null,
+    "evaluation_validity": "unknown",
+    "failed_intervals": [],
+    "log_summary": null,
+    "ordinary_control_count": 0,
+    "passing_intervals": [],
+    "security_test_control_count": 0,
+    "warnings": [
+      "no independently recorded benign target-health controls were supplied"
+    ]
+  },
+  "metrics": {
+    "benchmark_scope": "endpoint_known_items",
+    "case_sensitive_input_identity": true,
+    "casefold_collisions_preserved_as_distinct": [],
+    "confusion_matrix_independently_derivable": false,
+    "distinct_supporting_proofs": 0,
+    "finding_occurrences": 378,
+    "metric_names": [
+      "endpoint_known_detection_recall",
+      "proof_supported_confirmation_occurrences"
+    ],
+    "normalized_auditable_finding_records": 378,
+    "proof_supported_confirmation_occurrences": 0,
+    "reported_metrics": {
+      "confusion_inputs_complete": false,
+      "labelled_items": [
+        {
+          "item_id": "GT01-sqli-search",
+          "provenance": "unknown",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT02-sqli-login",
+          "provenance": "unknown",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT03-xxe-import",
+          "provenance": "unknown",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT04-idor-ticket",
+          "provenance": "earned",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT05-idor-report",
+          "provenance": "earned",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT06-idor-comments",
+          "provenance": "",
+          "status": "detected_unconfirmed"
+        },
+        {
+          "item_id": "GT07-pathtrav-uploads",
+          "provenance": "earned",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT08-jwt-forge",
+          "provenance": "earned",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT09-massassign-profile",
+          "provenance": "",
+          "status": "detected_unconfirmed"
+        },
+        {
+          "item_id": "GT10-massassign-register",
+          "provenance": "",
+          "status": "detected_unconfirmed"
+        },
+        {
+          "item_id": "GT11-bfla-admin-users",
+          "provenance": "unknown",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT12-disclosure-admin-debug",
+          "provenance": "unknown",
+          "status": "confirmed"
+        },
+        {
+          "item_id": "GT13-ssrf-integrations",
+          "provenance": "",
+          "status": "missed"
+        }
+      ],
+      "reported_all_finding_occurrences": 2428,
+      "reported_confirmed_finding_occurrences": 887,
+      "reported_endpoint_known_confirmed": 9,
+      "reported_endpoint_known_detected_unconfirmed": 3,
+      "reported_endpoint_known_missed": 1,
+      "reported_endpoint_known_total": 13,
+      "reported_unknown_provenance_confirmations": 5
+    },
+    "source_reported_finding_occurrences": 2428,
+    "unique_issue_identity_basis": "unavailable",
+    "unique_issues": null,
+    "warnings": [
+      "unique issue count is unknown because trustworthy production issue identity is incomplete",
+      "source-reported occurrence count differs from normalized auditable records; both are preserved and neither is silently substituted",
+      "endpoint-known benchmark results are not whole-target recall",
+      "missing labels or complete prediction/evidence inputs prevent independently deriving TP/FP/FN conclusions"
+    ]
+  },
+  "process_outcome": {
+    "degraded": false,
+    "elapsed_seconds": 35086.3,
+    "errors": [],
+    "finished": true
+  },
+  "provenance": {
+    "checked_artifacts": [],
+    "errors": [
+      "no evaluation manifest supplied"
+    ],
+    "provenance": "unknown_or_mismatched",
+    "valid": false,
+    "warnings": [
+      "artifact hashes establish consistency, not independent authenticity"
+    ]
+  },
+  "schema_version": "evaluation-integrity-audit/v1",
+  "sources": [
+    {
+      "adapter": "agenticvibe-maxcov-results/v1",
+      "bytes": 5205487,
+      "path": "C:\\Users\\arthu\\Documents\\AgenticVibe\\testing\\vulncorp-helpdesk\\maxrun\\maxcov_results_s19_full.json",
+      "sha256": "a5db4d0bf057f99c4716d6d425bc6eba13faf4ef2a3ce9562ed57b3422e1cb82",
+      "source_unchanged_during_read": true
+    },
+    {
+      "adapter": "agenticvibe-endpoint-known-recall/v1",
+      "bytes": 114848,
+      "path": "C:\\Users\\arthu\\Documents\\AgenticVibe\\testing\\vulncorp-helpdesk\\maxrun\\recall_report_s19_full.json",
+      "sha256": "37ad4cf2bdb4d1f954c1acfbb63dc93daddd16fddd18d5870b10d8f6a2a800e8",
+      "source_unchanged_during_read": true
+    }
+  ],
+  "warnings": [
+    "process completion is reported separately and does not imply complete coverage or valid evaluation"
+  ]
+}

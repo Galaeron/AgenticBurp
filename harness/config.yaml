@@ -18,7 +18,11 @@ ollama:
   timeout_seconds: 240
 
 # How many specialist agents are allowed to run concurrently against
-# Ollama at once, per exchange. Without a limit, a single exchange that
+# Ollama through one AgentManager. The application orchestrator shares that
+# manager across overlapping exchanges/jobs, so the limit applies across those
+# calls, not independently per exchange. Separately constructed orchestrators
+# have separate managers; this is not a process-global/Ollama-wide ceiling.
+# Without a limit, a single exchange that
 # dispatches several agents (or the coordinator failing open to all 36 --
 # see orchestrator.py) fires every one of those inference requests
 # simultaneously. On a single consumer GPU this can exceed available
