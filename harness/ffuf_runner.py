@@ -15,6 +15,7 @@ run time.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from dataclasses import dataclass, field
@@ -74,6 +75,18 @@ def build_args(target_url: str, *, wordlist: str = DEFAULT_WORDLIST,
     return args
 
 
+def _decode_ffuf_input(raw: str) -> str:
+    """ffuf's -json output always base64-encodes each keyword's raw input
+    bytes in the `input` map (so a binary/non-UTF8 wordlist entry survives
+    JSON safely) -- decode it back to the real wordlist entry. Falls back to
+    the raw string on decode failure, defensive against a future ffuf
+    version that stops encoding it."""
+    try:
+        return base64.b64decode(raw, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return raw
+
+
 def parse_json_lines(stdout: str) -> list[Route]:
     """Parse ffuf's -json output (one JSON object per line) into Route objects."""
     routes: list[Route] = []
@@ -86,7 +99,7 @@ def parse_json_lines(stdout: str) -> list[Route]:
         except (json.JSONDecodeError, ValueError):
             continue
         input_data = obj.get("input", {})
-        fuzz_val = input_data.get("FUZZ", "")
+        fuzz_val = _decode_ffuf_input(input_data.get("FUZZ", ""))
         if not fuzz_val:
             continue
         path = "/" + fuzz_val.lstrip("/")

@@ -1,10 +1,15 @@
 """Tests for ffuf_runner -- container-based content discovery."""
+import base64
 import json
 import unittest
 from unittest.mock import patch, MagicMock
 
 from harness import ffuf_runner
 from harness.api_surface_discovery import Route
+
+
+def _b64(s: str) -> str:
+    return base64.b64encode(s.encode()).decode()
 
 
 class BuildArgsTests(unittest.TestCase):
@@ -98,6 +103,54 @@ class ParseJsonLinesTests(unittest.TestCase):
         stdout = self._line("/already/slashed")
         routes = ffuf_runner.parse_json_lines(stdout)
         self.assertEqual(routes[0].path, "/already/slashed")
+
+
+class ParseJsonLinesBase64Tests(unittest.TestCase):
+    """Real ffuf -json output base64-encodes each `input` keyword value (so a
+    binary/non-UTF8 wordlist entry survives JSON safely) -- parse_json_lines
+    must decode it back to the real path, not feed the base64 blob itself
+    back into discovery as a candidate route. Regression for a live run where
+    role_crawl's active-discovery sweep fed base64 blobs like /LmVudg== back
+    into the probe queue instead of the real /.env they decode to, silently
+    starving 9 of 13 ground-truth findings that only the real path would
+    have reached."""
+
+    def _b64_line(self, real_value, status=200, length=42):
+        return json.dumps({"input": {"FUZZ": _b64(real_value)}, "status": status, "length": length})
+
+    def test_dotenv_decoded_not_left_base64(self):
+        stdout = self._b64_line(".env", 200, 146)
+        routes = ffuf_runner.parse_json_lines(stdout)
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0].path, "/.env")
+        self.assertNotEqual(routes[0].path, "/LmVudg==")
+
+    def test_nested_api_path_decoded(self):
+        stdout = self._b64_line("api/account/profile")
+        routes = ffuf_runner.parse_json_lines(stdout)
+        self.assertEqual(routes[0].path, "/api/account/profile")
+
+    def test_multiple_real_ffuf_style_results(self):
+        stdout = "\n".join([
+            self._b64_line("api/login"),
+            self._b64_line("api/tickets/search"),
+            self._b64_line("api/integrations"),
+        ])
+        routes = ffuf_runner.parse_json_lines(stdout)
+        paths = {r.path for r in routes}
+        self.assertEqual(paths, {"/api/login", "/api/tickets/search", "/api/integrations"})
+        # negative control: none of the base64 encodings themselves leak through
+        for p in paths:
+            self.assertNotIn("=", p)
+
+    def test_non_base64_fuzz_value_falls_back_to_raw(self):
+        # Defensive path for a hypothetical ffuf version that stops
+        # base64-encoding `input` -- a raw value that ISN'T valid base64
+        # (most real path segments, since '.' and unpadded lengths aren't
+        # valid base64) must still come through unchanged, not get dropped.
+        stdout = json.dumps({"input": {"FUZZ": "api/plain-path"}, "status": 200, "length": 10})
+        routes = ffuf_runner.parse_json_lines(stdout)
+        self.assertEqual(routes[0].path, "/api/plain-path")
 
 
 class ParseSilentLinesTests(unittest.TestCase):
