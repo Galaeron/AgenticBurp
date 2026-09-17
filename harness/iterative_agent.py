@@ -157,7 +157,16 @@ class IterativeAgent:
         self.allowed_hosts = allowed_hosts or []
         self.temperature = temperature
         self.max_steps = max_steps
-        self.gate = get_default_gate()
+
+    @property
+    def gate(self):
+        # Resolved fresh on every access, never cached: this agent is built once
+        # at Orchestrator startup, long before any particular run's RunContext
+        # (and its ambient gate) exists. Caching get_default_gate() at __init__
+        # time pinned every later _execute() to whatever gate was ambient (or
+        # the safe fallback) at STARTUP, forever -- exactly the stale-gate defect
+        # this property closes (2026-09-17 coverage-recovery plan, Step 1).
+        return get_default_gate()
 
     def _build_request(self, exchange: HttpExchange, action: dict, headers_state: dict) -> tuple:
         """Translate a constrained action into (method, url, headers, body),

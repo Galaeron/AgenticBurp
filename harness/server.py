@@ -74,6 +74,24 @@ orchestrator = Orchestrator(config)
 app = FastAPI(title="Burp LLM Harness", version="0.1.0")
 
 
+def _live_validators_gate_config() -> dict:
+    """The validators config for a NEW invocation started RIGHT NOW: the
+    static startup config as a base, with the live `active_enabled` toggle
+    (POST /settings -> ValidatorRegistry.set_active_enabled, in-memory only,
+    never written back to `config`) always taking precedence.
+
+    Without this, every RunContext built here read `config.get("validators")`
+    directly -- the frozen startup snapshot -- so a run started AFTER an
+    operator armed active mode via /settings still got a safe-default gate
+    (the actual defect behind SQLMap/CSRF mutating sends being BLOCKED with
+    "active testing... which is off" while the registry had already armed
+    dispatch for them). 2026-09-17 coverage-recovery plan, Step 1.
+    """
+    live = dict(config.get("validators", {}) or {})
+    live["active_enabled"] = orchestrator.validator_registry.active_enabled
+    return live
+
+
 def _is_loopback(host: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
 
@@ -476,7 +494,7 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
         from harness.run_context import RunContext, ScopePolicy
         async with RunContext.create(
                 allowed_hosts=orchestrator.allowed_hosts,
-                gate_config=(orchestrator.config.get("validators", {}) or {}),
+                gate_config=_live_validators_gate_config(),
                 max_requests=max(1, min(req.max_pages, 200))) as crawl_context:
             session_ref = None
             if req.headers:
@@ -497,7 +515,7 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
     sends_per_shape = 2 if req.send_garbage_token else 1
     async with RunContext.create(
             allowed_hosts=orchestrator.allowed_hosts,
-            gate_config=(orchestrator.config.get("validators", {}) or {}),
+            gate_config=_live_validators_gate_config(),
             max_requests=max(1, len(shapes) * sends_per_shape)) as probe_context:
         outcomes = await missing_auth_probe.probe_call_shapes(
             req.base_url, shapes,
@@ -952,7 +970,7 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
         allowed_hosts.add(target_host)
     run_context = RunContext.create(
         run_id=job_id, allowed_hosts=allowed_hosts,
-        gate_config=config.get("validators", {}) or {},
+        gate_config=_live_validators_gate_config(),
         max_requests=runs_cfg.get("max_requests"), config=config,
         timeout=float(runs_cfg.get("request_timeout_seconds", 15.0)))
     manifest = _run_manifest.RunManifest.start(

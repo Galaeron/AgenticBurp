@@ -14,6 +14,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from harness.run_context import RunContext, ScopePolicy, TypedRequest
+from harness.safety_gate import get_default_gate, reset_default_gate
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -215,6 +216,113 @@ class GateBudgetCancelTests(unittest.TestCase):
         out = asyncio.run(scenario())
         self.assertEqual(out.outcome, "blocked")
         self.assertEqual(self.srv.paths(), [])
+
+
+class AmbientGateAcrossInvocationsTests(unittest.TestCase):
+    """2026-09-17 coverage-recovery plan, Step 1, at the production seam: a
+    RunContext installs ITS gate as the ambient default (safety_gate.get_default_gate)
+    for its whole lifetime, so a validator with no run_context wiring at its own send
+    site -- CSRF's `GatedAsyncClient(get_default_gate(), ...)`, SQLMap's
+    `get_default_gate()` fallback -- still sees THIS run's policy, not a stale gate
+    left by an earlier, unrelated run (or none at all)."""
+
+    def setUp(self):
+        self.srv = _Fixture()
+        reset_default_gate()
+
+    def tearDown(self):
+        self.srv.close()
+        reset_default_gate()
+
+    def test_active_run_makes_bare_get_default_gate_calls_see_its_policy(self):
+        # A prior, unrelated safe/default call (e.g. a standalone script) first.
+        reset_default_gate()
+        get_default_gate({"active_enabled": False})
+
+        async def scenario():
+            # `async with` (not bare create()+aclose()) is what installs the
+            # ambient gate -- exactly how server.py's job/probe endpoints use a
+            # RunContext for the duration of the actual work.
+            async with RunContext.create(
+                    allowed_hosts=["127.0.0.1"],
+                    gate_config={"active_enabled": True, "allow_mutating_replay": True}):
+                # No run_context passed to authorize() -- this is exactly CSRF/
+                # SQLMap's own fallback expression when they have no run_context.
+                return get_default_gate().authorize(
+                    validator_name="csrf", method="POST", url=f"{self.srv.base}/register")
+
+        decision = asyncio.run(scenario())
+        self.assertTrue(decision.allowed, decision.reason)
+
+    def test_later_safe_run_is_not_contaminated_by_an_earlier_active_one(self):
+        async def scenario():
+            async with RunContext.create(
+                    allowed_hosts=["127.0.0.1"],
+                    gate_config={"active_enabled": True, "allow_mutating_replay": True}):
+                pass  # active run does its work and closes
+
+            async with RunContext.create(allowed_hosts=["127.0.0.1"],
+                                         gate_config={"active_enabled": False}):
+                return get_default_gate().authorize(
+                    validator_name="sqlmap", method="POST", url=f"{self.srv.base}/login")
+
+        decision = asyncio.run(scenario())
+        self.assertFalse(decision.allowed)
+
+    def test_active_run_without_allow_mutating_replay_still_blocks_the_send(self):
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"],
+                                gate_config={"active_enabled": True, "allow_mutating_replay": False})
+
+        async def scenario():
+            out = await ctx.executor().execute(
+                TypedRequest("POST", f"{self.srv.base}/login", body="u=1"), capability="sqlmap")
+            await ctx.aclose()
+            return out
+
+        out = asyncio.run(scenario())
+        self.assertEqual(out.outcome, "blocked")
+        self.assertNotIn("/login", self.srv.paths())
+
+    def test_off_scope_target_denied_even_inside_an_active_run(self):
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"],
+                                gate_config={"active_enabled": True, "allow_mutating_replay": True})
+
+        async def scenario():
+            out = await ctx.executor().execute(
+                TypedRequest("POST", "http://evil.example/login", body="u=1"), capability="sqlmap")
+            await ctx.aclose()
+            return out
+
+        out = asyncio.run(scenario())
+        self.assertEqual(out.outcome, "out_of_scope")
+        self.assertEqual(self.srv.paths(), [])
+
+    def test_closing_a_run_restores_the_ambient_gate_that_preceded_it(self):
+        outer_default = get_default_gate({"active_enabled": False})
+
+        async def scenario():
+            ctx = RunContext.create(allowed_hosts=["127.0.0.1"], gate_config={"active_enabled": True})
+            async with ctx:
+                self.assertIs(get_default_gate(), ctx.gate)
+            return get_default_gate()
+
+        after_close = asyncio.run(scenario())
+        self.assertIs(after_close, outer_default)
+
+    def test_bare_create_and_manual_aclose_do_not_touch_the_ambient_gate(self):
+        # No `async with` -- __aenter__ never runs, so this must be a complete
+        # no-op for the ambient scope (unchanged from before this fix), which is
+        # what keeps the ~70 existing tests that construct a RunContext directly
+        # and never close it safe from leaking a gate into unrelated tests.
+        outer_default = get_default_gate({"active_enabled": False})
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], gate_config={"active_enabled": True})
+        self.assertIs(get_default_gate(), outer_default)
+
+        async def scenario():
+            await ctx.aclose()  # must not raise even though __aenter__ never ran
+
+        asyncio.run(scenario())
+        self.assertIs(get_default_gate(), outer_default)
 
 
 class CookieAndRedirectTests(unittest.TestCase):

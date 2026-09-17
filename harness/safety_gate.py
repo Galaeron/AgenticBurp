@@ -38,10 +38,12 @@ things MORE restrictive than these ceilings, never less.
 """
 
 from __future__ import annotations
+import contextvars
 import logging
 import re
 import time
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -382,14 +384,90 @@ class GatedAsyncClient:
 
 _default_gate: SafetyGate | None = None
 
+# R-gate-01 (2026-09-17 coverage-recovery plan, Step 1): the module-level
+# singleton below is a process-wide cache that, once seeded, ignored every
+# later invocation's configuration -- a run started with active_enabled=True
+# AFTER a prior safe/default call still got the FIRST call's gate. That was
+# invisible in a short-lived test process but real in the long-lived server:
+# a runtime `/settings` toggle (ValidatorRegistry.set_active_enabled) or a
+# fresh RunContext for a new job never reached callers that just call
+# get_default_gate() with no config (IterativeAgent, missing_auth_probe,
+# feature_workflow, and every validator that has no run_context wiring at its
+# actual send site) -- they kept whatever gate was cached at first use.
+#
+# Fix: an invocation (a RunContext, or any caller that wants its OWN gate
+# used by everything nested under it) pushes that gate onto this ContextVar
+# for the dynamic extent of the call via `gate_scope()`/`push_gate()`. Being a
+# ContextVar (not a plain module global) makes this async-task-local: pushing
+# it in one asyncio Task's context does not affect a concurrent, unrelated
+# Task, and popping it restores exactly what was ambient before -- so a prior
+# invocation's gate can never leak into a later, unrelated one, in either
+# direction. `get_default_gate()` prefers this ambient gate when one is
+# active; only a caller with NO enclosing invocation at all (a standalone
+# script, or a test that never opens a scope) falls back to the historical
+# lazily-initialized singleton, which stays exactly as before for that case.
+_gate_ctx: "contextvars.ContextVar[SafetyGate | None]" = contextvars.ContextVar(
+    "harness_safety_gate_ambient", default=None)
+
+
+def push_gate(gate: SafetyGate) -> "SafetyGate | None":
+    """Make `gate` the ambient gate for `get_default_gate()` calls made
+    anywhere in the dynamic extent of the current invocation, until `pop_gate`
+    is called with the returned handle. Nests correctly: an inner push shadows
+    an outer one and popping restores it, so a sub-invocation (e.g. a
+    `standalone_context()` opened inside a larger run) cannot leak its gate
+    past its own lifetime.
+
+    Deliberately implemented with plain ContextVar.get()/set() rather than
+    the Token returned by `.set()` + `.reset(token)`: a RunContext is routinely
+    PUSHED in one asyncio Task (e.g. a request handler) and POPPED in another
+    (e.g. a background job Task it spawns to do the actual run) --
+    `Token.reset()` raises `ValueError: token was created in a different
+    Context` across that boundary, which is exactly how this is used in
+    server.py. Plain get/set has no such restriction and still composes
+    correctly (LIFO) as long as push/pop stay ordered within whichever task
+    actually uses them, which every caller here already guarantees."""
+    previous = _gate_ctx.get()
+    _gate_ctx.set(gate)
+    return previous
+
+
+def pop_gate(previous: "SafetyGate | None") -> None:
+    """Undo a `push_gate`, restoring whatever gate (or none) was ambient before it."""
+    _gate_ctx.set(previous)
+
+
+@contextmanager
+def gate_scope(gate: SafetyGate):
+    """Context-manager sugar over push_gate/pop_gate for a caller that just
+    wants a `with` block, e.g. a test or a script that isn't a RunContext."""
+    previous = push_gate(gate)
+    try:
+        yield gate
+    finally:
+        pop_gate(previous)
+
 
 def get_default_gate(config: dict | None = None) -> SafetyGate:
     """
-    Process-wide default gate, initialized from the validators config
-    block on first call. Subsequent calls ignore `config` and return
-    the same instance, so the audit log accumulates across a whole
-    run rather than resetting per validator.
+    Returns the gate for the CURRENT invocation.
+
+    Resolution order:
+    1. If an invocation has an ambient gate installed (via `push_gate`/
+       `gate_scope` -- RunContext does this for the duration of its
+       `async with` block), that
+       gate is returned and `config` is ignored: the invocation's own
+       validated configuration already built it, and it is what every
+       validator in this call tree -- including one with no run_context
+       wiring of its own -- must see.
+    2. Otherwise, fall back to a process-wide singleton built from `config`
+       the first time this path is taken (and reused, ignoring `config`, on
+       later no-scope calls) -- unchanged behaviour for a standalone caller
+       that opens no invocation of its own.
     """
+    ambient = _gate_ctx.get()
+    if ambient is not None:
+        return ambient
     global _default_gate
     if _default_gate is None:
         _default_gate = SafetyGate(SafetyGateConfig.from_dict(config or {}))
@@ -397,6 +475,8 @@ def get_default_gate(config: dict | None = None) -> SafetyGate:
 
 
 def reset_default_gate() -> None:
-    """Test-only: clears the process-wide gate so tests don't leak state into each other."""
+    """Test-only: clears the process-wide fallback gate (not the ambient
+    per-invocation one -- that resets itself when its scope exits) so tests
+    don't leak state into each other."""
     global _default_gate
     _default_gate = None

@@ -2,6 +2,7 @@ import unittest
 from harness.safety_gate import (
     SafetyGate, SafetyGateConfig, ActionRiskTier, GatedAsyncClient,
     SafetyGateBlocked, HARD_MAX_BURST_SIZE, get_default_gate, reset_default_gate,
+    gate_scope, push_gate, pop_gate,
 )
 
 
@@ -592,6 +593,95 @@ class PerFindingMutationCeilingTests(unittest.TestCase):
         for _ in range(10):
             self.assertTrue(gate.authorize(validator_name="s", method="GET",
                                            url="https://x/a", finding_id="F1").allowed)
+
+
+class TestAmbientGateScope(unittest.TestCase):
+    """2026-09-17 coverage-recovery plan, Step 1: get_default_gate() used to be a
+    process-wide singleton that cached whichever config it saw FIRST and ignored
+    every later invocation -- a real live run armed active_enabled via a runtime
+    toggle, but SQLMap and CSRF (which fall back to a bare get_default_gate() call
+    at their own send site with no run_context of their own) still saw the earlier
+    safe-default gate and were BLOCKED. gate_scope()/push_gate()/pop_gate() make
+    the ambient gate invocation-scoped (a ContextVar, not a mutable global), so a
+    later invocation's policy is visible to these bare callers, and an
+    invocation's gate never leaks into an unrelated one before or after it."""
+
+    def setUp(self):
+        reset_default_gate()
+
+    def tearDown(self):
+        reset_default_gate()
+
+    def test_active_run_after_a_default_gate_is_visible_to_bare_get_default_gate(self):
+        # 1. "Create a default gate first" -- a caller with no invocation of its
+        # own (e.g. a standalone script) seeds the safe fallback singleton.
+        default_gate = get_default_gate({"active_enabled": False})
+        self.assertFalse(default_gate.config.active_enabled)
+
+        # 2. "create an active run afterward" -- an invocation installs its OWN
+        # gate as ambient for its lifetime.
+        active_gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        with gate_scope(active_gate):
+            # SQLMap's exact fallback expression (self.run_context is None):
+            # `get_default_gate()`, then .authorize(POST ...).
+            sqlmap_decision = get_default_gate().authorize(
+                validator_name="sqlmap", method="POST", url="http://127.0.0.1:5002/api/login")
+            self.assertTrue(sqlmap_decision.allowed, sqlmap_decision.reason)
+            # CSRF's exact fallback expression: GatedAsyncClient(get_default_gate(), ...)
+            # -- authorize() is what GatedAsyncClient.request() calls internally.
+            csrf_decision = get_default_gate().authorize(
+                validator_name="csrf", method="POST", url="http://127.0.0.1:5002/api/register")
+            self.assertTrue(csrf_decision.allowed, csrf_decision.reason)
+            self.assertIs(get_default_gate(), active_gate)
+
+    def test_a_safe_run_afterward_is_not_contaminated_by_the_earlier_active_one(self):
+        active_gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        with gate_scope(active_gate):
+            self.assertTrue(get_default_gate().authorize(
+                validator_name="sqlmap", method="POST", url="http://x/login").allowed)
+
+        # 3. A later, unrelated safe/default invocation must NOT inherit the
+        # active gate the prior invocation used -- no cross-run leakage forward.
+        safe_gate = SafetyGate(SafetyGateConfig(active_enabled=False))
+        with gate_scope(safe_gate):
+            decision = get_default_gate().authorize(
+                validator_name="sqlmap", method="POST", url="http://x/login")
+            self.assertFalse(decision.allowed)
+
+    def test_scope_exit_restores_whatever_was_ambient_before_it(self):
+        default_gate = get_default_gate({"active_enabled": False})
+        active_gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        with gate_scope(active_gate):
+            self.assertIs(get_default_gate(), active_gate)
+        # Back to the fallback singleton once the active invocation's scope ends.
+        self.assertIs(get_default_gate(), default_gate)
+
+    def test_nested_scopes_unwind_in_order(self):
+        outer = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        inner = SafetyGate(SafetyGateConfig(active_enabled=False))
+        with gate_scope(outer):
+            self.assertIs(get_default_gate(), outer)
+            with gate_scope(inner):
+                self.assertIs(get_default_gate(), inner)
+            self.assertIs(get_default_gate(), outer)
+
+    def test_manual_push_pop_matches_the_context_manager(self):
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        token = push_gate(gate)
+        try:
+            self.assertIs(get_default_gate(), gate)
+        finally:
+            pop_gate(token)
+        self.assertIsNot(get_default_gate(), gate)
+
+    def test_active_run_without_allow_mutating_replay_still_denies_mutation(self):
+        # Item 3: active_enabled alone is not enough -- the stricter opt-in
+        # (allow_mutating_replay) must still be honored inside an active scope.
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=False))
+        with gate_scope(gate):
+            decision = get_default_gate().authorize(
+                validator_name="sqlmap", method="POST", url="http://x/login")
+            self.assertFalse(decision.allowed)
 
 
 if __name__ == "__main__":

@@ -443,11 +443,9 @@ def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
     per-context gate is used. The caller owns the returned context and must aclose()
     it (or use `transport_for`, which reports ownership)."""
     rc = RunContext.create(allowed_hosts=allowed_hosts, config=config, timeout=timeout,
-                           max_requests=max_requests)
+                           max_requests=max_requests, gate=gate)
     rc.scope = HostAllowScope(hosts=tuple((h or "") for h in (allowed_hosts or [])),
                               active_mode=active_mode)
-    if gate is not None:
-        rc.gate = gate
     return rc
 
 
@@ -481,23 +479,30 @@ class RunContext:
     cache_namespace: str = ""
     timeout: float = 15.0
     _default_client: httpx.AsyncClient | None = None
+    # What safety_gate.push_gate returned when this run installed its gate as
+    # ambient -- the gate (or None) that was ambient before it, to restore on
+    # aclose(). Not a contextvars.Token: see push_gate's docstring for why.
+    _gate_restore: object = field(default=None, repr=False, compare=False)
+    _gate_pushed: bool = field(default=False, repr=False, compare=False)
 
     @classmethod
     def create(cls, *, run_id: str | None = None, allowed_hosts=None, gate_config: dict | None = None,
-               max_requests: int | None = None, config: dict | None = None,
-               timeout: float = 15.0) -> "RunContext":
+               gate: "SafetyGate | None" = None, max_requests: int | None = None,
+               config: dict | None = None, timeout: float = 15.0) -> "RunContext":
         # A FRESH gate per run (never the process-global default) -- the #3 isolation
         # fix: authorization state is per run, so two runs cannot contaminate each
-        # other's mutation budgets or audit log.
+        # other's mutation budgets or audit log. Pass `gate` to reuse an existing
+        # gate (e.g. the caller's own) instead of building one from gate_config.
         resolved_run_id = run_id or uuid.uuid4().hex
         config_snapshot = deepcopy(config or {})
         configured_namespace = str(
             ((config_snapshot.get("runs", {}) or {}).get("cache_namespace") or "")
         )
+        resolved_gate = gate if gate is not None else SafetyGate(SafetyGateConfig.from_dict(gate_config or {}))
         return cls(
             run_id=resolved_run_id,
             scope=ScopePolicy(allowed_hosts=frozenset((h or "").lower() for h in (allowed_hosts or []))),
-            gate=SafetyGate(SafetyGateConfig.from_dict(gate_config or {})),
+            gate=resolved_gate,
             budget=RequestBudget(max_requests), cancel=CancelToken(),
             sessions=SessionManager(), config=config_snapshot,
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
@@ -520,8 +525,28 @@ class RunContext:
             await self._default_client.aclose()
             self._default_client = None
         await self.sessions.aclose()
+        if self._gate_pushed:
+            from harness.safety_gate import pop_gate
+            pop_gate(self._gate_restore)
+            self._gate_pushed = False
+            self._gate_restore = None
 
     async def __aenter__(self) -> "RunContext":
+        # Install this run's gate as the AMBIENT one (safety_gate.get_default_gate)
+        # for the `async with` block's lifetime, so a validator with no run_context
+        # wiring at its own send site (calls get_default_gate() bare -- CSRF's,
+        # SQLMap's fallback) still sees THIS invocation's policy, not a stale
+        # process-wide default from server startup or an unrelated earlier run
+        # (2026-09-17 coverage-recovery plan, Step 1). Deliberately scoped to
+        # `async with`, not to bare create()/aclose(): every real call site that
+        # needs this (server.py's engagement/probe endpoints) already uses
+        # `async with`, and the ~70 existing tests that construct a RunContext
+        # directly and read `.gate` themselves (never through get_default_gate())
+        # stay exactly as they were -- no eager global side effect at construction
+        # time that a test forgetting to call aclose() could leak into another.
+        from harness.safety_gate import push_gate
+        self._gate_restore = push_gate(self.gate)
+        self._gate_pushed = True
         return self
 
     async def __aexit__(self, *exc) -> None:
