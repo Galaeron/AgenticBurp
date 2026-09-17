@@ -89,6 +89,42 @@ def _derived_class_confirmed(node: dict, specialty: str) -> bool:
     return False
 
 
+def _parent_template_object_id(state, node: dict) -> str | None:
+    """A concrete, real object id borrowed from a PARENT object-scoped route's
+    own captured template, for a NESTED child route (e.g.
+    /api/tickets/{id}/comments derived from /api/tickets/{id}) that has no
+    template -- hence no real id -- of its own.
+
+    Without this, a nested route with no capture of its own falls back to the
+    generic id_fill ("1"), which may not correspond to ANY real object for
+    ANY identity -- cross-identity replay against a nonexistent object is
+    indistinguishable from "properly denied" (a 404, not a 200), so the leg
+    can never confirm. The object a SIBLING route (the same {id}, one path
+    segment shorter) was captured against DOES exist, so replaying the nested
+    route with THAT id gives cross-identity confirmation something real to
+    compare (2026-09-17 coverage-recovery plan, Step 3).
+
+    Walks the path's `{id}` occurrences from the LAST toward the first, so a
+    doubly-nested route (/a/{id}/b/{id}/c) still tries its immediate parent
+    first. Returns None when the node already has its own object id, or no
+    ancestor route with one is known -- callers keep their own id_fill."""
+    tmpl = node.get("template") or {}
+    if tmpl.get("object_id"):
+        return None
+    path = node.get("path") or "/"
+    method = (node.get("method") or "GET").upper()
+    segments = path.split("/")
+    id_positions = [i for i, s in enumerate(segments) if s == "{id}"]
+    for cut in reversed(id_positions):
+        parent_path = "/".join(segments[:cut + 1]) or "/"
+        if parent_path == path:
+            continue  # not actually a proper ancestor
+        parent = state.endpoints.get(f"{method} {parent_path}") if state else None
+        if parent is not None and parent.template and parent.template.get("object_id"):
+            return parent.template["object_id"]
+    return None
+
+
 def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
                    template: dict | None = None) -> HttpExchange:
     """Build the probe exchange for a node. When a captured request TEMPLATE exists
@@ -234,7 +270,16 @@ async def investigate_worklist(
         if eligible:
             eligible_count += 1
         do_agent = eligible and investigated < max_nodes
-        do_precond = precondition_fn is not None and precondition_run < max_precondition_legs
+        # Step 3 (2026-09-17 coverage-recovery plan): a proven-dead endpoint
+        # (every probed role got a server error) or a malformed/encoded
+        # discovery artifact must not spend the shared max_precondition_legs
+        # budget -- that budget is what a real, live endpoint (e.g. a captured
+        # /api/integrations POST) needs to actually get its SSRF/xxe/mass-
+        # assignment leg attempted, and it is finite while decoys can be
+        # numerous (the same route guessed under a dozen path prefixes).
+        is_junk_node = bool(node.get("dead_endpoint")) or bool(node.get("malformed_or_encoded"))
+        do_precond = (precondition_fn is not None and precondition_run < max_precondition_legs
+                     and not is_junk_node)
         if not do_agent and not do_precond:
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
                             "reason": _skip_reason(node, eligible, investigated, max_nodes, False)})
@@ -244,7 +289,8 @@ async def investigate_worklist(
         # probe from the lowest-trust identity that can reach it (strongest proof).
         probe_role = min(reach, key=_trust) if reach else (roles[0].role if roles else "anonymous")
         headers = role_headers.get(probe_role, {})
-        exchange = _seed_exchange(base_url, node, headers, id_fill)
+        parent_id = _parent_template_object_id(state, node)
+        exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
 
         node_findings: list[dict] = []
 

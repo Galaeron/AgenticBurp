@@ -401,10 +401,19 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
       - JWT-carrying protected GET   -> jwt-forge (seeded from a JWT-bearing role)
       - XML-accepting request body   -> xxe (OOB)
       - URL-shaped param present      -> ssrf (OOB)
+      - settable JSON/form body on a mutating method -> mass-assignment
+        (write-then-re-read differential, sequence validator)
 
-    The xxe/ssrf legs need a real body/param, which route-discovery seeds don't
-    carry, so they fire only on a captured exchange that actually has that shape
-    (real Burp use) -- never as a blind guess from a bare route."""
+    The xxe/ssrf/mass-assignment legs need a real body/param, which route-
+    discovery seeds don't carry, so they fire only on a captured exchange that
+    actually has that shape (real Burp use) -- never as a blind guess from a
+    bare route. Mass-assignment was previously only reachable through
+    `shape_precondition_findings` (the analyze()/captured-exchange path) -- a
+    settable-body node the graph loop investigated on its own (e.g.
+    /api/account/profile, /api/register) got NO shape-driven confirmation leg
+    at all unless an agent happened to label it `mass_assignment` itself,
+    reproducing the exact detection->confirmation coupling this module exists
+    to remove for every other class (2026-09-17 coverage-recovery plan, Step 3)."""
     from harness import worklist_investigator
     method = (node.get("method") or "GET").upper()
     legs: list[tuple[str, HttpExchange]] = []
@@ -431,6 +440,8 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
         legs.append(("open_redirect", exchange))
     if _has_pickle_shape(exchange):
         legs.append(("deserialization", exchange))
+    if _has_settable_body(exchange):
+        legs.append(("mass_assignment", exchange))
     return legs
 
 

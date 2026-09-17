@@ -281,6 +281,13 @@ class SurfaceEndpoint:
             "object_scoped": self.object_scoped, "findings": self.findings,
             "template": self.template,
             "score": s, "reasons": reasons,
+            # Step 2/3 (2026-09-17 coverage-recovery plan): surfaced so a
+            # dict-based consumer (investigate_worklist) can preserve a bounded
+            # per-run budget (max_precondition_legs) for real, live endpoints
+            # instead of spending it on a discovery artifact that already
+            # proved dead or malformed.
+            "dead_endpoint": self.is_repeat_5xx_artifact(),
+            "malformed_or_encoded": self.is_malformed_or_encoded(),
         }
 
     @classmethod

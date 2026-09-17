@@ -311,6 +311,41 @@ class ShapePreconditionLegsTests(unittest.TestCase):
         for c in ("command_injection", "ssti", "path_traversal", "open_redirect"):
             self.assertNotIn(c, classes)
 
+    def test_settable_json_body_routes_mass_assignment(self):
+        # Step 3 (2026-09-17 coverage-recovery plan): a POST with a settable
+        # JSON body (e.g. /api/account/profile, /api/register) previously got
+        # NO shape-driven mass-assignment leg at all -- only an agent that
+        # happened to label it 'mass_assignment' itself would trigger the
+        # sequence validator, reproducing the exact detection->confirmation
+        # coupling this module exists to remove for every other class.
+        node = {"method": "POST", "path": "/api/account/profile", "reachable_roles": ["user"]}
+        ex = _ex(url="http://t/api/account/profile", method="POST",
+                 body='{"role":"user","email":"me@t"}')
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertIn("mass_assignment", classes)
+
+    def test_settable_form_body_on_register_routes_mass_assignment(self):
+        node = {"method": "POST", "path": "/api/register", "reachable_roles": ["anonymous"]}
+        ex = _ex(url="http://t/api/register", method="POST", body="username=me&role=user")
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertIn("mass_assignment", classes)
+
+    def test_get_only_no_body_does_not_route_mass_assignment(self):
+        # Negative control: a GET-only node with no body must not be mislabeled
+        # as tested for mass-assignment -- there is nothing settable to probe.
+        node = {"method": "GET", "path": "/api/account/profile", "reachable_roles": ["user"]}
+        ex = _ex(url="http://t/api/account/profile", method="GET")
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertNotIn("mass_assignment", classes)
+
+    def test_post_with_no_object_body_does_not_route_mass_assignment(self):
+        # Negative control: a mutating method with an empty/non-object body
+        # (no settable fields) is not a mass-assignment target either.
+        node = {"method": "POST", "path": "/api/logout", "reachable_roles": ["user"]}
+        ex = _ex(url="http://t/api/logout", method="POST", body="")
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertNotIn("mass_assignment", classes)
+
 
 class ShapePredicateTests(unittest.TestCase):
     def test_has_injectable_param(self):

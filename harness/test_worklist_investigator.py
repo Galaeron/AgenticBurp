@@ -273,6 +273,141 @@ class PreconditionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ran), 2)   # stops after the cap of confirmed proactive legs
 
 
+class NestedObjectParentIdTests(unittest.TestCase):
+    """2026-09-17 coverage-recovery plan, Step 3: a nested child route (e.g.
+    /api/tickets/{id}/comments) with no template of its own borrows a REAL
+    object id from its parent object-scoped route's own captured template, so
+    cross-identity replay tests an object that actually exists instead of a
+    fabricated id indistinguishable from '404, properly denied'."""
+
+    def _state_with_parent_template(self, object_id="77"):
+        st = _state_with([dict(OBJ, path="/api/tickets/{id}")])
+        parent = st.endpoints["GET /api/tickets/{id}"]
+        parent.template = {"method": "GET", "body": "", "query": "",
+                           "content_type": "", "object_id": object_id}
+        return st
+
+    def test_positive_borrows_parent_object_id(self):
+        st = self._state_with_parent_template("77")
+        child = {"method": "GET", "path": "/api/tickets/{id}/comments", "object_scoped": True}
+        self.assertEqual(wi._parent_template_object_id(st, child), "77")
+
+    def test_negative_no_parent_template_returns_none(self):
+        st = engagement.EngagementState(host="t")   # no endpoints at all
+        child = {"method": "GET", "path": "/api/tickets/{id}/comments", "object_scoped": True}
+        self.assertIsNone(wi._parent_template_object_id(st, child))
+
+    def test_negative_node_with_its_own_object_id_does_not_borrow(self):
+        st = self._state_with_parent_template("77")
+        child = {"method": "GET", "path": "/api/tickets/{id}/comments",
+                "template": {"object_id": "99"}}
+        self.assertIsNone(wi._parent_template_object_id(st, child))
+
+
+class NestedObjectIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_seeded_exchange_carries_the_real_borrowed_id(self):
+        st = _state_with([dict(OBJ, path="/api/tickets/{id}")])
+        parent = st.endpoints["GET /api/tickets/{id}"]
+        parent.template = {"method": "GET", "body": "", "query": "",
+                           "content_type": "", "object_id": "77"}
+        comments_node = dict(OBJ, path="/api/tickets/{id}/comments")
+        st.ingest_role_crawl({"endpoints": [comments_node]})
+        seen_urls = []
+        async def probe(exchange, hypothesis, specialty, step_budget):
+            seen_urls.append(exchange.url)
+            return _nothing()
+        await wi.investigate_worklist(probe, st, "http://t", ROLES, max_nodes=8)
+        comments_calls = [u for u in seen_urls if u.endswith("/comments")]
+        self.assertTrue(comments_calls, "the nested comments node was never investigated")
+        for u in comments_calls:
+            self.assertIn("/api/tickets/77/comments", u)
+            self.assertNotIn("/api/tickets/1/comments", u)   # not the fabricated id_fill
+
+
+class SsrfBudgetPreservationTests(unittest.IsolatedAsyncioTestCase):
+    """2026-09-17 coverage-recovery plan, Step 3: dead (repeat-5xx) and
+    malformed/encoded discovery decoys must not spend the shared
+    max_precondition_legs budget that a real, captured, body-bearing route
+    (e.g. /api/integrations) needs to actually get its SSRF leg attempted."""
+
+    @staticmethod
+    def _real_integrations_node_and_state():
+        real = dict(OBJ, method="POST", path="/api/integrations", object_scoped=False,
+                   by_role={"agent": 200}, reachable_roles=["agent"])
+        st = _state_with([real])
+        ep = st.endpoints["POST /api/integrations"]
+        ep.template = {"method": "POST", "body": "url=http://collab.example/cb",
+                       "query": "", "content_type": "", "object_id": None}
+        return st
+
+    def test_positive_real_templated_route_gets_its_leg_attempted(self):
+        st = self._real_integrations_node_and_state()
+        attempted = []
+        async def precondition(node, exchange):
+            attempted.append(node["path"])
+            return []
+
+        asyncio.run(wi.investigate_worklist(
+            lambda *a, **k: _async(_nothing()), st, "http://t", ROLES,
+            precondition_fn=precondition, max_nodes=0, max_precondition_legs=24))
+        self.assertIn("/api/integrations", attempted)
+
+    def test_negative_dead_endpoint_leg_is_never_attempted(self):
+        # A speculative route-guessed variant that returned nothing but server
+        # errors for every role -- exactly what flooded the real run's log
+        # (a dozen /api/v1/integrations, /admin/integrations, ... 500s).
+        dead = dict(OBJ, method="GET", path="/api/v3/integrations", object_scoped=False,
+                   by_role={"anonymous": 500}, reachable_roles=[])
+        st = _state_with([dead])
+        attempted = []
+        async def precondition(node, exchange):
+            attempted.append(node["path"])
+            return []
+
+        asyncio.run(wi.investigate_worklist(
+            lambda *a, **k: _async(_nothing()), st, "http://t", ROLES,
+            precondition_fn=precondition, max_nodes=0, max_precondition_legs=24))
+        self.assertEqual(attempted, [], "a proven-dead discovery artifact spent a precondition-leg attempt")
+
+    def test_negative_malformed_encoded_leg_is_never_attempted(self):
+        malformed = dict(OBJ, method="GET", path="/api/integrations%2f1", object_scoped=False,
+                        by_role={"user": 200}, reachable_roles=["user"])
+        st = _state_with([malformed])
+        attempted = []
+        async def precondition(node, exchange):
+            attempted.append(node["path"])
+            return []
+
+        asyncio.run(wi.investigate_worklist(
+            lambda *a, **k: _async(_nothing()), st, "http://t", ROLES,
+            precondition_fn=precondition, max_nodes=0, max_precondition_legs=24))
+        self.assertEqual(attempted, [], "a malformed/encoded discovery artifact spent a precondition-leg attempt")
+
+    def test_integration_a_starved_budget_still_reaches_the_real_route_over_many_dead_decoys(self):
+        st = self._real_integrations_node_and_state()
+        # Insert the dead decoys BEFORE the real route so a naive "first N
+        # nodes in whatever order" dispatch would exhaust the budget on them;
+        # ranking (Step 2) additionally sinks them, but the exclusion here
+        # (test_negative_dead_endpoint_leg_is_never_attempted) is what
+        # guarantees they can NEVER consume a slot regardless of rank.
+        for n in range(20):
+            st.endpoints[f"GET /api/v{n}/integrations"] = engagement.SurfaceEndpoint(
+                method="GET", path=f"/api/v{n}/integrations", object_scoped=False,
+                access={"anonymous": 500}, reachable_roles=[])
+
+        attempted = []
+        async def precondition(node, exchange):
+            attempted.append(node["path"])
+            return []
+
+        # A budget of exactly 1: if even one dead decoy were attempted, the
+        # real route would starve.
+        asyncio.run(wi.investigate_worklist(
+            lambda *a, **k: _async(_nothing()), st, "http://t", ROLES,
+            precondition_fn=precondition, max_nodes=0, max_precondition_legs=1))
+        self.assertEqual(attempted, ["/api/integrations"])
+
+
 class HonestCoverageAccountingTests(unittest.IsolatedAsyncioTestCase):
     """2026-09-17 coverage-recovery plan, Step 2: prove SELECTION (good routes
     ranked and budgeted ahead of malformed/encoded discovery artifacts) and
