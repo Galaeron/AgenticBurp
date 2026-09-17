@@ -74,6 +74,17 @@ class Finding(BaseModel):
     confirmed: bool = False
     validation_hints: list[str] = Field(default_factory=list)
 
+    # 2026-09-17 coverage-recovery plan, Step 4: the NAME of the deterministic
+    # leg that set `confirmed=True` (e.g. "cross_identity", "sqlmap",
+    # "jwt_forge"), stamped by _validate_findings/coverage_confirmation_finding
+    # at the SAME moment as proof_id/case_id. Before this field existed, the
+    # only way to recover which leg (if any) confirmed a finding was to regex
+    # -parse its free-text evidence string for a "<leg> CONFIRMED" stamp
+    # (recall_benchmark.confirmation_leg_of) -- fragile, and silently empty for
+    # any confirmation path that phrased its evidence differently. Empty means
+    # no leg is known to have proved it, structurally, not by string luck.
+    confirmed_by_leg: str = ""
+
     # Originating-case coordinates (T01).  Producers may supply authoritative
     # values; the orchestrator derives a stable invocation-local finding_id when
     # legacy findings omit one.  proof_id/case_id are populated only after the
@@ -101,7 +112,7 @@ class Finding(BaseModel):
 AGENT_AUTHORITY_FIELDS = frozenset({
     "confirmed", "proof_id", "case_id", "review_verdict", "review_note",
     "original_confidence", "original_severity", "original_vulnerability_class",
-    "shape_inconsistent",
+    "shape_inconsistent", "confirmed_by_leg",
 })
 
 

@@ -443,6 +443,14 @@ class ChainMixin:
                 finding["confidence"] = max(float(finding.get("confidence", 0) or 0), float(res.confidence or floor))
                 finding["evidence"] = ((finding.get("evidence") or "") + f" || {leg} CONFIRMED: "
                                        + (res.summary or "")).strip(" |")
+                # Step 4 (2026-09-17 coverage-recovery plan): the STRUCTURED leg
+                # name, set at the SAME moment as the evidence stamp above -- this
+                # is the dominant confirmation path in the graph loop (both
+                # worklist_investigator's confirm_fn for agent findings and its
+                # precondition_fn for every shape-driven leg dispatch through
+                # here), and until now it stamped confirmation ONLY into the
+                # free-text evidence string, recoverable only by regex.
+                finding["confirmed_by_leg"] = leg.replace("-", "_")
 
         def _as_finding(finding, default_class):
             return Finding(vulnerability_class=finding.get("vulnerability_class") or default_class,

@@ -26,7 +26,8 @@ class SanitizeAgentFindingTests(unittest.TestCase):
         raw = self._raw(confirmed=True, proof_id="model-supplied-id", case_id="model-case",
                         review_verdict="validator-confirmed", review_note="looks solid",
                         original_confidence=0.99, original_severity="critical",
-                        original_vulnerability_class="idor", shape_inconsistent=True)
+                        original_vulnerability_class="idor", shape_inconsistent=True,
+                        confirmed_by_leg="cross_identity")
         cleaned = sanitize_agent_finding(raw)
         for field in AGENT_AUTHORITY_FIELDS:
             self.assertNotIn(field, cleaned)

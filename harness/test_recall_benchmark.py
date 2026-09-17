@@ -30,6 +30,19 @@ class LegExtractionTests(unittest.TestCase):
     def test_no_leg(self):
         self.assertEqual(confirmation_leg_of({"evidence": "just a hypothesis"}), "")
 
+    def test_structured_field_preferred_over_evidence_text(self):
+        # 2026-09-17 coverage-recovery plan, Step 4: confirmed_by_leg is the
+        # reliable, structured source -- checked before falling back to
+        # regex-parsing free-text evidence, which never has to phrase things
+        # a particular way for the leg to be recoverable.
+        f = {"confirmed_by_leg": "sqlmap", "evidence": "nothing named here at all"}
+        self.assertEqual(confirmation_leg_of(f), "sqlmap")
+
+    def test_structured_field_wins_even_if_evidence_names_a_different_leg(self):
+        f = {"confirmed_by_leg": "cross_identity",
+            "evidence": "hypothesis || jwt-forge CONFIRMED: unrelated stale text"}
+        self.assertEqual(confirmation_leg_of(f), "cross_identity")
+
 
 class ScoringTests(unittest.TestCase):
     def test_confirmed_detected_missed(self):
@@ -156,6 +169,57 @@ class AdapterTests(unittest.TestCase):
         it = score_run(gt, findings_from_engagement(result)).items[0]
         self.assertEqual(it.status, CONFIRMED)
         self.assertEqual(it.provenance, EARNED)
+
+
+class EarnedRecallTests(unittest.TestCase):
+    """2026-09-17 coverage-recovery plan, Step 4: `earned` is the honest
+    headline -- confirmed via the SPECIFIC intended leg, structurally
+    attributed, not "confirmed by something." A reported `confirmed` count
+    has repeatedly overstated real detection-path coverage (a run reporting
+    9/13 confirmed had only 4/13 earned once lucky/unknown confirms were
+    excluded); `earned` is what a coverage claim should be measured against."""
+
+    def test_earned_counts_only_intended_leg_structured_confirmations(self):
+        gt = [
+            PlantedVuln("V1", "idor", "/api/tickets/{id}", intended_confirmation="cross_identity"),
+            PlantedVuln("V2", "sqli", "/api/search", intended_confirmation="sqlmap"),
+            PlantedVuln("V3", "xxe", "/api/import", intended_confirmation="xxe"),
+            PlantedVuln("V4", "ssrf", "/api/fetch", intended_confirmation="ssrf"),
+        ]
+        findings = [
+            # V1: earned -- the intended leg, structurally named.
+            {"url": "http://t/api/tickets/7", "vulnerability_class": "idor",
+             "confirmed": True, "confirmed_by_leg": "cross_identity"},
+            # V2: confirmed, but by a DIFFERENT leg than intended -- lucky, not earned.
+            {"url": "http://t/api/search", "vulnerability_class": "sqli",
+             "confirmed": True, "confirmed_by_leg": "cross_identity"},
+            # V3: confirmed, but no leg named at all -- unknown, not earned.
+            {"url": "http://t/api/import", "vulnerability_class": "xxe",
+             "confirmed": True, "evidence": "confirmed somehow"},
+            # V4: missed entirely.
+        ]
+        score = score_run(gt, findings)
+        self.assertEqual(score.confirmed, 3)     # V1, V2, V3 all report confirmed=True
+        self.assertEqual(score.earned, 1)        # only V1 is earned
+        self.assertIn("1/4 earned", score.summary_line())
+        self.assertIn("3/4 confirmed", score.summary_line())
+
+    def test_a_passive_observation_is_visible_but_not_earned(self):
+        # A CORS/CSP-style passive observation (no leg tier at all --
+        # confirmation_gate.leg_tier("cors") == "none") is a real, visible,
+        # matched-and-confirmed item -- but it never counts toward earned
+        # EXPLOIT recall, even when its own provenance resolves to EARNED
+        # (its declared "intended" leg matched what confirmed it).
+        from harness.confirmation_gate import leg_tier
+        self.assertEqual(leg_tier("cors"), "none")
+        gt = [PlantedVuln("V1", "cors", "/api/data", intended_confirmation="cors")]
+        findings = [{"url": "http://t/api/data", "vulnerability_class": "cors",
+                    "confirmed": True, "confirmed_by_leg": "cors"}]
+        score = score_run(gt, findings)
+        item = score.items[0]
+        self.assertEqual(item.status, CONFIRMED)   # visible: it IS a matched, confirmed finding
+        self.assertEqual(item.provenance, EARNED)  # its own item-level provenance says "earned"
+        self.assertEqual(score.earned, 0)          # but excluded from earned EXPLOIT recall
 
 
 if __name__ == "__main__":

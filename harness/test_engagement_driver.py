@@ -55,7 +55,7 @@ class DriverPlanTests(unittest.TestCase):
         st = _seed_state()
         st.ingest_findings("http://shop.test/rest/admin/config", "GET",
                            [{"vulnerability_class": "misconfig", "severity": "high",
-                             "confidence": 0.9, "confirmed": True}])
+                             "confidence": 0.9, "confirmed": True, "confirmed_by_leg": "sqlmap"}])
         store.save_engagement("shop.test", st.to_dict())
         r = asyncio.run(self.orch.plan_engagement("shop.test", base_url="http://shop.test/"))
         paths = {t["path"] for t in r["targets"]}

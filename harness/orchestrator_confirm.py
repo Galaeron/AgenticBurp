@@ -339,6 +339,10 @@ class ConfirmMixin:
                             " " if finding.review_note else "") + result.summary
                         finding.proof_id = pr.proof_id
                         finding.case_id = case.case_id
+                        # Step 4 (2026-09-17 coverage-recovery plan): the STRUCTURED
+                        # leg name, set at the exact same moment as proof_id/case_id
+                        # -- not recovered later by regex-parsing evidence text.
+                        finding.confirmed_by_leg = result.validator
                 else:
                     log.warning("failed to persist proof for %s: %s", result.validator, reason)
                     output[-1] = ValidationReport(

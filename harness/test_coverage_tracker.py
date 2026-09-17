@@ -58,6 +58,7 @@ class BuildTests(unittest.TestCase):
             ("GET", "/api/tickets/{id}", {
                 "reachable_roles": ["user", "admin"],
                 "findings": [{"vulnerability_class": "idor", "confirmed": True,
+                              "confirmed_by_leg": "cross_identity",
                               "severity": "high", "confidence": 0.9}]}),
         ])
         t = CoverageTracker()

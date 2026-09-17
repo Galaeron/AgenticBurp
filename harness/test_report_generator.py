@@ -63,6 +63,38 @@ class TestReportStructure(unittest.TestCase):
         self.assertLess(confirmed_idx, sqli_idx)
         self.assertLess(unconfirmed_idx, xss_idx)
 
+    def test_confirmed_exploits_and_observations_are_split(self):
+        # 2026-09-17 coverage-recovery plan, Step 4: a passive header/content
+        # observation (CORS, no exploit-confirmation leg at all) that happens
+        # to set confirmed=True is visible, but distinguished from an actual
+        # confirmed exploit (SQLi) -- not bundled into one undifferentiated
+        # "confirmed" pile.
+        findings = [
+            sample(vulnerability_class="sqli", confirmed=True),
+            sample(vulnerability_class="cors", confirmed=True),
+        ]
+        report = generate_markdown_report("example.com", findings)
+        self.assertIn("## Confirmed Findings", report)
+        self.assertIn("### Confirmed Exploits", report)
+        self.assertIn("### Confirmed Observations", report)
+        exploits_idx = report.index("### Confirmed Exploits")
+        observations_idx = report.index("### Confirmed Observations")
+        sqli_idx = report.index("sqli --")
+        cors_idx = report.index("cors --")
+        self.assertLess(exploits_idx, sqli_idx)
+        self.assertLess(observations_idx, cors_idx)
+        # both are still counted in the overall confirmed total
+        self.assertIn("2 confirmed finding(s)", report)
+
+    def test_no_split_rendered_when_all_confirmed_are_exploits(self):
+        # Purely additive: a report with no observation-class confirmations
+        # renders exactly as before -- no empty "Confirmed Observations"
+        # section, no subheadings clutter.
+        findings = [sample(vulnerability_class="sqli", confirmed=True)]
+        report = generate_markdown_report("example.com", findings)
+        self.assertNotIn("### Confirmed Exploits", report)
+        self.assertNotIn("### Confirmed Observations", report)
+
     def test_confirmed_status_badge_present(self):
         findings = [sample(confirmed=True)]
         report = generate_markdown_report("example.com", findings)

@@ -354,6 +354,30 @@ def leg_tier(vuln_class: str | None, live_verified_markers: frozenset | None = N
     return "live" if any(marker in lowered for marker in live) else "provisional"
 
 
+def active_confirmation_is_unproven(finding: dict) -> bool:
+    """2026-09-17 coverage-recovery plan, Step 4: True when a finding claims
+    `confirmed=True` for a class that HAS a deterministic leg (leg_tier !=
+    "none") but carries none of `confirmed_by_leg`, `proof_id`, or the older
+    `confirmation_method` (a pre-Step-4 synonym some call sites still use) --
+    an active-class confirmation with no leg named at all.
+
+    This is the honesty backstop, not the primary path: `_validate_findings`
+    and `coverage_confirmation_finding` always stamp `confirmed_by_leg`
+    alongside `confirmed=True` (Step 4), so a finding that reaches here
+    unstamped got `confirmed=True` from somewhere else entirely -- an agent's
+    own claim that survived sanitize_agent_finding some other way, or a future
+    call site that sets the flag directly. A class with NO leg at all
+    (leg_tier == "none") is a *different*, already-handled case
+    (engagement.needs_human_review's human-verification hand-off) and is
+    deliberately excluded here -- this function only polices classes where an
+    automated leg exists and therefore SHOULD have been the one to confirm."""
+    if not finding.get("confirmed"):
+        return False
+    if finding.get("confirmed_by_leg") or finding.get("proof_id") or finding.get("confirmation_method"):
+        return False
+    return leg_tier(finding.get("vulnerability_class")) != "none"
+
+
 def _controlled_negative_classes(validation_reports: list | None) -> set:
     """Canonical finding classes for which a validator produced a real controlled
     NEGATIVE -- it actually ran and returned `not_confirmed` (R08). This is what

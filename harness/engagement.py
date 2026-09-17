@@ -170,17 +170,26 @@ class SurfaceEndpoint:
         identity, basis) are PRESERVED rather than dropped to a 4-key slim, and
         every superseded entry is retained under `_superseded` so the history and
         the proof that backed a finding are never silently lost."""
+        # Step 4 (2026-09-17 coverage-recovery plan): reject an active-class
+        # confirmation with no leg proof behind it -- the honesty backstop, not
+        # the primary path (see confirmation_gate.active_confirmation_is_unproven's
+        # docstring for exactly what this does and does not police).
+        from harness import confirmation_gate
+        confirmed = bool(f.get("confirmed", False))
+        if confirmed and confirmation_gate.active_confirmation_is_unproven(f):
+            confirmed = False
         slim = {
             "vulnerability_class": f.get("vulnerability_class", ""),
             "severity": f.get("severity", "info"),
             "confidence": f.get("confidence", 0.0),
-            "confirmed": bool(f.get("confirmed", False)),
+            "confirmed": confirmed,
         }
         # Carry proof/context when present -- never fabricate empty keys.
         # (T04: proof_id/case_id link a finding to its case-bound structured proof so
         # the link survives ingestion into state and the report projection.)
         for k in ("evidence", "summary", "url", "confirmation_method",
-                  "validator", "identity", "basis", "proof_id", "case_id"):
+                  "validator", "identity", "basis", "proof_id", "case_id",
+                  "confirmed_by_leg"):
             if f.get(k):
                 slim[k] = f[k]
 

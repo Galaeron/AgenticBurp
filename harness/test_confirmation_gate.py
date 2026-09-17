@@ -1,6 +1,9 @@
 import unittest
 from harness.models import AgentReport, Finding, ValidationReport
-from harness.confirmation_gate import is_confirmable_class, apply_confirmation_suppression, leg_tier
+from harness.confirmation_gate import (
+    is_confirmable_class, apply_confirmation_suppression, leg_tier,
+    active_confirmation_is_unproven,
+)
 
 
 def _finding(vc, severity="high", confidence=0.85, confirmed=False):
@@ -222,6 +225,50 @@ class TestLegAwareThreeState(unittest.TestCase):
         f = _apply(_finding("reflected xss", severity="high", confirmed=True))
         self.assertEqual(f.severity, "high")
         self.assertIsNone(f.review_verdict)
+
+
+class ActiveConfirmationProvenanceTests(unittest.TestCase):
+    """2026-09-17 coverage-recovery plan, Step 4: reject an active-class
+    confirmation with no leg proof behind it -- the honesty backstop."""
+
+    def test_unstamped_active_finding_is_unproven(self):
+        # "sqli" is a live-verified, leg-bearing class -- confirmed=True with
+        # NO confirmed_by_leg/proof_id/confirmation_method is not credible.
+        f = {"vulnerability_class": "sqli", "confirmed": True}
+        self.assertTrue(active_confirmation_is_unproven(f))
+
+    def test_a_real_leg_proof_remains_proven(self):
+        f = {"vulnerability_class": "sqli", "confirmed": True, "confirmed_by_leg": "sqlmap"}
+        self.assertFalse(active_confirmation_is_unproven(f))
+
+    def test_proof_id_alone_is_also_accepted_as_proof(self):
+        f = {"vulnerability_class": "idor", "confirmed": True, "proof_id": "abc123"}
+        self.assertFalse(active_confirmation_is_unproven(f))
+
+    def test_unconfirmed_finding_is_never_flagged(self):
+        # The rule only polices claims of confirmed=True.
+        f = {"vulnerability_class": "sqli", "confirmed": False}
+        self.assertFalse(active_confirmation_is_unproven(f))
+
+    def test_class_with_no_leg_at_all_is_exempt(self):
+        # cors/csp have leg_tier == "none" -- a different, already-handled case
+        # (engagement.needs_human_review), not this backstop's concern.
+        f = {"vulnerability_class": "cors", "confirmed": True}
+        self.assertFalse(active_confirmation_is_unproven(f))
+
+    def test_engagement_add_finding_downgrades_an_unstamped_active_confirmation(self):
+        from harness.engagement import SurfaceEndpoint
+        ep = SurfaceEndpoint("GET", "/x")
+        ep.add_finding({"vulnerability_class": "sqli", "severity": "high",
+                       "confidence": 0.9, "confirmed": True})   # no leg stamp
+        self.assertFalse(ep.findings[0]["confirmed"])
+
+    def test_engagement_add_finding_keeps_a_real_leg_proof_confirmed(self):
+        from harness.engagement import SurfaceEndpoint
+        ep = SurfaceEndpoint("GET", "/x")
+        ep.add_finding({"vulnerability_class": "sqli", "severity": "high", "confidence": 0.9,
+                       "confirmed": True, "confirmed_by_leg": "sqlmap"})
+        self.assertTrue(ep.findings[0]["confirmed"])
 
 
 if __name__ == "__main__":

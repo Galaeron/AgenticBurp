@@ -32,13 +32,15 @@ class IngestTests(unittest.TestCase):
         ep = self.st.endpoints["GET /api/x"]
         self.assertEqual(ep.status, "analyzed")
         self.st.ingest_findings("http://shop.test/api/x", "GET",
-                                [{"vulnerability_class": "xss", "severity": "high", "confidence": 0.9, "confirmed": True}])
+                                [{"vulnerability_class": "xss", "severity": "high", "confidence": 0.9,
+                                  "confirmed": True, "confirmed_by_leg": "browser_xss"}])
         self.assertEqual(self.st.endpoints["GET /api/x"].status, "validated")
 
     def test_add_finding_dedup_supersede(self):
         ep = SurfaceEndpoint("GET", "/x")
         ep.add_finding({"vulnerability_class": "sqli", "severity": "high", "confidence": 0.5, "confirmed": False})
-        ep.add_finding({"vulnerability_class": "sqli", "severity": "high", "confidence": 0.9, "confirmed": True})
+        ep.add_finding({"vulnerability_class": "sqli", "severity": "high", "confidence": 0.9,
+                        "confirmed": True, "confirmed_by_leg": "sqlmap"})
         self.assertEqual(len(ep.findings), 1)
         self.assertTrue(ep.findings[0]["confirmed"])
 
@@ -118,7 +120,8 @@ class FusionTests(unittest.TestCase):
         st = EngagementState(host="shop.test")
         # two identical-severity findings; one validated, one still a hypothesis
         st.ingest_findings("http://shop.test/api/done", "GET",
-                           [{"vulnerability_class": "xss", "severity": "high", "confidence": 0.9, "confirmed": True}])
+                           [{"vulnerability_class": "xss", "severity": "high", "confidence": 0.9,
+                             "confirmed": True, "confirmed_by_leg": "browser_xss"}])
         st.ingest_findings("http://shop.test/api/open", "GET",
                            [{"vulnerability_class": "xss", "severity": "high", "confidence": 0.9, "confirmed": False}])
         scores = {e["path"]: e["score"] for e in st.worklist()}
@@ -287,7 +290,8 @@ class MergeStateTests(unittest.TestCase):
         derived = EngagementState(host="t")
         d_ep = derived._ep("GET", "/api/secret")   # reachable only as the leaked id
         d_ep.reachable_roles = ["derived"]
-        d_ep.add_finding({"vulnerability_class": "idor", "confirmed": True, "severity": "high"})
+        d_ep.add_finding({"vulnerability_class": "idor", "confirmed": True, "severity": "high",
+                         "confirmed_by_leg": "cross_identity"})
         derived.ingest_identity("leaked-bearer", "derived")
         added = primary.merge_from(derived)
         self.assertEqual(added, 1)
@@ -298,7 +302,8 @@ class MergeStateTests(unittest.TestCase):
     def test_merge_is_monotonic_on_shared_endpoint(self):
         primary = EngagementState(host="t")
         primary._ep("GET", "/api/x").add_finding(
-            {"vulnerability_class": "idor", "confirmed": True, "severity": "high", "confidence": 0.9})
+            {"vulnerability_class": "idor", "confirmed": True, "severity": "high", "confidence": 0.9,
+             "confirmed_by_leg": "cross_identity"})
         derived = EngagementState(host="t")
         derived._ep("GET", "/api/x").add_finding(
             {"vulnerability_class": "idor", "confirmed": False, "severity": "high", "confidence": 0.99})

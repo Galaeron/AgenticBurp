@@ -124,10 +124,19 @@ class ReportFinding:
     issue_id: str = ""
     # W-7: explicit CONFIRMED/SUSPECTED/LEAD state (from confirmation_gate).
     lifecycle_state: str = "SUSPECTED"
+    # Step 4 (2026-09-17 coverage-recovery plan): True for a class with NO
+    # deterministic exploit-confirmation leg at all (leg_tier == "none" --
+    # cors, csp, verbose_error, info_disclosure, ...). These validators are
+    # passive header/content checks, not live exploitation, so a "confirmed"
+    # CORS misconfiguration and a "confirmed" SQL injection are not the same
+    # kind of claim; bundling them under one "confirmed" count inflated the
+    # headline number without the reader being able to tell which is which.
+    is_observation: bool = False
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
     from harness import issues
+    from harness.confirmation_gate import leg_tier
     vc = d.get("vulnerability_class", "")
     return ReportFinding(
         url=d.get("url", ""),
@@ -151,6 +160,7 @@ def _from_store_dict(d: dict) -> ReportFinding:
         lifecycle_state=d.get("lifecycle_state")
         or __import__("harness.confirmation_gate",
                       fromlist=["finding_lifecycle_state"]).finding_lifecycle_state(d),
+        is_observation=(leg_tier(vc) == "none"),
     )
 
 
@@ -355,10 +365,37 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     lines.append("")
 
     if confirmed:
+        # Step 4 (2026-09-17 coverage-recovery plan): an exploit a deterministic
+        # leg actually confirmed (SQLi, IDOR, RCE, ...) is a different kind of
+        # claim than a passive header/content OBSERVATION (CORS, CSP,
+        # verbose-error, ...) that happens to also set confirmed=True -- split
+        # them so the reader (and anyone counting "N confirmed") can tell which
+        # is which, without changing the overall confirmed count or heading any
+        # existing caller already relies on.
+        confirmed_exploits = [f for f in confirmed if not f.is_observation]
+        confirmed_observations = [f for f in confirmed if f.is_observation]
         lines.append("## Confirmed Findings")
         lines.append("")
-        for f in confirmed:
-            lines.extend(_render_finding(f))
+        if confirmed_observations:
+            lines.append(f"Of these, **{len(confirmed_exploits)}** are confirmed EXPLOITS "
+                        f"(a deterministic leg actively proved the vulnerability) and "
+                        f"**{len(confirmed_observations)}** are confirmed OBSERVATIONS "
+                        f"(a passive header/content check, not a live exploit).")
+            lines.append("")
+        if confirmed_exploits:
+            if confirmed_observations:
+                lines.append("### Confirmed Exploits")
+                lines.append("")
+            for f in confirmed_exploits:
+                lines.extend(_render_finding(f))
+        if confirmed_observations:
+            lines.append("### Confirmed Observations")
+            lines.append("")
+            lines.append("_Passive header/content checks (CORS, CSP, verbose errors, ...) -- real "
+                        "findings, but not live-exploited the way the findings above were._")
+            lines.append("")
+            for f in confirmed_observations:
+                lines.extend(_render_finding(f))
 
     if unconfirmed:
         lines.append("## Unconfirmed Findings")

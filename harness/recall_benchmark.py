@@ -117,9 +117,30 @@ class RecallScore:
         # #6: confirmed but with no leg named -- distinct from lucky.
         return sum(1 for it in self.items if it.status == CONFIRMED and it.provenance == UNKNOWN)
 
+    @property
+    def earned(self) -> int:
+        """2026-09-17 coverage-recovery plan, Step 4: the honest headline
+        number -- confirmed via the SPECIFIC leg the planted vuln was meant to
+        be confirmed by, not "confirmed by something, anything." Reported
+        `confirmed` counts have repeatedly overstated this (a run reporting
+        9/13 confirmed had only 4/13 earned once lucky/unknown-provenance
+        confirms were excluded) -- `earned` is what a claim of real detection-
+        path coverage should be measured against, not `confirmed`.
+
+        Also excludes a class with NO automated exploit-confirmation leg at
+        all (confirmation_gate.leg_tier == "none" -- CORS, CSP, verbose-error,
+        ...): a passive header/content observation is real and stays visible
+        as CONFIRMED/EARNED-provenance on its own item, but it never counts
+        toward earned EXPLOIT recall, regardless of what a ground-truth entry
+        happens to declare as its "intended" leg."""
+        from harness.confirmation_gate import leg_tier
+        return sum(1 for it in self.items
+                  if it.status == CONFIRMED and it.provenance == EARNED
+                  and leg_tier(it.planted.vulnerability_class) != "none")
+
     def summary_line(self) -> str:
         n = self.total
-        s = (f"{self.confirmed}/{n} confirmed, {self.detected_unconfirmed}/{n} "
+        s = (f"{self.earned}/{n} earned, {self.confirmed}/{n} confirmed, {self.detected_unconfirmed}/{n} "
              f"detected-unconfirmed, {self.missed}/{n} missed")
         if self.lucky_confirms:
             s += f" ({self.lucky_confirms} confirmed by luck, not the intended path)"
@@ -128,7 +149,7 @@ class RecallScore:
         return s
 
     def to_dict(self) -> dict:
-        return {"total": self.total, "confirmed": self.confirmed,
+        return {"total": self.total, "earned": self.earned, "confirmed": self.confirmed,
                 "detected_unconfirmed": self.detected_unconfirmed, "missed": self.missed,
                 "lucky_confirms": self.lucky_confirms,
                 "unknown_provenance_confirms": self.unknown_provenance_confirms,
@@ -168,10 +189,20 @@ def _matches(planted: PlantedVuln, f: dict) -> bool:
 
 
 def confirmation_leg_of(f: dict) -> str:
-    """The confirmation leg that proved a finding, from its evidence stamp
-    ("... || cross-identity CONFIRMED: ..."), falling back to an explicit
-    proactive_leg field or a validation_hints prefix. Empty when nothing names
-    a leg. Normalised to the underscored token form (cross_identity, jwt_forge)."""
+    """The confirmation leg that proved a finding.
+
+    Prefers the STRUCTURED `confirmed_by_leg` field (2026-09-17 coverage-
+    recovery plan, Step 4), stamped by _validate_findings/
+    coverage_confirmation_finding at the same moment as proof_id -- reliable
+    regardless of how a leg happened to phrase its evidence text. Falls back,
+    for legacy findings with no structured stamp, to the evidence stamp
+    ("... || cross-identity CONFIRMED: ..."), an explicit proactive_leg field,
+    or a validation_hints prefix. Empty when nothing names a leg. Normalised
+    to the underscored token form (cross_identity, jwt_forge)."""
+    structured = f.get("confirmed_by_leg")
+    if structured:
+        leg = str(structured).strip().lower()
+        return _LEG_ALIASES.get(leg, leg)
     ev = f.get("evidence") or ""
     m = _LEG_RX.search(ev)
     if m:

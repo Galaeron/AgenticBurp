@@ -100,6 +100,24 @@ class CoverageConfirmationFindingTests(unittest.TestCase):
         self.assertEqual(f["confirmation_method"], "sqlmap")
         self.assertEqual(f["evidence"], "ev")
 
+    def test_confirmed_by_leg_matches_the_graph_paths_structured_field(self):
+        # 2026-09-17 coverage-recovery plan, Step 4: the coverage-driven path
+        # must stamp the SAME structured field name (confirmed_by_leg) the
+        # graph-driven path (_validate_findings) stamps, with the same value
+        # -- one provenance reader, not "check confirmation_method for
+        # coverage-driven, confirmed_by_leg for graph-driven."
+        f = coverage_confirmation_finding(self._Res(True, validator="sqlmap"),
+                                          self._Check(), "http://t/x", "user")
+        self.assertEqual(f["confirmed_by_leg"], "sqlmap")
+        self.assertEqual(f["confirmed_by_leg"], f["confirmation_method"])
+
+    def test_confirmed_by_leg_falls_back_to_the_checks_own_confirmation_name(self):
+        # When the ValidationResult carries no validator name of its own, the
+        # check's own declared confirmation leg is used -- never left blank.
+        res = self._Res(True, validator=None)
+        f = coverage_confirmation_finding(res, self._Check(), "http://t/x", "user")
+        self.assertEqual(f["confirmed_by_leg"], "sqlmap")   # _Check.confirmation
+
     def test_not_confirmed_result_maps_to_none(self):
         self.assertIsNone(coverage_confirmation_finding(self._Res(False), self._Check(), "http://t/x", "user"))
 

@@ -346,6 +346,14 @@ def coverage_confirmation_finding(res, check, url: str, identity: str) -> dict |
                     f"Coverage-driven {check.confirmation} leg confirmed on {url}"),
         "evidence": getattr(res, "evidence", "") or "",
         "confirmation_method": getattr(res, "validator", None) or check.confirmation,
+        # Step 4 (2026-09-17 coverage-recovery plan): the SAME structured field
+        # name the graph-driven path (_validate_findings) stamps, so a
+        # confirmation's provenance is identical shape regardless of which
+        # dispatcher produced it -- a coverage-driven confirm previously only
+        # carried this leg name under confirmation_method, a key the graph
+        # path never wrote, so a single provenance reader had to know which
+        # path produced a given finding.
+        "confirmed_by_leg": getattr(res, "validator", None) or check.confirmation,
         "url": url,
         "identity": identity,
         "basis": "derived",

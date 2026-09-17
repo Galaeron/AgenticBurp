@@ -33,6 +33,7 @@ BENIGN = {"method": "GET", "path": "/api/health", "by_role": {"anonymous": 200, 
 def _found_idor():
     return {"iterative_result": {"stop_reason": "found", "findings": [
         {"vulnerability_class": "idor", "confidence": 0.8, "severity": "high", "confirmed": True,
+         "confirmed_by_leg": "cross_identity",
          "summary": "IDOR", "evidence": "other id", "suggested_test": "x", "basis": "derived"}]},
         "integration": {}}
 
@@ -123,6 +124,7 @@ class InvestigateTests(unittest.IsolatedAsyncioTestCase):
         async def confirm(finding, exchange):
             seen.append((finding["vulnerability_class"], exchange.url))
             finding["confirmed"] = True
+            finding["confirmed_by_leg"] = "cross_identity"
             finding["confidence"] = 0.91
         out = await wi.investigate_worklist(probe, st, "http://t", ROLES, confirm_fn=confirm)
         self.assertTrue(seen)                       # confirmation ran on the finding
@@ -198,7 +200,8 @@ class PreconditionTests(unittest.IsolatedAsyncioTestCase):
             return _nothing()
         async def precondition(node, exchange):
             return [{"vulnerability_class": "jwt", "confidence": 0.9, "severity": "high",
-                     "confirmed": True, "summary": "forged alg:none accepted",
+                     "confirmed": True, "confirmed_by_leg": "jwt_forge",
+                     "summary": "forged alg:none accepted",
                      "evidence": "e", "basis": "derived"}]
         out = await wi.investigate_worklist(
             probe, st, "http://t", ROLES, precondition_fn=precondition)

@@ -295,6 +295,26 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         self.assertEqual(len(store.proofs_for_case(case_id)), 1)
         self.assertEqual(store.best_proof_for_case(case_id)["verdict"], "confirmed")
 
+    def test_confirmed_finding_is_stamped_with_the_structured_leg_name(self):
+        # 2026-09-17 coverage-recovery plan, Step 4: confirmed_by_leg is set at
+        # the SAME moment as proof_id/case_id -- not recovered later by
+        # regex-parsing evidence text.
+        reg = _FakeRegistry({"sqli": _FakeValidator("sqlmap", "confirmed", True)})
+        reports = self._reports("sqli")
+        self._run(reports, self._exchange(), reg)
+        finding = reports[0].findings[0]
+        self.assertTrue(finding.confirmed)
+        self.assertEqual(finding.confirmed_by_leg, "sqlmap")
+        self.assertTrue(finding.proof_id)
+
+    def test_unconfirmed_finding_has_no_leg_stamp(self):
+        reg = _FakeRegistry({"idor": _FakeValidator("cross_identity", "not_confirmed", False)})
+        reports = self._reports("idor")
+        self._run(reports, self._exchange(), reg)
+        finding = reports[0].findings[0]
+        self.assertFalse(finding.confirmed)
+        self.assertEqual(finding.confirmed_by_leg, "")
+
     def test_legacy_not_confirmed_is_inconclusive(self):
         reg = _FakeRegistry({"idor": _FakeValidator("cross_identity", "not_confirmed", False)})
         _, proofs = self._run(self._reports("idor"), self._exchange(), reg)
