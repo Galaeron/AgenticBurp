@@ -1,5 +1,75 @@
 # Current state
 
+## 2026-09-17 — ◄► CLEAN STEP 5 RE-RUN (job 2dc2a3f1ff08) — 5/13 EARNED ◄►
+
+Re-ran the Step 5 measurement after fixing the bug the first run (job
+b4b5d11ec068, below) surfaced. Two fixes landed from peer sessions and were
+cherry-picked onto `reconciliation-backlog`:
+
+- **`0acf140` fix(store): make identities-table migration idempotent under
+  concurrency** — the pre-existing sqlite race flagged during Step 1-4 work
+  (`_connect()`'s check-then-act ALTER TABLE let concurrent callers racing
+  inside `analyze()`'s `asyncio.gather()` both see a column missing and
+  both ALTER; the loser raised `duplicate column name`). Now swallows only
+  that specific outcome.
+- **`e65d848` fix(discovery): decode ffuf's base64-encoded FUZZ input before
+  using it as a path** — THE root cause of the first Step 5 run's 9/13
+  misses. ffuf's `-json` output always base64-encodes each wordlist
+  keyword's raw input bytes (so binary/non-UTF8 entries survive JSON
+  safely); `ffuf_runner.parse_json_lines()` read it raw, so every route
+  ffuf found through the container fast-path was recorded under its
+  base64-encoded form (`/LmVudg==` instead of `/.env`,
+  `/YXBpL2FjY291bnQvcHJvZmlsZQ==` instead of `/api/account/profile`) and
+  fed back into `role_crawl`'s active-discovery queue as a NEW candidate —
+  crowding out the real path, which was then never probed at all.
+
+Same methodology as the first run (fresh state/cache, fresh VulnCorp
+instance, `active_enabled` armed at runtime via `/settings`, local
+qwen3:8b, `max_nodes=60 step_budget=16 max_chain_rounds=3`,
+`feature_crawl`+`coverage_drive_legs` on). **Confirmed live: the real GT
+paths (`/api/login`, `/api/register`, `/api/account/profile`,
+`/api/admin/debug`, `/.env`, ...) are now discovered and probed directly —
+zero base64-mangled paths anywhere in the run.** Ran 4.95h, zero
+`[safety_gate] BLOCKED` lines, zero tracebacks, `degraded=false`.
+
+**Result: 5/13 earned, 6/13 confirmed, 0/13 detected-unconfirmed, 7/13
+missed (1 confirmed by luck).** Up from the buggy run's 4/13 earned — a
+real, attributable gain. New earned item: **GT11-bfla-admin-users**
+(`/api/admin/users`, `cross_identity`) — reachable and cross-identity-
+confirmed now that the real path was discovered directly. GT12
+(`/api/admin/debug` disclosure) moved from missed to confirmed-but-lucky
+(via `verbose_error_validator`, not the intended `secret_disclosure` leg).
+
+**Why 7/13 are still missed — two distinct, well-understood causes (not
+regressions), flagged as a follow-up (`task_0a7f81bc`):**
+1. **GT01/GT02 (sqli), GT03 (xxe)** — SQLi/XXE detection in this harness
+   comes from the dedicated LLM specialist agents that run during the
+   captured-exchange `analyze()` pass ("PASS 1" in the historical
+   `run_maxcov_recall.py` driver), which this run did not execute — only
+   `investigate_engagement()` ("PASS 2") ran. PASS 2's own worklist only
+   derives idor/auth hypotheses, and `shape_precondition_legs` has no
+   generic "any parameter could be sqli" branch. A methodology gap, not a
+   bug — running PASS 1 too (over the 37 exchanges in
+   `testing/vulncorp-helpdesk/maxrun/captured_exchanges.json`) would very
+   plausibly close it.
+2. **GT09/GT10 (mass-assignment, `/api/account/profile` + `/api/register`)**
+   — discovered, but their captured template ended up with an EMPTY body
+   (GET, `body=""`): `feature_crawl` never actually submitted a real
+   POST/JSON body to them, so Step 3's `_has_settable_body` gate (correct
+   and unit-tested) never had a precondition to fire on. Likely cause:
+   these forms are JS `fetch()`/XHR-submitted, not classic HTML `<form>`
+   elements `feature_workflow.py`'s `_FormParser` can see.
+3. **GT06 (nested idor comments) and GT13 (ssrf /api/integrations)** were
+   not discovered at all this run either.
+
+Artifacts (all git-ignored/untracked, none committed):
+`testing/vulncorp-helpdesk/harness_server_step5b.log`,
+`testing/vulncorp-helpdesk/app_step5b_run.log`,
+`testing/vulncorp-helpdesk/maxrun/step5b_job_result.json`,
+`recall_final_step5.json` (overwrites the prior run's — see
+`score_step5b.py`). Both processes stopped cleanly; state/cache DBs backed
+up as `harness/*.db.bak-pre-step5b` before the fresh run.
+
 ## 2026-09-17 — ◄► LIVE STEP 5 MEASUREMENT RUN (job b4b5d11ec068) — DONE ◄►
 
 Ran Step 5 of `reviews/2026-09-17/GEMMA_RUN_COVERAGE_PLAN.md` against a fresh
