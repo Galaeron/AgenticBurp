@@ -306,5 +306,57 @@ class TestConfirmationCapabilitiesAllowlist(unittest.TestCase):
             self.assertEqual(reason, "this capability may provide evidence but cannot mark the vulnerability confirmed")
 
 
+class TestConnectConcurrentMigrationIsIdempotent(unittest.TestCase):
+    """Regression test: _connect()'s identities-table migration (tenant /
+    permissions_json / trust) is a check-then-act -- PRAGMA table_info() read,
+    then a conditional ALTER TABLE. Concurrent first callers on a fresh on-disk
+    db (e.g. asyncio.to_thread() callers racing inside an asyncio.gather()) can
+    all see the column missing and all attempt the ALTER; the losers used to
+    raise sqlite3.OperationalError: duplicate column name. Flaky ~1-in-2 on the
+    full suite before the fix (see harness/CURRENT_STATE.md), not reproducible
+    on a single-threaded run -- hence the concurrent harness below."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state_concurrent.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def test_concurrent_first_connects_do_not_raise(self):
+        import threading
+
+        worker_count = 16
+        barrier = threading.Barrier(worker_count)
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def worker():
+            try:
+                barrier.wait(timeout=5)
+                conn = store._connect()
+                conn.close()
+            except BaseException as exc:  # noqa: BLE001 -- capture for the main thread
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(worker_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [], f"_connect() raised under concurrency: {errors}")
+
+        conn = store._connect()
+        try:
+            ident_cols = {row[1] for row in conn.execute("PRAGMA table_info(identities)")}
+        finally:
+            conn.close()
+        self.assertTrue({"tenant", "permissions_json", "trust"}.issubset(ident_cols))
+
+
 if __name__ == "__main__":
     unittest.main()

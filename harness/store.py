@@ -301,7 +301,15 @@ def _connect() -> sqlite3.Connection:
         ("trust", "ALTER TABLE identities ADD COLUMN trust INTEGER NOT NULL DEFAULT 1"),
     ]:
         if col not in ident_cols:
-            conn.execute(ddl)
+            # Concurrent _connect() callers can all see `col` missing before any of
+            # them commits the ALTER (check-then-act race, not a single-writer
+            # invariant here). Swallow only the "already added it" outcome so a
+            # loser of the race doesn't raise; any other OperationalError is real.
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
 
     # Cross-run finding suppression -- see suppress_finding()'s docstring
     # for the workflow this exists for. Keyed on the same `fingerprint`
