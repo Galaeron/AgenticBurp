@@ -52,6 +52,19 @@ _PRIVILEGED = re.compile(
 _NUM_SEG = re.compile(r"/\d+(?=/|$)")
 _HEXISH = re.compile(r"/[0-9a-fA-F]{12,}(?=/|$)")
 
+# 2026-09-17 coverage-recovery plan, Step 2: a percent-encoded byte surviving
+# INTO the normalized path is a discovery artifact (an encoded traversal probe,
+# a doubly-encoded fuzz payload), not a distinct real route -- a legitimate
+# captured path is decoded before it ever reaches here. Left unscored, one of
+# these can still out-rank a real endpoint just by containing a privileged
+# keyword substring (e.g. "/admin%2f..") or a high path_tier/LLM rating, which
+# is exactly how a max-coverage run's worklist got crowded with them.
+_PERCENT_ENCODED = re.compile(r"%[0-9a-fA-F]{2}")
+
+
+def _looks_malformed_or_encoded(path: str) -> bool:
+    return bool(_PERCENT_ENCODED.search(path or ""))
+
 
 def normalize_path(url_or_path: str) -> str:
     """A stable key that aligns a crawl's normalized path with a finding's
@@ -118,6 +131,26 @@ class SurfaceEndpoint:
     @property
     def key(self) -> str:
         return f"{self.method.upper()} {self.path}"
+
+    def is_malformed_or_encoded(self) -> bool:
+        """A discovery artifact (residual percent-encoding), not a distinct
+        real route to test -- Step 2 of the 2026-09-17 coverage-recovery plan."""
+        return _looks_malformed_or_encoded(self.path)
+
+    def is_repeat_5xx_artifact(self) -> bool:
+        """Every role that was probed got a server error (or no substantive
+        response at all) and none reached it -- a dead/broken discovery
+        artifact, not a real endpoint worth a bounded agent investigation."""
+        if not self.access or self.reachable_roles:
+            return False
+        return all(v is None or (isinstance(v, int) and v >= 500) for v in self.access.values())
+
+    def is_input_bearing(self) -> bool:
+        """A concrete, replayable shape exists to probe with -- a captured
+        body/query TEMPLATE, or a live object id to enumerate -- rather than a
+        bare path the graph would have to fabricate a probe for."""
+        tmpl = self.template or {}
+        return bool(tmpl.get("body") or tmpl.get("query") or self.object_scoped)
 
     def best_finding(self) -> dict | None:
         if not self.findings:
@@ -213,10 +246,29 @@ class SurfaceEndpoint:
             score += 0.15
             reasons.append("privileged-looking path, not yet tested")
 
+        # Step 2 (2026-09-17 coverage-recovery plan): a concrete, replayable
+        # shape (a captured body/query, or a live object id) means a real probe
+        # can be built, not a fabricated one -- rank it above a bare path with
+        # the same other signals.
+        if self.is_input_bearing():
+            score += 0.2
+            reasons.append("input-bearing route (body/query/object-id) -- concrete probe available")
+
         # Already validated -> mostly done; keep a little so it stays visible.
         if self.status == "validated":
             score *= 0.3
             reasons.append("already validated (deprioritized)")
+
+        # A discovery artifact competing on borrowed signal (a privileged
+        # keyword substring inside an encoded probe, a path_tier/LLM score that
+        # doesn't know the route is dead) must not out-rank a real endpoint --
+        # multiplicative, so it demotes regardless of which additive signal fired.
+        if self.is_malformed_or_encoded():
+            score *= 0.05
+            reasons.append("malformed/encoded discovery artifact (deprioritized)")
+        if self.is_repeat_5xx_artifact():
+            score *= 0.05
+            reasons.append("every probed role got a server error here -- dead endpoint (deprioritized)")
 
         return round(score, 4), reasons
 

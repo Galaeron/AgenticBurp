@@ -25,6 +25,7 @@ import logging
 from urllib.parse import urlsplit
 
 from harness.models import HttpExchange
+from harness.safety_gate import SafetyGateBlocked
 
 log = logging.getLogger("harness.worklist_investigator")
 
@@ -132,6 +133,32 @@ def _findings_from_outcome(outcome: dict) -> list[dict]:
     return out
 
 
+# 2026-09-17 coverage-recovery plan, Step 2: the four honest reasons a
+# high-priority, applicable node can go uninvestigated. Exhaustive by
+# construction -- every skip in investigate_worklist maps to exactly one of
+# these, so a caller can tell "we chose not to reach it" apart from "we never
+# got the chance."
+SKIP_BUDGET_EXHAUSTED = "budget_exhausted"
+SKIP_UNREACHABLE = "unreachable"
+SKIP_MISSING_TEMPLATE = "missing_template"
+SKIP_POLICY_BLOCKED = "policy_blocked"
+
+
+def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
+                 policy_blocked_leg: bool) -> str:
+    """Why a node that reached the end of one sweep iteration with no agent
+    probe run was left uninvestigated -- checked in priority order so a node
+    that is BOTH unreachable and over budget reports the more actionable
+    reason (there was never anything to do here vs. we ran out of budget)."""
+    if policy_blocked_leg:
+        return SKIP_POLICY_BLOCKED
+    if not (node.get("reachable_roles") or []):
+        return SKIP_UNREACHABLE
+    if eligible and investigated >= max_nodes:
+        return SKIP_BUDGET_EXHAUSTED
+    return SKIP_MISSING_TEMPLATE
+
+
 async def investigate_worklist(
     probe_fn,
     state,
@@ -144,6 +171,8 @@ async def investigate_worklist(
     max_precondition_legs: int = 24,
     step_budget: int = 16,
     id_fill: str = "1",
+    worklist_limit: int = 200,
+    summary_out: dict | None = None,
 ) -> list[dict]:
     """Drive `probe_fn` over the top `max_nodes` actionable worklist nodes.
 
@@ -168,13 +197,30 @@ async def investigate_worklist(
     It returns only CONFIRMED findings (shape is a reason to TRY; confirmation is
     still deterministic), so it never adds unconfirmed shape-guesses as noise.
 
+    `worklist_limit` bounds how much of the ranked worklist is even considered
+    (2026-09-17 coverage-recovery plan, Step 2) -- it defaults far above
+    `max_nodes` so honest budget/skip accounting covers the real candidate
+    set, not a silently-truncated top slice.
+
+    `summary_out`, if given a dict, is updated in place with `eligible`
+    (agent-actionable, not-yet-confirmed nodes seen this sweep),
+    `investigated` (agent probes actually run), and `skipped` (a list of
+    `{path, method, reason}` for every eligible-or-applicable node this sweep
+    did NOT investigate, `reason` being one of budget_exhausted, unreachable,
+    missing_template, policy_blocked) plus `skipped_by_reason` counts. This is
+    what makes a "max coverage" claim checkable instead of asserted: a run
+    with a nonempty `skipped_by_reason[budget_exhausted]` reached its node
+    budget with eligible work still on the table.
+
     Returns a per-node outcome list; findings are folded back into `state`."""
     role_headers = {r.role: dict(r.headers or {}) for r in roles}
     outcomes: list[dict] = []
     investigated = 0
     precondition_run = 0
+    eligible_count = 0
+    skipped: list[dict] = []
 
-    for node in state.worklist(50):
+    for node in state.worklist(worklist_limit):
         derived = _derive_probe(node)
         # R21: completion belongs to an (endpoint, check) case, not the whole
         # endpoint -- a "validated" endpoint may still hold UNRELATED vulnerabilities.
@@ -184,9 +230,14 @@ async def investigate_worklist(
         # validated endpoints sink in the fused-score ordering they only draw leftover
         # budget.
         derived_confirmed = derived is not None and _derived_class_confirmed(node, derived[0])
-        do_agent = derived is not None and not derived_confirmed and investigated < max_nodes
+        eligible = derived is not None and not derived_confirmed
+        if eligible:
+            eligible_count += 1
+        do_agent = eligible and investigated < max_nodes
         do_precond = precondition_fn is not None and precondition_run < max_precondition_legs
         if not do_agent and not do_precond:
+            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
+                            "reason": _skip_reason(node, eligible, investigated, max_nodes, False)})
             continue  # no agent hypothesis AND no shape-driven leg to run -- skip
 
         reach = node.get("reachable_roles", []) or []
@@ -200,6 +251,7 @@ async def investigate_worklist(
         # 1. Proactive, precondition-driven legs (shape, not agent label). Cheap
         #    for a node whose shape warrants nothing (returns [] with no network).
         precond_findings: list[dict] = []
+        policy_blocked_leg = False
         if do_precond:
             # R23: the precondition budget bounds ATTEMPTS, not confirmations. Count
             # the attempt here (a leg was run on this node) regardless of whether it
@@ -208,6 +260,12 @@ async def investigate_worklist(
             precondition_run += 1
             try:
                 precond_findings = await precondition_fn(node, exchange) or []
+            except SafetyGateBlocked:
+                # The leg was attempted but the safety gate denied the send --
+                # a concrete, reportable reason (policy_blocked), distinct from
+                # "this node's shape warranted nothing."
+                policy_blocked_leg = True
+                precond_findings = []
             except Exception as e:  # a leg failure must not sink the sweep
                 log.debug("precondition_fn failed on %s %s: %s",
                           node.get("method"), node.get("path"), e)
@@ -247,6 +305,9 @@ async def investigate_worklist(
             agent_stop = (outcome or {}).get("iterative_result", {}).get("stop_reason")
 
         if not do_agent and not precond_findings:
+            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
+                            "reason": _skip_reason(node, eligible, investigated, max_nodes,
+                                                   policy_blocked_leg)})
             continue  # a shape-scan that confirmed nothing -- don't record an empty outcome
 
         if node_findings:
@@ -262,6 +323,17 @@ async def investigate_worklist(
             "stop_reason": agent_stop,
         })
 
-    log.info("investigate_worklist: %s -- investigated %d nodes, %d proactive legs attempted",
-             base_url, investigated, precondition_run)
+    log.info("investigate_worklist: %s -- investigated %d nodes, %d proactive legs attempted, "
+             "%d node(s) skipped (of %d eligible)",
+             base_url, investigated, precondition_run, len(skipped), eligible_count)
+    if summary_out is not None:
+        by_reason: dict[str, int] = {}
+        for s in skipped:
+            by_reason[s["reason"]] = by_reason.get(s["reason"], 0) + 1
+        summary_out.update({
+            "eligible": eligible_count,
+            "investigated": investigated,
+            "skipped": skipped,
+            "skipped_by_reason": by_reason,
+        })
     return outcomes

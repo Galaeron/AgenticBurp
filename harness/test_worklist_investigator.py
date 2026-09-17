@@ -273,6 +273,87 @@ class PreconditionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ran), 2)   # stops after the cap of confirmed proactive legs
 
 
+class HonestCoverageAccountingTests(unittest.IsolatedAsyncioTestCase):
+    """2026-09-17 coverage-recovery plan, Step 2: prove SELECTION (good routes
+    ranked and budgeted ahead of malformed/encoded discovery artifacts) and
+    REPORTING (the nodes a budget genuinely couldn't reach are named, with an
+    honest reason), not just that a ranking score differs in isolation."""
+
+    @staticmethod
+    def _good_nodes():
+        # 10 legitimate, object-scoped (idor-eligible) endpoints: 2 body-bearing
+        # (a captured request template with a real body), 1 nested-object route,
+        # and 7 plain object-scoped ones -- all agent-actionable via _derive_probe.
+        nodes = [dict(OBJ, path=f"/api/orders/{{id}}/item{n}") for n in range(7)]
+        nodes.append(dict(OBJ, path="/api/tickets/{id}/comments"))       # nested-object
+        nodes.append(dict(OBJ, path="/api/tickets/{id}"))                # body-bearing #1
+        nodes.append(dict(OBJ, path="/api/reports/{id}"))                # body-bearing #2
+        return nodes
+
+    @staticmethod
+    def _malformed_nodes():
+        # 2 discovery artifacts with residual percent-encoding in the path --
+        # ALSO object-scoped (a crawler can't structurally tell these apart from
+        # a real id-shaped segment), so they are equally "eligible" by
+        # _derive_probe, and given an elevated path_tier/LLM score to simulate
+        # them competing on borrowed signal (a privileged keyword substring, a
+        # tier/LLM rating that doesn't know the route is a decoy).
+        return [dict(OBJ, path="/api/tickets/%2e%2e%2f{id}"),
+                dict(OBJ, path="/api/admin%2fusers/{id}")]
+
+    def _build_state(self):
+        good = self._good_nodes()
+        bad = self._malformed_nodes()
+        st = _state_with(good + bad)
+        for n in bad:
+            ep = st.endpoints[f"{n['method']} {engagement.normalize_path(n['path'])}"]
+            ep.path_tier = "critical"
+            ep.llm_score = 0.95
+            ep.llm_priority = "critical"
+        # The 2 body-bearing good nodes get a real captured template.
+        for path in ("/api/tickets/{id}", "/api/reports/{id}"):
+            ep = st.endpoints[f"GET {engagement.normalize_path(path)}"]
+            ep.template = {"method": "GET", "body": "x=1", "query": "", "content_type": "", "object_id": "1"}
+        return st, good, bad
+
+    def test_malformed_encoded_routes_rank_below_legitimate_ones(self):
+        st, good, bad = self._build_state()
+        ranked_paths = [w["path"] for w in st.worklist(50)]
+        good_paths = {n["path"] for n in good}
+        bad_paths = {n["path"] for n in bad}
+        worst_good_rank = max(ranked_paths.index(p) for p in good_paths)
+        best_bad_rank = min(ranked_paths.index(p) for p in bad_paths)
+        self.assertLess(worst_good_rank, best_bad_rank,
+                        "a malformed/encoded route outranked a legitimate one despite "
+                        "its elevated path_tier/LLM score")
+
+    async def test_budget_selects_good_nodes_and_reports_the_rest_as_budget_exhausted(self):
+        st, good, bad = self._build_state()
+        summary: dict = {}
+        outcomes = await wi.investigate_worklist(
+            lambda *a, **k: _async(_nothing()), st, "http://t", ROLES,
+            max_nodes=10, summary_out=summary)
+
+        investigated_paths = {o["path"] for o in outcomes}
+        good_paths = {n["path"] for n in good}
+        bad_paths = {n["path"] for n in bad}
+
+        # Selection: all 10 good nodes investigated; neither malformed one is.
+        self.assertEqual(investigated_paths, good_paths)
+        self.assertTrue(bad_paths.isdisjoint(investigated_paths))
+
+        # Reporting: eligible/investigated counts are exact, and the omitted
+        # nodes are named with an honest, checkable reason -- not asserted, not
+        # silently dropped.
+        self.assertEqual(summary["eligible"], 12)
+        self.assertEqual(summary["investigated"], 10)
+        skipped_paths = {s["path"] for s in summary["skipped"]}
+        self.assertEqual(skipped_paths, bad_paths)
+        for s in summary["skipped"]:
+            self.assertEqual(s["reason"], wi.SKIP_BUDGET_EXHAUSTED)
+        self.assertEqual(summary["skipped_by_reason"], {wi.SKIP_BUDGET_EXHAUSTED: 2})
+
+
 def _async(value):
     async def _c(*a, **k):
         return value

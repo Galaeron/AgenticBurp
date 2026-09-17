@@ -613,10 +613,12 @@ class ChainMixin:
                     confirmed.append(r)
             return confirmed
 
+        worklist_summary: dict = {}
+
         async def _investigate(st, rs):
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
-                max_nodes=max_nodes, step_budget=step_budget)
+                max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary)
             return outs, [f for o in outs for f in o.get("findings_detail", [])]
 
         outcomes, all_findings = await _investigate(state, roles)
@@ -921,6 +923,12 @@ class ChainMixin:
             "summary": state.summary(),
             "worklist": state.worklist(50),
             "outcomes": outcomes,
+            # 2026-09-17 coverage-recovery plan, Step 2: eligible/investigated
+            # counts + a named, reasoned list of every eligible node this run did
+            # NOT reach (budget_exhausted/unreachable/missing_template/
+            # policy_blocked). A run must not be called "max coverage" if
+            # skipped_by_reason shows eligible high-priority nodes were skipped.
+            "worklist_summary": worklist_summary,
             "chains": chains,
             "chain_rounds": rounds,
             "coverage": coverage,
