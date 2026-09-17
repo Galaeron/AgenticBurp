@@ -1,5 +1,104 @@
 # Current state
 
+## 2026-09-17 — GEMMA_RUN_COVERAGE_PLAN.md Steps 1–4 implemented (branch `reconciliation-backlog`)
+
+Worked [`reviews/2026-09-17/GEMMA_RUN_COVERAGE_PLAN.md`](reviews/2026-09-17/GEMMA_RUN_COVERAGE_PLAN.md)
+top-to-bottom through Step 4. Four focused commits, full suite green at each
+(1951 → 1953 → 1965 → 1982 tests, exit 0, ~350s each). **Step 5 (one live
+VulnCorp run to measure movement) and the model A/B are explicitly NOT
+done** — both require starting a live target/server for hours and are
+gated on an operator decision, not attempted this session.
+
+- **Step 1 (`eef01df`) — safety-gate invocation scoping.** Root cause: the
+  gemma_cloud_full run's log showed SQLMap/CSRF POST probes BLOCKED
+  ("active testing... which is off") despite the run having armed
+  `active_enabled` via a runtime `/settings` toggle. `get_default_gate()`
+  was a process-wide singleton that cached whichever config it saw first;
+  `safety_gate.py` now resolves an AMBIENT, per-invocation gate (a
+  ContextVar, installed by `RunContext.__aenter__`/`__aexit__` for the
+  `async with` block's lifetime — NOT at bare `create()`/`aclose()`, which
+  a first attempt showed leaks across the ~70 tests that construct a
+  RunContext directly and never close it). `IterativeAgent.gate` is now a
+  property (was cached at `__init__`, long before any run's gate exists).
+  `server.py` overlays the live `ValidatorRegistry.active_enabled` toggle
+  onto the three RunContext-building call sites instead of reading the
+  frozen startup config.
+- **Step 2 (`a2d0b9c`) — honest coverage ranking/reporting.** `engagement.py`
+  penalizes malformed/encoded discovery artifacts and repeat-5xx dead
+  endpoints (0.05x multiplicative) and rewards input-bearing routes (+0.2)
+  in `fused_score()`. `worklist_investigator.investigate_worklist` gained
+  `summary_out` (eligible/investigated/skipped-by-reason:
+  budget_exhausted/unreachable/missing_template/policy_blocked), wired into
+  `investigate_engagement`'s result as `worklist_summary`.
+- **Step 3 (`6f8493a`) — SSRF/nested-IDOR/mass-assignment reach.** The
+  graph-driven `shape_precondition_legs` had NO mass-assignment branch at
+  all (only the captured-exchange path did) — added. Dead/malformed nodes
+  now never spend the shared `max_precondition_legs` budget. New
+  `_parent_template_object_id` borrows a nested route's (e.g.
+  `/api/tickets/{id}/comments`) PARENT object-scoped route's real captured
+  object id when the child has none, so cross-identity replay tests an
+  object that actually exists instead of a fabricated id.
+- **Step 4 (`ffa805b`) — structured confirmation provenance.** `Finding`
+  gains `confirmed_by_leg`, stamped at the same moment as `proof_id` by all
+  three production confirmation-stamping paths (`_validate_findings`,
+  `coverage_confirmation_finding`, and `orchestrator_chain._apply` — the
+  dominant graph-loop path, previously evidence-text-only).
+  `confirmation_gate.active_confirmation_is_unproven` downgrades an
+  active-class `confirmed=True` claim with no leg proof, wired into
+  `engagement.add_finding` as the single chokepoint. `recall_benchmark.
+  RecallScore.earned` is the new honest headline (intended-leg-confirmed,
+  excluding no-leg-tier observation classes); `report_generator.py` splits
+  "Confirmed Exploits" from "Confirmed Observations".
+
+**Honest frontier:** none of this has been measured against a live target
+yet — Step 5 (fresh cache, one clean VulnCorp instance, the max-coverage
+driver, compare against the 4/13-earned baseline established 2026-09-11)
+is the next session's first job, followed by the model A/B only once that
+baseline is trustworthy.
+
+## 2026-09-16 — isolated defensive fixes prepared; live checkout unchanged
+
+Implemented the three follow-up findings in `.worktrees/review-safety-fixes/`
+(isolated source copy, not a registered Git worktree). Patch:
+`reviews/2026-09-16/round2/safety-fixes.patch`; `git apply --check` passed.
+Do not apply until the current helpdesk pass finishes. Main product files,
+configuration, caches, dependencies and running services were left unchanged.
+64 selected offline regression/passive smoke tests passed in the isolated copy;
+log: `reviews/2026-09-16/round2/fix-tests.log`. Full suite/live runs not executed.
+Uncommitted main-checkout Ollama changes were not copied or overwritten.
+
+## 2026-09-16 — follow-up review of implemented R01–R03 fixes
+
+Report: [`reviews/2026-09-16/round2/REVIEW.md`](reviews/2026-09-16/round2/REVIEW.md).
+Reviewed HEAD `4db2fef`, plus uncommitted Ollama client/parser tests. Three residual
+findings: chain Markdown redaction (P1), model-supplied case origin metadata (P2),
+and registry/gate disagreement on quoted false (P2). Synthetic offline checks
+confirm the main direct-confirmation and individual-redaction fixes.
+Selected suite: **209 tests, 206 passed, 3 dependency-import errors** (AnyIO /
+typing_extensions); not a green-suite claim. No target/model execution or product
+changes. Earlier findings outside R01–R03 were not re-certified in this round.
+
+## 2026-09-16 — defensive/platform and product review (no product changes)
+
+Review: [`reviews/2026-09-16/PROJECT_REVIEW.md`](reviews/2026-09-16/PROJECT_REVIEW.md),
+23 sections / 15 findings, with commands and limitations in `EXECUTION_LOG.md` beside it.
+Baseline **`02a3326cad43c886c6341f197ee3b9c09a4a4848`**, branch initially
+`reconciliation-backlog`. Another process refactored orchestration and advanced HEAD
+to `99c5712` during review; **that newer revision is not assessed by this report**.
+The final tests/diagnostics use the archived original commit, not a mixed working tree.
+
+**Verified this review:** 213 selected offline/passive tests, **OK**, exit 0, 3.164s;
+includes the four passive detection/persistence smoke tests with model stubs/negative
+controls. Synthetic diagnostics reproduced quoted-boolean configuration disagreement,
+model-writeable confirmation/proof fields, Markdown secret retention, artifact-free
+legacy confirmation, and per-run cache-key separation. Report distinguishes executed
+checks from source findings, historical claims, and product judgments.
+**Not verified:** full suite, live efficacy/model, active targets, browser/container,
+Java/Burp runtime, dependency audit, or user-study outcomes. No product code or safety
+defaults changed; no server/cache reset, no commit/push. Existing work is preserved.
+
+---
+
 The single rolling per-session delta. Stable context (architecture, hazards, environment,
 file map) is in [`CLAUDE.md`](CLAUDE.md) — read that first, then this.
 
@@ -44,6 +143,41 @@ fixes), + a catalog-expansion commit.
   coverage_manifest.py --check`. Full stdlib discovery: **1,782 OK**, exit 0
   (hermetic; no model/live run). All 8 reviewer findings addressed with regressions.
 - **Owed:** merge decision; broaden the catalog with more slices.
+
+---
+
+## ►► LIVE MAX-COVERAGE RUN — s19_full, 2026-09-11 (branch `astra-integration`) ◄◄
+
+The "one measurement still owed" fresh live VulnCorp run was executed. Artifacts in
+`testing/vulncorp-helpdesk/maxrun/*s19_full*` (recall_report_s19_full.{md,json},
+report_s19_full.md, maxcov_results_s19_full.json, maxcov_s19_full.log). Driver:
+`run_maxcov_recall.py` (config built IN MEMORY over config.yaml — on-disk config untouched;
+fresh s19_full state+cache DBs). Harness interpreter: python 3.14.7. Target: one clean
+fresh-seed instance, debug off (killed a 3-instance hazard-#5 state first). Wall time
+**9.75 h** (PASS1 37/37 exchanges ~1h40m; PASS2 investigate_engagement ~8.1h). Exit 0,
+no traceback.
+
+**Path-matched recall vs the 13 endpoint-known GT items: 9/13 "confirmed", 3/13
+detected-unconfirmed, 1/13 missed — but only 4/13 are leg-EARNED.**
+- **Earned (deterministic leg, trustworthy):** GT04 idor tickets/{id} + GT05 idor
+  reports/{id} (cross_identity), GT07 path_traversal uploads/{id}, GT08 jwt forge (jwt_forge).
+- **Confirmed but UNKNOWN provenance (agent-asserted, `leg=None`, no leg proved them):**
+  GT01/GT02 sqli, GT03 xxe import, GT11 bfla admin/users, GT12 admin/debug disclosure.
+  Evidence is agent hypothesis ("common target for SQLi… no sanitization"), not leg proof.
+- **Detected-unconfirmed:** GT06 idor comments, GT09/GT10 mass_assignment.
+- **Missed:** GT13 ssrf /api/integrations (collaborator OOB never fired; 0 in log).
+
+**This REPRODUCES s18 (s18: 9/13, 6 unknown; s19: 9/13, 5 unknown) — no real movement.**
+Standing gaps, all persisting: **0 chains composed** (second-order V17/V22 path produced
+nothing despite max_chain_rounds=3); **browser_xss 0 confirmations** (keep smoke_only, no
+→live promotion); breadth "887 confirmed" is ~552 disclosure-class NOISE (info_disclosure
+×413 + verbose_error ×139) from the app's `/`-route 500 verbose-error page.
+
+**Honest frontier for next session:** the dominant issue is that 5/9 GT "confirms" are
+agent-set `confirmed=True` with no deterministic leg — the scorer is honest (flags them
+UNKNOWN) but the headline "9/13" overstates leg-earned confirmation (really 4/13). SSRF
+leg + second-order chaining + disclosure-noise suppression are the levers to move the
+EARNED number. Target left running on :5002 (PID was 55264).
 
 ---
 
@@ -321,9 +455,9 @@ they were deliberately **not** rewritten unilaterally:
   across raw clients), #2 (cache manifest — over-invalidation risk).
 - **Infra/CI:** #15/#16 (packaging/deps), #17 (scored CI tier + Java/browser gates),
   and the **deletion/consolidation table** (Phase 9 — gated on the rebuilds above).
-- **The one measurement still owed:** a fresh live max-coverage VulnCorp run. Everything
-  above is hermetic; target-recall numbers are unchanged. Use `testing/vulncorp-helpdesk/maxrun/`,
-  a FRESH cache DB, toggles in `config.local.yaml` (never a committed flip).
+- **The one measurement still owed — DONE 2026-09-11 (s19_full).** See the LIVE
+  MAX-COVERAGE RUN section at the top of this file. Result reproduced s18 (9/13 confirmed,
+  4 leg-earned); the hermetic review work did not move live recall, as predicted.
 
 ### Environment
 
