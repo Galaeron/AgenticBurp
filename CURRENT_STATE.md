@@ -1,5 +1,110 @@
 # Current state
 
+## 2026-09-17 — ◄► LIVE STEP 5 MEASUREMENT RUN (job b4b5d11ec068) — DONE ◄►
+
+Ran Step 5 of `reviews/2026-09-17/GEMMA_RUN_COVERAGE_PLAN.md` against a fresh
+VulnCorp instance: state/cache DBs backed up and rebuilt fresh
+(`harness/*.db.bak-pre-step5`), one clean `python app.py` (killed two stale
+leftover instances from the prior gemma run first), harness server started
+fresh, `validators.active_enabled` armed at RUNTIME via `POST /settings`
+(not at config load) — the exact scenario Step 1 fixed. Model: local
+**qwen3:8b** (config.local.yaml's cloud-model block commented out for this
+run), matching the s19_full baseline's model so the comparison isolates
+Steps 1–4 as the only changed variable. 6 identities logged in and
+registered (alice/bob/carol/dave/admin/eve) via `/api/login` +
+`/identities/session-headers`. `POST /engagement/127.0.0.1/investigate`
+(max_nodes=60, step_budget=16, max_chain_rounds=3, feature_crawl +
+coverage_drive_legs on, budget 400). Ran **5.47h**, finished clean (no
+error, degraded=false). Scored with the SAME ground truth the baseline
+used (`testing/vulncorp-helpdesk/maxrun/vulncorp_ground_truth.py`, still
+present on disk) via a new `testing/vulncorp-helpdesk/maxrun/score_step5.py`.
+**NOTE: this run covered PASS2 (investigate_engagement) only — the
+baseline's PASS1 (analyze() over 37 curated captured exchanges) was not
+re-run, so this is not a byte-for-byte repeat of the s19_full methodology.**
+
+**Result: 4/13 earned, 4/13 confirmed, 0/13 detected-unconfirmed, 9/13
+missed** — identical 4 earned items as baseline (GT04 idor ticket, GT05
+idor report, GT07 path traversal uploads, GT08 jwt forge), same legs
+(cross_identity/path_traversal/jwt_forge). **Earned recall did not regress
+(success criterion met) but did not improve either.**
+
+**Step 1 success criterion directly confirmed live:** zero
+`[safety_gate] ... BLOCKED` log lines in the entire 5.47h run (grep count
+0) — no active leg was blocked by a stale/safe-default gate, despite
+`active_enabled` being armed at runtime exactly like the gemma run that
+originally exposed the bug. `worklist_summary.skipped_by_reason` shows
+only `unreachable`(22)/`missing_template`(3) — no `budget_exhausted`, no
+`policy_blocked`; the 60-node budget was never the binding constraint
+(only 5 nodes were ever "eligible").
+
+**Why Steps 2–4 didn't move the needle this run — a NEW bug, not a Steps
+1–4 regression:** the real paths for 9 of 13 GT items (`/api/login`,
+`/api/register`, `/api/tickets/search`, `/api/tickets/import`,
+`/api/account/profile`, `/api/admin/users`, `/api/admin/debug`, plus
+`/api/tickets/{id}/comments` and `/api/integrations` never being
+discovered at all) were **never probed in their real form** — active
+discovery (`role_crawl` → `api_surface_discovery.SurfaceDiscovery`)
+started feeding BASE64-ENCODED versions of its own already-discovered
+paths back into the queue as new candidates (`GET /YXBpL2FjY291bnQvcHJvZmlsZQ==`
+etc. — every one decodes cleanly to a real path already found). This
+crowded out the real paths and is very likely the dominant reason 9/13
+show MISSED instead of at least detected. Root cause narrowed to
+`js_endpoint_extractor.py`'s `_ABS_URL` regex (unlike `_QUOTED_PATH`, its
+path-capture group allows `=`) but the exact triggering response body was
+not pinned down live — **flagged as a follow-up task (`task_31eb6593`),
+not fixed this session.** SSRF/nested-IDOR/mass-assignment's Step-3 wiring
+is independently unit-tested and correct in isolation
+(test_orchestrator_precondition.py, test_worklist_investigator.py); none
+of the three got a chance to fire live because their precondition (a real
+discovered node with a template) never materialized in this run.
+
+**Also observed, not yet diagnosed:** a huge share of live request volume
+(992 `path_traversal` + 248 `open_redirect` + 147 `command_injection` +
+126 `ssti` POSTs, all against the single `/web/login?next=...` redirect
+param) — `coverage_drive_legs` firing every applicable check across many
+payload-encoding variants on one shape-rich endpoint. Plausibly consumed a
+large share of the run's wall time without adding coverage elsewhere; not
+investigated further this session.
+
+**Honest next steps:** (1) fix the base64-discovery bug (task_31eb6593) —
+highest-leverage single fix, since it blocks 9 of 13 GT paths from ever
+being reached; (2) re-run Step 5 after that fix; (3) optionally add PASS1
+(`analyze()` over the 37 captured exchanges in
+`testing/vulncorp-helpdesk/maxrun/captured_exchanges.json`) for a fully
+apples-to-apples methodology match with s19_full; (4) only then the model
+A/B. Artifacts: `testing/vulncorp-helpdesk/harness_server_step5.log`,
+`testing/vulncorp-helpdesk/app_step5_run.log`,
+`testing/vulncorp-helpdesk/maxrun/step5_job_result.json`,
+`recall_final_step5.json`, `score_step5.py` (none committed — this whole
+directory is git-ignored/untracked, matching prior sessions). Both
+processes stopped cleanly at session end; `harness/config.local.yaml`
+left with `active_enabled: false` (armed only at runtime per run) and the
+cloud-model block still commented out.
+
+Separately, `confirmation_gate.active_confirmation_is_unproven` (Step 4)
+has a known, not-yet-closed gap raised by a concurrent review this same
+day (`reviews/2026-09-17/MEASUREMENT_REVIEW.md`, finding 3): it accepts
+`confirmed_by_leg` as sufficient proof on its own, but that field is a
+NAME, not an authenticated reference to a persisted proof record the way
+`proof_id` is for the `_validate_findings`/coverage-driven paths. The
+`_apply`-based graph-loop confirmations (the majority of shape-driven
+legs) have no persisted `proof_id` at all by design (no case/proof
+persistence step), so a strict proof_id-only requirement isn't currently
+implementable there. Not tightened this session — noted for follow-up.
+
+## 2026-09-17 — offline detection-measurement review
+
+Review: [MEASUREMENT_REVIEW.md](reviews/2026-09-17/MEASUREMENT_REVIEW.md), at
+HEAD `fceb4e59a52d3adf3b05c5894246078da9c98847` with existing Ollama edits untouched.
+Parsed historical Gemma aggregates: 308 attempted / 11,438 total coverage cells,
+6,990 not applicable, 4,140 skipped; 13-item score has 4 earned-provenance,
+3 unknown-provenance confirmations, 5 unconfirmed detections, 1 missed.
+These are artifact-reported statuses, not fresh execution verification.
+Executed **18 scorer tests OK** plus a synthetic diagnostic showing the scorer
+can award earned credit without a proof ID. Reviewed smoke-test mocking boundaries.
+No product/config changes, full suite, active target tests, or model calls.
+Latest-fix live efficacy and whole-application recall remain unverified.
+
 ## 2026-09-17 — GEMMA_RUN_COVERAGE_PLAN.md Steps 1–4 implemented (branch `reconciliation-backlog`)
 
 Worked [`reviews/2026-09-17/GEMMA_RUN_COVERAGE_PLAN.md`](reviews/2026-09-17/GEMMA_RUN_COVERAGE_PLAN.md)
