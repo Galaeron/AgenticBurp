@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS findings (
     finding_id TEXT NOT NULL DEFAULT '',
     case_id TEXT NOT NULL DEFAULT '',
     proof_id TEXT NOT NULL DEFAULT '',
+    oracle_verified INTEGER NOT NULL DEFAULT 0,
+    verification_state TEXT NOT NULL DEFAULT 'candidate',
+    oracle_capsule_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_findings_host ON findings(host);
@@ -262,6 +265,15 @@ def _connect() -> sqlite3.Connection:
     for col in ("finding_id", "case_id", "proof_id"):
         if col not in cols:
             conn.execute(f"ALTER TABLE findings ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    # Oracle-verification axis (precision items #1/#2): the stricter verified/candidate
+    # state and the id of the proof capsule that earned it. Additive, defaults keep
+    # every legacy row a "candidate" (no oracle ever ran on it).
+    if "oracle_verified" not in cols:
+        conn.execute("ALTER TABLE findings ADD COLUMN oracle_verified INTEGER NOT NULL DEFAULT 0")
+    if "verification_state" not in cols:
+        conn.execute("ALTER TABLE findings ADD COLUMN verification_state TEXT NOT NULL DEFAULT 'candidate'")
+    if "oracle_capsule_id" not in cols:
+        conn.execute("ALTER TABLE findings ADD COLUMN oracle_capsule_id TEXT NOT NULL DEFAULT ''")
     # T06/R08: dedup on (fingerprint, case_id), not fingerprint alone, so a
     # patched-fixture RETEST -- same coordinates, a NEW case identity -- is retained
     # as its own row (append-only retest history) instead of being IGNORE'd. Legacy
@@ -375,14 +387,18 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
             rows.append((host, exchange.url, exchange.method, agent_name, f.vulnerability_class,
                          f.severity, f.confidence, f.summary, f.basis, f.evidence, f.suggested_test,
                          f.owasp_category, f.review_verdict, int(f.confirmed), fingerprint,
-                         model, prompt_version, f.finding_id, f.case_id, f.proof_id, now))
+                         model, prompt_version, f.finding_id, f.case_id, f.proof_id,
+                         int(getattr(f, "oracle_verified", False)),
+                         getattr(f, "verification_state", "candidate") or "candidate",
+                         getattr(f, "oracle_capsule_id", "") or "", now))
         conn.executemany(
             """INSERT OR IGNORE INTO findings
                (host, url, method, agent, vulnerability_class, severity,
                 confidence, summary, basis, evidence, suggested_test, owasp_category,
                 review_verdict, confirmed, fingerprint, model, prompt_version,
-                finding_id, case_id, proof_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                finding_id, case_id, proof_id, oracle_verified, verification_state,
+                oracle_capsule_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
         conn.commit()
     finally:
         conn.close()

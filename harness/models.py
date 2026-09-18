@@ -98,6 +98,18 @@ class Finding(BaseModel):
     proof_id: str = ""
     case_id: str = ""
 
+    # Oracle-verification axis (precision item #1/#2), orthogonal to `confirmed`.
+    # `confirmed` means a leg fired at least once; `oracle_verified` is the higher
+    # bar -- the oracle_framework reproduced it N-of-N AND (for non-self-controlling
+    # legs) a paired negative control stayed clean. `verification_state` is the
+    # operator-facing label derived from it ("verified" vs "candidate"), and
+    # `oracle_capsule_id`/`oracle_reason` point at the auditable proof capsule.
+    # Set only by oracle_framework.stamp_finding; agents can never assert them.
+    oracle_verified: bool = False
+    verification_state: str = "candidate"
+    oracle_capsule_id: str = ""
+    oracle_reason: str = ""
+
 
 # R02: fields this harness's own deterministic pipeline owns -- the
 # orchestrator's confirmation/proof linkage (orchestrator_confirm.py), its
@@ -113,6 +125,7 @@ AGENT_AUTHORITY_FIELDS = frozenset({
     "confirmed", "proof_id", "case_id", "review_verdict", "review_note",
     "original_confidence", "original_severity", "original_vulnerability_class",
     "shape_inconsistent", "confirmed_by_leg",
+    "oracle_verified", "verification_state", "oracle_capsule_id", "oracle_reason",
 })
 
 

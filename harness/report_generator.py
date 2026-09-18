@@ -124,6 +124,11 @@ class ReportFinding:
     issue_id: str = ""
     # W-7: explicit CONFIRMED/SUSPECTED/LEAD state (from confirmation_gate).
     lifecycle_state: str = "SUSPECTED"
+    # Oracle-verification axis (precision items #1/#2): "verified" only when the
+    # oracle reproduced the finding N-of-N with a clean negative control; else
+    # "candidate". Orthogonal to lifecycle_state -- a CONFIRMED finding (a leg
+    # fired once) can still be a candidate until an oracle reproduces it.
+    verification_state: str = "candidate"
     # Step 4 (2026-09-17 coverage-recovery plan): True for a class with NO
     # deterministic exploit-confirmation leg at all (leg_tier == "none" --
     # cors, csp, verbose_error, info_disclosure, ...). These validators are
@@ -161,6 +166,8 @@ def _from_store_dict(d: dict) -> ReportFinding:
         or __import__("harness.confirmation_gate",
                       fromlist=["finding_lifecycle_state"]).finding_lifecycle_state(d),
         is_observation=(leg_tier(vc) == "none"),
+        verification_state=__import__("harness.oracle_framework",
+                      fromlist=["derive_verification_state"]).derive_verification_state(d),
     )
 
 
@@ -441,6 +448,14 @@ _STATE_BADGE = {
     "LEAD": "🔻 LEAD (demoted, unconfirmed)",
 }
 
+# Oracle-verification badge (precision item #2): VERIFIED means an oracle
+# reproduced it N-of-N with a clean negative control; CANDIDATE means it did not
+# clear that bar (a leg may still have fired once -- see the Status badge).
+_VERIFICATION_BADGE = {
+    "verified": "🔒 VERIFIED (oracle-reproduced)",
+    "candidate": "🧪 CANDIDATE (not oracle-verified)",
+}
+
 
 def _render_finding(f: ReportFinding) -> list[str]:
     # R03: this Markdown path did not share issues.py's redaction (redact/
@@ -458,9 +473,11 @@ def _render_finding(f: ReportFinding) -> list[str]:
 
     lines = []
     status = _STATE_BADGE.get(f.lifecycle_state, "❓ SUSPECTED (unconfirmed)")
+    verification = _VERIFICATION_BADGE.get(f.verification_state, "🧪 CANDIDATE")
     lines.append(f"### {f.vulnerability_class} -- {url}")
     lines.append("")
-    lines.append(f"**Status:** {status} &nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)} "
+    lines.append(f"**Status:** {status} &nbsp;|&nbsp; **Verification:** {verification} "
+                 f"&nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)} "
                  f"&nbsp;|&nbsp; **Confidence:** {f.confidence:.2f} ({_confidence_label(f.confidence)}) "
                  f"&nbsp;|&nbsp; **Basis:** {f.basis}")
     if f.duplicate_count > 1:
