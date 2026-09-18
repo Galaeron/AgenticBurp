@@ -256,7 +256,7 @@ class TestAgentPluginSystem:
         # First, manually register the sqli agent
         plugin_system.register_agent(
             name="sqli",
-            module_path="agents.sqli_agent",
+            module_path="harness.agents.sqli_agent",
             class_name="SqliAgent",
         )
         
@@ -407,7 +407,7 @@ class TestPluginSystemCaching:
         # Register and load an agent
         plugin_system.register_agent(
             name="cached_agent",
-            module_path="agents.sqli_agent",
+            module_path="harness.agents.sqli_agent",
             class_name="SqliAgent",
         )
         
