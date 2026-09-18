@@ -733,7 +733,8 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
                       (SELECT parameter_location FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       (SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1),
-                      s.fingerprint IS NOT NULL AS suppressed
+                      s.fingerprint IS NOT NULL AS suppressed,
+                      f.oracle_verified, f.verification_state, f.oracle_capsule_id
                FROM findings f
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                WHERE f.host = ?
@@ -757,9 +758,17 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
          # confidence number.
          "lifecycle_state": confirmation_gate.lifecycle_state(bool(confirmed), rv),
          "parameter_location": ploc or "", "parameter_name": pname or "",
-         "principal_id": principal or "", "suppressed": bool(suppressed)}
+         "principal_id": principal or "", "suppressed": bool(suppressed),
+         # P0.2-API: the oracle's verdict (item #1/#2) must be readable from the
+         # SAME dict the report/API/Burp panel all consume -- previously this
+         # query never selected these columns, so `oracle_verified` was always
+         # absent here and `derive_verification_state()` silently defaulted
+         # every finding to "candidate" regardless of what was persisted.
+         "oracle_verified": bool(oracle_verified), "verification_state": vstate or "candidate",
+         "oracle_capsule_id": capsule_id or ""}
         for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
-             finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed) in rows
+             finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed,
+             oracle_verified, vstate, capsule_id) in rows
     ]
     if not include_suppressed:
         results = [r for r in results if not r["suppressed"]]
