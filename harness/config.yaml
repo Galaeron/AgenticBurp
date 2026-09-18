@@ -520,3 +520,14 @@ surface_prioritization:
   model: "qwen3:8b"
   temperature: 0.1
   max_items_per_call: 40
+
+# Deterministic verification oracle (harness/oracle_framework.py, precision
+# item #1/#2). SAFE DEFAULT: off. When enabled, every confirmed finding's
+# leg is re-run n_required times (N-of-N reproduction) plus a paired
+# negative control before the finding is stamped `verification_state:
+# verified` -- otherwise it stays `candidate`. This roughly triples (or
+# more) the number of live probes sent per confirmed finding, so it must
+# be opted into explicitly, exactly like every other active leg.
+oracle:
+  enabled: false
+  n_required: 3

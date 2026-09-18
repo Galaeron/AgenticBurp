@@ -13,6 +13,29 @@ from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/h
 
 
 class ConfirmMixin:
+    async def _oracle_gate(self, finding, exchange) -> None:
+        """P0.1-WIRE: run the deterministic verification oracle over a just-
+        confirmed finding, behind config `oracle.enabled` (default false).
+
+        Disabled (the default): stamps the finding as a candidate WITHOUT
+        sending any additional probe -- `oracle_framework.stamp_finding`
+        with a None capsule is pure bookkeeping, not a network call. Enabled:
+        builds an `OracleRegistry` over the SAME validator registry the
+        graph loop already uses (same scope/safety gating) and re-runs the
+        confirming leg n_required times plus its negative control, then
+        stamps the resulting capsule (verified only on N-of-N + a clean
+        control, or a self-controlling OOB leg reproducing alone)."""
+        from harness import oracle_framework
+        cfg = (getattr(self, "config", {}) or {}).get("oracle", {}) or {}
+        if not cfg.get("enabled", False):
+            oracle_framework.stamp_finding(finding, None)
+            return
+        n_required = int(cfg.get("n_required", 3) or 3)
+        registry = oracle_framework.OracleRegistry(
+            self.validator_registry, n_required=n_required)
+        capsule = await registry.verify(finding, exchange)
+        oracle_framework.stamp_finding(finding, capsule)
+
     async def run_active_probe(
         self,
         exchange: HttpExchange,
@@ -348,6 +371,9 @@ class ConfirmMixin:
                         # leg name, set at the exact same moment as proof_id/case_id
                         # -- not recovered later by regex-parsing evidence text.
                         finding.confirmed_by_leg = result.validator
+                        # P0.1-WIRE: oracle gate runs (or no-ops, per config)
+                        # at the exact moment a finding is first confirmed.
+                        await self._oracle_gate(finding, exchange)
                 else:
                     log.warning("failed to persist proof for %s: %s", result.validator, reason)
                     output[-1] = ValidationReport(
