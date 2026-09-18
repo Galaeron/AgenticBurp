@@ -255,5 +255,53 @@ class FailOpenTelemetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coordinator.fail_open_stats()["count"], 0)
 
 
+class FallbackFlagTests(unittest.IsolatedAsyncioTestCase):
+    """P0.9: a fail-open route must be surfaced as a structured flag (not just
+    process-wide telemetry) and logged loudly, not silently. is_fallback_reason
+    is the pure predicate orchestrator_detect.py stamps AnalysisResponse.
+    coordinator_fallback with; tested directly here plus end-to-end via a
+    real (mocked-LLM) choose_agents call, per the local and cloud paths."""
+
+    def setUp(self):
+        self.ollama = AsyncMock()
+        self.coordinator = Coordinator(self.ollama, {"model": "qwen3:8b"})
+        self.available = ["sqli", "xss", "idor"]
+        coordinator.reset_fail_open_stats()
+
+    def tearDown(self):
+        coordinator.reset_fail_open_stats()
+
+    def test_is_fallback_reason_true_for_local_fallback(self):
+        self.assertTrue(coordinator.is_fallback_reason(
+            "fallback (all): coordinator error (boom)"))
+
+    def test_is_fallback_reason_true_when_nested_in_cloud_primary_reason(self):
+        self.assertTrue(coordinator.is_fallback_reason(
+            "cloud-coordinator (fallback (curated): cloud coordinator error (boom))"))
+
+    def test_is_fallback_reason_false_for_normal_reason(self):
+        # Negative control: a real routing decision must not read as a fallback.
+        self.assertFalse(coordinator.is_fallback_reason("numeric id + no auth header"))
+        self.assertFalse(coordinator.is_fallback_reason(""))
+
+    async def test_llm_error_sets_flag_true_and_logs_warning(self):
+        self.ollama.chat_json_metered.side_effect = RuntimeError("boom")
+        with self.assertLogs("harness.coordinator", level="WARNING") as cm:
+            dispatch, reason = await self.coordinator.choose_agents(_exchange(), self.available)
+        self.assertEqual(dispatch, self.available)
+        self.assertTrue(coordinator.is_fallback_reason(reason))
+        self.assertTrue(any("FAIL-OPEN" in line for line in cm.output))
+
+    async def test_normal_routing_sets_flag_false(self):
+        # Negative control: a healthy route must not read as a fallback.
+        self.ollama.chat_json_metered.return_value = OllamaResult(
+            data={"dispatch": ["idor"], "reason": "numeric id + no auth header"},
+            prompt_tokens=5, completion_tokens=2,
+        )
+        dispatch, reason = await self.coordinator.choose_agents(_exchange(), self.available)
+        self.assertEqual(dispatch, ["idor"])
+        self.assertFalse(coordinator.is_fallback_reason(reason))
+
+
 if __name__ == "__main__":
     unittest.main()

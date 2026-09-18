@@ -260,6 +260,13 @@ class AnalysisResponse(BaseModel):
     # tools, each with a command templated to this exchange's URL.
     tool_recommendations: list[dict] = Field(default_factory=list)
     telemetry: dict = Field(default_factory=dict)
+    # P0.9: True when agent routing for this exchange failed open (the
+    # coordinator errored or returned no valid targets, so a fallback set --
+    # curated or all-agents, per coordinator.fail_open_mode -- was dispatched
+    # instead of a real routing decision). Surfaces coordinator._record_fail_open's
+    # reason string as a structured flag on the response itself, not just in
+    # `telemetry`'s process-wide counters or the logs.
+    coordinator_fallback: bool = False
     # Astra T01: case-bound structured proof records for this analysis, one per
     # validator attempt (evidence.ProofRecord.to_dict()). This is the API/report
     # surface for structured, verdict-honest evidence -- distinct from the

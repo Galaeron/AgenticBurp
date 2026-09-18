@@ -38,6 +38,16 @@ def reset_fail_open_stats() -> None:
     _FAIL_OPEN["by_reason"].clear()
 
 
+def is_fallback_reason(reason: str) -> bool:
+    """True when a (dispatch, reason) pair from choose_agents/choose_agents_cloud
+    represents a fail-open fallback rather than a real routing decision (P0.9).
+
+    `in`, not `startswith`: cloud-primary composes the cloud reason into a
+    larger string (`"cloud-coordinator (fallback (...): ...)"`), so the
+    marker can be nested rather than at the start."""
+    return "fallback (" in (reason or "")
+
+
 def _record_fail_open(mode: str, reason: str, n_agents: int) -> None:
     _FAIL_OPEN["count"] += 1
     key = f"{mode}:{reason}"
