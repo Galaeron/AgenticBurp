@@ -91,11 +91,15 @@ class ReconValidator(Validator):
     active = True
     
     def __init__(self, timeout: float = 15.0, max_redirects: int = 10,
-                 max_depth: int = 5, run_context=None):
+                 max_depth: int = 5, run_context=None, allowed_hosts: list[str] | None = None):
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.max_depth = max_depth  # Crawl depth
         self.run_context = run_context
+        # Safety item #12: scope lock. When run_context is set the executor already
+        # enforces scope, but the fallback plain-httpx crawl path did not -- guard
+        # it here so an off-scope host (or off-scope crawl target) is never fetched.
+        self.allowed_hosts = allowed_hosts or []
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -161,6 +165,12 @@ class ReconValidator(Validator):
         
         Builds a comprehensive attack map of the target application.
         """
+        from harness import scope_lock
+        if not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
+            return ValidationResult(
+                validator=self.name, status="skipped",
+                finding_class=finding.vulnerability_class,
+                summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts))
         try:
             # Initialize
             base_url = self._get_base_url(exchange.url)

@@ -498,7 +498,11 @@ class RunContext:
         configured_namespace = str(
             ((config_snapshot.get("runs", {}) or {}).get("cache_namespace") or "")
         )
-        resolved_gate = gate if gate is not None else SafetyGate(SafetyGateConfig.from_dict(gate_config or {}))
+        # Safety item #12: fold this run's scope into the gate config so the gate
+        # itself refuses any off-scope send (central defense-in-depth), matching
+        # the ScopePolicy the transport already enforces.
+        _gate_cfg = {**(gate_config or {}), "allowed_hosts": list(allowed_hosts or [])}
+        resolved_gate = gate if gate is not None else SafetyGate(SafetyGateConfig.from_dict(_gate_cfg))
         return cls(
             run_id=resolved_run_id,
             scope=ScopePolicy(allowed_hosts=frozenset((h or "").lower() for h in (allowed_hosts or []))),

@@ -66,7 +66,12 @@ class CryptoValidator(Validator):
     finding_classes = {"crypto", "cryptography", "weak crypto", "weak_crypto", "tls", "ssl"}
     active = True
 
-    def __init__(self, timeout: float = 10.0, max_redirects: int = 0):
+    def __init__(self, timeout: float = 10.0, max_redirects: int = 0,
+                 allowed_hosts: list[str] | None = None):
+        # Safety item #12: crypto opens a RAW TLS socket to the host (not httpx),
+        # so it is neither covered by the safety gate nor an httpx-level guard --
+        # it must enforce scope itself before connecting.
+        self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self.max_redirects = max_redirects
 
@@ -107,6 +112,13 @@ class CryptoValidator(Validator):
         )
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> Any:
+        from harness import scope_lock
+        if not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
+            return ValidationResult(
+                validator=self.get_name(), status="skipped",
+                finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
+                summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts),
+                evidence="", raw_output="")
         tests: list[CryptoTestResult] = []
         try:
             parsed = urlparse(exchange.url)

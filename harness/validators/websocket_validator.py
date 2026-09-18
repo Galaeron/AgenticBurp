@@ -65,9 +65,11 @@ class WebsocketValidator(Validator):
     active = True
 
     def __init__(self, timeout: float = 10.0, max_redirects: int = 0,
-                 run_context=None):
+                 run_context=None, allowed_hosts: list[str] | None = None):
         self.timeout = timeout
         self.run_context = run_context
+        # Safety item #12: opens a raw socket to the ws host -- enforce scope first.
+        self.allowed_hosts = allowed_hosts or []
 
     def get_name(self) -> str:
         return "websocket_validator"
@@ -106,6 +108,13 @@ class WebsocketValidator(Validator):
         )
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> Any:
+        from harness import scope_lock
+        if not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
+            return ValidationResult(
+                validator=self.get_name(), status="skipped",
+                finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
+                summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts),
+                evidence="", raw_output="[]")
         try:
             ws_url = self._to_ws_url(exchange.url)
             if ws_url is None:

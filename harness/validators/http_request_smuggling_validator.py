@@ -64,10 +64,11 @@ class HttpRequestSmugglingValidator(Validator):
     active = True
     
     def __init__(self, timeout: float = 30.0, max_redirects: int = 0,
-                 run_context=None):
+                 run_context=None, allowed_hosts: list[str] | None = None):
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.run_context = run_context
+        self.allowed_hosts = allowed_hosts or []  # safety item #12: scope lock
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -129,6 +130,12 @@ class HttpRequestSmugglingValidator(Validator):
         """
         Validate an HRS finding by testing for request smuggling vulnerabilities.
         """
+        from harness import scope_lock
+        if not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
+            return ValidationResult(
+                validator=self.name, status="skipped",
+                finding_class=finding.vulnerability_class,
+                summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts))
         try:
             base_url = self._get_base_url(exchange.url)
             if not base_url:

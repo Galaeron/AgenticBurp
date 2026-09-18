@@ -218,11 +218,17 @@ class SqlmapValidator(Validator):
 
     def __init__(self, binary: str = "sqlmap", timeout_seconds: int = 90,
                  level: int = 1, risk: int = 1, container_image: str | None = None,
-                 run_context=None):
+                 run_context=None, allowed_hosts: list[str] | None = None):
         self.binary = binary
         self.timeout_seconds = timeout_seconds
         self.level = max(1, min(level, 2))
         self.risk = max(1, min(risk, 2))
+        # Safety item #12: sqlmap is the highest-risk active leg (it fuzzes the
+        # target with many requests). It previously had NO scope check -- it ran
+        # against exchange.url whatever the host was, trusting the caller to only
+        # ever hand it in-scope exchanges. Enforce scope here too (defense in
+        # depth): an off-scope host is refused before any sqlmap process starts.
+        self.allowed_hosts = allowed_hosts or []
         # When set (and the docker daemon is up), sqlmap runs in a throwaway
         # container instead of on the host -- so the offensive tool never touches
         # host disk (where Defender quarantines it) and its version is pinned to
@@ -273,6 +279,12 @@ class SqlmapValidator(Validator):
         if not exchange.url.startswith(("http://", "https://")):
             return ValidationResult(self.name, "skipped", finding.vulnerability_class,
                                     summary="unsupported URL scheme")
+
+        # Safety item #12: refuse an off-scope host before launching sqlmap.
+        from harness import scope_lock
+        if not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
+            return ValidationResult(self.name, "skipped", finding.vulnerability_class,
+                                    summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts))
 
         if exchange.method.upper() != "GET":
             # sqlmap fuzzes a parameter by sending many requests with

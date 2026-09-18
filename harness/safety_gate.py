@@ -91,6 +91,7 @@ class ActionRiskTier(str, Enum):
     SAFE = "safe"                    # GET/HEAD/OPTIONS/TRACE
     MUTATING = "mutating"             # POST/PUT/PATCH/DELETE
     HARD_DENIED = "hard_denied"       # matched a _HARD_DENY_PATTERNS entry -- never allowed, no override
+    OUT_OF_SCOPE = "out_of_scope"     # host not in configured allowed_hosts -- never sent (safety item #12)
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,11 @@ class SafetyGateConfig:
     allow_mutating_replay: bool = False  # separate, stricter flag from active_enabled
     max_burst_size: int = 1
     max_mutating_requests_per_finding: int = 1
+    # Safety item #12: engagement scope. Empty = unset (no host restriction, the
+    # historical default). Non-empty = every gated send is refused for a host not
+    # listed -- central defense-in-depth so a validator that forgets its own scope
+    # check, or follows an off-scope redirect, is still stopped at the transport.
+    allowed_hosts: frozenset = field(default_factory=frozenset)
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "SafetyGateConfig":
@@ -128,6 +134,7 @@ class SafetyGateConfig:
             allow_mutating_replay=flags["allow_mutating_replay"],
             max_burst_size=int(cfg.get("max_burst_size", 1)),
             max_mutating_requests_per_finding=int(cfg.get("max_mutating_requests_per_finding", 1)),
+            allowed_hosts=frozenset(str(h).lower() for h in (cfg.get("allowed_hosts") or [])),
         )
 
 
@@ -236,6 +243,19 @@ class SafetyGate:
         max_mutating_requests_per_finding (capped by the hard ceiling) sends have
         been authorized for the finding, further mutating sends are denied. `count`
         is how many sends this authorization represents (>1 for a burst)."""
+        # Safety item #12: scope lock is checked FIRST -- an off-scope host is
+        # refused regardless of method, before hard-deny/mutating classification,
+        # so no probe (read-only or mutating) can be sent to a host outside the
+        # engagement scope. Empty allowed_hosts = unset = no restriction.
+        from harness import scope_lock
+        if not scope_lock.host_in_scope(url, self.config.allowed_hosts):
+            decision = AuthorizationDecision(
+                allowed=False, tier=ActionRiskTier.OUT_OF_SCOPE,
+                reason="Refused by scope lock: " + scope_lock.out_of_scope_reason(url, self.config.allowed_hosts),
+            )
+            self._log(validator_name, method, url, decision)
+            return decision
+
         tier = self.classify(method, body=body, url=url)
 
         if tier == ActionRiskTier.HARD_DENIED:

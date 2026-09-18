@@ -49,7 +49,10 @@ class ValidatorRegistry:
         # ValidatorRegistry (e.g. in tests, or a config reload) doesn't
         # keep stale gate settings from a previous instantiation.
         reset_default_gate()
-        get_default_gate(cfg)
+        # Safety item #12: seed the gate with the engagement scope so every gated
+        # send is centrally scope-locked, not only method-gated.
+        _sqlmap_allowed = config.get("server", {}).get("allowed_hosts", [])
+        get_default_gate({**cfg, "allowed_hosts": _sqlmap_allowed})
         sqlmap_cfg = cfg.get("sqlmap", {})
         self.validators: dict[str, Validator] = {}
         if sqlmap_cfg.get("enabled", True):
@@ -59,6 +62,7 @@ class ValidatorRegistry:
                 level=int(sqlmap_cfg.get("level", 1)),
                 risk=int(sqlmap_cfg.get("risk", 1)),
                 container_image=sqlmap_cfg.get("container_image"),
+                allowed_hosts=_sqlmap_allowed,
             )
         
         # CORS validator
@@ -77,14 +81,16 @@ class ValidatorRegistry:
                 timeout=float(recon_cfg.get("timeout", 15.0)),
                 max_redirects=int(recon_cfg.get("max_redirects", 10)),
                 max_depth=int(recon_cfg.get("max_depth", 5)),
+                allowed_hosts=_sqlmap_allowed,
             )
-        
+
         # HTTP Request Smuggling validator
         hrs_cfg = cfg.get("http_request_smuggling", {})
         if hrs_cfg.get("enabled", True):
             self.validators["http_request_smuggling"] = HttpRequestSmugglingValidator(
                 timeout=float(hrs_cfg.get("timeout", 30.0)),
                 max_redirects=int(hrs_cfg.get("max_redirects", 0)),
+                allowed_hosts=_sqlmap_allowed,
             )
 
         # Web Cache Poisoning validator
@@ -93,6 +99,7 @@ class ValidatorRegistry:
             self.validators["web_cache_poisoning"] = WebCachePoisoningValidator(
                 timeout=float(cache_cfg.get("timeout", 15.0)),
                 max_redirects=int(cache_cfg.get("max_redirects", 5)),
+                allowed_hosts=_sqlmap_allowed,
             )
 
         # OAuth / OIDC validator
@@ -116,6 +123,7 @@ class ValidatorRegistry:
         if crypto_cfg.get("enabled", True):
             self.validators["crypto"] = CryptoValidator(
                 timeout=float(crypto_cfg.get("timeout", 10.0)),
+                allowed_hosts=_sqlmap_allowed,
             )
 
         # CSP / Clickjacking validator
@@ -124,6 +132,7 @@ class ValidatorRegistry:
             self.validators["csp"] = CspValidator(
                 timeout=float(csp_cfg.get("timeout", 10.0)),
                 max_redirects=int(csp_cfg.get("max_redirects", 5)),
+                allowed_hosts=_sqlmap_allowed,
             )
 
         # Header Injection validator
@@ -131,6 +140,7 @@ class ValidatorRegistry:
         if header_inj_cfg.get("enabled", True):
             self.validators["header_injection"] = HeaderInjectionValidator(
                 timeout=float(header_inj_cfg.get("timeout", 10.0)),
+                allowed_hosts=_sqlmap_allowed,
             )
 
         # API Security validator
@@ -145,6 +155,7 @@ class ValidatorRegistry:
         if websocket_cfg.get("enabled", True):
             self.validators["websocket"] = WebsocketValidator(
                 timeout=float(websocket_cfg.get("timeout", 10.0)),
+                allowed_hosts=_sqlmap_allowed,
             )
 
         # Race Condition validator
