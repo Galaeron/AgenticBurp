@@ -5,6 +5,7 @@ warrants, independent of any agent label -- at the module level, so the routing
 that `investigate_engagement` depends on is exercised without a live model. This
 is deliberately the piece the historical "green tests, dead pipeline" failures
 lived in: routing code that no test ever ran."""
+import asyncio
 import unittest
 
 from harness.models import HttpExchange
@@ -437,6 +438,115 @@ class ShapePreconditionFindingsTests(unittest.TestCase):
                    shape_precondition_findings(_ex(url="http://t/api/users/1",
                                                     method="POST", body=""))}
         self.assertNotIn("mass_assignment", classes)
+
+
+class ValidatorEvidenceBackfillTests(unittest.TestCase):
+    """orchestrator_confirm._validate_findings bug: a shape_precondition_findings
+    placeholder is minted with evidence="" -- it exists only to TRIGGER a leg, not
+    to describe a result (see shape_precondition_findings' docstring). When the
+    leg confirms, _validate_findings set finding.confirmed=True and copied over
+    confidence/review_verdict/proof_id/case_id, but never the validator's own
+    result.evidence -- so a genuinely CONFIRMED finding was persisted with an
+    empty evidence field, indistinguishable from a fabricated confirmation. Live
+    reproduction: a real XXE confirmation on VulnCorp's /api/tickets/import
+    (job postfix_smoke, 2026-09-18) had confirmed=true, evidence=""."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from harness import store
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmp.name) / "t.db"
+
+    def tearDown(self):
+        from harness import store
+        store._DB_PATH = self._orig_db_path
+        self._tmp.cleanup()
+
+    def _orchestrator(self):
+        from harness.orchestrator import Orchestrator
+        return Orchestrator({
+            "ollama": {"base_url": "http://localhost:11434"},
+            "coordinator": {"model": "llama3.1:8b"},
+            "agent_defaults": {"model": "gemma2:9b"},
+            "agents": {},
+            "server": {"allowed_hosts": ["example.test"]},
+        })
+
+    def test_confirmed_placeholder_finding_gets_the_leg_evidence_backfilled(self):
+        from unittest.mock import patch
+        from harness.models import AgentReport, Finding
+        from harness.validators.base import ValidationResult
+
+        class _FakeValidator:
+            name = "fake_xxe"
+            version = ""
+
+            def plan(self, finding, exchange):
+                return None  # not exercising the separate local-tool ledger here
+
+            async def validate(self, finding, exchange):
+                return ValidationResult(
+                    validator="fake_xxe", status="confirmed",
+                    finding_class=finding.vulnerability_class,
+                    confidence=0.95, confirmed=True,
+                    summary="External entity resolved out-of-band",
+                    evidence="OOB collaborator hit from the injected external entity")
+
+        # A shape_precondition_findings-style placeholder: confirmed=False,
+        # evidence="" -- exists only to trigger the leg (see that function).
+        placeholder = Finding(
+            vulnerability_class="xxe", confidence=0.3, severity="high",
+            summary="XXE precondition: http://example.test/import accepts an XML body",
+            evidence="", suggested_test="", basis="derived")
+        report = AgentReport(agent="shape_precondition", model="rule-based", findings=[placeholder])
+        exchange = _ex(url="http://example.test/import", method="POST", body="<a/>")
+
+        orch = self._orchestrator()
+        with patch.object(orch.validator_registry, "for_finding", return_value=[_FakeValidator()]):
+            asyncio.run(orch._validate_findings(exchange, [report]))
+
+        self.assertTrue(placeholder.confirmed)
+        self.assertEqual(placeholder.evidence,
+                         "OOB collaborator hit from the injected external entity")
+
+    def test_agent_authored_evidence_is_never_overwritten(self):
+        # Negative control: a finding that already carries real evidence (an
+        # agent's own narrative) must NOT be clobbered by the leg's evidence --
+        # only an EMPTY placeholder gets backfilled.
+        from unittest.mock import patch
+        from harness.models import AgentReport, Finding
+        from harness.validators.base import ValidationResult
+
+        class _FakeValidator:
+            name = "fake_xxe"
+            version = ""
+
+            def plan(self, finding, exchange):
+                return None  # not exercising the separate local-tool ledger here
+
+            async def validate(self, finding, exchange):
+                return ValidationResult(
+                    validator="fake_xxe", status="confirmed",
+                    finding_class=finding.vulnerability_class,
+                    confidence=0.95, confirmed=True,
+                    summary="External entity resolved out-of-band",
+                    evidence="leg evidence that must NOT overwrite the agent's own")
+
+        agent_finding = Finding(
+            vulnerability_class="xxe", confidence=0.4, severity="high",
+            summary="Looks XXE-shaped", evidence="agent's own narrative evidence",
+            suggested_test="", basis="derived")
+        report = AgentReport(agent="xxe", model="m", findings=[agent_finding])
+        exchange = _ex(url="http://example.test/import", method="POST", body="<a/>")
+
+        orch = self._orchestrator()
+        with patch.object(orch.validator_registry, "for_finding", return_value=[_FakeValidator()]):
+            asyncio.run(orch._validate_findings(exchange, [report]))
+
+        self.assertTrue(agent_finding.confirmed)
+        self.assertEqual(agent_finding.evidence, "agent's own narrative evidence")
 
 
 if __name__ == "__main__":
