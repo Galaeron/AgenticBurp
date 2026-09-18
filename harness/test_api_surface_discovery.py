@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from harness.api_surface_discovery import SurfaceDiscovery, _is_not_found, _paths_from_spec
+from harness.api_surface_discovery import SurfaceDiscovery, Route, _is_not_found, _paths_from_spec
 from harness.run_context import RunContext, ScopePolicy
 from harness.test_run_context import _Fixture
 
@@ -93,6 +93,41 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("POST", login.methods)
         self.assertNotEqual(login.methods, ("GET",))
 
+    def test_allow_mining_also_covers_ffuf_sourced_routes_with_no_method_info(self):
+        # ffuf's own routes carry methods=() (never populated by parse_json_lines)
+        # -- exactly as uninformative as an assumed ("GET",), and the majority of
+        # the surface on a pure JSON API with no HTML/JS to crawl comes from ffuf.
+        # Bug: mining's condition checked `methods == ("GET",)` only, so an
+        # ffuf-sourced route was silently excluded from ever being mined.
+        disc = self._disc({})
+        disc._seen["/api/login"] = Route(path="/api/login", status=500, methods=(), source="ffuf")
+        disc._responder = lambda method, path: (
+            (200, "", "OPTIONS, POST") if path == "/api/login" and method != "GET"
+            else (500, "{}", "") if path == "/api/login"
+            else (500, _NF, ""))
+        res = _run(disc)
+        login = next(r for r in res.routes if r.path == "/api/login")
+        self.assertIn("POST", login.methods)
+
+    def test_method_mining_uses_options_without_sending_a_write(self):
+        sent = []
+        def responder(method, path):
+            sent.append((method, path))
+            if path == "/api/profile" and method == "GET":
+                return (200, '{"name":"probe"}', "")
+            if path == "/api/profile" and method == "OPTIONS":
+                return (200, "", "GET, PUT, OPTIONS")
+            return (500, _NF, "")
+
+        disc = _FakeDiscovery(
+            responder, use_ffuf=False, max_probes=100,
+            prefixes=["/api/"], collections=[], nouns=["profile"])
+        result = _run(disc)
+        profile = next(r for r in result.routes if r.path == "/api/profile")
+        self.assertIn("PUT", profile.methods)
+        self.assertFalse(any(method in ("POST", "PUT", "PATCH", "DELETE")
+                             for method, _ in sent))
+
     def test_response_driven_id_enumeration(self):
         # A 200 list body reveals sibling object ids to enumerate.
         known = {
@@ -130,6 +165,89 @@ class DiscoveryTests(unittest.TestCase):
                               nouns=["x", "y", "z"], max_probes=5)
         res = _run(disc)
         self.assertLessEqual(res.probes_sent, 5)  # every phase is budget-guarded
+
+
+class AllowMiningBudgetReserveTests(unittest.TestCase):
+    """Bug: Allow mining (phase 5) is cheap but runs LAST. On a surface large
+    enough that the combinatorial wordlist sweep (phase 2) alone exceeds
+    max_probes, it used to spend the ENTIRE budget before mining ever ran,
+    permanently mislabelling a real POST-only route "methods=(GET,)"."""
+
+    def _responder(self):
+        def r(method, path):
+            if path == "/api/login":
+                if method == "GET":
+                    return (500, "{}", "")          # app swallows 405 into a bare 500
+                return (200, "", "POST, OPTIONS")   # any other verb reveals the real Allow set
+            return (500, _NF, "")
+        return r
+
+    def _disc(self, max_probes):
+        # "login" is first in the noun list, so it's found on an early probe
+        # regardless of budget -- what's under test is whether mining SURVIVES
+        # the rest of a wordlist sweep too large for the given budget, not
+        # whether the route is discoverable at all.
+        return _FakeDiscovery(
+            self._responder(), use_ffuf=False, max_probes=max_probes,
+            prefixes=["/api/", "/admin/", "/internal/", "/v1/", "/v2/"],
+            collections=["admin", "tickets", "users", "orders"],
+            nouns=["login"] + [f"noun{i}" for i in range(40)])
+
+    def test_mining_survives_a_budget_the_wordlist_sweep_alone_exhausts(self):
+        res = _run(self._disc(max_probes=15))
+        self.assertLessEqual(res.probes_sent, 15)
+        login = next(r for r in res.routes if r.path == "/api/login")
+        self.assertIn("POST", login.methods)
+        self.assertNotEqual(login.methods, ("GET",))
+
+    def test_negative_control_no_reserve_loses_the_route_to_budget_exhaustion(self):
+        # Proves the test above is meaningful: with the reserve disabled (the
+        # pre-fix behavior), the SAME tight budget starves mining and
+        # /api/login stays mislabelled GET-only.
+        import harness.api_surface_discovery as asd
+        orig = asd._ALLOW_MINING_RESERVE
+        orig_late = asd._LATE_DISCOVERY_FRACTION
+        asd._ALLOW_MINING_RESERVE = 0
+        asd._LATE_DISCOVERY_FRACTION = 0
+        try:
+            res = _run(self._disc(max_probes=15))
+        finally:
+            asd._ALLOW_MINING_RESERVE = orig
+            asd._LATE_DISCOVERY_FRACTION = orig_late
+        login = next(r for r in res.routes if r.path == "/api/login")
+        self.assertEqual(login.methods, ("GET",))
+
+    def test_query_phase_gets_budget_after_large_wordlist(self):
+        def responder(method, path):
+            if path == "/api/search" and method == "GET":
+                return (200, '{"items":[]}', "")
+            if path == "/api/search?q=1" and method == "GET":
+                return (200, '{"items":[{"id":1}]}', "")
+            return (500, _NF, "")
+
+        disc = _FakeDiscovery(
+            responder, use_ffuf=False, max_probes=30,
+            prefixes=["/api/", "/v1/"], collections=["tickets"],
+            nouns=["search"] + [f"noun{i}" for i in range(40)],
+            actions=[], sensitive_files=[])
+        result = _run(disc)
+        self.assertIn("/api/search?q=1", result.paths())
+        self.assertLessEqual(result.probes_sent, 30)
+
+        # Without the late-phase reserve, the same wordlist consumes the budget
+        # before query mining can try even the first input parameter.
+        import harness.api_surface_discovery as asd
+        original = asd._LATE_DISCOVERY_FRACTION
+        asd._LATE_DISCOVERY_FRACTION = 0
+        try:
+            control = _run(_FakeDiscovery(
+                responder, use_ffuf=False, max_probes=30,
+                prefixes=["/api/", "/v1/"], collections=["tickets"],
+                nouns=["search"] + [f"noun{i}" for i in range(40)],
+                actions=[], sensitive_files=[]))
+        finally:
+            asd._LATE_DISCOVERY_FRACTION = original
+        self.assertNotIn("/api/search?q=1", control.paths())
 
 
 class PrefixDerivationTests(unittest.TestCase):

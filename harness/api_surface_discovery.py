@@ -129,6 +129,12 @@ DEFAULT_SENSITIVE_FILES = (
     "error.log access.log debug.log app.log"
 ).split()
 
+# Method mining runs last. Reserve probes for a safe OPTIONS request per
+# discovered path, even when the earlier combinatorial wordlists are larger
+# than max_probes.
+_ALLOW_MINING_RESERVE = 200
+_LATE_DISCOVERY_FRACTION = 0.25
+
 # Backup/editor-swap suffixes, and the common source/config basenames worth
 # trying them on even before any file is discovered.
 _BACKUP_SUFFIXES = (".bak", "~", ".old", ".orig", ".save", ".swp")
@@ -339,6 +345,19 @@ class SurfaceDiscovery:
     async def discover(self) -> SurfaceResult:
         result = SurfaceResult(base_url=self.base_url)
 
+        # Keep part of the probe budget for response/subresource and query
+        # mining. The nested wordlist can otherwise consume all 6,000 probes
+        # before any input-bearing routes are examined.
+        mining_reserve = min(_ALLOW_MINING_RESERVE, max(0, self.max_probes // 10))
+        # Tiny test/operator budgets need the calibration and spec probes plus
+        # at least one wordlist candidate; phase quotas only help at useful
+        # discovery sizes.
+        late_reserve = (min(int(self.max_probes * _LATE_DISCOVERY_FRACTION),
+                            max(0, self.max_probes - mining_reserve))
+                        if self.max_probes >= 24 else 0)
+        query_reserve = late_reserve // 2
+        self._phase_limit = max(0, self.max_probes - mining_reserve - late_reserve)
+
         # 0. Calibrate the soft-404 signature FIRST (Phase 5): if the target has a
         #    catch-all that answers non-404 for unknown paths, learn its shape now
         #    so the whole sweep below keys off content, not just "not a 404".
@@ -392,6 +411,9 @@ class SurfaceDiscovery:
                 for n in self.nouns:
                     await self._check(f"{pre}{coll}/{n}", "nested")
 
+        # Wordlist quota ends here; let adaptive discovery spend its share.
+        self._phase_limit = max(0, self.max_probes - mining_reserve - query_reserve)
+
         # 2c. Phase 0.2(a): don't assume the surface lives under the built-in
         #     prefixes. Sweep the noun list under the namespaces the app actually
         #     exposes -- derived from caller seed paths and from hits so far.
@@ -428,24 +450,34 @@ class SurfaceDiscovery:
         #     that already proved live, so the cost is adaptive.
         await self._mine_deep_nested()
 
+        # Query mining has its own reserve, separate from response and deep
+        # route discovery. An endpoint with an undiscovered input must not be
+        # labelled inapplicable just because a path wordlist used the budget.
+        self._phase_limit = max(0, self.max_probes - mining_reserve)
+
         # 4e. Query-parameter discovery: probe common param names on discovered
         #     GET endpoints. A distinct response means the endpoint accepts that
         #     parameter -- surfaces hidden input vectors the path wordlist misses.
         await self._probe_query_params()
 
-        # 5. Allow mining (LAST, over the FULL route set incl. sub-resources): a
-        #    route that rejects GET answers 405 with an `Allow` header -> learn its
-        #    real verbs so POST-only routes aren't mislabelled GET-only.
-        for path, route in list(self._seen.items()):
-            if route.methods == ("GET",) and route.status in (405, 500):
-                for m in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
-                    r = await self._raw(m, path)
-                    if r and r[2]:
-                        methods = tuple(x.strip().upper() for x in r[2].split(",") if x.strip())
-                        if methods:
-                            self._seen[path] = Route(path=path, status=route.status,
-                                                     methods=methods, length=route.length, source=route.source)
-                        break
+        # 5. Learn accepted methods without executing a write. OPTIONS can
+        # reveal POST-only routes as well as a PUT operation on a readable GET
+        # route. Check ambiguous routes first while the reserve is available.
+        self._phase_limit = self.max_probes
+        method_candidates = sorted(
+            list(self._seen.items()),
+            key=lambda item: (item[1].methods not in ((), ("GET",)),
+                              item[1].status not in (405, 500), item[0]))
+        for path, route in method_candidates:
+            if route.methods not in ((), ("GET",)) or "?" in path:
+                continue
+            r = await self._raw("OPTIONS", path)
+            if r and r[2]:
+                methods = tuple(x.strip().upper() for x in r[2].split(",") if x.strip())
+                if methods:
+                    self._seen[path] = Route(path=path, status=route.status,
+                                             methods=methods, length=route.length,
+                                             source=route.source)
 
         result.routes = list(self._seen.values())
         result.probes_sent = self._probes
@@ -625,6 +657,8 @@ class SurfaceDiscovery:
         redirect=, org_id=) that the path-only wordlist never tests."""
         candidates = [p for p, r in list(self._seen.items())
                       if 200 <= r.status < 300 and "?" not in p]
+        candidates.sort(key=lambda p: (not any(k in p.lower() for k in
+                           ("search", "query", "filter", "find")), p))
         for p in candidates:
             if not self._budget_left():
                 return
@@ -633,7 +667,11 @@ class SurfaceDiscovery:
                 continue
             base_len = len(base_r[1])
             base_hash = self._norm_body_hash(base_r[1], p)
-            for param in _COMMON_PARAMS:
+            params = (("q", "query", "search", "filter") +
+                      tuple(x for x in _COMMON_PARAMS if x not in
+                            ("q", "query", "search", "filter"))) if any(
+                                k in p.lower() for k in ("search", "query", "filter", "find")) else _COMMON_PARAMS
+            for param in params:
                 if not self._budget_left():
                     return
                 qpath = f"{p}?{param}=1"

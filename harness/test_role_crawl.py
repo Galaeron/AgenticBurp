@@ -62,7 +62,7 @@ def _fake_crawl(endpoints):
 
 def _fake_probe(matrix):
     """matrix: (path) -> function(authHeader) -> (status, body)."""
-    async def fake_request(self, method, url, headers=None):
+    async def fake_request(self, method, url, headers=None, **kwargs):
         # recover the path key from the url
         from urllib.parse import urlsplit
         path = urlsplit(url).path
@@ -304,6 +304,206 @@ class RoleCrawlEndpointTests(unittest.TestCase):
         finally:
             store._DB_PATH = orig
             tmp.cleanup()
+
+
+class ProbeSynthesisHelperTests(unittest.TestCase):
+    """Pure helpers behind the method/body/query fix -- no network."""
+
+    def test_resolve_prefers_post_over_put_when_both_declared(self):
+        self.assertEqual(role_crawl._resolve_probe_method({"PUT", "POST", "OPTIONS"}), "POST")
+
+    def test_resolve_defaults_to_get_when_get_declared(self):
+        self.assertEqual(role_crawl._resolve_probe_method({"GET", "POST"}), "GET")
+        self.assertEqual(role_crawl._resolve_probe_methods({"GET", "PUT", "OPTIONS"}),
+                         ("GET", "PUT"))
+
+    def test_resolve_defaults_to_get_with_no_method_info(self):
+        # No entry in path_methods (passive JS/HTML crawl only) -- must not
+        # invent a non-GET method out of nothing.
+        self.assertEqual(role_crawl._resolve_probe_method(None), "GET")
+        self.assertEqual(role_crawl._resolve_probe_method(set()), "GET")
+
+    def test_resolve_refuses_destructive_or_unknown_method(self):
+        self.assertIsNone(role_crawl._resolve_probe_method({"DELETE"}))
+        self.assertIsNone(role_crawl._resolve_probe_method({"CONNECT"}))
+
+    def test_synthesize_body_is_empty_for_get(self):
+        self.assertEqual(role_crawl._synthesize_body("GET", "/api/anything"), ("", ""))
+
+    def test_synthesize_body_guesses_login_shape(self):
+        body, ctype = role_crawl._synthesize_body("POST", "/api/login")
+        self.assertIn("password", body)
+        self.assertEqual(ctype, "application/json")
+
+    def test_synthesize_body_falls_back_generic(self):
+        body, ctype = role_crawl._synthesize_body("POST", "/api/widgets")
+        self.assertEqual(body, role_crawl._GENERIC_JSON_BODY)
+        self.assertEqual(ctype, "application/json")
+
+    def test_synthesize_query_only_for_search_like_paths(self):
+        self.assertEqual(role_crawl._synthesize_query("/api/tickets/search"), "q=test")
+        self.assertEqual(role_crawl._synthesize_query("/api/tickets"), "")
+        self.assertEqual(role_crawl._synthesize_query("/api/tickets/search?q=1"), "")
+
+
+class ActiveDiscoveryMethodPropagationTests(unittest.TestCase):
+    """role_crawl.py bug: active discovery correctly learns a route's real
+    accepted methods (an Allow-header introspection), but crawl_roles threw
+    that away and always probed GET -- a POST/PUT-only endpoint (login,
+    register, mass-assignment writes) got a uniform wrong-method error across
+    every role and was misread as unreachable, masking whatever real
+    vulnerability the correct method+body would have reached."""
+
+    def setUp(self):
+        global_throttle.configure(0)
+
+    def test_declared_post_only_route_needs_gated_run_context(self):
+        from harness.api_surface_discovery import Route, SurfaceResult
+
+        async def fake_discover(self):
+            return SurfaceResult(
+                base_url=self.base_url,
+                routes=[Route(path="/api/register", status=405, methods=("POST", "OPTIONS"))])
+
+        sent = []
+
+        async def fake_request(self, method, url, headers=None, content=None):
+            sent.append((method, url, content))
+            if method == "GET":
+                return _Resp(405, '{"error": "method not allowed"}')
+            return _Resp(201, '{"ok": true}')
+
+        roles = [RoleSession("user", {"Authorization": "Bearer u"})]
+        with patch("harness.crawler.crawl", _fake_crawl([])), \
+             patch("harness.api_surface_discovery.SurfaceDiscovery.discover", fake_discover), \
+             patch("httpx.AsyncClient.request", fake_request):
+            r = asyncio.run(role_crawl.crawl_roles(
+                "http://shop.test/", roles, allowed_hosts=["shop.test"], active_discovery=True))
+
+        ep = next(e for e in r.endpoints if e.path == "/api/register")
+        # NEGATIVE CONTROL baked into the assertion itself: before the fix this
+        # was unconditionally "GET" and by_role["user"] was 405 for everyone.
+        self.assertEqual(ep.method, "POST")
+        self.assertIsNone(ep.by_role["user"])
+        posts = [s for s in sent if s[0] == "POST" and s[1].endswith("/api/register")]
+        self.assertEqual(posts, [], "direct HTTP path must not send inferred writes")
+        gets = [s for s in sent if s[0] == "GET" and s[1].endswith("/api/register")]
+        self.assertEqual(gets, [], "must not also probe the known-wrong GET method")
+
+    def test_declared_get_only_route_still_uses_get(self):
+        from harness.api_surface_discovery import Route, SurfaceResult
+
+        async def fake_discover(self):
+            return SurfaceResult(
+                base_url=self.base_url,
+                routes=[Route(path="/api/health", status=200, methods=("GET",))])
+
+        roles = [RoleSession("user", {"Authorization": "Bearer u"})]
+        matrix = {"/api/health": lambda auth: (200, '{"ok":true}')}
+        with patch("harness.crawler.crawl", _fake_crawl([])), \
+             patch("harness.api_surface_discovery.SurfaceDiscovery.discover", fake_discover), \
+             patch("httpx.AsyncClient.request", _fake_probe(matrix)):
+            r = asyncio.run(role_crawl.crawl_roles(
+                "http://shop.test/", roles, allowed_hosts=["shop.test"], active_discovery=True))
+
+        ep = next(e for e in r.endpoints if e.path == "/api/health")
+        self.assertEqual(ep.method, "GET")
+        self.assertEqual(ep.by_role["user"], 200)
+
+    def test_live_transport_carries_post_template_and_gate_negative_control(self):
+        from harness.api_surface_discovery import Route, SurfaceResult
+
+        async def fake_discover(self):
+            return SurfaceResult(base_url=self.base_url,
+                                 routes=[Route(path="/api/register", status=405,
+                                               methods=("POST", "OPTIONS"))])
+
+        fixture = _Fixture()
+        role = RoleSession("user", {"Authorization": "Bearer registered"})
+        origin = ScopePolicy.origin_of(fixture.base)
+
+        async def scenario(allow_mutation):
+            ctx = RunContext.create(
+                allowed_hosts=["127.0.0.1"], max_requests=2,
+                gate_config={"active_enabled": True,
+                             "allow_mutating_replay": allow_mutation})
+            ctx.sessions.register("user", "user", role.norm_headers(),
+                                  allowed_origins=[origin])
+            try:
+                with patch("harness.crawler.crawl", _fake_crawl([])), \
+                     patch("harness.api_surface_discovery.SurfaceDiscovery.discover",
+                           fake_discover):
+                    return await role_crawl.crawl_roles(
+                        fixture.base, [role], allowed_hosts=["127.0.0.1"],
+                        active_discovery=True, run_context=ctx,
+                        session_refs=["user"])
+            finally:
+                await ctx.aclose()
+
+        try:
+            positive = asyncio.run(scenario(True))
+            self.assertEqual(positive.endpoints[0].method, "POST")
+            self.assertEqual(positive.endpoints[0].by_role["user"], 200)
+            self.assertEqual(len(fixture.httpd.received), 1)
+            sent = fixture.httpd.received[0]
+            self.assertEqual(sent["method"], "POST")
+            self.assertIn("username", sent["body"])
+            self.assertEqual(sent["authorization"], "Bearer registered")
+            self.assertEqual(positive.captured[0]["request_body"], sent["body"])
+
+            fixture.httpd.received.clear()
+            blocked = asyncio.run(scenario(False))
+            self.assertIsNone(blocked.endpoints[0].by_role["user"])
+            self.assertEqual(fixture.httpd.received, [])
+            self.assertEqual(blocked.captured, [])
+        finally:
+            fixture.close()
+
+    def test_live_transport_preserves_get_and_put_operations(self):
+        from harness.api_surface_discovery import Route, SurfaceResult
+
+        async def fake_discover(self):
+            return SurfaceResult(base_url=self.base_url,
+                                 routes=[Route(path="/api/account/profile", status=200,
+                                               methods=("GET", "PUT", "OPTIONS"))])
+
+        fixture = _Fixture()
+        role = RoleSession("user", {"Authorization": "Bearer profile"})
+        origin = ScopePolicy.origin_of(fixture.base)
+
+        async def scenario(allow_mutation):
+            ctx = RunContext.create(
+                allowed_hosts=["127.0.0.1"], max_requests=3,
+                gate_config={"active_enabled": True,
+                             "allow_mutating_replay": allow_mutation})
+            ctx.sessions.register("user", "user", role.norm_headers(),
+                                  allowed_origins=[origin])
+            try:
+                with patch("harness.crawler.crawl", _fake_crawl([])), \
+                     patch("harness.api_surface_discovery.SurfaceDiscovery.discover",
+                           fake_discover):
+                    return await role_crawl.crawl_roles(
+                        fixture.base, [role], allowed_hosts=["127.0.0.1"],
+                        active_discovery=True, run_context=ctx,
+                        session_refs=["user"])
+            finally:
+                await ctx.aclose()
+
+        try:
+            positive = asyncio.run(scenario(True))
+            self.assertEqual({e.method for e in positive.endpoints}, {"GET", "PUT"})
+            self.assertEqual([r["method"] for r in fixture.httpd.received],
+                             ["GET", "PUT"])
+            put = next(c for c in positive.captured if c["method"] == "PUT")
+            self.assertIn("name", put["request_body"])
+
+            fixture.httpd.received.clear()
+            blocked = asyncio.run(scenario(False))
+            self.assertEqual([r["method"] for r in fixture.httpd.received], ["GET"])
+            self.assertIsNone(next(e for e in blocked.endpoints
+                                   if e.method == "PUT").by_role["user"])
+        finally:
+            fixture.close()
 
 
 if __name__ == "__main__":

@@ -58,6 +58,10 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._reply(200, b"posted")
 
+    def do_PUT(self):
+        self._record()
+        self._reply(200, b"updated")
+
 
 class _Fixture:
     def __init__(self):

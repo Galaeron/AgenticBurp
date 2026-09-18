@@ -47,6 +47,79 @@ _NUM_SEG = re.compile(r"/\d+(?=/|$)")
 def _template_ids(path: str) -> str:
     return _NUM_SEG.sub("/{id}", path)
 
+
+# Probe only these declared write methods, in stable order. DELETE needs a
+# purpose-built confirmation flow and is excluded from speculative crawl.
+_NON_GET_PREFERENCE = ("POST", "PUT", "PATCH")
+
+# No OpenAPI spec and no HTML form means no schema to build a body from --
+# guess a minimal, generically-plausible one from common field-name
+# conventions in the path, rather than sending an empty body that trips a
+# uniform error across every identity and gets a real POST/PUT-only endpoint
+# misread as unreachable.
+_BODY_HEURISTICS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("login", "signin", "sign-in", "authenticate"),
+     '{"username": "probe_user", "password": "ProbeUser123!"}'),
+    (("regist", "signup", "sign-up"),
+     '{"username": "probe_user", "password": "ProbeUser123!", "email": "probe@example.com"}'),
+    (("password", "reset"),
+     '{"password": "ProbeUser123!", "new_password": "ProbeUser123!"}'),
+    (("profile", "account", "settings", "/me"),
+     '{"name": "Probe User", "email": "probe@example.com"}'),
+)
+_GENERIC_JSON_BODY = '{"name": "probe", "value": "probe"}'
+
+# Endpoints whose own path names them as a search/filter/query surface but
+# were discovered with no captured query string -- probe with a plausible
+# parameter rather than an empty query that returns default/no results and
+# exercises no input-handling code at all.
+_QUERY_KEYWORDS = ("search", "query", "find", "filter")
+
+
+def _synthesize_body(method: str, path: str) -> tuple[str, str]:
+    """Guess a minimal JSON body for a POST/PUT/PATCH endpoint with no
+    captured template. Returns (body, content_type); ("", "") for GET."""
+    if method == "GET":
+        return "", ""
+    low = path.lower()
+    for keywords, body in _BODY_HEURISTICS:
+        if any(k in low for k in keywords):
+            return body, "application/json"
+    return _GENERIC_JSON_BODY, "application/json"
+
+
+def _synthesize_query(path: str) -> str:
+    """Guess a plausible query string for a GET endpoint that looks like a
+    search/filter surface but was discovered with no captured query."""
+    low = path.lower()
+    if "?" in path:
+        return ""
+    if any(k in low for k in _QUERY_KEYWORDS):
+        return "q=test"
+    return ""
+
+
+def _resolve_probe_methods(methods: set[str] | None) -> tuple[str, ...]:
+    """Pick bounded operations to exercise for one discovered path.
+    `methods` are the REAL accepted verbs from discovery (an Allow header),
+    not a guess. A path can have both GET and PUT operations; collapsing it
+    to one method hides the write shape. None/empty defaults to GET."""
+    if not methods:
+        return ("GET",)
+    selected = (("GET",) if "GET" in methods else ()) + tuple(
+        m for m in _NON_GET_PREFERENCE if m in methods)
+    if selected:
+        return selected
+    # DELETE and unusual protocol verbs are never chosen for speculative
+    # access-matrix probing. They require a purpose-built confirmation leg.
+    return ()
+
+
+def _resolve_probe_method(methods: set[str] | None) -> str | None:
+    """Legacy one-method helper for callers needing a representative verb."""
+    selected = _resolve_probe_methods(methods)
+    return selected[0] if selected else None
+
 # Trust ordering for the built-in identity roles (identity.IdentityRole). A role
 # reaching something a STRICTLY higher-trust role also reaches is normal; a
 # lower-trust role reaching something a higher one can't is the interesting
@@ -198,21 +271,33 @@ class RoleCrawlResult:
 
 
 async def _probe(method: str, url: str, headers: dict, timeout: float, *,
-                 run_context=None, session_ref: str | None = None) -> tuple[int | None, str, dict]:
+                 run_context=None, session_ref: str | None = None,
+                 body: str = "", content_type: str = "") -> tuple[int | None, str, dict]:
     if not method:
         method = "GET"
+    if run_context is None and method not in ("GET", "HEAD", "OPTIONS"):
+        return None, "mutating role crawl requires a gated run context", {}
+    req_headers = dict(headers or {})
+    if content_type and not any((k or "").lower() == "content-type" for k in req_headers):
+        req_headers["Content-Type"] = content_type
     try:
         if run_context is not None:
             from harness.run_context import TypedRequest
             outcome = await run_context.executor().execute(
-                TypedRequest(method=method, url=url), capability="role_crawl",
-                session_ref=session_ref)
+                TypedRequest(method=method, url=url, body=body or None,
+                            headers={"Content-Type": content_type} if content_type else {}),
+                capability="role_crawl", session_ref=session_ref)
             if not outcome.ok:
                 return None, f"request {outcome.outcome}: {outcome.error}", {}
             return outcome.status, outcome.body or "", dict(outcome.headers or {})
         await global_throttle.acquire()
+        # `content` is only passed when there is a body; older test doubles
+        # and bodyless GET/HEAD/OPTIONS calls do not require the keyword.
+        request_kwargs = {"headers": req_headers or None}
+        if body:
+            request_kwargs["content"] = body.encode("utf-8")
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            resp = await client.request(method, url, headers=headers or None)
+            resp = await client.request(method, url, **request_kwargs)
         # getattr guard: test stubs return a minimal response object with no
         # .headers -- capture must degrade to empty headers, not crash.
         return resp.status_code, (resp.text or ""), dict(getattr(resp, "headers", None) or {})
@@ -239,14 +324,12 @@ async def crawl_roles(
     with every role, and derive auth-bypass + IDOR candidates from the matrix.
 
     `roles` is a list of RoleSession; include an anonymous role (empty headers)
-    to detect auth bypass. Probing is bounded by `max_endpoints` (the union is
-    truncated, most-specific first is not assumed -- simply capped) so a large
-    surface can't fan out into an unbounded number of requests.
+    to detect auth bypass. Probing is bounded by `max_endpoints` method+path
+    operations so a large surface cannot fan out without limit.
 
     `active_discovery` augments the JS-mined surface with black-box API discovery
     (api_surface_discovery) -- essential on a headless API where the JS crawler
-    finds nothing. Off by default so the plain crawl stays purely passive; the
-    engagement builder turns it on."""
+    finds nothing. The engagement builder turns active discovery on."""
     result = RoleCrawlResult(base_url=base_url, roles=[r.role for r in roles])
     if not roles:
         result.errors.append("no roles supplied")
@@ -257,6 +340,10 @@ async def crawl_roles(
 
     # 1. Discover the surface, per role (authenticated pages/JS may reveal more).
     discovered: set[str] = set()
+    # path -> real accepted HTTP verbs, from active discovery's Allow-header
+    # introspection. A path with no entry here came from the passive JS/HTML
+    # crawl only, which carries no method signal -- default GET for those.
+    path_methods: dict[str, set[str]] = {}
     for role_index, r in enumerate(roles):
         try:
             cr = await crawler.crawl(base_url, headers=r.norm_headers(),
@@ -301,7 +388,12 @@ async def crawl_roles(
                                             session_ref=(session_refs[roles.index(sr)]
                                                          if session_refs is not None else None))
                     sres = await disc.discover()
-                    discovered |= {_template_ids(rt.path) for rt in sres.routes}
+                    for rt in sres.routes:
+                        tp = _template_ids(rt.path)
+                        discovered.add(tp)
+                        if rt.methods:
+                            path_methods.setdefault(tp, set()).update(
+                                m.upper() for m in rt.methods if m.upper() != "OPTIONS")
                     total_routes += len(sres.routes); total_probes += sres.probes_sent
                     result.sensitive_file_hits.extend(sres.sensitive_file_hits)
                     if sres.spec_found:
@@ -313,36 +405,55 @@ async def crawl_roles(
         except Exception as e:
             result.errors.append(f"[discovery] failed: {e.__class__.__name__}")
 
-    paths = sorted(discovered)[:max_endpoints]
-    if len(discovered) > max_endpoints:
-        result.errors.append(f"surface truncated to {max_endpoints} of {len(discovered)} endpoints for probing")
+    operations = [(path, method) for path in sorted(discovered)
+                  for method in _resolve_probe_methods(path_methods.get(path))]
+    if len(operations) > max_endpoints:
+        result.errors.append(f"surface truncated to {max_endpoints} of {len(operations)} "
+                             "endpoint operations for probing")
 
     # 2. Probe each endpoint with each role -> access matrix.
     captured_keys: set[tuple] = set()   # (method, path, body-fp) -> dedup captures
-    for path in paths:
+    for path, probe_method in operations[:max_endpoints]:
+        # Use the endpoint's REAL accepted method (from discovery's Allow-header
+        # introspection) rather than always GET -- a POST/PUT-only endpoint
+        # probed with GET returns a uniform wrong-method error to every role
+        # and is misread as unreachable/dead, never exercising the endpoint's
+        # actual logic. No method info (passive JS/HTML crawl only) -> GET.
+        req_body, req_ctype = _synthesize_body(probe_method, path)
+        query = _synthesize_query(path) if probe_method == "GET" else ""
         url = map_._build_url(base_url, path, id_fill)
+        if query:
+            url = f"{url}?{query}"
         if not map_._host_allowed(url, allowed_hosts):
             continue
-        access = EndpointAccess(method="GET", path=path)
+        access = EndpointAccess(method=probe_method, path=path)
         for role_index, r in enumerate(roles):
             status, body, resp_headers = await _probe(
-                "GET", url, r.norm_headers(), timeout, run_context=run_context,
-                session_ref=session_refs[role_index] if session_refs is not None else None)
+                probe_method, url, r.norm_headers(), timeout, run_context=run_context,
+                session_ref=session_refs[role_index] if session_refs is not None else None,
+                body=req_body, content_type=req_ctype)
             access.by_role[r.role] = status
             substantive = map_._substantive(status, body)
             if substantive:
                 access.reachable_roles.append(r.role)
                 # Phase 0.1: retain the substantive 2xx as an analyzable exchange
-                # so full content-level review reaches it. Dedup by response
-                # content -- identical bodies returned to several roles are one
-                # exchange for content purposes (the cross-identity lens already
-                # owns the "same body to two identities" signal separately).
+                # so full content-level review reaches it, AND (R05) so the
+                # request body/query the harness actually used to reach it
+                # survives as this endpoint's replay template -- not an empty
+                # fabrication -- via record_template downstream. Dedup by
+                # response content -- identical bodies returned to several
+                # roles are one exchange for content purposes (the
+                # cross-identity lens already owns the "same body to two
+                # identities" signal separately).
                 cap_key = (access.method, path, _body_fp(body))
                 if cap_key not in captured_keys and len(result.captured) < max_captured:
                     captured_keys.add(cap_key)
+                    req_headers = dict(r.norm_headers())
+                    if req_ctype and not any((k or "").lower() == "content-type" for k in req_headers):
+                        req_headers["Content-Type"] = req_ctype
                     result.captured.append(HttpExchange(
                         url=url, method=access.method,
-                        request_headers=r.norm_headers(), request_body="",
+                        request_headers=req_headers, request_body=req_body,
                         response_status=status, response_headers=resp_headers,
                         response_body=body,
                         analyst_note=f"role_crawl discovery capture as '{r.role}' (HTTP {status})",
