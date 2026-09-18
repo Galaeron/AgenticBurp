@@ -35,30 +35,46 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r harness/requirements.lock
+      # Every harness step runs from the REPO ROOT: since W-18 the modules import
+      # each other as `harness.*` and so need the repo root on sys.path (CLAUDE.md
+      # "Run everything from the repository root"). Running these `working-directory:
+      # harness` errored on `No module named 'harness'`. Test modules are named
+      # `harness.<mod>`; coverage_manifest runs as `-m harness.coverage_manifest`
+      # (its evidence dir is module-relative, so it still writes harness/.coverage_runs).
       - name: Clean this run's evidence dir (fresh, run-bound)
-        working-directory: harness
-        run: python -c "import shutil; shutil.rmtree('.coverage_runs', ignore_errors=True)"
+        run: python -c "import shutil; shutil.rmtree('harness/.coverage_runs', ignore_errors=True)"
       - name: PR smoke subset (fast signal, writes this run's coverage evidence)
-        working-directory: harness
         run: >-
           python -m unittest
-          test_smoke_detection
-          test_smoke_investigate
-          test_smoke_shape_precondition
-          test_smoke_authorization_workflow
-          test_smoke_phase0_capture_review
-          test_mass_assignment_slice
-          test_open_redirect_slice
-          test_coverage_manifest
+          harness.test_smoke_detection
+          harness.test_smoke_investigate
+          harness.test_smoke_shape_precondition
+          harness.test_smoke_authorization_workflow
+          harness.test_smoke_phase0_capture_review
+          harness.test_mass_assignment_slice
+          harness.test_open_redirect_slice
+          harness.test_coverage_manifest
+      # Real-pipeline gate: drives REAL discovery -> confirmation against a local
+      # fixture (only the model boundary is stubbed) and includes the defect-injection
+      # proofs that the gate goes red when the pipeline breaks.
+      - name: Real-pipeline gate (real discovery -> confirmation)
+        run: python -m unittest harness.test_pipeline_gate
+      # pytest-native tests unittest's discover CANNOT collect (module-level test
+      # functions + fixtures). Before this step they ran in NO tier -- the exact
+      # "green tests, dead pipeline" gap. Run them explicitly.
+      - name: pytest-native tests (not collected by unittest discover)
+        run: >-
+          python -m pytest -q
+          harness/test_plugin_system.py
+          harness/test_execution_protocol.py
+          harness/test_hardening.py
       - name: Requirement-coverage gate (declared automated aspects must be a fresh pass)
-        working-directory: harness
-        run: python coverage_manifest.py --check
+        run: python -m harness.coverage_manifest --check
       - name: Generate coverage report (always, for diagnostics)
         if: always()
-        working-directory: harness
         run: |
-          python coverage_manifest.py > coverage_report.md
-          python coverage_manifest.py --json > coverage_report.json
+          python -m harness.coverage_manifest > harness/coverage_report.md
+          python -m harness.coverage_manifest --json > harness/coverage_report.json
       - name: Upload coverage evidence + report (always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -88,21 +104,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r harness/requirements.lock
+      # Repo root, same as the fast tier (harness.* imports need it).
       - name: Clean this run's evidence dir
-        working-directory: harness
-        run: python -c "import shutil; shutil.rmtree('.coverage_runs', ignore_errors=True)"
+        run: python -c "import shutil; shutil.rmtree('harness/.coverage_runs', ignore_errors=True)"
       - name: Full unit suite (writes this run's coverage evidence)
-        working-directory: harness
-        run: python -m unittest discover -p "test_*.py"
+        run: python -m unittest discover -t . -s harness -p "test_*.py"
+      # unittest's discover silently collects ZERO tests from the pytest-native files
+      # (module-level functions + fixtures), so the full suite above does not run them.
+      # Run them explicitly from the repo root, mirroring the fast tier.
+      - name: pytest-native tests (not collected by unittest discover)
+        run: >-
+          python -m pytest -q
+          harness/test_plugin_system.py
+          harness/test_execution_protocol.py
+          harness/test_hardening.py
       - name: Requirement-coverage gate
-        working-directory: harness
-        run: python coverage_manifest.py --check
+        run: python -m harness.coverage_manifest --check
       - name: Generate coverage report (always, for diagnostics)
         if: always()
-        working-directory: harness
         run: |
-          python coverage_manifest.py > coverage_report.md
-          python coverage_manifest.py --json > coverage_report.json
+          python -m harness.coverage_manifest > harness/coverage_report.md
+          python -m harness.coverage_manifest --json > harness/coverage_report.json
       - name: Upload coverage evidence + report (always)
         if: always()
         uses: actions/upload-artifact@v4
