@@ -10,7 +10,7 @@ mixins; searching only that file misses the implementation.
 | Validator dispatch/proof binding | `orchestrator_confirm.py`, `validators/registry.py`, `evidence_ledger.py` | `test_evidence_ledger.py`, `test_oracle_wiring.py` |
 | Endpoint shape warrants a confirmation attempt | `orchestrator_helpers.py`, `orchestrator_chain.py` | `test_smoke_shape_precondition.py`, `test_orchestrator_precondition.py` |
 | Discovery and request templates | `api_surface_discovery.py`, `role_crawl.py`, `openapi_ingest.py` | `test_api_surface_discovery.py`, `test_role_crawl.py` |
-| Invocation isolation, scope and credentials | `run_context.py`, `target_transport.py`, `safety_gate.py`, `scope_lock.py` | `test_run_context.py`, `test_offscope_host_lock.py` |
+| Invocation isolation, scope and credentials | `run_context.py` (`TargetTransport`), `transport_inventory.py`, `safety_gate.py`, `scope_lock.py` | `test_run_context.py`, `test_offscope_host_lock.py` |
 | Stateful workflows | `workflow_engine.py`, `feature_workflow.py` | `test_workflow_engine.py` |
 | Coverage applicability/proof state | `coverage_model.py`, `coverage_tracker.py`, `evidence.py` | `test_coverage_tracker.py`, `test_coverage_cases.py` |
 | Escalation and second-order pairs | `chain_linker.py`, `chaining.py`, `second_order.py` | `test_chain_linker.py`, `test_second_order.py` |

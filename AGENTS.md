@@ -14,7 +14,7 @@ Ollama-backed reasoning and deterministic validators. Safe defaults are passive.
   confirmation: `orchestrator_confirm.py`; engagement: `orchestrator_chain.py`.
 - Discovery/worklist: `engagement_builder.py`, `api_surface_discovery.py`,
   `role_crawl.py`, `worklist_investigator.py`.
-- Transport/policy: `run_context.py`, `target_transport.py`, `safety_gate.py`.
+- Transport/policy: `run_context.py` (the `TargetTransport` class), `safety_gate.py`.
 - Evidence: `evidence.py`, `evidence_ledger.py`, `store.py`; validator registration:
   `validators/registry.py`; confirmation tiers: `confirmation_gate.py`.
 - Burp UI: `burp-extension/` (Java). See [architecture](docs/ARCHITECTURE.md)
