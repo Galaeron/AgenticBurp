@@ -4,6 +4,17 @@ from .base_agent import BaseAgent
 class MisconfigAgent(BaseAgent):
     name = "misconfig"
 
+    tactical_guide = """
+1. Look for a default/leftover admin path, a debug/dev endpoint left
+   reachable in what looks like production, or a framework's default error/
+   status page (Werkzeug debugger, Spring Whitelabel, default Nginx/Apache
+   page) -- these are configuration, not code, bugs.
+2. Check response headers for a stack/version banner (`Server`, `X-Powered-
+   By`) combined with a known-sensitive default path for that stack.
+3. Note directory-listing-shaped responses (an `Index of /` page or a bare
+   JSON array of filenames) as their own distinct finding.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

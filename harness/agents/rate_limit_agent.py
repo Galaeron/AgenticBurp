@@ -4,6 +4,17 @@ from .base_agent import BaseAgent
 class RateLimitAgent(BaseAgent):
     name = "rate_limit"
 
+    tactical_guide = """
+1. Check for any rate-limit signal already present (429 status,
+   `X-RateLimit-*`/`Retry-After` headers) -- their ABSENCE on a sensitive
+   endpoint (login, OTP verify, password reset) is the finding.
+2. Prioritize endpoints where unlimited attempts have real impact:
+   authentication, token/OTP verification, invite/coupon redemption --
+   over low-value endpoints where rate limiting rarely matters.
+3. A missing rate limit is only confirmed by actually sending N requests and
+   observing no throttling/lockout -- name that as the concrete next step.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

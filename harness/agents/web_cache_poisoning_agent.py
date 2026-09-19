@@ -24,6 +24,20 @@ class WebCachePoisoningAgent(BaseAgent):
     """
     name = "web_cache_poisoning"
 
+    tactical_guide = """
+1. Look for signals a caching layer is present (`X-Cache`, `Age`, `CF-Cache-
+   Status`, a `Vary` header) and note whether the response includes content
+   that varies by a header/cookie NOT listed in `Vary` -- that's the
+   concrete cache-key mismatch signal.
+2. Check whether an unkeyed input (a header like `X-Forwarded-Host`, or a
+   cache-busting-looking query param) appears reflected into the cached
+   response body -- that's what makes poisoning practical, not just cache
+   presence alone.
+3. This needs a second, unauthenticated request to the SAME cache key to
+   confirm the poisoned response was actually served to someone else --
+   name that as the required confirmation step.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

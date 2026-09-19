@@ -4,6 +4,20 @@ from .base_agent import BaseAgent
 class AiLlmAgent(BaseAgent):
     name = "ai_llm"
 
+    tactical_guide = """
+1. Look for the actual LLM-facing prompt boundary: is user input concatenated
+   directly into a system/instruction string, or passed as a separate role?
+2. Check whether the response echoes back anything resembling an internal
+   system prompt, tool name, or hidden instruction -- that is a prompt-leak,
+   not just a stylistic quirk.
+3. If the app exposes tool-calling/function-calling, look for a parameter that
+   flows untouched into a shell/SQL/file-path sink downstream of the model --
+   that is indirect injection turning into a concrete vulnerability class.
+4. Note (don't guess) whether user-supplied text could reach a RETRIEVED
+   document/webpage the model later reads -- that is the indirect prompt-
+   injection surface, and needs a second exchange to confirm.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

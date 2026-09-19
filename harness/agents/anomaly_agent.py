@@ -15,6 +15,18 @@ class AnomalyAgent(BaseAgent):
     """
     name = "anomaly"
 
+    tactical_guide = """
+1. Compare this exchange's shape (status code, header set, response size,
+   timing markers if present) against what a well-behaved response for this
+   route would look like -- an anomaly is a DEVIATION, not a bug in itself.
+2. Look specifically for signals no single-purpose agent would flag: an
+   unusual header combination, a response that doesn't match its declared
+   Content-Type, or a status/body mismatch (200 with an error-shaped body).
+3. State the baseline you're comparing against explicitly in evidence -- an
+   anomaly claim with no stated baseline is not falsifiable and should not
+   be reported.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

@@ -22,6 +22,17 @@ class CspAgent(BaseAgent):
     """
     name = "csp"
 
+    tactical_guide = """
+1. Read the actual Content-Security-Policy header (or its absence) on THIS
+   response -- don't assume a site-wide policy from one exchange.
+2. If present, check for the classic weak directives: `unsafe-inline`,
+   `unsafe-eval`, a wildcard `*` source, or a missing `object-src`/
+   `frame-ancestors` -- each has a different practical impact, name which.
+3. If ABSENT entirely on an HTML response, that's the finding itself (no
+   clickjacking/XSS-mitigation baseline) -- don't wait for a policy to
+   analyze before reporting a missing one.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

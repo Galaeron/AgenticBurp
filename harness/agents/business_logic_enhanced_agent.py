@@ -5,6 +5,17 @@ class BusinessLogicEnhancedAgent(BaseAgent):
     """Enhanced agent for detecting business logic vulnerabilities."""
     name = "business_logic_enhanced"
 
+    tactical_guide = """
+1. Build on the basic business-logic lens: look specifically for RACE-prone
+   sequences (check-then-act on a balance/inventory/coupon) and workflow
+   state that a client could resubmit or replay out of order.
+2. Look for numeric bounds that are enforced client-side only (a quantity
+   field with a UI max but no visible server-side re-validation signal).
+3. Flag multi-tenant boundary logic (an org/account id in the body vs the
+   session) as a business-logic-flavored IDOR that also needs a cross-
+   identity differential to confirm.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

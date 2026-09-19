@@ -5,6 +5,18 @@ class JwtAgent(BaseAgent):
     """Agent for detecting JWT and token-based authentication vulnerabilities."""
     name = "jwt"
 
+    tactical_guide = """
+1. Decode the JWT header (never the signature) and check `alg`: `none` is
+   an immediate critical finding; HS256 where the app might actually expect
+   RS256 is the classic algorithm-confusion candidate.
+2. Check the payload for missing/expired-but-still-accepted `exp`, and for
+   authorization data (role, user_id) that lives in a token an end user
+   could plausibly re-sign if a weak/guessable secret is used.
+3. This agent can only observe the token's SHAPE -- forging and replaying it
+   is the deterministic jwt_forge leg's job; name the exact fields (alg,
+   claims) that make it worth trying, not a generic "JWT looks weak".
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

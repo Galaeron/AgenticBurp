@@ -18,6 +18,19 @@ class DeserializationAgent(BaseAgent):
     """
     name = "deserialization"
 
+    tactical_guide = """
+1. Look for a serialized-object shape, not just "JSON": Java-serialized
+   (`rO0AB` / `\xac\xed`), Python pickle (`\x80\x04` / crafted
+   `c__main__`), PHP `O:8:"ClassName"`, or a .NET `TypeObject` marker in a
+   request body, cookie, or hidden field.
+2. Note the exact sink (a cookie value, a "state" hidden field, a cache
+   payload) and whether the app appears to deserialize it BEFORE any
+   integrity check (no HMAC/signature covering the blob).
+3. This class is unsafe to actively exploit blind -- report the candidate
+   shape/sink precisely and let the deterministic OOB-beacon leg confirm it,
+   rather than proposing a payload yourself.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

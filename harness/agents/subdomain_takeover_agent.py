@@ -21,6 +21,19 @@ class SubdomainTakeoverAgent(BaseAgent):
     """
     name = "subdomain_takeover"
 
+    tactical_guide = """
+1. Look for a CNAME-shaped hostname reference (in a header, redirect
+   target, or response body) that points at a third-party PaaS domain
+   (e.g. an *.github.io, *.herokuapp.com, *.s3.amazonaws.com-shaped
+   pattern) rather than the app's own infrastructure.
+2. Note any response that looks like the THIRD-PARTY SERVICE's own
+   "not found"/"no such app/bucket" page reached through the app's own
+   domain -- that's the concrete signal a dangling DNS record exists.
+3. This can only be confirmed by checking whether that third-party name is
+   actually unclaimed and registerable -- say that's the required next
+   step, not something this exchange alone proves.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

@@ -5,6 +5,18 @@ class XxeAgent(BaseAgent):
     """Agent for detecting XML External Entity (XXE) injection vulnerabilities."""
     name = "xxe"
 
+    tactical_guide = """
+1. Confirm the request actually declares/accepts XML (Content-Type, a
+   `<?xml` body, or a SOAP-shaped envelope) -- this class does not apply to
+   a JSON-only endpoint.
+2. Check whether the body structure would allow a DOCTYPE/external-entity
+   declaration to be added (is the root element and its immediate
+   structure visible/predictable enough to graft one onto).
+3. Blind XXE (no entity content reflected in the response) needs an
+   out-of-band callback to confirm -- name that as the suggested_test
+   explicitly rather than implying the response alone would show it.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

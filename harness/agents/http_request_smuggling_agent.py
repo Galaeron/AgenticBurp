@@ -196,6 +196,20 @@ class HttpRequestSmugglingAgent(BaseAgent):
     """
     name = "http_request_smuggling"
 
+    tactical_guide = """
+1. Look for the CL.TE/TE.CL precondition: does this response's headers show
+   BOTH a Content-Length and a Transfer-Encoding, or hints of a front-end
+   proxy plus a distinct backend (Server header mismatch, unusual latency
+   pattern)?
+2. Smuggling cannot be confirmed from a single exchange -- it requires a
+   crafted request that desyncs the connection and a SECOND request that
+   observes the effect. Say that explicitly rather than implying this one
+   exchange proves anything.
+3. Note any obfuscated Transfer-Encoding variant (extra whitespace, wrong
+   case, duplicate header) -- that's the specific parser-disagreement signal
+   worth flagging over a generic "might smuggle" claim.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

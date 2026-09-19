@@ -4,6 +4,18 @@ from .base_agent import BaseAgent
 class SupplyChainAgent(BaseAgent):
     name = "supply_chain"
 
+    tactical_guide = """
+1. Look for a NAMED third-party component and version (a JS library in a
+   script tag/bundle comment, a package name in an error trace, a
+   dependency manifest fragment) -- report the exact name+version as a
+   `components` entry, don't guess whether it's vulnerable yourself.
+2. Note any CI/CD or build-pipeline artifact exposed (a `.github/workflows`
+   reference, a webhook URL, a package-registry token shape) as its own,
+   higher-severity finding distinct from a plain outdated-library note.
+3. Flag any third-party script loaded WITHOUT Subresource Integrity (no
+   `integrity=` attribute visible) on a security-sensitive page.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

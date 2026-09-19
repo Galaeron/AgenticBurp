@@ -150,6 +150,11 @@ class AgentReport(BaseModel):
     # to precisely which prompt version produced it, without hand-
     # maintained version numbers going stale the moment a prompt changes.
     prompt_version: str = ""
+    # P1.14 -- short hash of the agent's tactical_guide text (base_agent.
+    # _guide_version), "" when the agent carries no guide. Lets a stored
+    # finding/report show which tactical-guide version was loaded for this
+    # dispatch, independent of the broader prompt_version hash above.
+    guide_version: str = ""
 
 
 class AnalysisRequest(BaseModel):

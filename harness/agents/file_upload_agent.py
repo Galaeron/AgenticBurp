@@ -5,6 +5,16 @@ class FileUploadAgent(BaseAgent):
     """Agent for detecting file upload and file handling vulnerabilities."""
     name = "file_upload"
 
+    tactical_guide = """
+1. Note the upload's declared Content-Type vs the filename extension vs any
+   magic-byte hint in the (truncated) body -- a mismatch is the first signal.
+2. Check whether the response reveals WHERE the file lands (a returned URL/
+   path) -- that's what makes an upload bypass exploitable at all.
+3. Look for weak extension filtering (blocklist-shaped: rejects `.php` but
+   not `.phtml`/`.php5`/double extensions) versus a real allowlist +
+   content-type re-validation.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

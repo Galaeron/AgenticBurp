@@ -17,6 +17,19 @@ class CryptoAgent(BaseAgent):
     """
     name = "crypto"
 
+    tactical_guide = """
+1. Look at what's actually observable: TLS version/cipher only shows up in
+   connection metadata this exchange may not carry -- focus on
+   APPLICATION-layer crypto misuse instead (token/signature schemes, hash
+   algorithms named in headers or error text, "encrypted" values that are
+   just base64 or otherwise reversible).
+2. Check for a version/algorithm identifier leaking in a header, cookie
+   attribute, or error message (e.g. "MD5", "DES", a JWT "alg" field) --
+   report the identifier, not a guessed CVE (components handle that).
+3. Look for predictable-looking tokens (short, sequential, timestamp-
+   derived) presented as if they were secure random values.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

@@ -4,6 +4,19 @@ from .base_agent import BaseAgent
 class IdorAgent(BaseAgent):
     name = "idor"
 
+    tactical_guide = """
+1. Identify the exact identifier(s) in play (path segment, query param,
+   JSON field) and whether it looks sequential/guessable vs an
+   unguessable UUID -- that changes exploitability, not just presence.
+2. Note whether the request carries a session/auth token at all -- an
+   IDOR with NO auth token present is a missing-authentication finding,
+   not just IDOR; say which this actually is.
+3. Propose the precise two-request differential as suggested_test: same
+   token + different id, OR same id + a different identity's token --
+   name which one applies here and say explicitly this single exchange
+   cannot prove it alone.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

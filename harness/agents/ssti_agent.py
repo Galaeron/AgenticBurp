@@ -5,6 +5,20 @@ class SstiAgent(BaseAgent):
     """Agent for detecting Server-Side Template Injection vulnerabilities."""
     name = "ssti"
 
+    tactical_guide = """
+1. Look for user input that lands somewhere that could plausibly be
+   template-rendered (a "name"/"greeting"/report-title field, an email/PDF
+   template preview) rather than just any string field.
+2. Note which template engine's syntax would fit the app's apparent stack
+   (Jinja2 `{{ }}`, Twig, Freemarker `${}`, Velocity `#set`) based on
+   response headers/framework signals, rather than proposing a generic
+   payload blind to the engine.
+3. Propose a NONCE-WRAPPED ARITHMETIC probe (e.g. a payload that would
+   evaluate to a distinctive number if rendered, literal text if not) as
+   the differential confirmation, not a payload that merely "looks like"
+   template syntax.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

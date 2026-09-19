@@ -5,6 +5,18 @@ class CommandInjectionAgent(BaseAgent):
     """Agent for detecting command injection and RCE vulnerabilities."""
     name = "command_injection"
 
+    tactical_guide = """
+1. Find any parameter whose value plausibly reaches a shell/subprocess call
+   server-side (filenames, hostnames for a ping/traceroute/DNS-lookup
+   feature, image/PDF conversion tools, git/archive operations).
+2. Note the delimiter set that would matter (semicolon, pipe, &, $(), backtick,
+   newline) for the SPECIFIC OS/shell this looks like, based on response
+   headers/error text -- don't propose a payload blind to the platform.
+3. Blind command injection (no output reflected) needs an out-of-band
+   callback to confirm -- say that explicitly as the suggested_test rather
+   than implying the response alone would show it.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

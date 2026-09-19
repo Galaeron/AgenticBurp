@@ -20,6 +20,18 @@ class RaceConditionAgent(BaseAgent):
     """
     name = "race_condition"
 
+    tactical_guide = """
+1. Look for a check-then-act shape: a balance/inventory/coupon/limit check
+   followed by a write, where nothing in the exchange suggests atomicity
+   (no visible idempotency key, no optimistic-lock version field).
+2. Name the SPECIFIC resource that could be over-spent/over-redeemed/
+   double-applied if this exact request were fired concurrently -- a race
+   condition finding needs a concrete resource, not a generic "might race".
+3. This can only be CONFIRMED by firing genuinely concurrent requests and
+   observing the resource end in an inconsistent state -- say that's the
+   required next step rather than implying single-request evidence proves it.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

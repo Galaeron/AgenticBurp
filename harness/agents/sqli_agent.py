@@ -4,6 +4,19 @@ from .base_agent import BaseAgent
 class SqliAgent(BaseAgent):
     name = "sqli"
 
+    tactical_guide = """
+1. Identify every parameter (query string, form field, JSON key, header,
+   cookie) that plausibly reaches a query, and note which looks most
+   promising (an id/filter/sort field beats a UI-only display string).
+2. Prefer a DIFFERENTIAL test in suggested_test: baseline vs a single quote
+   vs the quote escaped/doubled -- a response DIFFERENCE between those two
+   is the signal, not the quote alone.
+3. If the response gives no visible signal, suggest a boolean-blind pair
+   (`AND 1=1` vs `AND 1=2`-shaped) or a time-based fallback -- and say
+   explicitly that a real confirmation needs the differential, not this
+   single exchange.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

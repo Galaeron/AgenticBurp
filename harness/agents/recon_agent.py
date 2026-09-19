@@ -153,6 +153,17 @@ class ReconAgent(BaseAgent):
     """
     name = "recon"
 
+    tactical_guide = """
+1. Note anything that expands the KNOWN SURFACE from this one exchange:
+   linked paths, API base paths in JS/JSON, comments referencing internal
+   hostnames or endpoints, version/framework banners.
+2. Prioritize signal that changes what to test next (a newly-seen `/api/`
+   prefix, an internal-looking hostname, a `.map`/`.git`/`.env`-shaped path)
+   over generic technology fingerprinting with no follow-on value.
+3. This agent's job is surface EXPANSION, not vulnerability confirmation --
+   report what was found and where, not a severity-laden claim about it.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

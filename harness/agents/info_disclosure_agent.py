@@ -5,6 +5,19 @@ class InfoDisclosureAgent(BaseAgent):
     """Agent for detecting information disclosure vulnerabilities."""
     name = "info_disclosure"
 
+    tactical_guide = """
+1. Distinguish three tiers explicitly: a stack trace/debug page (framework
+   internals), a source-code/config leak (real secrets or logic exposed),
+   and a soft leak (verbose error naming a library version) -- severity
+   differs a lot between them.
+2. Actually read what's disclosed before reporting -- a generic 500 page
+   with no path/stack/version info is not the same finding as one that
+   names a file path or a DB error string.
+3. If a secret-shaped string (API key, private key, token) appears, treat it
+   as the primary finding (credential leak) over the fact that an error
+   page exists at all.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

@@ -5,6 +5,17 @@ class OpenRedirectAgent(BaseAgent):
     """Agent for detecting open redirect vulnerabilities."""
     name = "open_redirect"
 
+    tactical_guide = """
+1. Find a parameter that plausibly feeds a redirect (`next`, `return`,
+   `redirect`, `url`, `continue`) and note the exact response mechanism
+   (Location header vs a client-side `window.location` in the body).
+2. Check whether validation looks like a naive prefix/substring check
+   (`startswith("/")`, `contains("trusted.com")`) that a
+   `//evil.com`-shaped or `trusted.com.evil.com`-shaped value could defeat.
+3. Note whether this redirect sits in an auth flow (post-login redirect) --
+   that raises impact from nuisance to phishing/token-leak territory.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

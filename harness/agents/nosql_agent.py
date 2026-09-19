@@ -5,6 +5,17 @@ class NosqlAgent(BaseAgent):
     """Agent for detecting NoSQL injection vulnerabilities."""
     name = "nosql"
 
+    tactical_guide = """
+1. Look for a NoSQL-shaped backend signal (MongoDB-style `$` operators,
+   a JSON body where a normally-scalar field could accept an object) rather
+   than assuming SQL syntax applies.
+2. Check whether a parameter that should be a string/number is instead
+   accepted as a JSON object/array in the request -- that's the concrete
+   NoSQL-operator-injection surface (`{"$ne": null}`-shaped).
+3. Note the query context (a `find`, a `$where` JS-eval-shaped field, an
+   aggregation pipeline) since the injection technique differs by context.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

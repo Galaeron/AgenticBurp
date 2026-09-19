@@ -26,6 +26,19 @@ class CorsAgent(BaseAgent):
     """
     name = "cors"
 
+    tactical_guide = """
+1. Read the Access-Control-Allow-Origin value literally: `*` with
+   credentials disallowed is normal; a REFLECTED Origin (the response
+   echoes back whatever Origin was sent) combined with
+   Access-Control-Allow-Credentials: true is the actual vulnerable shape.
+2. Check whether Access-Control-Allow-Origin is null-accepting or matches an
+   overly broad suffix/regex (e.g. any *.trusted.com subdomain, including
+   ones an attacker could register).
+3. A permissive CORS header alone is not a finding without a credentialed
+   endpoint behind it -- note what data/action the reflected origin would
+   actually be able to reach.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

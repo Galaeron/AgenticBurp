@@ -14,6 +14,19 @@ class WebsocketAgent(BaseAgent):
     """
     name = "websocket"
 
+    tactical_guide = """
+1. Note whether the WebSocket handshake (the HTTP Upgrade request/response)
+   carries an Origin header and whether the server appears to validate it --
+   missing origin validation is the CSWSH (cross-site WebSocket hijacking)
+   precondition.
+2. Check whether the handshake reuses the same session cookie/token as the
+   rest of the app (making it hijackable cross-site) vs a separate, scoped
+   connection token.
+3. If message-level content is visible, note whether it looks
+   unauthenticated/unvalidated per-message (no per-message auth check
+   beyond the initial handshake).
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

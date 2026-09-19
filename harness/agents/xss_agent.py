@@ -4,6 +4,20 @@ from .base_agent import BaseAgent
 class XssAgent(BaseAgent):
     name = "xss"
 
+    tactical_guide = """
+1. Find WHERE user input is reflected: an HTML body context, an HTML
+   attribute, inside a `<script>` block, or inside a JSON response later
+   consumed by JS -- each needs a different breakout and has different real
+   impact.
+2. Check what (if anything) is already escaped in the reflection (are `<`/
+   `>` encoded but `"` is not, e.g.) -- that tells you which breakout
+   characters are actually still live.
+3. For a JSON-response reflection, note explicitly that impact depends on a
+   DOWNSTREAM consumer doing something unsafe with it (eval/innerHTML) --
+   don't claim the same severity as a direct HTML-context reflection
+   without that link.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

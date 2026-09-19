@@ -5,6 +5,18 @@ class CsrfAgent(BaseAgent):
     """Agent for detecting Cross-Site Request Forgery vulnerabilities."""
     name = "csrf"
 
+    tactical_guide = """
+1. Identify whether this is a STATE-CHANGING request (POST/PUT/PATCH/DELETE,
+   or a GET that clearly mutates data) -- CSRF only matters for those.
+2. Check for an anti-CSRF token in the body/header AND whether SameSite is
+   set on the session cookie (Lax/Strict materially reduces classic CSRF
+   even without a token) -- report what's actually present, not assumed.
+3. A CSRF finding on a request authenticated ONLY by a custom header (never
+   sent automatically by a browser) is not exploitable the normal way --
+   say so rather than reporting it at the same severity as a cookie-only
+   endpoint.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

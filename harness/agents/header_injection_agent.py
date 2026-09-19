@@ -20,6 +20,18 @@ class HeaderInjectionAgent(BaseAgent):
     """
     name = "header_injection"
 
+    tactical_guide = """
+1. Find any response header whose value is clearly echoed from a request
+   parameter (Location, a custom header, a cache-control directive) --
+   that's the injection point to name explicitly.
+2. Check whether CRLF sequences (`\r\n`, or their URL-encoded forms) in
+   that parameter could reach the raw header block -- note the encoding
+   context (is the value URL-decoded before being placed in the header?).
+3. Distinguish response-splitting (forging a whole second response/header)
+   from a simple single-header value injection -- they have different
+   impact and need different suggested_test payloads.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

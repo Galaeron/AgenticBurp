@@ -26,6 +26,18 @@ class GraphQLAgent(BaseAgent):
     """
     name = "graphql"
 
+    tactical_guide = """
+1. If this is a GraphQL endpoint, check whether introspection
+   (`__schema`/`__type`) is reachable -- that alone is a significant
+   over-exposure finding on its own.
+2. Look at the query/mutation shape for missing per-field authorization
+   (a query that nests into another user's data via a relation) and for
+   batching/aliasing that could bypass simple rate limiting.
+3. Note query depth/complexity: an unbounded nested query is a resource-
+   exhaustion (DoS-shaped) finding distinct from a data-exposure one --
+   don't conflate them.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

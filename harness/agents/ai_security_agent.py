@@ -30,6 +30,18 @@ class AISecurityAgent(BaseAgent):
     """
     name = "ai_security"
 
+    tactical_guide = """
+1. Identify which AI-specific surface is actually present here: a model
+   endpoint, an embeddings/vector-search call, a fine-tuning/upload endpoint,
+   or an agent/tool-execution loop -- each has a different attack surface.
+2. For a model/completion endpoint, check whether rate limiting or per-token
+   cost controls exist (unbounded generation is a resource-exhaustion risk).
+3. For an embeddings/RAG endpoint, check whether the returned context passage
+   could carry attacker-controlled text back into a later prompt.
+4. Flag, don't assume: this agent's job is surface identification, not
+   independently re-deriving a specific jailbreak.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

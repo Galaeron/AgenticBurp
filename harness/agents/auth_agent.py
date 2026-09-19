@@ -4,6 +4,18 @@ from .base_agent import BaseAgent
 class AuthAgent(BaseAgent):
     name = "auth"
 
+    tactical_guide = """
+1. Separate AUTHENTICATION (who are you) from AUTHORIZATION (what can you
+   do) explicitly in your findings -- they are different bugs with different
+   fixes, and conflating them produces a useless suggested_test.
+2. Look at how the session/token is transported (cookie vs bearer vs custom
+   header) and whether it's the kind of thing the client-side could read.
+3. If this is a login/registration/password-reset flow, look for account
+   enumeration (different error text/timing for "user exists" vs not) and
+   missing lockout/backoff -- both need a MULTI-request differential to
+   confirm, which a single exchange cannot do; say so explicitly.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

@@ -23,6 +23,18 @@ class OAuthAgent(BaseAgent):
     """
     name = "oauth"
 
+    tactical_guide = """
+1. Identify which OAuth/OIDC step this exchange represents (authorization
+   request, redirect callback, token exchange) -- the vulnerable shape is
+   different at each step.
+2. On a callback/redirect, check whether `state` is present and looks
+   unpredictable, and whether `redirect_uri` appears to be validated by
+   exact match vs a loose prefix/substring check.
+3. On a token response, check whether the access token or id_token is
+   exposed somewhere it shouldn't be (URL query string, Referer-leaking
+   context) rather than only in a POST body/fragment.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

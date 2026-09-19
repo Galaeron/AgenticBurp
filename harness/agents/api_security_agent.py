@@ -16,6 +16,18 @@ class ApiSecurityAgent(BaseAgent):
     """
     name = "api_security"
 
+    tactical_guide = """
+1. Identify the API style (REST/GraphQL/RPC) and whether this endpoint
+   exposes an OpenAPI/GraphQL schema anywhere -- schema over-exposure itself
+   is worth flagging.
+2. Check for classic API misconfig: excessive data exposure (response fields
+   far beyond what the request needed), missing pagination/rate limiting on
+   a list endpoint, and mass-assignment-shaped request bodies (a write body
+   with far more fields than the response ever needed).
+3. Note whether versioning is visible (/v1/, /v2/) -- an old, still-live
+   version is a common place authz fixes never got backported.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """

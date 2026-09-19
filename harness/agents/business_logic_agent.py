@@ -4,6 +4,19 @@ from .base_agent import BaseAgent
 class BusinessLogicAgent(BaseAgent):
     name = "business_logic"
 
+    tactical_guide = """
+1. Ask what INVARIANT the application intends to hold here (price can't go
+   negative, a discount can't stack past 100%, a workflow step can't be
+   skipped) -- a business-logic bug is a broken invariant, not a technical
+   injection.
+2. Look for client-trusted values that should be server-derived: price,
+   quantity limits, discount codes, or state transitions sent as request
+   parameters rather than computed server-side.
+3. Multi-step flows (checkout, approval chains) are the highest-value target
+   -- note explicitly which step this exchange represents and what skipping
+   or reordering it might achieve.
+"""
+
     @property
     def specialty_prompt(self) -> str:
         return """
