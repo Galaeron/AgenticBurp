@@ -531,3 +531,14 @@ surface_prioritization:
 oracle:
   enabled: false
   n_required: 3
+
+# Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
+# off. When enabled, a CONFIRMED finding's host-agnostic structural shape
+# (method + normalized path template + sorted parameter NAMES -- never a
+# host, value, header, or evidence string) is appended to a JSONL log; a
+# later exchange on ANY host whose shape matches gets the corresponding
+# specialist added to its dispatch (additively -- it can only add an agent
+# worth trying, never remove or override a routing decision).
+pattern_memory:
+  enabled: false
+  # path: "harness/pattern_memory.jsonl"  # default; override to relocate the log
