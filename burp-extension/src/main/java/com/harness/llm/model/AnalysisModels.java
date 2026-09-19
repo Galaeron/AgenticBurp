@@ -41,6 +41,22 @@ public class AnalysisModels {
         public String review_verdict;      // nullable
         public String review_note;         // nullable
         public boolean confirmed;
+        // P1.9 (Astra oracle + T01/T06 case/proof identity) -- WRITE-ONLY /
+        // SELF-REVIEWED addition: this repo has no JDK to compile or test the
+        // Burp extension (see CLAUDE.md hazard #6), so these fields are added
+        // to keep the wire format in sync with harness/models.py's Finding but
+        // are UNBUILT/UNVERIFIED. Before this change, a Finding crossing into
+        // the Burp panel silently DROPPED all seven of these -- Gson leaves an
+        // unmapped Java field at its default (false/"" ) rather than erroring,
+        // so the panel always showed an unconfirmed, non-oracle-verified,
+        // case/proof-less finding regardless of what the harness actually sent.
+        public String case_id;             // nullable/"" -- T01 case identity
+        public String proof_id;            // nullable/"" -- T01 proof identity
+        public String confirmed_by_leg;    // nullable/"" -- the confirming validator's name
+        public boolean oracle_verified;    // oracle_framework.py's N-of-N + negative-control verdict
+        public String verification_state;  // "candidate" | "verified"
+        public String oracle_capsule_id;   // nullable/"" -- ProofCapsule.capsule_id()
+        public String oracle_reason;       // nullable/"" -- human-readable oracle verdict reason
     }
 
     public static class AgentReport {
