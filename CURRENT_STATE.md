@@ -1,5 +1,306 @@
 # Current state
 
+## 2026-09-19 (night) — implemented reviews/2026-09-19/IMPLEMENTATION_PLAN.md through P1.7 (22 commits, suite green)
+
+Worked `reviews/2026-09-19/IMPLEMENTATION_PLAN.md` top-to-bottom, autonomously,
+starting from the prior session's oracle-framework/off-scope-lock baseline (2067
+tests). 22 focused commits on `reconciliation-backlog`, full suite green after
+**every** commit (`python -m unittest discover -t . -s harness -p "test_*.py"`,
+final count **2201 OK**, ~370s each run). Every task added at least one negative
+control, per the plan's own #0-discipline requirement. Nothing pushed; nothing in
+`harness/config.yaml` flips a live toggle (all new flags default OFF/safe).
+
+**Known flake, not caused by this session:** `test_store.TestConnectConcurrentMigrationIsIdempotent
+.test_concurrent_first_connects_do_not_raise` intermittently raises
+`sqlite3.OperationalError: database is locked` under full-suite load on this
+Windows/WAL setup (passes reliably in isolation). Reproduced both before and
+during this session's edits, unrelated to any touched file — not chased further.
+
+**All P0 items done:**
+- **P0.1-WIRE** — `orchestrator_confirm.ConfirmMixin._oracle_gate` runs (or no-ops)
+  right where a finding is first confirmed, behind default-off `oracle.enabled`.
+- **P0.2-API** — found and fixed a REAL bug: `store.all_host_findings()` never
+  selected `oracle_verified`/`verification_state`/`oracle_capsule_id`, so
+  `report_generator`'s badge silently showed every finding as "candidate"
+  regardless of what was persisted. Fixed; the JSON/API path was already fine
+  (pydantic `model_dump()` has no exclusions).
+- **P0.3** — proved the OOB oracle reaches `verified` only on a real collaborator
+  callback (`test_oob_oracle.py`, real fixture + real in-process collaborator).
+- **P0.4** — `harness/score_provenance.py` (fresh/historical/invalid labels).
+- **P0.5** — `harness/evidence_audit.py` (verified/rejected/unverifiable; a missing
+  proof is `unverifiable`, never conflated with a demonstrated mismatch).
+- **P0.6** — `harness/coverage_summary.py` (executed vs inferred vs
+  not-a-clean-negative, every % names its denominator, `None` not fabricated
+  on 0/0).
+- **P0.7** — `harness/eval_health.py` (4 independent process/artifact/target/phase
+  flags; target health is never inferred from the exit code).
+- **P0.8** — `harness/test_credential_isolation.py` closes the one real gap
+  (combined cookie+Authorization cross-origin strip, mid-run cancel) on top of
+  T03's already-thorough `test_run_context.py` coverage.
+- **P0.9** — `coordinator.is_fallback_reason()` + `AnalysisResponse.coordinator_fallback`;
+  the WARN+metric already existed in `_record_fail_open`, the gap was the
+  structured per-exchange flag.
+- **P0.10** — `testing/nightly_precision.py` + a CPU-only `nightly-precision` CI
+  job: a tiny, fully-stubbed 4-exchange corpus proves the SCORING PLUMBING
+  (not model accuracy — that's still `scored`'s GPU job) stays wired, writes
+  `SCORECARD.md` (now gitignored, regenerable), independently gated so a missing
+  file fails the job regardless of the script's own exit code.
+
+**P1/P2 items done:**
+- **P1.1 + P2.2** — `harness/llm_provider.py` (+`openai_provider.py`/
+  `anthropic_provider.py`): coordinator/critique can opt into a remote model via
+  config `provider:` key, but ONLY with the matching `$OPENAI_API_KEY`/
+  `$ANTHROPIC_API_KEY` env var also set — missing either raises, never a silent
+  Ollama fallback. Redacted `provider_diagnostics()` wired into `GET /settings`.
+  `transport_inventory.py` updated (new httpx-client modules registered).
+- **P1.6** — `scored-status` CI job reports fresh/historical/not_run/failed for
+  the scored tier (a skipped GPU job can no longer read as "passed").
+- **P1.7** — `eval_repeat.EvalReport.compare()`: a cross-corpus (or unlabeled)
+  delta is never presented as a model-only effect.
+- **P1.8** — `issues.apply_merge_overrides` + `store.py`'s `issue_merges` table +
+  `POST/DELETE/GET /issues/{host}/merge[s]`: operator-declared root-cause merges,
+  reversible by construction (removing the override restores the automatic split).
+- **P1.9** — Python-side Finding JSON round-trip proven lossless
+  (`test_serialization_roundtrip.py`); Java `AnalysisModels.Finding` POJO was
+  missing all 7 oracle/case/proof fields (silently dropped by Gson) — added,
+  marked UNBUILT/self-review (no JDK here); a `burp-extension-build` CI job is
+  written but also unverified (no committed Gradle wrapper).
+- **P2.1** — `harness/mcp_adapter.py`: read-only MCP-resource-shaped adapter
+  (results/coverage/provenance), no execution method exists on the class at all,
+  bearer-token tenant isolation, pagination.
+- **P2.4** — `harness/sarif_adapter.py`: lossless SARIF 2.1.0 export/import;
+  an imported finding is UNCONDITIONALLY advisory (candidate) even when the
+  source SARIF claims a confirmed exploit.
+- **P2.5** — `harness/pattern_memory.py`: append-only, host-agnostic
+  (method+normalized-path+param-NAMES-only, never a value/host/evidence)
+  cross-host signature memory; wired additively into `analyze()`'s dispatch,
+  default off.
+- **P2.6** — `IterativeAgent._execute` skips (and logs) a request byte-identical
+  to one already sent this active-probe session.
+- **P1.12 — verified ALREADY DONE, no action.** `harness/agents/
+  http_request_smuggling_agent.py` and `web_cache_poisoning_agent.py` both
+  already exist, load via the plugin loader, and appear in every orchestrator's
+  36-agent roster — the source list's premise was stale.
+- **P1.10 — verified DONE** (`test_fix_verifier.py` still green, no changes needed).
+
+**Not done this session (deliberately, by size/priority):** P1.2 (RAG knowledge
+retrieval), P1.3 (multi-role active cross-identity probe), P1.4 (MITRE attack-tree
++ value-ordered search over the task graph), P1.5 (external benchmark corpora +
+LLM-as-judge), P1.11 (SAST/code-property-graph corroboration), P1.14 (per-agent
+tactical guides), P2.3 (pairs with P1.2, same reason), P2.8 (web3 agents — plan
+says "only after P0/P1", low priority), P3.1 (source-code ingestion — plan's own
+"large; last"). None of these were attempted or partially started; each remains
+exactly as scoped in `reviews/2026-09-19/IMPLEMENTATION_PLAN.md` §5-§7.
+
+**Honest frontier for the next session:** the highest-leverage remaining items are
+probably P1.3 (multi-role active probe — directly extends the already-built
+`missing_auth_probe.py`/`role_crawl.py`) and P1.4 (attack-tree — extends
+`task_graph.py`, no new external dependency). P1.2/P1.5 are both meaningfully
+larger (retrieval corpus + versioning; external benchmark integration) and
+deserve their own planning pass rather than being squeezed into a continuation.
+No live target/model run was performed this session — every new capability is
+hermetically tested only; live efficacy (does pattern_memory/the oracle/etc.
+actually move recall on VulnCorp) remains unmeasured, as it was before.
+
+## 2026-09-19 — precision oracle framework + off-scope host-lock (2 commits, suite green)
+
+Implemented the P0-precision core and the cheap safety win from the prioritised
+coding backlog. Two focused commits on `reconciliation-backlog`; full suite green
+after both (`python -m unittest discover -t . -s harness -p "test_*.py"` -> **2067
+OK**, ~370s). Nothing pushed. Pre-existing uncommitted Ollama edits + this file
+were NOT swept into either commit.
+
+- **Precision oracle framework (items #1/#2/#10).** New `oracle_framework.py`
+  (Oracle / OracleRegistry / ProofCapsule), `negative_controls.py` (per-class
+  benign-variant builders + the self-controlling OOB set), `fix_verifier.py`
+  (CLOSED/PARTIAL/NOT_FIXED/REGRESSED/INCONCLUSIVE). An oracle promotes a finding
+  from "a leg fired once" to `verification_state="verified"` only on **N-of-N
+  reproduction + a clean paired negative control**; self-controlling OOB legs
+  (unique-token callback) reach verified on reproduction alone. `Finding` gains
+  `oracle_verified`/`verification_state`/`oracle_capsule_id`/`oracle_reason`
+  (all in `AGENT_AUTHORITY_FIELDS` -- agents can't assert them); `store.py` adds
+  additive columns (legacy rows stay "candidate"); `report_generator.py` shows a
+  VERIFIED/CANDIDATE badge. fix-verifier's CLOSED requires a clean **executed**
+  negative -- skip/error/blocked -> INCONCLUSIVE (Q03/Q11). 43 hermetic tests.
+- **Off-scope host-lock audit (item #12 / Q06).** `test_offscope_host_lock.py`
+  enumerates every ACTIVE validator against an off-scope exchange with httpx AND
+  raw sockets patched to raise a non-swallowable BaseException on any send. It
+  **found 8 real gaps**: `sqlmap` (no scope check at all -- ran straight at
+  exchange.url), `crypto` + `websocket` (raw sockets, bypassed all httpx guards),
+  and `recon`/`http_request_smuggling`/`web_cache_poisoning`/`csp`/`header_injection`
+  (plain-httpx fallback with follow_redirects, unscoped when no run_context). All
+  fixed via the shared `scope_lock.py` helper. The SafetyGate gained an
+  OUT_OF_SCOPE tier (checked first) so every gated send is centrally scope-locked;
+  `server.allowed_hosts` is folded into the gate at the registry seed + RunContext.
+
+**NOT live-verified.** The oracle is a hermetic framework: it is NOT yet wired into
+the live `investigate_engagement`/`analyze()` confirmation path (that seam is the
+next step, and must land with an end-to-end smoke test + negative control per the
+#0 discipline, gated behind an `oracle.enabled` config flag default-off). No live
+VulnCorp run was performed. verification_state therefore defaults to "candidate"
+for every real finding until the live wiring + a measured run exist.
+
+**Large remaining backlog (three overlapping reviewer lists, NOT done this session):**
+original items #3/#4/#5/#6/#7/#8/#9/#11; evaluation-integrity Q01-Q05/Q07-Q10/Q12-Q15
+(run-manifest-bound scoring, proof-audit contract, auditable coverage denominators,
+completion-vs-health, provider egress, MCP, RAG citations, SARIF import); and the
+P-list (P0.1 coordinator fail-open metric, P0.2 CI precision tier, P0.3 basis UI
+filter, P1.1 provider abstraction = #4, P1.2 smuggling/cache agents, P1.3 multi-role
+active probe, P2.1 cross-host pattern memory, P2.2 MCP = #11, P2.3 active-probe
+idempotency guard). These are separate M-sized tracks; several need a live target
+or a JDK/GPU runner. Multi-provider (#4/P1.1) and MCP (#11/P2.2) are the highest-value
+self-contained follow-ups.
+
+## 2026-09-19 — comparative review and quality backlog (no implementation)
+
+Report: [PRIORITISED_REVIEW.md](reviews/2026-09-19/PRIORITISED_REVIEW.md).
+Reviewed local HEAD `a2e6831` plus explicitly identified concurrent WIP; product
+edits were left untouched. Compared the supplied 12 priorities with local source,
+the two named public repositories, and 20 additional peer/adjacent projects using
+primary documentation (not runtime efficacy verification). Backlog Q01–Q15 covers
+evaluation integrity, reporting, safety, and interoperability; no exploit-expansion
+implementation plan. Existing evaluation_integrity tooling should be reused.
+Verified **18 recall-scorer + 42 evaluation-integrity tests OK**. Inspected scored
+CI uses historical cache scoring without revision-bound efficacy provenance.
+The inspected integrated_full result contains 37 analyses and null investigate;
+it remains a partial artifact, not a new recall result or process-health finding.
+No target/model execution, full suite, configuration changes, or commits.
+
+## 2026-09-18 — test-suite rationalisation: real-pipeline gate + dead-test CI holes
+
+Acted on a source audit of the ~2,000-test suite (2,052 `def test_` across 141
+files — a source count, not executed). Verified the audit's claims against the
+code, then closed the two highest-value gaps. Three focused commits on
+`reconciliation-backlog` (`c4c3d49`, `c233869`, `0503e1a`), suite green at each.
+
+- **Real-pipeline gate (`c4c3d49`).** Every prior "real HTTP" slice SUPPLIES
+  discovery (test_smoke_investigate patches `build_engagement`; the auth slice
+  seeds the object endpoint), so none can catch discovery dropping a
+  route/method/body. New `testing_fixtures/discovery_pipeline.py` ADVERTISES its
+  surface via `/openapi.json`; new `test_pipeline_gate.py` runs REAL
+  api_surface_discovery → role_crawl → worklist → the shape-driven cross-identity
+  leg → a CONFIRMED IDOR, stubbing ONLY the model boundary (a silent Ollama; the
+  confirmation is the deterministic replay, not an LLM guess — this also stops
+  `review_captured_exchanges` from firing the real model at every discovered 2xx,
+  the minutes→~11s difference). Carries 3 defect-injection proofs (starve the
+  budget, force GET-only crawl, suppress the leg) that each turn the gate red.
+  `python -m unittest harness.test_pipeline_gate` → 6 OK, ~11s.
+- **Dead pytest tests + tripwire (`c233869`).** `test_plugin_system.py`,
+  `test_execution_protocol.py`, `test_hardening.py` use module-level
+  pytest functions/fixtures → `unittest discover` collects ZERO from them, so
+  ~48 tests (incl. security test `test_prompt_injection_is_data`) ran in NO tier.
+  One (`test_load_builtin_agent_class`) was actually FAILING on a stale pre-W-18
+  `agents.sqli_agent` path — hidden because nothing ran it. Fixed the path;
+  added `test_no_orphan_test_files.py` (tripwire: every `test_*.py` is
+  unittest-collectable or in a pytest-native allowlist CI runs via pytest).
+- **CI ran from the wrong cwd (`0503e1a`).** Steps used `working-directory:
+  harness` + `python -m unittest`/`coverage_manifest.py`, but since W-18 imports
+  are `harness.*` and need the repo root — the exact nightly command errors on
+  141/146 modules locally, and requirements.lock does not install the package, so
+  the unittest steps were **not actually running the tests**. Moved every harness
+  step to the repo root (`harness.<mod>`, `discover -t . -s harness`,
+  `-m harness.coverage_manifest`); testing/ steps untouched. Wired the gate (fast
+  tier) and the pytest-native trio (both tiers) in.
+
+Not done / owed: the ~2,000 tests were NOT pruned (that was the deferred half of
+the plan — do the pruning by demonstrated redundancy only after this gate is
+trusted). Nothing pushed. Whether the live CI runner somehow installed the
+package (masking the cwd bug) is unconfirmed — the fix is correct either way.
+
+## 2026-09-18 — integration and comparable rerun in flight
+
+On `reconciliation-backlog`, `a2bbf87` integrates the sharp-dijkstra
+discovery/role-crawl changes with separate late-phase probe reserves,
+read-only OPTIONS method mining, multiple operations per path, and a gated
+transport for inferred writes. `eb70210` backfills confirming validator
+evidence on empty shape-precondition findings. The sharp worktree remains
+untouched; its ffuf fix was already on this branch. The isolated runtime
+checkout is `.worktrees/integration-measure` at `eb70210`, excluding the
+pre-existing uncommitted Ollama JSON-repair changes in the main checkout.
+Focused discovery/crawl/confirmation tests: 137 passed. Final full suite:
+`2006 tests`, `OK (skipped=2)` using `.review-deps` plus an isolated compatible
+`typing_extensions` in `.test-deps`; log:
+`harness/run-output/integration_full_suite_final_20260918.log`.
+
+The stateless VulnCorp target was restarted once on :5002. A fresh combined
+37-capture PASS1 plus full graph PASS2 run started 2026-09-18 17:35 local
+using `testing/vulncorp-helpdesk/maxrun/run_maxcov_integrated.py`. It writes
+unique `integrated_full` state/cache/results/log artifacts under `maxrun`.
+The driver preserves the historical scorer and adds a stricter proof-linked
+audit against persisted case/validator records. **No recall result yet.**
+After completion: inspect both scores and errors, update this section, then
+fast-forward local `main` from `reconciliation-backlog` as requested. Do not
+commit the untracked runtime artifacts or the unrelated Ollama edits.
+
+## 2026-09-18 — branch/worktree audit (read-only)
+
+`claude/sharp-dijkstra-9a8830` and `main` both point to `3603b1f`.
+`reconciliation-backlog` is its descendant, 12 commits ahead at `0859ca2`.
+The sharp-dijkstra worktree has uncommitted discovery/method-propagation,
+request-synthesis, and evidence-backfill changes plus tests; its staged ffuf
+decode change is already present on `reconciliation-backlog`. Its saved
+`postfix_smoke` ran only 3 curated analyses and a small graph budget
+(`max_nodes=2`, 600 discovery probes), scoring 3 intended-leg earned items;
+it is not comparable to the Step 5b full graph run. No saved `postfix_full`
+result or commit of the sharp-dijkstra worktree changes was found. The
+evidence-backfill file changed after the smoke artifact was written, so that
+artifact does not verify the entire current worktree. No merges or tests were
+performed during this audit.
+
+## 2026-09-18 — source/artifact audit of Step 5b (no live rerun)
+
+At HEAD `0859ca2`, inspected `step5b_job_result.json`, `recall_final_step5.json`,
+the saved target/harness logs, the 37 curated capture metadata, and the relevant
+discovery, graph, validator, coverage, and scorer source. Did not read the target's
+`app.py` or any `*ANSWER_KEY*` file. No product code/config changed. The scorer's
+18 unit tests passed; four other focused test modules could not import because
+the bundled Python lacks `httpx` in this session. No full suite or target run.
+
+Verified: the clean job was `2dc2a3f1ff08`, ran 4.95 h, and scored 5/13 earned,
+6/13 confirmed, 7 missed. The score artifact's `job_id` is erroneously hardcoded
+to the earlier `b4b5d11ec068` in `score_step5b.py`. The matrix reports
+336/1,846 applicable coverage cells attempted; 1,510 were skipped. Those 336
+include statuses inferred from findings, not independently audited requests.
+`degraded=false` and zero
+safety blocks do not establish coverage or target health. The target log contains
+78,374 GET 500 responses, mostly to guessed paths; their specific cause was not
+determined. The 24,735 run-context request count omits traffic visible in the
+target log (84,894 HTTP requests), so it is not an all-traffic count.
+
+Newly verified root cause: `SurfaceDiscovery.discover()` puts bare/id wordlists
+and nested wordlists before response, subresource, query, and method mining.
+Defaults yield up to 4,134 bare/id candidates plus 22,260 nested candidates
+against 6,000 Python probes per role; the log shows all four role sweeps used
+exactly 6,000 probes. Later phases therefore have no budget in this configuration
+unless an implausibly large number of candidates are skipped as already seen.
+`role_crawl.crawl_roles()` then discards discovered route methods and probes only
+GET. Thus the result retained empty GET templates for `/api/login`,
+`/api/register`, `/api/tickets/import`, `/api/account/profile`, and
+`/api/tickets/search`; no parameter `q` was captured for search. The 37 curated
+baseline exchanges do contain POST login/register/import, PUT profile, GET
+search with `q`, and GET comments with concrete IDs. The graph path did invoke
+`analyze()` on 14 discovery and 92 feature captures, but those captures lacked
+the decisive request shapes. PASS1 on the curated exchanges was still omitted.
+
+The last score's missed GT01/02/03/06/09/10/13 map to missing input/method/route
+preconditions, not a demonstrated model regression. The s19_full combined pass
+reported GT01/02/03 confirmed with UNKNOWN leg provenance (not earned),
+GT06 and GT09/10 detected-unconfirmed, and GT13 missed. Re-running curated
+PASS1 alone is therefore not a verified fix for all seven, nor proof that the
+intended SQLi/XXE legs work on those three cases.
+Coverage mislabels unknown operations as `not_applicable`: e.g. GET
+`/api/tickets/import` makes XXE N/A, GET `/api/account/profile` makes mass
+assignment N/A, and parameterless GET `/api/tickets/search` makes SQLi N/A.
+The 13-item benchmark is a limited lower bound, not full-app recall; the scorer
+trusts `confirmed` plus a leg label without requiring a persisted case-bound proof.
+
+Highest-priority next work: budget/reserve every discovery phase and preserve
+methods/query/body templates; ingest real captured traffic or an available spec
+before claiming a method's checks N/A; run positive and patched negative controls
+for all seven misses; then rerun the exact combined 37-exchange + graph methodology
+with a fresh cache and proof-linked scoring. Measure request counts by phase,
+per-check attempted/skipped/unknown, distinct confirmed cases, and false positives.
+
 ## 2026-09-17 — ◄► CLEAN STEP 5 RE-RUN (job 2dc2a3f1ff08) — 5/13 EARNED ◄►
 
 Re-ran the Step 5 measurement after fixing the bug the first run (job
