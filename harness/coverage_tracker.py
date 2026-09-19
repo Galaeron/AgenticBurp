@@ -238,7 +238,7 @@ class CoverageTracker:
                     reason=ev.get("reason") or f"{conf or cid} leg executed",
                     confidence=ev.get("confidence"),
                     validator=conf or (CHECKS_BY_ID.get(cid).confirmation if cid in CHECKS_BY_ID else None),
-                    evidence=(ev.get("evidence") or "")[:200] or None)
+                    evidence=(ev.get("evidence") or "")[:200] or None, executed=True)
                 n += 1
         return n
 
@@ -289,7 +289,7 @@ class CoverageTracker:
                 reason=(getattr(res, "summary", "") or f"{check.confirmation} leg driven off the matrix")[:180],
                 confidence=getattr(res, "confidence", None),
                 validator=getattr(res, "validator", None) or check.confirmation,
-                evidence=(getattr(res, "evidence", "") or "")[:200])
+                evidence=(getattr(res, "evidence", "") or "")[:200], executed=True)
         return n
 
     def expand_parameter_cases(self, endpoints: dict[str, dict], *,
@@ -383,18 +383,23 @@ class CoverageTracker:
                 res = await run_case(ident, method, path, check, rep)
             except Exception as e:  # a leg blowing up is recorded, never swallowed
                 log.debug("drive_coverage_cases: %s on %s failed: %s", check.confirmation, ep_key, e)
+                # An attempt was actually dispatched (run_case was invoked and
+                # failed mid-flight) -- executed=True distinguishes this from
+                # the "no send at all" branch below (R07).
                 self.matrix.record_case(
                     ident, ep_key, check_id, rep, status=CellStatus.ERROR,
                     reason=f"{check.confirmation} attempt errored: {type(e).__name__}: {e}"[:180],
-                    validator=check.confirmation)
+                    validator=check.confirmation, executed=True)
                 _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep,
                                             f"{check.confirmation} attempt errored at request level")
                 continue
             if res is None:
+                # No request was ever sent (declined/unsupported) -- NOT an
+                # execution, however loudly the validator name is attached.
                 self.matrix.record_case(
                     ident, ep_key, check_id, rep, status=CellStatus.INCONCLUSIVE,
                     reason=f"{check.confirmation} produced no send (declined/unsupported)",
-                    validator=check.confirmation)
+                    validator=check.confirmation, executed=False)
                 _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
                 continue
             status = _STATUS.get(getattr(res, "status", ""), CellStatus.INCONCLUSIVE)
@@ -403,7 +408,7 @@ class CoverageTracker:
                 reason=(getattr(res, "summary", "") or f"{check.confirmation} driven at request level")[:180],
                 confidence=getattr(res, "confidence", None),
                 validator=getattr(res, "validator", None) or check.confirmation,
-                evidence=(getattr(res, "evidence", "") or "")[:200])
+                evidence=(getattr(res, "evidence", "") or "")[:200], executed=True)
             _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
         return attempts
 
@@ -442,6 +447,12 @@ class CoverageTracker:
         # T05: the case-granular "not tested + why" (pending/budget-skipped/blocked
         # child cases). Empty when no case layer was populated -- fully additive.
         s["cases_not_tested"] = self.matrix.cases_not_tested()
+        # R01/R07: the auditable executed-vs-inferred breakdown, additive
+        # alongside the matrix's own (coarser) summary -- coverage_summary.py's
+        # real production consumer, reached by every live investigate_engagement
+        # run through build_coverage/build_coverage_driven/build_coverage_cases_driven.
+        from harness.coverage_summary import summarize_coverage
+        s["audited"] = summarize_coverage(self.matrix)
         return s
 
 

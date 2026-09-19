@@ -78,13 +78,25 @@ _OPEN_STATUSES = frozenset({
 
 @dataclass
 class CellResult:
-    """One cell in the coverage matrix: (identity, endpoint, check)."""
+    """One cell in the coverage matrix: (identity, endpoint, check).
+
+    `validator` names the leg/check ASSOCIATED with this result -- it is
+    populated both when a leg actually ran AND when an agent's finding was
+    merely attributed to a check's catalog confirmation name with no request
+    ever sent (R07). `executed` is the separate, narrower signal: True only
+    when a deterministic leg actually dispatched a request/comparison for
+    this cell (`record_execution_events`, `drive_coverage_legs`,
+    `drive_coverage_cases`); False for a purely agent-attributed result
+    (`record_findings_from_state`). A validator NAME is provenance, not
+    execution evidence -- callers that need "did this actually run" must
+    read `executed`, never infer it from `validator` being truthy."""
     status: CellStatus = CellStatus.PENDING
     reason: str = ""
     severity: str | None = None
     confidence: float | None = None
     validator: str | None = None
     evidence: str | None = None
+    executed: bool = False
 
     def to_dict(self) -> dict:
         d: dict = {"status": self.status.value, "reason": self.reason}
@@ -96,6 +108,8 @@ class CellResult:
             d["validator"] = self.validator
         if self.evidence:
             d["evidence"] = self.evidence
+        if self.executed:
+            d["executed"] = self.executed
         return d
 
     @classmethod
@@ -111,6 +125,7 @@ class CellResult:
             confidence=d.get("confidence"),
             validator=d.get("validator"),
             evidence=d.get("evidence"),
+            executed=bool(d.get("executed", False)),
         )
 
 
@@ -704,14 +719,19 @@ class CoverageMatrix:
     def record(self, identity: str, endpoint_key: str, check_id: str, *,
                status: CellStatus, reason: str = "", severity: str | None = None,
                confidence: float | None = None, validator: str | None = None,
-               evidence: str | None = None) -> CellResult:
-        """Record a check result. Does NOT overwrite a CONFIRMED cell."""
+               evidence: str | None = None, executed: bool = False) -> CellResult:
+        """Record a check result. Does NOT overwrite a CONFIRMED cell.
+
+        `executed` (R07) must be True only when a deterministic leg actually
+        dispatched a request/comparison for this cell -- callers recording a
+        purely agent-attributed result (no leg ran) must leave it False."""
         key = (identity, endpoint_key, check_id)
         existing = self._cells.get(key)
         if existing and existing.status == CellStatus.CONFIRMED:
             return existing
         result = CellResult(status=status, reason=reason, severity=severity,
-                            confidence=confidence, validator=validator, evidence=evidence)
+                            confidence=confidence, validator=validator, evidence=evidence,
+                            executed=executed)
         self._cells[key] = result
         return result
 
@@ -754,7 +774,8 @@ class CoverageMatrix:
     def record_case(self, identity: str, endpoint_key: str, check_id: str,
                     case_key: CaseKey, *, status: CellStatus, reason: str = "",
                     severity: str | None = None, confidence: float | None = None,
-                    validator: str | None = None, evidence: str | None = None) -> CellResult:
+                    validator: str | None = None, evidence: str | None = None,
+                    executed: bool = False) -> CellResult:
         """Record the outcome of ONE concrete case, then re-aggregate its parent
         cell. A CONFIRMED case is never overwritten (same monotonicity as `record`).
         Registers the case if `expand_cases` had not already."""
@@ -766,7 +787,8 @@ class CoverageMatrix:
             self._aggregate_cell(key)
             return existing[1]
         result = CellResult(status=status, reason=reason, severity=severity,
-                            confidence=confidence, validator=validator, evidence=evidence)
+                            confidence=confidence, validator=validator, evidence=evidence,
+                            executed=executed)
         # Preserve the original replay spelling if the caller passed a bare key.
         stored_key = existing[0] if existing else case_key
         bucket[cid] = (stored_key, result)
@@ -837,7 +859,23 @@ class CoverageMatrix:
         # Never downgrade a locked CONFIRMED cell.
         if prior and prior.status == CellStatus.CONFIRMED and agg != CellStatus.CONFIRMED:
             return
-        self._cells[key] = CellResult(status=agg, reason=reason)
+        # R07: carry the representative child's executed/validator signal into
+        # the rolled-up parent cell, so a matrix reader iterating top-level
+        # cells (coverage_summary.py) sees whether the aggregate verdict
+        # actually came from an executed leg -- never defaulting to
+        # executed=False just because the parent cell itself never called
+        # `record()` directly.
+        rep_executed = False
+        rep_validator: str | None = None
+        for _ck, r in bucket.values():
+            if r.status == agg:
+                rep_executed = rep_executed or bool(r.executed)
+                rep_validator = rep_validator or r.validator
+        if prior and prior.status == agg:
+            rep_executed = rep_executed or bool(prior.executed)
+            rep_validator = rep_validator or prior.validator
+        self._cells[key] = CellResult(status=agg, reason=reason, validator=rep_validator,
+                                      executed=rep_executed)
 
     # --- queries ---
 

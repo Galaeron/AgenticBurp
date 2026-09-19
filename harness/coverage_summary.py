@@ -1,16 +1,28 @@
-"""Auditable coverage summary (P0.6, evaluation integrity).
+"""Auditable coverage summary (P0.6/R07, evaluation integrity).
 
 `CoverageMatrix.summary()` already gives honest per-status counts (I2/R02:
 skipped/pending/not_applicable never inflate "tested"). What it does NOT do
-is separate an EXECUTED verdict (a deterministic leg actually ran --
-`CellResult.validator` is set) from an INFERRED one (a conclusive status
-set from an agent's finding with no leg behind it -- the exact ambiguity
-CURRENT_STATE.md flagged: "336 include statuses inferred from findings, not
-independently audited requests"), or say a percentage's denominator out
-loud. This module adds that: every reported percentage NAMES its numerator
-and denominator and is None rather than a fabricated number when the
-denominator is zero (a 0/0 "100% covered" is exactly the kind of number that
-made an untested surface look tested before).
+is separate an EXECUTED verdict (a deterministic leg actually dispatched a
+request/comparison for this cell -- `CellResult.executed`) from an INFERRED
+one (a conclusive status set from an agent's finding with no leg behind it --
+the exact ambiguity CURRENT_STATE.md flagged: "336 include statuses inferred
+from findings, not independently audited requests"), or say a percentage's
+denominator out loud. This module adds that: every reported percentage NAMES
+its numerator and denominator and is None rather than a fabricated number
+when the denominator is zero (a 0/0 "100% covered" is exactly the kind of
+number that made an untested surface look tested before).
+
+R07 correction: `CellResult.validator` is populated BOTH when a leg actually
+ran AND when an agent's finding was merely attributed to a check's catalog
+confirmation name with no request ever sent -- a validator NAME is
+provenance, not execution evidence. This module reads the dedicated
+`CellResult.executed` flag instead of treating a nonempty `validator` as
+proof of execution. It also no longer excludes an executed-but-inconclusive
+attempt (a leg that actually ran but errored/produced no send) from the
+"executed" count -- `not_a_clean_negative` now separately reports how many
+of its members were real attempts, so the label is not misleading in either
+direction (an unexecuted validator NAME inflating "executed", or a real
+executed-but-inconclusive attempt being invisible to it).
 
 Pure and hermetic: reads an existing CoverageMatrix, no I/O.
 """
@@ -49,10 +61,22 @@ def summarize_coverage(matrix: CoverageMatrix) -> dict:
     Returns:
       {
         "total_cells": int, "not_applicable": int, "applicable": int,
-        "executed": {numerator, denominator, kind, pct},   # leg actually ran
-        "inferred": {numerator, denominator, kind, pct},   # agent-asserted, no leg
+        "executed": {numerator, denominator, kind, pct},
+            # applicable cells where a leg ACTUALLY DISPATCHED
+            # (CellResult.executed=True), of ANY status -- a conclusive
+            # confirm/negative, or an executed-but-inconclusive/errored
+            # attempt, both count: this answers "did a leg run here",
+            # not "did it find something clean".
+        "inferred": {numerator, denominator, kind, pct},
+            # applicable, CONCLUSIVE-status cells with NO leg execution --
+            # agent-only attribution, never counted as executed regardless
+            # of whether a validator NAME happens to be attached.
         "not_a_clean_negative": {"skipped": n, "error": n, "inconclusive": n,
-                                  "blocked": n, "total": n},
+                                  "blocked": n, "total": n,
+                                  "executed_attempts": n},
+            # executed_attempts: of the members above, how many were a REAL
+            # dispatched attempt (e.g. a leg that errored mid-flight) rather
+            # than never attempted at all (e.g. a plain reachability skip).
       }
 
     `executed`/`inferred` are both denominated over `applicable` (total minus
@@ -64,27 +88,33 @@ def summarize_coverage(matrix: CoverageMatrix) -> dict:
     executed_n = 0
     inferred_n = 0
     not_a_clean_negative = {"skipped": 0, "error": 0, "inconclusive": 0, "blocked": 0}
+    not_a_clean_negative_executed = 0
 
     for result in matrix.cells().values():
         status = result.status
         if status == CellStatus.NOT_APPLICABLE:
             not_applicable += 1
             continue
+        if result.executed:
+            executed_n += 1
         if status in _CONCLUSIVE:
-            if result.validator:
-                executed_n += 1
-            else:
+            if not result.executed:
                 inferred_n += 1
         elif status in _NOT_A_CLEAN_NEGATIVE:
             not_a_clean_negative[status.value] += 1
-        # PENDING/RUNNING: neither executed, inferred, nor a clean-negative
-        # candidate -- simply not yet resolved. Counted in total/applicable only.
+            if result.executed:
+                not_a_clean_negative_executed += 1
+        # PENDING/RUNNING: not conclusive and not a not-a-clean-negative
+        # bucket member -- simply not yet resolved. Counted in
+        # total/applicable (and in `executed` if somehow already marked
+        # executed) only.
 
     total = len(matrix.cells())
     applicable = total - not_applicable
     kind = KIND_UNKNOWN if applicable <= 0 else None
 
     not_a_clean_negative["total"] = sum(not_a_clean_negative.values())
+    not_a_clean_negative["executed_attempts"] = not_a_clean_negative_executed
 
     return {
         "total_cells": total,

@@ -1,5 +1,5 @@
-"""Hermetic tests for coverage_summary.py (P0.6). Builds CoverageMatrix cells
-directly -- no discovery/crawl/live target involved."""
+"""Hermetic tests for coverage_summary.py (P0.6/R07). Builds CoverageMatrix
+cells directly -- no discovery/crawl/live target involved."""
 from __future__ import annotations
 
 import unittest
@@ -18,12 +18,12 @@ def _matrix(cells: list[tuple[str, str, str, CellResult]]) -> CoverageMatrix:
 class TestSummarizeCoverageMixedMatrix(unittest.TestCase):
     def setUp(self):
         self.matrix = _matrix([
-            # Executed conclusive: validator set.
+            # Executed conclusive: a leg actually dispatched (executed=True).
             ("alice", "GET /a", "sqli",
-             CellResult(status=CellStatus.CONFIRMED, validator="sqlmap")),
+             CellResult(status=CellStatus.CONFIRMED, validator="sqlmap", executed=True)),
             ("alice", "GET /b", "idor",
-             CellResult(status=CellStatus.NOT_DETECTED, validator="cross_identity")),
-            # Inferred conclusive: no validator -- an agent asserted it.
+             CellResult(status=CellStatus.NOT_DETECTED, validator="cross_identity", executed=True)),
+            # Inferred conclusive: no leg execution -- an agent asserted it.
             ("alice", "GET /c", "xss",
              CellResult(status=CellStatus.DETECTED)),
             # Not-a-clean-negative bucket.
@@ -59,7 +59,8 @@ class TestSummarizeCoverageMixedMatrix(unittest.TestCase):
         self.assertEqual(neg["inconclusive"], 1)
         self.assertEqual(neg["blocked"], 1)
         self.assertEqual(neg["total"], 4)
-        # None of these leaked into the conclusive executed/inferred counts.
+        # None of these (none were executed here) leaked into the conclusive
+        # executed/inferred counts.
         self.assertEqual(s["executed"]["numerator"] + s["inferred"]["numerator"], 3)
 
     def test_percentages_computed_over_named_denominator(self):
@@ -91,6 +92,50 @@ class TestSummarizeCoverageAllUnknown(unittest.TestCase):
         self.assertEqual(s["total_cells"], 0)
         self.assertIsNone(s["executed"]["pct"])
         self.assertIsNone(s["inferred"]["pct"])
+
+
+class TestValidatorNameIsNotExecutionEvidence(unittest.TestCase):
+    """R07 reproduction: a validator NAME attached to a cell is provenance,
+    not proof of a dispatched request. A CONFIRMED cell with only a
+    `validator` string and no `executed` flag must count as inferred, never
+    executed."""
+
+    def test_reviewer_repro_validator_name_alone_is_not_executed(self):
+        matrix = _matrix([
+            ("alice", "GET /a", "sqli",
+             CellResult(status=CellStatus.CONFIRMED, validator="sqlmap")),  # no executed=True
+        ])
+        s = summarize_coverage(matrix)
+        self.assertEqual(s["executed"]["numerator"], 0)
+        self.assertNotEqual(s["executed"]["pct"], 100.0)
+        self.assertEqual(s["inferred"]["numerator"], 1)
+
+    def test_executed_flag_true_is_required_to_count_as_executed(self):
+        matrix = _matrix([
+            ("alice", "GET /a", "sqli",
+             CellResult(status=CellStatus.CONFIRMED, validator="sqlmap", executed=True)),
+        ])
+        s = summarize_coverage(matrix)
+        self.assertEqual(s["executed"]["numerator"], 1)
+        self.assertEqual(s["executed"]["pct"], 100.0)
+        self.assertEqual(s["inferred"]["numerator"], 0)
+
+    def test_executed_but_inconclusive_attempt_is_visible_as_a_real_attempt(self):
+        """R07: an executed-but-inconclusive/errored leg must not be invisible
+        to the executed metric just because it landed in the
+        not-a-clean-negative bucket -- it was a real attempt."""
+        matrix = _matrix([
+            ("alice", "GET /a", "ssrf",
+             CellResult(status=CellStatus.ERROR, validator="ssrf", executed=True)),
+            ("alice", "GET /b", "xxe",
+             CellResult(status=CellStatus.SKIPPED)),  # never attempted at all
+        ])
+        s = summarize_coverage(matrix)
+        self.assertEqual(s["executed"]["numerator"], 1)  # the errored attempt counts
+        neg = s["not_a_clean_negative"]
+        self.assertEqual(neg["error"], 1)
+        self.assertEqual(neg["skipped"], 1)
+        self.assertEqual(neg["executed_attempts"], 1)  # only the errored one was a real attempt
 
 
 if __name__ == "__main__":

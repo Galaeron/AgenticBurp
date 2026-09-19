@@ -84,6 +84,26 @@ class BuildTests(unittest.TestCase):
         cell = t.matrix.get("user", "GET /api/admin/users", "WSTG-ATHZ-02")
         self.assertEqual(cell.status, CellStatus.DETECTED)
 
+    def test_reviewer_repro_report_audited_distinguishes_executed_from_attributed(self):
+        """R01/R07: CoverageTracker.report()["audited"] is coverage_summary.py's
+        real production consumer -- an agent-attributed CONFIRMED (no leg ran)
+        counts as inferred there, while a real recorded leg execution counts
+        as executed, even though both show CONFIRMED in the coarser top-level
+        matrix summary."""
+        st = _state_with([
+            ("GET", "/api/tickets/{id}", {
+                "reachable_roles": ["user"],
+                "findings": [{"vulnerability_class": "idor", "confirmed": True,
+                              "severity": "high", "confidence": 0.9}]}),
+        ])
+        t = CoverageTracker()
+        eps = endpoint_view(st)
+        t.build(eps, ["user"])
+        t.record_findings_from_state(eps, ["user"])
+        audited = t.report()["audited"]
+        self.assertGreaterEqual(audited["inferred"]["numerator"], 1)
+        self.assertEqual(audited["executed"]["numerator"], 0)
+
     def test_execution_event_marks_not_detected(self):
         """A REAL recorded leg execution with a not_detected outcome marks the
         cell not_detected (R01: only actual executions, never inference)."""
