@@ -80,6 +80,27 @@ def _require_env(var_name: str, provider_name: str) -> str:
     return key
 
 
+_API_KEY_ENV_VAR = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+
+
+def provider_diagnostics(role_config: dict) -> dict:
+    """Redacted, safe-to-expose diagnostics for one role's provider config
+    (P2.2) -- for a `/settings`-style operator surface. NEVER includes an
+    API key value, only whether the env var it would read is present. Pure:
+    reads `role_config` and `os.environ` presence only, makes no network call,
+    and never raises (unlike build_provider, this must be safe to call just
+    to render a status panel even when a key is missing or misconfigured)."""
+    provider_name = str((role_config or {}).get("provider", "ollama") or "ollama").lower()
+    env_var = _API_KEY_ENV_VAR.get(provider_name, "")
+    return {
+        "provider": provider_name,
+        "model": (role_config or {}).get("model", ""),
+        "remote": provider_name != "ollama",
+        "api_key_env_var": env_var,
+        "api_key_present": bool(env_var and os.environ.get(env_var)),
+    }
+
+
 def build_provider(role_config: dict, *, ollama_client: OllamaClient) -> Provider:
     """Build the Provider for one role (coordinator or critique) from its own
     config block, e.g. `config.get("coordinator", {})`.

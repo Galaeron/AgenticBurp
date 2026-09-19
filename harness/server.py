@@ -640,6 +640,7 @@ async def get_settings(authorization: str | None = Header(default=None)):
     a request may have changed since startup."""
     _require_auth(authorization)
     from harness import global_throttle
+    from harness import llm_provider as _llm_provider
     p = orchestrator.retry_budget_policy
     return {
         "throttle": global_throttle.throttle.stats(),
@@ -654,6 +655,16 @@ async def get_settings(authorization: str | None = Header(default=None)):
         # Cloud-coordinator reasoning seam (Phase 4): whether the iterative agent
         # + critique run on the cloud model (sends real content off-host).
         "coordinator": orchestrator.cloud_reasoning_state(),
+        # P2.2: redacted per-role provider diagnostics -- provider name, model,
+        # whether a remote provider is configured, and whether its API-key env
+        # var is PRESENT (never its value). Lets an operator confirm which
+        # provider is actually active without exposing a secret.
+        "llm_providers": {
+            "coordinator": _llm_provider.provider_diagnostics(
+                orchestrator.config.get("coordinator", {}) or {}),
+            "critique": _llm_provider.provider_diagnostics(
+                orchestrator.config.get("critique", {}) or {}),
+        },
     }
 
 
