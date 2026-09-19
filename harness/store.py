@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sqlite3
 import time
+import random
 import hashlib
 import json
 from pathlib import Path
@@ -226,8 +227,38 @@ CREATE TABLE IF NOT EXISTS issue_merges (
 """
 
 
+# Concurrent first callers on a fresh on-disk DB race on schema setup: switching
+# to WAL and the check-then-act migrations below all take a write lock, and SQLite
+# returns SQLITE_BUSY *immediately* -- bypassing busy_timeout -- when a connection
+# holding a read lock from a PRAGMA table_info() must upgrade to write while a peer
+# already holds one (its deadlock-avoidance path). So busy_timeout alone does not
+# save the losers; they fail fast with "database is locked" and, unclosed, go on to
+# lock the DB file (a Windows teardown error in the test). The whole setup is
+# idempotent (CREATE IF NOT EXISTS, guarded ALTERs, DROP/CREATE INDEX IF EXISTS,
+# user_version guard), so on a lock error we close and retry: once any caller wins,
+# the losers reopen an already-migrated DB and sail through.
+_CONNECT_MAX_ATTEMPTS = 12
+_CONNECT_RETRY_BASE_SLEEP = 0.02
+
+
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH, timeout=10.0)
+    last_exc: sqlite3.OperationalError | None = None
+    for attempt in range(_CONNECT_MAX_ATTEMPTS):
+        conn = sqlite3.connect(_DB_PATH, timeout=10.0)
+        try:
+            _initialise_connection(conn)
+            return conn
+        except sqlite3.OperationalError as exc:
+            conn.close()
+            if "locked" not in str(exc).lower():
+                raise
+            last_exc = exc
+            time.sleep(_CONNECT_RETRY_BASE_SLEEP * (attempt + 1) + random.random() * 0.01)
+    assert last_exc is not None  # loop only exits early via return/raise
+    raise last_exc
+
+
+def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
     conn.executescript(_SCHEMA)
@@ -384,7 +415,6 @@ def _connect() -> sqlite3.Connection:
     if "engagement_id" not in knowledge_cols:
         conn.execute("ALTER TABLE knowledge_notes ADD COLUMN engagement_id TEXT NOT NULL DEFAULT ''")
     conn.commit()
-    return conn
 
 
 def host_of(url: str) -> str:
