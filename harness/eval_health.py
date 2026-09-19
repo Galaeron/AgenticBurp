@@ -17,15 +17,38 @@ health probe, phase ledger) -- no I/O, no live run.
 """
 from __future__ import annotations
 
+_UNSET = object()
+
+
+def _completeness(job: dict, expected_key: str, present_key: str, label: str) -> tuple[bool, str | None]:
+    """True (no reason) only when the caller EXPLICITLY declared its expected
+    set -- even an explicit empty list counts as a real "nothing expected"
+    declaration -- and every expected member is present. A MISSING
+    expected_key reads as "unknown expectations", never "assumed fine": the
+    absence of a declared expectation is not evidence the phase/artifact list
+    was legitimately empty."""
+    expected_raw = job.get(expected_key, _UNSET)
+    if expected_raw is _UNSET:
+        return False, f"no {label} expectations declared ({expected_key!r} key missing)"
+    expected = set(expected_raw or [])
+    present = set(job.get(present_key, []) or [])
+    missing = sorted(expected - present)
+    if missing:
+        return False, f"missing {label}: {missing}"
+    return True, None
+
 
 def evaluate_health(job: dict) -> dict:
     """Evaluate one run's health from a plain summary dict.
 
-    Expected `job` keys (all optional; a missing key reads as the unhealthy
-    default, never as "assumed fine"):
+    Expected `job` keys (all optional; a MISSING key reads as the unhealthy
+    default, never as "assumed fine" -- an explicit empty list/False is a
+    real declaration and is honoured):
       - "exit_code": int | None -- the harness process's own exit code.
       - "expected_artifacts": list[str], "present_artifacts": list[str].
-      - "target_healthy": bool, "target_health_reason": str.
+      - "target_healthy": bool (must be an actual bool; a truthy non-bool
+        value such as the string "false" is never read as healthy),
+        "target_health_reason": str.
       - "expected_phases": list[str], "completed_phases": list[str].
 
     Returns {"process_complete", "artifacts_complete", "target_healthy",
@@ -40,24 +63,30 @@ def evaluate_health(job: dict) -> dict:
     if not process_complete:
         reasons.append(f"process did not complete cleanly (exit_code={job.get('exit_code')!r})")
 
-    expected_artifacts = set(job.get("expected_artifacts", []) or [])
-    present_artifacts = set(job.get("present_artifacts", []) or [])
-    missing_artifacts = sorted(expected_artifacts - present_artifacts)
-    artifacts_complete = not missing_artifacts
-    if not artifacts_complete:
-        reasons.append(f"missing artifact(s): {missing_artifacts}")
+    artifacts_complete, artifact_reason = _completeness(
+        job, "expected_artifacts", "present_artifacts", "artifact(s)")
+    if artifact_reason:
+        reasons.append(artifact_reason)
 
-    target_healthy = bool(job.get("target_healthy", False))
-    if not target_healthy:
+    target_healthy_raw = job.get("target_healthy", _UNSET)
+    if target_healthy_raw is _UNSET:
+        target_healthy = False
+        reasons.append("target health not reported (target_healthy key missing)")
+    elif not isinstance(target_healthy_raw, bool):
+        target_healthy = False
         reasons.append(
-            f"target not healthy: {job.get('target_health_reason', 'no health signal reported')}")
+            f"target_healthy must be a real bool, got {target_healthy_raw!r} -- a truthy "
+            "non-bool value (e.g. the string 'false') is never read as healthy")
+    else:
+        target_healthy = target_healthy_raw
+        if not target_healthy:
+            reasons.append(
+                f"target not healthy: {job.get('target_health_reason', 'no health signal reported')}")
 
-    expected_phases = list(job.get("expected_phases", []) or [])
-    completed_phases = set(job.get("completed_phases", []) or [])
-    missing_phases = [p for p in expected_phases if p not in completed_phases]
-    no_missing_phase = not missing_phases
-    if not no_missing_phase:
-        reasons.append(f"missing phase(s): {missing_phases}")
+    no_missing_phase, phase_reason = _completeness(
+        job, "expected_phases", "completed_phases", "phase(s)")
+    if phase_reason:
+        reasons.append(phase_reason)
 
     eval_valid = process_complete and artifacts_complete and target_healthy and no_missing_phase
 

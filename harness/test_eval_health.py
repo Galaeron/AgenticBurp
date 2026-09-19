@@ -81,6 +81,42 @@ class TestEvaluateHealth(unittest.TestCase):
         self.assertFalse(result["eval_valid"])
         self.assertGreaterEqual(len(result["reasons"]), 1)
 
+    def test_reviewer_repro_absent_expectations_do_not_read_as_complete(self):
+        """R03 reproduction: evaluate_health({'exit_code': 0, 'target_healthy':
+        True}) must NOT return eval_valid=True -- no expected_artifacts or
+        expected_phases were declared at all, which is unknown, not zero."""
+        result = evaluate_health({"exit_code": 0, "target_healthy": True})
+        self.assertFalse(result["eval_valid"])
+        self.assertFalse(result["artifacts_complete"])
+        self.assertFalse(result["no_missing_phase"])
+        self.assertTrue(any("expected_artifacts" in r for r in result["reasons"]))
+        self.assertTrue(any("expected_phases" in r for r in result["reasons"]))
+
+    def test_explicit_empty_expectations_are_honoured_as_complete(self):
+        """An explicitly declared empty list is a real "nothing expected"
+        statement, distinct from an absent key, and must read as complete."""
+        result = evaluate_health(_healthy_job(
+            expected_artifacts=[], present_artifacts=[],
+            expected_phases=[], completed_phases=[]))
+        self.assertTrue(result["artifacts_complete"])
+        self.assertTrue(result["no_missing_phase"])
+        self.assertTrue(result["eval_valid"])
+
+    def test_string_false_is_not_read_as_healthy(self):
+        """R03 reproduction: target_healthy='false' (a non-empty, truthy
+        string) must never be coerced into a healthy bool."""
+        result = evaluate_health(_healthy_job(target_healthy="false"))
+        self.assertFalse(result["target_healthy"])
+        self.assertFalse(result["eval_valid"])
+        self.assertTrue(any("target_healthy" in r for r in result["reasons"]))
+
+    def test_non_bool_target_healthy_types_are_rejected(self):
+        for bad in (1, "true", None, [], {}):
+            with self.subTest(bad=bad):
+                result = evaluate_health(_healthy_job(target_healthy=bad))
+                self.assertFalse(result["target_healthy"])
+                self.assertFalse(result["eval_valid"])
+
 
 if __name__ == "__main__":
     unittest.main()
