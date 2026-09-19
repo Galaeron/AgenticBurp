@@ -207,6 +207,53 @@ class ExportTests(unittest.TestCase):
             self.assertIn(key, exp)
         self.assertEqual(exp["expected_vs_observed"].keys(), {"expected", "observed"})
 
+    def test_reviewer_repro_export_carries_oracle_verification_state(self):
+        """R01/R06 reproduction: an oracle-verified finding's export must
+        expose `oracle_verified`/`verification_state` -- previously omitted
+        entirely, so `all_host_findings()` reporting verified had nowhere to
+        surface at the export boundary. AUDITED (R01/R02) against a real,
+        executed, CONFIRMED proof linked by case_id/proof_id -- not just the
+        member's own self-reported claim."""
+        verified_member = F("https://x/api/tickets/9", "idor", method="GET", confirmed=True,
+                            case_id="c9", proof_id="p9", principal_id="user")
+        verified_member["oracle_verified"] = True
+        verified_member["verification_state"] = "verified"
+        verified_member["oracle_capsule_id"] = "capsule-9"
+        issue = issues.group_findings_into_issues([verified_member])[0]
+        proofs_by_case = {"c9": {
+            "proof_id": "p9", "case": {"run_id": "run-1", "case_id": "c9"},
+            "verdict": "confirmed", "executed": True,
+        }}
+        exp = issues.export_issue(issue, proofs_by_case=proofs_by_case)
+        self.assertTrue(exp["oracle_verified"])
+        self.assertEqual(exp["verification_state"], "verified")
+        self.assertIn("capsule-9", exp["oracle_capsule_ids"])
+
+    def test_reviewer_repro_verified_claim_with_no_backing_proof_exports_as_candidate(self):
+        """R01/R02 negative control: a member self-reporting oracle_verified
+        with NO reachable, matching persisted proof must export as
+        candidate -- a claim without an auditable backing proof is
+        unverifiable, never exported as verified, even if the raw Finding
+        row still says "verified"."""
+        verified_member = F("https://x/api/tickets/9", "idor", method="GET", confirmed=True,
+                            case_id="c9", proof_id="p9", principal_id="user")
+        verified_member["oracle_verified"] = True
+        verified_member["verification_state"] = "verified"
+        issue = issues.group_findings_into_issues([verified_member])[0]
+        exp = issues.export_issue(issue)  # no proofs_by_case supplied
+        self.assertFalse(exp["oracle_verified"])
+        self.assertEqual(exp["verification_state"], "candidate")
+
+    def test_confirmed_but_not_oracle_verified_export_says_candidate(self):
+        """Negative control: a merely leg-confirmed member (the legacy bar)
+        that the oracle never reproduced must export as
+        verification_state="candidate" -- confirmed and oracle-verified are
+        different claims and must not be conflated in either direction."""
+        exp = issues.export_issue(self._issue())  # confirmed=True members, no oracle fields set
+        self.assertTrue(exp["confirmed"])
+        self.assertFalse(exp["oracle_verified"])
+        self.assertEqual(exp["verification_state"], "candidate")
+
     def test_export_references_available_artifacts(self):
         exp = issues.export_issue(self._issue(), proofs_by_case={
             "c1": [{"proof_id": "p1", "verdict": "confirmed"}]})

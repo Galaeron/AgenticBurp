@@ -315,8 +315,22 @@ public class HarnessPanel extends JPanel {
                     sb.append("  - Summary: ").append(f.summary).append('\n');
                     sb.append("  - Evidence: ").append(f.evidence).append('\n');
                     sb.append("  - Next step: ").append(f.suggested_test).append('\n');
-                    sb.append("  - Verification status: ").append(f.confirmed ? "CONFIRMED" : "HYPOTHESIS / NOT CONFIRMED")
-                      .append('\n');
+                    // R06 (self-reviewed / UNBUILT, see AnalysisModels.Finding's own note --
+                    // no JDK here to compile or test this file): `confirmed` only means a
+                    // deterministic leg fired once; `verification_state`/`oracle_verified`
+                    // is the STRICTER oracle bar (N-of-N reproduction + a clean negative
+                    // control). Before this change the panel collapsed both axes into one
+                    // CONFIRMED/HYPOTHESIS label, so an oracle-verified finding and a
+                    // merely leg-confirmed one were shown identically.
+                    String verificationLabel;
+                    if (f.oracle_verified || "verified".equals(f.verification_state)) {
+                        verificationLabel = "ORACLE-VERIFIED";
+                    } else if (f.confirmed) {
+                        verificationLabel = "CONFIRMED (leg fired, not oracle-verified)";
+                    } else {
+                        verificationLabel = "HYPOTHESIS / NOT CONFIRMED";
+                    }
+                    sb.append("  - Verification status: ").append(verificationLabel).append('\n');
                     if (f.review_verdict != null) {
                         sb.append("  - Reviewed: ").append(f.review_verdict)
                           .append(" -- ").append(f.review_note).append('\n');

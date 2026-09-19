@@ -144,6 +144,25 @@ class Issue:
         return any(m.get("confirmed") for m in self.members)
 
     @property
+    def oracle_verified(self) -> bool:
+        """R06: the oracle-verification axis (orthogonal to `confirmed`, the
+        legacy "a leg fired once" bar) must survive issue aggregation and
+        export -- a leg-confirmed issue whose oracle never reproduced it is
+        NOT the same claim as one the oracle actually verified."""
+        return any(m.get("oracle_verified") for m in self.members)
+
+    @property
+    def verification_state(self) -> str:
+        """The strongest operator-facing oracle label across members:
+        "verified" if any member reached it, else "candidate" -- distinct
+        from `confirmed`, which only means a leg fired at least once."""
+        return "verified" if self.oracle_verified else "candidate"
+
+    @property
+    def oracle_capsule_ids(self) -> list[str]:
+        return sorted({m.get("oracle_capsule_id") for m in self.members if m.get("oracle_capsule_id")})
+
+    @property
     def severity(self) -> str:
         return min((m.get("severity", "info") or "info" for m in self.members),
                    key=lambda s: _SEV_ORDER.get(s.lower(), 99), default="info")
@@ -346,6 +365,39 @@ def _proof_references(issue: Issue, proofs_by_case: dict) -> list[dict]:
     return refs
 
 
+def _audited_oracle_state(issue: Issue, proofs_by_case: dict) -> tuple[bool, str, list[str]]:
+    """R01: evidence_audit.audit_proof's real production consumer. Rather than
+    exporting the raw, self-reported Finding.oracle_verified/verification_state
+    fields at face value, audit EACH member's "verified" claim against its own
+    linked, PERSISTED proof (via proofs_by_case, the same ledger
+    _proof_references already resolves). A member claiming verified with no
+    matching, executed, CONFIRMED proof reachable here is downgraded to
+    candidate in the export -- a claim without an auditable backing proof is
+    unverifiable, never exported as verified (R02's rule, enforced at the
+    export boundary rather than left as an unused helper)."""
+    from harness import evidence_audit
+    from harness.evidence import Verdict
+    verified_any = False
+    capsule_ids: set[str] = set()
+    for m in issue.members:
+        if not (m.get("oracle_verified") or m.get("verification_state") == "verified"):
+            continue
+        cid = m.get("case_id") or ""
+        attempts = _normalize_attempts(proofs_by_case.get(cid)) if cid else []
+        best = None
+        if attempts:
+            try:
+                best = max(attempts, key=lambda p: Verdict(p.get("verdict", "inconclusive")).rank())
+            except ValueError:
+                best = attempts[0]
+        run_id = ((best or {}).get("case") or {}).get("run_id", "")
+        if evidence_audit.audit_proof(m, best, run_id) == evidence_audit.AUDIT_VERIFIED:
+            verified_any = True
+            if m.get("oracle_capsule_id"):
+                capsule_ids.add(m["oracle_capsule_id"])
+    return verified_any, ("verified" if verified_any else "candidate"), sorted(capsule_ids)
+
+
 def _member_evidence(issue: Issue) -> list[dict]:
     """Per-member evidence, redacted -- so grouping keeps every affected instance's
     own evidence (R10), not only the best member's."""
@@ -371,6 +423,8 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
     aliases = _principal_aliases(issue)
     proof_refs = _proof_references(issue, proofs_by_case)
     has_proof = any(r.get("proof_id") for r in proof_refs)
+    audited_verified, audited_verification_state, audited_capsule_ids = \
+        _audited_oracle_state(issue, proofs_by_case)
 
     boundary_word = "read" if issue.authorization_boundary == "read" else "state-changing"
     first_alias = next(iter(aliases), None)
@@ -392,6 +446,16 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "severity": issue.severity,
         "confidence": round(issue.confidence, 3),
         "confirmed": issue.confirmed,
+        # R01/R06: oracle verification state must survive export, distinct
+        # from the legacy `confirmed` (leg fired once) axis -- a consumer
+        # reading only `confirmed` cannot tell a leg-confirmed-but-unverified
+        # claim from an oracle-verified one. AUDITED (evidence_audit.audit_proof)
+        # against the linked proof ledger, not the members' raw self-reported
+        # fields -- a "verified" claim with no reachable backing proof exports
+        # as candidate (see _audited_oracle_state).
+        "oracle_verified": audited_verified,
+        "verification_state": audited_verification_state,
+        "oracle_capsule_ids": audited_capsule_ids,
         "host": redact_url(issue.host),
         "endpoint_family": issue.endpoint_family,
         "method": issue.method,
