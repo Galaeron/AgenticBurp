@@ -146,15 +146,21 @@ async def _run_corpus() -> dict[str, list[str]]:
 
 
 def main() -> int:
+    from harness.eval_health import evaluate_health  # R01: real production consumer
+
     tmp = tempfile.mkdtemp(prefix="nightly_precision_")
     orig_db_path = store._DB_PATH
     orig_cache = cache._cache
+    completed_phases: list[str] = []
+    exit_code = 0
     try:
         store._DB_PATH = Path(tmp) / "state.db"
         cache.init_cache(db_path=os.path.join(tmp, "cache.db"))
 
         labeled_findings = asyncio.run(_run_corpus())
+        completed_phases.append("run_corpus")
         report = score.score(labeled_findings, label_category=_LABEL_CATEGORY)
+        completed_phases.append("score")
         report["provenance"] = (
             "CPU-only, model-STUBBED plumbing check (P0.10) -- NOT a measurement of "
             "real model detection accuracy. See testing/test-target/ + the `scored` "
@@ -163,6 +169,7 @@ def main() -> int:
         table = score.format_table(report, corpus="nightly-precision-fixture", model="stubbed/none")
         SCORECARD_PATH.write_text(
             table + "\n\n" + report["provenance"] + "\n", encoding="utf-8")
+        completed_phases.append("write_scorecard")
         print(table)
         print()
         print(report["provenance"])
@@ -173,8 +180,31 @@ def main() -> int:
         if overall["tp"] != 2 or overall["fp"] != 0 or overall["fn"] != 0:
             print(f"NIGHTLY PRECISION PLUMBING CHECK FAILED: expected tp=2 fp=0 fn=0, "
                   f"got {overall}", file=sys.stderr)
-            return 1
-        return 0
+            exit_code = 1
+
+        # R01/P0.7: the four independent process/artifact/target/phase health
+        # signals, explicit rather than a bare exit code -- the SAME failure
+        # mode ("green tests, dead pipeline") this whole script exists to
+        # guard against also applies to trusting a lone tp/fp/fn check.
+        # `target_healthy=True` here is an honest structural fact, not an
+        # inferred default: this job is fully stubbed (no live target at
+        # all), so "no target to be unhealthy" is the true state, not a
+        # guess from the exit code.
+        health = evaluate_health({
+            "exit_code": exit_code,
+            "expected_artifacts": ["SCORECARD.md"],
+            "present_artifacts": ["SCORECARD.md"] if SCORECARD_PATH.exists() else [],
+            "target_healthy": True,
+            "target_health_reason": "no live target in this stubbed CPU-only plumbing check",
+            "expected_phases": ["run_corpus", "score", "write_scorecard"],
+            "completed_phases": completed_phases,
+        })
+        print(f"\neval_health: eval_valid={health['eval_valid']} reasons={health['reasons']}")
+        if not health["eval_valid"]:
+            print("NIGHTLY PRECISION PLUMBING CHECK FAILED health gate: "
+                  f"{health['reasons']}", file=sys.stderr)
+            exit_code = 1
+        return exit_code
     finally:
         store._DB_PATH = orig_db_path
         cache._cache = orig_cache

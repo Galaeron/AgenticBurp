@@ -137,6 +137,17 @@ class ReadOnlyMcpAdapter:
             from harness import store, engagement
             snap = store.load_engagement(host)
             data = engagement.EngagementState.from_dict(snap).summary() if snap else None
+            # R01/R07: layer in the auditable executed-vs-inferred coverage
+            # breakdown from the most recent run manifest for this host, when
+            # one exists -- coverage_summary.py's output, persisted by
+            # run_manifest.RunManifest.finish(). EngagementState.summary()
+            # alone (the prior behaviour) has no executed/inferred distinction
+            # at all; this is additive, never replacing the base summary.
+            audited = latest_provenance_for_host(host, self._run_output_dir)
+            coverage_audited = (audited or {}).get("coverage_audited")
+            if coverage_audited:
+                data = dict(data or {})
+                data["audited"] = coverage_audited
             return {"uri": uri, "mimeType": "application/json", "page": 0,
                     "page_size": self.page_size, "total": 1 if data else 0, "data": data}
 

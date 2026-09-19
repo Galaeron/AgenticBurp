@@ -127,6 +127,29 @@ class TestReadResourceMatchesNormalExport(_IsolatedDbTest):
             result = adapter.read_resource("mcp://harness/a.example.com/provenance")
             self.assertIsNone(result["data"])
 
+    def test_reviewer_repro_coverage_resource_surfaces_audited_breakdown(self):
+        """R01/R07: the coverage resource must surface the auditable
+        executed-vs-inferred breakdown from the latest run manifest, not just
+        EngagementState.summary() (which has no such distinction at all)."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = Path(out_dir)
+            (out / "run1.json").write_text(json.dumps({
+                "run_id": "run1", "target_identifier": "audited.example.com", "started_at": 100,
+                "coverage_audited": {
+                    "executed": {"numerator": 3, "denominator": 10, "kind": "executed", "pct": 30.0},
+                    "inferred": {"numerator": 1, "denominator": 10, "kind": "inferred", "pct": 10.0},
+                },
+            }))
+            adapter = ReadOnlyMcpAdapter(run_output_dir=out_dir)
+            result = adapter.read_resource("mcp://harness/audited.example.com/coverage")
+            self.assertEqual(result["data"]["audited"]["executed"]["numerator"], 3)
+
+    def test_no_manifest_coverage_resource_still_honest_none(self):
+        with tempfile.TemporaryDirectory() as empty_dir:
+            adapter = ReadOnlyMcpAdapter(run_output_dir=empty_dir)
+            result = adapter.read_resource("mcp://harness/nobody.example.com/coverage")
+            self.assertIsNone(result["data"])
+
 
 class TestLatestProvenanceForHost(unittest.TestCase):
     def test_picks_the_most_recent_manifest_for_the_host(self):

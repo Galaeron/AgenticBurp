@@ -86,5 +86,51 @@ class MetricScopeTest(unittest.TestCase):
         self.assertNotEqual(label, "fresh_end_to_end")
 
 
+class ScoreProvenanceWiringTest(unittest.TestCase):
+    """R01/R05: score.py's own `_score_provenance` is the real production
+    consumer of harness.score_provenance -- not just a hermetically-tested
+    helper with no caller. Requires the repo root importable (score.py adds
+    it lazily itself via `_ensure_harness_importable`)."""
+
+    def test_complete_run_with_a_real_input_file_is_fresh_or_historical(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "detection_fixture.json"
+            cache.write_text("{}")
+            prov = score._score_provenance(
+                corpus="test-target", conf=0.0, min_severity="info",
+                n_exchanges=13, cache_path=cache, refresh=False)
+            self.assertTrue(prov["complete"])
+            self.assertNotEqual(prov["inputs_hash"], "")
+            self.assertIn(prov["evaluation_integrity_label"], ("fresh", "historical"))
+
+    def test_reviewer_repro_synthetic_invalid_artifact_zero_exchanges(self):
+        """Synthetic invalid artifact (per the review's own ask): a run that
+        scored ZERO exchanges must never be labeled fresh/historical -- it
+        never actually completed a real scoring pass."""
+        prov = score._score_provenance(
+            corpus="test-target", conf=0.0, min_severity="info",
+            n_exchanges=0, cache_path=None, refresh=False)
+        self.assertFalse(prov["complete"])
+        self.assertEqual(prov["evaluation_integrity_label"], "invalid")
+
+    def test_synthetic_invalid_artifact_missing_cache_file(self):
+        """Synthetic invalid artifact: a cache_path that does not resolve to
+        a real file on disk must never produce a fabricated inputs_hash --
+        the missing inputs_hash id field alone makes the label invalid."""
+        from pathlib import Path
+        prov = score._score_provenance(
+            corpus="test-target", conf=0.0, min_severity="info",
+            n_exchanges=13, cache_path=Path("/does/not/exist/detection_fixture.json"),
+            refresh=False)
+        self.assertEqual(prov["inputs_hash"], "")
+        self.assertEqual(prov["evaluation_integrity_label"], "invalid")
+
+    def test_git_revision_never_raises_outside_a_checkout(self):
+        # smoke: must return a string either way, never raise
+        self.assertIsInstance(score._git_revision(), str)
+
+
 if __name__ == "__main__":
     unittest.main()

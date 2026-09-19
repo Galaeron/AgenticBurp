@@ -171,7 +171,7 @@ _SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 async def _collect_from_fixture(labels, refresh: bool, corpus: str,
-                                conf: float, min_severity: str) -> dict[str, list[str]]:
+                                conf: float, min_severity: str) -> tuple[dict[str, list[str]], Path | None]:
     """Adapter over detection_fixture.py (the cached real-agent findings). Kept
     async + lazily imported so importing score.py stays cheap and GPU-free.
     The fixture module lives in the corpus subdir (e.g. testing/test-target/).
@@ -180,7 +180,11 @@ async def _collect_from_fixture(labels, refresh: bool, corpus: str,
       `conf`         -- confidence floor (low-confidence "I'm guessing" gated out)
       `min_severity` -- severity floor (info/low/medium/high/critical); the
                         biggest FP source here is low-severity missing-header
-                        noise, so severity is the more effective knob."""
+                        noise, so severity is the more effective knob.
+
+    Returns (label -> classes, the fixture's own CACHE_PATH or None) -- the
+    cache path is the actual "inputs" this scoring run reads, so the caller
+    can bind a provenance hash to it (R01/R05)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent / corpus))
     import detection_fixture as fx
     import access_control_gate as acg
@@ -205,7 +209,8 @@ async def _collect_from_fixture(labels, refresh: bool, corpus: str,
                 if (conf <= 0.0 or (c is not None and c >= conf)) and sev >= sev_floor:
                     classes.append(f["class"])
         out[lab] = classes
-    return out
+    cache_path = getattr(fx, "CACHE_PATH", None)
+    return out, (Path(cache_path) if cache_path else None)
 
 
 def _model_from_config() -> str:
@@ -223,6 +228,66 @@ def freshness_label(refresh: bool) -> str:
     for that contract), so neither may claim to be a fresh end-to-end
     pipeline run -- only the honest label differs between them."""
     return "live_refresh_no_manifest_binding" if refresh else "historical_cache_rescore"
+
+
+def _git_revision() -> str:
+    """Best-effort current HEAD sha; "unknown" (never a fabricated value) if
+    git is unavailable or this isn't a checkout -- score_provenance.py itself
+    stays git-subprocess-free by design, so the CALLER (this script) is
+    where a real revision gets resolved."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).resolve().parent),
+                             capture_output=True, text=True, timeout=5)
+        rev = out.stdout.strip()
+        return rev if out.returncode == 0 and rev else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _ensure_harness_importable() -> None:
+    """score.py is deliberately harness-free at import time (kept cheap/GPU-
+    free for callers like testing/test_score.py that only need the pure
+    scoring math); the repo root is only added to sys.path lazily, right
+    before the one thing that needs harness.score_provenance (R01)."""
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+
+def _score_provenance(*, corpus: str, conf: float, min_severity: str,
+                      n_exchanges: int, cache_path: Path | None, refresh: bool) -> dict:
+    """R01/R05: bind this score artifact to an auditable ScoreProvenance
+    record -- the actual production consumer of harness.score_provenance,
+    replacing "a score file exists" with an explicit fresh/historical/invalid
+    label. `complete` is n_exchanges > 0 (the run actually scored something);
+    `inputs_hash` is over the fixture's own real cache file when resolvable,
+    "" (an id field score_provenance.py then classifies as invalid) when not
+    -- never a fabricated hash for a file that wasn't actually read."""
+    import uuid
+    _ensure_harness_importable()
+    from harness.score_provenance import ScoreProvenance, freshness_label as _score_freshness
+
+    run_id = uuid.uuid4().hex
+    inputs_hash = ""
+    if cache_path is not None and cache_path.exists():
+        inputs_hash = compute_inputs_hash([cache_path])
+    revision = _git_revision()
+    corpus_id = f"{corpus}@conf{conf}_sev{min_severity}"
+    prov = ScoreProvenance(git_revision=revision, run_id=run_id, corpus_id=corpus_id,
+                           inputs_hash=inputs_hash, complete=n_exchanges > 0)
+    label = _score_freshness(prov, revision, corpus_id, expected_run_id=run_id,
+                             expected_inputs_hash=inputs_hash)
+    return {**prov.to_dict(), "evaluation_integrity_label": label}
+
+
+def compute_inputs_hash(paths):
+    """Lazily delegates to harness.score_provenance -- imported here (not at
+    module load) so score.py's own import stays GPU/harness-free for callers
+    that only need the pure scoring math (e.g. testing/test_score.py)."""
+    _ensure_harness_importable()
+    from harness.score_provenance import compute_inputs_hash as _cih
+    return _cih(paths)
 
 
 def main() -> int:
@@ -250,7 +315,8 @@ def main() -> int:
         return 2
 
     model = _model_from_config()
-    labeled = asyncio.run(_collect_from_fixture(None, args.refresh, args.corpus, args.conf, args.min_severity))
+    labeled, cache_path = asyncio.run(
+        _collect_from_fixture(None, args.refresh, args.corpus, args.conf, args.min_severity))
     report = score(labeled)
     # W-8/W-23: `--from-cache` (the only wired mode) reads detection_fixture.py's
     # saved cache; `--refresh` forces a live re-run of every label through the
@@ -265,6 +331,16 @@ def main() -> int:
                             "freshness": freshness,
                             "freshness_note": "not a fresh end-to-end pipeline run; "
                                               "no invocation/revision/artifact-hash manifest is bound to this result"}
+    # R01/R05: the auditable evaluation_integrity contract's own freshness
+    # label, bound to a real git revision, a fresh run_id, and a content hash
+    # of the fixture cache file this run actually read -- score_provenance.py's
+    # real production consumer, not just a hermetically-tested helper.
+    try:
+        report["provenance"]["score_provenance"] = _score_provenance(
+            corpus=args.corpus, conf=args.conf, min_severity=args.min_severity,
+            n_exchanges=len(labeled), cache_path=cache_path, refresh=args.refresh)
+    except Exception as e:  # provenance stamping must never sink the score itself
+        report["provenance"]["score_provenance_error"] = f"{type(e).__name__}: {e}"
 
     print(format_table(report, args.corpus, f"{model} @conf>={args.conf},sev>={args.min_severity}"))
     if args.json:

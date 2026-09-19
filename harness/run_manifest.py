@@ -94,7 +94,14 @@ class RunManifest:
                           "request_count": result.get("request_count"),
                           "confirmed_issues": result.get("confirmed_issues"),
                           "operational_errors": redact(errors),
-                          "degraded": bool(result.get("degraded") or errors)})
+                          "degraded": bool(result.get("degraded") or errors),
+                          # R01/R07: the auditable executed-vs-inferred coverage
+                          # breakdown (coverage_summary.summarize_coverage's
+                          # output, already additive on CoverageTracker.report()),
+                          # persisted here so a LATER reader (e.g. the MCP
+                          # coverage resource) can see it without needing the
+                          # live in-memory job result.
+                          "coverage_audited": (result.get("coverage") or {}).get("audited")})
         self._persist(append_ledger=True)
 
     def _persist(self, *, append_ledger: bool) -> None:

@@ -39,6 +39,27 @@ class RunManifestTests(unittest.TestCase):
         self.assertTrue(saved["degraded"])
         self.assertIn("Ollama unavailable", saved["operational_errors"][0]["error"])
 
+    def test_reviewer_repro_coverage_audited_survives_into_the_manifest(self):
+        """R01/R07: the auditable executed-vs-inferred coverage breakdown
+        (CoverageTracker.report()["audited"], via coverage_summary.py) must
+        survive into the persisted manifest, so a LATER reader (the MCP
+        coverage resource) can see it without the live in-memory job result."""
+        with tempfile.TemporaryDirectory() as td:
+            run = RunManifest.start(run_id="cov-run", target_identifier="fixture", config={}, output_dir=td)
+            run.finish("done", result={"coverage": {"audited": {
+                "executed": {"numerator": 2, "denominator": 8, "kind": "executed", "pct": 25.0},
+                "inferred": {"numerator": 1, "denominator": 8, "kind": "inferred", "pct": 12.5},
+            }}})
+            saved = json.loads(run.path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["coverage_audited"]["executed"]["numerator"], 2)
+
+    def test_missing_coverage_key_leaves_coverage_audited_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = RunManifest.start(run_id="no-cov", target_identifier="fixture", config={}, output_dir=td)
+            run.finish("done", result={})
+            saved = json.loads(run.path.read_text(encoding="utf-8"))
+        self.assertIsNone(saved["coverage_audited"])
+
     def test_redact_does_not_mutate_input(self):
         original = {"password": "live", "nested": [{"token": "t"}]}
         cleaned = redact(original)
