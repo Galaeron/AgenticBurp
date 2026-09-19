@@ -1,5 +1,10 @@
 # Leg verification status — the live-verified vs smoke-only split
 
+> Historical qualification record. Current routing/tiers are defined by
+> `harness/confirmation_gate.py` and validators; see ORACLE_RETIREMENTS.md.
+> Silence or a skipped leg is not a controlled negative and cannot establish
+> refutation. This table is not a fresh verification of the current checkout.
+
 The confirmation legs are not equally trustworthy. A leg that has only ever
 passed a **smoke test** (network stubbed at `httpx`, decision logic asserted) is
 not the same as one **live-verified** against a real target with a true positive

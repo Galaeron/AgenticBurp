@@ -295,5 +295,25 @@ class ModelExtensionTests(unittest.TestCase):
         self.assertNotEqual(CHECKS_BY_ID["WSTG-CONF-09"].vulnerability_class, "api_security")
 
 
+class DeclaredIdentityTests(unittest.TestCase):
+    def test_declared_automated_ids_resolve_to_runner_ids(self):
+        for spec in cm.REQUIREMENT_TESTS:
+            if spec.mode != "automated":
+                continue
+            with self.subTest(test_id=spec.test_id):
+                loader = unittest.TestLoader()
+                suite = loader.loadTestsFromName(spec.test_id)
+                self.assertEqual(loader.errors, [], "stale declared test identity")
+                self.assertEqual(suite.countTestCases(), 1)
+                self.assertEqual(next(iter(suite)).id(), spec.test_id)
+
+    def test_old_flat_module_identity_does_not_resolve(self):
+        loader = unittest.TestLoader()
+        loader.loadTestsFromName(
+            "test_mass_assignment_slice.MassAssignmentSliceTest."
+            "test_harness_sequence_validator_confirms_vulnerable")
+        self.assertTrue(loader.errors, "negative control must reject the pre-package ID")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,24 +1,9 @@
-"""
-Live leg-verification (Phase 2) -- REAL, not stubbed.
+"""Leg integration against an owned loopback Flask fixture and collaborator.
 
-Stands up the disposable vulnerable fixture on a real localhost socket and runs
-the in-band confirmation legs against it with genuine HTTP (real httpx inside the
-leg, a real Flask app answering). Unlike the per-leg smoke tests -- which stub the
-network at httpx and assert only the decision logic -- this proves the whole leg
-path bites on a real true-positive and stays silent on a matched negative control.
-
-Scope: SSTI, open redirect, SSRF, mass-assignment (the sequence leg), and
-browser_xss (real Playwright + Chromium) are all verified here -- the OOB legs
-(SSRF, command-injection) reach the real in-process collaborator, which is itself
-just a loopback listener. command-injection needs `curl` on this host to run the
-injected fetch, so it is skipped when curl is absent. browser_xss needs Playwright
-+ Chromium installed, so it is skipUnless-gated. Path traversal (needs a real
-system file) stays in testing/leg-verification/run_leg_verification.py, run live
-by the operator.
-
-Hermetic and self-contained: the only "network" is loopback -- the fixture server
-this test owns, plus the collaborator's loopback listener; the server is torn down
-in tearDownClass.
+Real HTTP plus vulnerable/secure controls exercise the confirmation adapters.
+Browser cases require Playwright/Chromium; shell callback cases require curl.
+Skipped cases establish no evidence. This is fixture integration, not a current
+blind-target measurement; path traversal has a separate operator-driven fixture.
 """
 import asyncio
 import importlib.util

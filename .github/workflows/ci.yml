@@ -43,33 +43,10 @@ jobs:
       # (its evidence dir is module-relative, so it still writes harness/.coverage_runs).
       - name: Clean this run's evidence dir (fresh, run-bound)
         run: python -c "import shutil; shutil.rmtree('harness/.coverage_runs', ignore_errors=True)"
-      - name: PR smoke subset (fast signal, writes this run's coverage evidence)
-        run: >-
-          python -m unittest
-          harness.test_smoke_detection
-          harness.test_smoke_investigate
-          harness.test_smoke_shape_precondition
-          harness.test_smoke_authorization_workflow
-          harness.test_smoke_phase0_capture_review
-          harness.test_mass_assignment_slice
-          harness.test_open_redirect_slice
-          harness.test_coverage_manifest
-      # Real-pipeline gate: drives REAL discovery -> confirmation against a local
-      # fixture (only the model boundary is stubbed) and includes the defect-injection
-      # proofs that the gate goes red when the pipeline breaks.
-      - name: Real-pipeline gate (real discovery -> confirmation)
-        run: python -m unittest harness.test_pipeline_gate
-      # pytest-native tests unittest's discover CANNOT collect (module-level test
-      # functions + fixtures). Before this step they ran in NO tier -- the exact
-      # "green tests, dead pipeline" gap. Run them explicitly.
+      - name: Pipeline smoke and discovery guards
+        run: python -m harness.suite smoke
       - name: pytest-native tests (not collected by unittest discover)
-        run: >-
-          python -m pytest -q
-          harness/test_plugin_system.py
-          harness/test_execution_protocol.py
-          harness/test_hardening.py
-      - name: Requirement-coverage gate (declared automated aspects must be a fresh pass)
-        run: python -m harness.coverage_manifest --check
+        run: python -m harness.suite native
       - name: Generate coverage report (always, for diagnostics)
         if: always()
         run: |
@@ -85,9 +62,8 @@ jobs:
             harness/coverage_report.md
             harness/coverage_report.json
           if-no-files-found: warn
-      - name: Score math self-test (no model/fixture needed)
-        working-directory: testing
-        run: python -m unittest test_score
+      - name: Evaluation contracts and score plumbing
+        run: python -m harness.suite evaluation
 
   # Nightly tier (schedule + on-demand): the WHOLE unittest suite, then the coverage
   # gate + report. This is the "full suite nightly" half.
@@ -109,15 +85,8 @@ jobs:
         run: python -c "import shutil; shutil.rmtree('harness/.coverage_runs', ignore_errors=True)"
       - name: Full unit suite (writes this run's coverage evidence)
         run: python -m unittest discover -t . -s harness -p "test_*.py"
-      # unittest's discover silently collects ZERO tests from the pytest-native files
-      # (module-level functions + fixtures), so the full suite above does not run them.
-      # Run them explicitly from the repo root, mirroring the fast tier.
       - name: pytest-native tests (not collected by unittest discover)
-        run: >-
-          python -m pytest -q
-          harness/test_plugin_system.py
-          harness/test_execution_protocol.py
-          harness/test_hardening.py
+        run: python -m harness.suite native
       - name: Requirement-coverage gate
         run: python -m harness.coverage_manifest --check
       - name: Generate coverage report (always, for diagnostics)
@@ -135,9 +104,8 @@ jobs:
             harness/coverage_report.md
             harness/coverage_report.json
           if-no-files-found: warn
-      - name: Score math self-test
-        working-directory: testing
-        run: python -m unittest test_score
+      - name: Evaluation contracts and score plumbing
+        run: python -m harness.suite evaluation
 
   # P0.10: CPU-only precision/recall plumbing check, nightly (+ on-demand). Distinct
   # from `scored` below -- this NEVER calls a real model and needs no GPU/self-hosted

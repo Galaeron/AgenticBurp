@@ -1,21 +1,9 @@
-"""
-End-to-end smoke test for the graph-driven investigation path and its PROACTIVE,
-precondition-driven confirmation legs (HANDOVER_6 §4).
+"""Graph JWT confirmation integration with supplied discovery and HTTP responders.
 
-Companion to test_smoke_detection.py (which covers analyze()). That one never
-exercised investigate_engagement, and NOTHING did -- the exact "green tests, dead
-pipeline" shape this project has been bitten by three times. This runs the REAL
-investigate_engagement pipeline (build_engagement -> worklist_investigator ->
-_precondition -> shape_precondition_legs -> _confirm -> the real jwt-forge
-validator) and asserts that a JWT-carrying endpoint an agent NEVER labelled "jwt"
-still gets its alg:none forgery run and CONFIRMED -- the precise failure §3
-documented (jwt_forge never fired where it could confirm).
-
-Hermetic: no GPU, no model, no live target. Discovery is replaced with a canned
-one-endpoint surface; the socket layer (httpx.AsyncClient.get, the only network
-the jwt leg uses here) is stubbed with a vulnerable/secure responder. The
-negative control (a server that actually verifies signatures) proves the test
-guards CONFIRMATION, not merely that the leg ran.
+Runs investigate_engagement through shape-driven JWT confirmation. An endpoint
+not labelled JWT must still get the deterministic leg; the signature-verifying
+responder is the negative control. This does not exercise real discovery or
+sockets: use test_pipeline_gate for discovery-to-confirmation integration.
 """
 import asyncio
 import os

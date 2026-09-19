@@ -1,5 +1,9 @@
 # Deferred confirmation legs — architectural decisions needed
 
+> Historical design discussion, not a current backlog. Several legs below have
+> since been implemented or had their verdicts retired. Consult the registry,
+> ORACLE_RETIREMENTS.md and CURRENT_STATE.md before scheduling new work.
+
 Session 13 built and live-verified active confirmation legs for the tractable
 missing classes (deserialization, session-fixation, weak-password, username-
 enumeration, stored/second-order XSS, JWT `kid` key-confusion, and generalised

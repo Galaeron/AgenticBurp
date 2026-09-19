@@ -1,22 +1,9 @@
-"""
-End-to-end detection smoke test -- SESSION_4_PLAN.md T1.1.
+"""Captured-analysis integration: routing through persisted findings.
 
-Runs the REAL orchestrator.analyze() pipeline (routing -> dispatch -> agent
-output parsing -> deterministic detectors -> synthesis -> gating) against a
-known SQL-injection exchange, with ONLY the Ollama boundary stubbed to return
-canned JSON.
-
-Why this test exists, when 889 others already pass: those mock at the plumbing
-layer and stayed green three separate times while real detection was silently
-ZERO (a prompt validator that rejected every agent; the circuit breaker zeroing
-agents mid-run; qwen3 thinking-mode never disabled). This test asserts a known
-finding actually survives the pipeline -- and the negative control proves it is
-testing detection, not plumbing. If this goes red, detection is broken even if
-every other test is green.
-
-Fast + hermetic: no network, no GPU, no target. State/cache DBs are redirected
-to a temp dir; every path that would call out (critique, active validators,
-autonomous discovery, advisory/KEV/registry lookups) is turned off.
+Only the model boundary supplies canned findings. Active validators and external
+lookups are disabled; state/cache are temporary. The empty-model negative control
+checks that the positive finding came from the model path. This tests integration,
+not real-model detection quality. Discovery is covered by test_pipeline_gate.
 """
 import asyncio
 import os

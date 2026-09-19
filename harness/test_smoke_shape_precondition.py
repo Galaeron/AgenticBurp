@@ -126,6 +126,10 @@ def _build(hit: bool) -> Orchestrator:
     xxe = orch.validator_registry.validators.get("xxe")
     assert xxe is not None, "xxe validator not registered -- config gate changed?"
     xxe._collab = _StubCollaborator(hit=hit)
+    # This is an XXE caller slice, not a sweep of every enabled validator.
+    # Unrelated default legs otherwise open real collaborator listeners and wait
+    # on their own callbacks despite the test's claimed no-network boundary.
+    orch.validator_registry.validators = {"xxe": xxe}
     return orch
 
 
@@ -158,7 +162,11 @@ class SmokeShapePreconditionTest(unittest.TestCase):
         # Stub the mutating XML POST so nothing hits the network; the validator
         # ignores the HTTP response and decides purely on the OOB callback.
         fake_resp = SimpleNamespace(status_code=200, text="", headers={})
-        with patch.object(httpx.AsyncClient, "request", new=AsyncMock(return_value=fake_resp)):
+        class UnexpectedCollaborator(BaseException):
+            """Must escape the production pipeline's recoverable-error handling."""
+
+        with patch.object(httpx.AsyncClient, "request", new=AsyncMock(return_value=fake_resp)), \
+             patch("harness.collaborator.shared", side_effect=UnexpectedCollaborator):
             return asyncio.run(orch.analyze(_XML_EXCHANGE, bypass_cache=True))
 
     def test_shape_driven_xxe_confirms_with_no_agent_label(self):

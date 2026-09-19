@@ -39,7 +39,7 @@ dev = ["pytest==9.1.1"]
 include = ["harness*"]
 
 [tool.pytest.ini_options]
-# The suite is stdlib unittest; pytest can also run it. Discovery matches the
-# unittest pattern so `pytest harness` and the unittest discover command agree.
+# Most tests use unittest; three pytest-native modules need a separate runner.
+# Use `python -m harness.suite full` for both plus standalone evaluation tests.
 testpaths = ["harness"]
 python_files = ["test_*.py"]

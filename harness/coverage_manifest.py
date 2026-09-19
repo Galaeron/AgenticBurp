@@ -182,34 +182,34 @@ _ASPECT_OR_CONTROL = ("harness OpenRedirectValidator returns a controlled negati
 
 REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
     TestSpec(_MASS,
-             "test_mass_assignment_slice.MassAssignmentSliceTest."
+             "harness.test_mass_assignment_slice.MassAssignmentSliceTest."
              "test_patched_upholds_protected_field_invariant",
              _ASPECT_INVARIANT, mode="automated", label="fixture_invariant",
              evidence_file=evidence_basename(_MASS, _ASPECT_INVARIANT)),
     TestSpec(_MASS,
-             "test_mass_assignment_slice.MassAssignmentSliceTest."
+             "harness.test_mass_assignment_slice.MassAssignmentSliceTest."
              "test_harness_sequence_validator_confirms_vulnerable",
              _ASPECT_CONFIRM, mode="automated", label="harness_confirmation",
              evidence_file=evidence_basename(_MASS, _ASPECT_CONFIRM)),
     TestSpec(_MASS,
-             "test_mass_assignment_slice.MassAssignmentSliceTest."
+             "harness.test_mass_assignment_slice.MassAssignmentSliceTest."
              "test_harness_sequence_validator_controlled_negative_on_patched",
              _ASPECT_CONTROL, mode="automated", label="harness_control",
              evidence_file=evidence_basename(_MASS, _ASPECT_CONTROL)),
 
     # open redirect (WSTG-INPV-17)
     TestSpec(_OR,
-             "test_open_redirect_slice.OpenRedirectSliceTest."
+             "harness.test_open_redirect_slice.OpenRedirectSliceTest."
              "test_patched_neutralises_off_origin_redirect",
              _ASPECT_OR_INVARIANT, mode="automated", label="fixture_invariant",
              evidence_file=evidence_basename(_OR, _ASPECT_OR_INVARIANT)),
     TestSpec(_OR,
-             "test_open_redirect_slice.OpenRedirectSliceTest."
+             "harness.test_open_redirect_slice.OpenRedirectSliceTest."
              "test_harness_validator_confirms_vulnerable",
              _ASPECT_OR_CONFIRM, mode="automated", label="harness_confirmation",
              evidence_file=evidence_basename(_OR, _ASPECT_OR_CONFIRM)),
     TestSpec(_OR,
-             "test_open_redirect_slice.OpenRedirectSliceTest."
+             "harness.test_open_redirect_slice.OpenRedirectSliceTest."
              "test_harness_validator_controlled_negative_on_patched",
              _ASPECT_OR_CONTROL, mode="automated", label="harness_control",
              evidence_file=evidence_basename(_OR, _ASPECT_OR_CONTROL)),

@@ -30,3 +30,7 @@ testing/**/fixture/
 testing/**/run-*-results/
 testing/**/exports/
 testing/**/uploads/
+
+# Local test environments and editable-install metadata
+.venv*/
+*.egg-info/

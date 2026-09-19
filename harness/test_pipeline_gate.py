@@ -1,35 +1,9 @@
-"""
-REAL-PIPELINE GATE -- the end-to-end test the smoke tests never were.
+"""Discovery-to-confirmation integration against an advertised loopback fixture.
 
-Why this exists (the #0 discipline, again): every other "real HTTP" slice in this
-suite SUPPLIES discovery. test_smoke_investigate patches build_engagement with a
-canned one-endpoint surface; test_smoke_authorization_workflow seeds the object
-endpoint via the tester-fed identity interface. So none of them can catch the
-failure this project keeps hitting -- discovery silently dropping a route, a
-method, or a body -- because none of them run discovery. A 2,000-test suite stayed
-green through exactly that.
-
-This gate runs the WHOLE chain for real against a local fixture that ADVERTISES its
-own surface (an OpenAPI document at /openapi.json):
-
-    REAL api_surface_discovery  ->  REAL role_crawl access matrix  ->
-    REAL worklist prioritisation  ->  REAL shape-driven cross-identity leg  ->
-    a CONFIRMED IDOR in the investigation result
-
-Only the model boundary is stubbed (run_active_probe), because the confirmation
-here is deterministic -- the cross-identity replay, not an LLM guess. ffuf is
-disabled: it is an external Docker tool, not the Python discovery logic this gate
-protects, and it must not make the gate depend on a container runtime.
-
-The gate is only trustworthy if it FAILS when the pipeline breaks. The
-`...DefectInjection...` class is the proof: it re-runs the SAME assertions with a
-known defect reintroduced (budget starved so the route is never discovered; POST
-dropped; the confirmation leg suppressed) and requires each to go red. If a defect
-does not turn the gate red, the gate is not guarding anything -- and that test
-fails instead.
-
-Runs the real discovery sweep, so it is slower than a unit test (a few seconds),
-but it is hermetic: loopback only, no model, no container, no external network.
+Runs real surface discovery, role crawl, worklist and cross-identity confirmation.
+The model is silent and ffuf is disabled. Paired vulnerable/secure controls test
+confirmation; defect injection must detect starved discovery, dropped methods and
+suppressed confirmation. This proves these fixture paths, not live-target recall.
 """
 from __future__ import annotations
 
