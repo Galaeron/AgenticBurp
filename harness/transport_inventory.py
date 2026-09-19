@@ -119,6 +119,16 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     # ---- llm: model transport, NOT the target ----
     TransportSite("ollama_client.py", CHANNEL_HTTP, SCOPE_LLM, ROUTING_DIRECT,
                   owner="agents", note="Ollama chat/tags transport; model plane, not target."),
+    TransportSite("openai_provider.py", CHANNEL_HTTP, SCOPE_LLM, ROUTING_DIRECT,
+                  owner="llm_provider (P1.1)",
+                  note="OpenAI-compatible chat-completions transport for the optional remote "
+                       "coordinator/critique provider; model plane, not target. Constructed only "
+                       "on explicit config opt-in + $OPENAI_API_KEY (see llm_provider.py)."),
+    TransportSite("anthropic_provider.py", CHANNEL_HTTP, SCOPE_LLM, ROUTING_DIRECT,
+                  owner="llm_provider (P1.1)",
+                  note="Anthropic Messages-API transport for the optional remote coordinator/"
+                       "critique provider; model plane, not target. Constructed only on explicit "
+                       "config opt-in + $ANTHROPIC_API_KEY (see llm_provider.py)."),
 
     # ---- target: discovery / crawl (routing gaps -- not yet on the executor) ----
     TransportSite("api_surface_discovery.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,

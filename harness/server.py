@@ -979,7 +979,13 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
         model_versions={"coordinator": orchestrator.coordinator_model,
                         "agents": sorted({getattr(a, "model", "")
                                           for a in orchestrator.agent_manager.agents.values()
-                                          if getattr(a, "model", "")})})
+                                          if getattr(a, "model", "")}),
+                        # P1.1: which provider actually served each role this run --
+                        # "ollama" unless config explicitly opted a role into a
+                        # remote provider. Read from config, not from a live
+                        # provider object, so this never touches an API key.
+                        "coordinator_provider": (config.get("coordinator") or {}).get("provider", "ollama"),
+                        "critique_provider": (config.get("critique") or {}).get("provider", "ollama")})
     job: dict = {"job_id": job_id, "host": host, "base_url": req.base_url,
                  "status": "running", "task": None, "result": None, "error": None,
                  "started_at": _time.time(), "finished_at": None,

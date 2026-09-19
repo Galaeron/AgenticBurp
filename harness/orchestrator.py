@@ -163,16 +163,32 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # Initialize agent manager (uses plugin system for discovery)
         self.agent_manager = AgentManager(config, self.ollama)
         
+        # Initialize coordinator + critique's LLM provider (P1.1). Every
+        # specialist agent above stays on local Ollama (agent_manager was
+        # already built with self.ollama); build_provider lets ONLY the
+        # coordinator and critique roles optionally point at a stronger
+        # remote model via their own config block's "provider" key. No
+        # "provider" key (the default, unchanged behavior for every existing
+        # deployment) wraps self.ollama unchanged -- a remote provider is
+        # constructed only on an explicit opt-in AND its API key being set
+        # (see llm_provider.build_provider; missing either raises loudly,
+        # never a silent fallback to Ollama).
+        from harness import llm_provider
+        coordinator_provider = llm_provider.build_provider(
+            config["coordinator"], ollama_client=self.ollama)
+        critique_provider = llm_provider.build_provider(
+            config.get("critique", {}) or {}, ollama_client=self.ollama)
+
         # Initialize coordinator
-        self.coordinator = Coordinator(self.ollama, config["coordinator"])
-        
+        self.coordinator = Coordinator(coordinator_provider, config["coordinator"])
+
         # Initialize analysis pipeline
         self.analysis_pipeline = AnalysisPipeline(
             self.agent_manager,
             self.effort_budget,
             store,
             config,
-            ollama_client=self.ollama,
+            ollama_client=critique_provider,
         )
         
         # Initialize fast-path selector
