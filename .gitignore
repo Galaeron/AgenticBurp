@@ -22,6 +22,9 @@ testing/**/*.db
 testing/**/scorecard.json
 testing/**/fixture/
 
+# Nightly CPU-only precision-plumbing check's output (P0.10, regenerated per CI run)
+/SCORECARD.md
+
 # Captured run artifacts can carry live target session tokens (JWTs/cookies) --
 # keep them out of git so a browse/run capture never leaks a secret into history.
 testing/**/run-*-results/
