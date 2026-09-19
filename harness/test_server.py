@@ -122,6 +122,56 @@ class SuppressionEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
 
+class IssueMergeEndpointTests(unittest.TestCase):
+    """P1.8: HTTP-level tests for the operator issue-merge endpoints, same
+    isolated-DB pattern as SuppressionEndpointTests."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
+        import importlib
+        import harness.server as server_module
+        importlib.reload(server_module)
+        from fastapi.testclient import TestClient
+        self.client = TestClient(server_module.app, base_url="http://localhost")
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def test_merge_via_post(self):
+        resp = self.client.post("/issues/example.com/merge",
+                                json={"source_id": "issue-a", "target_id": "issue-b"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["merged"])
+        self.assertEqual(store.all_issue_merges("example.com"), {"issue-a": "issue-b"})
+
+    def test_merge_into_self_is_400(self):
+        resp = self.client.post("/issues/example.com/merge",
+                                json={"source_id": "issue-a", "target_id": "issue-a"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_list_merges_via_get(self):
+        self.client.post("/issues/example.com/merge",
+                         json={"source_id": "issue-a", "target_id": "issue-b"})
+        resp = self.client.get("/issues/example.com/merges")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"issue-a": "issue-b"})
+
+    def test_unmerge_via_delete(self):
+        self.client.post("/issues/example.com/merge",
+                         json={"source_id": "issue-a", "target_id": "issue-b"})
+        resp = self.client.delete("/issues/example.com/merge/issue-a")
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["merged"])
+        self.assertEqual(store.all_issue_merges("example.com"), {})
+
+    def test_unmerge_unknown_source_is_404(self):
+        resp = self.client.delete("/issues/example.com/merge/not-a-real-source")
+        self.assertEqual(resp.status_code, 404)
+
+
 class PrioritizeEndpointTests(unittest.TestCase):
     """HTTP-level coverage for POST /prioritize -- the wiring/chunking
     logic itself (surface_prioritizer.prioritize is mocked out here; its

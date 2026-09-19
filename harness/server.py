@@ -1181,6 +1181,44 @@ async def list_suppressions(authorization: str | None = Header(default=None)):
     return await __import__("asyncio").to_thread(store.list_suppressions)
 
 
+class MergeIssuesRequest(_BaseModel):
+    source_id: str
+    target_id: str
+
+
+@app.post("/issues/{host}/merge")
+async def merge_issues(host: str, req: MergeIssuesRequest,
+                       authorization: str | None = Header(default=None)):
+    """Operator override (P1.8): declare that issue `source_id` is actually
+    the same underlying bug as `target_id` on `host`, folding them together
+    in every subsequent export_issues_for_host() call. Reversible via DELETE
+    /issues/{host}/merge/{source_id} -- see issues.apply_merge_overrides
+    and store.record_issue_merge for why this never mutates the underlying
+    findings or the automatic grouping."""
+    _require_auth(authorization)
+    try:
+        await __import__("asyncio").to_thread(
+            store.record_issue_merge, host, req.source_id, req.target_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"host": host, "source_id": req.source_id, "target_id": req.target_id, "merged": True}
+
+
+@app.delete("/issues/{host}/merge/{source_id}")
+async def unmerge_issue(host: str, source_id: str, authorization: str | None = Header(default=None)):
+    """Reverses a prior merge. 404s if no such override existed, so a caller
+    can tell "nothing happened" from "it worked"."""
+    _require_auth(authorization)
+    removed = await __import__("asyncio").to_thread(store.remove_issue_merge, host, source_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="no such merge override")
+    return {"host": host, "source_id": source_id, "merged": False}
+
+
+@app.get("/issues/{host}/merges")
+async def list_issue_merges(host: str, authorization: str | None = Header(default=None)):
+    _require_auth(authorization)
+    return await __import__("asyncio").to_thread(store.all_issue_merges, host)
 
 
 @app.get("/cache/stats")

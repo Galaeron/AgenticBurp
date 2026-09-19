@@ -195,6 +195,47 @@ class TestFindingSuppression(unittest.TestCase):
         self.assertNotIn("open_redirect", classes)
 
 
+class TestIssueMergeOverrides(unittest.TestCase):
+    """P1.8: persisted, reversible operator issue-merge overrides."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def test_record_and_read_back_a_merge(self):
+        store.record_issue_merge("example.com", "issue-a", "issue-b")
+        self.assertEqual(store.all_issue_merges("example.com"), {"issue-a": "issue-b"})
+
+    def test_merge_is_idempotent(self):
+        store.record_issue_merge("example.com", "issue-a", "issue-b")
+        store.record_issue_merge("example.com", "issue-a", "issue-c")  # re-target
+        self.assertEqual(store.all_issue_merges("example.com"), {"issue-a": "issue-c"})
+
+    def test_cannot_merge_an_issue_into_itself(self):
+        with self.assertRaises(ValueError):
+            store.record_issue_merge("example.com", "issue-a", "issue-a")
+
+    def test_remove_issue_merge_reverses_it(self):
+        store.record_issue_merge("example.com", "issue-a", "issue-b")
+        removed = store.remove_issue_merge("example.com", "issue-a")
+        self.assertTrue(removed)
+        self.assertEqual(store.all_issue_merges("example.com"), {})
+
+    def test_remove_unknown_merge_returns_false(self):
+        self.assertFalse(store.remove_issue_merge("example.com", "not-a-real-source"))
+
+    def test_merges_are_scoped_per_host(self):
+        """Negative control: a merge declared for one host must not leak into
+        another host's issue export."""
+        store.record_issue_merge("a.example.com", "issue-a", "issue-b")
+        self.assertEqual(store.all_issue_merges("b.example.com"), {})
+
+
 class TestPriorFindingsSummaryStripsBackticks(unittest.TestCase):
     """
     Regression test for a real, severe bug found during this project's

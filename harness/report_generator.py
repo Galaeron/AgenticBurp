@@ -548,14 +548,22 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     return generate_markdown_report(host, findings, effort_ledger=effort_ledger, suppressed_count=suppressed_count)
 
 
-def issue_exports(findings: list[dict], proofs_by_case: dict | None = None) -> list[dict]:
+def issue_exports(findings: list[dict], proofs_by_case: dict | None = None,
+                   merges: dict[str, str] | None = None) -> list[dict]:
     """Group store-shaped findings into stable issues and render each as a
     reproducible, secret-free export (T06). This is the machine-readable
     counterpart to the Markdown report: it keeps EVERY affected case/instance
     (not just a winner + count) and links case/proof ids, so an issue exported
-    from one run maps to the same issue id on a patched-fixture retest."""
+    from one run maps to the same issue id on a patched-fixture retest.
+
+    `merges` (P1.8), when given, applies operator-declared REVERSIBLE
+    root-cause merges on top of the automatic grouping -- see
+    issues.apply_merge_overrides. Omitted/empty -> unchanged automatic
+    grouping, exactly as before this parameter existed."""
     from harness import issues
     grouped = issues.group_findings_into_issues(findings)
+    if merges:
+        grouped = issues.apply_merge_overrides(grouped, merges)
     return [issues.export_issue(i, proofs_by_case=proofs_by_case) for i in grouped]
 
 
@@ -563,7 +571,8 @@ def export_issues_for_host(url: str) -> list[dict]:
     """Convenience: pull a host's findings from store.py and return their T06 issue
     exports, enriched with the FULL append-only proof-attempt history per case
     (store.proofs_for_case) -- so every attempt, including a patched-fixture retest,
-    is preserved with its own proof id and verdict (T06 history preservation)."""
+    is preserved with its own proof id and verdict (T06 history preservation).
+    Also applies any operator-declared merge overrides for this host (P1.8)."""
     from harness import store
     findings = store.all_host_findings(url)
     proofs_by_case: dict = {}
@@ -573,4 +582,5 @@ def export_issues_for_host(url: str) -> list[dict]:
             attempts = store.proofs_for_case(cid)   # every recorded attempt, append-only
             if attempts:
                 proofs_by_case[cid] = attempts
-    return issue_exports(findings, proofs_by_case=proofs_by_case)
+    merges = store.all_issue_merges(store.host_of(url))
+    return issue_exports(findings, proofs_by_case=proofs_by_case, merges=merges)

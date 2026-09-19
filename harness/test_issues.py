@@ -92,6 +92,81 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(issues.issue_id_for(a), issues.issue_id_for(b))
 
 
+class MergeOverrideTests(unittest.TestCase):
+    """P1.8: operator-declared, reversible root-cause merges on top of the
+    automatic grouping."""
+
+    def _two_distinct_issues(self):
+        fs = [
+            F("https://x/api/search", "sqli", method="GET", ploc="query", pname="search",
+              case_id="c1", proof_id="p1"),
+            F("https://x/api/search", "sqli", method="GET", ploc="query", pname="sort",
+              case_id="c2", proof_id="p2"),
+        ]
+        return issues.group_findings_into_issues(fs)
+
+    def test_merge_combines_members_under_the_target_id(self):
+        grouped = self._two_distinct_issues()
+        source, target = grouped[0], grouped[1]
+        merged = issues.apply_merge_overrides(grouped, {source.issue_id: target.issue_id})
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].issue_id, target.issue_id)
+        self.assertEqual(len(merged[0].members), 2)
+        self.assertEqual(sorted(merged[0].case_ids), ["c1", "c2"])
+
+    def test_different_parameters_do_not_merge_without_an_explicit_override(self):
+        """Negative control: two findings on DIFFERENT parameters must NOT
+        merge on their own -- only an explicit operator override folds them
+        together. This is the plan's own required negative control."""
+        grouped = self._two_distinct_issues()
+        self.assertEqual(len(grouped), 2)
+        self.assertNotEqual(grouped[0].issue_id, grouped[1].issue_id)
+        # No merges dict at all -> apply_merge_overrides is a no-op.
+        unmerged = issues.apply_merge_overrides(grouped, {})
+        self.assertEqual(len(unmerged), 2)
+
+    def test_merge_is_reversible_by_removing_the_override(self):
+        """Reversibility: removing the override entry and recomputing from
+        the SAME underlying issues restores the original two-issue split
+        exactly -- no member/case/proof is lost either way."""
+        grouped = self._two_distinct_issues()
+        source, target = grouped[0], grouped[1]
+        merges = {source.issue_id: target.issue_id}
+
+        merged = issues.apply_merge_overrides(grouped, merges)
+        self.assertEqual(len(merged), 1)
+
+        del merges[source.issue_id]  # the reversal -- just data removal
+        restored = issues.apply_merge_overrides(grouped, merges)
+        self.assertEqual(len(restored), 2)
+        self.assertEqual({i.issue_id for i in restored}, {source.issue_id, target.issue_id})
+        self.assertEqual(len(restored[0].members) + len(restored[1].members), 2)
+
+    def test_transitive_merge_chain_collapses_to_the_terminal_target(self):
+        fs = [
+            F("https://x/api/a", "sqli", method="GET", ploc="query", pname="a", case_id="ca"),
+            F("https://x/api/b", "sqli", method="GET", ploc="query", pname="b", case_id="cb"),
+            F("https://x/api/c", "sqli", method="GET", ploc="query", pname="c", case_id="cc"),
+        ]
+        grouped = issues.group_findings_into_issues(fs)
+        a, b, c = grouped
+        merges = {a.issue_id: b.issue_id, b.issue_id: c.issue_id}
+        merged = issues.apply_merge_overrides(grouped, merges)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].issue_id, c.issue_id)
+        self.assertEqual(sorted(merged[0].case_ids), ["ca", "cb", "cc"])
+
+    def test_cycle_is_not_dropped_or_infinite_looped(self):
+        grouped = self._two_distinct_issues()
+        source, target = grouped[0], grouped[1]
+        merges = {source.issue_id: target.issue_id, target.issue_id: source.issue_id}
+        merged = issues.apply_merge_overrides(grouped, merges)
+        # A cycle must never lose data -- both issues' members are still
+        # present somewhere in the result, however it resolves the cycle.
+        total_members = sum(len(i.members) for i in merged)
+        self.assertEqual(total_members, 2)
+
+
 class RetestLinkageTests(unittest.TestCase):
     def test_patched_retest_links_to_original_issue(self):
         # run 1: confirmed on the vulnerable fixture

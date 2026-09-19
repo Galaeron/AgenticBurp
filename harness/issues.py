@@ -244,6 +244,57 @@ def group_findings_into_issues(findings: list[dict]) -> list[Issue]:
     return [by_key[k] for k in order]
 
 
+def apply_merge_overrides(issues: list[Issue], merges: dict[str, str]) -> list[Issue]:
+    """Apply operator-declared merge overrides on top of the automatic
+    grouping (P1.8's "root-cause dedup" -- an operator's "these two issues
+    are actually the same underlying bug" call that the conservative
+    automatic key alone cannot make).
+
+    `merges` maps a SOURCE issue_id to the TARGET issue_id it should be
+    folded into -- typically `store.all_issue_merges(host)`. Resolved
+    transitively (A->B, B->C folds A and B into C); a cycle or a target that
+    is not among `issues` leaves that entry unresolved rather than dropping
+    data or looping forever. Every member from every folded issue survives
+    on the resulting Issue (duplicate members, from applying the override to
+    the target issue itself, are not double-counted).
+
+    Reversible BY CONSTRUCTION: `merges` is plain, separately-persisted data
+    (see store.record_issue_merge/remove_issue_merge) applied on top of
+    `group_findings_into_issues`'s deterministic output -- it never mutates
+    a finding or an Issue. Removing an entry and recomputing from the SAME
+    `issues` restores the pre-merge grouping exactly; no history is lost."""
+    by_id = {iss.issue_id: iss for iss in issues}
+
+    def _resolve(issue_id: str, seen: frozenset[str] = frozenset()) -> str:
+        target = merges.get(issue_id)
+        if not target or target not in by_id or target == issue_id or issue_id in seen:
+            return issue_id
+        return _resolve(target, seen | {issue_id})
+
+    merged: dict[str, Issue] = {}
+    order: list[str] = []
+    for iss in issues:
+        final_id = _resolve(iss.issue_id)
+        canonical_source = by_id[final_id]
+        canonical = merged.get(final_id)
+        if canonical is None:
+            canonical = Issue(
+                issue_id=canonical_source.issue_id,
+                endpoint_family=canonical_source.endpoint_family,
+                method=canonical_source.method,
+                vulnerability_class=canonical_source.vulnerability_class,
+                affected_input=canonical_source.affected_input,
+                authorization_boundary=canonical_source.authorization_boundary,
+                host=canonical_source.host,
+            )
+            merged[final_id] = canonical
+            order.append(final_id)
+        for member in iss.members:
+            if member not in canonical.members:
+                canonical.members.append(member)
+    return [merged[k] for k in order]
+
+
 # --------------------------------------------------------------------------- #
 # Export -- reproducible, secret-free
 # --------------------------------------------------------------------------- #

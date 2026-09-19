@@ -208,6 +208,23 @@ CREATE TABLE IF NOT EXISTS ownership_facts (
 );
 """
 
+# P1.8: operator-declared, REVERSIBLE issue-merge overrides (issues.py's
+# automatic grouping stays untouched; this is a separate, removable layer on
+# top of it). Keyed by (host, source_id) so unmerging is just DELETEing the
+# row -- group_findings_into_issues()'s output is recomputed from the
+# underlying findings every time, so removing the override row restores the
+# original split exactly, with no destructive mutation ever applied to a
+# finding or an Issue.
+_ISSUE_MERGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS issue_merges (
+    host TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (host, source_id)
+);
+"""
+
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(_DB_PATH, timeout=10.0)
@@ -220,6 +237,7 @@ def _connect() -> sqlite3.Connection:
     conn.executescript(_IDENTITY_SCHEMA)
     conn.executescript(_EVIDENCE_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
+    conn.executescript(_ISSUE_MERGE_SCHEMA)
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -845,6 +863,50 @@ def list_suppressions() -> list[dict]:
     finally:
         conn.close()
     return [{"fingerprint": fp, "reason": reason, "suppressed_at": ts} for (fp, reason, ts) in rows]
+
+
+def record_issue_merge(host: str, source_id: str, target_id: str) -> None:
+    """Operator override (P1.8): fold issue `source_id` into `target_id` for
+    `host`. Idempotent (INSERT OR REPLACE), like suppress_finding. Reversible
+    by remove_issue_merge -- this is a separate override table, never a
+    mutation of the underlying findings or the deterministic issue_key
+    grouping, so removing the row exactly restores the automatic split."""
+    if source_id == target_id:
+        raise ValueError("cannot merge an issue into itself")
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO issue_merges (host, source_id, target_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (host, source_id, target_id, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def remove_issue_merge(host: str, source_id: str) -> bool:
+    """Reverses a prior record_issue_merge. Returns True if a row was removed."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM issue_merges WHERE host = ? AND source_id = ?", (host, source_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def all_issue_merges(host: str) -> dict[str, str]:
+    """{source_id: target_id} for every active merge override on `host`."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT source_id, target_id FROM issue_merges WHERE host = ?", (host,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return {source_id: target_id for (source_id, target_id) in rows}
 
 
 def save_engagement(host: str, state: dict) -> None:
