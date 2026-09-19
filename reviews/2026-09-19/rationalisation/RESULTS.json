@@ -1,0 +1,40 @@
+{
+  "head_at_completion": "8325b05cd40eeda5ded4f61840d981fb1fdbbcdc",
+  "changed_recorded_sources": [],
+  "runtime": "Python 3.12.14, .venv-rationalisation; see REVIEW.md for dependency caveat",
+  "smoke": {
+    "tests": 90,
+    "seconds": 27.923,
+    "evidence_gate": "passed",
+    "exit_code": 0
+  },
+  "full": {
+    "unittest": {
+      "tests": 2295,
+      "skipped": 2,
+      "seconds": 234.228,
+      "status": "OK"
+    },
+    "evidence_gate": "passed",
+    "pytest_native": {
+      "passed": 38
+    },
+    "score_plumbing": {
+      "tests": 13,
+      "status": "OK"
+    },
+    "evaluation_contracts": {
+      "tests": 42,
+      "status": "OK"
+    },
+    "exit_code": 0
+  },
+  "log_sha256": {
+    "review_test_smoke_rationalisation_complete.log": "6e69a9a6a9c2eb2d49ae24bc21c12e93c2d5fd5015dd1ec1543768b9fcb26b24",
+    "review_test_full_rationalisation_complete.log": "216912b5fcfd5c22b1e031f564d9d03623e75f52cbe7405dbda090a0981d370e",
+    "review_test_transport_before.log": "142263ea6460b3e4f1cb584b129fa05ad76576f5a551851ba9ff908ecca5fad8",
+    "review_test_transport_after.log": "cbfc46de1cf317b50f15da41626cbb4462421e019629fe7cb46f8def5c736f43",
+    "review_test_shape_diagnostic.log": "e34ff8719e5429b8141d34f9aad89b1233c22eb6868d83fcab9ad26a33573e47",
+    "review_test_shape_isolated.log": "ad254c88390127c5b5852f92e5f457000cf523bd2adccd3b99367944b31e1e43"
+  }
+}

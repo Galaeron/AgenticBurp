@@ -1,76 +1,61 @@
 # Current state — 2026-09-19
 
-## Checkout and scope
+## Checkout
 
-Branch `reconciliation-backlog`; base HEAD `8f63511` at this audit's start.
-The checkout is dirty and has concurrent product work. Do not assume HEAD alone
-identifies the tested tree, or stage unrelated edits. This session rationalizes
-documentation, test selection and repeated transport tests; it does not certify
-new exploit capability, current model accuracy or a Java build.
+Branch `reconciliation-backlog`. Consolidation committed in `8325b05`; the final
+test run completed on that HEAD plus the pre-existing uncommitted
+`harness/ollama_client.py` and `harness/test_ollama_client.py` edits. Preserve them.
+All 377 recorded source/config hashes stayed unchanged during final verification.
+The clean commit alone was not the tested tree.
 
-## Current orientation
+## What changed
 
-- AGENTS.md is the shared onboarding source; CLAUDE.md redirects there.
-- README.md covers setup; docs/ indexes architecture and test evidence boundaries.
-- `python -m harness.suite full` runs harness unittest, pytest-native, score
-  plumbing and standalone evaluation tests. Smoke is a smaller caller-level gate.
-- Seven validator transport adapters share `test_validator_transport.py`:
-  14 positive/denied scenarios remain; CORS-specific controls remain separately.
-- Discovery guards now reject main-only modules, mixed uncollected tests and
-  shadowed definitions, and verify actual CI selections. No bulk test deletion
-  was justified by age or mocked boundaries.
+AGENTS.md is the shared onboarding source; CLAUDE.md redirects there. README.md
+covers setup, docs/ indexes task-specific architecture and evidence boundaries.
+The old accumulated onboarding is preserved in archive/onboarding-2026-09-19/.
 
-## Verification in this session
+Seven transport adapters now share 14 positive/denied scenarios in
+`test_validator_transport.py`; the two CORS-specific tests remain separately.
+Six redundant test files were removed, preserving their assertions. Discovery
+checks reject uncollected/mixed-style tests, main-only files and shadowed names.
 
-An isolated `.venv-rationalisation` was created with the declared core/dev
-dependencies, Flask and proxy dependencies to work around the bundled
-runtime's incomplete old dependency directories; Python 3.12 requires an
-explicit typing-extensions metadata workaround (see docs/TESTING.md).
-Sandbox access to existing audit-log and pytest temp paths blocked that
-environment's initial full run.
+Six requirement-evidence IDs were still pre-package names: corrected them to
+`harness.*` and added real loader-ID controls. The XXE smoke now isolates its
+intended validator and forbids an unexpected shared collaborator. Canonical
+smoke/full commands enforce the evidence gate and use fresh local run IDs.
 
-`python -m harness.suite full` was subsequently run to completion against
-this exact working tree (this rationalization plus the concurrent
-role-crawl/task-graph/agent/knowledge work below, both present) on the
-ambient Python 3.14 interpreter: harness unittest discovery **2293 OK**
-(386s), native pytest (`test_plugin_system`/`test_execution_protocol`/
-`test_hardening`) **38 passed**, `testing/` **13 OK**, `evaluation_integrity/
-tests` **42 OK** — combined exit 0. This is a fresh pass of the actual suite
-selections, not a re-report of the blocked `.venv-rationalisation` attempt
-above; it does not by itself certify model accuracy, live-target recall, or
-the caller-level integration gaps the implementation review raised.
+## Verified here
 
-## Open work and inherited evidence
+From the repository root, using `.venv-rationalisation/Scripts/python.exe`:
 
-The [implementation review](reviews/2026-09-19/implementation-review/REVIEW.md)
-reported evaluation integration, proof binding, provenance/health, shared-memory
-privacy, export/UI, coverage attribution, comparison and SARIF gaps at the base
-revision. Concurrent edits to these areas appeared during this audit; their
-completion is not certified here. Helper tests alone cannot close caller-level
-integration findings. Use the review as a task-specific checklist, not onboarding.
+- `-m harness.suite smoke`: **90 tests OK**, 27.923s, evidence gate passed.
+- `-m harness.suite full`: **2,295 unittest tests OK, 2 browser skips**;
+  **38 pytest passed**, **13 score/plumbing + 42 evaluation tests OK**;
+  evidence gate passed, combined exit 0. Unittest duration: 234.228s.
+- Original transport group: 16 tests OK; consolidated group retains all 16
+  scenarios. No assertion was removed merely because it was old or mocked.
 
-Other pre-existing work includes Ollama/agent, model, role-crawl and task-graph
-changes plus new attack-tree/cross-role tests. Leave it with its owner.
+These are offline/stubbed-model and owned-loopback results. Python 3.12.14 was
+used with isolated dependencies and a reported proxy/typing-extensions metadata
+conflict; initial dependency/sandbox failures are documented, not hidden as skips.
+See [TESTING.md](docs/TESTING.md) and the [audit](reviews/2026-09-19/rationalisation/REVIEW.md)
+for commands, old-to-new mapping, runtime limits, log hashes and source binding.
+A separate task's Python 3.14 pass is recorded as owner-reported in that audit.
 
-**Update from that owner's session (same day, `reconciliation-backlog`):** the
-role-crawl/task-graph/agent/knowledge work above is DONE, not WIP — it
-implemented `reviews/2026-09-19/IMPLEMENTATION_PLAN.md` P1.2/P2.3 (RAG),
-P1.3 (multi-role probe), P1.4 (attack tree), P1.14 (tactical guides), four
-focused commits (`1b0b1d5`..`506e2e5`), each with its own hermetic tests
-(9+21+16+13 new tests) and a negative control per the plan's #0 discipline.
-Full suite green after the last commit: `python -m unittest discover -t .
--s harness -p "test_*.py"` → **2285 OK**, exit 0, ~388s (run concurrently
-with this audit session's own edits to unrelated files). Not live-verified
-against a target/model — hermetic only, same caveat as the rest of this
-session's inherited work. See the commit messages for what each item does;
-not re-narrated here to avoid duplicating/drifting from them.
+## Other work and remaining verification
 
-Prior suite counts and live scores are historical/reported, not fresh evidence.
-The earlier integrated live run used
-`testing/vulncorp-helpdesk/maxrun/run_maxcov_integrated.py`; its completion and
-results were not checked here. Do not stop a process based on an old status note.
-No model/target run, hosted CI or Java build was performed for this rationalization.
+Concurrent commits `1b0b1d5` through `506e2e5` added role probing, attack-tree
+search, knowledge retrieval and tactical guides. Commits `fe30f64` through
+`57bcc02` address the dated implementation review's proof, evaluation, privacy,
+coverage, export and integration findings. Current consumers were located in
+score/export/coverage paths; this audit does not independently certify every
+review requirement or live efficacy. Inspect the specific caller and its tests.
+The [review](reviews/2026-09-19/implementation-review/REVIEW.md) describes its base
+revision, not an automatically current backlog.
 
-The complete pre-consolidation notes (including pre-existing uncommitted text)
-are preserved in [the onboarding snapshot](archive/onboarding-2026-09-19/INDEX.md).
-Read them only for a specific historical question; do not restore the session chain.
+No real-model benchmark, blind-target run, hosted CI or Java build was performed
+here. Cached scores and older suite counts remain historical. The earlier live
+integrated driver was `testing/vulncorp-helpdesk/maxrun/run_maxcov_integrated.py`;
+its completion/results and current process state were not checked in this task.
+Do not restart unrelated processes based on old notes. Keep future updates in
+this rolling file rather than appending session histories.
