@@ -365,16 +365,24 @@ def _connect() -> sqlite3.Connection:
     # Retrievable knowledge notes (knowledge.py's Memory Retriever) -- tester-
     # authored methodology writeups and auto-remembered confirmed findings,
     # merged with the built-in corpus at decision time. `source` distinguishes
-    # them (manual | finding); `fingerprint` de-dupes.
+    # them (manual | finding); `fingerprint` de-dupes. `engagement_id` (P2.3):
+    # '' means globally shared (every legacy row, and every note saved without
+    # an explicit scope -- unchanged prior behaviour); a non-empty value is a
+    # PRIVATE note visible only when that same engagement_id is queried --
+    # never to a different engagement (see list_knowledge_notes).
     conn.execute("""
         CREATE TABLE IF NOT EXISTS knowledge_notes (
             fingerprint TEXT PRIMARY KEY,
             tags_json TEXT NOT NULL DEFAULT '[]',
             note TEXT NOT NULL,
             source TEXT NOT NULL DEFAULT 'manual',
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            engagement_id TEXT NOT NULL DEFAULT ''
         )
     """)
+    knowledge_cols = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_notes)")}
+    if "engagement_id" not in knowledge_cols:
+        conn.execute("ALTER TABLE knowledge_notes ADD COLUMN engagement_id TEXT NOT NULL DEFAULT ''")
     conn.commit()
     return conn
 
@@ -940,41 +948,65 @@ def load_engagement(host: str) -> dict | None:
         return None
 
 
-def save_knowledge_note(tags: list, note: str, source: str = "manual") -> bool:
-    """Persist a retrievable knowledge note (idempotent by content). Returns
+def save_knowledge_note(tags: list, note: str, source: str = "manual", engagement_id: str = "") -> bool:
+    """Persist a retrievable knowledge note (idempotent by content WITHIN a
+    scope -- the fingerprint folds in engagement_id so the same note text
+    saved privately for two different engagements is two distinct rows, never
+    a collision that silently drops the second one). `engagement_id=""`
+    (default, unchanged prior behaviour) is the globally-shared scope; a
+    non-empty value marks the note PRIVATE to that engagement (P2.3). Returns
     whether a new row was inserted."""
     note = (note or "").strip()
     if not note:
         return False
-    fp = hashlib.sha256(("|".join(sorted(tags)) + "\x1f" + note).encode("utf-8")).hexdigest()[:24]
+    fp = hashlib.sha256(
+        ("|".join(sorted(tags)) + "\x1f" + note + "\x1f" + (engagement_id or "")).encode("utf-8")
+    ).hexdigest()[:24]
     conn = _connect()
     try:
         cur = conn.execute(
-            "INSERT OR IGNORE INTO knowledge_notes (fingerprint, tags_json, note, source, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (fp, json.dumps(list(tags)), note, source, time.time()))
+            "INSERT OR IGNORE INTO knowledge_notes "
+            "(fingerprint, tags_json, note, source, created_at, engagement_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (fp, json.dumps(list(tags)), note, source, time.time(), engagement_id or ""))
         conn.commit()
         return cur.rowcount > 0
     finally:
         conn.close()
 
 
-def list_knowledge_notes(limit: int = 500) -> list[dict]:
-    """All stored knowledge notes, newest first."""
+def list_knowledge_notes(limit: int = 500, engagement_id: str | None = None) -> list[dict]:
+    """Stored knowledge notes, newest first, scoped for cross-engagement
+    privacy (P2.3):
+
+      - `engagement_id=None` (default, unchanged prior behaviour): only the
+        globally-shared notes (engagement_id == '').
+      - `engagement_id="some-id"`: the globally-shared notes PLUS that
+        engagement's own private notes -- never another engagement's private
+        notes. A private note saved under one engagement_id is therefore
+        structurally unreachable from any other engagement_id or from the
+        global-only default."""
     conn = _connect()
     try:
-        rows = conn.execute(
-            "SELECT tags_json, note, source, created_at FROM knowledge_notes "
-            "ORDER BY created_at DESC LIMIT ?", (int(limit),)).fetchall()
+        if engagement_id is None:
+            rows = conn.execute(
+                "SELECT tags_json, note, source, created_at, engagement_id FROM knowledge_notes "
+                "WHERE engagement_id = '' ORDER BY created_at DESC LIMIT ?", (int(limit),)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT tags_json, note, source, created_at, engagement_id FROM knowledge_notes "
+                "WHERE engagement_id = '' OR engagement_id = ? "
+                "ORDER BY created_at DESC LIMIT ?", (engagement_id, int(limit))).fetchall()
     finally:
         conn.close()
     out = []
-    for tags_json, note, source, ts in rows:
+    for tags_json, note, source, ts, eng_id in rows:
         try:
             tags = json.loads(tags_json)
         except (json.JSONDecodeError, TypeError):
             tags = []
-        out.append({"tags": tags, "note": note, "source": source, "created_at": ts})
+        out.append({"tags": tags, "note": note, "source": source, "created_at": ts,
+                    "engagement_id": eng_id})
     return out
 
 

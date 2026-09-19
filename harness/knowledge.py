@@ -117,14 +117,18 @@ def _tokenize(text: str) -> set[str]:
     return set(re.findall(r"[a-z][a-z0-9_-]{2,}", text.lower()))
 
 
-def _external_notes() -> list[dict]:
+def _external_notes(engagement_id: str = "") -> list[dict]:
     """Tester-authored writeups + auto-remembered confirmed findings, loaded from
     the store at decision time (VulnBot's Memory Retriever role -- grounding on
     accumulated experience, not just the model's weights). Best-effort: a store
-    hiccup degrades to the built-in corpus alone, never an error."""
+    hiccup degrades to the built-in corpus alone, never an error.
+
+    `engagement_id` (P2.3, optional): "" (default) keeps the prior global-only
+    behaviour; a non-empty value additionally surfaces THAT engagement's own
+    private notes, never another engagement's -- see store.list_knowledge_notes."""
     try:
         from harness import store
-        rows = store.list_knowledge_notes()
+        rows = store.list_knowledge_notes(engagement_id=(engagement_id or None))
     except Exception:
         return []
     out = []
@@ -136,11 +140,15 @@ def _external_notes() -> list[dict]:
     return out
 
 
-def remember_finding(vulnerability_class: str, url: str, evidence: str = "") -> bool:
+def remember_finding(vulnerability_class: str, url: str, evidence: str = "",
+                     engagement_id: str = "") -> bool:
     """Persist a confirmed finding as a retrievable note -- the harness's own
     'past task' memory. Stores only the class + a path shape (no bodies/values),
     so future analyses of similar surface get grounded in what already worked
-    here. Returns whether a new note was stored."""
+    here. `engagement_id` (P2.3, optional): "" (default) saves a globally-
+    shared note, matching prior behaviour; a non-empty value saves it PRIVATE
+    to that engagement (see store.save_knowledge_note). Returns whether a new
+    note was stored."""
     try:
         from harness import store
         from urllib.parse import urlsplit
@@ -148,18 +156,24 @@ def remember_finding(vulnerability_class: str, url: str, evidence: str = "") -> 
         note = (f"On this engagement, {vulnerability_class} was CONFIRMED at a "
                 f"{path}-shaped endpoint. Prioritize the same check on similar endpoints.")
         tags = list(_tokenize(vulnerability_class) | _tokenize(path))
-        return store.save_knowledge_note(tags, note, source="finding")
+        return store.save_knowledge_note(tags, note, source="finding", engagement_id=engagement_id)
     except Exception:
         return False
 
 
-def retrieve(agent_name: str, exchange: HttpExchange, top_k: int = 2) -> str:
+def retrieve(agent_name: str, exchange: HttpExchange, top_k: int = 2, engagement_id: str = "") -> str:
     """
     Keyword-overlap retrieval (no embeddings): score the built-in corpus AND the
     tester's stored notes / remembered findings by how many of their tags/words
     appear in the agent's own name plus a slice of the exchange (URL + first part
     of the body), return the top_k notes as a single prompt-ready block.
     Deterministic and cheap enough to run on every call.
+
+    `engagement_id` (P2.3, optional): "" (default) keeps the prior global-only
+    behaviour for external notes; a non-empty value also surfaces that
+    engagement's own PRIVATE notes -- never another engagement's (see
+    _external_notes/store.list_knowledge_notes). The built-in corpus is always
+    shared -- it carries no engagement-specific data at all.
     """
     query_tokens = _tokenize(agent_name) | _tokenize(exchange.url) | _tokenize(exchange.request_body[:500])
 
@@ -170,7 +184,7 @@ def retrieve(agent_name: str, exchange: HttpExchange, top_k: int = 2) -> str:
         overlap = len(query_tokens & set(entry["tags"]))
         if overlap > 0:
             scored.append((overlap, 1, entry["note"]))
-    for entry in _external_notes():
+    for entry in _external_notes(engagement_id=engagement_id):
         overlap = len(query_tokens & entry["tags"])
         if overlap > 0:
             scored.append((overlap, 0, entry["note"]))
