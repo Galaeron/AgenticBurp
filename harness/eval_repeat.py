@@ -27,6 +27,11 @@ class EvalRun:
     precision: float
     per_class_recall: dict = field(default_factory=dict)
     seed: int = 0
+    # P1.7: which corpus (+ implicitly, whatever budget/config the caller
+    # bundles into this label -- e.g. "test-target@budget400") this run was
+    # scored against. Empty means unlabeled; EvalReport.compare() treats an
+    # unlabeled corpus the same as a mismatched one -- never assumed same.
+    corpus_id: str = ""
 
 
 @dataclass
@@ -73,6 +78,35 @@ class EvalReport:
                     f"{metric} variance too high to trust the mean "
                     f"(stdev {s[metric]['stdev']} over {s[metric]['n']} runs)")
         return (not reasons, reasons)
+
+    def corpus_ids(self) -> set[str]:
+        return {r.corpus_id for r in self.runs if r.corpus_id}
+
+    def compare(self, other: "EvalReport") -> dict:
+        """Compare this report's summary against another's (e.g. two model
+        variants, or before/after a change), honestly labelling whether the
+        delta can be attributed to the model alone (P1.7). A delta is only
+        `attributable_to_model_only=True` when BOTH reports carry the SAME
+        non-empty corpus_id set -- an unlabeled corpus is treated exactly
+        like a mismatched one (never assumed to match), so a real
+        cross-corpus or changed-budget comparison can never silently read
+        as "the model caused this"."""
+        mine, theirs = self.corpus_ids(), other.corpus_ids()
+        same_corpus = bool(mine) and mine == theirs
+        s1, s2 = self.summary(), other.summary()
+
+        def _delta(metric: str):
+            a, b = s1[metric]["mean"], s2[metric]["mean"]
+            return round(b - a, 4) if (a is not None and b is not None) else None
+
+        return {
+            "recall_delta": _delta("recall"),
+            "precision_delta": _delta("precision"),
+            "attributable_to_model_only": same_corpus,
+            "reason": ("same corpus on both sides" if same_corpus else
+                      f"different or unlabeled corpora ({mine or '(none)'} vs {theirs or '(none)'}) "
+                      "-- this delta may reflect corpus/budget differences, not the model alone"),
+        }
 
 
 def run_repeated(scorer, seeds, *, recall_floor: float | None = None,

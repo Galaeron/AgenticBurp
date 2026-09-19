@@ -1,7 +1,7 @@
 """W-23: repeated eval reports variance and gates on the mean, not one run."""
 import unittest
 
-from harness.eval_repeat import EvalRun, run_repeated
+from harness.eval_repeat import EvalReport, EvalRun, run_repeated
 
 
 def _scorer(recalls, precisions):
@@ -56,6 +56,51 @@ class RepeatedEvalTests(unittest.TestCase):
                            list(range(5)), recall_floor=0.80, precision_floor=0.50)
         ok, reasons = rep.passes_floor()
         self.assertTrue(ok, reasons)
+
+    def test_summary_reports_run_count_and_uncertainty(self):
+        """P1.7: the summary must surface HOW MANY runs backed the mean and
+        its spread (n/stdev/min/max), not just a bare number."""
+        rep = run_repeated(_scorer([0.8, 0.7, 0.75, 0.72, 0.78], [0.6] * 5), list(range(5)))
+        s = rep.summary()
+        self.assertEqual(s["recall"]["n"], 5)
+        for key in ("mean", "stdev", "min", "max", "n", "high_variance"):
+            self.assertIn(key, s["recall"])
+            self.assertIn(key, s["precision"])
+
+
+class CorpusAwareComparisonTests(unittest.TestCase):
+    """P1.7: a comparison between two eval reports must never present a
+    cross-corpus (or budget-changed) delta as a model-only effect."""
+
+    def _report(self, recalls, corpus_id):
+        runs = [EvalRun(recall=r, precision=0.6, seed=i, corpus_id=corpus_id)
+                for i, r in enumerate(recalls)]
+        return EvalReport(runs=runs)
+
+    def test_same_corpus_both_sides_is_attributable_to_model(self):
+        a = self._report([0.70] * 5, corpus_id="test-target@budget400")
+        b = self._report([0.80] * 5, corpus_id="test-target@budget400")
+        delta = a.compare(b)
+        self.assertTrue(delta["attributable_to_model_only"])
+        self.assertAlmostEqual(delta["recall_delta"], 0.10, places=4)
+
+    def test_different_corpus_is_not_attributable_to_model(self):
+        """Negative control: a delta between two DIFFERENT corpora must be
+        flagged, never silently presented as a pure model effect."""
+        a = self._report([0.70] * 5, corpus_id="test-target@budget400")
+        b = self._report([0.90] * 5, corpus_id="juiceshop-full@budget400")
+        delta = a.compare(b)
+        self.assertFalse(delta["attributable_to_model_only"])
+        self.assertIn("different or unlabeled corpora", delta["reason"])
+
+    def test_unlabeled_corpus_is_not_assumed_to_match(self):
+        """Negative control: an eval run with NO corpus_id must never be
+        treated as matching another unlabeled run just because both are
+        blank -- absence of a label is not evidence of a match."""
+        a = self._report([0.70] * 5, corpus_id="")
+        b = self._report([0.90] * 5, corpus_id="")
+        delta = a.compare(b)
+        self.assertFalse(delta["attributable_to_model_only"])
 
 
 if __name__ == "__main__":
