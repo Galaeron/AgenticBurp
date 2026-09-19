@@ -232,6 +232,139 @@ class EndpointAccess:
                 "fingerprints": self.fingerprints}
 
 
+@dataclass
+class CrossRoleOutcome:
+    """Result of one ACTIVE cross-role object probe: role `requester_role`
+    replaying its own credentials against an object id known to be OWNED by
+    `owner_role` (a specific, real id -- not the shared templated id_fill
+    `_compare_identities` uses). This is the direct test broken object-level
+    authorization turns on: does B's session get A's actual data."""
+    method: str
+    path: str
+    owner_role: str
+    owner_object_id: str
+    requester_role: str
+    status: int | None
+    classification: str   # "leaked" | "denied" | "error"
+    finding: Finding | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "method": self.method, "path": self.path,
+            "owner_role": self.owner_role, "owner_object_id": self.owner_object_id,
+            "requester_role": self.requester_role, "status": self.status,
+            "classification": self.classification,
+            "finding": self.finding.model_dump() if self.finding else None,
+        }
+
+
+def _cross_role_finding(method: str, url: str, owner_role: str, requester_role: str,
+                        status: int | None) -> Finding:
+    return Finding(
+        vulnerability_class="idor",
+        confidence=0.9,
+        summary=(f"{method} {url} -- role '{requester_role}' was served role '{owner_role}'s' "
+                 f"own object (HTTP {status}) using {requester_role}'s own credentials. "
+                 f"Object-level authorization is not enforced across identities."),
+        evidence=(f"{requester_role}'s session requested the object id owned by {owner_role} "
+                  f"at {method} {url} and received a substantive HTTP {status} response."),
+        suggested_test=(f"Repeat this exact request as '{requester_role}' against an object id "
+                        f"known to belong to '{owner_role}'; a proper control returns 403/404, "
+                        f"not the owner's data."),
+        basis="derived",
+        severity="high",
+        owasp_category="A01:2021-Broken Access Control",
+        confirmed=True,  # this IS the active confirmation -- sent and observed the leak
+        validation_hints=[f"cross_role_probe:{method}:{url}"],
+    )
+
+
+async def probe_cross_role_objects(
+    base_url: str,
+    roles: list[RoleSession],
+    method: str,
+    path: str,
+    owned_object_ids: dict,        # owner role -> the real object id that role owns
+    *,
+    allowed_hosts: list[str] | None = None,
+    timeout: float = 15.0,
+    run_context=None,
+    session_refs: list[str | None] | None = None,
+) -> list[CrossRoleOutcome]:
+    """ACTIVELY probe every (owner, requester) pair, owner != requester, for one
+    object-scoped endpoint: build the URL from the OWNER's real object id, send
+    it with the REQUESTER's own credentials, and classify the result.
+
+      - "leaked": the requester got a substantive 2xx for another role's object
+        -- broken object-level authorization (BOLA/IDOR), carries a Finding.
+      - "denied": 401/403/404/redirect/empty -- the negative control proving
+        the endpoint DOES scope this object to its owner for this pair.
+      - "error": the request itself failed (network/scope), not a security
+        signal either way.
+
+    `session_refs`, when supplied, must align 1:1 with `roles` (same contract
+    as `crawl_roles`)."""
+    role_by_name = {r.role: (i, r) for i, r in enumerate(roles)}
+    outcomes: list[CrossRoleOutcome] = []
+    for owner_role, obj_id in owned_object_ids.items():
+        if not obj_id or owner_role not in role_by_name:
+            continue
+        url = map_._build_url(base_url, path, str(obj_id))
+        if not map_._host_allowed(url, allowed_hosts):
+            continue
+        for requester_role, (role_index, r) in role_by_name.items():
+            if requester_role == owner_role:
+                continue
+            session_ref = session_refs[role_index] if session_refs is not None else None
+            status, body, _ = await _probe(method, url, r.norm_headers(), timeout,
+                                           run_context=run_context, session_ref=session_ref)
+            if status is None:
+                classification = "error"
+            elif map_._substantive(status, body):
+                classification = "leaked"
+            else:
+                classification = "denied"
+            outcome = CrossRoleOutcome(method=method, path=path, owner_role=owner_role,
+                                       owner_object_id=str(obj_id), requester_role=requester_role,
+                                       status=status, classification=classification)
+            if classification == "leaked":
+                outcome.finding = _cross_role_finding(method, url, owner_role, requester_role, status)
+            outcomes.append(outcome)
+    return outcomes
+
+
+async def probe_cross_role_matrix(
+    result: RoleCrawlResult,
+    roles: list[RoleSession],
+    owned_object_ids: dict,        # role -> {normalized path: object id owned by that role}
+    *,
+    allowed_hosts: list[str] | None = None,
+    timeout: float = 15.0,
+    run_context=None,
+    session_refs: list[str | None] | None = None,
+) -> None:
+    """Wire `probe_cross_role_objects` across every object-scoped endpoint
+    already in the crawl matrix (`result.endpoints`) for which at least two
+    roles have a declared owned object id -- "auto-test cross-role access on
+    every crawl-matrix endpoint" once ownership is known. Mutates `result` in
+    place: appends to `result.cross_role_outcomes` and folds `leaked`
+    outcomes into `result.idor_findings` (the same sink `_compare_identities`
+    uses), so downstream consumers see one unified IDOR-findings list."""
+    for endpoint in result.endpoints:
+        if not endpoint.object_scoped:
+            continue
+        per_role_id = {role: paths.get(endpoint.path) for role, paths in owned_object_ids.items()
+                       if paths.get(endpoint.path)}
+        if len(per_role_id) < 2:
+            continue
+        outcomes = await probe_cross_role_objects(
+            result.base_url, roles, endpoint.method, endpoint.path, per_role_id,
+            allowed_hosts=allowed_hosts, timeout=timeout, run_context=run_context,
+            session_refs=session_refs)
+        result.cross_role_outcomes.extend(o.to_dict() for o in outcomes)
+        result.idor_findings.extend(o.finding.model_dump() for o in outcomes if o.finding is not None)
+
+
 def _body_fp(body: str) -> str:
     return hashlib.sha1((body or "")[:4000].encode("utf-8", "ignore")).hexdigest()[:16]
 
@@ -255,6 +388,12 @@ class RoleCrawlResult:
     captured: list = field(default_factory=list)
     sensitive_file_hits: list = field(default_factory=list)
     errors: list = field(default_factory=list)
+    # P1.3: per-(owner,requester) results of the ACTIVE cross-role object probe
+    # (probe_cross_role_matrix) -- dicts from CrossRoleOutcome.to_dict(). Leaked
+    # outcomes are ALSO folded into idor_findings; this list additionally keeps
+    # the "denied" negative controls, which idor_findings (a findings-only sink)
+    # has no slot for.
+    cross_role_outcomes: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -267,6 +406,7 @@ class RoleCrawlResult:
             "idor_findings": self.idor_findings,
             "captured": self.captured,
             "errors": self.errors,
+            "cross_role_outcomes": self.cross_role_outcomes,
         }
 
 
@@ -319,6 +459,7 @@ async def crawl_roles(
     max_captured: int = 200,
     run_context=None,
     session_refs: list[str | None] | None = None,
+    owned_object_ids: dict | None = None,
 ) -> RoleCrawlResult:
     """Crawl `base_url` once per role, union the surface, probe every endpoint
     with every role, and derive auth-bypass + IDOR candidates from the matrix.
@@ -329,7 +470,15 @@ async def crawl_roles(
 
     `active_discovery` augments the JS-mined surface with black-box API discovery
     (api_surface_discovery) -- essential on a headless API where the JS crawler
-    finds nothing. The engagement builder turns active discovery on."""
+    finds nothing. The engagement builder turns active discovery on.
+
+    `owned_object_ids` (P1.3, optional): {role -> {normalized_path: object_id}}
+    -- when the caller knows which real object id each role owns (e.g. "alice
+    created ticket 101"), every object-scoped matrix endpoint with >=2 declared
+    owners is AUTOMATICALLY cross-role probed (probe_cross_role_matrix): each
+    other role's own credentials are replayed against that owner's real object
+    id. Omitted/empty -> unchanged behaviour (matches the shared id_fill lens
+    `_compare_identities` already runs)."""
     result = RoleCrawlResult(base_url=base_url, roles=[r.role for r in roles])
     if not roles:
         result.errors.append("no roles supplied")
@@ -469,10 +618,18 @@ async def crawl_roles(
 
     _derive_candidates(result, roles)
     _compare_identities(result, roles, id_fill)
+    if owned_object_ids:
+        try:
+            await probe_cross_role_matrix(
+                result, roles, owned_object_ids, allowed_hosts=allowed_hosts,
+                timeout=timeout, run_context=run_context, session_refs=session_refs)
+        except Exception as e:  # active cross-role probing must not sink the whole crawl
+            result.errors.append(f"[cross_role] failed: {e.__class__.__name__}")
     log.info("role_crawl: %s -- %d endpoints, %d auth-bypass, %d idor candidates, "
-             "%d idor findings, %d captured exchanges",
+             "%d idor findings, %d captured exchanges, %d cross-role outcomes",
              base_url, len(result.endpoints), len(result.auth_bypass_candidates),
-             len(result.idor_candidates), len(result.idor_findings), len(result.captured))
+             len(result.idor_candidates), len(result.idor_findings), len(result.captured),
+             len(result.cross_role_outcomes))
     return result
 
 
