@@ -31,6 +31,32 @@ class TestSignatures(unittest.TestCase):
         self.assertNotIn("SUPERSECRET123", sig)
         self.assertIn("token", sig)  # the NAME is fine -- it's structural
 
+    def test_reviewer_repro_private_path_token_never_survives(self):
+        """R04 reproduction: a reset path containing an arbitrary,
+        non-hex/non-numeric private token must not survive into the
+        signature verbatim -- only normalize_path's numeric/hex collapse was
+        applied before, and this token is neither."""
+        sig = pattern_memory.signature_for(
+            "GET", "https://victim.example.com/reset/SyntheticPrivateToken_xYz!")
+        self.assertNotIn("SyntheticPrivateToken_xYz", sig)
+        self.assertIn("{id}", sig)
+
+    def test_reviewer_repro_private_query_param_name_never_survives(self):
+        """R04 reproduction: an email-shaped query parameter NAME must not
+        survive -- some applications put identifiers/private data in names,
+        not just values."""
+        sig = pattern_memory.signature_for(
+            "GET", "https://victim.example.com/api/search?alice@example.invalid=1")
+        self.assertNotIn("alice@example.invalid", sig)
+
+    def test_ordinary_route_words_and_param_names_still_survive(self):
+        """Positive control: the sanitizer must not gut ordinary structural
+        signal -- ordinary lowercase route words/param names still pass."""
+        sig = pattern_memory.signature_for("GET", "https://x.test/api/tickets/search?q=widget")
+        self.assertIn("api", sig)
+        self.assertIn("tickets", sig)
+        self.assertIn("q", sig)
+
 
 class TestAppendOnlyStore(unittest.TestCase):
     def setUp(self):
@@ -66,6 +92,21 @@ class TestAppendOnlyStore(unittest.TestCase):
         pattern_memory.record_pattern("idor", sig, path=self.path)
         patterns = pattern_memory.known_patterns(self.path)
         self.assertEqual(patterns, {("idor", sig)})  # one entry despite 3 appends
+
+    def test_reviewer_repro_synthetic_private_data_never_written_to_disk(self):
+        """R04 reproduction, on disk: the exact synthetic private path token
+        and email-shaped query param name from the review must not appear in
+        the written JSONL record."""
+        sig = pattern_memory.signature_for_finding(
+            {},
+            {"method": "GET",
+             "url": "https://victim.example.com/reset/SyntheticPrivateToken_xYz!"
+                    "?alice@example.invalid=1"},
+        )
+        pattern_memory.record_pattern("reset_token", sig, path=self.path)
+        raw = self.path.read_text(encoding="utf-8")
+        self.assertNotIn("SyntheticPrivateToken_xYz", raw)
+        self.assertNotIn("alice@example.invalid", raw)
 
     def test_no_private_data_ever_written_to_the_store(self):
         """Negative control: recording a pattern derived from a request that

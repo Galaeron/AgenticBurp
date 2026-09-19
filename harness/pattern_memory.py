@@ -16,6 +16,19 @@ text, no summary prose ever enters the store. This is deliberately a much
 narrower signal than a Finding -- it cannot leak a secret because it never
 carries anything but shape.
 
+R04 correction: `engagement.normalize_path` only collapses segments that are
+PURELY numeric or long-hex -- an arbitrary token, an email address, or a
+private project name used as a path segment (or as a query parameter NAME,
+not value) survived verbatim into the shared store. Raw path normalization
+is not a privacy boundary on its own, so this module applies its OWN
+additional, conservative allowlist filter on top of it (`_sanitize_shape`):
+any path segment or parameter NAME that is not an ordinary short
+lowercase-alnum/hyphen/underscore route word is generalized away (a segment
+becomes the same "{id}" placeholder normalize_path already uses; a
+parameter name is dropped from the signature entirely) BEFORE it can ever
+reach `record_pattern`. This is deliberately conservative -- it would rather
+overgeneralize a legitimate route word than risk retaining a private token.
+
 Storage is a plain append-only JSONL file (one line per confirmed pattern
 observation) -- simple, human-auditable, and trivially portable; no schema
 migration machinery needed for something this small. Duplicate observations
@@ -25,6 +38,7 @@ log, not a keyed table) and collapse naturally at read time.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -32,6 +46,34 @@ from urllib.parse import parse_qsl, urlsplit
 from harness.engagement import normalize_path
 
 DEFAULT_PATH = Path(__file__).parent / "pattern_memory.jsonl"
+
+# Conservative allowlist for a path segment / parameter NAME that is safe to
+# retain literally: short, lowercase (case alone carries no privacy risk, so
+# the check is applied case-insensitively), plain identifier characters only.
+# Anything else -- mixed alphanumeric tokens, emails, punctuation, long
+# opaque strings -- is generalized away rather than risk retaining private
+# data (R04). Deliberately favors false positives (overgeneralizing a real
+# route word) over false negatives (retaining a private token).
+_SAFE_TOKEN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def _is_safe_token(value: str) -> bool:
+    return bool(value) and bool(_SAFE_TOKEN.match(value.lower()))
+
+
+def _sanitize_path(path: str) -> str:
+    """Generalize any path segment normalize_path left untouched that is not
+    an ordinary route word, to the same "{id}" placeholder."""
+    segments = path.split("/")
+    return "/".join(seg if (seg in ("", "{id}") or _is_safe_token(seg)) else "{id}"
+                    for seg in segments)
+
+
+def _sanitize_names(names) -> list[str]:
+    """Keep only parameter NAMES that look like ordinary identifiers; drop
+    anything else (an email address, an opaque token) rather than let it
+    reach the shared store under the guise of being "just a name"."""
+    return sorted({str(n) for n in names if n and _is_safe_token(str(n))})
 
 
 def _query_param_names(url: str) -> list[str]:
@@ -52,15 +94,19 @@ def _method_and_url(exchange) -> tuple[str, str]:
 def signature_for(method: str, url: str, param_names: list[str] | None = None) -> str:
     """A host-agnostic structural signature: METHOD + normalized path
     template + sorted parameter NAMES. Never includes host, query/body
-    VALUES, headers, or any evidence/response content.
+    VALUES, headers, or any evidence/response content. Any path segment or
+    parameter NAME that is not an ordinary route-word/identifier is
+    generalized away by `_sanitize_path`/`_sanitize_names` before it can
+    enter the signature (R04) -- e.g. an email address or an opaque private
+    token never survives, whether it appears in the path or as a param name.
 
     `param_names=None` (the default) auto-extracts query parameter NAMES
     from `url` itself; pass an explicit list to use different/additional
     names instead (e.g. signature_for_finding folding in a finding's own
     parameter_name)."""
-    path = normalize_path(url)
+    path = _sanitize_path(normalize_path(url))
     names = _query_param_names(url) if param_names is None else param_names
-    names = sorted({str(p) for p in names if p})
+    names = _sanitize_names(names)
     return f"{(method or 'GET').upper()} {path} params={','.join(names)}"
 
 
