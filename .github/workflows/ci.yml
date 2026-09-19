@@ -210,3 +210,54 @@ jobs:
         run: >-
           python score.py --corpus test-target --from-cache
           --fail-under-recall 0.80 --fail-under-precision 0.50
+
+  # P1.6: `scored` can be SKIPPED entirely (no self-hosted GPU runner attached, no
+  # "run-scored" label, not a schedule/dispatch trigger) -- GitHub renders a skipped
+  # required check in a way that is easy to misread as "passed" or "not required
+  # here, fine either way". This job always runs and reports one of FOUR distinct,
+  # honest statuses instead of collapsing "didn't run" and "ran and passed" into
+  # one green checkmark:
+  #   - failed:     scored ran and did not meet the precision/recall floor (or errored).
+  #   - historical: scored ran and passed, but --from-cache is a RESCORE of a
+  #                 previously cached fixture (score.py's own freshness_label calls
+  #                 this "historical_cache_rescore") -- not a fresh, provenance-bound
+  #                 run (P0.4/score_provenance.py). Nothing in this job today
+  #                 produces a ScoreProvenance record, so a "fresh" status is never
+  #                 claimed here even on success -- that would overclaim.
+  #   - not_run:    scored was skipped or cancelled -- no runner/label attached this
+  #                 trigger. This is the status an unavailable runner gets; it is
+  #                 NEVER read as passing.
+  # test_no_orphan_test_files.py's tripwire is unaffected by this job -- it stays
+  # wired into the full-suite discovery the `nightly` tier already runs.
+  scored-status:
+    name: Scored-tier provenance status
+    needs: [scored]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report a distinct, honest status (never let "not run" read as "passed")
+        shell: bash
+        run: |
+          case "${{ needs.scored.result }}" in
+            success)
+              STATUS="historical"
+              DETAIL="scored tier ran and met its floors -- a --from-cache rescore, not a fresh provenance-bound run" ;;
+            failure)
+              STATUS="failed"
+              DETAIL="scored tier ran; the precision/recall floor was not met, or it errored" ;;
+            skipped)
+              STATUS="not_run"
+              DETAIL="scored tier did not run this trigger (no self-hosted GPU runner / run-scored label)" ;;
+            cancelled)
+              STATUS="not_run"
+              DETAIL="scored tier was cancelled before completing" ;;
+            *)
+              STATUS="not_run"
+              DETAIL="unrecognized scored-tier result: ${{ needs.scored.result }}" ;;
+          esac
+          echo "### Scored-tier status: **$STATUS**" >> "$GITHUB_STEP_SUMMARY"
+          echo "$DETAIL" >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$STATUS ($DETAIL)"
+          if [ "$STATUS" = "failed" ]; then
+            exit 1
+          fi
