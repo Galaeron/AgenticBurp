@@ -28,6 +28,7 @@ Off by default; this is a fundamentally more active mode than the passive
 pipeline and is opt-in per run.
 """
 from __future__ import annotations
+import hashlib
 import json
 import logging
 import re
@@ -55,6 +56,21 @@ if TYPE_CHECKING:
 log = logging.getLogger("harness.iterative_agent")
 
 _MAX_RESP_CHARS = 1200  # response summary fed back to the model, per step
+
+
+def _request_signature(method: str, url: str, headers: dict | None, body: str | None) -> str:
+    """P2.6: a stable fingerprint over (method, URL, sha256(body), relevant
+    headers) -- relevant headers being every header this agent itself set
+    (the whole dict; nothing here is agent-opaque boilerplate the way e.g.
+    a browser's User-Agent would be), canonicalized so key order/case never
+    changes the signature. Two calls that would send byte-identical requests
+    produce the same signature; a different body, URL, method, or header
+    value produces a different one."""
+    body_hash = hashlib.sha256((body or "").encode("utf-8", "replace")).hexdigest()
+    header_items = tuple(sorted((str(k).lower(), str(v)) for k, v in (headers or {}).items()))
+    return hashlib.sha256(
+        "\x1f".join([method.upper(), url, body_hash, repr(header_items)]).encode("utf-8")
+    ).hexdigest()
 
 # A path segment that is an OBJECT IDENTIFIER an IDOR swaps: all-digits
 # (/tickets/1) or a long hex/uuid (/tickets/a1b2c3d4-...). Mirrors the
@@ -157,6 +173,11 @@ class IterativeAgent:
         self.allowed_hosts = allowed_hosts or []
         self.temperature = temperature
         self.max_steps = max_steps
+        # P2.6: idempotency guard, scoped to THIS active-probe session -- one
+        # IterativeAgent is constructed fresh per run_active_probe() call
+        # (orchestrator_confirm.py), so this set's lifetime is exactly "this
+        # session", never leaking across sessions or agents.
+        self._sent_signatures: set[str] = set()
 
     @property
     def gate(self):
@@ -226,7 +247,22 @@ class IterativeAgent:
         context carries this agent's own SafetyGate so mutating-method decisions are
         unchanged, and its scope is is_host_allowed(self.allowed_hosts) -- a superset
         of the old host/subdomain check. send_creds forwards any captured credential
-        headers; max_redirects=0 keeps the old follow_redirects=False behaviour."""
+        headers; max_redirects=0 keeps the old follow_redirects=False behaviour.
+
+        P2.6: before sending, skip (and log) a request whose (method, URL,
+        sha256(body), headers) signature was already sent THIS session -- the
+        model re-proposing an identical mutation it already tried wastes a
+        step/request budget on a probe that can only repeat the same answer.
+        A genuinely different request (any of those four differs) is never
+        skipped."""
+        sig = _request_signature(method, url, headers, body)
+        if sig in self._sent_signatures:
+            log.info(
+                "iterative_agent: skipping duplicate request already sent this "
+                "active-probe session: %s %s", method, url)
+            return None, "skipped: identical request already sent this active-probe session"
+        self._sent_signatures.add(sig)
+
         _tt, _ctx = transport_for(None, allowed_hosts=self.allowed_hosts, gate=self.gate)
         try:
             await global_throttle.acquire()

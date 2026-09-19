@@ -151,6 +151,41 @@ class IterativeAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.stop_reason, "target_distress")
         self.assertLessEqual(r.steps_used, 3)  # aborted quickly, did not run all 50
 
+    async def test_duplicate_request_is_skipped_and_logged(self):
+        """P2.6: the model re-proposing the EXACT same mutation (same
+        location/param/value -> byte-identical request) a second time must
+        be skipped, not re-sent."""
+        ollama = _ScriptedOllama([
+            {"action": "mutate", "location": "query", "param": "q", "value": "same-value"},
+            {"action": "mutate", "location": "query", "param": "q", "value": "same-value"},
+            {"action": "stop", "verdict": "not_found", "thought": "done"},
+        ])
+        agent = IterativeAgent(ollama, "m", ["localhost"])
+        with self.assertLogs("harness.iterative_agent", level="INFO") as cm:
+            with patch("httpx.AsyncClient.request", return_value=_Resp(200, "ok")) as mock_req:
+                r = await agent.run(_exchange(), "h", "sqli", step_budget=5)
+        self.assertEqual(mock_req.call_count, 1)  # second identical mutation never sent
+        self.assertTrue(any(
+            s.blocked and "already sent this active-probe session" in s.blocked
+            for s in r.transcript))
+        self.assertTrue(any("skipping duplicate request" in line for line in cm.output))
+
+    async def test_different_request_is_not_skipped(self):
+        """Negative control: two DIFFERENT mutations (different values) must
+        both be sent -- the guard must not over-match."""
+        ollama = _ScriptedOllama([
+            {"action": "mutate", "location": "query", "param": "q", "value": "value-one"},
+            {"action": "mutate", "location": "query", "param": "q", "value": "value-two"},
+            {"action": "stop", "verdict": "not_found", "thought": "done"},
+        ])
+        agent = IterativeAgent(ollama, "m", ["localhost"])
+        with patch("httpx.AsyncClient.request", return_value=_Resp(200, "ok")) as mock_req:
+            r = await agent.run(_exchange(), "h", "sqli", step_budget=5)
+        self.assertEqual(mock_req.call_count, 2)  # both distinct requests sent
+        self.assertFalse(any(
+            s.blocked and "already sent this active-probe session" in s.blocked
+            for s in r.transcript))
+
     async def test_on_step_receives_live_activity(self):
         seen = []
         ollama = _ScriptedOllama([
