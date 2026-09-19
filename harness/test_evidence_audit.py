@@ -83,8 +83,63 @@ class TestAuditProof(unittest.TestCase):
             "proof_id": "p1",
             "case": {"run_id": "run-1", "case_id": case.case_id},
             "verdict": "confirmed",
+            "executed": True,
         }
         self.assertEqual(audit_proof(finding, proof_dict, "run-1"), AUDIT_VERIFIED)
+
+    def test_reviewer_repro_proof_id_mismatch_is_rejected_not_verified(self):
+        """R02 reproduction: a finding declaring proof_id="requested-proof"
+        must not be verified by an unrelated proof, even if case/run happen
+        to line up -- proof_id binding was previously never checked at all.
+        Uses the store-shaped dict form (like the reviewer's diagnostic) since
+        ProofRecord's own constructor already rejects a CONFIRMED+executed=False
+        combination -- the dict path is exactly how an untrusted/legacy record
+        could carry that contradiction into the audit."""
+        case = _case()
+        finding = _finding_for(case)
+        finding.proof_id = "requested-proof"
+        proof = {
+            "proof_id": "unrelated-proof",
+            "case": {"run_id": "run-1", "case_id": case.case_id},
+            "verdict": "confirmed", "executed": False, "legacy": True,
+        }
+        self.assertEqual(audit_proof(finding, proof, "run-1"), AUDIT_REJECTED)
+
+    def test_non_executed_proof_is_rejected_not_verified(self):
+        """R02 reproduction: executed=False must never verify, even with a
+        matching case/run and a CONFIRMED verdict on the record."""
+        case = _case()
+        finding = _finding_for(case)
+        proof = {
+            "proof_id": "p1",
+            "case": {"run_id": "run-1", "case_id": case.case_id},
+            "verdict": "confirmed", "executed": False, "legacy": True,
+        }
+        self.assertEqual(audit_proof(finding, proof, "run-1"), AUDIT_REJECTED)
+
+    def test_empty_finding_case_id_and_empty_run_id_are_unverifiable(self):
+        """R02 reproduction: an empty finding (no case_id) audited with an
+        empty requested run_id must be unverifiable, not pass through a
+        weakened check that only compares nonempty fields."""
+        case = _case()
+        finding = _finding_for(case)
+        finding.case_id = ""
+        proof = ProofRecord(
+            proof_id="p1", case=case, validator="sqlmap",
+            verdict=Verdict.CONFIRMED, executed=True)
+        self.assertEqual(audit_proof(finding, proof, ""), AUDIT_UNVERIFIABLE)
+
+    def test_executed_and_matching_proof_id_still_verifies(self):
+        """Positive control paired with the mismatch tests above: a proof
+        that actually executed, matches case/run, and matches the finding's
+        declared proof_id still verifies."""
+        case = _case()
+        finding = _finding_for(case)
+        finding.proof_id = "p1"
+        proof = ProofRecord(
+            proof_id="p1", case=case, validator="sqlmap",
+            verdict=Verdict.CONFIRMED, executed=True, observed_result="boolean diff")
+        self.assertEqual(audit_proof(finding, proof, "run-1"), AUDIT_VERIFIED)
 
 
 if __name__ == "__main__":
