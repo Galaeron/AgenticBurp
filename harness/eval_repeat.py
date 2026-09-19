@@ -80,32 +80,52 @@ class EvalReport:
         return (not reasons, reasons)
 
     def corpus_ids(self) -> set[str]:
-        return {r.corpus_id for r in self.runs if r.corpus_id}
+        """Every distinct corpus_id label across this report's runs, INCLUDING
+        the empty string when any run is unlabeled -- a caller checking
+        `fully_labeled()` first will therefore never mistake "one of my runs
+        had no label" for "my runs only ever used one (labeled) corpus"."""
+        return {r.corpus_id for r in self.runs}
+
+    def fully_labeled(self) -> bool:
+        """True only when every run in this report carries a non-empty
+        corpus_id. A report is REJECTED as a partial-label report (R08) if
+        even one run is unlabeled -- an unlabeled run is not evidence it
+        matches anything, so it must never be silently dropped from the
+        comparison instead of disqualifying it."""
+        return bool(self.runs) and all(r.corpus_id for r in self.runs)
 
     def compare(self, other: "EvalReport") -> dict:
         """Compare this report's summary against another's (e.g. two model
         variants, or before/after a change), honestly labelling whether the
-        delta can be attributed to the model alone (P1.7). A delta is only
-        `attributable_to_model_only=True` when BOTH reports carry the SAME
-        non-empty corpus_id set -- an unlabeled corpus is treated exactly
-        like a mismatched one (never assumed to match), so a real
-        cross-corpus or changed-budget comparison can never silently read
-        as "the model caused this"."""
+        delta is comparable under checked (corpus-matched) conditions -- NOT
+        a claim of causal model attribution (P1.7/R08). `attributable_to_model_only`
+        is True only when BOTH reports are `fully_labeled()` (every run
+        carries a non-empty corpus_id -- a report with even one unlabeled
+        run is rejected outright, never partially credited) AND their
+        corpus_id sets are identical. Matching corpus labels establishes
+        corpus/config compatibility only; it is not proof the observed delta
+        is caused by the model alone."""
         mine, theirs = self.corpus_ids(), other.corpus_ids()
-        same_corpus = bool(mine) and mine == theirs
+        comparable = self.fully_labeled() and other.fully_labeled() and mine == theirs
         s1, s2 = self.summary(), other.summary()
 
         def _delta(metric: str):
             a, b = s1[metric]["mean"], s2[metric]["mean"]
             return round(b - a, 4) if (a is not None and b is not None) else None
 
+        if comparable:
+            reason = ("same corpus label(s) on both sides, every run labeled -- "
+                      "comparable under checked conditions, not proof of causal model attribution")
+        else:
+            reason = (f"different, unlabeled, or partially unlabeled corpora "
+                      f"({mine or '(none)'} vs {theirs or '(none)'}) "
+                      "-- this delta may reflect corpus/budget differences, not the model alone")
+
         return {
             "recall_delta": _delta("recall"),
             "precision_delta": _delta("precision"),
-            "attributable_to_model_only": same_corpus,
-            "reason": ("same corpus on both sides" if same_corpus else
-                      f"different or unlabeled corpora ({mine or '(none)'} vs {theirs or '(none)'}) "
-                      "-- this delta may reflect corpus/budget differences, not the model alone"),
+            "attributable_to_model_only": comparable,
+            "reason": reason,
         }
 
 

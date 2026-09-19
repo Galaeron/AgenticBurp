@@ -91,7 +91,7 @@ class CorpusAwareComparisonTests(unittest.TestCase):
         b = self._report([0.90] * 5, corpus_id="juiceshop-full@budget400")
         delta = a.compare(b)
         self.assertFalse(delta["attributable_to_model_only"])
-        self.assertIn("different or unlabeled corpora", delta["reason"])
+        self.assertIn("unlabeled corpora", delta["reason"])
 
     def test_unlabeled_corpus_is_not_assumed_to_match(self):
         """Negative control: an eval run with NO corpus_id must never be
@@ -101,6 +101,29 @@ class CorpusAwareComparisonTests(unittest.TestCase):
         b = self._report([0.90] * 5, corpus_id="")
         delta = a.compare(b)
         self.assertFalse(delta["attributable_to_model_only"])
+
+    def test_reviewer_repro_partial_label_report_is_not_attributable(self):
+        """R08 reproduction: a report with ONE labeled and ONE unlabeled run,
+        compared against a single labeled run of the same corpus, must NOT
+        read as attributable_to_model_only -- corpus_ids() previously dropped
+        the unlabeled run, so the remaining label set matched by accident."""
+        mixed = EvalReport(runs=[
+            EvalRun(recall=0.70, precision=0.6, seed=0, corpus_id="test-target@budget400"),
+            EvalRun(recall=0.72, precision=0.6, seed=1, corpus_id=""),
+        ])
+        single = self._report([0.90], corpus_id="test-target@budget400")
+        delta = mixed.compare(single)
+        self.assertFalse(delta["attributable_to_model_only"])
+        self.assertFalse(mixed.fully_labeled())
+        self.assertTrue(single.fully_labeled())
+
+    def test_fully_labeled_matching_single_corpus_is_comparable(self):
+        """Positive control: when every run on both sides is labeled with the
+        SAME corpus, the comparison is still allowed through."""
+        a = self._report([0.70] * 5, corpus_id="test-target@budget400")
+        b = self._report([0.80] * 3, corpus_id="test-target@budget400")
+        delta = a.compare(b)
+        self.assertTrue(delta["attributable_to_model_only"])
 
 
 if __name__ == "__main__":
