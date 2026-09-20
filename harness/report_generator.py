@@ -309,7 +309,8 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
 
 
 def generate_markdown_report(host: str, findings: list[dict], generated_at: datetime | None = None,
-                              effort_ledger: EffortLedger | None = None, suppressed_count: int = 0) -> str:
+                              effort_ledger: EffortLedger | None = None, suppressed_count: int = 0,
+                              quarantine_leads: bool = False) -> str:
     """
     Build a submission-ready Markdown report from store.all_host_findings()
     -shaped dicts (or anything with the same keys). Chain hypotheses
@@ -324,12 +325,39 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     unconfirmed findings keep the same plain severity/confidence sort as
     confirmed findings -- this parameter is purely additive; no existing
     caller's behavior changes unless it opts in.
-    """
-    generated_at = generated_at or datetime.now(timezone.utc)
-    parsed = [_from_store_dict(f) for f in findings]
 
-    individual = [f for f in parsed if not f.is_chain]
-    chains = [f for f in parsed if f.is_chain]
+    `quarantine_leads`: when True, assumed/recalled live-class findings with no
+    oracle verification and no leg confirmation are routed to a separate
+    "Test Suggestions" section rather than counting toward reported findings.
+    Intended for blind / no-oracle measurement runs. SHIPPED OFF (False) so a
+    fully-confirmed run is unaffected.
+    """
+    from harness.confirmation_gate import should_quarantine_as_lead
+
+    generated_at = generated_at or datetime.now(timezone.utc)
+
+    # Parse raw dicts alongside their findings so the quarantine predicate can
+    # read all stored fields (oracle_verified, basis, confirmed, ...) from the
+    # original dict -- the ReportFinding view does not carry every field.
+    pairs = [(raw, _from_store_dict(raw)) for raw in findings]
+
+    individual_pairs = [(r, f) for r, f in pairs if not f.is_chain]
+    chains = [f for _, f in pairs if f.is_chain]
+
+    # Quarantine: route assumed/recalled live-class unverified findings to a
+    # separate bucket rather than the main list. The predicate uses the raw dict
+    # so it sees oracle_verified / basis / confirmed exactly as stored.
+    if quarantine_leads:
+        leads_bucket: list = []
+        individual: list = []
+        for raw, f in individual_pairs:
+            if should_quarantine_as_lead(raw):
+                leads_bucket.append(f)
+            else:
+                individual.append(f)
+    else:
+        individual = [f for _, f in individual_pairs]
+        leads_bucket = []
 
     # Collapse per-(endpoint-family, class) duplicates, floating confirmed. A
     # max-coverage run's 225 findings / 45 confirmed were heavy duplicates over ~4
@@ -350,8 +378,10 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     lines.append("")
     lines.append(f"Generated: {generated_at.strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("")
+    _leads_note = (f", **{len(leads_bucket)} quarantined test suggestion(s)**"
+                   if leads_bucket else "")
     lines.append(f"**{len(confirmed)} confirmed finding(s)**, **{len(unconfirmed)} unconfirmed finding(s)**, "
-                 f"**{len(chains)} potential attack chain(s)**.")
+                 f"**{len(chains)} potential attack chain(s)**{_leads_note}.")
     if collapsed_count:
         lines.append("")
         lines.append(f"*{collapsed_count} duplicate finding(s) were collapsed* -- the same class proven or "
@@ -431,7 +461,19 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
             lines.append(f"**Suggested verification:** {f.suggested_test}")
             lines.append("")
 
-    if not individual and not chains:
+    if leads_bucket:
+        lines.append("## Test Suggestions (unverified leads)")
+        lines.append("")
+        lines.append("_These assumed/recalled-basis findings were quarantined from the main list because "
+                     "the class has a live-verified oracle leg that did not run on this exchange, and no "
+                     "leg independently confirmed or refuted them. They are test suggestions, not reported "
+                     "vulnerabilities -- manually trigger the appropriate validator before treating these "
+                     "as real findings._")
+        lines.append("")
+        for f in leads_bucket:
+            lines.extend(_render_finding(f))
+
+    if not individual and not chains and not leads_bucket:
         lines.append("_No findings recorded for this host._")
         lines.append("")
 

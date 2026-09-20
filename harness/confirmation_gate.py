@@ -378,6 +378,41 @@ def active_confirmation_is_unproven(finding: dict) -> bool:
     return leg_tier(finding.get("vulnerability_class")) != "none"
 
 
+def should_quarantine_as_lead(finding) -> bool:
+    """True when a finding should be surfaced as a LEAD test suggestion rather
+    than a reported finding, on a blind / no-oracle run.
+
+    Quarantine conditions (ALL must hold):
+      - The class has a live-verified leg (leg_tier == "live") -- so a real
+        oracle EXISTS but never ran.
+      - The agent's basis is "assumed" or "recalled" -- not directly observed.
+      - The finding was not confirmed by any leg (confirmed is False).
+      - The oracle did not verify the finding (oracle_verified is False).
+
+    A finding that is already CONFIRMED or ORACLE-VERIFIED is never quarantined.
+    A finding whose class has NO live leg (provisional / none) is never quarantined
+    here; those are handled by the ordinary confirmation-suppression gate.
+
+    This is a SURFACING decision, not a deletion: callers route quarantined findings
+    into a separate `leads` bucket rather than removing them."""
+    if isinstance(finding, dict):
+        basis = (finding.get("basis") or "derived").lower()
+        oracle_verified = bool(finding.get("oracle_verified", False))
+        confirmed = bool(finding.get("confirmed", False))
+        vc = finding.get("vulnerability_class", "")
+    else:
+        basis = (getattr(finding, "basis", "derived") or "derived").lower()
+        oracle_verified = bool(getattr(finding, "oracle_verified", False))
+        confirmed = bool(getattr(finding, "confirmed", False))
+        vc = getattr(finding, "vulnerability_class", "")
+
+    if confirmed or oracle_verified:
+        return False
+    if basis not in ("assumed", "recalled"):
+        return False
+    return leg_tier(vc) == "live"
+
+
 def _controlled_negative_classes(validation_reports: list | None) -> set:
     """Canonical finding classes for which a validator produced a real controlled
     NEGATIVE -- it actually ran and returned `not_confirmed` (R08). This is what

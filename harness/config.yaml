@@ -544,6 +544,17 @@ oracle:
 # later exchange on ANY host whose shape matches gets the corresponding
 # specialist added to its dispatch (additively -- it can only add an agent
 # worth trying, never remove or override a routing decision).
+# Surfacing controls for the report and findings API.
+reporting:
+  # Gate undifferentiated assumed/recalled live-class findings as LEADs on blind
+  # runs. When true, a finding with basis in {assumed, recalled}, a live-verified
+  # class leg, and no oracle or leg confirmation is routed to a separate `leads`
+  # bucket instead of the main findings list -- it appears as a test suggestion
+  # rather than a reported vulnerability. SHIPPED OFF so a fully-confirmed run is
+  # unaffected; enable in the measurement overlay (config.local.yaml or the
+  # runner's explicit config dict) for blind/no-oracle evaluation.
+  quarantine_unverified_leads: false
+
 pattern_memory:
   enabled: false
   # path: "harness/pattern_memory.jsonl"  # default; override to relocate the log
