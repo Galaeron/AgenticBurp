@@ -12,25 +12,46 @@ Ground truth (derived by hand over HTTP only, no app.py/answer-key read):
     high-entropy tokens, own-ticket reads.
 The question this run answers: does the harness independently flag the IDOR
 on a target the model has never seen?
+
+Measurement knobs (env vars, all default to the precision-measurement setting):
+  HARNESS_FAIL_OPEN_MODE       curated | all           (default: curated)
+  HARNESS_QUARANTINE_LEADS     1 | 0                   (default: 1)
 """
-import asyncio, json, sys, time, yaml
+import asyncio, json, os, sys, time, yaml
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 HARNESS_DIR = PROJECT_ROOT / "harness"
 BLIND_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(HARNESS_DIR))
+sys.path.insert(0, str(PROJECT_ROOT))
 
-import store
+from harness import store
 store._DB_PATH = r"C:\tmp\blind_eval_state.db"
-import cache
+from harness import cache
 cache.init_cache(db_path=r"C:\tmp\blind_eval_cache.db")
 
-import orchestrator as orch_mod
-from models import HttpExchange
+from harness import orchestrator as orch_mod
+from harness.models import HttpExchange
+from harness.coordinator import fail_open_stats, reset_fail_open_stats
+from harness.config_schema import config_fingerprint
+
+# --- Measurement knobs ---------------------------------------------------
+_FAIL_OPEN_MODE = os.environ.get("HARNESS_FAIL_OPEN_MODE", "curated")
+_QUARANTINE_LEADS = os.environ.get("HARNESS_QUARANTINE_LEADS", "1") not in ("0", "false", "no")
 
 with open(HARNESS_DIR / "config.yaml") as f:
     config = yaml.safe_load(f)
+
+# Inject measurement overrides explicitly so the exact mode is provable from
+# the manifest -- do not rely on config.local.yaml reaching this runner.
+config.setdefault("coordinator", {})["fail_open_mode"] = _FAIL_OPEN_MODE
+config.setdefault("reporting", {})["quarantine_unverified_leads"] = _QUARANTINE_LEADS
+
+_FINGERPRINT = config_fingerprint(config)
+print(f"[config] fail_open_mode={_FAIL_OPEN_MODE!r}  quarantine_leads={_QUARANTINE_LEADS}"
+      f"  fingerprint={_FINGERPRINT[:16]}")
+
+reset_fail_open_stats()
 orch = orch_mod.Orchestrator(config)
 
 
@@ -38,6 +59,7 @@ async def main():
     exf = BLIND_DIR / "blind_eval_exchanges.json"
     exchanges = json.load(open(exf))
     print(f"[*] {len(exchanges)} curated exchanges through REAL orchestrator (live Ollama)\n")
+    stats_before = fail_open_stats()
     results = []
     for idx, e in enumerate(exchanges):
         ex = HttpExchange(
@@ -68,11 +90,22 @@ async def main():
                             "elapsed_seconds": round(el, 1), "error": repr(exc)})
             print(f"[{idx:2d}] ERROR {exc}")
 
+    stats_final = fail_open_stats()
     out = r"C:\tmp\blind_eval_results.json"
-    json.dump({"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "results": results}, open(out, "w"), indent=2)
+    manifest = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config_fingerprint": _FINGERPRINT,
+        "fail_open_mode": _FAIL_OPEN_MODE,
+        "quarantine_leads": _QUARANTINE_LEADS,
+        "fail_open_stats_before": stats_before,
+        "fail_open_stats_final": stats_final,
+        "results": results,
+    }
+    json.dump(manifest, open(out, "w"), indent=2)
     print("\n" + "=" * 68)
     print(f"exchanges: {len(results)} | total findings: {sum(len(r['findings']) for r in results)} | "
           f"errors: {sum(1 for r in results if r['error'])}")
+    print(f"fail-open triggered: {stats_final['count']} times  (mode={_FAIL_OPEN_MODE!r})")
     print(f"results -> {out}")
 
 asyncio.run(main())

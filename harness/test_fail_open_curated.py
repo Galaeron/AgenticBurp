@@ -8,7 +8,7 @@ miss" core and never comes out empty.
 import asyncio
 import unittest
 
-from harness.coordinator import Coordinator, _curated_fallback
+from harness.coordinator import Coordinator, _curated_fallback, fail_open_stats
 from harness.models import HttpExchange
 from harness.ollama_client import OllamaResult
 
@@ -58,6 +58,43 @@ class FailOpenModeTests(unittest.TestCase):
         # never an empty dispatch (which would be worse than the old behavior).
         self.assertEqual(_curated_fallback(_ex(), ["some_unknown_agent"]),
                          ["some_unknown_agent"])
+
+
+class RunnerConfigThreadingTests(unittest.TestCase):
+    """Verify that a runner-style config dict (config["coordinator"]) threads
+    fail_open_mode through to the Coordinator exactly as run_blind_eval.py does."""
+
+    def test_runner_config_dict_curated_fires_subset(self):
+        # Mirrors: config["coordinator"]["fail_open_mode"] = "curated"
+        # then Orchestrator(config) -> Coordinator(config["coordinator"])
+        coordinator_cfg = {"model": "m", "fail_open_mode": "curated"}
+        c = Coordinator(_StubOllama(dispatch=[]), coordinator_cfg)
+        agents, reason = asyncio.run(c.choose_agents(_ex(), list(_AGENTS)))
+        self.assertLess(len(agents), len(_AGENTS),
+                        "runner's curated config must fire a subset, not all agents")
+        self.assertTrue(set(agents).issubset(set(_AGENTS)))
+        self.assertIn("fallback", reason)
+
+    def test_fail_open_stats_and_fingerprint_are_capturable(self):
+        from harness.coordinator import reset_fail_open_stats
+        from harness.config_schema import config_fingerprint
+
+        reset_fail_open_stats()
+        c = Coordinator(_StubOllama(dispatch=[]), {"model": "m", "fail_open_mode": "curated"})
+        asyncio.run(c.choose_agents(_ex(), list(_AGENTS)))
+
+        stats = fail_open_stats()
+        self.assertGreater(stats["count"], 0,
+                           "fail_open_stats should record at least one fail-open event")
+        self.assertIn("by_reason", stats)
+
+        cfg = {"coordinator": {"model": "m", "fail_open_mode": "curated"}}
+        fp = config_fingerprint(cfg)
+        self.assertEqual(len(fp), 64, "config_fingerprint must return a 64-char sha256 hex string")
+        self.assertTrue(all(c in "0123456789abcdef" for c in fp))
+
+        reset_fail_open_stats()
+        self.assertEqual(fail_open_stats()["count"], 0)
 
 
 if __name__ == "__main__":

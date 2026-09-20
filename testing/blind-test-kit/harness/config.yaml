@@ -14,6 +14,11 @@ ollama:
 coordinator:
   model: "llama3.1:8b"
   temperature: 0.1
+  # Measurement setting: curated fires a high-value, shape-keyed subset on
+  # fail-open rather than all agents. Diverges from the real harness/config.yaml
+  # because this vendored copy is loaded by bare yaml.safe_load() with no
+  # config.local.yaml overlay -- the knob must be set here directly.
+  fail_open_mode: "curated"
 
 # Default model for any specialist agent that doesn't set its own "model"
 # below. This used to silently fall back to the coordinator's model,
