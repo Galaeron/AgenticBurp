@@ -5,35 +5,25 @@
 Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
 refactor and the precision & blind-control sprint (Items 1–3) are committed
 (base `02de8bf`, HEAD of that batch `bc5f599`). On top, improvement-loop items
-**P0-1** (`25a737a`), **P0-2** (`533928c`), **P0-4** (`0e993da`), and **P1-1**
-(`33392c9`) landed. Re-verified green (full suite 2342 OK / 2 skip).
+**P0-1, P0-2, P0-4, P1-1, P1-2** landed. Re-verified green (full suite 2349 OK /
+2 skip). Full per-item detail with Result lines is in IMPROVEMENT_BACKLOG.md.
 
 ## Improvement loop (IMPROVEMENT_BACKLOG.md)
 
-- **P0-1 done (`25a737a`):** EvidenceLedger wired into the live pipeline —
-  records each finding's causal chain to an append-only `ledger_events` store
-  table; reconstructable via `GET /findings/{ref}/evidence` and a report line.
-  Instrumentation-only (no config/verdict/scope/gate/control-flow change).
-- **P0-2 done (`533928c`):** run-derived leg trust tiers — `leg_self_test.py`
-  fires each active leg against the owned loopback fixture + negative control and
-  demotes classes that fail their self-test, via the existing
-  `live_verified_markers` override. Demotion-only, OFF by default
-  (`leg_self_test.enabled`; static table stays the shipped default), fail-safe to
-  demote-all. +8 tests; full suite 2333 OK / 2 skip.
-- **P0-4 done (`0e993da`):** reverted committed `server.allowed_hosts` to `[]`
-  (live scope now in the git-ignored `config.local.yaml`); added
-  `SafeDefaultGuardTests` that fails the suite if any covered safety default drifts
-  (allowed_hosts, validators active/mutating, autonomous_discovery, oracle,
-  engagement toggles, coordinator.cloud_*).
-- **P1-1 done (`33392c9`):** fence-breakout neutralization for untrusted target
-  text (body/headers/analyst_note) on top of the nonce fence; adversarial
-  injection cannot alter finding state, caps/high-signal-slice preserved,
-  defensive-only. +7 tests.
-- Follow-on nits filed: P3-4 (bound/rotate in-memory ledger singleton), P3-5
-  (extend fence isolation to prior-context/knowledge blocks).
-- P0 offline tier done (P0-3 owner-only). Next eligible offline items: P1-2
-  (scope-escape adversarial tests), P1-4 (operating profiles), P1-6 (policy
-  object). P1-3 depends on P0-3; P1-5 needs a JDK/Burp build.
+- **P0-1 (`25a737a`):** EvidenceLedger wired into the live pipeline (append-only
+  `ledger_events` table; `GET /findings/{ref}/evidence`). Instrumentation-only.
+- **P0-2 (`533928c`):** run-derived leg trust tiers via the `live_verified_markers`
+  override; demotion-only, OFF by default (`leg_self_test.enabled`), fail-safe.
+- **P0-4 (`0e993da`):** reverted committed `server.allowed_hosts` to `[]` (live
+  scope → git-ignored `config.local.yaml`); `SafeDefaultGuardTests` blocks drift.
+- **P1-1 (`33392c9`):** fence-breakout neutralization for untrusted target text;
+  defensive-only, caps/high-signal-slice preserved.
+- **P1-2 (`e54cfb6`):** scope-escape adversarial regression coverage (IP-literal,
+  DNS-rebinding, file://+gopher://, mid-hop redirect) — all already blocked; no
+  production change.
+- Follow-on nits filed: P3-4 (ledger singleton), P3-5 (fence prior-context).
+- P0 offline tier done (P0-3 owner-only). Next eligible offline: P1-4 (operating
+  profiles), P1-6 (policy object). P1-3 depends on P0-3; P1-5 needs a JDK/Burp build.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 

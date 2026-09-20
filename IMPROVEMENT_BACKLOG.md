@@ -180,7 +180,15 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   finding state or trigger an action; regression test added.
 - **Impact:** High.
 
-### [ ] P1-2 — Scope-escape adversarial tests (IP literal / DNS rebinding / nested URL)
+### [x] P1-2 — Scope-escape adversarial tests (IP literal / DNS rebinding / nested URL)
+- **Result (VERIFIED):** `e54cfb6` — `harness/test_scope_escape.py` (+7) characterizes
+  that `ScopePolicy.in_scope` (hostname-string + scheme allow-list, re-checked per
+  redirect hop) already blocks all four vectors: off-scope IP literal, DNS-rebinding
+  (getaddrinfo mocked → decision provably keys on hostname string, not resolved IP),
+  file:// + gopher://, and mid-hop redirect leaving scope (off-scope 2nd hop never
+  contacted). Positive control: in-scope loopback still returns ok/200. NO
+  production gap found → regression coverage only; no production/config change. Full
+  suite 2349 OK / 2 skip.
 - **Domain:** Security · **Effort:** S · **Depends on:** none
 - **Evidence (VERIFIED gap):** scope is enforced in `run_context.ScopePolicy` and
   `safety_gate` via `scope_lock`, but no IP-literal / DNS-rebinding / alternate-scheme
