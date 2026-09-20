@@ -13,6 +13,47 @@ from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/h
 
 
 class ConfirmMixin:
+    async def get_run_derived_live_markers(self):
+        """P0-2: the run-derived confirmation-trust-tier override.
+
+        Off unless `leg_self_test.enabled` is set in config -- the static
+        LIVE_VERIFIED_MARKERS table (confirmation_gate.py) stays the offline
+        default for every run that doesn't opt in, so this changes nothing
+        for the harness's existing default configuration or test suite.
+
+        When enabled, runs harness.leg_self_test.run_self_test() (fires each
+        active confirmation leg against the owned loopback fixture and its
+        paired negative control -- see that module) AT MOST ONCE per
+        Orchestrator instance, cached on `self`, and returns the resulting
+        frozenset. That frozenset is meant to be passed straight through as
+        `live_verified_markers` to confirmation_gate.leg_tier() /
+        apply_confirmation_suppression(): a class not in it is never treated
+        as "live" this run, only "provisional" (capped at medium) --
+        DEMOTION only, never promotion beyond what confirmation_gate already
+        allows for an explicit override.
+
+        FAIL-SAFE: any exception out of the self-test (fixture wouldn't
+        start, an import failed, anything) is swallowed and produces an
+        EMPTY frozenset -- "could not measure" demotes every confirmable
+        class to provisional this run, it never falls back to trusting the
+        static table while claiming to be run-derived."""
+        cfg = (getattr(self, "config", {}) or {}).get("leg_self_test", {}) or {}
+        if not cfg.get("enabled", False):
+            return None  # override absent -- confirmation_gate uses its static offline default
+        cached = getattr(self, "_leg_self_test_cache", None)
+        if cached is not None:
+            return cached
+        from harness import leg_self_test
+        try:
+            markers = await asyncio.to_thread(leg_self_test.run_self_test)
+        except Exception:
+            log.warning(
+                "leg self-test crashed this run -- every confirmable class "
+                "falls back to provisional (fail-safe)", exc_info=True)
+            markers = frozenset()
+        self._leg_self_test_cache = markers
+        return markers
+
     async def _oracle_gate(self, finding, exchange) -> None:
         """P0.1-WIRE: run the deterministic verification oracle over a just-
         confirmed finding, behind config `oracle.enabled` (default false).
