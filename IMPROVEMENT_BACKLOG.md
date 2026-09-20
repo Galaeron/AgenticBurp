@@ -153,7 +153,18 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 
 ## P1 — Product blockers (before regular practitioner use)
 
-### [ ] P1-1 — Prompt-injection isolation for target responses
+### [x] P1-1 — Prompt-injection isolation for target responses
+- **Result (VERIFIED):** `33392c9` — added a fence-breakout neutralization layer on
+  top of the pre-existing per-request nonce fence: `_neutralize_fence_breakout()`
+  defangs any `<<<UNTRUSTED-DATA-...>>>` lookalike in body/headers/analyst_note so
+  target content cannot forge or terminate the boundary. Runs AFTER `trunc()`, so
+  the body caps and `_high_signal_slice` (W#13) excerpt are preserved. Defensive-
+  only (no config/verdict/gate/scope/control-flow change; `_prompt_version`
+  unaffected). +7 tests: adversarial injection cannot change finding state / trigger
+  an action (forged authority fields stripped by `sanitize_agent_finding`), payload
+  confined, fence-shape + nonce-guess breakout defanged, benign body intact with
+  caps enforced, validators read only the captured exchange. Full suite 2342 OK /
+  2 skip. Follow-on filed: P3-5.
 - **Domain:** Security · **Effort:** M · **Depends on:** none
 - **Evidence (INFERRED/SUPPORTED):** target response bodies are truncated to
   `max_body_chars` and fed into agent prompts; no dedicated isolation/escaping of
@@ -363,6 +374,20 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   findings store, role-based access, centralized audit log (the ledger is the seed),
   and resumable engagements.
 - **Impact:** High for commercialization; premature before efficacy is proven.
+
+### [ ] P3-5 — Extend fence isolation to prior-context / knowledge blocks
+- **Domain:** Security · **Effort:** S · **Depends on:** P1-1 [x]
+- **Evidence (VERIFIED):** filed during P1-1 review. P1-1 fences body/headers/
+  analyst_note, but `prior_context` / `knowledge_block` in `base_agent._user_prompt`
+  are not run through `_neutralize_fence_breakout`. They are harness-derived
+  (sanitized prior findings, methodology notes) so this is low-risk today, but a
+  prior finding can echo untrusted body content.
+- **Recommendation:** Apply the same fence-shape neutralization to prior-context /
+  knowledge blocks that can carry echoed target content.
+- **Acceptance criteria:** A test injects a fence-shaped token via prior-finding
+  text and asserts it is defanged before entering the prompt; benign prior context
+  is unchanged (negative control).
+- **Impact:** Low-Medium (defense-in-depth).
 
 ### [ ] P3-4 — Bound/rotate the in-memory ledger singleton
 - **Domain:** Reliability · **Effort:** S · **Depends on:** none

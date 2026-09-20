@@ -5,8 +5,8 @@
 Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
 refactor and the precision & blind-control sprint (Items 1–3) are committed
 (base `02de8bf`, HEAD of that batch `bc5f599`). On top, improvement-loop items
-**P0-1** (`25a737a`), **P0-2** (`533928c`), and **P0-4** (`0e993da`) landed.
-Re-verified green.
+**P0-1** (`25a737a`), **P0-2** (`533928c`), **P0-4** (`0e993da`), and **P1-1**
+(`33392c9`) landed. Re-verified green (full suite 2342 OK / 2 skip).
 
 ## Improvement loop (IMPROVEMENT_BACKLOG.md)
 
@@ -25,11 +25,15 @@ Re-verified green.
   `SafeDefaultGuardTests` that fails the suite if any covered safety default drifts
   (allowed_hosts, validators active/mutating, autonomous_discovery, oracle,
   engagement toggles, coordinator.cloud_*).
-- Follow-on nit filed as P3-4 (bound/rotate the in-memory ledger singleton).
-- P0 tier offline items are done. Remaining P0-3 is owner-only (real-model run).
-  Next eligible offline items: P1 tier (P1-1 prompt-injection isolation, P1-2
-  scope-escape tests, P1-4 operating profiles, P1-6 policy object; P1-3 depends on
-  P0-3, P1-5 needs a JDK/Burp build).
+- **P1-1 done (`33392c9`):** fence-breakout neutralization for untrusted target
+  text (body/headers/analyst_note) on top of the nonce fence; adversarial
+  injection cannot alter finding state, caps/high-signal-slice preserved,
+  defensive-only. +7 tests.
+- Follow-on nits filed: P3-4 (bound/rotate in-memory ledger singleton), P3-5
+  (extend fence isolation to prior-context/knowledge blocks).
+- P0 offline tier done (P0-3 owner-only). Next eligible offline items: P1-2
+  (scope-escape adversarial tests), P1-4 (operating profiles), P1-6 (policy
+  object). P1-3 depends on P0-3; P1-5 needs a JDK/Burp build.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
