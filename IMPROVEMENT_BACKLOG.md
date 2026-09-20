@@ -214,7 +214,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 - **Impact:** Medium.
 
 ### [x] P1-4 — Named operating profiles
-- **Result (VERIFIED):** `df91df8` — 5 presets (passive-only/laptop/workstation/
+- **Result (VERIFIED):** `1e084e1` — 5 presets (passive-only/laptop/workstation/
   deep-assessment/ci-eval) in `config_schema.OPERATING_PROFILES` bundle existing
   knobs, selected via one opt-in `operating_profile` key (ships "none" → unset is a
   byte-for-byte no-op, returns the same object). Composition rule: a profile knob

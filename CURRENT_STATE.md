@@ -21,7 +21,7 @@ OK / 2 skip). Full per-item detail with Result lines is in IMPROVEMENT_BACKLOG.m
 - **P1-2 (`e54cfb6`):** scope-escape adversarial regression coverage (IP-literal,
   DNS-rebinding, file://+gopher://, mid-hop redirect) — all already blocked; no
   production change.
-- **P1-4 (`df91df8`):** 5 named operating profiles via one opt-in `operating_profile`
+- **P1-4 (`1e084e1`):** 5 named operating profiles via one opt-in `operating_profile`
   selector (ships "none" → no-op); passive-only asserted all-flags-off; safe
   defaults + SafeDefaultGuardTests intact.
 - Follow-on nits filed: P3-4 (ledger singleton), P3-5 (fence prior-context).
