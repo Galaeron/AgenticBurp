@@ -3,9 +3,22 @@
 ## Checkout
 
 Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
-refactor and the precision & blind-control sprint (Items 1–3), previously
-uncommitted, are now committed as five focused commits (base `02de8bf`, HEAD
-`bc5f599`) and re-verified green on the committed tree (see Verified below).
+refactor and the precision & blind-control sprint (Items 1–3) are committed
+(base `02de8bf`, HEAD of that batch `bc5f599`). On top, improvement-loop item
+**P0-1** landed at `25a737a`. Re-verified green on the committed tree.
+
+## Improvement loop (IMPROVEMENT_BACKLOG.md)
+
+- **P0-1 done (`25a737a`):** EvidenceLedger wired into the live pipeline —
+  records each finding's causal chain (HYPOTHESIS → PLANNED_ACTION/
+  AUTHORIZATION_DECISION/EXECUTION → VALIDATION_DECISION → FINDING_REVISION, plus
+  an OBSERVATION "never-tested" note not counted toward completeness) to an
+  append-only `ledger_events` store table; reconstructable via
+  `GET /findings/{ref}/evidence` and a report line. Instrumentation-only: no
+  config default, verdict, severity, scope, gate, or control-flow change.
+- Follow-on nit filed as P3-4 (bound/rotate the in-memory ledger singleton).
+- Next eligible offline items: P0-2 (run-derived trust tiers), P0-4 (revert
+  committed scope + safe-default CI guard). P0-3 remains owner-only (real-model run).
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
@@ -28,36 +41,14 @@ loaded by bare `yaml.safe_load()` and cannot inherit from the real harness confi
 
 ## Precision & blind-control sprint (Items 1–3, committed this session)
 
-Item 1 — fail_open_mode: curated for measurement (shipped default stays `all`):
-- `testing/blind-target-2/run_blind_eval.py`: injects `fail_open_mode=curated` via
-  `HARNESS_FAIL_OPEN_MODE` env var (default curated); logs config fingerprint +
-  fail_open_stats in the run manifest.
-- `testing/blind-test-kit/harness/config.yaml` (vendored): added
-  `fail_open_mode: "curated"` with a divergence note (this runner uses bare
-  yaml.safe_load, no config.local.yaml overlay reaches it).
-- `harness/test_fail_open_curated.py`: two new tests — runner config dict threads
-  through correctly; fail_open_stats() and config_fingerprint() are capturable.
-
-Item 2 — safe passive oracle (zero live traffic):
-- `harness/config.yaml`: added `oracle.safe_passive_default: true` — runs oracle
-  only for `active=False` validators (no new requests). Shipped ON; safe by design.
-- `harness/oracle_framework.py`: `oracle_for()` gains `passive_only: bool = False`
-  parameter; skips active validators when True.
-- `harness/orchestrator_confirm.py`: `_oracle_gate` handles the three modes:
-  disabled, safe-passive (new), and full-active.
-- `harness/test_oracle_framework.py`: 6 new tests in `TestOracleForPassiveOnly`,
-  including the zero-sends safety contract negative control.
-
-Item 3 — quarantine undifferentiated live-class findings as LEADs on blind runs:
-- `harness/confirmation_gate.py`: `should_quarantine_as_lead(finding) -> bool` —
-  true for assumed/recalled + live-class + not confirmed + not oracle-verified.
-- `harness/config.yaml`: `reporting.quarantine_unverified_leads: false` (shipped OFF).
-- `harness/report_generator.py`: `generate_markdown_report` gains
-  `quarantine_leads: bool = False`; quarantined findings routed to a separate
-  "Test Suggestions" section.
-- `testing/blind-target-2/run_blind_eval.py`: `HARNESS_QUARANTINE_LEADS` env var
-  (default 1 = enabled for measurement).
-- `harness/test_quarantine_leads.py`: 12 new tests (predicate + report integration).
+- Item 1 — fail_open curated mode for measurement (shipped default stays `all`):
+  `run_blind_eval.py` env knob, vendored kit config, `test_fail_open_curated.py`.
+- Item 2 — safe passive oracle (`oracle.safe_passive_default: true`, zero live
+  traffic): `oracle_framework.oracle_for(passive_only=...)`, `_oracle_gate` modes,
+  6 new tests incl. zero-sends negative control.
+- Item 3 — quarantine undifferentiated live-class findings as LEADs on blind runs
+  (`reporting.quarantine_unverified_leads: false`, shipped OFF):
+  `should_quarantine_as_lead`, report "Test Suggestions" section, 12 new tests.
 
 Owner action required (these numbers are NOT verified here):
 - Re-run PixelMart + blind helpdesk under `fail_open_mode=curated` and
