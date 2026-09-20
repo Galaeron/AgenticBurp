@@ -187,7 +187,7 @@ async def _collect_from_fixture(labels, refresh: bool, corpus: str,
     can bind a provenance hash to it (R01/R05)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent / corpus))
     import detection_fixture as fx
-    import access_control_gate as acg
+    from harness import access_control_gate as acg
     labs = labels or sorted(fx.EXCHANGES_BY_LABEL)
     sev_floor = _SEVERITY_RANK.get(min_severity, 0)
     out: dict[str, list[str]] = {}

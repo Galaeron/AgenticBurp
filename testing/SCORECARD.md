@@ -173,6 +173,57 @@ CONFIRMED).
 Also this session: `access_control_gate` now caps severity as well as confidence,
 and `score.py` applies the gate so the fixture reflects the shipped pipeline.
 
+## 2026-09-20 — fresh live re-run (current checkout, no cache reuse)
+
+`detection_fixture.py` and `run_blind_eval.py` had been broken since the W-18
+`harness.*` package refactor (flat `import store`/`import orchestrator`
+instead of `from harness import ...`) — fixed as import-path-only changes to
+run this. `testing/score.py` had the same stale `import access_control_gate`
+and was fixed the same way.
+
+**test-target, sev≥medium (`python score.py --corpus test-target --from-cache`,
+fixture rebuilt live via `detection_fixture.py build`, which force-refreshes
+every dispatched agent — this is a live run, not a cache replay):**
+
+| category | support | precision | recall | f1 |
+|---|--:|--:|--:|--:|
+| A01 Broken Access Control | 3 | 0.429 | 1.000 | 0.600 |
+| A03 Injection | 4 | 0.667 | 1.000 | 0.800 |
+| A04 Insecure Design | 1 | 1.000 | 1.000 | 1.000 |
+| A05 Security Misconfiguration | 1 | 0.200 | 1.000 | 0.333 |
+| A07 Auth Failures | 1 | 0.333 | 1.000 | 0.500 |
+| A10 SSRF | 1 | 0.500 | 1.000 | 0.667 |
+
+**Overall (micro): precision 0.423, recall 1.000, f1 0.595 (tp=11, fp=15, fn=0).**
+vs. the 2026-09-02 baseline above (0.476 / 0.909): recall is now perfect, at the
+cost of a few more FPs — inside the variance this doc already documents (a
+prior fresh retest saw precision fall to 0.286). Read as one sample in a
+~0.29–0.48 precision band, not a fixed score.
+
+**blind-target-2 fresh re-run (`run_blind_eval.py`, 10 exchanges, live
+Ollama):** positives detected 2/2 (unchanged). **Controls clean 1/6 — up from
+0/6** on 2026-09-02, though still the weakest axis: 5 of 6 genuinely-secure
+endpoints still get a spurious medium+ finding, mostly `missing_authentication`/
+`security_misconfiguration` guesses the critique pass downgrades but doesn't
+fully suppress. Total findings 51 (vs. 39 previously), 0 errors across 10
+exchanges.
+
+**VulnCorp-Helpdesk maxrun** (`testing/vulncorp-helpdesk/maxrun/run_maxcov_integrated.py`,
+`.worktrees/integration-measure` @ `eb70210`, one day behind main's `249b799`;
+full report: `testing/vulncorp-helpdesk/maxrun/recall_report_integrated_full.md`,
+not tracked in git per this directory's existing convention): 8.3h wall time,
+1,914 fused findings. Against the 13 known planted bugs: **9/13 confirmed**
+(8/13 via the intended path), 3/13 detected-unconfirmed, 1/13 missed (SSRF).
+**Proof-linked audit** (finding must resolve to an actual persisted proof for
+its own case+validator, not just a `confirmed` flag) drops that to **6/13**.
+**0 chains detected** — the session-8 "1 chain" claim in
+`COMPETITIVE_LANDSCAPE.md` did not reproduce here. `command_injection` and
+`ssti` were confirmed at `/api/tickets/import`, outside the tracked 13-item
+ground truth. The confirmed-class breakdown is dominated by repetitive
+`information_disclosure`/`verbose_error_disclosure` hits (641× / 107× on one
+validator) — almost certainly duplicate noise, not distinct bugs, so raw
+finding-volume numbers from this run should not be read as a precision claim.
+
 ## Remaining
 - **Burp UI toggle** for `cross_identity` + a field to paste another identity's
   session headers (config toggle + endpoint exist; the Java panel wiring is
@@ -182,3 +233,6 @@ and `score.py` applies the gate so the fixture reflects the shipped pipeline.
   non-vulns.
 - **Werkzeug dep noise (9×)**: per-advisory dedup already exists; a per-component
   cap is a minor follow-up.
+- **Chaining regressed to 0** (2026-09-20 VulnCorp re-run, was 1 in session-8) and
+  **proof-linked VulnCorp confirmation (6/13) trails the raw `confirmed` flag
+  (9/13)** — both worth root-causing before quoting the session-8 numbers again.
