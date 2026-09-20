@@ -75,7 +75,18 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   - `reproduction_recipe` returns runnable steps + a config fingerprint.
 - **Impact:** Transformational.
 
-### [ ] P0-2 — Run-derived confirmation trust tiers (retire the static table)
+### [x] P0-2 — Run-derived confirmation trust tiers (retire the static table)
+- **Result (VERIFIED):** `533928c` — `harness/leg_self_test.py` fires each active
+  leg against the owned loopback fixture + paired negative control and returns the
+  run's live set, threaded through the existing `live_verified_markers` override.
+  Demotion-only (never promotes), OFF by default (`leg_self_test.enabled`, not in
+  config.yaml → shipped behavior byte-for-byte unchanged, static
+  `LIVE_VERIFIED_MARKERS` stays the offline default). Fail-safe: unavailable leg /
+  fixture-startup failure / crashed self-test all yield an empty set (demote-all),
+  never silent stay-live; self-test runs under a 127.0.0.1-scoped SafetyGate. +8
+  tests (healthy-leg negative control, defect-injection demotion, 3 fail-safe
+  paths, off-by-default no-op). Full suite 2333 OK / 2 skip, exit 0. To measure/
+  retire the static table on a run, set `leg_self_test.enabled: true` per-run/CI.
 - **Domain:** Reliability / Trust · **Effort:** M · **Depends on:** none
 - **Evidence (VERIFIED):** `LIVE_VERIFIED_MARKERS` / `PROVISIONAL_MARKERS` in
   [harness/confirmation_gate.py:202-270](harness/confirmation_gate.py) are hand-maintained

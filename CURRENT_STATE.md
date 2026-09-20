@@ -4,21 +4,24 @@
 
 Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
 refactor and the precision & blind-control sprint (Items 1–3) are committed
-(base `02de8bf`, HEAD of that batch `bc5f599`). On top, improvement-loop item
-**P0-1** landed at `25a737a`. Re-verified green on the committed tree.
+(base `02de8bf`, HEAD of that batch `bc5f599`). On top, improvement-loop items
+**P0-1** (`25a737a`) and **P0-2** (`533928c`) landed. Re-verified green.
 
 ## Improvement loop (IMPROVEMENT_BACKLOG.md)
 
 - **P0-1 done (`25a737a`):** EvidenceLedger wired into the live pipeline —
-  records each finding's causal chain (HYPOTHESIS → PLANNED_ACTION/
-  AUTHORIZATION_DECISION/EXECUTION → VALIDATION_DECISION → FINDING_REVISION, plus
-  an OBSERVATION "never-tested" note not counted toward completeness) to an
-  append-only `ledger_events` store table; reconstructable via
-  `GET /findings/{ref}/evidence` and a report line. Instrumentation-only: no
-  config default, verdict, severity, scope, gate, or control-flow change.
+  records each finding's causal chain to an append-only `ledger_events` store
+  table; reconstructable via `GET /findings/{ref}/evidence` and a report line.
+  Instrumentation-only (no config/verdict/scope/gate/control-flow change).
+- **P0-2 done (`533928c`):** run-derived leg trust tiers — `leg_self_test.py`
+  fires each active leg against the owned loopback fixture + negative control and
+  demotes classes that fail their self-test, via the existing
+  `live_verified_markers` override. Demotion-only, OFF by default
+  (`leg_self_test.enabled`; static table stays the shipped default), fail-safe to
+  demote-all. +8 tests; full suite 2333 OK / 2 skip.
 - Follow-on nit filed as P3-4 (bound/rotate the in-memory ledger singleton).
-- Next eligible offline items: P0-2 (run-derived trust tiers), P0-4 (revert
-  committed scope + safe-default CI guard). P0-3 remains owner-only (real-model run).
+- Next eligible offline items: P0-4 (revert committed scope + safe-default CI
+  guard), then P1 tier. P0-3 remains owner-only (real-model run).
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
