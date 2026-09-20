@@ -213,7 +213,16 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   note in `reviews/<date>/`.
 - **Impact:** Medium.
 
-### [ ] P1-4 — Named operating profiles
+### [x] P1-4 — Named operating profiles
+- **Result (VERIFIED):** `df91df8` — 5 presets (passive-only/laptop/workstation/
+  deep-assessment/ci-eval) in `config_schema.OPERATING_PROFILES` bundle existing
+  knobs, selected via one opt-in `operating_profile` key (ships "none" → unset is a
+  byte-for-byte no-op, returns the same object). Composition rule: a profile knob
+  applies only where the value still equals the shipped baseline; an explicit
+  operator value wins. Resolved config flows into all orchestrator sub-components.
+  passive-only asserted to leave every active/mutating/discovery/engagement/cloud
+  flag off. Profiles are Python-defined so P0-4 SafeDefaultGuardTests still passes
+  with the new key. +16 tests; full suite 2365 OK / 2 skip.
 - **Domain:** UX / Performance · **Effort:** S · **Depends on:** none
 - **Evidence (VERIFIED):** `orchestrator.__init__` reads 10+ behavioral toggles;
   config comments document a real perf cliff (38 agents × serialized inference on

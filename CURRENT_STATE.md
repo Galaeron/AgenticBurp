@@ -5,8 +5,8 @@
 Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
 refactor and the precision & blind-control sprint (Items 1–3) are committed
 (base `02de8bf`, HEAD of that batch `bc5f599`). On top, improvement-loop items
-**P0-1, P0-2, P0-4, P1-1, P1-2** landed. Re-verified green (full suite 2349 OK /
-2 skip). Full per-item detail with Result lines is in IMPROVEMENT_BACKLOG.md.
+**P0-1, P0-2, P0-4, P1-1, P1-2, P1-4** landed. Re-verified green (full suite 2365
+OK / 2 skip). Full per-item detail with Result lines is in IMPROVEMENT_BACKLOG.md.
 
 ## Improvement loop (IMPROVEMENT_BACKLOG.md)
 
@@ -21,9 +21,12 @@ refactor and the precision & blind-control sprint (Items 1–3) are committed
 - **P1-2 (`e54cfb6`):** scope-escape adversarial regression coverage (IP-literal,
   DNS-rebinding, file://+gopher://, mid-hop redirect) — all already blocked; no
   production change.
+- **P1-4 (`df91df8`):** 5 named operating profiles via one opt-in `operating_profile`
+  selector (ships "none" → no-op); passive-only asserted all-flags-off; safe
+  defaults + SafeDefaultGuardTests intact.
 - Follow-on nits filed: P3-4 (ledger singleton), P3-5 (fence prior-context).
-- P0 offline tier done (P0-3 owner-only). Next eligible offline: P1-4 (operating
-  profiles), P1-6 (policy object). P1-3 depends on P0-3; P1-5 needs a JDK/Burp build.
+- P0 offline tier done (P0-3 owner-only). Next eligible offline: P1-6 (policy
+  object). P1-3 depends on P0-3; P1-5 needs a JDK/Burp build.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
