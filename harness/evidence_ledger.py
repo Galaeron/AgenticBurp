@@ -198,3 +198,90 @@ class EvidenceLedger:
 
     def __len__(self) -> int:
         return len(self._events)
+
+
+# ---------------------------------------------------------------------------
+# Wiring seam (P0-1): a process-wide default ledger every pipeline stage
+# emits onto, plus a persistence bridge to store.py so the stream survives a
+# process restart and the findings API / report can reconstruct a finding
+# without needing the in-memory singleton. INSTRUMENTATION ONLY: emit()
+# never raises into and never returns anything a caller branches on -- a
+# store failure is swallowed (logged) so a persistence hiccup can never
+# affect a finding's verdict, severity, or the send it is recording.
+# ---------------------------------------------------------------------------
+
+import logging as _logging
+
+_log = _logging.getLogger("harness.evidence_ledger")
+
+_DEFAULT_LEDGER = EvidenceLedger()
+
+
+def get_default_ledger() -> EvidenceLedger:
+    """The process-wide ledger every live pipeline stage emits onto."""
+    return _DEFAULT_LEDGER
+
+
+def emit(event_type, finding_ref: str, summary: str, *, data: dict | None = None,
+          provenance: Provenance | None = None, case_ref: str = "",
+          ledger: "EvidenceLedger | None" = None) -> LedgerEvent | None:
+    """Record one event onto `ledger` (default: the process-wide default
+    ledger) AND best-effort persist it to store.py's ledger_events table.
+
+    Returns None (recording nothing) when `finding_ref` is empty -- an event
+    with no finding to attach to is not useful and would only pollute the
+    stream. This is the single seam every pipeline stage (agents, transport,
+    confirmation, the suppression gate) calls through; it is read/record-only
+    and never influences the caller's own decision.
+    """
+    if not finding_ref:
+        return None
+    led = ledger if ledger is not None else _DEFAULT_LEDGER
+    ev = led.record(event_type, finding_ref, summary, data=data,
+                    provenance=provenance, case_ref=case_ref)
+    try:
+        from harness import store
+        store.persist_ledger_event(ev.to_dict())
+    except Exception as e:  # persistence is best-effort; never break the live pipeline
+        _log.debug("failed to persist ledger event %s for %s: %s", event_type, finding_ref, e)
+    return ev
+
+
+def ledger_from_store(finding_ref: str) -> EvidenceLedger:
+    """Replay this finding's persisted events (store.py) into a fresh ledger.
+
+    Lets the findings API / report reconstruct a finding independent of the
+    in-memory singleton (e.g. after a restart, or from a different process),
+    while reconstruct()/reproduction_recipe() themselves stay pure functions
+    of whatever events a ledger holds."""
+    led = EvidenceLedger()
+    try:
+        from harness import store
+        rows = store.ledger_events_for(finding_ref)
+    except Exception as e:
+        _log.debug("failed to load persisted ledger events for %s: %s", finding_ref, e)
+        return led
+    for row in rows:
+        try:
+            prov = Provenance(**row.get("provenance", {}))
+            event = LedgerEvent(
+                event_type=EventType(row["event_type"]), finding_ref=row["finding_ref"],
+                summary=row.get("summary", ""), data=row.get("data", {}),
+                provenance=prov, case_ref=row.get("case_ref", ""),
+                event_id=row.get("event_id", ""), created_at=row.get("created_at", 0.0))
+            led.append(event)
+        except AppendOnlyViolation:
+            pass  # duplicate row (e.g. re-persisted); the first copy already holds
+        except Exception as e:
+            _log.debug("skipping malformed persisted ledger event for %s: %s", finding_ref, e)
+    return led
+
+
+def reconstruct_persisted(finding_ref: str) -> dict:
+    """reconstruct(), reading from the durable store instead of memory."""
+    return ledger_from_store(finding_ref).reconstruct(finding_ref)
+
+
+def reproduction_recipe_persisted(finding_ref: str) -> dict:
+    """reproduction_recipe(), reading from the durable store instead of memory."""
+    return ledger_from_store(finding_ref).reproduction_recipe(finding_ref)

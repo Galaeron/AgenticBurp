@@ -193,6 +193,26 @@ CREATE INDEX IF NOT EXISTS idx_proof_case ON proof_records(case_id);
 CREATE INDEX IF NOT EXISTS idx_proof_run ON proof_records(run_id);
 """
 
+# P0-1: the durable stream for harness.evidence_ledger.EvidenceLedger. Append-only
+# (event_id is the primary key and every write is INSERT OR IGNORE -- a caller
+# re-persisting the same event, e.g. after a retry, is a no-op, never an overwrite)
+# so the audit trail behind reconstruct()/reproduction_recipe() survives a process
+# restart, independent of the in-memory singleton. Purely additive: nothing else
+# reads or writes this table, so it cannot change any verdict/severity/scope logic.
+_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ledger_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    finding_ref TEXT NOT NULL,
+    case_ref TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    data_json TEXT NOT NULL DEFAULT '{}',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_finding_ref ON ledger_events(finding_ref);
+"""
+
 # Astra T02: observed object-ownership facts (who owns / can reach an object), with
 # provenance. Additive; unknown ownership is simply absent (never guessed). The
 # principal metadata (tenant/permissions/trust) is added to the existing identities
@@ -269,6 +289,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_EVIDENCE_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
+    conn.executescript(_LEDGER_SCHEMA)
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -1348,3 +1369,54 @@ def get_identity_principal_meta(identity_id: str) -> dict | None:
         return {"tenant": row[0], "permissions": json.loads(row[1] or "[]"), "trust": row[2]}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-1: EvidenceLedger persistence -- the durable stream behind
+# reconstruct()/reproduction_recipe(). Read-only from every other module's
+# perspective: nothing here is consulted by any verdict, severity, scope, or
+# gate decision -- it is purely a record of what already happened.
+# ---------------------------------------------------------------------------
+
+def persist_ledger_event(event: dict) -> None:
+    """Append one harness.evidence_ledger.LedgerEvent.to_dict() to the durable
+    stream. INSERT OR IGNORE keyed on event_id keeps this append-only: a
+    caller that persists the same event twice (e.g. a retried emit) is a
+    no-op, never an overwrite. Best-effort by design -- callers (evidence_
+    ledger.emit) already swallow any exception this raises, so a storage
+    hiccup here can never surface as a pipeline failure."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO ledger_events "
+            "(event_id, event_type, finding_ref, case_ref, summary, data_json, "
+            "provenance_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (event.get("event_id", ""), event.get("event_type", ""),
+             event.get("finding_ref", ""), event.get("case_ref", ""),
+             event.get("summary", ""), json.dumps(event.get("data", {}) or {}),
+             json.dumps(event.get("provenance", {}) or {}), event.get("created_at", time.time())))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def ledger_events_for(finding_ref: str) -> list[dict]:
+    """All persisted ledger events for one finding, oldest first, as plain
+    dicts shaped like LedgerEvent.to_dict() (ready for
+    harness.evidence_ledger.ledger_from_store to replay)."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT event_id, event_type, finding_ref, case_ref, summary, data_json, "
+            "provenance_json, created_at FROM ledger_events WHERE finding_ref = ? "
+            "ORDER BY created_at ASC", (finding_ref,)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        out.append({
+            "event_id": r[0], "event_type": r[1], "finding_ref": r[2], "case_ref": r[3],
+            "summary": r[4], "data": json.loads(r[5] or "{}"),
+            "provenance": json.loads(r[6] or "{}"), "created_at": r[7],
+        })
+    return out

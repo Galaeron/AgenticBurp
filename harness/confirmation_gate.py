@@ -434,6 +434,7 @@ def apply_confirmation_suppression(
     reports: list[AgentReport],
     validation_reports: list[ValidationReport] | None = None,
     live_verified_markers: frozenset | None = None,
+    config: dict | None = None,
 ) -> int:
     """
     Place each unconfirmed finding into an execution-aware, leg-aware state model.
@@ -460,6 +461,28 @@ def apply_confirmation_suppression(
     demoted = 0
     negatives = _controlled_negative_classes(validation_reports)
     from harness.categories import canonicalize as _canon
+
+    def _emit_revision(finding, tier: str) -> None:
+        # P0-1: FINDING_REVISION -- this gate's severity/confidence/verdict
+        # demotion is already fully computed on `finding` by this point (the
+        # lines above this call); this only RECORDS that decision onto the
+        # ledger, it never feeds back into it. No-op when the finding has no
+        # finding_id (nothing to attach the event to) -- never raises.
+        if not getattr(finding, "finding_id", ""):
+            return
+        try:
+            from harness import evidence_ledger
+            evidence_ledger.emit(
+                evidence_ledger.EventType.FINDING_REVISION, finding.finding_id,
+                f"confirmation-suppression gate ({tier}): {finding.review_verdict} "
+                f"-> severity={finding.severity}, confidence={finding.confidence:.2f}",
+                data={"tier": tier, "review_verdict": finding.review_verdict,
+                      "severity": finding.severity, "confidence": finding.confidence,
+                      "original_severity": finding.original_severity,
+                      "original_confidence": finding.original_confidence},
+                provenance=evidence_ledger.Provenance.capture(config=config))
+        except Exception:
+            pass
 
     for report in reports:
         for finding in report.findings:
@@ -503,6 +526,7 @@ def apply_confirmation_suppression(
                 )
                 if finding.summary and not finding.summary.startswith(prefix):
                     finding.summary = f"{prefix} {finding.summary}"
+                _emit_revision(finding, "live")
                 continue
             else:  # provisional
                 # UNPROVEN: the leg isn't live-verified, so silence is weak
@@ -523,6 +547,7 @@ def apply_confirmation_suppression(
             )
             if finding.summary and not finding.summary.startswith(prefix):
                 finding.summary = f"{prefix} {finding.summary}"
+            _emit_revision(finding, "provisional")
 
     if demoted > 0:
         log.info("Confirmation-suppression gate processed %d unconfirmed finding(s) "

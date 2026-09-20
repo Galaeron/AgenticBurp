@@ -289,6 +289,27 @@ class ConfirmMixin:
                 bind_context = getattr(self.validator_registry, "bind_run_context", None)
                 if bind_context is not None:
                     validators = bind_context(validators, run_context)
+                if not validators:
+                    # P0-1: an honest "never tested" record -- this finding's class
+                    # has no applicable confirmation leg, so no VALIDATION_DECISION
+                    # will ever be emitted for it below. Recorded as an OBSERVATION
+                    # (never VALIDATION_DECISION/FINDING_REVISION), so
+                    # reconstruct()'s `complete` stays False for it, exactly as it
+                    # should for a finding that was never actually confirmed or
+                    # refuted. Read-only bookkeeping; does not affect dispatch.
+                    try:
+                        from harness import evidence_ledger
+                        evidence_ledger.emit(
+                            evidence_ledger.EventType.OBSERVATION, finding.finding_id,
+                            f"no confirmation validator available for class "
+                            f"{finding.vulnerability_class!r}",
+                            data={"not_tested": f"no validator applies to "
+                                                 f"vulnerability_class={finding.vulnerability_class!r}"},
+                            provenance=evidence_ledger.Provenance.capture(
+                                config=getattr(self, "config", {})),
+                            case_ref=case.case_id)
+                    except Exception:
+                        pass
                 for validator in validators:
                     jobs.append(validator.validate(finding, exchange))
                     plans.append(validator.plan(finding, exchange))
@@ -350,6 +371,27 @@ class ConfirmMixin:
                 summary=result.summary,
                 evidence=result.evidence,
             ))
+            # P0-1: VALIDATION_DECISION -- "why was it concluded (vulnerable or
+            # not)", the confirmation half of a finding's audit trail. Recorded
+            # for every reached verdict (confirmed, not_confirmed, skipped), not
+            # only confirmations, so a REFUTED/UNVERIFIED finding's reconstruction
+            # is just as complete. Read-only: this call cannot affect `result`,
+            # `finding`, or anything read below it.
+            try:
+                from harness import evidence_ledger
+                evidence_ledger.emit(
+                    evidence_ledger.EventType.VALIDATION_DECISION, finding.finding_id,
+                    f"{result.validator}: {result.status}"
+                    + (" (confirmed)" if result.confirmed else "")
+                    + (f" -- {result.summary}" if result.summary else ""),
+                    data={"validator": result.validator, "status": result.status,
+                          "confirmed": result.confirmed, "confidence": result.confidence,
+                          "evidence": (result.evidence or "")[:1000]},
+                    provenance=evidence_ledger.Provenance.capture(
+                        config=getattr(self, "config", {})),
+                    case_ref=case.case_id)
+            except Exception:
+                pass
             # Case-bound structured proof for this attempt (T01): persisted and
             # returned through the response so a confirmation is evidence, not a bare
             # boolean, and each attempt gets its OWN proof (unique proof_id). Additive

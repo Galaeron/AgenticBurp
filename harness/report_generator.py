@@ -137,6 +137,10 @@ class ReportFinding:
     # kind of claim; bundling them under one "confirmed" count inflated the
     # headline number without the reader being able to tell which is which.
     is_observation: bool = False
+    # P0-1: the EvidenceLedger's finding_ref -- lets the report point the
+    # reader at the full request/response/why-concluded reconstruction for
+    # this exact finding instead of only the summarized evidence above.
+    finding_id: str = ""
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
@@ -168,6 +172,7 @@ def _from_store_dict(d: dict) -> ReportFinding:
         is_observation=(leg_tier(vc) == "none"),
         verification_state=__import__("harness.oracle_framework",
                       fromlist=["derive_verification_state"]).derive_verification_state(d),
+        finding_id=d.get("finding_id", "") or "",
     )
 
 
@@ -566,6 +571,21 @@ def _render_finding(f: ReportFinding) -> list[str]:
     if f.fingerprint:
         lines.append(f"_Fingerprint: `{f.fingerprint[:16]}` -- use this to suppress if this is a "
                       f"false positive, so it doesn't resurface on a future scan of this host._")
+    # P0-1: the evidence ledger's audit-grade reconstruction of this exact
+    # finding (what was sent, what came back, why it was concluded), when the
+    # ledger actually has a chain for it. Best-effort/read-only -- a ledger
+    # lookup failure never blocks the rest of the report.
+    if f.finding_id:
+        try:
+            from harness import evidence_ledger
+            recon = evidence_ledger.reconstruct_persisted(f.finding_id)
+            if recon.get("event_count"):
+                completeness = "complete" if recon.get("complete") else "partial"
+                lines.append(f"_Evidence chain: `{f.finding_id}` ({completeness}, "
+                              f"{recon['event_count']} recorded event(s)) -- reconstructable via "
+                              f"the findings API without re-reading server logs._")
+        except Exception:
+            pass
     lines.append("")
     lines.append("---")
     lines.append("")

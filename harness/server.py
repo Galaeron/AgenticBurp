@@ -1181,6 +1181,25 @@ async def list_suppressions(authorization: str | None = Header(default=None)):
     return await __import__("asyncio").to_thread(store.list_suppressions)
 
 
+@app.get("/findings/{finding_ref}/evidence")
+async def finding_evidence(finding_ref: str, authorization: str | None = Header(default=None)):
+    """P0-1: the EvidenceLedger's audit-grade reconstruction of one finding --
+    why it was tested, what was sent, what came back, why it was concluded
+    (vulnerable or not), and what was never tested -- plus the minimal recipe
+    to reproduce it. Read-only: this exposes what the pipeline already
+    recorded, never a live re-test. Reads the durable store (not the
+    in-memory ledger) so it works even after a server restart."""
+    _require_auth(authorization)
+    from harness import evidence_ledger
+    reconstruction = await __import__("asyncio").to_thread(
+        evidence_ledger.reconstruct_persisted, finding_ref)
+    recipe = await __import__("asyncio").to_thread(
+        evidence_ledger.reproduction_recipe_persisted, finding_ref)
+    if not reconstruction.get("event_count"):
+        raise HTTPException(status_code=404, detail="no evidence-ledger events for this finding_ref")
+    return {"reconstruction": reconstruction, "reproduction_recipe": recipe}
+
+
 class MergeIssuesRequest(_BaseModel):
     source_id: str
     target_id: str
