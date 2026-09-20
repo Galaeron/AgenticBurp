@@ -5,7 +5,8 @@
 Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
 refactor and the precision & blind-control sprint (Items 1–3) are committed
 (base `02de8bf`, HEAD of that batch `bc5f599`). On top, improvement-loop items
-**P0-1** (`25a737a`) and **P0-2** (`533928c`) landed. Re-verified green.
+**P0-1** (`25a737a`), **P0-2** (`533928c`), and **P0-4** (`0e993da`) landed.
+Re-verified green.
 
 ## Improvement loop (IMPROVEMENT_BACKLOG.md)
 
@@ -19,9 +20,16 @@ refactor and the precision & blind-control sprint (Items 1–3) are committed
   `live_verified_markers` override. Demotion-only, OFF by default
   (`leg_self_test.enabled`; static table stays the shipped default), fail-safe to
   demote-all. +8 tests; full suite 2333 OK / 2 skip.
+- **P0-4 done (`0e993da`):** reverted committed `server.allowed_hosts` to `[]`
+  (live scope now in the git-ignored `config.local.yaml`); added
+  `SafeDefaultGuardTests` that fails the suite if any covered safety default drifts
+  (allowed_hosts, validators active/mutating, autonomous_discovery, oracle,
+  engagement toggles, coordinator.cloud_*).
 - Follow-on nit filed as P3-4 (bound/rotate the in-memory ledger singleton).
-- Next eligible offline items: P0-4 (revert committed scope + safe-default CI
-  guard), then P1 tier. P0-3 remains owner-only (real-model run).
+- P0 tier offline items are done. Remaining P0-3 is owner-only (real-model run).
+  Next eligible offline items: P1 tier (P1-1 prompt-injection isolation, P1-2
+  scope-escape tests, P1-4 operating profiles, P1-6 policy object; P1-3 depends on
+  P0-3, P1-5 needs a JDK/Burp build).
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 

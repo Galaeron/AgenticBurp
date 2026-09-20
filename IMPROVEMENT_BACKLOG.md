@@ -123,7 +123,17 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   never promoted from stubbed results.
 - **Impact:** High.
 
-### [ ] P0-4 — Revert committed scope + add a safe-default CI guard
+### [x] P0-4 — Revert committed scope + add a safe-default CI guard
+- **Result (VERIFIED):** `0e993da` — committed `server.allowed_hosts` reverted to
+  `[]` (live scope moved to the git-ignored `harness/config.local.yaml`); fixed the
+  interleaved `pattern_memory`/`reporting` comments (comments only). Added
+  `SafeDefaultGuardTests` (harness/test_config_schema.py): loads the real committed
+  config, asserts safe defaults, and as a negative control mutates a fresh reload
+  one flag at a time to its unsafe value and asserts each is caught — covering
+  non-empty allowed_hosts, `validators.active_enabled`, `allow_mutating_replay`,
+  `autonomous_discovery.enabled`, `oracle.enabled`, the engagement toggles, and
+  `coordinator.cloud_*`. No test weakened (scope-dependent tests self-provide
+  scope). Full suite green, exit 0.
 - **Domain:** Safety hygiene · **Effort:** S · **Depends on:** none
 - **Evidence (VERIFIED):** [harness/config.yaml](harness/config.yaml) ships
   `allowed_hosts: ["localhost","127.0.0.1"]` (its own comment says revert to `[]`);
