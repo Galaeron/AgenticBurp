@@ -1,6 +1,22 @@
 # Harness configuration
 # Ollama must be running locally: `ollama serve` (default http://localhost:11434)
 
+# P1-4: named operating profile (harness/config_schema.py, OPERATING_PROFILES).
+# Bundles ~10 of the behavioral toggles below (routing fail-open mode,
+# concurrency, active/mutating validator flags, autonomous discovery, the
+# oracle) into one selector, so you don't have to remember which knobs move
+# together for a given situation. One of: "none" (default -- every knob below
+# keeps exactly the value written for it in this file; byte-for-byte today's
+# behavior), "passive-only", "laptop", "workstation", "deep-assessment",
+# "ci-eval". See OPERATING_PROFILES in config_schema.py for exactly what each
+# named profile sets, and its module comment for how a profile value composes
+# with a knob you've already set explicitly (your explicit value wins).
+# SAFE DEFAULT: "none" in the committed config, same rule as every other
+# knob a profile can touch -- select a profile for a live/local run via the
+# git-ignored config.local.yaml overlay, never by committing a flipped value
+# here (see CLAUDE.md/AGENTS.md config hazard).
+operating_profile: "none"
+
 ollama:
   base_url: "http://localhost:11434"
   # Raised from 120s: three separate real PixelMart runs this session

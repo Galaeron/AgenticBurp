@@ -40,6 +40,7 @@ plus the assembly. Behavior is unchanged -- the methods moved verbatim and every
 """
 from __future__ import annotations
 
+from harness import config_schema
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (re-export shared namespace)
 from harness.orchestrator_detect import DetectMixin
 from harness.orchestrator_confirm import ConfirmMixin
@@ -69,8 +70,19 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         Args:
             config: Full application configuration
         """
+        # P1-4: resolve the named operating profile (config["operating_profile"],
+        # default "none") FIRST, before anything below reads `config`. This isn't
+        # just about the attributes this method sets on self below -- AgentManager,
+        # ValidatorRegistry, Coordinator, and AnalysisPipeline further down all take
+        # this SAME `config` dict and read their own knobs straight out of it, so
+        # the profile has to be applied to the dict itself, not layered on after.
+        # Unset/"none" (the shipped config.yaml default) returns `config` unchanged
+        # -- byte-for-byte today's behavior. See config_schema.resolve_operating_profile
+        # for the documented profile-vs-explicit-override composition rule.
+        config = config_schema.resolve_operating_profile(
+            config, config.get("operating_profile"))
         self.config = config
-        
+
         # Initialize Ollama client
         self.ollama = OllamaClient(
             base_url=config["ollama"]["base_url"],
