@@ -18,9 +18,10 @@ Usage:
     }
     
     # For the harness - load all agents:
-    from agents.plugin import AgentPluginSystem
+    from harness.agents.plugin import AgentPluginSystem
     plugin_system = AgentPluginSystem()
-    agents = plugin_system.load_all_agents(config, ollama)
+    agents = {name: plugin_system.load_agent_class(name)
+              for name in plugin_system.list_agents()}
 """
 
 from __future__ import annotations
@@ -161,58 +162,18 @@ class AgentPluginSystem:
         return self._registry
     
     def _load_from_entry_points(self) -> list[AgentMetadata]:
-        """Load agents from entry points."""
+        """Read the structured entry-point API supported by Python >=3.11."""
+        from importlib.metadata import entry_points
+
         agents = []
-        
-        try:
-            # Python 3.10+ importlib metadata
-            from importlib.metadata import entry_points
-            
-            # Handle both old and new entry_points API
-            eps = entry_points()
-            if hasattr(eps, 'select'):
-                # Python 3.10+ style
-                agent_eps = eps.select(group=ENTRY_POINT_GROUP)
-            elif isinstance(eps, dict):
-                # Python 3.9 and older style
-                agent_eps = eps.get(ENTRY_POINT_GROUP, [])
-            else:
-                # Fallback for other implementations
-                agent_eps = getattr(eps, ENTRY_POINT_GROUP, [])
-            
-            for ep in agent_eps:
-                # Entry point format: "name = module.path:ClassName"
-                entry_point_str = str(ep)
-                if '=' in entry_point_str:
-                    name, value = entry_point_str.split('=', 1)
-                    name = name.strip()
-                    value = value.strip()
-                    
-                    # Parse module:class
-                    if ':' in value:
-                        module_path, class_name = value.rsplit(':', 1)
-                        agents.append(AgentMetadata(
-                            name=name,
-                            module_path=module_path.strip(),
-                            class_name=class_name.strip()
-                        ))
-        except ImportError:
-            # importlib.metadata not available, try pkg_resources
+        for ep in entry_points(group=ENTRY_POINT_GROUP):
             try:
-                import pkg_resources
-                for ep in pkg_resources.iter_entry_points(ENTRY_POINT_GROUP):
-                    name = ep.name
-                    value = str(ep)
-                    if ':' in value:
-                        module_path, class_name = value.rsplit(':', 1)
-                        agents.append(AgentMetadata(
-                            name=name,
-                            module_path=module_path.strip(),
-                            class_name=class_name.strip()
-                        ))
-            except ImportError:
-                log.debug("No plugin discovery library available (importlib.metadata or pkg_resources)")
-        
+                if not ep.attr:
+                    raise ValueError("agent entry point must name a class")
+                agents.append(AgentMetadata(
+                    name=ep.name, module_path=ep.module, class_name=ep.attr))
+            except (AttributeError, ValueError) as exc:
+                log.warning("Invalid agent entry point %r: %s", ep.name, exc)
         return agents
     
     def _load_from_file_scan(self) -> list[AgentMetadata]:
@@ -285,7 +246,9 @@ class AgentPluginSystem:
             module = importlib.import_module(metadata.module_path)
             
             # Get the class
-            agent_class = getattr(module, metadata.class_name)
+            agent_class = module
+            for part in metadata.class_name.split("."):
+                agent_class = getattr(agent_class, part)
             
             # Verify it's a BaseAgent subclass
             from .base_agent import BaseAgent

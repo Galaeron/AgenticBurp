@@ -9,10 +9,10 @@ Agent Discovery:
 - Custom agents can be added as plugins via entry points or file placement
 
 Usage:
-    from agents import get_all_agents, get_agent_class
+    from harness.agents import get_all_agent_classes, get_agent_class
     
     # Get all available agent classes
-    agents = get_all_agents(config, ollama)
+    agents = get_all_agent_classes()
     
     # Get a specific agent class
     agent_class = get_agent_class("sqli")
@@ -28,94 +28,23 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("harness.agents")
 
-# Lazy loading of plugin system
-_plugin_system = None
-
-
 def _get_plugin_system():
-    """Get or create the plugin system instance."""
-    global _plugin_system
-    if _plugin_system is None:
-        from .plugin import get_plugin_system
-        _plugin_system = get_plugin_system()
-    return _plugin_system
+    """Use the canonical registry, including after reset_plugin_system()."""
+    from .plugin import get_plugin_system
+    return get_plugin_system()
 
 
-def get_all_agent_classes(config: dict, ollama: OllamaClient) -> dict[str, Type[BaseAgent]]:
+def get_all_agent_classes(config: dict | None = None, ollama: OllamaClient | None = None) -> dict[str, Type[BaseAgent]]:
+    """Return discovered classes. Optional legacy arguments are unused.
+
+    Class discovery has no model or configuration dependency; instantiate enabled
+    agents through AgentManager. Built-ins use the registry's file-scan source.
     """
-    Get all available agent classes.
-    
-    This function discovers all agents (both built-in and plugin) and
-    returns a dictionary mapping agent names to their classes.
-    
-    Args:
-        config: Application configuration
-        ollama: Ollama client instance
-        
-    Returns:
-        Dictionary mapping agent names to agent classes
-    """
-    plugin_system = _get_plugin_system()
-    
-    # Discover all agents
-    agent_names = plugin_system.list_agents()
-    
-    # Load all agent classes
-    agents = {}
-    for name in agent_names:
-        agent_class = plugin_system.load_agent_class(name)
-        if agent_class is not None:
-            agents[name] = agent_class
-    
-    # If no agents found via plugin system, fall back to built-in agents
-    if not agents:
-        log.warning("No agents found via plugin system, falling back to built-in agents")
-        agents = _load_builtin_agents()
-    
-    return agents
+    plugins = _get_plugin_system()
+    return {name: cls for name in plugins.list_agents()
+            if (cls := plugins.load_agent_class(name)) is not None}
 
 
-def _load_builtin_agents() -> dict[str, Type[BaseAgent]]:
-    """Load built-in agent classes directly."""
-    from .base_agent import BaseAgent
-    
-    agents = {}
-    builtin_agents = [
-        ('sqli', 'SqliAgent'),
-        ('xss', 'XssAgent'),
-        ('idor', 'IdorAgent'),
-        ('ssrf', 'SsrfAgent'),
-        ('auth', 'AuthAgent'),
-        ('business_logic', 'BusinessLogicAgent'),
-        ('business_logic_enhanced', 'BusinessLogicEnhancedAgent'),
-        ('misconfig', 'MisconfigAgent'),
-        ('ai_llm', 'AiLlmAgent'),
-        ('ai_security', 'AiSecurityAgent'),
-        ('supply_chain', 'SupplyChainAgent'),
-        ('rate_limit', 'RateLimitAgent'),
-        ('graphql', 'GraphqlAgent'),
-        ('jwt', 'JwtAgent'),
-        ('xxe', 'XxeAgent'),
-        ('csrf', 'CsrfAgent'),
-        ('file_upload', 'FileUploadAgent'),
-        ('nosql', 'NosqlAgent'),
-        ('command_injection', 'CommandInjectionAgent'),
-        ('ssti', 'SstiAgent'),
-        ('open_redirect', 'OpenRedirectAgent'),
-        ('info_disclosure', 'InfoDisclosureAgent'),
-        ('anomaly', 'AnomalyAgent'),
-    ]
-    
-    for name, class_name in builtin_agents:
-        try:
-            module = __import__(f'agents.{name}_agent', fromlist=[class_name])
-            agent_class = getattr(module, class_name)
-            if isinstance(agent_class, type) and issubclass(agent_class, BaseAgent):
-                agents[name] = agent_class
-        except Exception as e:
-            log.warning(f"Failed to load built-in agent {name}: {e}")
-    
-    return agents
 
 
 def get_agent_class(name: str) -> Type[BaseAgent] | None:

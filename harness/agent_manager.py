@@ -82,8 +82,7 @@ class AgentManager:
         agent_names = plugin_system.list_agents()
         
         if not agent_names:
-            log.warning("No agents discovered via plugin system, falling back to built-in agents")
-            agent_names = self._get_builtin_agent_names()
+            raise RuntimeError("No agents discovered; check plugin sources before starting analysis")
         
         # Initialize enabled agents
         for name in agent_names:
@@ -101,34 +100,20 @@ class AgentManager:
             
             # Initialize the agent
             try:
-                agent_defaults = self.config.get("agent_defaults", {})
-                default_model = agent_defaults.get("model", "gemma2:9b")
-                default_temperature = agent_defaults.get("temperature", 0.1)
-                resolved_model = acfg.get("model", default_model)
-                self.agents[name] = agent_class(
-                    ollama=self.ollama,
-                    model=resolved_model,
-                    temperature=acfg.get("temperature", default_temperature),
-                )
-                log.info(f"Initialized agent: {name} (model: {resolved_model})")
+                self.agents[name] = self._create_agent(agent_class, acfg)
+                log.info("Initialized agent: %s (model: %s)", name, self.agents[name].model)
             except Exception as e:
                 log.error(f"Failed to initialize agent {name}: {e}")
                 raise
     
-    def _get_builtin_agent_names(self) -> list[str]:
-        """Get list of built-in agent names."""
-        return [
-            "sqli",
-            "xss", 
-            "idor",
-            "ssrf",
-            "auth",
-            "business_logic",
-            "misconfig",
-            "ai_llm",
-            "supply_chain",
-            "rate_limit",
-        ]
+    def _create_agent(self, agent_class, agent_config):
+        """One configuration contract for initial, dynamic and recreated agents."""
+        defaults = self.config.get("agent_defaults", {})
+        return agent_class(
+            ollama=self.ollama,
+            model=agent_config.get("model", defaults.get("model", "qwen3:8b")),
+            temperature=agent_config.get("temperature", defaults.get("temperature", 0.1)),
+        )
     
     def get_agent(self, name: str) -> BaseAgent | None:
         """
@@ -188,43 +173,20 @@ class AgentManager:
         """
         return name in self.agents
     
-    def register_agent(self, name: str, agent_class: Type[BaseAgent], config: dict = None) -> bool:
-        """
-        Dynamically register and initialize a new agent.
-        
-        This allows for runtime agent registration, useful for
-        hot-reloading or adding custom agents programmatically.
-        
-        Args:
-            name: The name to register the agent under
-            agent_class: The agent class to register
-            config: Optional configuration for the agent
-            
-        Returns:
-            True if registration succeeded, False otherwise
-        """
+    def register_agent(self, name: str, agent_class: Type[BaseAgent], config: dict | None = None) -> bool:
+        """Initialize a runtime agent using agent_defaults; publish only on success."""
         if name in self.agents:
-            log.warning(f"Agent {name} already registered")
+            log.warning("Agent %s already registered", name)
             return False
-        
+        acfg = dict(config) if config is not None else self._agent_configs.get(name, {})
         try:
-            # Store config
-            if config:
-                self._agent_configs[name] = config
-            
-            # Initialize the agent
-            acfg = self._agent_configs.get(name, {})
-            self.agents[name] = agent_class(
-                ollama=self.ollama,
-                model=acfg.get("model", self.config.get("coordinator", {}).get("model", "llama3.2")),
-                temperature=acfg.get("temperature", 0.1),
-            )
-            log.info(f"Dynamically registered agent: {name}")
-            return True
-            
-        except Exception as e:
-            log.error(f"Failed to register agent {name}: {e}")
+            agent = self._create_agent(agent_class, acfg)
+        except Exception as exc:
+            log.error("Failed to register agent %s: %s", name, exc)
             return False
+        self._agent_configs[name] = acfg
+        self.agents[name] = agent
+        return True
     
     def unregister_agent(self, name: str) -> bool:
         """
@@ -245,41 +207,20 @@ class AgentManager:
         return True
     
     def reload_agent(self, name: str) -> bool:
-        """
-        Reload an agent (useful for development/hot-reloading).
-        
-        Args:
-            name: The name of the agent to reload
-            
-        Returns:
-            True if reload succeeded, False otherwise
+        """Recreate an existing agent from current configuration (not module reload).
+
+        Use its actual class so manually registered agents also work. A failed
+        recreation leaves the running instance intact.
         """
         if name not in self.agents:
-            log.warning(f"Agent {name} not found")
             return False
-        
-        # Get the agent class
-        agent_class = self.get_agent_class(name)
-        if agent_class is None:
-            log.error(f"Failed to get agent class for {name}")
-            return False
-        
-        # Get the config
-        acfg = self._agent_configs.get(name, {})
-        
-        # Reinitialize the agent
         try:
-            self.agents[name] = agent_class(
-                ollama=self.ollama,
-                model=acfg.get("model", self.config.get("coordinator", {}).get("model", "llama3.2")),
-                temperature=acfg.get("temperature", 0.1),
-            )
-            log.info(f"Reloaded agent: {name}")
-            return True
-            
-        except Exception as e:
-            log.error(f"Failed to reload agent {name}: {e}")
+            replacement = self._create_agent(type(self.agents[name]), self._agent_configs.get(name, {}))
+        except Exception as exc:
+            log.error("Failed to recreate agent %s: %s", name, exc)
             return False
+        self.agents[name] = replacement
+        return True
     
     def get_agent_metadata(self, name: str) -> dict | None:
         """
@@ -348,21 +289,6 @@ class AgentManager:
                 result.append(name)
         return result
     
-    def get_agents_by_capability(self, capability: str) -> list[str]:
-        """
-        Get all enabled agents that support a specific capability.
-        
-        This is a placeholder for future capability-based filtering.
-        
-        Args:
-            capability: The capability to filter by
-            
-        Returns:
-            List of agent names supporting the capability
-        """
-        # For now, return all agents
-        # This can be enhanced with capability metadata in the future
-        return list(self.agents.keys())
     
     def run_agent(self, name: str, exchange, max_body_chars: int = 6000, prior_context: str = "") -> AgentReport:
         """
