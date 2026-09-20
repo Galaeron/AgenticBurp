@@ -98,5 +98,94 @@ class ParseValidatorsFlagsTests(unittest.TestCase):
         self.assertEqual(flags, {"active_enabled": False, "allow_mutating_replay": False})
 
 
+class SafeDefaultGuardTests(unittest.TestCase):
+    """P0-4: CI guard against the COMMITTED harness/config.yaml drifting to an
+    unsafe default. Unlike validate_config above (type/coherence checks, not
+    opinionated about which side of a boolean is "safe"), this asserts the
+    actual safe-side value for each flag that sends live traffic or widens
+    scope by default. It must pass on the clean committed tree and fail the
+    moment any one of these is flipped -- a real negative control per flag,
+    not just a schema/type check.
+    """
+
+    # (dotted path, "is this cfg value the SAFE default?") pairs. Every flag
+    # named in IMPROVEMENT_BACKLOG.md's P0-4 acceptance criteria is covered.
+    SAFE_CHECKS: list[tuple[str, "callable"]] = [
+        ("server.allowed_hosts",
+         lambda cfg: cfg.get("server", {}).get("allowed_hosts", []) == []),
+        ("validators.active_enabled",
+         lambda cfg: cfg.get("validators", {}).get("active_enabled", False) is False),
+        ("validators.allow_mutating_replay",
+         lambda cfg: cfg.get("validators", {}).get("allow_mutating_replay", False) is False),
+        ("autonomous_discovery.enabled",
+         lambda cfg: cfg.get("autonomous_discovery", {}).get("enabled", False) is False),
+        ("oracle.enabled",
+         lambda cfg: cfg.get("oracle", {}).get("enabled", False) is False),
+        ("engagement.auto_escalate",
+         lambda cfg: cfg.get("engagement", {}).get("auto_escalate", False) is False),
+        ("engagement.driver_execute",
+         lambda cfg: cfg.get("engagement", {}).get("driver_execute", False) is False),
+        ("engagement.feature_crawl",
+         lambda cfg: cfg.get("engagement", {}).get("feature_crawl", False) is False),
+        ("engagement.coverage_drive_legs",
+         lambda cfg: cfg.get("engagement", {}).get("coverage_drive_legs", False) is False),
+        ("coordinator.cloud_primary",
+         lambda cfg: cfg.get("coordinator", {}).get("cloud_primary", False) is False),
+        ("coordinator.cloud_reasoning",
+         lambda cfg: cfg.get("coordinator", {}).get("cloud_reasoning", False) is False),
+    ]
+
+    # Unsafe replacement value used to flip each flag for the negative control.
+    UNSAFE_VALUES = {
+        "server.allowed_hosts": ["evil.example.com"],
+        "validators.active_enabled": True,
+        "validators.allow_mutating_replay": True,
+        "autonomous_discovery.enabled": True,
+        "oracle.enabled": True,
+        "engagement.auto_escalate": True,
+        "engagement.driver_execute": True,
+        "engagement.feature_crawl": True,
+        "engagement.coverage_drive_legs": True,
+        "coordinator.cloud_primary": True,
+        "coordinator.cloud_reasoning": True,
+    }
+
+    @staticmethod
+    def _load_committed_config() -> dict:
+        with open(_HARNESS / "config.yaml") as f:
+            return yaml.safe_load(f) or {}
+
+    @classmethod
+    def _violations(cls, cfg: dict) -> list[str]:
+        return [name for name, is_safe in cls.SAFE_CHECKS if not is_safe(cfg)]
+
+    def test_committed_config_yaml_has_all_safe_defaults(self):
+        """PASSES on the clean committed tree: every safety-critical flag in
+        harness/config.yaml, as actually shipped, must be at its safe default."""
+        cfg = self._load_committed_config()
+        violations = self._violations(cfg)
+        self.assertEqual(
+            violations, [],
+            f"harness/config.yaml has unsafe default(s) for: {violations} -- "
+            "committed config must only move toward safer defaults; put live "
+            "overrides in the git-ignored harness/config.local.yaml instead.",
+        )
+
+    def test_each_flag_flip_is_caught_by_the_guard(self):
+        """Negative control: mutate a COPY of the real committed config, one
+        flag at a time, to its unsafe value and assert the guard catches it.
+        This must genuinely fail (not vacuously pass) for every flag P0-4 lists."""
+        for name, _ in self.SAFE_CHECKS:
+            with self.subTest(flag=name):
+                cfg = self._load_committed_config()
+                section, key = name.split(".")
+                cfg.setdefault(section, {})[key] = self.UNSAFE_VALUES[name]
+                violations = self._violations(cfg)
+                self.assertIn(
+                    name, violations,
+                    f"flipping {name} to an unsafe value was not caught by the guard",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
