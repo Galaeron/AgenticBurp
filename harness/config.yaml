@@ -531,6 +531,11 @@ surface_prioritization:
 oracle:
   enabled: false
   n_required: 3
+  # Run the oracle ONLY for validators that send no live traffic (active=False
+  # -- currently deserialization_validator and verbose_error_validator). Safe to
+  # ship ON: these are pure re-analysis of the already-captured exchange, zero
+  # new requests. The full active oracle (above) stays behind oracle.enabled.
+  safe_passive_default: true
 
 # Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
 # off. When enabled, a CONFIRMED finding's host-agnostic structural shape

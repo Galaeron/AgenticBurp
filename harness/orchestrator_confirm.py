@@ -17,23 +17,35 @@ class ConfirmMixin:
         """P0.1-WIRE: run the deterministic verification oracle over a just-
         confirmed finding, behind config `oracle.enabled` (default false).
 
-        Disabled (the default): stamps the finding as a candidate WITHOUT
-        sending any additional probe -- `oracle_framework.stamp_finding`
-        with a None capsule is pure bookkeeping, not a network call. Enabled:
-        builds an `OracleRegistry` over the SAME validator registry the
-        graph loop already uses (same scope/safety gating) and re-runs the
-        confirming leg n_required times plus its negative control, then
-        stamps the resulting capsule (verified only on N-of-N + a clean
-        control, or a self-controlling OOB leg reproducing alone)."""
+        Three operating modes, controlled by the `oracle` config section:
+
+        1. `enabled=false, safe_passive_default=false` (old default): stamps
+           the finding as a candidate WITHOUT any probe -- pure bookkeeping.
+        2. `enabled=false, safe_passive_default=true` (new safe default): runs
+           the oracle ONLY for validators with `active=False` (no live traffic).
+           Pure re-analysis of the already-captured exchange; safe to ship ON.
+        3. `enabled=true`: full oracle -- all applicable validators, including
+           active ones (3x+ probes per finding). Must be explicitly opted in."""
         from harness import oracle_framework
         cfg = (getattr(self, "config", {}) or {}).get("oracle", {}) or {}
-        if not cfg.get("enabled", False):
+        enabled = cfg.get("enabled", False)
+        safe_passive_default = cfg.get("safe_passive_default", True)
+
+        if not enabled and not safe_passive_default:
             oracle_framework.stamp_finding(finding, None)
             return
+
         n_required = int(cfg.get("n_required", 3) or 3)
         registry = oracle_framework.OracleRegistry(
             self.validator_registry, n_required=n_required)
-        capsule = await registry.verify(finding, exchange)
+
+        if enabled:
+            capsule = await registry.verify(finding, exchange)
+        else:
+            # safe_passive_default: passive-only oracle, zero new requests
+            oracle = registry.oracle_for(finding, exchange, passive_only=True)
+            capsule = await oracle.run(finding, exchange) if oracle is not None else None
+
         oracle_framework.stamp_finding(finding, capsule)
 
     async def run_active_probe(

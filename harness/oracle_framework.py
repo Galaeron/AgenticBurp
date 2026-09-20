@@ -277,11 +277,23 @@ class OracleRegistry:
                                   if self_controlling_validators is not None
                                   else negative_controls.SELF_CONTROLLING)
 
-    def oracle_for(self, finding: Finding, exchange: HttpExchange) -> Oracle | None:
-        """Pick an oracle for this finding: the applicable, active validator whose
-        class matches, wrapped with its negative control. None when nothing applies."""
+    def oracle_for(
+        self,
+        finding: Finding,
+        exchange: HttpExchange,
+        *,
+        passive_only: bool = False,
+    ) -> Oracle | None:
+        """Pick an oracle for this finding: the applicable validator whose class
+        matches, wrapped with its negative control. None when nothing applies.
+
+        `passive_only=True` restricts to validators with `active=False` (sends no
+        live traffic). Used by `safe_passive_default` to run the oracle without
+        sending any new requests, even when `oracle.enabled` is False."""
         candidates = self._registry.for_finding(finding, exchange)
         for validator in candidates:
+            if passive_only and getattr(validator, "active", True):
+                continue  # skip validators that send traffic when passive_only
             name = getattr(validator, "name", "")
             builder = self._builders.get(name)
             return Oracle(

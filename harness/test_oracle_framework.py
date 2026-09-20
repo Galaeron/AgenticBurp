@@ -263,5 +263,93 @@ class TestOracleRegistry(unittest.TestCase):
         self.assertFalse(cap.verified)  # can't rule out confirm-on-anything
 
 
+class PassiveValidator(Validator):
+    """Pure passive validator -- re-analyses the captured exchange, no network call."""
+    name = "passive_fake"
+    finding_classes = {"ssrf"}
+    active = False  # sends no traffic
+
+    def __init__(self, result):
+        self._result = result
+        self.call_count = 0
+
+    async def validate(self, finding, exchange):
+        self.call_count += 1
+        return self._result
+
+
+class TestOracleForPassiveOnly(unittest.TestCase):
+    """safe_passive_default / passive_only gate: zero live sends for passive validators."""
+
+    def test_passive_only_returns_oracle_for_passive_validator(self):
+        v = PassiveValidator(_confirmed())
+        reg = OracleRegistry(FakeRegistry([v]), n_required=1)
+        oracle = reg.oracle_for(_finding(), _exchange(), passive_only=True)
+        self.assertIsNotNone(oracle, "passive_only should return oracle for active=False validator")
+
+    def test_passive_only_skips_active_validator(self):
+        v = ScriptedValidator([_confirmed()])  # active=True
+        reg = OracleRegistry(FakeRegistry([v]), n_required=1)
+        oracle = reg.oracle_for(_finding(), _exchange(), passive_only=True)
+        self.assertIsNone(oracle, "passive_only must return None for active=True validator")
+
+    def test_passive_only_false_includes_active_validators(self):
+        v = ScriptedValidator([_confirmed()])  # active=True
+        reg = OracleRegistry(FakeRegistry([v]), n_required=1)
+        oracle = reg.oracle_for(_finding(), _exchange(), passive_only=False)
+        self.assertIsNotNone(oracle, "passive_only=False should include active validators")
+
+    def test_passive_oracle_zero_calls_on_no_applicable_validator(self):
+        # Negative control on the safety contract: when only active validators exist
+        # and passive_only=True, no validate() call is made (zero live sends).
+        v = ScriptedValidator([_confirmed()])  # active=True, would send traffic
+        reg = OracleRegistry(FakeRegistry([v]), n_required=1)
+        oracle = reg.oracle_for(_finding(), _exchange(), passive_only=True)
+        self.assertIsNone(oracle)
+        self.assertEqual(len(v.calls), 0, "no validate() call must be made when passive_only filtered out all validators")
+
+    def test_passive_validator_reaches_verified_via_passive_oracle(self):
+        # A passive validator that confirms N-of-N and has a clean negative
+        # should still reach verification_state=verified via oracle.run().
+        confirmed_result = _confirmed()
+        clean_result = _clean()
+        v = PassiveValidator(confirmed_result)
+
+        # Stub: reproduce by returning confirmed twice, then clean for the negative.
+        results = [_confirmed(), _confirmed()]
+        scripted_passive = ScriptedValidator(results, benign_marker="BENIGN", benign_result=_clean())
+        scripted_passive.active = False  # mark as passive
+        scripted_passive.name = "passive_scripted"
+
+        def _builder(exchange):
+            data = exchange.model_dump()
+            data["url"] = "http://127.0.0.1/x?url=BENIGN"
+            return HttpExchange(**data)
+
+        oracle = Oracle(scripted_passive, n_required=2, negative_control=_builder,
+                        require_negative_control=True)
+        cap = run(oracle.run(_finding(), _exchange()))
+        self.assertTrue(cap.reproduced)
+        self.assertTrue(cap.verified, "passive oracle with clean negative should reach verified")
+        self.assertFalse(scripted_passive.active, "validator must be passive (safety invariant)")
+
+    def test_same_class_active_validator_not_run_under_passive_only(self):
+        # Discrimination test: same finding, active and passive validator available.
+        # passive_only=True must pick passive, not active.
+        active_v = ScriptedValidator([_confirmed()])  # active=True
+        passive_v = PassiveValidator(_confirmed())    # active=False
+        passive_v.finding_classes = {"ssrf"}
+
+        class BothRegistry:
+            def for_finding(self, finding, exchange):
+                return [active_v, passive_v]  # active first
+
+        reg = OracleRegistry(BothRegistry(), n_required=1)
+        oracle = reg.oracle_for(_finding(), _exchange(), passive_only=True)
+        self.assertIsNotNone(oracle, "should pick the passive validator")
+        self.assertFalse(oracle.validator.active, "oracle must use the passive validator, not the active one")
+        self.assertEqual(len(active_v.calls), 0, "active validator must not have been called")
+
+
 if __name__ == "__main__":
     unittest.main()
