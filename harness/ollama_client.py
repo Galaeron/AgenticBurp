@@ -57,6 +57,49 @@ def _strip_json_fence(s: str) -> str:
     return m.group(0) if m else s
 
 
+# The characters that may legally follow a backslash inside a JSON string.
+_VALID_JSON_ESCAPE = set('"\\/bfnrtu')
+
+
+def _repair_json_escapes(s: str) -> str:
+    r"""Double any backslash that does NOT begin a legal JSON escape sequence.
+
+    Root cause (investigated live this session against gemma4:31b-cloud): some
+    models -- notably CLOUD-hosted ones reached through Ollama, which do NOT run
+    under Ollama's output grammar, so `format: json`/`format: <schema>` is a
+    silent no-op for them (verified: 18/18 responses came back markdown-fenced
+    and free-generated) -- occasionally emit a RAW single backslash inside a
+    JSON string value, e.g. a detection regex `\s`/`\d`/`\(` they forgot to
+    double. That is illegal JSON (`json.JSONDecodeError: Invalid \escape`) and
+    was silently dropping ~15-20% of that model's agent findings, including
+    whole SQLi detections (the "green tests, dead pipeline" shape). qwen3:8b
+    local honors `format: json` and never needs this.
+
+    This turns `\s` -> `\\s` while leaving genuine escapes (`\"`, `\\`, `\n`,
+    `\uXXXX`, ...) untouched, so it is idempotent on already-valid JSON. It is
+    applied ONLY as a fallback after a strict parse fails (see `_loads_lenient`),
+    so the reliable path is never touched. It is a best-effort repair, not a JSON
+    grammar: if the model produced structurally-broken JSON (unbalanced braces,
+    a bad `\uXX`), the retried parse still raises and the caller still sees
+    OllamaInvalidJSONError -- we never fabricate a parse."""
+    return re.sub(
+        r"\\(.)",
+        lambda m: ("\\" + m.group(1)) if m.group(1) in _VALID_JSON_ESCAPE
+        else ("\\\\" + m.group(1)),
+        s,
+    )
+
+
+def _loads_lenient(s: str) -> dict:
+    """json.loads, but retried once through _repair_json_escapes if the strict
+    parse fails on a stray backslash. Valid JSON parses on the first try and is
+    never passed through the repair."""
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return json.loads(_repair_json_escapes(s))
+
+
 class OllamaClient:
     """
     Minimal wrapper around Ollama's /api/chat endpoint.
@@ -213,8 +256,8 @@ class OllamaClient:
                     raise OllamaError(f"Ollama returned an empty message body: {data}")
 
                 try:
-                    parsed = json.loads(_strip_json_fence(content))
-                    
+                    parsed = _loads_lenient(_strip_json_fence(content))
+
                     # Log the response
                     prompt_tokens = data.get("prompt_eval_count", 0) or 0
                     completion_tokens = data.get("eval_count", 0) or 0

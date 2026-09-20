@@ -2,7 +2,14 @@ import json
 import unittest
 import httpx
 
-from harness.ollama_client import OllamaClient, OllamaError, OllamaModelNotFoundError
+from harness.ollama_client import (
+    OllamaClient,
+    OllamaError,
+    OllamaModelNotFoundError,
+    OllamaInvalidJSONError,
+    _repair_json_escapes,
+    _loads_lenient,
+)
 
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -173,6 +180,75 @@ class ModelNotFoundDoesNotTripSharedBreakerTests(unittest.IsolatedAsyncioTestCas
                        "test assumption: both clients must share the same breaker")
         result = await good_client.chat_json_metered(model="working-model", system_prompt="s", user_prompt="u")
         self.assertEqual(result.data, {"ok": True})
+
+
+class StrayBackslashJsonRepairTests(unittest.TestCase):
+    r"""Root cause found live this session against gemma4:31b-cloud: a CLOUD
+    model reached through Ollama ignores `format: json` (no output grammar for
+    cloud-hosted models -- verified: every response markdown-fenced and
+    free-generated) and intermittently emits a RAW single backslash inside a
+    JSON string (a regex `\s`/`\(` it forgot to double). That is illegal JSON
+    and was silently dropping ~15-20% of that model's agent findings, whole SQLi
+    detections among them. The repair doubles only invalid-escape backslashes,
+    leaving genuine escapes intact, and runs ONLY as a post-failure fallback."""
+
+    def test_stray_backslash_is_doubled(self):
+        bad = r'{"regex":"id=[^&]*\s*(AND|SLEEP\()"}'
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(bad)
+        obj = _loads_lenient(bad)
+        # The regex round-trips byte-for-byte -- \s and \( are preserved.
+        self.assertEqual(obj["regex"], r"id=[^&]*\s*(AND|SLEEP\()")
+
+    def test_valid_escapes_are_preserved(self):
+        good = r'{"a":"line\nbreak","b":"quote\"q","c":"back\\slash","d":"uA"}'
+        obj = _loads_lenient(good)
+        self.assertEqual(obj["a"], "line\nbreak")
+        self.assertEqual(obj["b"], 'quote"q')
+        self.assertEqual(obj["c"], "back\\slash")
+        self.assertEqual(obj["d"], "uA")
+
+    def test_repair_is_idempotent_on_valid_json(self):
+        good = r'{"c":"back\\slash","n":"x\ny"}'
+        self.assertEqual(_repair_json_escapes(good), good)
+
+    def test_repair_does_not_fabricate_on_structurally_broken_json(self):
+        # Unbalanced braces are not an escaping problem; repair must not rescue it.
+        broken = r'{"regex":"\s","missing":'
+        with self.assertRaises(json.JSONDecodeError):
+            _loads_lenient(broken)
+
+
+class InvalidEscapeEndToEndTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fenced_content_with_stray_backslash_parses(self):
+        # Exactly what gemma4:31b-cloud returned: markdown-fenced JSON whose
+        # regex value carries an unescaped backslash. Must survive the pipeline.
+        content = (
+            "```json\n"
+            r'{"findings":[{"vulnerability_class":"sql_injection","confidence":0.9,'
+            r'"suggested_test":"detect with regex id=[^&]*\s*(UNION|SLEEP\()"}]}'
+            "\n```"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "message": {"content": content},
+                "done": True, "prompt_eval_count": 100, "eval_count": 20,
+            })
+        client = _make_client(self, handler)
+        result = await client.chat_json(model="gemma4:31b-cloud", system_prompt="s", user_prompt="u")
+        self.assertEqual(result["findings"][0]["vulnerability_class"], "sql_injection")
+        self.assertIn(r"\s", result["findings"][0]["suggested_test"])
+
+    async def test_truly_broken_json_still_raises_invalid_json(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "message": {"content": "this is not json at all"},
+                "done": True,
+            })
+        client = _make_client(self, handler)
+        with self.assertRaises(OllamaInvalidJSONError):
+            await client.chat_json(model="m", system_prompt="s", user_prompt="u")
 
 
 if __name__ == "__main__":
