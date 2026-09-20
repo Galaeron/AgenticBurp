@@ -175,6 +175,29 @@ and `score.py` applies the gate so the fixture reflects the shipped pipeline.
 
 ## 2026-09-20 — fresh live re-run (current checkout, no cache reuse)
 
+**Tested revision (test-target + blind-target-2 only — see below for VulnCorp):**
+base commit `249b799` (2026-09-19 18:17:42 +0200) plus the pre-existing
+uncommitted working-tree diff on `harness/agent_manager.py`,
+`harness/agents/__init__.py`, `harness/agents/plugin.py`,
+`harness/ollama_client.py`, `harness/test_ollama_client.py`
+(sha256 of `git diff 249b799 -- <those 5 paths>`:
+`72ff7a40b04a096d26ba6a99971141f88f3ba4767f7aee712f8e93920592b0fa`). Those
+five files were already modified when this session started and were not
+touched by it; nothing else in the working tree differed from `249b799`
+during either run.
+
+Both runs finished strictly before commit `ccf12c0` (2026-09-19 20:39:39) and
+before that commit's own follow-on edits to `confirmation_gate.py` /
+`oracle_framework.py` / `orchestrator_confirm.py` / `report_generator.py` /
+`config.yaml` (all touched 20:40–20:43, by a different, concurrently-running
+session on this same checkout): the test-target fixture build finished
+writing at 20:12:17, and blind-target-2's results carry an internal
+timestamp of 20:18:37 — both windows close before 20:39. **Neither run's
+live agent/orchestrator execution could have observed that later work.** A
+reviewing agent that wants to reproduce these two numbers should check out
+`249b799`, reapply the five-file diff above (or verify its hash matches),
+and run with nothing else modified.
+
 `detection_fixture.py` and `run_blind_eval.py` had been broken since the W-18
 `harness.*` package refactor (flat `import store`/`import orchestrator`
 instead of `from harness import ...`) — fixed as import-path-only changes to
