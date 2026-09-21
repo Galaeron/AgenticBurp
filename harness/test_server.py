@@ -558,6 +558,12 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         self.server = server_module
         self.server.config["runs"] = {"output_dir": self._tmpdir.name,
                                        "cache_namespace": "test-isolated"}
+        # P1-7: /investigate now enforces pre-authorized scope (it can no
+        # longer grant scope just by naming a base_url) and route/base_url
+        # host consistency. These tests exercise the positive path, so they
+        # authorize "shop.test" here (NOT via committed config.yaml) and use
+        # "http://shop.test:..." base_urls consistently with the route host.
+        self.server.orchestrator.allowed_hosts = ["shop.test"]
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")
 
@@ -581,7 +587,7 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         with patch.object(self.server.orchestrator, "investigate_engagement",
                           new=AsyncMock(return_value=result)):
             start = self.client.post("/engagement/shop.test/investigate",
-                                     json={"base_url": "http://localhost:5002", "roles": []})
+                                     json={"base_url": "http://shop.test:5002", "roles": []})
             self.assertEqual(start.status_code, 200)
             job_id = start.json()["job_id"]
             self.assertTrue(job_id)
@@ -606,7 +612,7 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         with patch.object(self.server.orchestrator, "investigate_engagement", new=capture):
             starts = [self.client.post(
                 "/engagement/shop.test/investigate",
-                json={"base_url": "http://localhost:5002"}) for _ in range(2)]
+                json={"base_url": "http://shop.test:5002"}) for _ in range(2)]
             done = [self._poll(
                 f"/engagement/shop.test/investigate/{r.json()['job_id']}", {"done", "error"})
                 for r in starts]
@@ -632,7 +638,7 @@ class InvestigateJobEndpointTests(unittest.TestCase):
 
         with patch.object(self.server.orchestrator, "investigate_engagement", new=_slow):
             start = self.client.post("/engagement/shop.test/investigate",
-                                     json={"base_url": "http://localhost:5002"})
+                                     json={"base_url": "http://shop.test:5002"})
             job_id = start.json()["job_id"]
             cancel = self.client.post(f"/engagement/shop.test/investigate/{job_id}/cancel")
             self.assertEqual(cancel.status_code, 200)
@@ -647,11 +653,55 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         resp = self.client.post("/engagement/shop.test/investigate", json={"base_url": ""})
         self.assertEqual(resp.status_code, 400)
 
+    def test_unauthorized_destination_rejected_before_job_creation(self):
+        # P1-7 NEGATIVE: "evil.test" is never added to orchestrator.allowed_hosts
+        # (setUp only authorizes "shop.test"). The old behaviour auto-added
+        # whatever host appeared in base_url to the run's scope -- this asserts
+        # that implicit self-authorization is gone.
+        from unittest.mock import patch, AsyncMock
+        before = dict(self.server._INVESTIGATE_JOBS)
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=AsyncMock(return_value={"summary": {}})) as mock_investigate:
+            resp = self.client.post("/engagement/evil.test/investigate",
+                                    json={"base_url": "http://evil.test:5002"})
+        self.assertEqual(resp.status_code, 403)
+        # No job side-effect: the jobs table is untouched and the target was
+        # never actually invoked.
+        self.assertEqual(self.server._INVESTIGATE_JOBS, before)
+        mock_investigate.assert_not_called()
+
+    def test_inconsistent_route_host_and_base_url_rejected(self):
+        # P1-7 NEGATIVE: route {host} ("shop.test", authorized) does not match
+        # base_url's hostname ("other.test", not authorized either, but the
+        # point of this control is the CONSISTENCY check, not the scope check --
+        # it must fire even for a route host that IS itself authorized).
+        from unittest.mock import patch, AsyncMock
+        before = dict(self.server._INVESTIGATE_JOBS)
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=AsyncMock(return_value={"summary": {}})) as mock_investigate:
+            resp = self.client.post("/engagement/shop.test/investigate",
+                                    json={"base_url": "http://other.test:5002"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.server._INVESTIGATE_JOBS, before)
+        mock_investigate.assert_not_called()
+
+    def test_authorized_consistent_investigation_still_starts(self):
+        # P1-7 POSITIVE control: an authorized ("shop.test" is in
+        # orchestrator.allowed_hosts per setUp), route/base_url-consistent
+        # request still starts and returns a job_id exactly as before.
+        from unittest.mock import patch, AsyncMock
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=AsyncMock(return_value={"summary": {}})):
+            resp = self.client.post("/engagement/shop.test/investigate",
+                                    json={"base_url": "http://shop.test:5002"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["job_id"])
+
     def test_list_jobs_for_host(self):
         from unittest.mock import patch, AsyncMock
         with patch.object(self.server.orchestrator, "investigate_engagement",
                           new=AsyncMock(return_value={"summary": {}})):
-            self.client.post("/engagement/shop.test/investigate", json={"base_url": "http://localhost:5002"})
+            self.client.post("/engagement/shop.test/investigate", json={"base_url": "http://shop.test:5002"})
             listing = self.client.get("/engagement/shop.test/investigate")
         self.assertEqual(listing.status_code, 200)
         self.assertGreaterEqual(len(listing.json()["jobs"]), 1)

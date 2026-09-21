@@ -983,6 +983,41 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     from harness import role_crawl
     from harness.run_context import RunContext
     from urllib.parse import urlsplit
+
+    # P1-7 pre-admission check -- runs BEFORE any job/task is created or any
+    # target request is made. An investigation start request must use scope
+    # that is ALREADY pre-authorized (orchestrator.allowed_hosts, sourced from
+    # config.yaml server.allowed_hosts); it may never grant new scope by the
+    # mere act of naming a base_url (that was the prior bug this closes: the
+    # target host used to be auto-added to allowed_hosts here). Host
+    # normalization: lowercase, host-only (no port, no scheme) -- the same
+    # normalization ScopePolicy.host_of/in_scope use elsewhere, so a request
+    # to "shop.test:8080" and "SHOP.TEST" both normalize to "shop.test".
+    def _norm_host(raw: str) -> str:
+        # Accept either a bare hostname (the route {host} path param) or a
+        # full URL (base_url); urlsplit on a bare host with no scheme puts it
+        # in .path, not .hostname, so fall back to stripping a port manually.
+        parsed = urlsplit(raw if "//" in raw else f"//{raw}")
+        host = parsed.hostname
+        if host is None:
+            host = raw.split(":", 1)[0].split("/", 1)[0]
+        return host.lower()
+
+    target_host = _norm_host(req.base_url)
+    route_host = _norm_host(host)
+    if not target_host:
+        raise HTTPException(status_code=400, detail="base_url has no resolvable host")
+    if route_host != target_host:
+        raise HTTPException(
+            status_code=400,
+            detail=f"route host {host!r} does not match base_url host {target_host!r}")
+    allowed_hosts = {(h or "").lower() for h in (orchestrator.allowed_hosts or [])}
+    if target_host not in allowed_hosts:
+        raise HTTPException(
+            status_code=403,
+            detail=f"host {target_host!r} is not in pre-authorized scope "
+                   f"(server.allowed_hosts); investigate cannot grant new scope")
+
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
                                     headers=r.get("headers") or {}, name=r.get("name"),
                                     tenant=r.get("tenant"),
@@ -991,10 +1026,6 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
              for r in (req.roles or [])] or [role_crawl.RoleSession(role="anonymous", headers={})]
     job_id = _uuid.uuid4().hex[:12]
     runs_cfg = (config.get("runs", {}) or {})
-    target_host = (urlsplit(req.base_url).hostname or "").lower()
-    allowed_hosts = set(orchestrator.allowed_hosts or [])
-    if target_host:
-        allowed_hosts.add(target_host)
     run_context = RunContext.create(
         run_id=job_id, allowed_hosts=allowed_hosts,
         gate_config=_live_validators_gate_config(),
