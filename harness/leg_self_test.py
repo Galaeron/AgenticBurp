@@ -36,10 +36,40 @@ whole self-test cannot run at all (fixture fails to import/bind/come up),
 this returns an EMPTY frozenset, never None and never the static default --
 "could not verify anything" must demote everything, not silently keep the
 offline table's claims.
+
+P0-7 (executed-negative-control requirement): a case only counts as a
+double-pass when BOTH probes actually executed to a decisive outcome. The
+positive probe must genuinely confirm (status == "confirmed" and
+confirmed is True); the negative control must genuinely EXECUTE against the
+paired safe endpoint and come back with a decisive "not_confirmed" verdict.
+A negative control that never reached that decisive outcome -- it was
+skipped (validator declined to run, e.g. the safety gate blocked it, a
+required capability/tool was unavailable), it errored mid-run, or it
+returned any other non-"not_confirmed" status -- is NOT treated as a
+refutation. Before P0-7, `_case_passes` accepted any negative status other
+than "confirmed", which let a skipped/errored/blocked/inconclusive control
+qualify a leg as if it had been genuinely refuted; that was the bug. See
+`_is_executed_confirmation` / `_is_executed_refutation` for the exact
+classification.
+
+CACHE / OVERRIDE LIFETIME: `run_self_test()` itself is stateless -- it
+recomputes the live set fresh every call, with no persistent cache or
+storage of any kind (no file, no DB row, nothing that outlives the call).
+The only memoization anywhere in this feature is the one-per-Orchestrator-
+instance cache in `harness.orchestrator_confirm.ConfirmMixin.
+get_run_derived_live_markers` (`self._leg_self_test_cache`), which exists
+purely so a single run doesn't re-fire the fixture more than once; it is
+scoped to that Orchestrator instance's lifetime (i.e. one engagement run)
+and is never persisted or shared across runs/processes. The resulting
+frozenset is threaded straight through as the `live_verified_markers`
+override into `confirmation_gate.leg_tier()` /
+`apply_confirmation_suppression()` for that run only -- it is run-derived,
+not a standing fact recorded anywhere.
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib.util
 import logging
 import shutil
@@ -50,6 +80,19 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 log = logging.getLogger("harness.leg_self_test")
+
+# P0-7 throttle isolation: a context-local override for global_throttle's
+# effective throttle instance. Unset (None) for everyone except code running
+# inside the self-test's own execution context -- see run_self_test() and
+# `_scoped_acquire` below. Using a contextvars.ContextVar (rather than
+# mutating the shared global_throttle.throttle singleton in place) means a
+# concurrent caller in a different context -- a different thread, or a
+# different asyncio Task not spawned from inside the self-test -- never
+# observes the self-test's fixture-only rate policy: it keeps resolving to
+# the real, unmodified global_throttle.throttle for the whole duration of
+# the self-test's execution, not just before/after it.
+_SCOPED_THROTTLE: "contextvars.ContextVar[object | None]" = contextvars.ContextVar(
+    "leg_self_test_scoped_throttle", default=None)
 
 _FIXTURE = (Path(__file__).resolve().parent.parent
             / "testing" / "leg-verification" / "vuln_fixture.py")
@@ -207,24 +250,63 @@ def _default_cases() -> list[LegCase]:
     ]
 
 
+def _is_executed_confirmation(result) -> bool:
+    """True only when the positive probe genuinely executed and reached a
+    decisive confirmed verdict: status == "confirmed" AND confirmed is
+    True. Anything else (not_confirmed, skipped, error, or any other
+    status) means the probe either never ran to a decisive result or did
+    not confirm -- not a pass."""
+    return result.status == "confirmed" and result.confirmed is True
+
+
+def _is_executed_refutation(result) -> bool:
+    """P0-7 core: True only when the negative control genuinely EXECUTED
+    against the paired safe endpoint and came back with a decisive
+    "not_confirmed" verdict. This is the ONLY outcome that counts as a real,
+    executed refutation.
+
+    Every other status is deliberately NOT a refutation, because none of
+    them is evidence the control actually ran to a decisive result:
+      - "skipped" -- the validator's own precondition/gate declined to run
+        the probe at all (safety gate blocked it, a required capability was
+        unavailable, etc.). Never executed.
+      - "error"   -- the probe raised / blew up mid-run. Inconclusive, not a
+        decisive negative.
+      - "confirmed" -- the "safe" endpoint also confirmed; not a refutation,
+        the opposite of one.
+      - anything else (including future/custom statuses that might read as
+        "blocked", "unavailable", or "inconclusive") -- unrecognized, so
+        treated the same fail-safe way: not proof of a genuine executed
+        negative result.
+
+    Before P0-7, `_case_passes` accepted any status other than "confirmed"
+    as a refutation -- which let a skipped/errored/blocked/inconclusive
+    control (i.e. one that never actually ran to a decisive verdict)
+    silently qualify a leg as though it had been genuinely refuted. That
+    was the bug this closes."""
+    return result.status == "not_confirmed" and result.confirmed is not True
+
+
 def _case_passes(case: LegCase, base_url: str) -> bool:
-    """A case passes only on the full double-check: confirmed-true on the
-    vulnerable endpoint AND confirmed-false (not_confirmed / any other
-    non-"confirmed" status) on the paired safe control. Any exception
-    propagates to the caller, which treats it as a fail (leave the marker
-    out) -- never as a pass."""
+    """A case passes only on the full EXECUTED-PAIR double-check: the
+    positive probe genuinely confirmed-true (`_is_executed_confirmation`)
+    AND the negative control genuinely EXECUTED and was refuted
+    (`_is_executed_refutation`) -- both real, decisive, executed outcomes
+    from this run, not assumed ones. Any exception propagates to the
+    caller, which treats it as a fail (leave the marker out) -- never as a
+    pass."""
     validator = case.validator_factory()
 
     if case.setup:
         case.setup(base_url)
     tp = asyncio.run(validator.validate(_finding(case.finding_class), case.build_tp(base_url)))
-    if not (tp.status == "confirmed" and tp.confirmed):
+    if not _is_executed_confirmation(tp):
         return False
 
     if case.setup:
         case.setup(base_url)
     neg = asyncio.run(validator.validate(_finding(case.finding_class), case.build_neg(base_url)))
-    if neg.status == "confirmed" or neg.confirmed:
+    if not _is_executed_refutation(neg):
         return False
 
     return True
@@ -258,9 +340,9 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
     base_url = f"http://127.0.0.1:{port}"
 
     from harness import global_throttle, safety_gate
+    from harness.global_throttle import GlobalRequestThrottle
     from harness.safety_gate import SafetyGate, SafetyGateConfig
 
-    prev_rate, prev_burst = global_throttle.throttle._rate, global_throttle.throttle._burst
     live: set[str] = set()
     try:
         deadline = time.time() + health_timeout
@@ -277,7 +359,42 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
                         "classes fall back to provisional this run")
             return frozenset()
 
-        global_throttle.configure(0)
+        # P0-7 throttle isolation: the fixture probes must not be rate-limited
+        # (it's a loopback, disposable fixture -- there's no "polite pace"
+        # to keep with it), but that must NOT come at the cost of a
+        # concurrent production engagement's real throttle policy. The old
+        # approach called global_throttle.configure(0), which mutated the
+        # single process-wide throttle singleton in place: for the whole
+        # duration of the self-test, ANY concurrent caller going through
+        # global_throttle.acquire() -- a real, enclosing engagement hitting
+        # a live target -- would also see "unlimited" until the finally
+        # block restored it. That is a real blast-radius hazard, not just a
+        # cosmetic one.
+        #
+        # Instead: build a throwaway, unconfigured GlobalRequestThrottle
+        # (rate 0 == unlimited == acquire() is a no-op) that is used ONLY by
+        # code running inside this self-test's own execution context, via
+        # the `_SCOPED_THROTTLE` contextvar + a dispatching replacement for
+        # the module-level `global_throttle.acquire` free function (the one
+        # every validator/send-site actually calls). The shared
+        # `global_throttle.throttle` singleton's rate/burst/tokens are never
+        # read or written here at all -- there is nothing to "restore"
+        # because nothing shared was ever mutated. A concurrent caller whose
+        # context does not have `_SCOPED_THROTTLE` set (a different thread,
+        # or a different asyncio Task not spawned from inside this call)
+        # keeps resolving straight through to the real, unmodified
+        # `global_throttle.throttle` for the entire self-test run, not only
+        # before/after it.
+        local_throttle = GlobalRequestThrottle()
+        real_acquire = global_throttle.acquire
+
+        async def _scoped_acquire() -> None:
+            scoped = _SCOPED_THROTTLE.get()
+            if scoped is not None:
+                await scoped.acquire()
+            else:
+                await real_acquire()
+
         # A scoped, task-local gate (harness.safety_gate.gate_scope) -- never
         # touches the process-wide default gate a concurrent/enclosing real
         # run relies on, and never grants anything beyond the loopback
@@ -286,17 +403,28 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
             "active_enabled": True, "allow_mutating_replay": True,
             "allowed_hosts": ["127.0.0.1"],
         }))
-        with safety_gate.gate_scope(scoped_gate):
-            for case in cases:
-                try:
-                    if not case.available():
-                        continue  # fail-safe: unavailable tool -- never counted as live
-                    if _case_passes(case, base_url):
-                        live.add(case.marker)
-                except Exception:
-                    log.debug("leg self-test: case %r errored -- leaving it "
-                              "provisional this run", case.marker, exc_info=True)
-                    continue
+        token = _SCOPED_THROTTLE.set(local_throttle)
+        global_throttle.acquire = _scoped_acquire
+        try:
+            with safety_gate.gate_scope(scoped_gate):
+                for case in cases:
+                    try:
+                        if not case.available():
+                            continue  # fail-safe: unavailable tool -- never counted as live
+                        if _case_passes(case, base_url):
+                            live.add(case.marker)
+                    except Exception:
+                        log.debug("leg self-test: case %r errored -- leaving it "
+                                  "provisional this run", case.marker, exc_info=True)
+                        continue
+        finally:
+            # Restore BOTH the contextvar and the module-level free function
+            # to their exact prior state, regardless of outcome -- a
+            # concurrent caller must never observe the scoped dispatch or
+            # the fixture-only throttle after (or, per the contextvar scope,
+            # during any interleaving outside this context) this call.
+            _SCOPED_THROTTLE.reset(token)
+            global_throttle.acquire = real_acquire
     except Exception:
         log.warning("leg self-test crashed -- all confirmable classes fall back "
                     "to provisional this run", exc_info=True)
@@ -305,10 +433,6 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
         try:
             server.shutdown()
             thread.join(timeout=5.0)
-        except Exception:
-            pass
-        try:
-            global_throttle.configure(prev_rate if prev_rate > 0 else None, prev_burst)
         except Exception:
             pass
 
