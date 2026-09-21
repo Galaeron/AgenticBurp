@@ -46,10 +46,14 @@ Shipped code items this session:
   engagement toggles from `Orchestrator.__init__` — purely behavior-preserving
   (parity + safe-defaults tests, full suite 2398 OK). Single source for "what active
   traffic is on"; add future toggles there.
+- **P1-7 done (`912df45`):** `/investigate` now enforces pre-authorized scope +
+  route/`base_url` host consistency before job allocation; removed the implicit
+  `base_url` self-grant (was silently widening scope). +3 tests; full suite 2401 OK.
 - Follow-on nits: P3-4 (ledger singleton), P3-5 (fence prior-context). The Astra
   T02–T08 "paused item" is merged (section above); codex/astra worktrees are drafts.
-- Queue next: remaining offline items are the INV fix tickets (from INV-1..4) and
-  the P3-4/P3-5 nits. Blocked/owner: P0-3, P0-6, P1-3, P1-5.
+- Queue next: the remaining P1 admission items **P1-8** (job admission bounding) and
+  **P1-9** (DNS/address-resolution policy), then P3 nits. Blocked/owner: P0-3, P0-6,
+  P1-3, P1-5.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 

@@ -548,7 +548,18 @@ an overlapping recommendation, and reuse applicable work rather than duplicating
   Persistence failures must not silently produce a complete durable record.
 - **Impact:** High; strengthens P0-1 without discarding its completed wiring.
 
-### [ ] P1-7 — Make investigation target selection and scope authorization explicit
+### [x] P1-7 — Make investigation target selection and scope authorization explicit
+- **Result (VERIFIED):** `912df45` — `/engagement/{host}/investigate` now enforces a
+  pre-admission contract BEFORE any job allocation: route `{host}` must match the
+  normalized `base_url` hostname (else 400), and the destination must already be in
+  `orchestrator.allowed_hosts` (else 403). Removed the implicit
+  `allowed_hosts.add(target_host)` self-grant, so a request can no longer widen scope
+  (empty allowed_hosts = fail-closed). Reuses the existing scope set (no parallel
+  mechanism); host normalization via `urlsplit().hostname` strips port/userinfo, and
+  bypass vectors (case/port/userinfo/trailing-dot) are fail-closed. Positive path
+  unchanged. config.yaml unchanged. +3 tests (unauthorized→403 with no job
+  side-effect, mismatch→400, authorized+consistent still starts). Full suite 2401 OK
+  / 2 skip. Server admission only — no P0-6/P1-8/P1-9 change.
 - **Domain:** Safety / API · **Effort:** M · **Depends on:** none
 - **Evidence (VERIFIED by source inspection):**
   `server.engagement_investigate` adds the submitted `base_url` hostname to the
