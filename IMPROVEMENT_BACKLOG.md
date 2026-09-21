@@ -651,7 +651,20 @@ improved or that a live rerun happened. Live measurements remain separately open
   current-code defects; specify caller-level positive and missing/wrong-proof controls.
   Coordinate resulting fixes with P0-6 and pending evidence work.
 
-### [ ] INV-3 — Locate where the chaining pipeline loses candidates
+### [x] INV-3 — Locate where the chaining pipeline loses candidates
+- **Result (VERIFIED-by-inspection @9cbb70b; artifacts VERIFIED-in-run @eb70210):**
+  `cc8e817` — `docs/investigations/INV-3-chain-funnel.md`. Two distinct chain paths:
+  the per-exchange path (`orchestrator_detect.py:736-772`) persisted 5 `chain_detector`
+  rows in the reported run; the graph path (`orchestrator_chain.investigate_engagement`)
+  computes its returned `chains` from a snapshot taken at link time (`:657`/`:687`)
+  and never re-links after the later second-order (`:691-813`) and coverage
+  (`:837-928`) phases append confirmations (`:770`/`:905`), so the empty `chains` is
+  a stale-snapshot reporting-order artifact — NOT a bare regression. Failure mode
+  classified as dropped/late-reporting (disabled/no-evidence/budget/rejected/
+  failed-step ruled out at source). Test spec (positive + scope-negative +
+  inactive-config zero-request controls). One additive fix ticket (final relink
+  before return). No code/worktree/DB write; Opus gate reproduced the artifact counts
+  read-only.
 - **Domain:** Pipeline / Efficacy · **Effort:** M · **Depends on:** INV-1, INV-2
 - **Mode:** Offline investigation; no new agent or live probing.
 - **Deliverable:** `docs/investigations/INV-3-chain-funnel.md`, with the production

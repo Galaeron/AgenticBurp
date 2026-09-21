@@ -50,8 +50,13 @@ as W-16.
   loop `orchestrator_chain._apply` stamps `confirmed_by_leg` only and persists no
   proof (honesty backstop's OR-logic misses it). Historical 9/13→6/13 gap =
   {GT04,GT05,GT06} idor/cross_identity (audited read-only). 3 sequenced tickets filed.
+- **INV-3 done (`cc8e817`):** graph-path `investigate_engagement` computes returned
+  `chains` from a link-time snapshot and never re-links after the later second-order
+  / coverage phases append confirmations → empty `chains` is a stale-snapshot
+  reporting-order artifact (the per-exchange path did persist 5 chain rows). One
+  additive fix ticket (final relink before return).
 - Backlog also gained review follow-ups P0-5/P0-6/P0-7 (safety/trust gaps in the
-  loop's own P1-4/P0-1/P0-2), to address after INV-1..4. Next: INV-3 (chain funnel).
+  loop's own P1-4/P0-1/P0-2), to address after INV-1..4. Next: INV-4 (noise/runtime).
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
