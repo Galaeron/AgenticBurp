@@ -221,30 +221,38 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             set(self.agent_manager.get_enabled_agents())
         )
 
+        # P1-6: one policy object for every active/engagement toggle below
+        # (adaptive_respin.*, iterative_agent.*, engagement.*) -- see
+        # engagement_policy.py for the field-by-field default/coercion this
+        # replaces (each was read inline here before). Built from the SAME
+        # already-resolved `config` (post resolve_operating_profile above);
+        # `self.<attr>` references are kept as thin aliases onto the policy
+        # so every existing internal read (orchestrator_chain.py,
+        # orchestrator_confirm.py, orchestrator_detect.py, server.py) keeps
+        # working unchanged.
+        from harness.engagement_policy import EngagementPolicy
+        self.engagement_policy = EngagementPolicy.from_config(config)
+
         # Adaptive re-spin loop (SESSION_HANDOVER.md §7). DEFAULT OFF, and
         # additionally a no-op unless coordinator.cloud_primary is also on --
         # the loop is driven by the cloud coordinator. When enabled, after a
         # first agent pass returns nothing actionable, the coordinator is
         # asked (on the anonymized projection) whether a DIFFERENT specialist
         # is worth a second look, bounded by max_rounds AND the effort budget.
-        respin_cfg = config.get("adaptive_respin", {}) or {}
-        self.adaptive_respin_enabled = bool(respin_cfg.get("enabled", False))
-        self.adaptive_respin_max_rounds = int(respin_cfg.get("max_rounds", 1))
+        self.adaptive_respin_enabled = self.engagement_policy.adaptive_respin_enabled
+        self.adaptive_respin_max_rounds = self.engagement_policy.adaptive_respin_max_rounds
         # A finding is "actionable" (so no re-spin is needed) at or above this
         # confidence -- deliberately low: the loop exists for exchanges the
         # first pass returned essentially nothing on, not to second-guess a
         # weak-but-present hit.
-        self.adaptive_respin_min_confidence = float(
-            respin_cfg.get("min_actionable_confidence", 0.4)
-        )
+        self.adaptive_respin_min_confidence = self.engagement_policy.adaptive_respin_min_confidence
 
         # Iterative (active) agent -- F4 + F2. DEFAULT OFF. A send->observe->
         # adapt loop that drives the target, then hands its result to F2's
         # pause->validate->remember integration (pivot_memory). Gated here
         # (enabled flag) AND, for any mutating step, by the safety gate.
-        iter_cfg = config.get("iterative_agent", {}) or {}
-        self.iterative_agent_enabled = bool(iter_cfg.get("enabled", False))
-        self.iterative_agent_max_steps = int(iter_cfg.get("max_steps", 250))
+        self.iterative_agent_enabled = self.engagement_policy.iterative_agent_enabled
+        self.iterative_agent_max_steps = self.engagement_policy.iterative_agent_max_steps
 
         # Per-vulnerability resource governance -- F5. The default policy for
         # how much one vulnerability may consume (retries/agents/tokens); a
@@ -258,19 +266,16 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # identity in-process and fold the new surface back into the worklist.
         # DEFAULT OFF: it sends active traffic (a role crawl) as a side effect of
         # analysis. Scope-gated to allowed_hosts and throttled regardless.
-        self.engagement_auto_escalate = bool(
-            (config.get("engagement", {}) or {}).get("auto_escalate", False))
+        self.engagement_auto_escalate = self.engagement_policy.engagement_auto_escalate
         # Whether the engagement driver may EXECUTE (fetch + analyze) the planned
         # targets, vs. only ever returning the plan. DEFAULT OFF: even when a
         # /run request asks to execute, this must also be true -- so the driver
         # never dispatches active testing automatically without a deliberate opt-in.
-        self.engagement_driver_execute = bool(
-            (config.get("engagement", {}) or {}).get("driver_execute", False))
+        self.engagement_driver_execute = self.engagement_policy.engagement_driver_execute
         # Auto-escalation blast-radius guard: a hard ceiling on how many
         # credential-triggered re-crawls fire per host in this process lifetime,
         # on top of the per-identity dedup + credential verification below.
-        self.engagement_max_escalations = int(
-            (config.get("engagement", {}) or {}).get("max_auto_escalations", 10))
+        self.engagement_max_escalations = self.engagement_policy.engagement_max_escalations
         self._escalation_counts: dict[str, int] = {}
         # Stateful agent-role feature crawling (feature_workflow.py). When on,
         # investigate_engagement drives each distinct role through the app's real
@@ -279,23 +284,21 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # -- reaching what route-guessing can't. DEFAULT OFF: it sends active
         # traffic, and its form submits are additionally gated by
         # allow_mutating_replay inside the client. Scope-gated + throttled.
-        self.engagement_feature_crawl = bool(
-            (config.get("engagement", {}) or {}).get("feature_crawl", False))
+        self.engagement_feature_crawl = self.engagement_policy.engagement_feature_crawl
         # Coverage matrix as a DRIVER (I1): actively fire every applicable
         # deterministic leg per (identity x endpoint x check) cell, regardless of
         # whether an agent labelled it -- so the matrix proves "every applicable
         # check was attempted", not merely inferred, and detection no longer hinges
         # on LLM label variance. DEFAULT OFF (sends the extra leg traffic); bounded
         # by coverage_leg_budget. Legs are still gated by active_enabled + scope.
-        _eng_cfg = config.get("engagement", {}) or {}
-        self.engagement_coverage_drive = bool(_eng_cfg.get("coverage_drive_legs", False))
-        self.coverage_leg_budget = int(_eng_cfg.get("coverage_leg_budget", 80))
+        self.engagement_coverage_drive = self.engagement_policy.engagement_coverage_drive
+        self.coverage_leg_budget = self.engagement_policy.coverage_leg_budget
         # T05/R26: drive coverage at CONCRETE-INPUT granularity -- fan each parameter
         # leg over the endpoint template's real inputs (query/body/object-id) so a
         # confirmation binds to the exact parameter case, and un-run inputs stay
         # visibly pending instead of a coarse endpoint-wide verdict. DEFAULT OFF
         # (finer fan-out = more leg traffic); bounded per cell by coverage_case_budget.
-        self.engagement_coverage_case_drive = bool(_eng_cfg.get("coverage_drive_cases", False))
-        self.coverage_case_budget = int(_eng_cfg.get("coverage_case_budget", 8))
+        self.engagement_coverage_case_drive = self.engagement_policy.engagement_coverage_case_drive
+        self.coverage_case_budget = self.engagement_policy.coverage_case_budget
 
         log.info(f"Orchestrator initialized with {len(self.agent_manager.get_enabled_agents())} agents")
