@@ -42,26 +42,27 @@ Shipped code items this session:
   transport evidence emission + request/response storage that P0-6 gates behind P3-1
   (unstarted). Left for the owner.
 - **P1-6 done (`4054135`):** `EngagementPolicy` dataclass extracts the 13 active/
-  engagement toggles from `Orchestrator.__init__` — purely behavior-preserving
-  (parity + safe-defaults tests, full suite 2398 OK). Single source for "what active
-  traffic is on"; add future toggles there.
-- **P1-7 done (`912df45`):** `/investigate` now enforces pre-authorized scope +
-  route/`base_url` host consistency before job allocation; removed the implicit
-  `base_url` self-grant (was silently widening scope). +3 tests; full suite 2401 OK.
+  engagement toggles from `Orchestrator.__init__` — behavior-preserving (parity +
+  safe-defaults tests). Single source for "what active traffic is on".
+- **P1-7 done (`912df45`):** `/investigate` enforces pre-authorized scope + route/
+  `base_url` host consistency before job allocation; removed the implicit `base_url`
+  self-grant (was silently widening scope). +3 tests.
 - **P1-8 done (`6a42cc6`):** bounded `/investigate` admission (`_MAX_RUNNING_JOBS=4`
-  → 503, layered after P1-7) + terminal-job retention/eviction (900s / max 50,
-  running jobs never evicted, expired id → 404). Module constants only. +6 tests.
+  → 503) + terminal-job retention/eviction (900s / max 50, running never evicted,
+  expired id → 404). Module constants only. +6 tests.
 - **P1-9 done (`bd96d9b`):** documented the scope contract honestly (hostname-string,
-  not address-pinning); corrected a P1-2 overclaim; added a changing-resolution
-  characterization test. Behavior-preserving. Filed **P1-10** (the actual rebinding fix).
+  not address-pinning); corrected a P1-2 overclaim; +characterization test. Filed P1-10.
 - **P3-5 done (`349a51a`):** prior-context + knowledge-block text now defanged via
   `_neutralize_fence_breakout` at fence interpolation (was unneutralized). +3 tests.
+- **P3-4 done (`6d1950c`):** `EvidenceLedger` bounded (5000, FIFO, id-index kept
+  consistent) + `reset_default_ledger()` seam; durable replay unbounded so
+  `reconstruct_persisted` is unaffected. +4 tests (incl. real-pipeline neg control).
 - **P1-10 DEFERRED (owner/dedicated iteration):** address-bound connect-time resolver
   pin is not one clean offline unit — needs a custom httpx/httpcore resolver seam
-  threaded through BOTH client factories (`session.client` + `default_client`),
-  per-redirect-hop pinning, and SNI/cert preservation. Split before automating.
-- Queue next: **P3-4** (bound/rotate ledger singleton) — next small offline unit.
-  Blocked/owner: P0-3, P0-6, P1-3, P1-5, P1-10.
+  through BOTH client factories, per-redirect-hop pinning, SNI/cert preservation.
+- Queue next: no clean P0–P3 offline unit remains unclaimed (P3-1 is multi-feature
+  with a safe-default tension; P3-2/P3-3 need external tooling/deps). Likely LOOP_DONE.
+  Blocked/owner: P0-3, P0-6, P1-3, P1-5, P1-10, P3-1, P3-2, P3-3.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
@@ -77,17 +78,13 @@ Owner action required (NOT verified here): re-run PixelMart + blind helpdesk und
 `fail_open_mode=curated` and `quarantine_unverified_leads=true`; record precision AND
 recall deltas in this file as owner-reported.
 
-## Verified here (2026-09-20, clean committed tree at HEAD `bc5f599`)
+## Verified here (2026-09-21, current HEAD)
 
-From the repository root, using `.venv-rationalisation/Scripts/python.exe`
-(Python 3.12.14, isolated deps):
-
-- `-m harness.suite smoke`: **90 tests OK**, exit 0.
-- `-m harness.suite full`: **green, exit 0.** Unittest **2,321 tests OK, 2 skips**
-  (261s); pytest-native **13 OK**; evaluation **42 OK**.
-
-These are offline/stubbed-model, owned-loopback results only. No real-model
-benchmark, blind-target run, hosted CI or Java build was performed here.
+From repo root, `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14, isolated):
+`-m harness.suite smoke` = **90 OK**, exit 0; `-m harness.suite full` = **green, exit 0**
+(unittest **2418 OK, 2 skip** ~260s; pytest-native 13 OK; evaluation 42 OK). These are
+offline/stubbed-model, owned-loopback results only — no real-model benchmark,
+blind-target run, hosted CI or Java build was performed here.
 
 ## Open work and pointers
 

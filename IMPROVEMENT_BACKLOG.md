@@ -454,7 +454,15 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   is unchanged (negative control).
 - **Impact:** Low-Medium (defense-in-depth).
 
-### [ ] P3-4 — Bound/rotate the in-memory ledger singleton
+### [x] P3-4 — Bound/rotate the in-memory ledger singleton
+- **Result (VERIFIED):** `6d1950c` — `EvidenceLedger` bounded to
+  `DEFAULT_MAX_EVENTS=5000` with FIFO eviction at the single append point
+  (id-index kept consistent); added `reset_default_ledger()` seam; durable replay
+  (`ledger_from_store`) constructed unbounded so `reconstruct_persisted` is provably
+  unaffected by in-memory eviction. emit/persistence/reconstruction behavior
+  unchanged; no config change. +4 tests (bound+eviction+id-consistency, reset,
+  real-pipeline negative control: durable reconstruction stays complete after the
+  in-memory ledger evicts). Modules 15/15; full suite 2418 OK / 2 skip, exit 0.
 - **Domain:** Reliability · **Effort:** S · **Depends on:** none
 - **Evidence (VERIFIED):** filed during P0-1 review. `evidence_ledger._DEFAULT_LEDGER`
   is a module-level singleton that grows unbounded in a long-lived server process.
