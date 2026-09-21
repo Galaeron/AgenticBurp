@@ -602,7 +602,19 @@ No existing priority heading or dependency list was rewritten by this addendum.
 
 ## Investigation queue — measured failures, before further feature expansion
 
-### [ ] P0-7 — Require executed negative controls for leg qualification
+### [x] P0-7 — Require executed negative controls for leg qualification
+- **Result (VERIFIED):** `ec03060` — leg qualification now requires an EXECUTED pair:
+  `_is_executed_confirmation` (confirmed/True) AND `_is_executed_refutation` (executed
+  `not_confirmed`). Skipped/errored/blocked/unavailable/inconclusive negatives no
+  longer qualify (was: accept-any-non-confirmed). Throttle isolation moved off the
+  process-wide singleton to a `_SCOPED_THROTTLE` contextvar + scoped
+  `global_throttle.acquire` dispatch restored in `finally`, so concurrent engagements
+  keep their real throttle through execution and cleanup. Per-run lifetime documented;
+  fail-safe empty-frozenset preserved; config.yaml unchanged (OFF by default). Only
+  `leg_self_test.py` + tests changed (no transport/ledger/store touch). +11 tests
+  (5 non-executed refusals, 1 healthy positive control, 2 throttle-isolation). Full
+  suite 2383 OK / 2 skip (independently re-run after the coder's background run was
+  killed mid-suite). Corrects an earlier-loop gap in P0-2.
 - **Domain:** Trust / Reliability · **Effort:** M · **Depends on:** P0-2
 - **Evidence (VERIFIED-by-inspection at c1133d5):**
   `harness/leg_self_test.py::_case_passes` accepts any negative result except

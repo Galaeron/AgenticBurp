@@ -23,41 +23,29 @@ as W-16.
 
 ## Improvement loop (IMPROVEMENT_BACKLOG.md)
 
-- **P0-1 (`25a737a`):** EvidenceLedger wired into the live pipeline (append-only
-  `ledger_events` table; `GET /findings/{ref}/evidence`). Instrumentation-only.
-- **P0-2 (`533928c`):** run-derived leg trust tiers via the `live_verified_markers`
-  override; demotion-only, OFF by default (`leg_self_test.enabled`), fail-safe.
-- **P0-4 (`0e993da`):** reverted committed `server.allowed_hosts` to `[]` (live
-  scope → git-ignored `config.local.yaml`); `SafeDefaultGuardTests` blocks drift.
-- **P1-1 (`33392c9`):** fence-breakout neutralization for untrusted target text;
-  defensive-only, caps/high-signal-slice preserved.
-- **P1-2 (`e54cfb6`):** scope-escape adversarial regression coverage (IP-literal,
-  DNS-rebinding, file://+gopher://, mid-hop redirect) — all already blocked; no
-  production change.
-- **P1-4 (`1e084e1`):** 5 named operating profiles via one opt-in `operating_profile`
-  selector (ships "none" → no-op); passive-only asserted all-flags-off; safe
-  defaults + SafeDefaultGuardTests intact.
-- Follow-on nits filed: P3-4 (ledger singleton), P3-5 (fence prior-context).
-- (The Astra T02–T08 "paused item" is in fact merged — see section above; the
-  codex/astra worktrees hold only superseded drafts.)
-- **INV-1..4 dispatch COMPLETE** (`e0ba0aa`, `40104a9`, `cc8e817`, `a6e125f`;
-  full Result lines in the backlog). Each is an evidence-tagged diagnosis with filed
-  tickets (production fixes are separate). Key findings: INV-1 quarantine knob is a
-  no-op on `run_blind_eval.py`; INV-2 the PASS2 graph confirm path
-  (`orchestrator_chain._apply`) persists no ProofRecord (the 9/13→6/13 gap =
-  {GT04,GT05,GT06}); INV-3 graph-path `chains` is computed on a pre-confirmation
-  snapshot (stale-snapshot reporting artifact); INV-4 the 1914/641/107 counts are a
-  driver-side un-deduped union, and no timing instrumentation exists.
-- **P0-5 done (`c7e0ce4`):** fixed the P1-4 safety gap — `passive-only` is now
-  safety-authoritative (force-disables all 10 active/mutating/discovery/engagement/
-  cloud knobs unconditionally, post-merge, even over `explicit_keys`); added an
-  `explicit_keys` provenance seam (from the `config.local.yaml` overlay via
-  `server.load_config`) so enabling profiles don't override an explicit operator
-  disable. no-op preserved; safe defaults + SafeDefaultGuardTests intact. +16 tests.
-  Residual: without provenance an explicit baseline-equal disable is indistinguishable
-  from default (never less safe than pre-P0-5).
-- Queue next: **P0-6** (ledger completeness, a P0-1 follow-up), then **P0-7**
-  (executed negative controls for leg qualification, a P0-2 follow-up).
+Full per-item Result lines (evidence tags, tests, commits) live in the backlog.
+Shipped code items this session:
+- **P0-1** `25a737a` EvidenceLedger wiring · **P0-2** `533928c` run-derived leg trust
+  tiers · **P0-4** `0e993da` safe-default guard (`allowed_hosts→[]`) · **P1-1**
+  `33392c9` injection fence-breakout neutralization · **P1-2** `e54cfb6` scope-escape
+  coverage · **P1-4** `1e084e1` operating profiles.
+- **P0-5** `c7e0ce4` — `passive-only` now safety-authoritative (force-off all 10
+  active knobs unconditionally) + `explicit_keys` provenance seam; fixes a P1-4 gap.
+- **P0-7** `ec03060` — leg qualification requires an EXECUTED negative control;
+  throttle isolated to a scoped contextvar; fixes a P0-2 gap.
+- **INV-1..4 dispatch COMPLETE** (`e0ba0aa`, `40104a9`, `cc8e817`, `a6e125f`):
+  evidence-tagged read-only diagnoses with filed tickets — INV-1 quarantine knob no-op
+  on `run_blind_eval.py`; INV-2 PASS2 confirm path persists no ProofRecord (9/13→6/13);
+  INV-3 graph `chains` computed on a pre-confirmation snapshot; INV-4 1914/641/107 is a
+  driver-side un-deduped union + no timing instrumentation. Production fixes are
+  separate tickets.
+- **P0-6 SKIPPED (still `[ ]`):** can't land as one offline unit — needs new per-hop
+  transport evidence emission + request/response storage that P0-6 gates behind P3-1
+  (unstarted). Left for the owner.
+- Follow-on nits: P3-4 (ledger singleton), P3-5 (fence prior-context). The Astra
+  T02–T08 "paused item" is merged (section above); codex/astra worktrees are drafts.
+- Queue next: remaining offline items are lower-tier (P1-6 policy object; INV fix
+  tickets; P3-4/P3-5).
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
