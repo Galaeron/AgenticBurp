@@ -42,10 +42,14 @@ Shipped code items this session:
 - **P0-6 SKIPPED (still `[ ]`):** can't land as one offline unit — needs new per-hop
   transport evidence emission + request/response storage that P0-6 gates behind P3-1
   (unstarted). Left for the owner.
+- **P1-6 done (`4054135`):** `EngagementPolicy` dataclass extracts the 13 active/
+  engagement toggles from `Orchestrator.__init__` — purely behavior-preserving
+  (parity + safe-defaults tests, full suite 2398 OK). Single source for "what active
+  traffic is on"; add future toggles there.
 - Follow-on nits: P3-4 (ledger singleton), P3-5 (fence prior-context). The Astra
   T02–T08 "paused item" is merged (section above); codex/astra worktrees are drafts.
-- Queue next: remaining offline items are lower-tier (P1-6 policy object; INV fix
-  tickets; P3-4/P3-5).
+- Queue next: remaining offline items are the INV fix tickets (from INV-1..4) and
+  the P3-4/P3-5 nits. Blocked/owner: P0-3, P0-6, P1-3, P1-5.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 

@@ -272,7 +272,17 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   build command actually run (label VERIFIED with the JDK/Gradle versions).
 - **Impact:** Medium-High.
 
-### [ ] P1-6 — Extract active/engagement flags into one policy object
+### [x] P1-6 — Extract active/engagement flags into one policy object
+- **Result (VERIFIED):** `4054135` — new `harness/engagement_policy.py`
+  (`EngagementPolicy.from_config`) extracts the 13 active/engagement toggles from
+  `Orchestrator.__init__`; purely behavior-preserving (same keys/defaults/coercion/
+  None-guard), fed the already-resolved config, each `self.<attr>` a thin alias so
+  downstream readers are untouched; per-request driver_execute gate unchanged. Flags
+  owned elsewhere (validators active/mutating, autonomous_discovery, coordinator.cloud_*,
+  retry_budget) deliberately not folded in (confirmed never read in __init__). config.yaml
+  unchanged; SafeDefaultGuardTests green. +15 tests (safe-defaults enumeration + parity
+  vs reconstructed old inline reads). Full suite 2398 OK / 2 skip. Gate verified parity
+  field-by-field and re-ran the test subsets.
 - **Domain:** Maintainability · **Effort:** S · **Depends on:** none
 - **Evidence (VERIFIED):** [harness/orchestrator.py:199-274](harness/orchestrator.py).
 - **Recommendation:** Introduce `EngagementPolicy`/`ActivePolicy` dataclasses with
