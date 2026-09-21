@@ -25,6 +25,19 @@ Opus reviews/selects; Sonnet investigates one item per iteration. Read
 for exact scope, deliverables, evidence rules, and review criteria. This dispatch
 does not start an automation or authorize live execution. Preserve existing work.
 
+**2026-09-21 consensus dispatch (reopens the LOOP_DONE hold for OFFLINE work):** A
+four-way review reconciliation (`reviews/2026-09-21/REVIEW_RECONCILIATION_AND_PLAN.md`
++ `PRINCIPAL_REVIEW.md`) reached consensus. The efficacy *runs* — a real-model blind
+scorecard and the A–F ablation — stay **OWNER/LIVE** and out of loop scope, but the loop
+can now BUILD the instruments those runs need and land the trust-completeness fixes. The
+INV-1..4 diagnoses promised "production fixes as separate tickets"; those are now filed
+below. Select from **Consensus batch — 2026-09-21** (end of file), in this order, before
+resuming the ordinary queue: **RB-1 → RB-4 → RB-8 → RB-3 → RB-5 → RB-2 → RB-7 → RB-6**.
+Items tagged `Mode: OWNER/LIVE` are NOT loop-consumable — leave them `[ ]` and skip.
+Do NOT flip a `config.yaml` default that carries a documented recall trade-off (the
+`fail_open_mode: curated` flip is owner-gated on RB-8's measured delta, not a loop freebie).
+Every RB item names a caller-level test + negative control; honour the non-negotiables below.
+
 1. Work top-down: finish all `P0` items before `P1`, etc. Within a tier, respect
    `Depends on`.
 2. Pick the first item whose checkbox is `[ ]` and whose dependencies are all `[x]`.
@@ -802,3 +815,194 @@ improved or that a live rerun happened. Live measurements remain separately open
 - **Acceptance:** Separate repeated evidence from distinct vulnerabilities and
   exposed findings from leads; preserve distinct principal/object cases. Each
   proposed optimization names a metric and caller-level regression control.
+
+## Consensus batch — 2026-09-21 (multi-review reconciliation)
+
+Derived from `reviews/2026-09-21/`. These file the INV-1..4 production fixes and the new
+items the reconciliation surfaced. **Loop pick order:** RB-1 → RB-4 → RB-8 → RB-3 → RB-5
+→ RB-2 → RB-7 → RB-6. `Mode: LOOP` = offline, testable, Sonnet-implementable. `Mode:
+OWNER/LIVE` = needs a real model / JDK-Burp / GPU and is out of loop scope (leave `[ ]`).
+Fact-check note for the loop: two "obvious" fixes proposed in review were WRONG against
+source — the coordinator fail-open is already telemetried with a `curated` mode (do not
+"add" it), and per-`(host,component)` advisory dedup already exists in
+`_resolve_known_vulnerabilities`; the real duplication is the driver-side union (RB-3).
+Verify every proposed diff against the code before implementing.
+
+### [x] RB-1 — Local-API origin/CSRF defense (ephemeral token + origin check)
+- **Result (VERIFIED):** `f24ff8e` — ephemeral bearer token (`secrets.token_urlsafe(32)`)
+  generated at startup when no operator token (`auth_token`/`HARNESS_BEARER_TOKEN`) is set,
+  written to a 0600 `harness/.harness_token.lock` (git-ignored; `os.chmod` best-effort/
+  non-fatal — Windows only toggles read-only, so the token, not the file mode, is the
+  boundary). `_csrf_defense_middleware` rejects `Sec-Fetch-Site: cross-site` and any
+  cross-site `Origin` (hostname compare via the new `urlparse` import) with 403 BEFORE the
+  token check (so a leaked token cannot rescue a cross-site call), then requires
+  `Authorization: Bearer` on POST/PUT/PATCH/DELETE (401) even on loopback; a MISSING Origin
+  (curl/extension) is allowed; GET stays governed by the pre-existing `_require_auth`. Python
+  side only — `burp-extension/` and `config.yaml` untouched; the extension reading the token
+  is **RB-1b (OWNER/JDK)** and until it lands the packaged extension will not authenticate.
+  +8 caller-level tests (`harness/test_local_api_csrf.py`): no-token→401, cross-site
+  Origin/`Sec-Fetch-Site`→403, token+no-Origin→200, and the no-Origin+token NEGATIVE CONTROL
+  still succeeds; 7 existing server `TestClient` suites updated to attach the now-required
+  token (mechanical header only — their route-level 403 tests still fire, proving coverage
+  preserved, not masked). Full suite **2426 OK / 2 skip, exit 0**. Opus-reviewed APPROVE.
+  Non-blocking follow-ups (documented, not separately filed — all low risk): middleware
+  docstring says "after TrustedHost" but a decorator middleware runs outermost (cosmetic);
+  Windows lockfile is `-rw-r--r--` (ACL hardening only if local-account isolation is ever
+  needed); read-only GET routes remain reachable by a same-host/different-port local origin
+  (browser labels it same-site; mutations stay token-gated); a non-ASCII `Authorization`
+  header raises in `compare_digest`→500 not a clean 401 (fail-closed, pre-existing in
+  `_require_auth`). **Owner next:** land RB-1b before shipping a token-enabled server.
+- **Domain:** Security / Trust · **Effort:** S · **Depends on:** none · **Mode:** LOOP
+  (Python side; the Burp extension reading the token is RB-1b, OWNER/JDK)
+- **Evidence (VERIFIED):** `server.py:146` allows unauthenticated requests on loopback
+  when no `auth_token`/`HARNESS_BEARER_TOKEN` is set; the file's own comment (~`:125`)
+  concedes JSON endpoints are "protected only by accidental CORS-preflight". `urlparse`
+  is NOT currently imported in `server.py`.
+- **Problem:** A page the tester visits in a browser can `fetch()` loopback endpoints
+  (exfiltrate findings, or drive the harness) via CSRF-shaped requests. GET routes and
+  any `text/plain` route are reachable cross-origin.
+- **Recommendation:** Generate an ephemeral bearer token at startup, write it to a
+  `0600` lockfile the extension reads, and require it on every state-changing route even
+  on loopback (primary control). Add an `Origin`/`Sec-Fetch-Site` reject-cross-site
+  middleware as defense-in-depth (add the `urllib.parse.urlparse` import). Do not break
+  no-Origin local callers (curl / the extension).
+- **Acceptance:** TestClient — state-changing route without the token → 401; a
+  cross-site `Origin` (or `Sec-Fetch-Site: cross-site`) → 403; a loopback call with the
+  token and no Origin → 200. Negative control: an existing same-origin/no-Origin call
+  the extension makes still succeeds (regression guard).
+- **Impact:** High (a real, cheap trust/safety win).
+
+### [ ] RB-2 — Surface a `degraded: routing_failed_open` signal (do NOT flip the default)
+- **Domain:** Reliability / Observability · **Effort:** S · **Depends on:** none · **Mode:** LOOP
+- **Evidence (VERIFIED):** `coordinator._record_fail_open` already logs + increments
+  `fail_open_stats()` + publishes to the activity feed (not silent); `_curated_fallback`
+  and `fail_open_mode` already exist. `config.yaml:88` states the `curated` flip is "a
+  recall trade-off that should be gated on the repeated/blind eval (W-23)". Fail-open is
+  already bounded by `concurrency.max_parallel_agents`.
+- **Problem:** An all-agent fail-open is observable in telemetry but not in the analysis
+  *result*, so a degraded run (routing failed → ~36 agents, minutes of latency) is not
+  distinguishable from a healthy one by a caller/UI reading the response.
+- **Recommendation:** Add a `degraded`/`routing_fallback` flag to the analysis response
+  when `is_fallback_reason` is true. **Do NOT change the committed `fail_open_mode`
+  default** — the `curated` flip is RB-2b, owner-gated on RB-8's measured recall delta.
+- **Acceptance:** caller-level test — force a coordinator error → response carries the
+  degraded flag AND `fail_open_stats` incremented. Negative control: healthy routing →
+  no degraded flag.
+- **Impact:** Medium (kills the "silent all-36" ambiguity without a recall change).
+
+### [ ] RB-3 — Dedupe dependency/banner findings at the aggregation layer (INV-4 fix)
+- **Domain:** Precision · **Effort:** S · **Depends on:** none · **Mode:** LOOP
+- **Evidence (VERIFIED):** per-`(host,component)` advisory dedup ALREADY exists in
+  `orchestrator_detect._resolve_known_vulnerabilities` (`_reported_banner_components`,
+  initialized `orchestrator.py:157`) and `host_dep_dedup.py` predates the 2026-09-20
+  SCORECARD base — yet 9× Werkzeug still appeared. INV-4 (`@a6e125f`) attributes the
+  count to a **driver-side un-deduped `_all_findings()` union** (1914 == union len vs
+  `store.findings` 1108), NOT a detection-layer gap. `issues.py:268` already does
+  root-cause grouping.
+- **Problem:** Identical dependency-banner findings collapse per analysis call but are
+  re-introduced when the engagement/eval driver unions findings across phases/exchanges,
+  flooding the report (the dominant blind-negative FP driver).
+- **Recommendation:** Group/dedupe at the `_all_findings()` union / `issues.py` surfacing
+  layer, keyed on the existing `issue_key`/fingerprint (host, canonical class/component).
+  Do NOT add a second detection-layer check — that logic already runs.
+- **Acceptance:** feed N identical Werkzeug-banner findings across multiple exchanges/
+  phases through the driver union → 1 surfaced issue. Negative control: two genuinely
+  distinct components on the same host → 2 issues; distinct principal/object cases
+  preserved (per INV-4).
+- **Impact:** Medium (directly lifts the measured blind-negative precision).
+
+### [ ] RB-4 — Persist ProofRecord + ledger events on the engagement confirm path (INV-2 fix)
+- **Domain:** Trust / Evidence · **Effort:** M · **Depends on:** P0-1 · **Mode:** LOOP
+- **Evidence (VERIFIED):** `CURRENT_STATE` INV-2 and `testing/SCORECARD.md`: the
+  proof-linked audit drops confirmations 9/13 → 6/13 because the active engagement
+  confirm path (`orchestrator_chain`) stamps `confirmed=True` without persisting a
+  `ProofRecord`/ledger `VALIDATION_DECISION`, unlike `orchestrator_confirm._validate_findings`.
+- **Problem:** A finding shown as CONFIRMED in an engagement run may have no reproducible
+  proof — the worst possible outcome for a tool whose value is evidence-grade confirmation.
+- **Recommendation:** Route the engagement-loop confirmation through the SAME proof
+  persistence + `evidence_ledger` emission as `orchestrator_confirm`, so every
+  `confirmed=True` in `investigate_engagement` resolves to a persisted proof.
+- **Acceptance:** extend `test_pipeline_gate` (real loopback discovery→confirm): the
+  confirmed IDOR has a persisted `ProofRecord` and `reconstruct_persisted(...)["complete"]
+  is True` with non-empty `what_sent`/`what_came_back`. Negative control (defect
+  injection): a suppressed leg → `confirmed=False` AND no orphan proof persisted.
+- **Impact:** High (the single most important trust fix in this batch).
+
+### [ ] RB-5 — Re-link attack chains after second-order + coverage phases (INV-3 fix)
+- **Domain:** Pipeline / Efficacy · **Effort:** S · **Depends on:** RB-4 · **Mode:** LOOP
+- **Evidence (VERIFIED):** `CURRENT_STATE` INV-3 and SCORECARD "0 chains ... did not
+  reproduce": chains are computed on a pre-confirmation snapshot and never recomputed
+  after the second-order/coverage phases confirm new findings.
+- **Problem:** Multi-step chains whose constituents only confirm in a later phase are
+  silently absent from the engagement report.
+- **Recommendation:** Add a second `chain_linker.link_findings` pass after the
+  second-order and coverage phases, before returning the engagement result.
+- **Acceptance:** fixture where a later-phase confirmation composes with an earlier
+  finding → chain present in the result. Negative control / defect injection: remove the
+  re-link → chain absent (the assertion goes red).
+- **Impact:** Medium.
+
+### [ ] RB-6 — Reconcile the two active-traffic execution planes by capability
+- **Domain:** Architecture / Safety · **Effort:** M (matrix) / L (reconciliation)
+  · **Depends on:** RB-7 (ablation informs which plane wins) · **Mode:** LOOP for the
+  capability matrix + Python evidence contract; **OWNER/JDK** for Java edits + build
+- **Evidence (VERIFIED):** `ValidationExecutor.java` (1,690 LOC) sends live traffic — 38
+  `api.http().sendRequest()` sites (XSS injection, rate-limit replay, identity replays) —
+  gated only by Burp's configured scope (`isInScope`, line 93), i.e. OUTSIDE the Python
+  `SafetyGate`/`TargetTransport`/two-flag mutating opt-in/budget. `*Logic.java` classes
+  are pure unit-tested helpers, not duplicate executors. `HarnessPanel.runnableHere`
+  already routes plans Java-vs-Python.
+- **Problem:** The SAME capability existing in both planes causes logic drift and
+  divergent results, and the Java plane's active traffic is invisible to the Python
+  evidence/safety trail. This is a maintainability + consistency hazard, NOT "unauthorized
+  requests" (it is operator-triggered and Burp-scope-gated).
+- **Recommendation (staged; NOT a rewrite):** (a) LOOP: produce the capability matrix of
+  which classes execute in each plane (from grep) + define one shared evidence/gate
+  contract; (b) assign each capability ONE authoritative plane; (c) OWNER/JDK: make the
+  Java plane emit its scope/gate decision into the shared trail. Do NOT delete the Java
+  execution path before RB-7's ablation shows Python-plane execution is strictly better.
+- **Acceptance (LOOP half):** a committed capability-ownership matrix + a test asserting
+  no capability is authoritative in both planes. Java behavioural changes are OWNER.
+- **Impact:** Medium.
+
+### [ ] RB-7 — Build the A–F ablation harness (instrument for P2-2)
+- **Domain:** Evaluation · **Effort:** M · **Depends on:** none · **Mode:** LOOP builds
+  the harness (stubbed-model testable); **OWNER/LIVE** runs it with a real model
+- **Evidence (VERIFIED):** P2-2 exists but is owner/live; `POSITIONING_DRAFT.md` says the
+  agent count "waits on the W-22 ablation". The seams already exist (`fail_open_mode`,
+  agent enable flags, `critique.enabled`, the graph path) to wire arms.
+- **Problem:** The central strategic question (do ~36 agents beat 1 model + tools / legs
+  only?) cannot be answered without a runnable ablation; today there is no harness.
+- **Recommendation:** Build a config-selectable arm set — A current, B single-agent +
+  tools, C legs-only/no-LLM, D no-critique, E no-graph, F curated-routing — emitting one
+  metrics table (precision/recall/FP/tokens/wall-clock) per arm. Real numbers are
+  OWNER/LIVE; the loop delivers the runnable, stubbed-model-verified instrument.
+- **Acceptance:** each arm selectable via config; a stubbed-model dry-run emits the
+  metrics schema; a test asserts arm selection deterministically changes the dispatched
+  set (e.g. B dispatches 1, C dispatches 0 agents). No accuracy claim from the loop.
+- **Impact:** High (unblocks the #1 architectural decision). Feeds P2-2.
+
+### [ ] RB-8 — Fix the blind-eval harness so an owner run yields a valid scorecard (INV-1 fix)
+- **Domain:** Evaluation · **Effort:** M · **Depends on:** RB-3 (dedupe first) · **Mode:**
+  LOOP builds/repairs the harness (stubbed-model testable); **OWNER/LIVE** runs it
+- **Evidence (VERIFIED):** INV-1 — `run_blind_eval.py` set `quarantine_unverified_leads`
+  but never called `generate_markdown_report()`, so the quarantine path never ran. SCORECARD
+  root-causes the 0/6→1/6 controls-clean to (a) the RB-3 dependency union and (b)
+  cross-identity REJECT being OFF in the blind config. INV-4: no timing instrumentation.
+- **Problem:** The blind scorecard the whole plan is gated on cannot be trusted until its
+  harness actually exercises quarantine + REJECT and reports variance + a controls-clean
+  metric with timing/token cost.
+- **Recommendation (LOOP):** make `run_blind_eval` exercise the quarantine path; wire
+  cross-identity REJECT into the blind config; add ≥5-run variance aggregation, a
+  controls-clean metric, and timing/token instrumentation. The RUN with a real model is
+  OWNER/LIVE (feeds P0-3).
+- **Acceptance:** an offline stubbed-model dry-run emits a scorecard with controls-clean +
+  variance + timing fields AND provably invokes the quarantine path. Negative control: a
+  synthetic secure fixture is quarantined (routed to leads), not reported as a finding.
+- **Impact:** High (makes the gating measurement trustworthy).
+
+> **OWNER/LIVE runs that the above instruments unblock (NOT loop-consumable):** the
+> real-model blind scorecard with variance and cross-identity REJECT on (P0-3, via RB-8),
+> and the A–F ablation run that sets the agent count (P2-2, via RB-7). Also owner:
+> P1-10 (connect-time IP pinning — needs a custom resolver), and RB-2b (the
+> `fail_open_mode: curated` default flip, gated on RB-8's measured recall delta).

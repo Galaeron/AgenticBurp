@@ -52,19 +52,20 @@ Shipped code items this session:
   expired id → 404). Module constants only. +6 tests.
 - **P1-9 done (`bd96d9b`):** documented the scope contract honestly (hostname-string,
   not address-pinning); corrected a P1-2 overclaim; +characterization test. Filed P1-10.
-- **P3-5 done (`349a51a`):** prior-context + knowledge-block text now defanged via
-  `_neutralize_fence_breakout` at fence interpolation (was unneutralized). +3 tests.
-- **P3-4 done (`6d1950c`):** `EvidenceLedger` bounded (5000, FIFO, id-index kept
-  consistent) + `reset_default_ledger()` seam; durable replay unbounded so
-  `reconstruct_persisted` is unaffected. +4 tests (incl. real-pipeline neg control).
-- **P1-10 DEFERRED (owner/dedicated iteration):** address-bound connect-time resolver
-  pin is not one clean offline unit — needs a custom httpx/httpcore resolver seam
-  through BOTH client factories, per-redirect-hop pinning, SNI/cert preservation.
-- **LOOP_DONE (offline items exhausted, confirmed 2026-09-21):** every remaining
-  unchecked item is blocked-by-dependency, needs a live model / Docker / JDK-Burp /
-  external tooling, needs an owner-reported measurement, or is multi-part. Owner-only:
-  P0-3, P0-6, P1-3, P1-5, P1-10, P2-1/2/3, P3-1, P3-2, P3-3. P3-1 must resolve its
-  redaction default (P0-6 depends on it); P1-10 needs splitting before it can automate.
+- **P3-5 (`349a51a`) + P3-4 (`6d1950c`) done:** fence defang extended to prior-context/knowledge blocks; `EvidenceLedger` bounded (5000 FIFO) + reset seam. +7 tests. (P1-10 DNS pin → owner/live below.)
+- **LOOP RUNNING (2026-09-21 consensus batch):** LOOP_DONE hold lifted; the four-way
+  reconciliation (`reviews/2026-09-21/`) filed the INV-1..4 production fixes as the
+  **Consensus batch** in `IMPROVEMENT_BACKLOG.md`. Pick order
+  RB-1 → RB-4 → RB-8 → RB-3 → RB-5 → RB-2 → RB-7 → RB-6.
+  - **RB-1 done (`f24ff8e`):** local-API CSRF/token — ephemeral bearer token to a 0600
+    lockfile + `Origin`/`Sec-Fetch-Site` cross-site middleware; token required on mutating
+    routes even on loopback (GET unchanged; no-Origin callers preserved). +8 tests; full
+    2426 OK / 2 skip. **Owner must land RB-1b** (Java extension reads the token) before
+    shipping a token-enabled server, else the packaged extension can't authenticate.
+  - **Next: RB-4** (INV-2 proof persistence on the engagement confirm path; deps P0-1 [x]).
+  Owner/live, skip in loop: P0-3 (blind scorecard RUN, via RB-8), P2-2 (ablation RUN, via
+  RB-7), P1-10 (DNS pin), RB-2b (`curated` flip, gated on RB-8's delta), P0-6/P3-1, P1-5,
+  P3-2/3-3.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
