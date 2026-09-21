@@ -38,10 +38,8 @@ as W-16.
   selector (ships "none" → no-op); passive-only asserted all-flags-off; safe
   defaults + SafeDefaultGuardTests intact.
 - Follow-on nits filed: P3-4 (ledger singleton), P3-5 (fence prior-context).
-- **Now on the INV dispatch** (IMPROVEMENT_BACKLOG.md + docs/INVESTIGATION_DISPATCH_2026-09-20.md):
-  offline read-only investigations, one per iteration. (The Astra T02–T08
-  workstream once tracked here as "paused" is in fact merged — see the section
-  above; the codex/astra worktrees hold only superseded drafts.)
+- (The Astra T02–T08 "paused item" is in fact merged — see section above; the
+  codex/astra worktrees hold only superseded drafts.)
 - **INV-1..4 dispatch COMPLETE** (`e0ba0aa`, `40104a9`, `cc8e817`, `a6e125f`;
   full Result lines in the backlog). Each is an evidence-tagged diagnosis with filed
   tickets (production fixes are separate). Key findings: INV-1 quarantine knob is a
@@ -50,9 +48,16 @@ as W-16.
   {GT04,GT05,GT06}); INV-3 graph-path `chains` is computed on a pre-confirmation
   snapshot (stale-snapshot reporting artifact); INV-4 the 1914/641/107 counts are a
   driver-side un-deduped union, and no timing instrumentation exists.
-- Ordinary queue resumes at review follow-ups **P0-5/P0-6/P0-7** (safety/trust gaps
-  in the loop's own P1-4/P0-1/P0-2) — code-change items, higher stakes than the
-  read-only investigations.
+- **P0-5 done (`c7e0ce4`):** fixed the P1-4 safety gap — `passive-only` is now
+  safety-authoritative (force-disables all 10 active/mutating/discovery/engagement/
+  cloud knobs unconditionally, post-merge, even over `explicit_keys`); added an
+  `explicit_keys` provenance seam (from the `config.local.yaml` overlay via
+  `server.load_config`) so enabling profiles don't override an explicit operator
+  disable. no-op preserved; safe defaults + SafeDefaultGuardTests intact. +16 tests.
+  Residual: without provenance an explicit baseline-equal disable is indistinguishable
+  from default (never less safe than pre-P0-5).
+- Queue next: **P0-6** (ledger completeness, a P0-1 follow-up), then **P0-7**
+  (executed negative controls for leg qualification, a P0-2 follow-up).
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 

@@ -481,7 +481,23 @@ artifact work in `.worktrees/astra-review-fixes` and evidence work in
 part of backlog selection. Recheck their integration status before implementing
 an overlapping recommendation, and reuse applicable work rather than duplicating it.
 
-### [ ] P0-5 — Preserve explicit safety overrides when resolving operating profiles
+### [x] P0-5 — Preserve explicit safety overrides when resolving operating profiles
+- **Result (VERIFIED):** `c7e0ce4` — `passive-only` is now safety-authoritative:
+  all ten active/mutating/discovery/engagement/cloud knobs are force-set False
+  unconditionally, applied AFTER the preset merge and even over a supplied
+  `explicit_keys` (safety wins over provenance), with a logged warning — it can no
+  longer leave an active flag on. Added an `explicit_keys` provenance seam:
+  `server.load_config` returns `(cfg, explicit_keys)` where explicit_keys =
+  `flatten_explicit_keys(pre-merge config.local.yaml overlay)`, threaded through
+  `Orchestrator` into `resolve_operating_profile`, so an enabling profile
+  (deep-assessment/workstation) no longer overrides an explicit operator disable.
+  none/unset no-op (same object) preserved; committed config.yaml unchanged; P0-4
+  SafeDefaultGuardTests still passes; all `load_config` callers updated (keyword-only
+  optional kwarg). +16 tests incl. the all-True→passive-only→all-False control.
+  Full suite 2375 OK / 2 skip. **Residual limitation:** without provenance
+  (`explicit_keys=None`, ad-hoc callers) an explicit-but-baseline-equal disable is
+  still indistinguishable from a default under an enabling profile — never less safe
+  than pre-P0-5.
 - **Domain:** Safety / Configuration · **Effort:** M · **Depends on:** P1-4
 - **Evidence (VERIFIED by source inspection):**
   `config_schema.resolve_operating_profile` infers explicit overrides by comparing
