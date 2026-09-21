@@ -63,12 +63,22 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
     - FastPathSelector: Provides deterministic pre-LLM agent routing
     """
     
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, explicit_keys: set[str] | None = None):
         """
         Initialize the orchestrator.
-        
+
         Args:
             config: Full application configuration
+            explicit_keys: P0-5 provenance seam -- the set of dotted config
+                paths the OPERATOR explicitly set (e.g. via the git-ignored
+                config.local.yaml overlay; harness/server.py's load_config()
+                sources it that way and passes it through here). Threaded
+                straight into resolve_operating_profile so an enabling
+                profile (workstation/deep-assessment) can't silently turn on
+                a knob the operator explicitly disabled. None (the default,
+                e.g. for test callers that construct `config` ad hoc) falls
+                back to resolve_operating_profile's documented no-provenance
+                heuristic -- see its docstring for the residual limitation.
         """
         # P1-4: resolve the named operating profile (config["operating_profile"],
         # default "none") FIRST, before anything below reads `config`. This isn't
@@ -78,9 +88,12 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # the profile has to be applied to the dict itself, not layered on after.
         # Unset/"none" (the shipped config.yaml default) returns `config` unchanged
         # -- byte-for-byte today's behavior. See config_schema.resolve_operating_profile
-        # for the documented profile-vs-explicit-override composition rule.
+        # for the documented profile-vs-explicit-override composition rule (P0-5
+        # tightened this: passive-only now forces active/mutating/discovery/
+        # engagement/cloud knobs off unconditionally, and explicit_keys above lets
+        # an enabling profile respect an explicit operator disable).
         config = config_schema.resolve_operating_profile(
-            config, config.get("operating_profile"))
+            config, config.get("operating_profile"), explicit_keys=explicit_keys)
         self.config = config
 
         # Initialize Ollama client

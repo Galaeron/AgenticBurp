@@ -36,17 +36,33 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return base
 
 
-def load_config() -> dict:
+def load_config() -> tuple[dict, set[str]]:
     """Load config.yaml, then merge an optional git-ignored config.local.yaml
     over it (local wins). This keeps active-mode toggles on for a live local
     server without ever committing them -- a `git add config.yaml` can no longer
-    leak them (SESSION_4_PLAN.md T0.1)."""
+    leak them (SESSION_4_PLAN.md T0.1).
+
+    Returns `(cfg, explicit_keys)`. P0-5: `explicit_keys` is the set of
+    dotted paths the operator explicitly set via config.local.yaml -- the
+    provenance seam resolve_operating_profile's `explicit_keys` param
+    consumes, threaded through Orchestrator.__init__. This is the one place
+    in the loader that still has the pre-merge overlay dict, so it's the
+    cleanest place to capture "the operator touched this" before that
+    information is lost in the deep-merge. Deliberately returned SEPARATELY
+    from `cfg` rather than stashed inside it: `cfg` feeds
+    config_fingerprint()/redacted_effective_config(), and a set of strings
+    isn't stable/JSON-clean through those. Empty when there is no
+    config.local.yaml (or it's empty) -- callers get an accurate "nothing
+    was explicitly overridden" rather than a stale/missing value."""
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f) or {}
+    explicit_keys: set[str] = set()
     if LOCAL_CONFIG_PATH.exists():
         with open(LOCAL_CONFIG_PATH) as f:
             local = yaml.safe_load(f) or {}
         if local:
+            from harness import config_schema
+            explicit_keys = config_schema.flatten_explicit_keys(local)
             _deep_merge(cfg, local)
             log.info("load_config: merged local overrides from config.local.yaml")
     # W-20: validate the MERGED config and record its fingerprint at startup.
@@ -66,11 +82,11 @@ def load_config() -> dict:
                  config_schema.config_fingerprint(cfg))
     except Exception as e:
         log.warning("load_config: config validation skipped (%s)", e)
-    return cfg
+    return cfg, explicit_keys
 
 
-config = load_config()
-orchestrator = Orchestrator(config)
+config, _explicit_config_keys = load_config()
+orchestrator = Orchestrator(config, explicit_keys=_explicit_config_keys)
 app = FastAPI(title="Burp LLM Harness", version="0.1.0")
 
 

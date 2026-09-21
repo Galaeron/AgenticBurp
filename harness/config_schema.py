@@ -25,9 +25,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 
 from pydantic import BaseModel, ConfigDict
+
+_log = logging.getLogger("harness.config_schema")
 
 
 _SECRET_KEYS = {"auth_token", "bearer_token", "api_key", "cloud_api_key", "token", "password"}
@@ -197,19 +200,68 @@ def config_fingerprint(cfg: dict) -> str:
 # SafeDefaultGuardTests-covered flags in that committed file are untouched
 # no matter which profiles exist here.
 #
-# Composition rule (documented once, here, because it has to be true in
-# exactly one place): a profile knob is applied ONLY when the merged
-# config's CURRENT value for that dotted path still equals
-# _PROFILE_KNOB_DEFAULTS' shipped baseline for that path. If the operator
-# already moved a knob away from that baseline -- typically by setting it in
-# the git-ignored config.local.yaml overlay, which deep-merges over
-# config.yaml before the orchestrator ever sees the result -- their value is
-# treated as an explicit override and wins; the profile never clobbers it.
-# This makes "explicit user value wins" checkable without threading
-# provenance through the config loader: the shipped config.yaml IS the
-# baseline, so "differs from baseline" and "the operator touched this" are
-# the same test.
+# P0-5 composition rule (supersedes the original P1-4 rule below it -- see
+# the module-level docstring on resolve_operating_profile for the full
+# writeup). Two guarantees now hold, in this order:
+#
+#   1. SAFETY-AUTHORITATIVE profiles (currently just `passive-only`) force
+#      every knob in _PASSIVE_FORCE_OFF_KNOBS to its safe (off) value
+#      UNCONDITIONALLY -- even over an explicit operator override, and even
+#      over a value the profile preset itself doesn't otherwise mention
+#      (e.g. `engagement.*`, `coordinator.cloud_*`). This is applied LAST,
+#      after the general per-knob loop, so nothing can put an active/
+#      mutating/discovery/engagement/cloud flag back on under this profile.
+#      Chosen over "reject startup on conflict" because forcing off keeps a
+#      passive-only run usable (the whole point of the profile is "just
+#      analyze captured traffic"); a logged warning documents the override
+#      so it isn't silent.
+#
+#   2. For every other (enabling) profile, a profile's own preset value for
+#      a knob is applied only when the operator has NOT explicitly set that
+#      knob. "Explicitly set" is now sourced from `explicit_keys` when the
+#      caller provides it -- the set of dotted paths the operator actually
+#      wrote (e.g. the keys present in the git-ignored config.local.yaml
+#      overlay; see harness/server.py's load_config()). This replaces the
+#      original "current != shipped baseline" heuristic, which could not
+#      tell an explicit value that happens to EQUAL the baseline (e.g. an
+#      operator writing `validators.active_enabled: false` in
+#      config.local.yaml, same as the shipped default) from a knob the
+#      operator never touched -- so an enabling profile could silently flip
+#      an explicit safety disable back on. When `explicit_keys` is None (no
+#      provenance available to this call -- e.g. a caller that hasn't
+#      adopted the seam, or a config assembled ad hoc in a test), resolution
+#      falls back to the original "current != baseline" heuristic; this is
+#      strictly a fallback and is the documented residual limitation: an
+#      explicit-but-baseline-equal disable in that no-provenance case is
+#      indistinguishable from an untouched default and CAN be turned on by
+#      an enabling profile, same as before P0-5. It never gets less safe
+#      than that pre-P0-5 behavior.
 # ---------------------------------------------------------------------------
+
+# Every active/mutating/discovery/engagement/cloud knob a SAFETY-AUTHORITATIVE
+# profile (passive-only) must force off. Deliberately broader than any single
+# profile's preset dict above -- it also covers engagement.* and
+# coordinator.cloud_* knobs that passive-only's preset never mentioned, which
+# is exactly the gap P0-5 closes (those could previously be left ON by
+# passive-only). Kept in lockstep with P0-4's SafeDefaultGuardTests.SAFE_CHECKS
+# (everything there except server.allowed_hosts, which is a scope declaration,
+# not an active/mutating/discovery/engagement/cloud toggle).
+_PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
+    "validators.active_enabled",
+    "validators.allow_mutating_replay",
+    "autonomous_discovery.enabled",
+    "oracle.enabled",
+    "engagement.auto_escalate",
+    "engagement.driver_execute",
+    "engagement.feature_crawl",
+    "engagement.coverage_drive_legs",
+    "coordinator.cloud_primary",
+    "coordinator.cloud_reasoning",
+)
+
+# Profiles whose entire purpose is "no active target traffic" and which
+# therefore get the unconditional force-off in guarantee (1) above.
+_SAFETY_AUTHORITATIVE_PROFILES: frozenset[str] = frozenset({"passive-only"})
 
 _MISSING = object()
 
@@ -221,6 +273,24 @@ def _get_dotted(d: dict, dotted_path: str):
             return _MISSING
         node = node[part]
     return node
+
+
+def flatten_explicit_keys(overlay: dict, prefix: str = "") -> set[str]:
+    """P0-5 provenance helper: turn a config overlay (e.g. the parsed
+    contents of the git-ignored config.local.yaml, BEFORE it's merged into
+    the base config) into the set of dotted leaf paths it sets. This is the
+    `explicit_keys` provenance source resolve_operating_profile accepts --
+    every key an operator actually wrote in the overlay is, by construction,
+    an explicit override, regardless of whether its value happens to equal
+    the shipped baseline."""
+    keys: set[str] = set()
+    for k, v in (overlay or {}).items():
+        path = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict) and v:
+            keys |= flatten_explicit_keys(v, path)
+        else:
+            keys.add(path)
+    return keys
 
 
 def _set_dotted(d: dict, dotted_path: str, value) -> None:
@@ -331,12 +401,18 @@ OPERATING_PROFILES: dict[str, dict[str, object]] = {
 }
 
 
-def resolve_operating_profile(config: dict, profile_name: str | None) -> dict:
-    """Apply a named operating profile (P1-4) to `config`, returning the
-    EFFECTIVE config used to build the orchestrator and its sub-components
-    (AgentManager, ValidatorRegistry, Coordinator, AnalysisPipeline all read
-    straight from this same dict, not just orchestrator instance attributes,
-    so the profile must be applied to the dict itself, before construction).
+def resolve_operating_profile(
+    config: dict,
+    profile_name: str | None,
+    *,
+    explicit_keys: set[str] | None = None,
+) -> dict:
+    """Apply a named operating profile (P1-4, safety contract tightened by
+    P0-5) to `config`, returning the EFFECTIVE config used to build the
+    orchestrator and its sub-components (AgentManager, ValidatorRegistry,
+    Coordinator, AnalysisPipeline all read straight from this same dict, not
+    just orchestrator instance attributes, so the profile must be applied to
+    the dict itself, before construction).
 
     `profile_name` unset / None / "" / "none" (case-insensitive) is a no-op:
     returns `config` UNCHANGED (the same object, not even copied), so
@@ -344,11 +420,21 @@ def resolve_operating_profile(config: dict, profile_name: str | None) -> dict:
     selected -- this is the required default (config.yaml ships
     `operating_profile: "none"`).
 
+    `explicit_keys` (P0-5): the set of dotted config paths the OPERATOR
+    explicitly set, if the caller has a clean provenance source for that
+    (harness/server.py's load_config() sources this from the keys present in
+    the git-ignored config.local.yaml overlay). When given, it is
+    authoritative for "did the operator touch this knob" -- see the module
+    comment above resolve_operating_profile's definition for the full
+    composition rule and the documented fallback when it's None.
+
     Otherwise returns a DEEP COPY of `config` with the named preset's knob
-    values applied, except where the operator already set that knob
-    explicitly away from its shipped baseline -- see _PROFILE_KNOB_DEFAULTS
-    and the module comment above for the composition rule: an explicit
-    operator value always wins over the profile.
+    values applied, except where the operator already explicitly set that
+    knob (see the composition rule above). A SAFETY-AUTHORITATIVE profile
+    (passive-only) additionally forces every _PASSIVE_FORCE_OFF_KNOBS entry
+    to its safe value UNCONDITIONALLY, regardless of any explicit override --
+    it must be impossible for passive-only to leave an active/mutating/
+    discovery/engagement/cloud flag on.
 
     Raises ValueError for an unrecognized profile name (fails loudly at
     startup rather than silently ignoring a typo'd profile).
@@ -365,12 +451,48 @@ def resolve_operating_profile(config: dict, profile_name: str | None) -> dict:
     preset = OPERATING_PROFILES[name]
     result = copy.deepcopy(config)
     for dotted_path, preset_value in preset.items():
-        current = _get_dotted(config, dotted_path)
-        baseline = _PROFILE_KNOB_DEFAULTS.get(dotted_path, _MISSING)
-        if current is not _MISSING and baseline is not _MISSING and current != baseline:
-            # Operator already overrode this knob away from the shipped
-            # baseline (e.g. via config.local.yaml) -- their explicit value
-            # wins; the profile leaves it alone.
+        if explicit_keys is not None:
+            # Provenance available: the operator touched this knob iff its
+            # dotted path is in the known explicit-set. current-vs-baseline
+            # is irrelevant here -- an explicit value equal to the baseline
+            # (e.g. an explicit `false` matching the shipped default) still
+            # counts as explicit and still wins.
+            is_explicit = dotted_path in explicit_keys
+        else:
+            # Fallback (documented residual limitation -- see module
+            # comment): no provenance, so fall back to the original P1-4
+            # heuristic. Cannot distinguish an explicit value equal to the
+            # baseline from an untouched default.
+            current = _get_dotted(config, dotted_path)
+            baseline = _PROFILE_KNOB_DEFAULTS.get(dotted_path, _MISSING)
+            is_explicit = (
+                current is not _MISSING and baseline is not _MISSING and current != baseline
+            )
+        if is_explicit:
+            # Operator's explicit value wins; the profile leaves it alone.
             continue
         _set_dotted(result, dotted_path, preset_value)
+
+    if name in _SAFETY_AUTHORITATIVE_PROFILES:
+        # P0-5 core safety guarantee: passive-only (and any future
+        # safety-authoritative profile) must NEVER leave an active/mutating/
+        # discovery/engagement/cloud flag on, even if the incoming config had
+        # it explicitly True and even for knobs the preset dict above never
+        # mentions. Applied last, after the general per-knob/explicit-override
+        # loop, so nothing above can re-enable what this forces off.
+        for dotted_path in _PASSIVE_FORCE_OFF_KNOBS:
+            current = _get_dotted(result, dotted_path)
+            if current not in (_MISSING, False, None):
+                _log.warning(
+                    "operating_profile=%r is safety-authoritative: forcing "
+                    "%s from %r to False (was explicitly or previously "
+                    "enabled in the incoming config).",
+                    name, dotted_path, current,
+                )
+            # Unconditional: force to False even if the key was absent from
+            # the incoming config, so passive-only can never leave this knob
+            # in a state where some other reader's own default would treat
+            # missing-as-True.
+            _set_dotted(result, dotted_path, False)
+
     return result
