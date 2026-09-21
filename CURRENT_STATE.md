@@ -60,9 +60,11 @@ Shipped code items this session:
 - **P1-10 DEFERRED (owner/dedicated iteration):** address-bound connect-time resolver
   pin is not one clean offline unit — needs a custom httpx/httpcore resolver seam
   through BOTH client factories, per-redirect-hop pinning, SNI/cert preservation.
-- Queue next: no clean P0–P3 offline unit remains unclaimed (P3-1 is multi-feature
-  with a safe-default tension; P3-2/P3-3 need external tooling/deps). Likely LOOP_DONE.
-  Blocked/owner: P0-3, P0-6, P1-3, P1-5, P1-10, P3-1, P3-2, P3-3.
+- **LOOP_DONE (offline items exhausted, confirmed 2026-09-21):** every remaining
+  unchecked item is blocked-by-dependency, needs a live model / Docker / JDK-Burp /
+  external tooling, needs an owner-reported measurement, or is multi-part. Owner-only:
+  P0-3, P0-6, P1-3, P1-5, P1-10, P2-1/2/3, P3-1, P3-2, P3-3. P3-1 must resolve its
+  redaction default (P0-6 depends on it); P1-10 needs splitting before it can automate.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
