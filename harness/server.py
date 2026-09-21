@@ -8,6 +8,7 @@ from harness import store
 from harness import active_verification
 from harness import surface_prioritizer
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -148,6 +149,134 @@ def _require_auth(authorization: str | None) -> None:
     expected = f"Bearer {_BEARER_TOKEN}"
     if not authorization or not secrets.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+
+# RB-1: local-API origin/CSRF defense. -------------------------------------
+#
+# Problem this closes: any web page the tester's browser visits (a malicious
+# site, or a compromised ad on an otherwise legitimate one) can silently
+# fetch() this loopback server. TrustedHostMiddleware above only checks the
+# Host header a same-origin OR cross-origin request equally carries, and
+# "simple" cross-origin requests (GET, and a POST with a CORS-simple
+# Content-Type such as text/plain) never trigger a preflight the browser
+# would otherwise block -- they just go out. Before this, on the default
+# deploy (loopback, no server.auth_token/HARNESS_BEARER_TOKEN configured),
+# _require_auth's loopback bypass above meant EVERY route, including every
+# state-changing one, was reachable by such a request with no proof the
+# caller is the tester's own Burp extension or curl session.
+#
+# Two independent controls, per the RB-1 backlog item:
+#   1. PRIMARY -- an ephemeral bearer token, generated at startup whenever no
+#      operator token is configured, required on every state-changing
+#      (POST/PUT/PATCH/DELETE) route EVEN FROM LOOPBACK. This is enforced in
+#      the middleware below, independently of _require_auth (left completely
+#      unchanged above, including its loopback bypass for GET/other safe
+#      routes -- see the docstring on _csrf_defense_middleware for why GET is
+#      intentionally NOT gated behind this token).
+#   2. DEFENSE-IN-DEPTH -- an Origin/Sec-Fetch-Site check that rejects any
+#      request a browser has labeled cross-site, on every route (GET
+#      included), since GET is exactly the "simple request" class the
+#      primary control above does not cover.
+#
+# RB-1b (separate, OWNER/JDK item, out of this change's scope) is the Burp
+# extension reading this token from the lockfile and sending it. Until that
+# lands, the packaged extension will not authenticate its mutating calls --
+# expected and accepted, per the backlog item.
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+# Where the ephemeral token is published for a local operator/extension to
+# read. Never committed (see .gitignore) -- regenerated fresh every process
+# start, so a stale lockfile from a prior run is always overwritten.
+TOKEN_LOCKFILE_PATH = Path(__file__).parent / ".harness_token.lock"
+
+
+def _write_token_lockfile(token: str) -> None:
+    """Best-effort: publish the ephemeral token to TOKEN_LOCKFILE_PATH with
+    owner-only (0600) permissions where the OS supports it. A failure to
+    write or chmod the file must never crash startup -- the token still
+    works for any caller that already has it (e.g. this same process's
+    tests); an operator who needs the file can always regenerate it by
+    restarting. NOTE (Windows caveat): os.chmod on Windows does not map onto
+    POSIX owner/group/other permission bits -- it can only toggle the
+    read-only attribute, not actually restrict the file to the current
+    user's account. On Windows this call is therefore a no-op with respect
+    to the "0600, other local accounts cannot read it" guarantee POSIX gets;
+    the real security boundary on any platform is still the token itself
+    (an attacker who can already read arbitrary files on the host has far
+    worse problems than this lockfile).
+    """
+    try:
+        TOKEN_LOCKFILE_PATH.write_text(token, encoding="utf-8")
+    except OSError as e:
+        log.warning("RB-1: could not write ephemeral token lockfile %s: %s", TOKEN_LOCKFILE_PATH, e)
+        return
+    try:
+        os.chmod(TOKEN_LOCKFILE_PATH, 0o600)
+    except OSError as e:
+        # Expected/benign on Windows (see docstring above) and on any
+        # filesystem that doesn't support POSIX permission bits.
+        log.debug("RB-1: chmod 0600 on token lockfile not applied (%s): %s", TOKEN_LOCKFILE_PATH, e)
+
+
+_EPHEMERAL_TOKEN: str | None = None
+if not _BEARER_TOKEN:
+    _EPHEMERAL_TOKEN = secrets.token_urlsafe(32)
+    _write_token_lockfile(_EPHEMERAL_TOKEN)
+    log.info("RB-1: no operator server.auth_token/HARNESS_BEARER_TOKEN configured -- generated an "
+             "ephemeral bearer token for state-changing routes and wrote it to %s", TOKEN_LOCKFILE_PATH)
+
+
+def _mutation_token() -> str | None:
+    """The token a state-changing request must present. The operator-
+    configured token if one was set (mirrors _require_auth's own precedence
+    -- an explicitly configured token always wins), else the ephemeral one
+    generated above. Never None in a running process: exactly one of
+    _BEARER_TOKEN / _EPHEMERAL_TOKEN is always set by the startup block
+    above."""
+    return _BEARER_TOKEN or _EPHEMERAL_TOKEN
+
+
+@app.middleware("http")
+async def _csrf_defense_middleware(request, call_next):
+    """Runs on every request, after TrustedHostMiddleware's Host check and
+    before any route handler (including before that route's own
+    _require_auth call). See the module comment above _MUTATING_METHODS for
+    the two controls this implements.
+
+    GET/HEAD/other safe methods are deliberately NOT required to present
+    _mutation_token() here -- only _require_auth's existing (unchanged)
+    logic gates them, which still allows a loopback caller through when no
+    operator token is configured. That preserves the Burp extension's and
+    curl's existing read-only calls exactly as before RB-1; the Origin/
+    Sec-Fetch-Site check below is what defends those routes instead, since
+    they are the "simple request" class a browser lets through un-preflighted.
+    """
+    # --- Control 2 (checked first so a genuinely cross-site request is
+    # rejected before we even look for a token): reject anything a browser
+    # itself has labeled cross-site, or whose Origin's host disagrees with
+    # the Host this request actually arrived on. CRUCIAL: curl and the Burp
+    # extension send NO Origin header and NO Sec-Fetch-Site header at all --
+    # neither condition below can ever fire for them, so a missing Origin is
+    # always allowed through to control 1.
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        return JSONResponse(status_code=403, content={"detail": "cross-site request rejected"})
+    origin = request.headers.get("origin")
+    if origin:
+        origin_host = urlparse(origin).hostname
+        request_host = request.url.hostname
+        if not origin_host or not request_host or origin_host.lower() != request_host.lower():
+            return JSONResponse(status_code=403, content={"detail": "cross-origin request rejected"})
+
+    # --- Control 1 (primary): state-changing routes need the bearer token,
+    # even from loopback, even with no Origin header at all.
+    if request.method in _MUTATING_METHODS:
+        expected = _mutation_token()
+        if expected:
+            authorization = request.headers.get("authorization")
+            if not authorization or not secrets.compare_digest(authorization, f"Bearer {expected}"):
+                return JSONResponse(status_code=401, content={"detail": "missing or invalid bearer token"})
+
+    return await call_next(request)
 
 
 @app.get("/health")

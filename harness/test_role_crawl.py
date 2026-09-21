@@ -256,7 +256,10 @@ class RoleCrawlEndpointTests(unittest.TestCase):
         self.server_module = server_module
         server_module.orchestrator.allowed_hosts = ["shop.test"]
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app, base_url="http://localhost")
+        # RB-1: state-changing routes require the bearer token even from
+        # loopback; attach the (ephemeral, in this test env) token.
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
 
     def test_endpoint_runs(self):
         with patch("harness.crawler.crawl", _fake_crawl(["/api/report"])), \
