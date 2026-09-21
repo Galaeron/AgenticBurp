@@ -674,7 +674,18 @@ improved or that a live rerun happened. Live measurements remain separately open
   execution, failed execution and missing reporting; do not infer a regression
   solely from an older run's reported one-chain count.
 
-### [ ] INV-4 — Attribute duplicate findings and runtime before optimizing
+### [x] INV-4 — Attribute duplicate findings and runtime before optimizing
+- **Result (VERIFIED-by-inspection @21f9b37; artifacts VERIFIED-in-run @eb70210):**
+  `a6e125f` — `docs/investigations/INV-4-noise-runtime.md`. `host_dep_dedup.py` is
+  severity-capping, not dedup; real keys mapped per layer (`finding_fingerprint`
+  tuple under UNIQUE (fingerprint, case_id) INSERT OR IGNORE — coarseness intentional
+  T06/R08; surfaced `issue_key`; leads predicate; case_id/proof_id). The 1914/641/107
+  counts trace to a driver-side un-deduped `_all_findings()` union (1914==union len;
+  store.findings=1108), NOT a store.py defect — distinct object/principal identity
+  preserved. Runtime: no timing instrumentation anywhere (telemetry counters only,
+  effort axis tokens-only, PASS2 elapsed UNKNOWN residual) → "8.3h = model time"
+  unsupported; missing instrumentation named. 3 instrumentation/counting-only tickets,
+  no concurrency/threshold change, no speedup promised. No code/worktree/DB write.
 - **Domain:** Precision / Performance · **Effort:** M · **Depends on:** INV-1, INV-3
 - **Mode:** Offline investigation; no fresh model run or raw-volume efficacy claim.
 - **Deliverable:** `docs/investigations/INV-4-noise-runtime.md`, with existing

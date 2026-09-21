@@ -42,21 +42,17 @@ as W-16.
   offline read-only investigations, one per iteration. (The Astra T02–T08
   workstream once tracked here as "paused" is in fact merged — see the section
   above; the codex/astra worktrees hold only superseded drafts.)
-- **INV-1 done (`e0ba0aa`):** baseline reconciled; `run_blind_eval.py` sets
-  `quarantine_unverified_leads` but never calls the report generator → quarantine
-  knob is a no-op on that driver (blocking sub-ticket filed).
-- **INV-2 done (`40104a9`):** two confirmation paths diverge —
-  `orchestrator_confirm._validate_findings` persists a ProofRecord; the PASS2 graph
-  loop `orchestrator_chain._apply` stamps `confirmed_by_leg` only and persists no
-  proof (honesty backstop's OR-logic misses it). Historical 9/13→6/13 gap =
-  {GT04,GT05,GT06} idor/cross_identity (audited read-only). 3 sequenced tickets filed.
-- **INV-3 done (`cc8e817`):** graph-path `investigate_engagement` computes returned
-  `chains` from a link-time snapshot and never re-links after the later second-order
-  / coverage phases append confirmations → empty `chains` is a stale-snapshot
-  reporting-order artifact (the per-exchange path did persist 5 chain rows). One
-  additive fix ticket (final relink before return).
-- Backlog also gained review follow-ups P0-5/P0-6/P0-7 (safety/trust gaps in the
-  loop's own P1-4/P0-1/P0-2), to address after INV-1..4. Next: INV-4 (noise/runtime).
+- **INV-1..4 dispatch COMPLETE** (`e0ba0aa`, `40104a9`, `cc8e817`, `a6e125f`;
+  full Result lines in the backlog). Each is an evidence-tagged diagnosis with filed
+  tickets (production fixes are separate). Key findings: INV-1 quarantine knob is a
+  no-op on `run_blind_eval.py`; INV-2 the PASS2 graph confirm path
+  (`orchestrator_chain._apply`) persists no ProofRecord (the 9/13→6/13 gap =
+  {GT04,GT05,GT06}); INV-3 graph-path `chains` is computed on a pre-confirmation
+  snapshot (stale-snapshot reporting artifact); INV-4 the 1914/641/107 counts are a
+  driver-side un-deduped union, and no timing instrumentation exists.
+- Ordinary queue resumes at review follow-ups **P0-5/P0-6/P0-7** (safety/trust gaps
+  in the loop's own P1-4/P0-1/P0-2) — code-change items, higher stakes than the
+  read-only investigations.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
