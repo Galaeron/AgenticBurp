@@ -247,7 +247,7 @@ class BaseAgent(ABC):
 PRIOR FINDINGS ON THIS HOST (from earlier exchanges this session -- context
 only, do not re-report these; use them to judge whether THIS exchange is
 more or less significant in light of what's already known):
-{prior_context}
+{_neutralize_fence_breakout(prior_context)}
 """
 
         retrieved = knowledge.retrieve(self.name, exchange)
@@ -257,7 +257,7 @@ more or less significant in light of what's already known):
 METHODOLOGY NOTES (retrieved for this vulnerability class -- general
 technique guidance, not specific to this exchange; use it to shape HOW
 you test, not as evidence that anything here is actually present):
-{retrieved}
+{_neutralize_fence_breakout(retrieved)}
 """
 
         # W-6: fence the untrusted region with a FRESH RANDOM nonce per call.
