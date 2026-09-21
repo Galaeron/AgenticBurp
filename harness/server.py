@@ -956,6 +956,46 @@ import harness.run_manifest as _run_manifest
 
 _INVESTIGATE_JOBS: dict[str, dict] = {}
 
+# P1-8: bounded admission + terminal-job retention. _INVESTIGATE_JOBS
+# accumulated without bound before this (every job dict, including its Task
+# and RunContext, lived forever), and engagement_investigate started an
+# asyncio task per request with no cap on concurrent RUNNING jobs. These
+# constants add both bounds. They are plain module constants, not
+# harness/config.yaml keys -- P1-8 must not add a SafeDefaultGuard-checked
+# config key or touch a committed default.
+_MAX_RUNNING_JOBS = 4            # admission cap on concurrent running/cancelling jobs
+_JOB_RETENTION_SECONDS = 900.0   # how long a terminal job's result stays readable/pollable
+_MAX_RETAINED_TERMINAL_JOBS = 50 # cap on retained terminal jobs; oldest-finished evicted first
+_RUNNING_STATUSES = {"running", "cancelling"}
+_TERMINAL_STATUSES = {"done", "error", "cancelled"}
+
+
+def _evict_expired_jobs(now: float | None = None) -> None:
+    """Release terminal (done/error/cancelled) jobs so their Task/RunContext
+    references (and eventually the job dict itself) can be GC'd. A terminal
+    job is evicted once it is older than _JOB_RETENTION_SECONDS past
+    finished_at, and/or once the number of retained terminal jobs exceeds
+    _MAX_RETAINED_TERMINAL_JOBS (oldest-finished evicted first). A RUNNING or
+    CANCELLING job is never touched here -- eviction is purely a terminal-job
+    memory bound, never a way to reclaim capacity from active work. After
+    eviction, GET status/cancel for that job_id returns 404 ("unknown job"),
+    the same response as a job_id that never existed -- this keeps the
+    lifecycle to one documented not-found path instead of adding a second
+    "410 Gone" state to distinguish, and leaks no information about
+    evicted job history."""
+    now = _time.time() if now is None else now
+    for job_id in [jid for jid, j in _INVESTIGATE_JOBS.items() if j["status"] in _TERMINAL_STATUSES]:
+        job = _INVESTIGATE_JOBS.get(job_id)
+        finished_at = job.get("finished_at") if job else None
+        if finished_at is not None and (now - finished_at) > _JOB_RETENTION_SECONDS:
+            del _INVESTIGATE_JOBS[job_id]
+    terminal_ids = [jid for jid, j in _INVESTIGATE_JOBS.items() if j["status"] in _TERMINAL_STATUSES]
+    excess = len(terminal_ids) - _MAX_RETAINED_TERMINAL_JOBS
+    if excess > 0:
+        terminal_ids.sort(key=lambda jid: _INVESTIGATE_JOBS[jid].get("finished_at") or 0)
+        for job_id in terminal_ids[:excess]:
+            del _INVESTIGATE_JOBS[job_id]
+
 
 def _job_public(job: dict) -> dict:
     """The JSON-safe view of a job (never leaks the asyncio Task)."""
@@ -1018,6 +1058,22 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             detail=f"host {target_host!r} is not in pre-authorized scope "
                    f"(server.allowed_hosts); investigate cannot grant new scope")
 
+    # P1-8 admission bound -- an ADDITIONAL gate that runs strictly AFTER
+    # P1-7's route/base_url-consistency and pre-authorized-scope checks
+    # above, never before or in place of them. First release any terminal
+    # jobs past their retention window (frees capacity room), then reject if
+    # concurrent running/cancelling jobs are already at the cap. This is a
+    # simple hard rejection (no queue): a 503 with Retry-After, since the
+    # server has finite job capacity and the caller can just retry later.
+    _evict_expired_jobs()
+    running_count = sum(1 for j in _INVESTIGATE_JOBS.values() if j["status"] in _RUNNING_STATUSES)
+    if running_count >= _MAX_RUNNING_JOBS:
+        raise HTTPException(
+            status_code=503,
+            detail=f"investigation job capacity reached ({running_count}/{_MAX_RUNNING_JOBS} "
+                   f"running); retry later",
+            headers={"Retry-After": "5"})
+
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
                                     headers=r.get("headers") or {}, name=r.get("name"),
                                     tenant=r.get("tenant"),
@@ -1074,6 +1130,16 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             log.warning("investigate job %s failed: %s", job_id, e)
         finally:
             job["finished_at"] = _time.time()
+            # P1-8: the job just reached a terminal state -- release the
+            # Task and RunContext references (the run_context's "async with"
+            # above already closed its transport) so they're eligible for
+            # GC. The job dict itself, including its result/error/
+            # manifest_path, stays in _INVESTIGATE_JOBS and readable for
+            # _JOB_RETENTION_SECONDS; _evict_expired_jobs() drops the whole
+            # dict once that window (or the retained-terminal-job cap) is
+            # exceeded.
+            job["task"] = None
+            job["run_context"] = None
 
     job["task"] = asyncio.create_task(_run())
     _INVESTIGATE_JOBS[job_id] = job
@@ -1084,6 +1150,7 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
 async def engagement_investigate_list(host: str, authorization: str | None = Header(default=None)):
     """List investigation jobs for a host (newest-first status only)."""
     _require_auth(authorization)
+    _evict_expired_jobs()
     jobs = [j for j in _INVESTIGATE_JOBS.values() if j["host"] == host]
     jobs.sort(key=lambda j: j.get("started_at") or 0, reverse=True)
     return {"host": host, "jobs": [_job_public(j) for j in jobs]}
@@ -1094,8 +1161,13 @@ async def engagement_investigate_status(host: str, job_id: str,
                                         authorization: str | None = Header(default=None)):
     """Poll a job; the full investigate_engagement result is included once done."""
     _require_auth(authorization)
+    _evict_expired_jobs()
     job = _INVESTIGATE_JOBS.get(job_id)
     if not job or job["host"] != host:
+        # P1-8: an evicted/expired job_id lands here too (its dict was
+        # dropped by _evict_expired_jobs), same as a job_id that never
+        # existed -- see _evict_expired_jobs's docstring for why this is a
+        # single documented 404 rather than a distinct "410 Gone".
         raise HTTPException(status_code=404, detail="unknown job")
     out = _job_public(job)
     if job["status"] == "done":
@@ -1108,6 +1180,7 @@ async def engagement_investigate_cancel(host: str, job_id: str,
                                         authorization: str | None = Header(default=None)):
     """Request cancellation of a running job (asyncio task cancellation)."""
     _require_auth(authorization)
+    _evict_expired_jobs()
     job = _INVESTIGATE_JOBS.get(job_id)
     if not job or job["host"] != host:
         raise HTTPException(status_code=404, detail="unknown job")

@@ -7,8 +7,10 @@ exercised server.py's endpoints via TestClient at all -- this is the
 first one, scoped to the new suppression endpoints since those are what
 this session added; it isn't a full endpoint audit of server.py.
 """
+import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -705,6 +707,294 @@ class InvestigateJobEndpointTests(unittest.TestCase):
             listing = self.client.get("/engagement/shop.test/investigate")
         self.assertEqual(listing.status_code, 200)
         self.assertGreaterEqual(len(listing.json()["jobs"]), 1)
+
+
+class InvestigateJobAdmissionAndRetentionTests(unittest.TestCase):
+    """P1-8: /investigate job resources are bounded. Before this,
+    _INVESTIGATE_JOBS grew without bound (every job's Task and RunContext
+    lived forever) and engagement_investigate started an asyncio task per
+    request with no cap on concurrent RUNNING jobs. These tests cover the
+    new admission cap (_MAX_RUNNING_JOBS), terminal-job retention/eviction
+    (_JOB_RETENTION_SECONDS / _MAX_RETAINED_TERMINAL_JOBS), and that a
+    RUNNING job is never evicted as a memory shortcut. Setup mirrors
+    InvestigateJobEndpointTests (same isolated-DB / allowed_hosts pattern)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
+        import importlib
+        import harness.server as server_module
+        importlib.reload(server_module)
+        self.server = server_module
+        self.server.config["runs"] = {"output_dir": self._tmpdir.name,
+                                       "cache_namespace": "test-isolated"}
+        self.server.orchestrator.allowed_hosts = ["shop.test"]
+        from fastapi.testclient import TestClient
+        # IMPORTANT: entered as a context manager (not a bare `TestClient(...)`
+        # instance) so a single portal/event loop is pinned for this test's
+        # whole lifetime. Starlette's TestClient otherwise opens and tears
+        # down a FRESH event loop for every single .get()/.post() call
+        # (see starlette/testclient.py's `_portal_factory`); any background
+        # asyncio task created during one call (our investigation job) is
+        # force-cancelled the instant that call's own portal closes, before
+        # a later call's /cancel or poll could ever observe it genuinely
+        # "running". Pinning the portal here is what lets a job started by
+        # one request actually still be running (or be cancelled by an
+        # explicit later request, not by portal teardown) when a later
+        # request checks on it -- required for every test in this class
+        # that starts a deliberately slow/blocking job.
+        self._client_cm = TestClient(server_module.app, base_url="http://localhost")
+        self.client = self._client_cm.__enter__()
+        # job_id -> threading.Event, keyed by the job's own id (== the
+        # RunContext.run_id the blocked stub is called with -- see
+        # _blocked_stub below) rather than appended in call order. An
+        # earlier append-ordered version raced: a job's background task
+        # doesn't necessarily start running (and so doesn't necessarily
+        # register its Event) before the *next* POST returns, so "release
+        # everything registered so far" could miss a job that hadn't
+        # registered yet, leaving it blocked forever. Keying by job_id
+        # (known synchronously from each POST's own response) removes the
+        # ordering dependency entirely: the test can create and pre-register
+        # a job's Event or look it up by id at any point, independent of
+        # when the stub itself actually starts running.
+        self._release_events: dict[str, threading.Event] = {}
+
+    def tearDown(self):
+        for ev in self._release_events.values():
+            ev.set()
+        # Belt-and-braces: cancel (through the real, already-tested cancel
+        # endpoint, so this exercises the same code path as production) any
+        # job this test left running/cancelling, then wait for it to reach a
+        # terminal state, so no live investigation Task survives this test.
+        # Finally, drop every job reference outright so nothing from this
+        # test's event loop lingers for the next test to trip over.
+        try:
+            jobs = getattr(self.server, "_INVESTIGATE_JOBS", {})
+            leftover = [(jid, j["host"]) for jid, j in list(jobs.items())
+                        if j.get("status") in ("running", "cancelling")]
+            for job_id, host in leftover:
+                self.client.post(f"/engagement/{host}/investigate/{job_id}/cancel")
+            for job_id, host in leftover:
+                self._poll(f"/engagement/{host}/investigate/{job_id}",
+                          {"done", "error", "cancelled"}, tries=200, delay=0.01)
+        finally:
+            self.server._INVESTIGATE_JOBS.clear()
+            # Closing the pinned portal here (after jobs are terminal) tears
+            # down this test's event loop for good -- nothing is left
+            # pending on it.
+            self._client_cm.__exit__(None, None, None)
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def _poll(self, url, want, tries=200, delay=0.02):
+        # tries*delay = 4s -- generous headroom over the stub's own 5ms
+        # cooperative-scheduling granularity (below), since several tests
+        # run multiple concurrently-looping blocked jobs on one event loop
+        # at once plus real HTTP round trips through the portal for every
+        # poll, and a tight budget here was observed to flake.
+        import time
+        last = None
+        for _ in range(tries):
+            last = self.client.get(url).json()
+            if last.get("status") in want:
+                return last
+            time.sleep(delay)
+        return last
+
+    def _start(self):
+        return self.client.post("/engagement/shop.test/investigate",
+                                json={"base_url": "http://shop.test:5002"})
+
+    def _start_blocked(self):
+        """Start an investigation whose orchestrator call stays "running"
+        until this job's own release Event (self._release_events[job_id])
+        is set. Returns (response, job_id). Blocking is a cooperative
+        `await asyncio.sleep(...)` poll loop keyed off the job's own
+        run_context.run_id (== job_id, per engagement_investigate's
+        RunContext.create(run_id=job_id, ...)) -- NOT asyncio.to_thread/a
+        real OS thread -- so task.cancel() interrupts it immediately (no
+        executor thread to join/leak), a real 36-agent Orchestrator is
+        never invoked, and each job's release is independently addressable
+        by its own id with no dependency on call/scheduling order."""
+        r = self._start()
+        if r.status_code == 200:
+            job_id = r.json()["job_id"]
+            self._release_events[job_id] = threading.Event()
+        else:
+            job_id = None
+        return r, job_id
+
+    def _blocked_stub(self):
+        async def _blocked(*a, **k):
+            run_id = k.get("run_context").run_id
+            # The Event is registered synchronously by _start_blocked() right
+            # after the POST response comes back, so it's already present by
+            # the time this task gets its first turn to run; this loop still
+            # guards the (harmless) case where it hasn't been set yet.
+            while run_id not in self._release_events:
+                await asyncio.sleep(0.005)
+            release = self._release_events[run_id]
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+            return {"summary": {}}
+        return _blocked
+
+    def test_admission_rejects_when_running_jobs_at_capacity(self):
+        from unittest.mock import patch
+        cap = self.server._MAX_RUNNING_JOBS
+        started = []
+
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=self._blocked_stub()):
+            for _ in range(cap):
+                r, job_id = self._start_blocked()
+                self.assertEqual(r.status_code, 200, r.text)
+                started.append(job_id)
+
+            before = dict(self.server._INVESTIGATE_JOBS)
+            reject = self._start()
+            self.assertEqual(reject.status_code, 503, reject.text)
+            self.assertIn("Retry-After", reject.headers)
+            # no excess job/task was started by the rejected request
+            self.assertEqual(set(self.server._INVESTIGATE_JOBS.keys()), set(before.keys()))
+            running = [j for j in self.server._INVESTIGATE_JOBS.values() if j["status"] == "running"]
+            self.assertEqual(len(running), cap)
+
+            for ev in self._release_events.values():
+                ev.set()
+            for jid in started:
+                done = self._poll(f"/engagement/shop.test/investigate/{jid}", {"done", "error"})
+                self.assertEqual(done["status"], "done", done)
+
+    def test_capacity_release_on_completion_and_on_cancel(self):
+        from unittest.mock import patch
+        cap = self.server._MAX_RUNNING_JOBS
+        started = []
+
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=self._blocked_stub()):
+            for _ in range(cap):
+                r, job_id = self._start_blocked()
+                self.assertEqual(r.status_code, 200, r.text)
+                started.append(job_id)
+            self.assertEqual(self._start().status_code, 503)
+
+            # release capacity via normal completion
+            self._release_events[started[0]].set()
+            done = self._poll(f"/engagement/shop.test/investigate/{started[0]}", {"done", "error"})
+            self.assertEqual(done["status"], "done", done)
+            ok, new_job_id = self._start_blocked()
+            self.assertEqual(ok.status_code, 200, ok.text)
+
+            # release capacity via cancellation (task.cancel() interrupts the
+            # asyncio.sleep poll loop directly -- no need to also set the
+            # Event, this is exercising real cancellation, not a race with it)
+            cancel = self.client.post(f"/engagement/shop.test/investigate/{started[1]}/cancel")
+            self.assertEqual(cancel.status_code, 200)
+            cancelled = self._poll(f"/engagement/shop.test/investigate/{started[1]}", {"cancelled"})
+            self.assertEqual(cancelled["status"], "cancelled", cancelled)
+            ok2, ok2_job_id = self._start_blocked()
+            self.assertEqual(ok2.status_code, 200, ok2.text)
+
+            for ev in self._release_events.values():
+                ev.set()
+            for jid in started[2:] + [new_job_id, ok2_job_id]:
+                done = self._poll(f"/engagement/shop.test/investigate/{jid}",
+                                  {"done", "error", "cancelled"})
+                self.assertIn(done["status"], {"done", "error", "cancelled"}, done)
+
+    def test_expired_job_id_returns_404_and_releases_the_slot(self):
+        from unittest.mock import patch, AsyncMock
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=AsyncMock(return_value={"summary": {}})):
+            r = self._start()
+            job_id = r.json()["job_id"]
+            done = self._poll(f"/engagement/shop.test/investigate/{job_id}", {"done", "error"})
+        self.assertEqual(done["status"], "done", done)
+
+        # simulate the retention window having elapsed
+        self.server._INVESTIGATE_JOBS[job_id]["finished_at"] = (
+            self.server._time.time() - self.server._JOB_RETENTION_SECONDS - 1)
+
+        resp = self.client.get(f"/engagement/shop.test/investigate/{job_id}")
+        # P1-8: documented response for an evicted/expired id is the same
+        # 404 "unknown job" as an id that never existed (see
+        # _evict_expired_jobs's docstring).
+        self.assertEqual(resp.status_code, 404)
+        self.assertNotIn(job_id, self.server._INVESTIGATE_JOBS)
+
+        cancel_resp = self.client.post(f"/engagement/shop.test/investigate/{job_id}/cancel")
+        self.assertEqual(cancel_resp.status_code, 404)
+
+    def test_retained_terminal_jobs_are_bounded(self):
+        from unittest.mock import patch, AsyncMock
+        cap = self.server._MAX_RETAINED_TERMINAL_JOBS
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=AsyncMock(return_value={"summary": {}})):
+            for _ in range(cap + 5):
+                r = self._start()
+                self.assertEqual(r.status_code, 200, r.text)
+                job_id = r.json()["job_id"]
+                self._poll(f"/engagement/shop.test/investigate/{job_id}", {"done", "error"})
+        self.server._evict_expired_jobs()
+        terminal = [j for j in self.server._INVESTIGATE_JOBS.values()
+                   if j["status"] in self.server._TERMINAL_STATUSES]
+        self.assertLessEqual(len(terminal), cap)
+
+    def test_admitted_job_remains_readable_during_retention_window(self):
+        # POSITIVE CONTROL: an admitted, within-limit job's happy path is
+        # unchanged -- it accepts, is pollable, completes, and its result
+        # stays readable (and its Task/RunContext are released) once done.
+        from unittest.mock import patch, AsyncMock
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=AsyncMock(return_value={"summary": {"ok": True}})):
+            r = self._start()
+            self.assertEqual(r.status_code, 200, r.text)
+            job_id = r.json()["job_id"]
+            done = self._poll(f"/engagement/shop.test/investigate/{job_id}", {"done", "error"})
+        self.assertEqual(done["status"], "done", done)
+
+        resp = self.client.get(f"/engagement/shop.test/investigate/{job_id}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["result"]["summary"]["ok"], True)
+
+        job = self.server._INVESTIGATE_JOBS[job_id]
+        self.assertIsNone(job["task"])
+        self.assertIsNone(job["run_context"])
+
+    def test_running_job_never_evicted_by_capacity_pressure(self):
+        from unittest.mock import patch
+
+        with patch.object(self.server.orchestrator, "investigate_engagement",
+                          new=self._blocked_stub()):
+            r, running_job_id = self._start_blocked()
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(self.server._INVESTIGATE_JOBS[running_job_id]["status"], "running")
+
+            # flood past the retained-terminal-job cap with synthetic
+            # already-terminal jobs (direct dict manipulation of the
+            # module's own state -- no HTTP calls needed to set this up).
+            cap = self.server._MAX_RETAINED_TERMINAL_JOBS
+            for i in range(cap + 10):
+                jid = f"synthetic-{i}"
+                self.server._INVESTIGATE_JOBS[jid] = {
+                    "job_id": jid, "host": "shop.test", "base_url": "http://shop.test:5002",
+                    "status": "done", "task": None, "result": {}, "error": None,
+                    "started_at": 0.0, "finished_at": float(i), "manifest_path": "",
+                    "run_context": None}
+
+            self.server._evict_expired_jobs()
+
+            self.assertIn(running_job_id, self.server._INVESTIGATE_JOBS)
+            self.assertEqual(self.server._INVESTIGATE_JOBS[running_job_id]["status"], "running")
+            terminal = [j for j in self.server._INVESTIGATE_JOBS.values()
+                       if j["status"] in self.server._TERMINAL_STATUSES]
+            self.assertLessEqual(len(terminal), cap)
+
+            for ev in self._release_events.values():
+                ev.set()
+            self._poll(f"/engagement/shop.test/investigate/{running_job_id}", {"done", "error"})
 
 
 class HostHeaderDefenseTests(unittest.TestCase):
