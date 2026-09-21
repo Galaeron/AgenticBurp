@@ -122,12 +122,26 @@ class AppendOnlyViolation(Exception):
     """Raised on any attempt to re-append or otherwise mutate a ledger event."""
 
 
-class EvidenceLedger:
-    """An append-only stream of LedgerEvents, queryable per finding."""
+DEFAULT_MAX_EVENTS = 5000
 
-    def __init__(self) -> None:
+
+class EvidenceLedger:
+    """An append-only stream of LedgerEvents, queryable per finding.
+
+    The in-memory stream is bounded to `max_events`: once the cap is
+    exceeded, the oldest events are evicted (FIFO). This is purely a
+    memory-footprint guard on the process-local copy -- the durable record
+    lives in store.py's ledger_events table (see persist_ledger_event /
+    ledger_events_for / reconstruct_persisted below), which is never
+    truncated and is what report_generator.py / server.py actually read for
+    a finding's evidence. Evicting an old in-memory event therefore never
+    changes what reconstruct_persisted() can answer.
+    """
+
+    def __init__(self, max_events: int = DEFAULT_MAX_EVENTS) -> None:
         self._events: list[LedgerEvent] = []
         self._ids: set[str] = set()
+        self.max_events = max_events
 
     def append(self, event: LedgerEvent) -> LedgerEvent:
         if event.event_id in self._ids:
@@ -136,6 +150,9 @@ class EvidenceLedger:
                 f"append-only -- record a new FINDING_REVISION instead of editing.")
         self._ids.add(event.event_id)
         self._events.append(event)
+        while self.max_events > 0 and len(self._events) > self.max_events:
+            evicted = self._events.pop(0)
+            self._ids.discard(evicted.event_id)
         return event
 
     def record(self, event_type, finding_ref: str, summary: str, *,
@@ -214,11 +231,23 @@ import logging as _logging
 
 _log = _logging.getLogger("harness.evidence_ledger")
 
-_DEFAULT_LEDGER = EvidenceLedger()
+_DEFAULT_LEDGER = EvidenceLedger(max_events=DEFAULT_MAX_EVENTS)
 
 
 def get_default_ledger() -> EvidenceLedger:
     """The process-wide ledger every live pipeline stage emits onto."""
+    return _DEFAULT_LEDGER
+
+
+def reset_default_ledger(max_events: int = DEFAULT_MAX_EVENTS) -> EvidenceLedger:
+    """Replace the process-wide default ledger with a fresh, empty one.
+
+    A seam for callers/tests that need to clear accumulated in-memory state
+    between runs; it never touches the durable store, so anything already
+    persisted via emit() remains reconstructable through reconstruct_persisted().
+    """
+    global _DEFAULT_LEDGER
+    _DEFAULT_LEDGER = EvidenceLedger(max_events=max_events)
     return _DEFAULT_LEDGER
 
 
@@ -254,7 +283,11 @@ def ledger_from_store(finding_ref: str) -> EvidenceLedger:
     in-memory singleton (e.g. after a restart, or from a different process),
     while reconstruct()/reproduction_recipe() themselves stay pure functions
     of whatever events a ledger holds."""
-    led = EvidenceLedger()
+    # Unbounded replay: the durable read path must never evict a finding's own
+    # persisted events, even in the pathological case of a single finding with
+    # more than DEFAULT_MAX_EVENTS records. The cap is only a memory guard on
+    # the long-lived in-memory singleton, not on a fresh per-finding replay.
+    led = EvidenceLedger(max_events=0)
     try:
         from harness import store
         rows = store.ledger_events_for(finding_ref)

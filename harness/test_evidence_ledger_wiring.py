@@ -260,6 +260,31 @@ class EvidenceLedgerWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hyp.provenance.model, "test-model")
         self.assertTrue(hyp.provenance.prompt_version)
 
+    async def test_durable_reconstruction_survives_in_memory_ledger_rotation(self):
+        """Negative control / regression for P3-4: bounding the in-memory
+        default ledger must never harm the durable read path. Runs the real
+        pipeline (as in the positive test above), then floods the in-memory
+        default ledger with far more events than its cap so the finding's
+        own events get evicted from memory -- and asserts reconstruct_persisted
+        (the store.py-backed path server.py / report_generator.py actually
+        use) is still complete regardless."""
+        finding = await self._run_pipeline(confirming_body=b"leaked other-users-data field")
+        self.assertTrue(finding.confirmed)
+
+        default_ledger = evidence_ledger.get_default_ledger()
+        cap = default_ledger.max_events
+        for i in range(cap * 2):
+            default_ledger.record(evidence_ledger.EventType.OBSERVATION,
+                                  f"unrelated-rotation-filler-{i}", "filler event")
+        self.assertLessEqual(len(default_ledger), cap,
+                             "in-memory default ledger must stay bounded after rotation")
+
+        persisted_recon = evidence_ledger.reconstruct_persisted(finding.finding_id)
+        self.assertTrue(persisted_recon["complete"], persisted_recon)
+        self.assertTrue(persisted_recon["what_sent"])
+        self.assertTrue(persisted_recon["what_came_back"])
+        self.assertTrue(persisted_recon["why_concluded"])
+
     async def test_execute_without_case_ref_does_not_pollute_the_ledger(self):
         """A send with no case_ref (the vast majority of harness traffic --
         discovery, scripts, non-finding-linked reads) must not create any

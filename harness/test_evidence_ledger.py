@@ -34,6 +34,42 @@ class AppendOnlyTests(unittest.TestCase):
         self.assertEqual(len(revs), 2)
 
 
+class BoundedLedgerTests(unittest.TestCase):
+    def test_below_cap_all_events_retained(self):
+        ledger = EvidenceLedger(max_events=10)
+        for i in range(5):
+            ledger.record(EventType.OBSERVATION, f"F{i}", f"event {i}")
+        self.assertEqual(len(ledger), 5)
+
+    def test_append_past_cap_evicts_oldest_and_stays_bounded(self):
+        cap = 50
+        ledger = EvidenceLedger(max_events=cap)
+        for i in range(cap * 4):
+            ledger.record(EventType.OBSERVATION, f"F{i}", f"event {i}")
+        self.assertLessEqual(len(ledger), cap)
+        self.assertEqual(len(ledger), cap)
+        # the oldest events were evicted; the newest ones survive
+        remaining_refs = {d["finding_ref"] for d in ledger.to_dicts()}
+        self.assertNotIn("F0", remaining_refs)
+        self.assertIn(f"F{cap * 4 - 1}", remaining_refs)
+        # _ids stays consistent with _events (no leaked ids from evicted events)
+        self.assertEqual(len(ledger._ids), len(ledger._events))
+
+    def test_reset_default_ledger_empties_it_and_respects_new_cap(self):
+        default = el.get_default_ledger()
+        default.record(EventType.OBSERVATION, "F-before-reset", "should be cleared")
+        self.assertGreater(len(default), 0)
+        fresh = el.reset_default_ledger(max_events=7)
+        try:
+            self.assertEqual(len(fresh), 0)
+            self.assertIs(el.get_default_ledger(), fresh)
+            for i in range(20):
+                fresh.record(EventType.OBSERVATION, f"G{i}", f"event {i}")
+            self.assertEqual(len(el.get_default_ledger()), 7)
+        finally:
+            el.reset_default_ledger()  # restore module default cap for other tests
+
+
 class ReconstructionTests(unittest.TestCase):
     def _full_chain(self):
         ledger = EvidenceLedger()
