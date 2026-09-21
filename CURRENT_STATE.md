@@ -4,9 +4,8 @@
 
 Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
 refactor and the precision & blind-control sprint (Items 1–3) are committed
-(base `02de8bf`, HEAD of that batch `bc5f599`). On top, improvement-loop items
-**P0-1, P0-2, P0-4, P1-1, P1-2, P1-4** landed. Re-verified green (full suite 2365
-OK / 2 skip). Full per-item detail with Result lines is in IMPROVEMENT_BACKLOG.md.
+(base `02de8bf`, HEAD of that batch `bc5f599`). On top, the improvement-loop items
+below landed; re-verified green (full suite 2414 OK / 2 skip).
 
 ## Astra T02–T08 workstream — merged, not open (verified 2026-09-21)
 
@@ -26,9 +25,9 @@ as W-16.
 Full per-item Result lines (evidence tags, tests, commits) live in the backlog.
 Shipped code items this session:
 - **P0-1** `25a737a` EvidenceLedger wiring · **P0-2** `533928c` run-derived leg trust
-  tiers · **P0-4** `0e993da` safe-default guard (`allowed_hosts→[]`) · **P1-1**
-  `33392c9` injection fence-breakout neutralization · **P1-2** `e54cfb6` scope-escape
-  coverage · **P1-4** `1e084e1` operating profiles.
+  tiers · **P0-4** `0e993da` safe-default guard (`allowed_hosts→[]`) · **P1-1** `33392c9`
+  injection fence neutralization · **P1-2** `e54cfb6` scope-escape · **P1-4** `1e084e1`
+  operating profiles.
 - **P0-5** `c7e0ce4` — `passive-only` now safety-authoritative (force-off all 10
   active knobs unconditionally) + `explicit_keys` provenance seam; fixes a P1-4 gap.
 - **P0-7** `ec03060` — leg qualification requires an EXECUTED negative control;
@@ -52,16 +51,17 @@ Shipped code items this session:
 - **P1-8 done (`6a42cc6`):** bounded `/investigate` admission (`_MAX_RUNNING_JOBS=4`
   → 503, layered after P1-7) + terminal-job retention/eviction (900s / max 50,
   running jobs never evicted, expired id → 404). Module constants only. +6 tests.
-  (An earlier revision hung the suite on an orphaned test stub; caught by
-  re-run-and-verify, fixed, independently re-confirmed exit 0.)
 - **P1-9 done (`bd96d9b`):** documented the scope contract honestly (hostname-string,
-  not address-pinning, not rebinding protection); corrected a P1-2 overclaim (wording
-  only); added a changing-resolution characterization test. Behavior-preserving. Filed
-  **P1-10** (address-bound connect-time resolution pin — the actual rebinding fix).
-- Follow-on items: **P1-10** (rebinding enforcement), P3-4 (ledger singleton), P3-5
-  (fence prior-context). The Astra T02–T08 "paused item" is merged (section above).
-- Queue next: **P1-10** if landable as one offline unit (else P3 nits). Blocked/owner:
-  P0-3, P0-6, P1-3, P1-5.
+  not address-pinning); corrected a P1-2 overclaim; added a changing-resolution
+  characterization test. Behavior-preserving. Filed **P1-10** (the actual rebinding fix).
+- **P3-5 done (`349a51a`):** prior-context + knowledge-block text now defanged via
+  `_neutralize_fence_breakout` at fence interpolation (was unneutralized). +3 tests.
+- **P1-10 DEFERRED (owner/dedicated iteration):** address-bound connect-time resolver
+  pin is not one clean offline unit — needs a custom httpx/httpcore resolver seam
+  threaded through BOTH client factories (`session.client` + `default_client`),
+  per-redirect-hop pinning, and SNI/cert preservation. Split before automating.
+- Queue next: **P3-4** (bound/rotate ledger singleton) — next small offline unit.
+  Blocked/owner: P0-3, P0-6, P1-3, P1-5, P1-10.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 

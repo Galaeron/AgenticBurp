@@ -433,7 +433,14 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   and resumable engagements.
 - **Impact:** High for commercialization; premature before efficacy is proven.
 
-### [ ] P3-5 — Extend fence isolation to prior-context / knowledge blocks
+### [x] P3-5 — Extend fence isolation to prior-context / knowledge blocks
+- **Result (VERIFIED):** `349a51a` — prior-context and knowledge-block text now
+  defanged via `_neutralize_fence_breakout` at the fence interpolation point
+  (`base_agent.py:250,260`), mirroring body/headers/analyst_note. Behavior-preserving
+  (`_prompt_version`, control flow, config untouched). +3 caller-level tests (positive
+  defang for both blocks asserting exactly one genuine assembly nonce survives +
+  benign byte-identical negative control); module 10/10, full suite 2414 OK / 2 skip,
+  exit 0, offline/deterministic.
 - **Domain:** Security · **Effort:** S · **Depends on:** P1-1 [x]
 - **Evidence (VERIFIED):** filed during P1-1 review. P1-1 fences body/headers/
   analyst_note, but `prior_context` / `knowledge_block` in `base_agent._user_prompt`
