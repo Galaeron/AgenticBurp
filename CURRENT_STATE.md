@@ -8,6 +8,19 @@ refactor and the precision & blind-control sprint (Items 1–3) are committed
 **P0-1, P0-2, P0-4, P1-1, P1-2, P1-4** landed. Re-verified green (full suite 2365
 OK / 2 skip). Full per-item detail with Result lines is in IMPROVEMENT_BACKLOG.md.
 
+## Astra T02–T08 workstream — merged, not open (verified 2026-09-21)
+
+The Astra roadmap (`reviews/review-Astra-Medium-10-09-06-30/`) T02–T08 is complete
+and reconciled **below** sprint base `02de8bf`, so it is already in this branch:
+W-13/W-14 (`1553178`), W-15 orchestrator split (`99c5712`), W-16 single
+`TargetTransport` (`cfb4504`, `routing_gaps()` empty), on the per-oracle T08
+migration + T08u websocket (`fa20bf7`); T04/T06 milestones wired
+(`test_smoke_authorization_workflow.py`, `issues.py`). Full suite re-verified green
+here 2026-09-21 (2365 OK / 2 skip). The `.worktrees/astra-*`, `supplemental-evidence`,
+`t08-final` and `../AgenticVibe-impl` checkouts hold only **superseded drafts** —
+do not resume them; the one un-merged commit, `t08-final 5aa4a1a` (T08v), was redone
+as W-16.
+
 ## Improvement loop (IMPROVEMENT_BACKLOG.md)
 
 - **P0-1 (`25a737a`):** EvidenceLedger wired into the live pipeline (append-only
@@ -26,45 +39,30 @@ OK / 2 skip). Full per-item detail with Result lines is in IMPROVEMENT_BACKLOG.m
   defaults + SafeDefaultGuardTests intact.
 - Follow-on nits filed: P3-4 (ledger singleton), P3-5 (fence prior-context).
 - **Now on the INV dispatch** (IMPROVEMENT_BACKLOG.md + docs/INVESTIGATION_DISPATCH_2026-09-20.md):
-  offline read-only investigations, one per iteration. The "paused item" is the
-  Astra T02–T08 transport/executor/evidence workstream in the codex/astra worktrees
-  and AgenticVibe-impl (owned by other sessions; preserved untouched, not this
-  loop's to finish).
-- **INV-1 done (`e0ba0aa`):** baseline reconciled; found `run_blind_eval.py` sets
+  offline read-only investigations, one per iteration. (The Astra T02–T08
+  workstream once tracked here as "paused" is in fact merged — see the section
+  above; the codex/astra worktrees hold only superseded drafts.)
+- **INV-1 done (`e0ba0aa`):** baseline reconciled; `run_blind_eval.py` sets
   `quarantine_unverified_leads` but never calls the report generator → quarantine
-  knob is a no-op on that driver (blocking sub-ticket filed). No live run/code change.
+  knob is a no-op on that driver (blocking sub-ticket filed).
+- **INV-2 done (`40104a9`):** two confirmation paths diverge —
+  `orchestrator_confirm._validate_findings` persists a ProofRecord; the PASS2 graph
+  loop `orchestrator_chain._apply` stamps `confirmed_by_leg` only and persists no
+  proof (honesty backstop's OR-logic misses it). Historical 9/13→6/13 gap =
+  {GT04,GT05,GT06} idor/cross_identity (audited read-only). 3 sequenced tickets filed.
 - Backlog also gained review follow-ups P0-5/P0-6/P0-7 (safety/trust gaps in the
-  loop's own P1-4/P0-1/P0-2), to address after INV-1..4. Next: INV-2 (proof gap).
+  loop's own P1-4/P0-1/P0-2), to address after INV-1..4. Next: INV-3 (chain funnel).
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
-Five focused commits, `02de8bf..bc5f599`:
-- `4dfa89c` refactor(agents): simplify agent lifecycle management —
-  `harness/agent_manager.py`, `harness/agents/__init__.py`, `harness/agents/plugin.py`,
-  new `harness/test_agent_lifecycle.py`. Plugin/agent-class discovery simplified;
-  lazy `_plugin_system` singleton dropped; `get_all_agents(config, ollama)` replaced
-  by argument-free `get_all_agent_classes()`.
-- `50fe65a` fix(ollama): harden client edge cases —
-  `harness/ollama_client.py`, `harness/test_ollama_client.py`.
-- Precision & blind-control sprint Items 1–3 (`a549d0b`, `ee54d02`, `bc5f599`).
+Five focused commits `02de8bf..bc5f599`: `4dfa89c` agents refactor
+(`get_all_agent_classes()`), `50fe65a` ollama hardening, and sprint Items 1–3
+(`a549d0b`, `ee54d02`, `bc5f599`). The two new `config.yaml` knobs ship safe:
+`oracle.safe_passive_default: true` (zero live traffic) and
+`reporting.quarantine_unverified_leads: false`; `oracle.enabled` stays `false`. The
+vendored `testing/blind-test-kit/harness/config.yaml` is updated separately (bare
+`yaml.safe_load`, no overlay inheritance).
 
-The two new `harness/config.yaml` knobs ship at safe defaults:
-`oracle.safe_passive_default: true` (passive-only re-analysis, zero live traffic)
-and `reporting.quarantine_unverified_leads: false` (opt-in via measurement
-overlay). `oracle.enabled` remains `false`. Note: the vendored
-`testing/blind-test-kit/harness/config.yaml` is updated separately because it is
-loaded by bare `yaml.safe_load()` and cannot inherit from the real harness config.
-
-## Precision & blind-control sprint (Items 1–3, committed this session)
-
-- Item 1 — fail_open curated mode for measurement (shipped default stays `all`):
-  `run_blind_eval.py` env knob, vendored kit config, `test_fail_open_curated.py`.
-- Item 2 — safe passive oracle (`oracle.safe_passive_default: true`, zero live
-  traffic): `oracle_framework.oracle_for(passive_only=...)`, `_oracle_gate` modes,
-  6 new tests incl. zero-sends negative control.
-- Item 3 — quarantine undifferentiated live-class findings as LEADs on blind runs
-  (`reporting.quarantine_unverified_leads: false`, shipped OFF):
-  `should_quarantine_as_lead`, report "Test Suggestions" section, 12 new tests.
 
 Owner action required (these numbers are NOT verified here):
 - Re-run PixelMart + blind helpdesk under `fail_open_mode=curated` and

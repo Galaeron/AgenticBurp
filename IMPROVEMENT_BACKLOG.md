@@ -630,7 +630,19 @@ improved or that a live rerun happened. Live measurements remain separately open
 - **Acceptance:** Opus can identify what actually ran, what changed afterward,
   and how the next comparison avoids stale caches and misleading quarantine gains.
 
-### [ ] INV-2 — Trace the raw-confirmed versus proof-linked confirmation gap
+### [x] INV-2 — Trace the raw-confirmed versus proof-linked confirmation gap
+- **Result (VERIFIED-by-inspection @b3d40a2; artifacts VERIFIED-in-run @eb70210):**
+  `40104a9` — `docs/investigations/INV-2-proof-gap.md`. Two confirmation paths
+  diverge: `orchestrator_confirm._validate_findings` (PASS1) persists a `ProofRecord`
+  + stamps `case_id`/`proof_id`; `orchestrator_chain._apply` (PASS2 graph loop) stamps
+  `confirmed_by_leg` only and never persists a proof. `active_confirmation_is_unproven`
+  OR-logic lets the proof-less confirmation pass the honesty backstop. The historical
+  9/13→6/13 proof-linked gap = exactly {GT04,GT05,GT06} (idor/cross_identity), audited
+  read-only against `recall_report_integrated_full.json` + `maxcov_state_integrated_full.db`
+  (mode=ro). "Complete proof link" defined (case_id+proof_id+matching row+verdict
+  confirmed+validator==leg). 3 bounded, sequenced tickets filed; P0-6 linked (no 2nd
+  ledger). No code/worktree/DB change; Opus gate re-verified _apply vs _validate_findings
+  and the {GT04,05,06} delta at source.
 - **Domain:** Evidence / Trust · **Effort:** M · **Depends on:** INV-1
 - **Mode:** Offline investigation; unavailable artifacts are explicit limitations.
 - **Deliverable:** `docs/investigations/INV-2-proof-gap.md`, with proof lifecycle
