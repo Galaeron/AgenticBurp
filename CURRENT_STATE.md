@@ -25,8 +25,16 @@ OK / 2 skip). Full per-item detail with Result lines is in IMPROVEMENT_BACKLOG.m
   selector (ships "none" → no-op); passive-only asserted all-flags-off; safe
   defaults + SafeDefaultGuardTests intact.
 - Follow-on nits filed: P3-4 (ledger singleton), P3-5 (fence prior-context).
-- P0 offline tier done (P0-3 owner-only). Next eligible offline: P1-6 (policy
-  object). P1-3 depends on P0-3; P1-5 needs a JDK/Burp build.
+- **Now on the INV dispatch** (IMPROVEMENT_BACKLOG.md + docs/INVESTIGATION_DISPATCH_2026-09-20.md):
+  offline read-only investigations, one per iteration. The "paused item" is the
+  Astra T02–T08 transport/executor/evidence workstream in the codex/astra worktrees
+  and AgenticVibe-impl (owned by other sessions; preserved untouched, not this
+  loop's to finish).
+- **INV-1 done (`e0ba0aa`):** baseline reconciled; found `run_blind_eval.py` sets
+  `quarantine_unverified_leads` but never calls the report generator → quarantine
+  knob is a no-op on that driver (blocking sub-ticket filed). No live run/code change.
+- Backlog also gained review follow-ups P0-5/P0-6/P0-7 (safety/trust gaps in the
+  loop's own P1-4/P0-1/P0-2), to address after INV-1..4. Next: INV-2 (proof gap).
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 

@@ -7,6 +7,24 @@ re-reading the whole review.
 
 ## How the loop should use this file
 
+**Evaluation correction (2026-09-20):** Read
+[the reassessment](docs/EVALUATION_REASSESSMENT_2026-09-20.md) when interpreting
+the original review. Completed items' original Evidence/Problem paragraphs are
+historical motivation, not current defects. Real-model benchmarks already exist;
+P0-3 concerns reproducibility and measuring subsequent changes. Ledger wiring is
+implemented but audit completeness remains P0-6; prompt fencing is not injection
+immunity; P1-2 does not establish allowed-host DNS-rebinding protection (P1-9).
+This correction preserves the paused-item and INV dispatch order below.
+
+**2026-09-20 investigation dispatch (user-requested):** Finish the already-paused
+item first. Then select INV-1, INV-2, INV-3, INV-4 below, in that order, before
+resuming the ordinary priority queue. These are bounded OFFLINE investigations;
+do not skip them merely because their eventual efficacy checks need a live run.
+Opus reviews/selects; Sonnet investigates one item per iteration. Read
+[docs/INVESTIGATION_DISPATCH_2026-09-20.md](docs/INVESTIGATION_DISPATCH_2026-09-20.md)
+for exact scope, deliverables, evidence rules, and review criteria. This dispatch
+does not start an automation or authorize live execution. Preserve existing work.
+
 1. Work top-down: finish all `P0` items before `P1`, etc. Within a tier, respect
    `Depends on`.
 2. Pick the first item whose checkbox is `[ ]` and whose dependencies are all `[x]`.
@@ -106,7 +124,14 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
     set and demotes its findings; negative control: a healthy leg stays live.
 - **Impact:** High.
 
-### [ ] P0-3 — Produce one reproducible real-model benchmark
+### [ ] P0-3 — Reconcile existing benchmarks and measure subsequent changes reproducibly
+- **Status correction (2026-09-20, source inspected; results historical/reported):**
+  Real-model runs already exist in `testing/SCORECARD.md`, dated 2026-09-20,
+  committed by `95b124a` and revision-pinned by `02de8bf`. The original absence
+  claim below is superseded. Do not create a first benchmark from scratch or use
+  root `SCORECARD.md` to dismiss this evidence. INV-1 inventories remaining
+  reproducibility/metric gaps and prepares measurement of subsequent changes.
+  Leave this item open until its remaining acceptance requirements are verified.
 - **Domain:** Efficacy / Evaluation · **Effort:** M · **Depends on:** P0-1 (nice), else none
 - **Evidence (VERIFIED):** [SCORECARD.md](SCORECARD.md) is `model=stubbed/none`
   (a plumbing check); [CURRENT_STATE.md](CURRENT_STATE.md) states no real-model or
@@ -262,6 +287,12 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 ## P2 — Differentiators (create competitive advantage)
 
 ### [ ] P2-1 — Business-reasoning agent feeding the chaining loop  ★ (requested)
+- **Review gate (2026-09-20):** Complete INV-3 before implementation; inventory
+  existing business-logic/workflow context and reuse its consumers. Zero observed
+  chains does not by itself prove a missing semantic model. Prefer one bounded
+  application-context planning pass over another per-exchange specialist. Require
+  ON/OFF measurement of distinct proof-linked chains, false chains, requests,
+  model cost and operator time before claiming an improvement.
 - **Domain:** AI / Product / Efficacy · **Effort:** L · **Depends on:** P0-1 (ledger),
   benefits from P0-3
 - **Problem it solves:** Today routing and detection are largely *per-exchange* and
@@ -429,3 +460,201 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 Rationale: the review found the leverage is in **proving and auditing** what exists,
 not adding surface area. Prefer changes that reduce components over ones that add a
 new one.
+
+---
+
+## Follow-up recommendations — 2026-09-20 (after the paused item)
+
+Scheduling: finish the already-started/paused item before selecting from this
+addendum, even where a new item has higher priority. Then select these items by
+their stated priority alongside the existing queue. Existing checkboxes, Result
+lines, and CURRENT_STATE.md are preserved; this is not an implementation handoff
+or a claim that the paused work is complete.
+
+Review basis: source inspection at `c1133d5` on `reconciliation-backlog`, with no
+tracked edits in that checkout before this addition. P0-1/P0-2/P0-4 and
+P1-1/P1-2/P1-4 are already recorded as landed. Their suite results remain
+historical/reported here; no tests or live runs were performed for this addendum.
+Other worktrees have unfinished changes, including transport/session/per-hop
+artifact work in `.worktrees/astra-review-fixes` and evidence work in
+`../AgenticVibe-impl`. Do not overwrite, cherry-pick, or restart those efforts as
+part of backlog selection. Recheck their integration status before implementing
+an overlapping recommendation, and reuse applicable work rather than duplicating it.
+
+### [ ] P0-5 — Preserve explicit safety overrides when resolving operating profiles
+- **Domain:** Safety / Configuration · **Effort:** M · **Depends on:** P1-4
+- **Evidence (VERIFIED by source inspection):**
+  `config_schema.resolve_operating_profile` infers explicit overrides by comparing
+  values with `_PROFILE_KNOB_DEFAULTS`. An explicit `false` equal to the baseline
+  cannot be distinguished from an inherited default; an existing `true` differs
+  from the baseline and survives `passive-only`. Existing profile tests cover
+  passive configurations and non-default overrides, not this safety contract.
+- **Recommendation:** Preserve explicit configuration-source information through
+  profile composition. Define `passive-only` as a strict no-active-traffic profile:
+  either disable conflicting active settings or reject the conflict clearly.
+  Coordinate with P1-6's policy object if that refactor has started; do not create
+  a second policy implementation.
+- **Acceptance criteria:** Caller-level configuration/analysis tests show that an
+  explicit disable survives `deep-assessment`, and `passive-only` with previously
+  enabled active/engagement flags sends no target traffic or rejects startup.
+  Negative controls show intentionally enabled scoped validation still works and
+  profile `none` preserves existing behavior. Keep shipped defaults safe.
+- **Impact:** High.
+
+### [ ] P0-6 — Require resolvable evidence for ledger completeness and reproduction
+- **Domain:** Trust / Evidence · **Effort:** M · **Depends on:** P0-1
+- **Evidence (VERIFIED by source inspection):** `TargetTransport._artifact` records
+  the URL as `request_ref` and an HTTP status summary as `response_ref`.
+  `EvidenceLedger.reconstruct` sets `complete` from a validation or revision event
+  alone. The current redirect loop continues before emitting an intermediate-hop
+  artifact. These establish event wiring, not a fully reconstructable exchange.
+- **Recommendation:** Link each attempted hop to durable request/response evidence
+  and its authorization/session reference. Define completeness against the evidence
+  required for that finding type, including passive findings; report missing,
+  redacted, or expired material honestly. Reuse pending per-hop artifact work after
+  reconciliation. Resolve P3-1's redaction/retention requirements before expanding
+  stored sensitive content; do not persist live credential values in recipes.
+- **Acceptance criteria:** Through the production caller and a fresh store reader,
+  reconstruct a multi-hop validation with method, safe request data, response
+  evidence, and required session placeholders. A redirect followed by denial still
+  records the sent first hop and the denied next step. Negative controls with a
+  missing evidence record or only a revision event cannot claim reproducibility.
+  Persistence failures must not silently produce a complete durable record.
+- **Impact:** High; strengthens P0-1 without discarding its completed wiring.
+
+### [ ] P1-7 — Make investigation target selection and scope authorization explicit
+- **Domain:** Safety / API · **Effort:** M · **Depends on:** none
+- **Evidence (VERIFIED by source inspection):**
+  `server.engagement_investigate` adds the submitted `base_url` hostname to the
+  run's `allowed_hosts`. The route `host` is separately used for job association.
+  This is an implicit scope-granting contract, not proof of an exploitable bypass.
+- **Recommendation:** Define whether an authenticated start request may grant
+  scope or must use pre-authorized scope. Enforce that contract explicitly and
+  validate route-host/base-URL consistency before allocating a job. Coordinate
+  with existing transport/policy work; do not add a competing scope mechanism.
+- **Acceptance criteria:** API caller tests reject an unauthorized destination and
+  inconsistent target identity before any send. A positive control starts an
+  authorized investigation. If explicit per-run scope grants are supported, test
+  and record that grant separately from ordinary target selection; redirects
+  remain subject to the same policy.
+- **Impact:** High.
+
+### [ ] P1-8 — Bound investigation admission and release completed job resources
+- **Domain:** Reliability · **Effort:** M · **Depends on:** none
+- **Evidence (VERIFIED by source inspection):** `_INVESTIGATE_JOBS` retains job
+  dictionaries, results, tasks, and run contexts; the start endpoint creates a
+  task for each accepted request without a job admission limit. Per-run request
+  budgets do not bound aggregate job count.
+- **Recommendation:** Add bounded concurrent admission, a bounded queue or clear
+  rejection response, and completed-job retention/eviction. Release task/context
+  references after termination while preserving the documented result-access
+  window and durable manifest. This is separate from P3-4's ledger singleton cap.
+- **Acceptance criteria:** Caller-level tests saturate admission and prove no
+  excess job starts; completion, error, and cancellation release capacity.
+  Expiry bounds retained jobs and returns a documented response for expired IDs.
+  Positive control: an admitted job completes and remains readable during its
+  retention window. Do not evict running jobs as a memory-management shortcut.
+- **Impact:** Medium-High.
+
+### [ ] P1-9 — Define and test the allowed-host DNS resolution boundary
+- **Domain:** Safety / Verification · **Effort:** M · **Depends on:** P1-2
+- **Evidence (VERIFIED by source inspection):** P1-2's rebinding-named test rejects
+  a hostname absent from the allow-list before DNS resolution. It does not test
+  an allowed hostname whose resolved address changes. Its coverage remains useful,
+  but does not establish protection against that different scenario.
+- **Recommendation:** Define whether authorization covers a hostname alone or also
+  destination addresses. Correct the test/documentation assurance to match that
+  contract and add controlled changing-resolution coverage. If address restrictions
+  are required, enforce them at connection time without a separate check/use race.
+  Preserve explicitly authorized loopback/private targets and legitimate DNS use.
+- **Acceptance criteria:** Tests exercise an allowed hostname with changing
+  resolution against the chosen contract, with a stable authorized destination as
+  a positive control. For an address-bound policy, assert the disallowed endpoint
+  receives zero requests, including on redirects. Do not claim address-level
+  rebinding protection from an unlisted-host rejection test.
+- **Impact:** Medium-High.
+
+### Priority adjustment proposed — P3-1 redaction/retention
+
+Treat the existing P3-1 as P1 work when scheduling after the paused item; retain its
+ID and existing entry to avoid duplicate implementation or broken references.
+Its controls should precede expanded sensitive evidence storage in P0-6 and export
+in P2-3. Completeness diagnostics in P0-6 can proceed without storing more data.
+No existing priority heading or dependency list was rewritten by this addendum.
+
+---
+
+## Investigation queue — measured failures, before further feature expansion
+
+### [ ] P0-7 — Require executed negative controls for leg qualification
+- **Domain:** Trust / Reliability · **Effort:** M · **Depends on:** P0-2
+- **Evidence (VERIFIED-by-inspection at c1133d5):**
+  `harness/leg_self_test.py::_case_passes` accepts any negative result except
+  `status == "confirmed"` or `confirmed == True`; skipped/error/inconclusive
+  negative controls can therefore qualify a leg. `run_self_test` temporarily
+  disables the process-wide throttle. No live failure was reproduced here.
+- **Recommendation:** Require evidence that both positive and negative probes
+  actually executed with valid outcomes; distinguish a controlled negative from
+  an unavailable or failed probe. Isolate fixture rate policy from concurrent
+  engagements. State the qualification cache's lifetime explicitly.
+- **Acceptance criteria:** Caller-level controls refuse qualification for skipped,
+  errored, blocked and inconclusive negative probes even when the positive
+  confirms; a healthy executed pair qualifies. Concurrent production contexts
+  retain their throttle policy throughout self-test execution and cleanup.
+- **Scheduling:** After the existing paused-item and INV-1..4 dispatch; do not
+  reopen completed implementation items or silently enable self-tests by default.
+- **Impact:** High.
+
+These items follow the dispatch override at the top of this file. Closing an
+investigation means its evidence package passed review, not that model accuracy
+improved or that a live rerun happened. Live measurements remain separately open.
+
+### [x] INV-1 — Reconcile the live baseline and prepare a controlled comparison
+- **Result (VERIFIED-by-inspection @c1133d5):** `e0ba0aa` —
+  `docs/investigations/INV-1-baseline.md`: revision table for the 3 historical runs,
+  config-consumer map, same-revision 2x2 comparison plan (fingerprints + fresh cache
+  namespaces), metrics spec, exact un-executed run recipe, P0-3 gap analysis + a
+  separate owner-run measurement ticket. Key finding: `run_blind_eval.py` sets
+  `reporting.quarantine_unverified_leads` but never calls
+  `report_generator.generate_markdown_report` (sole caller of
+  `should_quarantine_as_lead`), so the quarantine knob is a no-op on that driver's
+  output — the quarantine axis is unmeasurable there until a small blocking
+  sub-ticket (wire the report generator into the blind driver + paired test) lands.
+  Routing axis unaffected. No live run; no code/worktree change; no precision/recall
+  delta claimed. Opus gate independently re-verified the no-op finding.
+- **Domain:** Evaluation · **Effort:** S · **Depends on:** none
+- **Mode:** Offline investigation; eventual live comparison is owner-run.
+- **Deliverable:** `docs/investigations/INV-1-baseline.md`, following the dispatch
+  guide's INV-1 steps, with revision table, metric definitions, driver/config
+  audit, comparison matrix, exact run recipe and unresolved prerequisites.
+- **Acceptance:** Opus can identify what actually ran, what changed afterward,
+  and how the next comparison avoids stale caches and misleading quarantine gains.
+
+### [ ] INV-2 — Trace the raw-confirmed versus proof-linked confirmation gap
+- **Domain:** Evidence / Trust · **Effort:** M · **Depends on:** INV-1
+- **Mode:** Offline investigation; unavailable artifacts are explicit limitations.
+- **Deliverable:** `docs/investigations/INV-2-proof-gap.md`, with proof lifecycle
+  map, run-isolated read-only audit recipe, supported causes and bounded fix tickets.
+- **Acceptance:** Distinguish the reported 9/13 versus 6/13 gap from demonstrated
+  current-code defects; specify caller-level positive and missing/wrong-proof controls.
+  Coordinate resulting fixes with P0-6 and pending evidence work.
+
+### [ ] INV-3 — Locate where the chaining pipeline loses candidates
+- **Domain:** Pipeline / Efficacy · **Effort:** M · **Depends on:** INV-1, INV-2
+- **Mode:** Offline investigation; no new agent or live probing.
+- **Deliverable:** `docs/investigations/INV-3-chain-funnel.md`, with the production
+  caller map, per-stage evidence/unknowns, first demonstrated loss point, and one
+  minimal fixture proposal with a broken-prerequisite negative control.
+- **Acceptance:** Explain the difference between zero opportunities, disabled
+  execution, failed execution and missing reporting; do not infer a regression
+  solely from an older run's reported one-chain count.
+
+### [ ] INV-4 — Attribute duplicate findings and runtime before optimizing
+- **Domain:** Precision / Performance · **Effort:** M · **Depends on:** INV-1, INV-3
+- **Mode:** Offline investigation; no fresh model run or raw-volume efficacy claim.
+- **Deliverable:** `docs/investigations/INV-4-noise-runtime.md`, with existing
+  dedup/cost instrumentation map, artifact-supported breakdown or explicit unknowns,
+  and at most three narrowly scoped remediation tickets.
+- **Acceptance:** Separate repeated evidence from distinct vulnerabilities and
+  exposed findings from leads; preserve distinct principal/object cases. Each
+  proposed optimization names a metric and caller-level regression control.
