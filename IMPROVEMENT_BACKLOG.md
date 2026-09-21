@@ -576,7 +576,19 @@ an overlapping recommendation, and reuse applicable work rather than duplicating
   remain subject to the same policy.
 - **Impact:** High.
 
-### [ ] P1-8 — Bound investigation admission and release completed job resources
+### [x] P1-8 — Bound investigation admission and release completed job resources
+- **Result (VERIFIED-tests):** `6a42cc6` — `/investigate` admission bounded at
+  `_MAX_RUNNING_JOBS=4` (503 + Retry-After when saturated, layered strictly AFTER
+  P1-7's 400/403 checks); terminal jobs retained `_JOB_RETENTION_SECONDS=900` /
+  `_MAX_RETAINED_TERMINAL_JOBS=50` (oldest-first), evicted/expired id → 404;
+  `_evict_expired_jobs` iterates ONLY terminal states so a running job is never
+  evicted; on terminal, task/run_context refs released while result/manifest persist.
+  In-limit happy path unchanged. Module constants only (no config.yaml key). +6
+  deterministic caller-level tests (saturation-no-excess, capacity release on
+  completion+cancel, expiry→404, retained cap, positive control, never-evict-running).
+  An earlier revision hung the suite on an orphaned OS-thread stub; fixed (cooperative
+  asyncio stub + portal-pinned TestClient + teardown cancels all jobs). Full suite
+  2407 OK / 2 skip, exit 0 — independently re-run to confirm clean termination.
 - **Domain:** Reliability · **Effort:** M · **Depends on:** none
 - **Evidence (VERIFIED by source inspection):** `_INVESTIGATE_JOBS` retains job
   dictionaries, results, tasks, and run contexts; the start endpoint creates a

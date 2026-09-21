@@ -49,11 +49,15 @@ Shipped code items this session:
 - **P1-7 done (`912df45`):** `/investigate` now enforces pre-authorized scope +
   route/`base_url` host consistency before job allocation; removed the implicit
   `base_url` self-grant (was silently widening scope). +3 tests; full suite 2401 OK.
+- **P1-8 done (`6a42cc6`):** bounded `/investigate` admission (`_MAX_RUNNING_JOBS=4`
+  → 503, layered after P1-7) + terminal-job retention/eviction (900s / max 50,
+  running jobs never evicted, expired id → 404). Module constants only. +6 tests.
+  (An earlier revision hung the suite on an orphaned test stub; caught by
+  re-run-and-verify, fixed, independently re-confirmed exit 0.)
 - Follow-on nits: P3-4 (ledger singleton), P3-5 (fence prior-context). The Astra
   T02–T08 "paused item" is merged (section above); codex/astra worktrees are drafts.
-- Queue next: the remaining P1 admission items **P1-8** (job admission bounding) and
-  **P1-9** (DNS/address-resolution policy), then P3 nits. Blocked/owner: P0-3, P0-6,
-  P1-3, P1-5.
+- Queue next: **P1-9** (DNS/address-resolution boundary — eligible only if testable
+  offline with a mocked resolver), then P3 nits. Blocked/owner: P0-3, P0-6, P1-3, P1-5.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
