@@ -4,11 +4,16 @@ Vectors an attacker-controlled target could use to trick the scoped transport
 into contacting a host outside the engagement's allow-list:
 
   (a) a raw IP literal that is not itself in `allowed_hosts`.
-  (b) DNS-rebinding style: a hostname NOT in `allowed_hosts` that a (mocked)
-      DNS resolver maps onto an address belonging to an in-scope host. Proves
-      the scope decision is made on the request's HOSTNAME STRING, never on a
-      resolved address, so rebinding the name after the scope check cannot
-      smuggle a request past it.
+  (b) DNS-rebinding-shaped hostname: a hostname NOT in `allowed_hosts` that a
+      (mocked) DNS resolver maps onto an address belonging to an in-scope
+      host. Proves only that scope membership is decided on the request's
+      HOSTNAME STRING, so an UNLISTED name is refused no matter what it
+      resolves to. It does NOT establish protection against true DNS
+      rebinding -- an ALREADY-allowed hostname whose resolution changes
+      between the scope check and the actual connect is a different scenario
+      this test does not cover; see harness/test_dns_resolution_boundary.py
+      (P1-9) for that characterization and why hostname-string scope does not
+      catch it.
   (c) alternate URL schemes (file://, gopher://) that bypass HTTP semantics.
   (d) a mid-hop redirect that tries to leave scope, via the transport's own
       manual redirect loop (real loopback fixture, not a mock).
@@ -67,6 +72,11 @@ class ScopeEscapeTests(unittest.TestCase):
         # resolves to the in-scope loopback address -- if scope were decided
         # on the RESOLVED address instead of the request's hostname string,
         # this would wrongly be let through. No real DNS lookup happens here.
+        # NOTE (P1-9): this proves an UNLISTED hostname is refused regardless
+        # of resolution; it does NOT prove rebinding protection for a hostname
+        # that IS already allowed and later resolves differently -- see
+        # test_dns_resolution_boundary.py for that (different, uncovered here)
+        # scenario.
         ctx = _ctx([IN_SCOPE_IP])
         rebinding_host = "attacker-controlled.example"
 

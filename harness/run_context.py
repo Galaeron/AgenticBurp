@@ -57,7 +57,22 @@ _CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization
 @dataclass(frozen=True)
 class ScopePolicy:
     """Which origins a run may contact. FAIL CLOSED: an empty allow-list permits
-    nothing, so a misconfigured scope never silently allows the whole internet."""
+    nothing, so a misconfigured scope never silently allows the whole internet.
+
+    P1-9 CONTRACT (read before relying on this for DNS-rebinding protection):
+    `in_scope` is a HOSTNAME-STRING membership check against `allowed_hosts`. It
+    does NOT resolve the hostname and does NOT pin the address httpx ultimately
+    connects to -- DNS resolution happens later, inside httpx's own connect path,
+    entirely outside this check. Consequently: (1) an unlisted hostname is always
+    refused, regardless of what it resolves to -- that is real and tested; but
+    (2) an ALREADY-ALLOWED hostname whose resolution changes between the scope
+    check and the actual connect (classic DNS rebinding) is NOT caught here --
+    the hostname string is still in `allowed_hosts`, so `in_scope` still returns
+    True, and the request proceeds to whatever address it resolves to at connect
+    time. This policy authorizes hostnames, not resolved addresses; it is not an
+    address-level rebinding defense. See harness/test_dns_resolution_boundary.py
+    for the characterization tests and IMPROVEMENT_BACKLOG.md P1-9 for the
+    follow-up (connect-time address pinning) this deliberately does not build."""
     allowed_hosts: frozenset = frozenset()
     allowed_schemes: frozenset = frozenset({"http", "https"})
 

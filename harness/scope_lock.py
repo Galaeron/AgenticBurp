@@ -16,6 +16,19 @@ so even a validator that forgets is stopped at the transport.
 default for a standalone caller that never set scope. It is deliberately
 fail-OPEN only when unset and fail-CLOSED (deny) for any host not listed once a
 non-empty scope IS configured.
+
+P1-9 CONTRACT: `host_in_scope` (like `ScopePolicy.in_scope` in run_context.py,
+the other scope authority) is a HOSTNAME-STRING membership check. It runs
+before DNS resolution and does not itself resolve the hostname or pin the
+address ultimately connected to -- httpx resolves and connects afterwards, on
+its own, outside this check. An unlisted hostname is refused regardless of
+what it would resolve to (tested); but a hostname that IS in `allowed_hosts`
+and later resolves to a different address than it did at scope-check time
+(DNS rebinding) is NOT caught by this function -- the string is still allowed,
+so this still returns True. This is a hostname-authorization boundary, not an
+address-level rebinding defense; see harness/test_dns_resolution_boundary.py
+and IMPROVEMENT_BACKLOG.md P1-9 for the characterization and the proposed
+(not yet built) connect-time address-pinning follow-up.
 """
 from __future__ import annotations
 
