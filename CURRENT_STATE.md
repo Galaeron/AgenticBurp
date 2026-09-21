@@ -54,10 +54,14 @@ Shipped code items this session:
   running jobs never evicted, expired id → 404). Module constants only. +6 tests.
   (An earlier revision hung the suite on an orphaned test stub; caught by
   re-run-and-verify, fixed, independently re-confirmed exit 0.)
-- Follow-on nits: P3-4 (ledger singleton), P3-5 (fence prior-context). The Astra
-  T02–T08 "paused item" is merged (section above); codex/astra worktrees are drafts.
-- Queue next: **P1-9** (DNS/address-resolution boundary — eligible only if testable
-  offline with a mocked resolver), then P3 nits. Blocked/owner: P0-3, P0-6, P1-3, P1-5.
+- **P1-9 done (`bd96d9b`):** documented the scope contract honestly (hostname-string,
+  not address-pinning, not rebinding protection); corrected a P1-2 overclaim (wording
+  only); added a changing-resolution characterization test. Behavior-preserving. Filed
+  **P1-10** (address-bound connect-time resolution pin — the actual rebinding fix).
+- Follow-on items: **P1-10** (rebinding enforcement), P3-4 (ledger singleton), P3-5
+  (fence prior-context). The Astra T02–T08 "paused item" is merged (section above).
+- Queue next: **P1-10** if landable as one offline unit (else P3 nits). Blocked/owner:
+  P0-3, P0-6, P1-3, P1-5.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 
@@ -69,11 +73,9 @@ Five focused commits `02de8bf..bc5f599`: `4dfa89c` agents refactor
 vendored `testing/blind-test-kit/harness/config.yaml` is updated separately (bare
 `yaml.safe_load`, no overlay inheritance).
 
-
-Owner action required (these numbers are NOT verified here):
-- Re-run PixelMart + blind helpdesk under `fail_open_mode=curated` and
-  `quarantine_unverified_leads=true`; record precision AND recall deltas in this
-  file as owner-reported.
+Owner action required (NOT verified here): re-run PixelMart + blind helpdesk under
+`fail_open_mode=curated` and `quarantine_unverified_leads=true`; record precision AND
+recall deltas in this file as owner-reported.
 
 ## Verified here (2026-09-20, clean committed tree at HEAD `bc5f599`)
 
@@ -89,8 +91,7 @@ benchmark, blind-target run, hosted CI or Java build was performed here.
 
 ## Open work and pointers
 
-- Owner: run both corpora under curated + quarantine; record precision/recall
-  deltas in this file as owner-reported (sprint exit criterion).
+- Owner: run both corpora under curated + quarantine; record precision/recall deltas here (sprint exit criterion).
 - Items 4–6 are scoped in [PRECISION_BLIND_CONTROLS_PLAN.md](reviews/2026-09-19/PRECISION_BLIND_CONTROLS_PLAN.md)
   (negative-control builders, per-endpoint baseline, coordinator model split).
   Do not start until Items 1–3 are measured.

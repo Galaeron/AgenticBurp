@@ -605,7 +605,18 @@ an overlapping recommendation, and reuse applicable work rather than duplicating
   retention window. Do not evict running jobs as a memory-management shortcut.
 - **Impact:** Medium-High.
 
-### [ ] P1-9 — Define and test the allowed-host DNS resolution boundary
+### [x] P1-9 — Define and test the allowed-host DNS resolution boundary
+- **Result (VERIFIED):** `bd96d9b` — documented the scope-authorization contract
+  honestly (hostname-string membership, decided before DNS, does NOT pin the resolved
+  address; NOT an address-level rebinding defense) in `ScopePolicy`/`scope_lock`
+  docstrings; corrected P1-2's rebinding-test overclaim (wording only — the 7
+  scope-escape assertions are byte-identical). Added
+  `harness/test_dns_resolution_boundary.py` (+4: stable-resolution positive control,
+  changing-resolution characterization asserting scope does NOT refuse an allowed
+  host's changed address, unlisted-host negative control, authorized-loopback). The
+  actual address-bound *enforcement* is deferred to P1-10 (behavior-changing).
+  Behavior-preserving (docstrings/comments + tests only; config.yaml untouched). Full
+  suite 2411 OK / 2 skip; affected files 11 OK, exit 0, offline/deterministic.
 - **Domain:** Safety / Verification · **Effort:** M · **Depends on:** P1-2
 - **Evidence (VERIFIED by source inspection):** P1-2's rebinding-named test rejects
   a hostname absent from the allow-list before DNS resolution. It does not test
@@ -622,6 +633,27 @@ an overlapping recommendation, and reuse applicable work rather than duplicating
   receives zero requests, including on redirects. Do not claim address-level
   rebinding protection from an unlisted-host rejection test.
 - **Impact:** Medium-High.
+
+### [ ] P1-10 — Address-bound connect-time resolution pin (DNS-rebinding enforcement)
+- **Domain:** Security · **Effort:** M · **Depends on:** P1-9 [x]
+- **Evidence (VERIFIED-by-inspection):** filed from the P1-9 review. P1-9 documented
+  that scope is hostname-string only and does NOT pin the resolved address, so an
+  already-allowed hostname whose resolution changes between the scope check and the
+  connect is not blocked at the address level (true DNS rebinding). This is the
+  behavior-changing *enforcement* P1-9 deliberately deferred.
+- **Recommendation:** In `TargetTransport.execute` (harness/run_context.py), inside
+  the per-hop loop after the existing scope/gate/budget checks, resolve the hop's
+  hostname ONCE and connect directly to that pinned address for that hop (custom
+  httpx transport / httpcore pool keyed on the pinned address), preserving the
+  original `Host` header and TLS SNI so virtual hosting and cert validation are
+  unaffected. Pin-and-connect must be atomic (no resolve → decide → re-resolve-by-name
+  race). Apply on every redirect hop too.
+- **Acceptance criteria:** Caller-level test with a mocked resolver returning address
+  A at pin time and address B on a later resolution asserts the request reaches ZERO
+  requests at B (including on redirects); positive control: a stable authorized host
+  still succeeds; explicitly authorized loopback/private targets and legitimate DNS
+  use preserved. `full` suite green. Ship any new toggle OFF/safe.
+- **Impact:** Medium-High (closes the rebinding gap P1-9 characterized).
 
 ### Priority adjustment proposed — P3-1 redaction/retention
 
