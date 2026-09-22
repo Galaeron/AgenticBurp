@@ -970,7 +970,23 @@ Verify every proposed diff against the code before implementing.
   injection): a suppressed leg → `confirmed=False` AND no orphan proof persisted.
 - **Impact:** High (the single most important trust fix in this batch).
 
-### [ ] RB-5 — Re-link attack chains after second-order + coverage phases (INV-3 fix)
+### [x] RB-5 — Re-link attack chains after second-order + coverage phases (INV-3 fix)
+- **Result (VERIFIED):** `4c78f2d` — `investigate_engagement` computed `chains` (via
+  `chain_linker.link_findings`) BEFORE the second-order auto-confirm (~782-897) and
+  coverage-driven (~921-1012) phases, both of which append NEW confirmed findings into
+  `all_findings`/`state` without re-linking → a chain whose second constituent only confirms
+  in a later phase was returned stale/absent (INV-3, SCORECARD "0 chains … did not reproduce").
+  Added ONE final re-link after the coverage phase, before the return, via a new pure-recompute
+  seam `Orchestrator._relink_chains` (no verdict/severity/scope decision). Append-only across
+  phases → only ADDS newly-enabled chains, never drops/mutates the ~752/782-linked ones (kept
+  as-is). Best-effort: a late linking error is logged + recorded in `errors` (→
+  `result["degraded"]`) and the prior snapshot kept, never sinking the run. +2 tests
+  (`test_engagement_chain_relink.py`, offline/stubbed model + synthetic discovery/worklist +
+  canned second-order confirmation): POSITIVE — chain from a pre-existing finding + a
+  second-order-phase-confirmed finding IS present in `result["chains"]`; NEGATIVE CONTROL —
+  `_relink_chains` patched to raise → same chain ABSENT + run `degraded` + `final_chain_relink`
+  error (genuine defect injection via the seam). Full suite **2436 OK / 2 skip, exit 0**.
+  Opus-reviewed APPROVE (best-effort + append-only reasoning confirmed at source).
 - **Domain:** Pipeline / Efficacy · **Effort:** S · **Depends on:** RB-4 · **Mode:** LOOP
 - **Evidence (VERIFIED):** `CURRENT_STATE` INV-3 and SCORECARD "0 chains ... did not
   reproduce": chains are computed on a pre-confirmation snapshot and never recomputed

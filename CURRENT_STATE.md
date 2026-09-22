@@ -61,7 +61,8 @@ Shipped code items this session:
   - **RB-4 (`301d848`):** engagement confirm path persists ProofRecord + VALIDATION_DECISION via shared `_persist_confirmation_proof` (INV-2; confirmed-only). +2 tests.
   - **RB-3 (`3028cf7`):** identical dependency/banner findings collapse to one issue via `issue_key` (INV-4 surfacing gap; non-dependency keys byte-identical). +6 tests.
   - **RB-8 (`dd104f9`):** blind-eval harness importable + quarantine path actually invoked; scorecard w/ controls-clean+variance+timing; +14 offline tests (INV-1). Live RUN owner-only.
-  - **Next: RB-5** (INV-3 chain re-link after 2nd-order+coverage phases; deps RB-4 [x]).
+  - **RB-5 (`4c78f2d`):** final chain re-link after 2nd-order+coverage phases via `_relink_chains` seam (INV-3; best-effort, append-only). +2 tests (positive + defect-injection).
+  - **Next: RB-2** (surface a `degraded: routing_failed_open` flag; NO default flip; deps none).
   Owner/live, skip in loop: RB-1b (Java token reader), P0-3 (blind scorecard RUN, via RB-8),
   P2-2 (ablation RUN, via RB-7), P1-10 (DNS pin), RB-2b (`curated` flip, gated on RB-8's
   delta), P0-6/P3-1, P1-5, P3-2/3-3.
