@@ -53,19 +53,18 @@ Shipped code items this session:
 - **P1-9 done (`bd96d9b`):** documented the scope contract honestly (hostname-string,
   not address-pinning); corrected a P1-2 overclaim; +characterization test. Filed P1-10.
 - **P3-5 (`349a51a`) + P3-4 (`6d1950c`) done:** fence defang extended to prior-context/knowledge blocks; `EvidenceLedger` bounded (5000 FIFO) + reset seam. +7 tests. (P1-10 DNS pin → owner/live below.)
-- **LOOP RUNNING (2026-09-21 consensus batch):** LOOP_DONE hold lifted; the four-way
-  reconciliation (`reviews/2026-09-21/`) filed the INV-1..4 production fixes as the
-  **Consensus batch** in `IMPROVEMENT_BACKLOG.md`. Order (deps-corrected): RB-1 → RB-4 →
-  RB-3 → RB-8 → RB-5 → RB-2 → RB-7 → RB-6 (RB-8 `Depends on RB-3`, so RB-3 precedes it).
-  Done (offline, tested; nothing pushed — full per-item Result lines in the backlog):
+- **LOOP_DONE (2026-09-21 consensus batch — all 8 RB items landed, nothing pushed):** the
+  four-way reconciliation (`reviews/2026-09-21/`) INV-1..4 production fixes + new items are
+  all shipped offline; full per-item Result lines in the backlog:
   **RB-1** `f24ff8e` local-API CSRF/token · **RB-4** `301d848` engagement proof persistence
   (INV-2) · **RB-3** `3028cf7` dependency/banner dedupe (INV-4) · **RB-8** `dd104f9` blind-eval
   harness repair (INV-1) · **RB-5** `4c78f2d` chain re-link (INV-3) · **RB-2** `35e5f4f`
-  fail-open flag caller-test · **RB-7** `fa3dd95` A–F ablation harness (W-22 scaffold completed).
-  - **Next (last loop item): RB-6** (execution-plane capability matrix, Python half; deps RB-7 [x]).
-  Owner/live, skip in loop: RB-1b (Java token reader), P0-3 (blind scorecard RUN, via RB-8),
-  P2-2 (ablation RUN, via RB-7), P1-10 (DNS pin), RB-2b (`curated` flip, gated on RB-8's
-  delta), P0-6/P3-1, P1-5, P3-2/3-3.
+  fail-open flag caller-test · **RB-7** `fa3dd95` A–F ablation harness · **RB-6** `5fa1a57`
+  execution-plane capability matrix (LOOP half). Full suite 2482 OK / 2 skip.
+  **No loop-consumable items remain — loop stopped.** Owner/live next: P0-3 blind-scorecard RUN
+  (via RB-8), P2-2 ablation RUN (via RB-7), RB-1b (Java token reader), RB-6 OWNER/JDK half
+  (Java→shared trail + fix stale HarnessPanel subset), RB-2b (`curated` flip, gated on RB-8's
+  delta), P1-10 (DNS pin), P0-6/P3-1 (redaction), P1-5 (Burp UX), P3-2/3-3.
 
 ## Committed this session (agents refactor + sprint Items 1–3)
 

@@ -1015,7 +1015,22 @@ Verify every proposed diff against the code before implementing.
   re-link → chain absent (the assertion goes red).
 - **Impact:** Medium.
 
-### [ ] RB-6 — Reconcile the two active-traffic execution planes by capability
+### [x] RB-6 (LOOP half) — Reconcile the two active-traffic execution planes by capability
+- **Result (VERIFIED):** `5fa1a57` — LOOP-half acceptance met: committed capability-ownership
+  matrix `harness/execution_planes.py` over 41 canonical capabilities (25 dual-plane, 4
+  Java-only, 12 Python-only) mapping each to which planes can execute it + the ONE authoritative
+  plane (dual-plane → Python-authoritative, since that plane carries SafetyGate/TargetTransport/
+  two-flag mutating opt-in/budget/evidence ledger vs Java's `isInScope` only). +23-test enforced
+  contract `test_execution_planes.py` that PARSES the real source at test time (no snapshot):
+  `ValidationExecutor.java`'s switch labels + `registry.py`/`_val_by_conf` keys, asserting
+  EXACTLY ONE authoritative plane per capability (the RB-6 acceptance) + bidirectional coverage
+  + non-triviality guards. No Java/config change; matrix module is a contract artifact, not
+  imported by production. Full suite **2482 OK / 2 skip, exit 0**. Opus-reviewed APPROVE.
+  Surfaced a real discrepancy: `HarnessPanel.IMPLEMENTED_BURP_CAPABILITIES` is a stale 22-of-30
+  subset so `runnableHere` under-reports Java's capabilities.
+  **OWNER/JDK residual (out of loop scope):** make the Java plane emit its scope/gate decision
+  into the shared evidence trail; fix the stale HarnessPanel subset; RB-7's owner-run ablation
+  may revise the authoritative assignments. Do NOT delete the Java path pre-ablation.
 - **Domain:** Architecture / Safety · **Effort:** M (matrix) / L (reconciliation)
   · **Depends on:** RB-7 (ablation informs which plane wins) · **Mode:** LOOP for the
   capability matrix + Python evidence contract; **OWNER/JDK** for Java edits + build
