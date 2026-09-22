@@ -62,7 +62,8 @@ Shipped code items this session:
   - **RB-3 (`3028cf7`):** identical dependency/banner findings collapse to one issue via `issue_key` (INV-4 surfacing gap; non-dependency keys byte-identical). +6 tests.
   - **RB-8 (`dd104f9`):** blind-eval harness importable + quarantine path actually invoked; scorecard w/ controls-clean+variance+timing; +14 offline tests (INV-1). Live RUN owner-only.
   - **RB-5 (`4c78f2d`):** final chain re-link after 2nd-order+coverage phases via `_relink_chains` seam (INV-3; best-effort, append-only). +2 tests (positive + defect-injection).
-  - **Next: RB-2** (surface a `degraded: routing_failed_open` flag; NO default flip; deps none).
+  - **RB-2 (`35e5f4f`):** coordinator fail-open flag (`coordinator_fallback`) was already wired (P0.9); added the missing caller-level test + negative control. No prod/config change; RB-2b (curated flip) stays owner-gated.
+  - **Next: RB-7** (build the A–F ablation harness; LOOP builds stubbed-testable instrument, owner runs live; deps none).
   Owner/live, skip in loop: RB-1b (Java token reader), P0-3 (blind scorecard RUN, via RB-8),
   P2-2 (ablation RUN, via RB-7), P1-10 (DNS pin), RB-2b (`curated` flip, gated on RB-8's
   delta), P0-6/P3-1, P1-5, P3-2/3-3.

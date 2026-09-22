@@ -872,7 +872,22 @@ Verify every proposed diff against the code before implementing.
   the extension makes still succeeds (regression guard).
 - **Impact:** High (a real, cheap trust/safety win).
 
-### [ ] RB-2 — Surface a `degraded: routing_failed_open` signal (do NOT flip the default)
+### [x] RB-2 — Surface a `degraded: routing_failed_open` signal (do NOT flip the default)
+- **Result (VERIFIED):** `35e5f4f` — the production wiring was ALREADY shipped pre-session
+  (`bea437a`, "P0.9"): `AnalysisResponse.coordinator_fallback` (models.py:274) is set in
+  `analyze()` via `coordinator_fallback=coordinator.is_fallback_reason(reason)`
+  (orchestrator_detect.py:904). The genuine gap (per RB-2's own "not distinguishable by a
+  caller reading the response") was that NO test asserted it through the real caller —
+  `test_coordinator.py` only exercised `is_fallback_reason()`/`choose_agents()` directly. Added
+  the missing caller-level leg (`harness/test_orchestrator_detect.py`, +2, offline: stubbed
+  ollama, isolated temp store/cache, no network/answer-key): POSITIVE — a forced coordinator
+  routing failure → `resp.coordinator_fallback is True` AND `fail_open_stats()["count"]==1`;
+  NEGATIVE CONTROL — healthy routing → `False` and count 0. Would fail if line 904 regressed
+  (drives real `analyze()`, not a tautology). **No production/config change** —
+  `coordinator.fail_open_mode` NOT flipped (the `curated` default flip stays owner-gated as
+  **RB-2b**, on RB-8's measured recall delta). Full suite **2438 OK / 2 skip, exit 0**.
+  Opus-reviewed APPROVE. (Note: a reconciliation gap — P0.9 shipped the flag but the RB-2
+  entry stayed open; this closes it, with the test that was actually missing.)
 - **Domain:** Reliability / Observability · **Effort:** S · **Depends on:** none · **Mode:** LOOP
 - **Evidence (VERIFIED):** `coordinator._record_fail_open` already logs + increments
   `fail_open_stats()` + publishes to the activity feed (not silent); `_curated_fallback`
