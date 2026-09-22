@@ -18,10 +18,13 @@ B2-3 issue-level controls-clean, B2-4 REJECT stubbed-testable, B2-5 gate the
 low-confidence FP guesses). **B2-1 done** (`345fcf8`: `agents_circuit_open` on
 `AnalysisResponse` + engagement `errors`→`degraded`). **B2-2 LOOP half done**
 (`7927d7e`: opt-in `scoped_ollama_breaker`/`reset_ollama_circuit_breaker`/
-`raise_if_ollama_starved` seam, additive/off-by-default; OWNER half — hardware
-timeout/GPU tuning + live-driver wiring — stays open). **Next pick: B2-3**
-(issue-level `controls_clean` + per-URL FP attribution in the scorecard; Depends
-on none). Full suite 2490 OK / 2 skip. The RB-1..RB-8 consensus batch is closed.
+`raise_if_ollama_starved` seam; OWNER half — hardware timeout/GPU tuning +
+live-driver wiring — stays open). **B2-3 done** (`e05c821`: issue-level
+`controls_clean` + `ambiguous_control_urls` exclusion + `per_control_drivers` in
+`build_scorecard`, raw metric kept). **Next pick: B2-4** (make
+`cross_identity_reject` stubbed-testable + recorded in the manifest — LOOP builds
+the stubbed proof + manifest field; OWNER/LIVE runs it). Full suite 2490 OK /
+2 skip (testing tier 31). The RB-1..RB-8 consensus batch is closed.
 
 **External-review borrow batch (2026-09-22): ER-1, ER-2, ER-4** loop-consumable
 (pick order ER-1→ER-2→ER-4), filed from a user-requested eval of external

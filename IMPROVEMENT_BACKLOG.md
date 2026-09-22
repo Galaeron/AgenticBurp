@@ -1277,7 +1277,28 @@ B ran clean and is the P2-2 crux).
   normal timing -> no isolation/flag side-effects. Owner tunes the real timeout on their hardware.
 - **Impact:** High (the P2-2 re-run blocker + a production reliability hazard).
 
-### [ ] B2-3 -- Issue-level `controls_clean` + per-URL FP attribution in the scorecard
+### [x] B2-3 -- Issue-level `controls_clean` + per-URL FP attribution in the scorecard
+- **Result (VERIFIED):** `e05c821` -- `build_scorecard` (testing/blind-target-2/
+  run_blind_eval.py) gains a FAIRER issue-level view ALONGSIDE the preserved raw
+  `controls_clean`/`dirty_controls`: `controls_clean_issue_level`/
+  `dirty_controls_issue_level` computed by grouping surfaced control findings via
+  `harness.issues.group_findings_into_issues` (pure, consumed read-only) so N
+  duplicate dependency/banner findings collapse to 1 issue; `ambiguous_control_urls`
+  = `control_urls & vuln_urls` excluded from the clean denominator (findings carry
+  only a url, not an exchange id -> exclude the shared URL rather than guess), bounded
+  to the intersection and surfaced as `n_controls_excluded_ambiguous` (auditable);
+  `per_control_drivers` names the class/agent per dirty issue. Testing-side only;
+  `harness/issues.py` + `config.yaml` untouched. +4 tests
+  (`IssueLevelControlsCleanTests`): dedup, URL-reuse fairness, shape, and a
+  genuinely-dirty NEGATIVE CONTROL that the issue-level metric still flags (mirrors
+  `test_dirty_control_is_detected_not_quarantined`) -- all on synthetic
+  `eval-fixture.invalid` fixtures + the canned-model stub, no answer-key/app.py/real
+  corpus read. Module 18 OK; smoke exit 0; full **2490 OK / 2 skip** (testing tier
+  27->31), exit 0. Opus-reviewed APPROVE (raw metric preserved, exclusion bounded +
+  auditable, non-tautological negative control confirmed at source). **OWNER re-run:**
+  the real-model blind scorecard now reports the fair issue-level number. **Follow-on
+  (noted):** if findings gain exchange-id provenance, revisit the ambiguous-URL
+  exclusion to attribute rather than exclude.
 - **Domain:** Evaluation - **Effort:** S - **Depends on:** none - **Mode:** LOOP builds; OWNER re-runs
 - **Evidence (VERIFIED):** `reviews/2026-09-22/BLIND_SCORECARD_P0-3.md` -- `build_scorecard`
   computes `dirty_controls` PER URL (not per exchange), so a URL shared between a `confirmed_vuln`
