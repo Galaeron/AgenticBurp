@@ -255,6 +255,17 @@ class ChainMixin:
             if _owned is not None:
                 await _owned.aclose()
 
+    def _relink_chains(self, state, all_findings, responses: dict) -> list:
+        """RB-5/INV-3 seam: pure chain-link recompute, no confirmation/severity/scope
+        decision of its own -- that already happened upstream in `_confirm` /
+        the second-order auto-confirm phase / the coverage-driven phase. Split out
+        of `investigate_engagement` so a test can monkeypatch this one method to
+        disable the final re-link and prove a chain composed across those later
+        phases actually depends on it (not a tautology)."""
+        from harness import chain_linker
+        link = chain_linker.link_findings(state, all_findings, responses=responses)
+        return list(link["chain_findings"])
+
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
                                      max_chain_rounds: int = 1, run_context=None) -> dict:
@@ -1010,6 +1021,30 @@ class ChainMixin:
         except Exception as e:  # coverage is a report layer -- never sink the run
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
+
+        # RB-5/INV-3: re-link chains over the FINAL findings set. The passes at
+        # ~741/771 above (kept as-is, not removed) compute `chains` from
+        # `all_findings` as it stood BEFORE the second-order auto-confirm phase
+        # (~782-897) and the coverage-driven phase (~921-1012) run -- both of
+        # which append NEW confirmed findings straight into `all_findings`/`state`
+        # (`all_findings.append(cf)` + `state.ingest_findings(...)`) without
+        # re-linking. A multi-step chain whose second constituent only confirms in
+        # one of those later phases was therefore silently absent from the
+        # returned `chains` (the SCORECARD "0 chains ... did not reproduce" gap,
+        # INV-3). `all_findings` is append-only across every phase above, so
+        # recomputing the link over the now-final superset can only ADD chains a
+        # later-phase confirmation newly enables -- it never drops or mutates a
+        # chain the 741/771 passes already linked, and it makes NO confirmation/
+        # severity/scope decision itself (`_relink_chains` is a pure recompute over
+        # already-decided findings). Best-effort, mirroring the coverage-build
+        # phase just above: a late linking error must never sink the whole
+        # engagement result, so on failure the prior `chains` snapshot is kept
+        # unchanged.
+        try:
+            chains = self._relink_chains(state, all_findings, _responses)
+        except Exception as e:
+            log.debug("investigate_engagement: final chain re-link failed: %s", e)
+            _errors.append({"phase": "final_chain_relink", "error": f"{type(e).__name__}: {e}"})
 
         return {
             "summary": state.summary(),
