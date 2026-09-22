@@ -61,6 +61,21 @@ def _affected_input(finding: dict) -> str:
     return f"{loc}:{name}"
 
 
+# RB-3 (INV-4): the `vulnerability_class` prefixes orchestrator_detect.py's
+# `_resolve_known_vulnerabilities`/`_check_registry_ages` stamp onto a
+# dependency/banner advisory (`known-vulnerable-dependency:<component>`,
+# `recently-published-dependency:<component>`). A finding in this family is a
+# HOST-level fact about the running software (e.g. "this host runs a
+# vulnerable Werkzeug version"), observed passively from a response header/
+# manifest -- not an endpoint- or method-scoped claim, and it never carries a
+# parameter_location/parameter_name (so `_affected_input` above is always "").
+_DEPENDENCY_CLASS_PREFIXES = ("known-vulnerable-dependency:", "recently-published-dependency:")
+
+
+def _is_dependency_class(vulnerability_class: str) -> bool:
+    return (vulnerability_class or "").strip().lower().startswith(_DEPENDENCY_CLASS_PREFIXES)
+
+
 # --------------------------------------------------------------------------- #
 # Redaction -- an export/replay must never carry a live secret
 # --------------------------------------------------------------------------- #
@@ -222,13 +237,34 @@ def issue_key(finding: dict) -> tuple:
     input, and authorization boundary. When the affected input is UNKNOWN, a
     per-finding disambiguator (finding_id/fingerprint) is added so two distinct
     unattributed findings do NOT collapse into one issue (review R04); attributed
-    inputs and repeated object ids that share a known input still group."""
+    inputs and repeated object ids that share a known input still group.
+
+    RB-3 (INV-4) exception: a dependency/banner-class finding (see
+    `_is_dependency_class`) is a host-level advisory about running software,
+    not an endpoint-scoped claim -- the identical advisory can be
+    independently re-observed on many different exchanges/endpoints (each
+    carrying its own url/finding_id), and, having no parameter_location/
+    parameter_name, would otherwise always hit the UNKNOWN-input branch above
+    and get the finding_id/fingerprint disambiguator appended -- turning every
+    repeat into its own issue. That disambiguator exists to stop an unknown
+    input acting as a wildcard over otherwise-unrelated findings (R04); it is
+    not needed here because `canon` already carries the exact component
+    identity (canonicalize() returns None for these compound
+    "prefix:<component>" strings -- no CANONICAL_CATEGORIES/_SYNONYMS entry
+    matches -- so `canon` falls back to the raw lowercased string, keeping two
+    DIFFERENT components, e.g. Werkzeug vs Flask, on different keys). So this
+    branch groups by host + canonical class/component only: endpoint_family
+    and method are dropped (irrelevant to a host-wide banner) and no
+    disambiguator is added, letting genuinely identical advisories collapse to
+    ONE issue regardless of which exchange first surfaced them."""
     url = finding.get("url", "")
     host = _host_of(url)
-    family = normalize_path(url) if url else ""
     method = (finding.get("method") or "").upper()
     vc = finding.get("vulnerability_class", "") or ""
     canon = canonicalize(vc) or vc.strip().lower()
+    if _is_dependency_class(vc):
+        return (host, "", "", canon, "", "read", "")
+    family = normalize_path(url) if url else ""
     affected = _affected_input(finding)
     # Unknown input is not a wildcard: keep distinct findings distinct.
     disambiguator = "" if affected else (finding.get("finding_id") or finding.get("fingerprint") or "")
