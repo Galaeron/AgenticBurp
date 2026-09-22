@@ -1374,7 +1374,26 @@ B ran clean and is the P2-2 crux).
   method+url does not exclude it; `aggregate_variance` reports the issue-level metric. `full` green.
 - **Impact:** High (otherwise the owner re-run reports a wrong fair number). **Pick before B2-4.**
 
-### [ ] B2-4 -- Make `cross_identity_reject` stubbed-testable + recorded in the manifest
+### [x] B2-4 (LOOP half) -- Make `cross_identity_reject` stubbed-testable + recorded in the manifest
+- **Result (VERIFIED):** `d1f6390` -- (a) the cross-identity REJECT/downgrade path is now proven
+  OFFLINE with NO production change: the deterministic non-LLM block in
+  `orchestrator_confirm._validate_findings` (:550-566, cap `_CROSS_IDENTITY_REJECT_CAP=0.15`)
+  already downgrades a finding to confidence 0.15 / severity low / `review_verdict="downgraded"`
+  (stamping `original_confidence`) when a `cross_identity` validator returns `not_confirmed`. New
+  `harness/test_cross_identity_reject.py` (+4) drives the REAL `_validate_findings` via a stub
+  validator (temp store, stub ollama never contacted): POSITIVE (cross_identity not_confirmed ->
+  downgraded); NEGATIVE controls (unrelated validator / none present -> untouched 0.6/high/None);
+  edge (already <=cap not re-stamped). REJECT on/off modeled by validator PRESENCE/ABSENCE, NOT a
+  new config gate. (b) `build_scorecard` gains a `cross_identity_reject` param + returned-dict key;
+  `run_once` computes it = `active_enabled AND cross_identity.enabled`; `_live_main` prints it. +5
+  scorecard tests. The armed `run_once` test sets the flags on an in-memory config copy ONLY and
+  fails CLOSED on scope (`eval-fixture.invalid` outside committed `allowed_hosts:[]`) -> no live
+  traffic, no committed config mutation. B2-3/B2-3b metric code untouched. smoke 92 OK; full
+  **2494 OK / 2 skip** (testing tier 41), exit 0. Opus-reviewed APPROVE (real caller-level exercise,
+  non-trivial negative controls, no config/production change, fail-closed confirmed at source).
+  **OWNER/LIVE half stays open (`[ ]` in spirit):** the real REJECT-on precision number still needs
+  `validators.active_enabled` + `validators.cross_identity.enabled` + the blind-target-2 Flask app on
+  `127.0.0.1:5002`.
 - **Domain:** Evaluation / Precision - **Effort:** M - **Depends on:** none - **Mode:** LOOP builds
   (stubbed); **OWNER/LIVE** runs it (needs `validators.active_enabled` + the blind-target-2 Flask app
   on `127.0.0.1:5002`)

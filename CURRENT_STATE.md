@@ -25,11 +25,12 @@ live-driver wiring — stays open). **B2-3 done** (`e05c821`: issue-level
 url-only attribution — control/vuln keyed on `(method.upper(), url)`, explicit
 vuln-label set, host-wide banners split into `host_level_issues_on_controls`,
 issue-level counts + variance + console summary; the shared GET-vuln/DELETE-control
-url no longer hides the DELETE control's FP). **Next pick: B2-4** (make
-`cross_identity_reject` stubbed-testable + recorded in the manifest — LOOP builds
-the stubbed proof + manifest field; OWNER/LIVE runs it; a partial B2-4 deliverable-b
-draft is parked in `git stash@{0}`). Full suite 2490 OK / 2 skip (testing tier
-36). The RB-1..RB-8 consensus batch is closed.
+url no longer hides the DELETE control's FP). **B2-4 LOOP half done** (`d1f6390`:
+`cross_identity_reject` proven offline against the existing downgrade block — no
+production change — + recorded in the scorecard; OWNER/LIVE REJECT-on precision
+run stays open). **Next pick: B2-5** (gate the generic low-confidence agent
+guesses that drive the controls-clean failure). Full suite 2494 OK / 2 skip
+(testing tier 41). The RB-1..RB-8 consensus batch is closed.
 
 **External-review borrow batch (2026-09-22): ER-1, ER-2, ER-4** loop-consumable
 (pick order ER-1→ER-2→ER-4), filed from a user-requested eval of external
