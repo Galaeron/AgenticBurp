@@ -890,7 +890,28 @@ Verify every proposed diff against the code before implementing.
   no degraded flag.
 - **Impact:** Medium (kills the "silent all-36" ambiguity without a recall change).
 
-### [ ] RB-3 — Dedupe dependency/banner findings at the aggregation layer (INV-4 fix)
+### [x] RB-3 — Dedupe dependency/banner findings at the aggregation layer (INV-4 fix)
+- **Result (VERIFIED):** `3028cf7` — confirmed a real HARNESS-CORE surfacing-layer gap
+  (distinct from INV-4's untracked driver-union count, which stays owner/eval): a
+  dependency/banner advisory (`known-vulnerable-dependency:<comp>` /
+  `recently-published-dependency:<comp>` from `orchestrator_detect`) has no
+  parameter → `issues._affected_input` is always `""` → `issue_key`'s R04 branch appended
+  the per-occurrence `finding_id`, so the SAME advisory across N exchanges surfaced as N
+  issues (empirically 3→3 before). Fix: `issue_key` now keys a dependency-class finding on
+  `(host, "", "", canon, "", "read", "")` — host + canonical class/component only
+  (`endpoint_family`/`method` dropped as a host-wide banner isn't endpoint-scoped; no
+  disambiguator, since `canonicalize()` returns None for these compound strings so `canon`
+  keeps the component identity → Werkzeug ≠ Flask stay distinct). Every non-dependency
+  finding falls through the ORIGINAL path — key byte-identical (verified vs pre-fix output
+  on 7 fixtures; all 37 existing `test_issues` incl. the R04 regression pass unmodified). NO
+  second detection-layer dedup added (that logic already runs); nothing under
+  `testing/vulncorp-helpdesk/` or any untracked eval driver touched. +6 tests
+  (`DependencyBannerDedupTests`): N identical banners→1 (positive); distinct components→2
+  (neg #1); two distinct unattributed non-dependency findings→2 (neg #2, R04). Full suite
+  **2434 OK / 2 skip, exit 0**. Opus-reviewed APPROVE (branch isolation confirmed at source).
+  **Residual (owner/eval):** INV-4 Ticket 1 — the raw 1914 count is the untracked
+  `run_maxcov_integrated.py` `_all_findings()` three-way union; deduping that driver is
+  owner/eval territory, not loop-consumable.
 - **Domain:** Precision · **Effort:** S · **Depends on:** none · **Mode:** LOOP
 - **Evidence (VERIFIED):** per-`(host,component)` advisory dedup ALREADY exists in
   `orchestrator_detect._resolve_known_vulnerabilities` (`_reported_banner_components`,
