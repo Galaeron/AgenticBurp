@@ -1232,7 +1232,28 @@ B ran clean and is the P2-2 crux).
   it, not silent; negative control -- a healthy run (breaker CLOSED) -> flag False.
 - **Impact:** High (closes a silent false-negative path; the report's own recommendation #3).
 
-### [ ] B2-2 -- Isolate the circuit breaker per run + fail a starvation cascade loudly
+### [x] B2-2 (LOOP half) -- Isolate the circuit breaker per run + fail a starvation cascade loudly
+- **Result (VERIFIED):** `7927d7e` -- OFF/opt-in offline seam added to
+  `harness/circuit_breaker.py` (pure append, +172 / 0 deletions; no existing line,
+  threshold, `_should_trip`/`_should_reset`, `__init__` default, registry, or
+  `get_ollama_circuit_breaker` touched): `reset_ollama_circuit_breaker()`,
+  `scoped_ollama_breaker()` CM (snapshot->reset-CLOSED->restore-on-exit incl. on
+  exception), `raise_if_ollama_starved()` -> `CircuitStarvationError` when OPEN
+  (loud-fail), internal `_set_state()` mutating only the state fields the existing
+  async reset/force-open own. The new API is invoked from NO committed run path
+  (grep-verified: symbols appear only in their defs + the test) -> default behavior
+  byte-for-byte unchanged, the deliberate process-wide singleton sharing preserved.
+  Scoping + loud-fail ONLY; `config.yaml` unchanged; untracked owner driver
+  `run_ablation_live.py` left untouched. +6 caller-level tests
+  (`harness/test_circuit_isolation.py`): isolation positive x2 (run-1 forces OPEN ->
+  scoped/reset run-2 sees CLOSED), loud-fail positive, 2 negative controls (healthy
+  CLOSED -> no raise/no side-effect), 1 asserting the default unscoped path still
+  shares the singleton; setUp/tearDown `.reset()` so no OPEN leaks (fresh-subprocess
+  CLOSED check confirms). smoke exit 0; full **2490 OK / 2 skip, exit 0**.
+  Opus-reviewed APPROVE (additive-only, no-run-path-invocation, sound CM restore-on-
+  exception, non-tautological loud-fail confirmed at source). **OWNER half (out of loop
+  scope, stays open):** raise `ollama.timeout_seconds`, GPU-headroom preflight, or bound
+  per-exchange routing width, and wire the seam into the owner's live ablation re-run.
 - **Domain:** Reliability - **Effort:** M - **Depends on:** B2-1 - **Mode:** LOOP (per-run scoping
   seam + loud-fail + test); **OWNER** (hardware timeout / GPU / routing-width tuning)
 - **Evidence (VERIFIED):** `ABLATION_P2-2.md` -- the breaker is a process-wide shared singleton

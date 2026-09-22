@@ -16,9 +16,12 @@ offline, loop-consumable. Pick order B2-1→B2-2→B2-3→B2-4→B2-5 (reliabili
 B2-1 circuit-breaker `degraded` flag, B2-2 per-run breaker isolation; precision:
 B2-3 issue-level controls-clean, B2-4 REJECT stubbed-testable, B2-5 gate the
 low-confidence FP guesses). **B2-1 done** (`345fcf8`: `agents_circuit_open` on
-`AnalysisResponse` + engagement `errors`→`degraded`, full 2484 OK / 2 skip).
-**Next pick: B2-2** (per-run breaker isolation + loud-fail on a starvation
-cascade; Depends on B2-1 [x]). The RB-1..RB-8 consensus batch is closed.
+`AnalysisResponse` + engagement `errors`→`degraded`). **B2-2 LOOP half done**
+(`7927d7e`: opt-in `scoped_ollama_breaker`/`reset_ollama_circuit_breaker`/
+`raise_if_ollama_starved` seam, additive/off-by-default; OWNER half — hardware
+timeout/GPU tuning + live-driver wiring — stays open). **Next pick: B2-3**
+(issue-level `controls_clean` + per-URL FP attribution in the scorecard; Depends
+on none). Full suite 2490 OK / 2 skip. The RB-1..RB-8 consensus batch is closed.
 
 **External-review borrow batch (2026-09-22): ER-1, ER-2, ER-4** loop-consumable
 (pick order ER-1→ER-2→ER-4), filed from a user-requested eval of external
