@@ -102,6 +102,26 @@ def _idor_finding(basis: str) -> dict:
     }
 
 
+def _dependency_finding() -> dict:
+    """A host-level dependency/banner-class finding (B2-3's dedup test):
+    `known-vulnerable-dependency:*` has no confirmation leg (leg_tier ==
+    "none"), so should_quarantine_as_lead never quarantines it regardless
+    of basis -- it always surfaces, like the real GHA-sourced advisories
+    orchestrator_detect.py produces (see harness/issues.py's
+    _is_dependency_class exemption, which groups these by host+class only,
+    dropping the endpoint/url, so the SAME advisory independently observed
+    on several urls collapses to ONE issue)."""
+    return {
+        "vulnerability_class": "known-vulnerable-dependency:libfoo",
+        "confidence": 0.9,
+        "summary": "libfoo has a disclosed advisory",
+        "evidence": "Seen via response header banner",
+        "suggested_test": "Confirm the exact deployed version falls within the affected range",
+        "basis": "derived",
+        "severity": "medium",
+    }
+
+
 class _CannedFindingModel:
     """Stand-in for OllamaClient -- the ONLY stubbed boundary, matching
     harness/test_pipeline_gate.py's _SilentModel pattern (stub the model,
@@ -114,13 +134,18 @@ class _CannedFindingModel:
     control's NON-lead-eligible guess) without needing a real model.
     `assumed_urls` get a basis='assumed' IDOR guess (lead-eligible);
     `derived_urls` get a basis='derived' IDOR claim (NOT lead-eligible --
-    used only to prove should_quarantine_as_lead discriminates). Every
-    other exchange gets empty findings, like _SilentModel.
+    used only to prove should_quarantine_as_lead discriminates).
+    `dependency_urls` get a host-level dependency/banner finding (see
+    _dependency_finding), used to prove issue-level dedup of the same
+    advisory independently observed on several urls. Every other exchange
+    gets empty findings, like _SilentModel.
     """
 
-    def __init__(self, assumed_urls: frozenset[str] = frozenset(), derived_urls: frozenset[str] = frozenset()):
+    def __init__(self, assumed_urls: frozenset[str] = frozenset(), derived_urls: frozenset[str] = frozenset(),
+                 dependency_urls: frozenset[str] = frozenset()):
         self._assumed_urls = set(assumed_urls)
         self._derived_urls = set(derived_urls)
+        self._dependency_urls = set(dependency_urls)
 
     def _canned(self, user_prompt: str) -> dict:
         for url in self._assumed_urls:
@@ -129,6 +154,9 @@ class _CannedFindingModel:
         for url in self._derived_urls:
             if url in user_prompt:
                 return {"findings": [_idor_finding("derived")], "components": []}
+        for url in self._dependency_urls:
+            if url in user_prompt:
+                return {"findings": [_dependency_finding()], "components": []}
         return {"findings": [], "components": []}
 
     async def chat_json(self, model, system_prompt, user_prompt, temperature=0.1):
@@ -352,6 +380,116 @@ class ControlsCleanMetricTests(unittest.TestCase):
         self.assertEqual(sc["dirty_controls"][0]["url"], _DIRTY_CONTROL_URL)
         self.assertEqual(sc["n_surfaced_findings"], 1)
         self.assertEqual(sc["n_quarantined_leads"], 0)
+
+
+class IssueLevelControlsCleanTests(unittest.TestCase):
+    """B2-3: issue-level controls_clean must (a) dedup duplicate findings on
+    one control url into a single issue, (b) not dirty a control url solely
+    because it is shared with a labeled vuln exchange's own finding, (c)
+    still discriminate a genuinely dirty control, and (d) the scorecard must
+    emit both the raw and issue-level fields plus the driver list."""
+
+    def setUp(self):
+        self.runner = _load_runner_module()
+
+    def test_duplicate_findings_on_one_control_collapse_to_one_issue(self):
+        # POSITIVE 1 (dedup): the SAME host-level dependency/banner advisory
+        # is independently observed on TWO different control urls (the
+        # realistic duplicate-banner pattern -- each exchange gets its own
+        # stored row since the fingerprint includes url). The raw metric
+        # counts 2 dirty urls/findings; the issue-level metric must collapse
+        # them to 1 issue (harness.issues groups dependency-class findings
+        # by host+class only, per _is_dependency_class).
+        exchanges = [
+            _exchange(_CLEAN_CONTROL_URL, "control", "dependency banner on control #1"),
+            _exchange(_DIRTY_CONTROL_URL, "control", "dependency banner on control #2"),
+        ]
+        stub = _CannedFindingModel(dependency_urls=frozenset({_CLEAN_CONTROL_URL, _DIRTY_CONTROL_URL}))
+        cfg = _test_config(self.runner, quarantine_leads=True)
+        with _isolated_store() as tmp:
+            sc = self.runner.run_once(
+                exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
+                orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+            )
+        # Raw metric counts every dirty url separately.
+        self.assertEqual(len(sc["dirty_controls"]), 2, sc["dirty_controls"])
+        self.assertFalse(sc["controls_clean"])
+        # Issue-level metric collapses the identical host-wide advisory to 1 issue.
+        self.assertFalse(sc["controls_clean_issue_level"])
+        self.assertEqual(len(sc["dirty_controls_issue_level"]), 1, sc["dirty_controls_issue_level"])
+        self.assertEqual(sc["dirty_controls_issue_level"][0]["finding_count"], 2)
+        self.assertCountEqual(sc["dirty_controls_issue_level"][0]["affected_instances"],
+                               [_CLEAN_CONTROL_URL, _DIRTY_CONTROL_URL])
+
+    def test_control_sharing_url_with_vuln_exchange_not_dirtied_by_vuln_finding(self):
+        # POSITIVE 2 (URL-reuse fairness): one url is BOTH labeled as the
+        # vuln exchange (ground_truth='idor_lead') and, via a distinct
+        # ground_truth-carrying record for the same url, also intended as a
+        # control -- the realistic case this item targets is a control url
+        # that happens to coincide with a vuln exchange's url. The vuln's
+        # own finding on that shared url must not dirty the issue-level
+        # control metric (whereas the raw per-url metric would).
+        shared_url = _VULN_URL
+        exchanges = [
+            _exchange(shared_url, "idor_lead", "the real vuln, on the shared url"),
+            _exchange(shared_url, "control", "same url also curated as a control"),
+        ]
+        stub = _CannedFindingModel(assumed_urls=frozenset({shared_url}))
+        cfg = _test_config(self.runner, quarantine_leads=False)  # keep the vuln finding surfaced
+        with _isolated_store() as tmp:
+            sc = self.runner.run_once(
+                exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
+                orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+            )
+        # Raw metric: the vuln's own surfaced finding sits on a "control" url
+        # -> falsely dirty.
+        self.assertFalse(sc["controls_clean"], sc["dirty_controls"])
+        self.assertEqual(len(sc["dirty_controls"]), 1)
+        # Issue-level metric: the shared url is excluded from the fair
+        # denominator (ambiguous with a labeled vuln exchange), so it is not
+        # counted dirty from the vuln's own finding.
+        self.assertTrue(sc["controls_clean_issue_level"], sc["dirty_controls_issue_level"])
+        self.assertEqual(sc["dirty_controls_issue_level"], [])
+        self.assertEqual(sc["n_controls_excluded_ambiguous"], 1)
+        self.assertEqual(sc["n_controls_issue_level"], 0)
+
+    def test_scorecard_emits_raw_and_issue_level_fields_and_driver_list(self):
+        # POSITIVE 3 (shape): both metrics and the driver list are present.
+        exchanges = [_exchange(_CLEAN_CONTROL_URL, "control", "clean control")]
+        stub = _CannedFindingModel()
+        cfg = _test_config(self.runner, quarantine_leads=True)
+        with _isolated_store() as tmp:
+            sc = self.runner.run_once(
+                exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
+                orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+            )
+        for key in ("controls_clean", "dirty_controls",
+                    "controls_clean_issue_level", "dirty_controls_issue_level",
+                    "per_control_drivers", "n_controls_issue_level",
+                    "n_controls_excluded_ambiguous"):
+            self.assertIn(key, sc)
+        self.assertIsInstance(sc["per_control_drivers"], list)
+        self.assertTrue(sc["controls_clean"])
+        self.assertTrue(sc["controls_clean_issue_level"])
+
+    def test_genuinely_dirty_control_still_flagged_by_issue_level_metric(self):
+        # NEGATIVE CONTROL: mirrors test_dirty_control_is_detected_not_
+        # quarantined -- a surfaced, non-lead-eligible finding actually
+        # attributable to a control exchange (no url-sharing, no
+        # duplication) must still be flagged dirty by the issue-level
+        # metric. The new metric must not read clean by construction.
+        exchanges = [_exchange(_DIRTY_CONTROL_URL, "control", "secure ticket, but claim is basis=derived")]
+        stub = _CannedFindingModel(derived_urls=frozenset({_DIRTY_CONTROL_URL}))
+        cfg = _test_config(self.runner, quarantine_leads=True)
+        with _isolated_store() as tmp:
+            sc = self.runner.run_once(
+                exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
+                orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+            )
+        self.assertFalse(sc["controls_clean_issue_level"], sc["dirty_controls_issue_level"])
+        self.assertEqual(len(sc["dirty_controls_issue_level"]), 1)
+        self.assertEqual(sc["dirty_controls_issue_level"][0]["url"], _DIRTY_CONTROL_URL)
+        self.assertIn("idor", sc["dirty_controls_issue_level"][0]["vulnerability_class"].lower())
 
 
 class ScorecardShapeTests(unittest.TestCase):

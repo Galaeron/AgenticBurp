@@ -229,6 +229,7 @@ def build_scorecard(
     from harness import store
     from harness.report_generator import generate_markdown_report
     from harness.confirmation_gate import should_quarantine_as_lead
+    from harness.issues import group_findings_into_issues
 
     hosts: list[str] = []
     for e in exchanges:
@@ -261,6 +262,41 @@ def build_scorecard(
     dirty_controls = [f for f in surfaced if f.get("url") in control_urls]
     controls_clean = len(dirty_controls) == 0
 
+    # --- B2-3: issue-level, per-exchange-fair controls_clean (ADDITIVE) ---
+    # The raw metric above has two known biases: (1) it counts RAW findings,
+    # so N duplicate dependency/banner findings on one control URL inflate
+    # the dirty count as N instead of 1 real issue; (2) it attributes a
+    # finding to "the control" by URL string match alone, so a control URL
+    # that is ALSO the url of a labeled vuln exchange gets falsely dirtied
+    # by the vuln's OWN finding. Fix both, without touching the raw fields
+    # above (kept for comparability / existing test expectations).
+    #
+    # Findings carry no exchange id, only a url (see harness/store.py's
+    # all_host_findings), so a finding on a url shared by both a control and
+    # a vuln exchange cannot be attributed to either exchange specifically.
+    # Rather than guess, that url is excluded from the clean denominator
+    # entirely -- it is neither asserted clean nor blamed on the control.
+    vuln_urls = {e["url"] for e in exchanges
+                 if (e.get("ground_truth") or "").strip()
+                 and (e.get("ground_truth") or "").lower() not in CONTROL_GROUND_TRUTH_LABELS}
+    ambiguous_control_urls = control_urls & vuln_urls
+    fair_control_urls = control_urls - ambiguous_control_urls
+
+    control_findings = [f for f in surfaced if f.get("url") in fair_control_urls]
+    dirty_control_issues = group_findings_into_issues(control_findings)
+    controls_clean_issue_level = len(dirty_control_issues) == 0
+    per_control_drivers = [
+        {
+            "issue_id": iss.issue_id,
+            "url": iss.affected_instances[0] if iss.affected_instances else "",
+            "affected_instances": iss.affected_instances,
+            "vulnerability_class": iss.vulnerability_class,
+            "agents": sorted({m.get("agent") or "" for m in iss.members} - {""}),
+            "finding_count": len(iss.members),
+        }
+        for iss in dirty_control_issues
+    ]
+
     elapsed = [o.elapsed_seconds for o in outcomes]
     tokens = [o.tokens_spent for o in outcomes]
     timing = {
@@ -289,6 +325,15 @@ def build_scorecard(
         "controls_clean": controls_clean,
         "dirty_controls": [{"url": f.get("url"), "vulnerability_class": f.get("vulnerability_class")}
                             for f in dirty_controls],
+        # B2-3: fairer, issue-level view alongside the raw metric above --
+        # deduped via harness.issues.group_findings_into_issues, and
+        # excluding control urls that are ambiguous with a labeled vuln
+        # exchange's url (see comment above) from the clean denominator.
+        "n_controls_issue_level": len(fair_control_urls),
+        "n_controls_excluded_ambiguous": len(ambiguous_control_urls),
+        "controls_clean_issue_level": controls_clean_issue_level,
+        "dirty_controls_issue_level": per_control_drivers,
+        "per_control_drivers": per_control_drivers,
         "timing": timing,
         "markdown_reports": markdown_reports,
         "results": [dataclasses.asdict(o) for o in outcomes],
