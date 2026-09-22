@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.circuit_breaker import get_ollama_circuit_breaker
 # W-16: the single TargetTransport. Imported by name (not as the module) because
 # investigate_engagement has a `run_context` parameter that would shadow the module;
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
@@ -1045,6 +1046,19 @@ class ChainMixin:
         except Exception as e:
             log.debug("investigate_engagement: final chain re-link failed: %s", e)
             _errors.append({"phase": "final_chain_relink", "error": f"{type(e).__name__}: {e}"})
+
+        # B2-1: if the shared ollama circuit breaker is OPEN at result assembly,
+        # agent/model calls made during this engagement short-circuited without
+        # hitting the model -- reuse the existing errors -> degraded contract
+        # (R30 above) rather than adding a parallel degraded signal. Best-effort:
+        # must never sink the run.
+        try:
+            if get_ollama_circuit_breaker("ollama").is_open:
+                _errors.append({"phase": "circuit_breaker",
+                                 "error": "ollama circuit breaker is OPEN: agent calls "
+                                          "may have short-circuited during this engagement"})
+        except Exception as e:
+            log.debug("investigate_engagement: circuit breaker check failed: %s", e)
 
         return {
             "summary": state.summary(),

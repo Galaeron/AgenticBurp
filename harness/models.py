@@ -272,6 +272,12 @@ class AnalysisResponse(BaseModel):
     # reason string as a structured flag on the response itself, not just in
     # `telemetry`'s process-wide counters or the logs.
     coordinator_fallback: bool = False
+    # B2-1: True when the shared ollama circuit breaker (harness.circuit_breaker
+    # .get_ollama_circuit_breaker("ollama")) was OPEN during this analysis --
+    # agent/critique calls short-circuited without hitting the model, so this
+    # result is degraded/false-negative-shaped rather than a clean miss.
+    # Observability only: does not change breaker trip/reset behavior.
+    agents_circuit_open: bool = False
     # Astra T01: case-bound structured proof records for this analysis, one per
     # validator attempt (evidence.ProofRecord.to_dict()). This is the API/report
     # surface for structured, verdict-honest evidence -- distinct from the
