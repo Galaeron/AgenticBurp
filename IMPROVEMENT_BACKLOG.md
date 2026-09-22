@@ -1038,7 +1038,26 @@ Verify every proposed diff against the code before implementing.
   no capability is authoritative in both planes. Java behavioural changes are OWNER.
 - **Impact:** Medium.
 
-### [ ] RB-7 — Build the A–F ablation harness (instrument for P2-2)
+### [x] RB-7 — Build the A–F ablation harness (instrument for P2-2)
+- **Result (VERIFIED):** `fa3dd95` — COMPLETED the pre-existing W-22 scaffold
+  `harness/ablation_harness.py` (which had A–F variants + an injectable `variant_runner` +
+  `RunMetrics`/table but B/C/E/F were `needs_implementation` stubs) rather than adding a
+  parallel module (a first draft that duplicated it was removed in review, per "reduce
+  components, don't add"). Wired the real seams: B `force_agents=[single_agent]` → dispatch
+  exactly 1; C disables every agent by name in the RUNTIME config → dispatch 0 (legs/validators
+  still run); D `critique.enabled=False`; F `coordinator.fail_open_mode="curated"`. E stays a
+  documented residual (`needs_implementation` kept + `NO_GRAPH_RESIDUAL`: the graph loop is
+  only reachable via `investigate_engagement`, never `analyze()`, so it needs an owner-run
+  engagement corpus; the runner refuses to present E's row as a measurement). Runner drives
+  synthetic exchanges through the real `analyze()` with a stubbed model, scores via
+  `testing.score.score()` (no second schema), and `render_table` exposes RB-7's schema
+  (precision/recall/FP/tokens/wall-clock, derived from tp/fp/fn) — NO accuracy claim;
+  confirmed/coverage left at defaults not fabricated. RUNTIME overrides only; committed
+  `config.yaml` untouched; import-safe. +tests: B→1, C→0 (strong-signal + signal-free),
+  negative controls (A→≥1 same exchange, `force_agents=[]` does NOT force-empty, D→critique off),
+  all six variants render the schema. Module 29 OK; full suite **2459 OK / 2 skip, exit 0**.
+  Opus-reviewed APPROVE (revised from a duplicate module onto the W-22 scaffold). **The
+  real-model RUN stays OWNER/LIVE → feeds P2-2 (the 36-agent keep/collapse decision).**
 - **Domain:** Evaluation · **Effort:** M · **Depends on:** none · **Mode:** LOOP builds
   the harness (stubbed-model testable); **OWNER/LIVE** runs it with a real model
 - **Evidence (VERIFIED):** P2-2 exists but is owner/live; `POSITIONING_DRAFT.md` says the
