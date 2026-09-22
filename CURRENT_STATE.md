@@ -15,7 +15,21 @@ status and pointers only, not session history.
 offline, loop-consumable. Pick order B2-1→B2-2→B2-3→B2-4→B2-5 (reliability:
 B2-1 circuit-breaker `degraded` flag, B2-2 per-run breaker isolation; precision:
 B2-3 issue-level controls-clean, B2-4 REJECT stubbed-testable, B2-5 gate the
-low-confidence FP guesses). The RB-1..RB-8 consensus batch is closed.
+low-confidence FP guesses). **B2-1 done** (`345fcf8`: `agents_circuit_open` on
+`AnalysisResponse` + engagement `errors`→`degraded`, full 2484 OK / 2 skip).
+**Next pick: B2-2** (per-run breaker isolation + loud-fail on a starvation
+cascade; Depends on B2-1 [x]). The RB-1..RB-8 consensus batch is closed.
+
+**External-review borrow batch (2026-09-22): ER-1, ER-2, ER-4** loop-consumable
+(pick order ER-1→ER-2→ER-4), filed from a user-requested eval of external
+LLM-pentest projects (burpai / hackingBuddyGPT / Strix) against this codebase:
+ER-1 wall-clock dimension for `EffortBudget`, ER-2 canonical per-run ledger trace
+summary, ER-4 optional reproduction-replay determinism gate. ER-3 (timing-based
+blind leg) and ER-5 (per-class agent methodology priming) are filed but FROZEN
+behind P2-2's new-surface freeze — leave `[ ]`, do not pick until P2-2 is `[x]`.
+Most borrow ideas were already present here in more mature form (leg-tiered gate,
+evidence ledger, token `EffortBudget`) and were deliberately not re-filed; B2-1/
+B2-2 already cover breaker-`degraded`/isolation, so ER items reuse them.
 
 ## Verified here (2026-09-21, current HEAD)
 

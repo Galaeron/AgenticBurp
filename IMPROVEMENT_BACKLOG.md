@@ -1194,7 +1194,22 @@ breaker or a second degraded mechanism. **Reliability prerequisite:** B2-1 + B2-
 before a trustworthy P2-2 ablation re-run (prioritise the A-vs-B comparison on that re-run --
 B ran clean and is the P2-2 crux).
 
-### [ ] B2-1 -- Surface circuit-breaker-OPEN as a `degraded` signal on the analysis/engagement result
+### [x] B2-1 -- Surface circuit-breaker-OPEN as a `degraded` signal on the analysis/engagement result
+- **Result (VERIFIED):** `345fcf8` -- `AnalysisResponse` gained `agents_circuit_open`
+  (mirrors RB-2's `coordinator_fallback`), set in `orchestrator_detect.analyze()` at
+  response assembly from the SHARED breaker's `.is_open` via
+  `get_ollama_circuit_breaker("ollama")` (read-only; never a directly-constructed
+  always-CLOSED breaker). Engagement path REUSES the existing `_errors`->`degraded`
+  contract: a best-effort/try-excepted breaker-open error entry flips
+  `result["degraded"]` True (no new field). Observability only -- NO breaker trip/reset
+  threshold logic touched (`circuit_breaker.py` not in diff); `config.yaml` unchanged.
+  +2 caller-level tests (`harness/test_degraded_circuit.py`): POSITIVE -- breaker forced
+  OPEN via `_force_open_async()` -> real `analyze()` -> `agents_circuit_open is True`;
+  NEGATIVE CONTROL -- healthy CLOSED breaker -> `False`; singleton `.reset()` in
+  setUp/tearDown so OPEN state cannot leak into the full suite (verified no leak). smoke
+  92 OK; full **2484 OK / 2 skip, exit 0**. Opus-reviewed APPROVE (read-only shared-accessor
+  read + no-threshold-change + non-tautological test confirmed at source). Non-blocking:
+  the budget-blocked early-return path leaves the flag False (agents not dispatched there).
 - **Domain:** Reliability / Observability / Trust - **Effort:** S - **Depends on:** none - **Mode:** LOOP
 - **Evidence (VERIFIED):** `reviews/2026-09-22/ABLATION_P2-2.md` -- the process-wide shared
   `"ollama"` breaker (`circuit_breaker.get_ollama_circuit_breaker("ollama")`) trips CLOSED->OPEN
@@ -1303,3 +1318,125 @@ B ran clean and is the P2-2 crux).
 > (B2-4, needs the Flask app + active-validator opt-in); the >=5-run variance pass; and the RB-2b
 > `curated` flip decision, now gated on a REJECT-on, issue-level, variance-backed number -- not the
 > single REJECT-off raw-count sample.
+
+---
+
+## External-review borrow batch -- 2026-09-22 (ER-1..ER-5)
+
+Filed from a user-requested objective evaluation (this session) of external LLM-pentest projects
+against this codebase: **burpai** (Java/Montoya + Ollama; timing-based blind detection, AgentLoop,
+TargetMemoryStore/AttackGraph), **hackingBuddyGPT** (run-governance: `max_rounds`/`max_tokens`/
+`max_cost`/`max_duration` + OpenTelemetry JSONL traces + ground-truth `check_success`), and **Strix**
+(no finding without a reproducible PoC). Most of those ideas were found ALREADY PRESENT here in a
+more mature form (leg-tiered `confirmation_gate`, controlled-negative refutation, `EvidenceLedger`,
+`EffortBudget` SOFT/HARD token modes) -- so only the genuinely-additive remainder is filed below.
+
+**De-dup (do NOT re-implement):** surfacing a breaker-OPEN run as `degraded` is already **B2-1**;
+per-run breaker isolation + loud-fail on a starvation cascade is already **B2-2**. ER items must
+REUSE those, not build a parallel mechanism.
+
+**Freeze compliance:** the "Explicitly NOT to build yet" section above freezes *new validators /
+specialist agents* until the **P2-2 ablation** decision lands. ER-3 (new timing leg) and ER-5
+(agent methodology priming) therefore carry `Depends on: P2-2 [ ]` and MUST NOT be picked until
+P2-2 is `[x]` -- they are filed now so the idea isn't lost, not opened for immediate work. **Loop
+pick order (only the unblocked ones):** ER-1 -> ER-2 -> ER-4. `Mode: LOOP` = offline,
+stubbed-model-testable. The non-negotiables at the top of this file apply (safe config defaults, a
+caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.py`,
+`python -m harness.suite full` before closing).
+
+### [ ] ER-1 -- Add a wall-clock/duration dimension to `EffortBudget`
+- **Domain:** Reliability / Governance - **Effort:** S - **Depends on:** none - **Mode:** LOOP
+- **Evidence (VERIFIED by source inspection):** `harness/effort.py:98-150` -- `EffortBudget` gates
+  only on `total_tokens` (SOFT/HARD) and `spent`; there is no time dimension. `allow()` never
+  consults a deadline. The P2-2 stall (`reviews/2026-09-22/ABLATION_P2-2.md`) burned ~720s of
+  wall-clock with no run-level deadline to stop it; B2-2 isolates/loud-fails the *breaker*, but no
+  budget object bounds *elapsed time* independent of the breaker. (Borrowed from hackingBuddyGPT's
+  `max_duration` run limit.)
+- **Problem:** a run can consume unbounded wall-clock (a slow/degraded backend, a long redirect
+  chain, a stuck leg) while still under token budget, with no clean, caller-visible abort.
+- **Recommendation:** add optional `max_duration_s: int | None` (default `None` = track-but-never-
+  block, mirroring `total_tokens=None`) and a monotonic `deadline` set on first spend; extend
+  `allow()` to also return `(False, reason)` when the deadline is passed, with the same SOFT (warn/
+  confirm) vs HARD (stop) semantics already implemented. Ships unset -> byte-for-byte no-op.
+- **Acceptance:** caller-level test -- a budget with a short `max_duration_s` returns `allow()==False`
+  with a duration reason once the deadline passes, HARD stops / SOFT warns-then-confirms; negative
+  control -- `max_duration_s=None` and an under-deadline budget both keep `allow()==True` and are
+  behaviourally identical to today. `full` suite green.
+- **Impact:** Medium-High (a clean elapsed-time stop, complementary to B2-2's breaker isolation).
+
+### [ ] ER-2 -- Emit one canonical per-run trace summary onto the EvidenceLedger
+- **Domain:** Observability / Evaluation - **Effort:** S - **Depends on:** B2-1 - **Mode:** LOOP
+- **Evidence (VERIFIED by source inspection):** `harness/ablation_harness.py:231-278` recomputes
+  tokens / wall-clock / tp-fp-fn ad hoc per arm; `EffortLedger.breakdown()` (`effort.py:90-94`) and
+  the `EvidenceLedger` already hold the raw material, but no single run-summary event ties
+  tokens + duration + degraded-state + tool/leg counts together. (Borrowed from hackingBuddyGPT's
+  JSONL run traces + `log-analyze` aggregate.)
+- **Problem:** run-level metrics the ablation/variance work (P2-2, RB-2b's >=5-run basis) needs are
+  reconstructed by hand each time and are not attached to the auditable ledger stream.
+- **Recommendation:** at orchestrator/engagement teardown emit ONE `EvidenceLedger` run-summary
+  event carrying `EffortLedger.breakdown()`, elapsed wall-clock, the B2-1 `degraded`/
+  `agents_circuit_open` flag, and validator/leg dispatch counts. Reuse the existing ledger +
+  `Provenance.capture`; add NO new logging stack and change no verdict/severity/scope.
+- **Acceptance:** caller-level test -- one driven run emits exactly one run-summary event whose
+  token total equals `EffortLedger.total_tokens` and whose `degraded` matches the B2-1 flag; negative
+  control -- a healthy run reports `degraded=False` and non-zero elapsed. `full` suite green.
+- **Impact:** Medium (cheaper, auditable variance/ablation measurement).
+
+### [ ] ER-4 -- Optional reproduction-replay determinism gate for active confirmation legs
+- **Domain:** Precision / Trust - **Effort:** M - **Depends on:** none - **Mode:** LOOP
+- **Evidence (VERIFIED by source inspection):** active legs stamp `confirmed=True` from a single
+  successful observation (e.g. one OOB callback / one differential); `confirmation_gate` then trusts
+  it. The P0-3 scorecard caveat (`reviews/2026-09-22/BLIND_SCORECARD_P0-3.md`) and P0-6 both flag
+  single-shot confirmations as a precision risk. (Borrowed from Strix's "no finding without a
+  reproducible PoC".)
+- **Problem:** a flaky single observation (transient timing, a shared-state artifact) can produce a
+  `confirmed=True` that would not reproduce, inflating precision.
+- **Recommendation:** add a config-gated `confirm_replay` (DEFAULT OFF, safe-defaults preserved):
+  when on, an active leg that confirms re-runs its confirming request once and only keeps
+  `confirmed=True` if BOTH agree; on disagreement it downgrades to the provisional/unproven path the
+  gate already implements. Start with `ssrf` / `ssti` / `command_injection`. Doubles active traffic
+  only when explicitly enabled; stays within scope/throttle/budget/`allow_mutating_replay`.
+- **Acceptance:** caller-level test -- with `confirm_replay` on, a leg that confirms twice stays
+  CONFIRMED; a leg that confirms once then fails the replay is NOT confirmed (routed to
+  provisional); negative control -- with `confirm_replay` off (shipped default) behaviour and traffic
+  are byte-for-byte unchanged. `full` suite green.
+- **Impact:** Medium (a precision guard for the single-shot-confirmation risk P0-3/P0-6 name).
+
+### [ ] ER-3 -- Time-based blind-injection fallback confirmation leg (provisional tier)  [FROZEN by P2-2]
+- **Domain:** Efficacy / Coverage - **Effort:** L - **Depends on:** P2-2 [ ] (new-validator freeze) - **Mode:** LOOP-BUILD (gated)
+- **Evidence (VERIFIED by source inspection):** no timing/latency confirmation exists -- `grep`
+  `elapsed|latency|timing|perf_counter|response_time` across `harness/validators/` returns nothing;
+  blind SSRF/XXE/command-injection confirmation is OOB-collaborator-only
+  (`harness/validators/registry.py:181-197`). (Borrowed from burpai's `fuzz_parameter`
+  timing-anomaly: response `> N s` absolute OR `> K x` baseline.)
+- **Problem:** the OOB legs cannot confirm on egress-filtered targets where the collaborator callback
+  can't return -- a real blind spot with no fallback today.
+- **Recommendation (do NOT start until P2-2 is `[x]`):** add a `timing_validator` that samples a
+  per-endpoint baseline and flags a payload whose latency exceeds an absolute floor AND a
+  baseline-multiple, requiring multiple confirming samples to control jitter FPs. Register it
+  `active=True` (gated by `active_enabled` + `allow_mutating_replay`); add its markers to
+  `PROVISIONAL_MARKERS` in `confirmation_gate.py` ONLY -- never `LIVE_VERIFIED_MARKERS` (so the gate
+  caps it at medium, matching its higher FP rate).
+- **Acceptance:** caller-level test on a stable-latency fixture -- an injected artificial delay
+  confirms (provisional), a normal endpoint does not; negative control -- a slow-but-benign endpoint
+  under natural jitter is NOT confirmed. `full` suite green. Ships OFF/active-gated.
+- **Impact:** Medium-High if P2-2 keeps the validator layer; **held** so it doesn't widen detection
+  surface before the ablation decides keep/collapse.
+
+### [ ] ER-5 -- Per-class methodology priming for specialist agents  [FROZEN by P2-2]
+- **Domain:** AI / Efficacy - **Effort:** M - **Depends on:** P2-2 [ ] (new-surface freeze) - **Mode:** LOOP-BUILD (gated)
+- **Evidence (SUPPORTED):** external `SnailSploit/Claude-Red` (MIT) carries ~20 concrete web/API/auth
+  attack-methodology skills (SQLi/IDOR/SSRF/etc.) usable as detect-side priming; VulnBot shows the
+  RAG-over-methodology pattern. This codebase primes agents from `agents/base_agent._COMMON_RULES`
+  + a specialty prompt, with no per-class methodology corpus keyed off `categories.py`.
+- **Problem:** detection priming is generic; concrete per-class methodology could lift recall on the
+  detect side -- but this expands the detection surface the P2-2 ablation is meant to justify first.
+- **Recommendation (do NOT start until P2-2 is `[x]`):** curate the MIT web/API/auth methodology
+  into per-class prompt snippets keyed on `categories.canonicalize`, injected into the matching
+  specialist agent's prompt only. Prompt-only (no new agent module, no new send authority); attribute
+  the MIT source. Keep behind a default-off flag and measure recall ON vs OFF on P0-3's corpus.
+- **Acceptance:** caller-level test -- the SQLi/IDOR specialist prompt includes its class snippet when
+  the flag is on and is byte-for-byte unchanged when off (negative control); `_prompt_version` bumps
+  only when on. Efficacy (owner-reported) -- recall ON vs OFF on the P0-3 corpus, kept only if it
+  helps without hurting precision. `full` suite green.
+- **Impact:** Medium (cheap recall lever) -- **held** behind P2-2 to avoid growing surface pre-ablation.
