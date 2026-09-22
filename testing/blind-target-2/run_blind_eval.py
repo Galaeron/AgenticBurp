@@ -86,6 +86,16 @@ CONTROL_GROUND_TRUTH_LABELS = frozenset({
     "confirmed_secure", "control", "secure", "negative_control", "true_negative",
 })
 
+# B2-3 CORRECTIONS (item 4): a FIXED allow-set of ground-truth labels that
+# count as a vuln for the issue-level fairness exclusion below -- NOT "any
+# label that isn't a control". "confirmed_vuln" is the label the real
+# curated blind_eval_exchanges.json actually uses for its two positive
+# exchanges (verified by inspecting its ground_truth values, same as
+# CONTROL_GROUND_TRUTH_LABELS above). Deliberately excludes "inconclusive"
+# -- an inconclusive exchange sharing a (method,url) with a control must
+# NOT remove that control from the fair denominator (see item 4 test).
+_VULN_LABELS = frozenset({"confirmed_vuln"})
+
 
 # ---------------------------------------------------------------------------
 # Config / exchange loading -- pure functions, no side effects.
@@ -229,7 +239,7 @@ def build_scorecard(
     from harness import store
     from harness.report_generator import generate_markdown_report
     from harness.confirmation_gate import should_quarantine_as_lead
-    from harness.issues import group_findings_into_issues
+    from harness.issues import group_findings_into_issues, _is_dependency_class
 
     hosts: list[str] = []
     for e in exchanges:
@@ -263,38 +273,100 @@ def build_scorecard(
     controls_clean = len(dirty_controls) == 0
 
     # --- B2-3: issue-level, per-exchange-fair controls_clean (ADDITIVE) ---
-    # The raw metric above has two known biases: (1) it counts RAW findings,
-    # so N duplicate dependency/banner findings on one control URL inflate
-    # the dirty count as N instead of 1 real issue; (2) it attributes a
-    # finding to "the control" by URL string match alone, so a control URL
-    # that is ALSO the url of a labeled vuln exchange gets falsely dirtied
-    # by the vuln's OWN finding. Fix both, without touching the raw fields
-    # above (kept for comparability / existing test expectations).
+    # The raw metric above has known biases: (1) it counts RAW findings, so
+    # N duplicate dependency/banner findings on one control URL inflate the
+    # dirty count as N instead of 1 real issue; (2) it attributed a finding
+    # to "the control" by URL string match alone, so a DELETE control could
+    # be silently dropped from the denominator whenever its URL was also hit
+    # by a GET vuln exchange, hiding a real false positive on the control
+    # itself; (3) it treated ANY non-control ground-truth label (including
+    # "inconclusive") as a vuln for that exclusion. Fixed below, without
+    # touching the raw fields above (kept for comparability).
     #
-    # Findings carry no exchange id, only a url (see harness/store.py's
-    # all_host_findings), so a finding on a url shared by both a control and
-    # a vuln exchange cannot be attributed to either exchange specifically.
-    # Rather than guess, that url is excluded from the clean denominator
-    # entirely -- it is neither asserted clean nor blamed on the control.
-    vuln_urls = {e["url"] for e in exchanges
-                 if (e.get("ground_truth") or "").strip()
-                 and (e.get("ground_truth") or "").lower() not in CONTROL_GROUND_TRUTH_LABELS}
-    ambiguous_control_urls = control_urls & vuln_urls
-    fair_control_urls = control_urls - ambiguous_control_urls
+    # Findings carry both a `url` AND a `method` (see harness/store.py's
+    # all_host_findings), so attribution is keyed on the (method, url) pair,
+    # not the url alone -- a GET vuln exchange and a DELETE control that
+    # happen to share a URL are distinguishable, and only a control whose
+    # OWN (method, url) exactly matches a vuln exchange's (method, url) is
+    # excluded from the fair denominator (neither asserted clean nor blamed
+    # on the control -- genuinely ambiguous attribution).
+    # Method normalized to uppercase AT CONSTRUCTION (not just downstream at
+    # finding-attribution time) -- otherwise a control record with
+    # method="delete" and a vuln with method="DELETE" on the same url fail
+    # to intersect, the control wrongly stays in the fair denominator, and
+    # the vuln's (uppercased) finding then falsely dirties it: the exact
+    # hidden-FP bug this correction exists to prevent, just reintroduced via
+    # case mismatch instead of a bare-url match.
+    control_pairs = {((e.get("method") or "").upper(), e["url"]) for e in exchanges
+                      if (e.get("ground_truth") or "").lower() in CONTROL_GROUND_TRUTH_LABELS}
+    vuln_pairs = {((e.get("method") or "").upper(), e["url"]) for e in exchanges
+                  if (e.get("ground_truth") or "").lower() in _VULN_LABELS}
+    ambiguous_control_pairs = control_pairs & vuln_pairs
+    fair_control_pairs = control_pairs - ambiguous_control_pairs
+    fair_control_urls = {u for _m, u in fair_control_pairs}
 
-    control_findings = [f for f in surfaced if f.get("url") in fair_control_urls]
-    dirty_control_issues = group_findings_into_issues(control_findings)
+    def _pair(f: dict) -> tuple[str, str]:
+        return ((f.get("method") or "").upper(), f.get("url") or "")
+
+    # DESIGN DECISION (item 12): host-wide dependency/banner findings are
+    # host+component scoped, not endpoint-scoped (see harness/issues.py's
+    # _is_dependency_class / issue_key, which already groups this family by
+    # host+class only, dropping the endpoint and method). They must not mark
+    # a specific control "dirty" -- surfaced separately below instead.
+    endpoint_scoped_surfaced = [f for f in surfaced if not _is_dependency_class(f.get("vulnerability_class", ""))]
+    dependency_surfaced = [f for f in surfaced if _is_dependency_class(f.get("vulnerability_class", ""))]
+
+    fair_control_findings = [f for f in endpoint_scoped_surfaced if _pair(f) in fair_control_pairs]
+    dirty_control_issues = group_findings_into_issues(fair_control_findings)
     controls_clean_issue_level = len(dirty_control_issues) == 0
+
+    # finding (by identity) -> the issue id it landed in, so the per-control
+    # driver list below can report which issue(s) touch each dirty control.
+    finding_issue_id: dict[int, str] = {}
+    for iss in dirty_control_issues:
+        for m in iss.members:
+            finding_issue_id[id(m)] = iss.issue_id
+
+    dirty_pairs_seen: list[tuple[str, str]] = []
+    findings_by_pair: dict[tuple[str, str], list[dict]] = {}
+    for f in fair_control_findings:
+        pair = _pair(f)
+        if pair not in findings_by_pair:
+            findings_by_pair[pair] = []
+            dirty_pairs_seen.append(pair)
+        findings_by_pair[pair].append(f)
+
+    # Item 7/9: ONE entry per dirty control (keyed by method+url), not per
+    # issue -- a host-wide issue used to become one entry with only its
+    # first url; now every dirty control gets its own entry listing the
+    # issue id(s), vulnerability classes, and agents observed on it.
     per_control_drivers = [
         {
+            "method": method,
+            "url": url,
+            "issue_ids": sorted({finding_issue_id.get(id(m)) for m in members} - {None}),
+            "vulnerability_classes": sorted({m.get("vulnerability_class") or "" for m in members} - {""}),
+            "agents": sorted({m.get("agent") or "" for m in members} - {""}),
+            "finding_count": len(members),
+        }
+        for (method, url), members in ((p, findings_by_pair[p]) for p in dirty_pairs_seen)
+    ]
+    n_controls_issue_level = len(fair_control_pairs)
+    n_controls_clean_issue_level = n_controls_issue_level - len(dirty_pairs_seen)
+
+    # Item 12: dependency/banner findings observed on a (fair) control URL,
+    # reported separately -- informational, never dirties a specific control.
+    host_level_issues_on_controls = [
+        {
             "issue_id": iss.issue_id,
-            "url": iss.affected_instances[0] if iss.affected_instances else "",
-            "affected_instances": iss.affected_instances,
             "vulnerability_class": iss.vulnerability_class,
+            "affected_instances": iss.affected_instances,
             "agents": sorted({m.get("agent") or "" for m in iss.members} - {""}),
             "finding_count": len(iss.members),
         }
-        for iss in dirty_control_issues
+        for iss in group_findings_into_issues(
+            [f for f in dependency_surfaced if (f.get("url") or "") in fair_control_urls]
+        )
     ]
 
     elapsed = [o.elapsed_seconds for o in outcomes]
@@ -326,14 +398,18 @@ def build_scorecard(
         "dirty_controls": [{"url": f.get("url"), "vulnerability_class": f.get("vulnerability_class")}
                             for f in dirty_controls],
         # B2-3: fairer, issue-level view alongside the raw metric above --
-        # deduped via harness.issues.group_findings_into_issues, and
-        # excluding control urls that are ambiguous with a labeled vuln
-        # exchange's url (see comment above) from the clean denominator.
-        "n_controls_issue_level": len(fair_control_urls),
-        "n_controls_excluded_ambiguous": len(ambiguous_control_urls),
+        # keyed on (method, url) not url alone, deduped via
+        # harness.issues.group_findings_into_issues, excluding (method, url)
+        # pairs ambiguous with a labeled vuln exchange from the clean
+        # denominator, and excluding host-wide dependency/banner findings
+        # from the per-control dirty/clean decision entirely (item 12 --
+        # see host_level_issues_on_controls below).
+        "n_controls_issue_level": n_controls_issue_level,
+        "n_controls_clean_issue_level": n_controls_clean_issue_level,
+        "n_controls_excluded_ambiguous": len(ambiguous_control_pairs),
         "controls_clean_issue_level": controls_clean_issue_level,
-        "dirty_controls_issue_level": per_control_drivers,
         "per_control_drivers": per_control_drivers,
+        "host_level_issues_on_controls": host_level_issues_on_controls,
         "timing": timing,
         "markdown_reports": markdown_reports,
         "results": [dataclasses.asdict(o) for o in outcomes],
@@ -399,6 +475,10 @@ _VARIANCE_METRICS: list[tuple[str, Callable[[dict], float]]] = [
     ("n_quarantined_leads", lambda sc: float(sc["n_quarantined_leads"])),
     ("n_surfaced_findings", lambda sc: float(sc["n_surfaced_findings"])),
     ("controls_clean", lambda sc: 1.0 if sc["controls_clean"] else 0.0),
+    # Item 5: the issue-level (fair) metric RB-2b's >=5-run variance pass
+    # actually needs to depend on, alongside the raw one above.
+    ("controls_clean_issue_level", lambda sc: 1.0 if sc["controls_clean_issue_level"] else 0.0),
+    ("n_controls_clean_issue_level", lambda sc: float(sc["n_controls_clean_issue_level"])),
     ("total_elapsed_seconds", lambda sc: float(sc["timing"]["total_elapsed_seconds"])),
     ("total_tokens_spent", lambda sc: float(sc["timing"]["total_tokens_spent"])),
 ]
@@ -491,6 +571,9 @@ def _live_main() -> None:
           f"errors: {scorecard['n_errors']}")
     print(f"surfaced: {scorecard['n_surfaced_findings']} | quarantined-as-leads: {scorecard['n_quarantined_leads']} "
           f"| controls_clean: {scorecard['controls_clean']} ({scorecard['n_controls']} control(s))")
+    print(f"controls_clean_issue_level: {scorecard['controls_clean_issue_level']} "
+          f"({scorecard['n_controls_clean_issue_level']}/{scorecard['n_controls_issue_level']} clean, "
+          f"{scorecard['n_controls_excluded_ambiguous']} excluded ambiguous)")
     print(f"fail-open triggered: {scorecard['fail_open_stats_final']['count']} times  (mode={fail_open_mode!r})")
     print(f"timing: {scorecard['timing']}")
     print(f"results -> {DEFAULT_OUT_PATH}")
