@@ -9,6 +9,8 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
+import uuid
+
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 # W-16: the single TargetTransport. Imported by name (not as the module) because
 # investigate_engagement has a `run_context` parameter that would shadow the module;
@@ -437,7 +439,33 @@ class ChainMixin:
             _confirmation_cache[key] = result
             return result
 
-        def _apply(finding, res, leg, floor):
+        # RB-4/INV-2: this path (worklist_investigator's confirm_fn for agent
+        # findings, and its precondition_fn for every shape-driven leg dispatch
+        # through _confirm/_apply below) used to stamp `confirmed`/
+        # `confirmed_by_leg` with NO persisted ProofRecord and NO evidence_ledger
+        # VALIDATION_DECISION behind it -- the exact GT04/05/06 gap INV-2 traced
+        # (docs/investigations/INV-2-proof-gap.md). One run-scoped id (not
+        # per-call) so every case _apply builds this run shares a stable
+        # run_id, matching how PASS1's RunContext-derived run_id is stable across
+        # one analyze() call.
+        _rb4_run_id = run_context.run_id if run_context is not None else uuid.uuid4().hex
+        from harness.categories import canonicalize as _rb4_canon
+        from harness import evidence_ledger
+
+        def _rb4_principal_for(exchange) -> str:
+            """Best-effort identity label for the case: the role whose headers
+            match this exchange's request headers, else "" (anonymous/unlabelled).
+            Only affects case-identity bookkeeping, never the confirmation verdict."""
+            hdrs = dict(exchange.request_headers or {})
+            if not hdrs:
+                return "anonymous"
+            for r in roles:
+                if dict(r.headers or {}) == hdrs:
+                    pid = getattr(r, "principal_id", None)
+                    return str(pid()) if callable(pid) else (getattr(r, "role", None) or "")
+            return ""
+
+        async def _apply(finding, res, leg, floor, exchange):
             if res is not None and res.status == "confirmed" and res.confirmed:
                 finding["confirmed"] = True
                 finding["confidence"] = max(float(finding.get("confidence", 0) or 0), float(res.confidence or floor))
@@ -451,6 +479,62 @@ class ChainMixin:
                 # here), and until now it stamped confirmation ONLY into the
                 # free-text evidence string, recoverable only by regex.
                 finding["confirmed_by_leg"] = leg.replace("-", "_")
+                # RB-4/INV-2: route this GENUINE confirmation through the SAME
+                # proof persistence + evidence_ledger emission PASS1's
+                # _validate_findings uses (ConfirmMixin._persist_confirmation_proof)
+                # -- reused, not reimplemented. Only reached when res.confirmed is
+                # True (this whole block is inside that check), so a suppressed/
+                # not-confirmed leg NEVER builds a case or persists a proof here --
+                # no orphan proofs. Best-effort: any failure is logged and
+                # swallowed, exactly like the coverage-driven leg's _coverage_proof
+                # -- a proof/ledger hiccup must never sink the graph loop or alter
+                # the confirmation this function already decided above.
+                try:
+                    check_id = (_rb4_canon(finding.get("vulnerability_class") or "")
+                               or (finding.get("vulnerability_class") or ""))
+                    template_id = evidence._short(
+                        (exchange.method or "").upper(), exchange.url or "",
+                        exchange.request_body or "")
+                    case = evidence.TestCaseRef.make(
+                        run_id=_rb4_run_id, request_template_id=template_id,
+                        check_id=check_id, principal_id=_rb4_principal_for(exchange))
+                    validator_name = leg.replace("-", "_")
+                    ok, proof_dict, reason = await self._persist_confirmation_proof(
+                        case=case, validator_name=validator_name,
+                        status=res.status, confirmed=res.confirmed,
+                        observed_result=(res.summary or res.evidence or "")[:500],
+                        finding_ref=case.case_id,
+                        ledger_summary=(f"{validator_name}: {res.status} (confirmed)"
+                                        + (f" -- {res.summary}" if res.summary else "")),
+                        ledger_data={"validator": validator_name, "status": res.status,
+                                     "confirmed": True, "confidence": res.confidence,
+                                     "evidence": (res.evidence or "")[:1000]})
+                    if ok:
+                        finding["proof_id"] = proof_dict["proof_id"]
+                        finding["case_id"] = case.case_id
+                        # The shape-driven legs' own probes (e.g.
+                        # CrossIdentityValidator) don't thread case_ref through the
+                        # shared TargetTransport, so a real reconstruct_persisted()
+                        # read would otherwise see no EXECUTION event at all for
+                        # this case (what_sent/what_came_back would stay empty even
+                        # though `complete` is already True from VALIDATION_DECISION
+                        # above). Stamp one summary EXECUTION event from data
+                        # already in hand here -- instrumentation only, via the
+                        # SAME evidence_ledger.emit API, never a second ledger.
+                        evidence_ledger.emit(
+                            evidence_ledger.EventType.EXECUTION, case.case_id,
+                            f"{validator_name} probe against {exchange.url}"[:500],
+                            data={"request": f"{(exchange.method or 'GET').upper()} {exchange.url}",
+                                  "response": (res.evidence or res.summary or "")[:1000]},
+                            provenance=evidence_ledger.Provenance.capture(
+                                config=getattr(self, "config", {})),
+                            case_ref=case.case_id)
+                    else:
+                        log.debug("RB-4: engagement-path proof persistence failed for "
+                                 "%s leg on %s: %s", validator_name, exchange.url, reason)
+                except Exception as e:
+                    log.debug("RB-4: engagement-path proof bookkeeping failed for "
+                             "%s leg on %s: %s", leg, exchange.url, e)
 
         def _as_finding(finding, default_class):
             return Finding(vulnerability_class=finding.get("vulnerability_class") or default_class,
@@ -488,15 +572,15 @@ class ChainMixin:
                         if _owned is not None:
                             await _owned.aclose()
                 try:
-                    _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9)
+                    await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9, exchange)
                 except Exception:
                     return
             elif ("dom" in low and "xss" in low) or "dom_xss" in low or "dom-based" in low or "client-side xss" in low:
                 # DOM-based XSS: fragment-payload browser execution (client-side
                 # source->sink), distinct from server-reflected browser_xss.
                 try:
-                    _apply(finding, await _cached_validate(_domxss, _as_finding(finding, "dom_xss"), exchange),
-                           "dom-xss", 0.95)
+                    await _apply(finding, await _cached_validate(_domxss, _as_finding(finding, "dom_xss"), exchange),
+                           "dom-xss", 0.95, exchange)
                 except Exception:
                     return
             elif "xss" in low or "cross-site scripting" in low or "cross_site" in low:
@@ -504,49 +588,49 @@ class ChainMixin:
                 # XSS and (crucially for a JSON API) declines what never reaches an HTML
                 # sink. Skips gracefully if no browser engine is installed.
                 try:
-                    _apply(finding, await _cached_validate(_bxss, _as_finding(finding, "xss"), exchange), "browser-xss", 0.95)
+                    await _apply(finding, await _cached_validate(_bxss, _as_finding(finding, "xss"), exchange), "browser-xss", 0.95, exchange)
                     # reflected browser_xss handles GET reflections; a write-shaped
                     # exchange may instead be a STORED-XSS plant point -- try that leg too.
                     if not finding.get("confirmed") and (exchange.method or "GET").upper() in ("POST", "PUT", "PATCH"):
-                        _apply(finding, await _cached_validate(_sxss, _as_finding(finding, "xss"), exchange), "stored-xss", 0.9)
+                        await _apply(finding, await _cached_validate(_sxss, _as_finding(finding, "xss"), exchange), "stored-xss", 0.9, exchange)
                 except Exception:
                     return
             elif "jwt" in low or "algorithm confusion" in low or "algorithm_confusion" in low or "weak_token" in low:
                 try:
-                    _apply(finding, await _cached_validate(_jwt, _as_finding(finding, "jwt"), exchange), "jwt-forge", 0.9)
+                    await _apply(finding, await _cached_validate(_jwt, _as_finding(finding, "jwt"), exchange), "jwt-forge", 0.9, exchange)
                 except Exception:
                     return
             elif "ssrf" in low or "server-side request" in low or "server_side_request" in low:
                 try:
-                    _apply(finding, await _cached_validate(_ssrf, _as_finding(finding, "ssrf"), exchange), "ssrf", 0.95)
+                    await _apply(finding, await _cached_validate(_ssrf, _as_finding(finding, "ssrf"), exchange), "ssrf", 0.95, exchange)
                 except Exception:
                     return
             elif "xxe" in low or "xml external" in low or "xml_external" in low:
                 try:
-                    _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange), "xxe", 0.95)
+                    await _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange), "xxe", 0.95, exchange)
                 except Exception:
                     return
             elif "command" in low or low in ("rce", "remote code execution", "code injection", "shell injection"):
                 try:
-                    _apply(finding, await _cached_validate(_cmdi, _as_finding(finding, "command_injection"), exchange),
-                           "command-injection", 0.95)
+                    await _apply(finding, await _cached_validate(_cmdi, _as_finding(finding, "command_injection"), exchange),
+                           "command-injection", 0.95, exchange)
                 except Exception:
                     return
             elif "ssti" in low or "template injection" in low:
                 try:
-                    _apply(finding, await _cached_validate(_ssti, _as_finding(finding, "ssti"), exchange), "ssti", 0.95)
+                    await _apply(finding, await _cached_validate(_ssti, _as_finding(finding, "ssti"), exchange), "ssti", 0.95, exchange)
                 except Exception:
                     return
             elif "traversal" in low or "lfi" in low or "file inclusion" in low:
                 try:
-                    _apply(finding, await _cached_validate(_path, _as_finding(finding, "path_traversal"), exchange),
-                           "path-traversal", 0.95)
+                    await _apply(finding, await _cached_validate(_path, _as_finding(finding, "path_traversal"), exchange),
+                           "path-traversal", 0.95, exchange)
                 except Exception:
                     return
             elif "redirect" in low:
                 try:
-                    _apply(finding, await _cached_validate(_redir, _as_finding(finding, "open_redirect"), exchange),
-                           "open-redirect", 0.9)
+                    await _apply(finding, await _cached_validate(_redir, _as_finding(finding, "open_redirect"), exchange),
+                           "open-redirect", 0.9, exchange)
                 except Exception:
                     return
             elif ("toctou" in low or "time-of-check" in low or "time of check" in low
@@ -555,41 +639,41 @@ class ChainMixin:
                 # TOCTOU privilege-escalation race: concurrent check-then-write.
                 # Must precede the mass/privilege->sequence branch below.
                 try:
-                    _apply(finding, await _cached_validate(_toctou, _as_finding(finding, "toctou"), exchange),
-                           "toctou", 0.85)
+                    await _apply(finding, await _cached_validate(_toctou, _as_finding(finding, "toctou"), exchange),
+                           "toctou", 0.85, exchange)
                 except Exception:
                     return
             elif "mass" in low or "assignment" in low or "privilege" in low or low in ("api_security", "api security"):
                 try:
-                    _apply(finding, await _cached_validate(_seq, _as_finding(finding, "mass_assignment"), exchange),
-                           "sequence", 0.9)
+                    await _apply(finding, await _cached_validate(_seq, _as_finding(finding, "mass_assignment"), exchange),
+                           "sequence", 0.9, exchange)
                 except Exception:
                     return
             elif "deserial" in low or "pickle" in low or "object injection" in low:
                 try:
-                    _apply(finding, await _cached_validate(_deser, _as_finding(finding, "deserialization"), exchange),
-                           "deserialization", 0.95)
+                    await _apply(finding, await _cached_validate(_deser, _as_finding(finding, "deserialization"), exchange),
+                           "deserialization", 0.95, exchange)
                 except Exception:
                     return
             elif ("session fixation" in low or "session_fixation" in low or "weak password" in low
                   or "weak_password" in low or "enumeration" in low or "broken authentication" in low
                   or "broken_authentication" in low):
                 try:
-                    _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange),
-                           "auth-sequence", 0.85)
+                    await _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange),
+                           "auth-sequence", 0.85, exchange)
                 except Exception:
                     return
             elif "rate limit" in low or "rate_limit" in low or "lockout" in low or "brute" in low:
                 try:
-                    _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange),
-                           "rate-limit", 0.85)
+                    await _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange),
+                           "rate-limit", 0.85, exchange)
                 except Exception:
                     return
             elif ("reset_token" in low or "reset token" in low or "predictable token" in low
                   or "weak token" in low or "token entropy" in low):
                 try:
-                    _apply(finding, await _cached_validate(_reset, _as_finding(finding, "reset_token"), exchange),
-                           "reset-token", 0.9)
+                    await _apply(finding, await _cached_validate(_reset, _as_finding(finding, "reset_token"), exchange),
+                           "reset-token", 0.9, exchange)
                 except Exception:
                     return
 
