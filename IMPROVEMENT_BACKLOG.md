@@ -257,6 +257,14 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 - **Evidence (VERIFIED):** overlapping layers — `testing/score.py`,
   `testing/nightly_precision.py`, standalone `evaluation_integrity/`, and
   `harness/{score_provenance,evidence_audit,coverage_summary,eval_health}.py`.
+- **Update (2026-09-22, VERIFIED by source inspection):** the layers now also include
+  `testing/blind-target-2/run_blind_eval.py` (`build_scorecard`, `_VARIANCE_METRICS`) and
+  `harness/ablation_harness.py` (per-arm tp/fp/fn, see ER-2's evidence), each recomputing
+  precision/controls metrics its own way. Concrete cost: B2-3's metric landed in one driver only,
+  shipped a url-only attribution bug (B2-3b) and never reached the variance aggregation. P0-3 is
+  `[x]`, so the dependency is met. Suggested first slice: one shared metrics module (controls-clean
+  raw + issue-level, precision/recall, variance) imported by both `run_blind_eval.py` and
+  `ablation_harness.py`, before touching the older layers.
 - **Recommendation:** Consolidate to one evaluation entry point that consumes the
   provenance/health helpers as libraries, with a single documented output schema.
 - **Acceptance criteria:** One command produces the scorecard + provenance + health
@@ -1316,6 +1324,56 @@ B ran clean and is the P2-2 crux).
   scorecard emits raw + issue-level controls-clean + the per-control driver list.
 - **Impact:** Medium-High (the fair denominator P0-3/RB-2b needs).
 
+### [x] B2-3b -- Attribute control findings by (method, url), not url alone (corrects B2-3)
+- **Result (VERIFIED):** `e560f6e` -- `build_scorecard` now keys `control_pairs`/`vuln_pairs`
+  on `(method.upper(), url)` at construction, so the ambiguity intersection, the
+  `n_controls_issue_level` denominator, and the finding-attribution `_pair(f)` share one
+  uppercased case-space; a control is excluded only when a labeled vuln has the SAME method
+  AND url. Vuln labels restricted to explicit `_VULN_LABELS={'confirmed_vuln'}` (inconclusive
+  no longer removes a control). Host-wide banner/dependency findings
+  (`harness.issues._is_dependency_class`, read-only) split into new
+  `host_level_issues_on_controls` and excluded from the per-control decision (architect
+  ruling: host-scoped, not endpoint-scoped). `per_control_drivers` one entry per dirty
+  `(method,url)`; duplicate `dirty_controls_issue_level` key removed; added
+  `n_controls_clean_issue_level`/`n_controls_issue_level` counts, issue-level metric added to
+  `_VARIANCE_METRICS`/`aggregate_variance` and the `_live_main` summary; raw fields untouched.
+  Testing-side only (`harness/issues.py`+`config.yaml` untouched). +tests (23 total in
+  `test_blind_eval_harness.py`): rewritten URL-reuse (GET vuln vs DELETE control clean),
+  hidden-FP guard (DELETE control with own finding -> `controls_clean_issue_level` False, RED
+  against url-only logic), mixed-case same-method guard (`delete` vs `DELETE`, RED against
+  raw-case construction), host-wide-exclusion, inconclusive-not-excluding, genuinely-dirty
+  negative control. smoke 92 OK; full **2490 OK / 2 skip** (testing tier 36), exit 0.
+  Opus-reviewed APPROVE after one REVISE (method-case was normalized only downstream; fixed at
+  source + a mixed-case regression test added). **OWNER re-run:** the real-model blind scorecard
+  now reports the fair (method,url)-attributed issue-level number.
+- **Domain:** Evaluation - **Effort:** S - **Depends on:** B2-3 - **Mode:** LOOP builds; OWNER re-runs
+- **Evidence (VERIFIED, 2026-09-22, stubbed repro):** `e05c821`'s `build_scorecard` keys control and
+  vuln exchanges by url only and excludes any shared url from the issue-level denominator, on the
+  premise that findings "carry no exchange id, only a url". Stored findings also carry `method`
+  (`store.py` `findings.method`, returned by `all_host_findings`, part of `finding_fingerprint`), and
+  the corpus's shared url splits by method: exchange 5 `GET /api/tickets/1` (`confirmed_vuln`) vs
+  exchange 7 `DELETE /api/tickets/1` (`confirmed_secure`). Repro (GET vuln + DELETE control on one
+  url, each with a surfaced finding): raw `controls_clean=False` (2 dirty) but
+  `controls_clean_issue_level=True`, `dirty_controls_issue_level=[]`,
+  `n_controls_excluded_ambiguous=1` -- the DELETE control's own FP is hidden. The URL-reuse test
+  passes only because `_exchange()` hardcodes `method: "GET"` for both exchanges.
+- **Problem:** the "fair" metric can read clean while a control is dirty -- the opposite of B2-3's
+  intent -- and it is the number RB-2b is gated on. Secondary: any non-control label (including the
+  corpus's 2 `inconclusive`) counts as a vuln for exclusion; the issue-level metric is missing from
+  `_VARIANCE_METRICS` and the `_live_main` summary; `per_control_drivers` is per issue (a multi-control
+  banner issue reports only `affected_instances[0]`) and duplicates `dirty_controls_issue_level`.
+- **Recommendation:** key the issue-level control/vuln sets on `(method.upper(), url)`; exclude only
+  when a labeled vuln exchange has the same method AND url. Use an explicit vuln-label set instead of
+  "any non-control label". Add the issue-level metric plus a clean/total count to
+  `_VARIANCE_METRICS` and the console summary. Make the driver list per control `(method, url)`; drop
+  or differentiate the alias key. Leave the raw fields untouched for comparability.
+- **Acceptance:** stubbed tests -- GET vuln + DELETE control on one url: the control is in the
+  denominator and clean when only the vuln has a finding; the same pair with a surfaced finding on
+  the DELETE control -> `controls_clean_issue_level=False` (NEGATIVE control, the repro above); a
+  same-method-and-url pair is still excluded; an `inconclusive` exchange sharing a control's
+  method+url does not exclude it; `aggregate_variance` reports the issue-level metric. `full` green.
+- **Impact:** High (otherwise the owner re-run reports a wrong fair number). **Pick before B2-4.**
+
 ### [ ] B2-4 -- Make `cross_identity_reject` stubbed-testable + recorded in the manifest
 - **Domain:** Evaluation / Precision - **Effort:** M - **Depends on:** none - **Mode:** LOOP builds
   (stubbed); **OWNER/LIVE** runs it (needs `validators.active_enabled` + the blind-target-2 Flask app
@@ -1482,3 +1540,106 @@ caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.
   only when on. Efficacy (owner-reported) -- recall ON vs OFF on the P0-3 corpus, kept only if it
   helps without hurting precision. `full` suite green.
 - **Impact:** Medium (cheap recall lever) -- **held** behind P2-2 to avoid growing surface pre-ablation.
+
+---
+
+## Architecture rebalance batch -- 2026-09-22 (AR-1..AR-3)
+
+Filed from a user-requested architecture review (this session: `docs/ARCHITECTURE.md`, a
+module/config survey, and the P0-3/P2-2 live-run reports). Verdict: the core shape is sound (the
+model proposes, deterministic legs confirm, `confirmation_gate` routes unconfirmed findings to
+leads, evidence ledger, layered scope/safety) -- do NOT rewrite. The items below move weight off the
+parts the live runs show failing. A fourth concern, the overlapping evaluation layers, is already
+**P1-3**; new evidence was added there instead of filing a duplicate.
+
+**Freeze compliance:** AR-1 builds a consolidation *candidate* for P2-2 to measure. It adds no
+detection class or validator and ships OFF, matching P2-2's own recommendation (collapse to agent
+families if recall holds) and the "prefer changes that reduce components" rationale above.
+**De-dup:** AR-2 generalizes B2-2's opt-in breaker seam and subsumes the "live-driver wiring" part
+of B2-2's OWNER half; it must reuse `scoped_ollama_breaker`/`raise_if_ollama_starved` semantics, not
+build a second breaker. **Pick order within the batch:** AR-2 -> AR-3 -> AR-1. Placement relative to
+Batch 2 / ER is the owner's call; recommended before the P2-2 re-run (AR-2 is a reliability
+prerequisite; AR-1 supplies the collapse candidate). The non-negotiables at the top of this file
+apply (safe config defaults, a caller-test + negative control per item, never read
+`*ANSWER_KEY*`/a blind `app.py`, `python -m harness.suite full` before closing).
+
+### [ ] AR-1 -- Opt-in agent-family routing mode as the P2-2 collapse candidate (ablation variant G)
+- **Domain:** AI / Architecture / Performance - **Effort:** M - **Depends on:** none (feeds P2-2) - **Mode:** LOOP builds; OWNER measures in the P2-2 re-run
+- **Evidence (VERIFIED by source inspection, 2026-09-22):** 36 specialist agent modules in
+  `harness/agents/`, most 33-55 lines of prompt wrapper over `base_agent.py` (411 lines). Routing
+  averages ~5.8 agents/exchange via `fast_path` (`config.yaml:98` comment), each a separate serial
+  model call (`concurrency.max_parallel_agents: 1`, `ollama.timeout_seconds: 240`), and falls back
+  to every agent when routing returns nothing (`coordinator.fail_open_mode: "all"`,
+  `config.yaml:89`). Live (owner-reported): the P2-2 stall/breaker cascade
+  (`reviews/2026-09-22/ABLATION_P2-2.md`); B (one forced agent) recall 0.364 vs A (full routing,
+  degraded) 0.182; P0-3's dominant FP driver is generic low-confidence guesses across many
+  exchanges. `ablation_harness.VARIANTS` (A-F) has no variant for the consolidation P2-2 names, so
+  even a clean re-run can only answer through proxies (B, F).
+- **Problem:** per-exchange model calls scale with routed-agent count on hardware that serializes
+  inference, and P2-2 cannot measure the actual collapse candidate.
+- **Recommendation:** add `coordinator.routing_mode` (`"agents"` default = today, byte-for-byte;
+  `"families"` opt-in) that groups the existing agents into a small number of families (~5-7; the
+  grouping is proposed and justified in the item's review) and issues one model call per routed
+  family, composed from the member agents' existing prompts -- no new detection logic. Findings keep
+  their per-class `vulnerability_class`, so confirmation/validator routing is unchanged. Register it
+  as variant G in `harness/ablation_harness.py`. Do not touch `fail_open_mode` (that is RB-2b).
+- **Acceptance:** caller-level stubbed test -- `"families"` issues at most one model call per routed
+  family per exchange (counted at the model stub) where `"agents"` issues one per routed agent; a
+  canned finding from a family call reaches the same confirmation/validator dispatch as the same
+  finding from its member agent; NEGATIVE control -- `"agents"` mode dispatch and call counts are
+  identical to before; `config.yaml` default unchanged; `VARIANTS` lists G. `full` suite green.
+- **Impact:** High (gives P2-2 the real collapse candidate; if recall holds, it cuts serial model
+  calls per exchange several-fold on the hardware that currently starves).
+
+### [ ] AR-2 -- Run-scoped model-backend state by default (breaker + fail-open counters on `RunContext`)
+- **Domain:** Reliability / Architecture - **Effort:** M - **Depends on:** B2-2 (LOOP half, done) - **Mode:** LOOP
+- **Evidence (VERIFIED by source inspection, 2026-09-22):** the "ollama" breaker is a process-wide
+  registry singleton (`circuit_breaker.py:345-359`, `get_ollama_circuit_breaker` at :397), bound
+  once per client (`ollama_client.py:121`) and read directly at `orchestrator_detect.py:909` and
+  `orchestrator_chain.py:1056`; coordinator fail-open telemetry is a module global
+  (`coordinator.py:27`). B2-2's `scoped_ollama_breaker` (:500) snapshots and restores that single
+  instance -- correct for sequential runs, but two concurrent runs (server mode) still share one
+  breaker, and one scoped block's exit restores over the other's state. No committed run path uses
+  the seam (grep: only `circuit_breaker.py` and `test_circuit_isolation.py`), so the live drivers
+  `run_blind_eval.py` and `run_ablation_live.py` stay exposed to P2-2's cross-run poisoning.
+  `RunContext` (`run_context.py:524`) already solved the same problem for the safety gate ("A FRESH
+  gate per run ... the #3 isolation fix", ambient push/restore).
+- **Problem:** model-backend health and routing telemetry leak across runs, and isolation depends on
+  each driver remembering to opt in.
+- **Recommendation:** `RunContext` owns a per-run breaker and fail-open counters, installed as
+  ambient on create and restored on `aclose()` (mirror `push_gate`). `OllamaClient`, the
+  orchestrator's `is_open` reads and the coordinator counters resolve through the ambient run
+  context, falling back to today's process-wide objects when none is active (server/default path
+  unchanged). Wire `run_blind_eval.run_once` and the ablation runner to create one run context per
+  run and call `raise_if_ollama_starved` (or record `degraded`) at run end. No trip/reset threshold
+  changes.
+- **Acceptance:** caller-level test -- two sequential runs in one process: run 1 trips its breaker
+  OPEN; run 2's agent calls are dispatched (not zeroed) and its fail-open count starts at 0; two
+  concurrent runs: tripping one leaves the other CLOSED. NEGATIVE controls -- within one run an OPEN
+  breaker still short-circuits later calls; with no run context, behavior is byte-for-byte today's.
+  `full` suite green.
+- **Impact:** High (removes a class of silently degraded live runs; prerequisite for trusting the
+  P2-2 re-run).
+
+### [ ] AR-3 -- Record which captured exchange produced each finding (exchange provenance)
+- **Domain:** Evaluation / Data model - **Effort:** M - **Depends on:** none (B2-3b is the method+url stopgap) - **Mode:** LOOP
+- **Evidence (VERIFIED by source inspection, 2026-09-22):** the `findings` table (`store.py:58-84`)
+  has host/url/method/agent/fingerprint/case/proof ids but no exchange or run identifier, and
+  `persist_findings` dedups via `INSERT OR IGNORE` on a fingerprint of host+method+url+class
+  (+param/principal), so two exchanges producing the same fingerprint (e.g. the corpus's two
+  `POST /api/register` exchanges) can collapse to one row. B2-3's Result line names this gap as a
+  follow-on; scoring must infer attribution from url (B2-3) or method+url (B2-3b).
+- **Problem:** evaluation cannot attribute a finding to the exchange that produced it, so pairs that
+  share method+url (or duplicate exchanges) can only be excluded, not scored.
+- **Recommendation:** additive migration: nullable `run_id` + `exchange_id` on first-seen rows, plus
+  a `finding_observations(fingerprint, run_id, exchange_id, created_at)` link table so a deduped
+  re-observation still records its exchange (fingerprint and dedup semantics unchanged).
+  `exchange_id` = the caller-supplied index/id when present, else a stable hash of the captured
+  request. Surface both via `all_host_findings`; `build_scorecard` attributes control findings by
+  exchange when present and falls back to B2-3b's (method, url) otherwise.
+- **Acceptance:** caller-level test -- two exchanges with identical method+url (one vuln-labeled, one
+  control), each with a finding: the scorecard attributes each to its own exchange and scores the
+  control (not excluded); a deduped re-observation records a second observation row. NEGATIVE
+  controls -- finding counts, fingerprints and report output are unchanged for a corpus without
+  duplicates; an existing DB migrates without error. `full` suite green.
+- **Impact:** Medium-High (fair per-exchange scoring; retires the exclusion heuristics).

@@ -2,7 +2,7 @@
 
 ## Checkout
 
-Branch `reconciliation-backlog`, ahead of `main`, 0 behind. HEAD `0f047e8`.
+Branch `reconciliation-backlog`, ahead of `main`, 0 behind. HEAD `8dd52d2`.
 The agents-subsystem refactor, the precision & blind-control sprint (Items
 1–3, base `02de8bf`), the Astra T02–T08 workstream, and the 2026-09-21
 consensus-batch RB-1..RB-8 items are all committed and reconciled into this
@@ -21,10 +21,15 @@ low-confidence FP guesses). **B2-1 done** (`345fcf8`: `agents_circuit_open` on
 `raise_if_ollama_starved` seam; OWNER half — hardware timeout/GPU tuning +
 live-driver wiring — stays open). **B2-3 done** (`e05c821`: issue-level
 `controls_clean` + `ambiguous_control_urls` exclusion + `per_control_drivers` in
-`build_scorecard`, raw metric kept). **Next pick: B2-4** (make
+`build_scorecard`, raw metric kept). **B2-3b done** (`e560f6e`: corrects B2-3's
+url-only attribution — control/vuln keyed on `(method.upper(), url)`, explicit
+vuln-label set, host-wide banners split into `host_level_issues_on_controls`,
+issue-level counts + variance + console summary; the shared GET-vuln/DELETE-control
+url no longer hides the DELETE control's FP). **Next pick: B2-4** (make
 `cross_identity_reject` stubbed-testable + recorded in the manifest — LOOP builds
-the stubbed proof + manifest field; OWNER/LIVE runs it). Full suite 2490 OK /
-2 skip (testing tier 31). The RB-1..RB-8 consensus batch is closed.
+the stubbed proof + manifest field; OWNER/LIVE runs it; a partial B2-4 deliverable-b
+draft is parked in `git stash@{0}`). Full suite 2490 OK / 2 skip (testing tier
+36). The RB-1..RB-8 consensus batch is closed.
 
 **External-review borrow batch (2026-09-22): ER-1, ER-2, ER-4** loop-consumable
 (pick order ER-1→ER-2→ER-4), filed from a user-requested eval of external
@@ -36,6 +41,15 @@ behind P2-2's new-surface freeze — leave `[ ]`, do not pick until P2-2 is `[x]
 Most borrow ideas were already present here in more mature form (leg-tiered gate,
 evidence ledger, token `EffortBudget`) and were deliberately not re-filed; B2-1/
 B2-2 already cover breaker-`degraded`/isolation, so ER items reuse them.
+
+**Architecture rebalance batch (2026-09-22): AR-1..AR-3** loop-consumable (pick
+order AR-2→AR-3→AR-1), filed from a user-requested architecture review: AR-2
+run-scoped breaker + fail-open counters on `RunContext` (and live-driver wiring),
+AR-3 exchange provenance on findings, AR-1 opt-in agent-family routing as P2-2's
+collapse candidate (ablation variant G, ships OFF). The overlapping evaluation
+layers are already P1-3, which gained new evidence rather than a duplicate item.
+Placement relative to B2-4/B2-5/ER is the owner's call; recommended before the
+P2-2 re-run.
 
 ## Verified here (2026-09-21, current HEAD)
 
