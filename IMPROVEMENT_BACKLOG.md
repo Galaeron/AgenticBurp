@@ -137,14 +137,27 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
     set and demotes its findings; negative control: a healthy leg stays live.
 - **Impact:** High.
 
-### [ ] P0-3 — Reconcile existing benchmarks and measure subsequent changes reproducibly
+### [x] P0-3 — Reconcile existing benchmarks and measure subsequent changes reproducibly
+- **Result (owner-reported/VERIFIED-in-run, 2026-09-22):** ran RB-8's fixed
+  `run_blind_eval.py` live against real `qwen3:8b` Ollama at HEAD `0f047e8`
+  (`.venv-rationalisation` venv, defaults: `fail_open_mode=curated`,
+  `quarantine_leads=1`, `cross_identity_reject=0`). 2/2 `confirmed_vuln`
+  exchanges detected; 0/5 unique control URLs clean by raw count (a URL-reuse
+  artifact inflates this slightly — see report caveat); config fingerprint
+  `514b4afd650ae1103f0c1621df2351ec111b2fcc72e3823426344c68d6e60e83`. Full
+  metrics, exact command, checkout state and caveats:
+  [reviews/2026-09-22/BLIND_SCORECARD_P0-3.md](reviews/2026-09-22/BLIND_SCORECARD_P0-3.md).
+  This satisfies the acceptance criterion (re-runnable command + results file
+  with the metrics + config fingerprint) as a single-sample measurement. NOT
+  done: the `run_eval_n_times` variance pass (n≥5) RB-8 also built — one
+  pass took ~24 min, so 5 would be ~2h of local compute; RB-2b's `curated`
+  default flip should be gated on that variance run, not this single sample.
 - **Status correction (2026-09-20, source inspected; results historical/reported):**
   Real-model runs already exist in `testing/SCORECARD.md`, dated 2026-09-20,
   committed by `95b124a` and revision-pinned by `02de8bf`. The original absence
   claim below is superseded. Do not create a first benchmark from scratch or use
   root `SCORECARD.md` to dismiss this evidence. INV-1 inventories remaining
   reproducibility/metric gaps and prepares measurement of subsequent changes.
-  Leave this item open until its remaining acceptance requirements are verified.
 - **Domain:** Efficacy / Evaluation · **Effort:** M · **Depends on:** P0-1 (nice), else none
 - **Evidence (VERIFIED):** [SCORECARD.md](SCORECARD.md) is `model=stubbed/none`
   (a plumbing check); [CURRENT_STATE.md](CURRENT_STATE.md) states no real-model or
@@ -399,6 +412,29 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   vs. per-request LLM tools) — **but gate its retention on the ablation.**
 
 ### [ ] P2-2 — Agent-count ablation (justify or collapse the 38 specialists)
+- **Result (owner-reported, 2026-09-22, INCONCLUSIVE — reliability finding, not
+  a code fix):** ran RB-7's ablation harness live (`testing/test-target/
+  run_ablation_live.py`, new owner-run driver) against the PixelMart corpus,
+  real `qwen3:8b`. Does NOT answer keep/collapse: D (minus-critique) and F
+  (curated-routing) each independently hit the SAME reproduced failure — 3
+  sequential agent calls timed out at 240s (720s total), tripping
+  `harness.circuit_breaker`'s shared "ollama" breaker OPEN, which silently
+  zeroed every remaining agent call for the rest of that run (0 error
+  surfaced) — exactly the failure mode `harness/config.yaml`'s own comments
+  already document from a prior incident on this hardware; the existing
+  mitigation (`max_parallel_agents: 1`, 240s timeout) is evidently not
+  sufficient here. Both degenerated to C's exact zero-agent numbers;
+  reproduced independently twice (separate processes), so this is systematic.
+  A ran but with ~5/22 exchanges critique-unreviewed (milder version of the
+  same issue, later in its run). One clean data point: B (single forced
+  agent, 0 errors) hit recall 0.364 vs A/C's degraded 0.182 — not strong
+  enough alone to decide anything. Full diagnosis + a single-exchange log
+  trace proving the mechanism + concrete next steps before re-attempting:
+  [reviews/2026-09-22/ABLATION_P2-2.md](reviews/2026-09-22/ABLATION_P2-2.md).
+  E (minus-graph-loop) not run — residual, needs an owner engagement corpus
+  (see `NO_GRAPH_RESIDUAL`). **This item stays `[ ]`**: the harness (RB-7) is
+  built and correct; what's missing is a trustworthy real-model run, which
+  needs the reliability fix in the report first.
 - **Domain:** AI / Architecture · **Effort:** L · **Depends on:** P0-3
 - **Evidence (VERIFIED):** ~38 agent modules, mostly narrow LLM classifiers; config
   comments repeatedly cite "LLM label variance" as the main detection risk; no
@@ -1127,7 +1163,143 @@ Verify every proposed diff against the code before implementing.
 - **Impact:** High (makes the gating measurement trustworthy).
 
 > **OWNER/LIVE runs that the above instruments unblock (NOT loop-consumable):** the
-> real-model blind scorecard with variance and cross-identity REJECT on (P0-3, via RB-8),
-> and the A–F ablation run that sets the agent count (P2-2, via RB-7). Also owner:
-> P1-10 (connect-time IP pinning — needs a custom resolver), and RB-2b (the
-> `fail_open_mode: curated` default flip, gated on RB-8's measured recall delta).
+> real-model blind scorecard single pass is done (P0-3, 2026-09-22,
+> [reviews/2026-09-22/BLIND_SCORECARD_P0-3.md](reviews/2026-09-22/BLIND_SCORECARD_P0-3.md));
+> the ≥5-run variance pass and cross-identity REJECT-on live run remain open.
+> The A–F ablation run (P2-2, via RB-7) was attempted 2026-09-22 and is
+> INCONCLUSIVE — a reproduced circuit-breaker starvation issue on this
+> hardware invalidated the D/F rows; see
+> [reviews/2026-09-22/ABLATION_P2-2.md](reviews/2026-09-22/ABLATION_P2-2.md)
+> for the reliability fix needed before re-attempting. Also open: P1-10
+> (connect-time IP pinning — needs a custom resolver), and RB-2b (the
+> `fail_open_mode: curated` default flip, gated on RB-8's measured recall delta —
+> the single-sample P0-3 run is not yet that basis).
+
+## Batch 2 — 2026-09-22 (post-live-run findings)
+
+Filed from the two owner/live runs at HEAD `0f047e8`: the P0-3 blind scorecard
+([reviews/2026-09-22/BLIND_SCORECARD_P0-3.md](reviews/2026-09-22/BLIND_SCORECARD_P0-3.md))
+and the P2-2 ablation attempt
+([reviews/2026-09-22/ABLATION_P2-2.md](reviews/2026-09-22/ABLATION_P2-2.md)). The RB batch is
+closed; these are the next loop-consumable items the live runs surfaced. **Loop pick order:**
+B2-1 -> B2-2 -> B2-3 -> B2-4 -> B2-5. `Mode: LOOP` = offline, stubbed-model-testable,
+Sonnet-implementable. The `OWNER/LIVE` portions (a real-model re-run, live active-validator
+traffic, hardware timeout tuning) are NOT loop-consumable -- leave them for the owner. The
+non-negotiables at the top of this file apply (safe config defaults, a caller-test + negative
+control per item, never read `*ANSWER_KEY*`/a blind `app.py`, `python -m harness.suite full`
+before closing). **Fact-check reminder for the loop:** the circuit breaker ALREADY exposes
+`.is_open`/`.state` (`circuit_breaker.py:112-124`) and RB-2 already added the
+`coordinator_fallback`/`degraded` response pattern -- REUSE both; do not build a parallel
+breaker or a second degraded mechanism. **Reliability prerequisite:** B2-1 + B2-2 must land
+before a trustworthy P2-2 ablation re-run (prioritise the A-vs-B comparison on that re-run --
+B ran clean and is the P2-2 crux).
+
+### [ ] B2-1 -- Surface circuit-breaker-OPEN as a `degraded` signal on the analysis/engagement result
+- **Domain:** Reliability / Observability / Trust - **Effort:** S - **Depends on:** none - **Mode:** LOOP
+- **Evidence (VERIFIED):** `reviews/2026-09-22/ABLATION_P2-2.md` -- the process-wide shared
+  `"ollama"` breaker (`circuit_breaker.get_ollama_circuit_breaker("ollama")`) trips CLOSED->OPEN
+  after 3 sequential 240s stalls (~720s) and then returns zero real findings for the rest of the
+  run "with no error surfaced anywhere in the response -- empty findings that looked identical to
+  'the model found nothing'" (`config.yaml` lines ~24-33 already document this mode). Reproduced
+  twice independently (D/F, 723.5s/723.9s -> the zero-LLM floor). The breaker exposes
+  `.is_open`/`.state` (`circuit_breaker.py:112-124`); nothing reads it onto the response.
+- **Problem:** a breaker-tripped run yields a silent, degraded, false-negative-shaped result
+  (agents starved -> "found nothing") that a caller/UI cannot distinguish from a healthy clean run
+  -- the same hazard class as RB-2's coordinator fail-open, but this mechanism is unsurfaced.
+- **Recommendation:** at `AnalysisResponse` assembly (`orchestrator_detect.analyze`) and the
+  engagement result, read the shared ollama breaker's `is_open` (and/or count agent calls
+  short-circuited by OPEN during the run) and set a `degraded`/`agents_circuit_open` flag -- REUSE
+  RB-2's `coordinator_fallback` pattern; for the engagement path record it in `errors` so
+  `result["degraded"]` is already True. Observability only -- do NOT change the breaker's trip
+  thresholds/logic (that is B2-2).
+- **Acceptance:** caller-level test -- force the ollama breaker OPEN (inject) around `analyze()` ->
+  the response carries the circuit-open/degraded flag and the empty-agent result is attributed to
+  it, not silent; negative control -- a healthy run (breaker CLOSED) -> flag False.
+- **Impact:** High (closes a silent false-negative path; the report's own recommendation #3).
+
+### [ ] B2-2 -- Isolate the circuit breaker per run + fail a starvation cascade loudly
+- **Domain:** Reliability - **Effort:** M - **Depends on:** B2-1 - **Mode:** LOOP (per-run scoping
+  seam + loud-fail + test); **OWNER** (hardware timeout / GPU / routing-width tuning)
+- **Evidence (VERIFIED):** `ABLATION_P2-2.md` -- the breaker is a process-wide shared singleton
+  (deliberate, so a short-lived client accumulates failures), so variant A's trip poisoned B/D/F in
+  the SAME process (they degenerated to C's floor while still inside the 60s cooldown). Report rec
+  #3: "a fresh circuit breaker per run ... so a starvation cascade in one repeat cannot silently
+  poison the numbers." Existing mitigation (`concurrency.max_parallel_agents: 1`,
+  `ollama.timeout_seconds: 240`) is insufficient on this box (`ollama ps` 41%/59% CPU/GPU -- model
+  not fully GPU-resident).
+- **Problem:** (a) cross-run contamination -- a shared breaker lets one run's trip silently starve
+  the next; (b) the cascade burns ~720s and then degrades silently.
+- **Recommendation:** (LOOP) add a per-run circuit-breaker scoping/reset seam (mirroring the fresh
+  state/cache DB the ablation driver already uses) so an eval/engagement run gets an isolated
+  breaker, plus a runner-level breaker-state assertion so a starved run FAILS LOUD (raises/flags)
+  instead of emitting silent zeros; ship OFF/opt-in so committed behavior is unchanged. (OWNER)
+  raise `ollama.timeout_seconds`, add a GPU-headroom preflight, or bound per-exchange routing width
+  -- hardware-specific, not a committed default.
+- **Acceptance:** test -- two sequential runs where the first trips the breaker do NOT silently
+  share it (the second still dispatches agents, or the starvation is flagged, not silent); a
+  simulated stuck call surfaces the failure within a bounded number of stalls; negative control --
+  normal timing -> no isolation/flag side-effects. Owner tunes the real timeout on their hardware.
+- **Impact:** High (the P2-2 re-run blocker + a production reliability hazard).
+
+### [ ] B2-3 -- Issue-level `controls_clean` + per-URL FP attribution in the scorecard
+- **Domain:** Evaluation - **Effort:** S - **Depends on:** none - **Mode:** LOOP builds; OWNER re-runs
+- **Evidence (VERIFIED):** `reviews/2026-09-22/BLIND_SCORECARD_P0-3.md` -- `build_scorecard`
+  computes `dirty_controls` PER URL (not per exchange), so a URL shared between a `confirmed_vuln`
+  and a `confirmed_secure` exchange (`GET /api/tickets/1`, exchanges 5 & 7) marks the secure control
+  dirty from the real IDOR finding, overstating "0/5". It also counts RAW findings, not post-RB-3
+  issues.
+- **Problem:** the controls-clean denominator overstates the FP problem (URL-reuse false-dirty +
+  raw findings vs issues), so it is not the fair number for the RB-2b decision.
+- **Recommendation:** add to `build_scorecard` an issue-level controls-clean metric (via
+  `issues.group_findings_into_issues`, not raw findings) + a per-control breakdown naming the
+  class/agent driving each dirty control; exclude/flag a control URL that also hosts a labeled vuln
+  exchange from the clean denominator. Keep the raw metric alongside for comparability.
+- **Acceptance:** stubbed test -- N duplicate banner findings on one control -> 1 issue; a control URL
+  that also hosts a labeled vuln exchange is not counted dirty solely from that vuln's finding; the
+  scorecard emits raw + issue-level controls-clean + the per-control driver list.
+- **Impact:** Medium-High (the fair denominator P0-3/RB-2b needs).
+
+### [ ] B2-4 -- Make `cross_identity_reject` stubbed-testable + recorded in the manifest
+- **Domain:** Evaluation / Precision - **Effort:** M - **Depends on:** none - **Mode:** LOOP builds
+  (stubbed); **OWNER/LIVE** runs it (needs `validators.active_enabled` + the blind-target-2 Flask app
+  on `127.0.0.1:5002`)
+- **Evidence (VERIFIED):** `BLIND_SCORECARD_P0-3.md` -- the run used `HARNESS_CROSS_IDENTITY_REJECT=0`;
+  it "is the one documented lever ... that should directly cut the IDOR-shaped FPs on secure endpoints,
+  but it turns on `validators.active_enabled` and sends live ... requests," so the precision lever most
+  likely to clean the controls was never exercised or measured.
+- **Problem:** the scorecard cannot show precision with the intended fixes engaged (REJECT needs live
+  traffic and was off), and the manifest does not make the REJECT state a first-class recorded axis.
+- **Recommendation:** (LOOP) make the cross-identity REJECT/downgrade path provable OFFLINE with a
+  stubbed model + a synthetic cross-identity control FP (REJECT on -> suppressed/downgraded; off ->
+  surfaced), and record `cross_identity_reject` on/off in the blind manifest + scorecard so a
+  REJECT-on run is self-describing. (OWNER/LIVE) the live REJECT run produces the real precision
+  number. Do NOT enable `active_enabled` in committed config.
+- **Acceptance:** stubbed test -- a synthetic cross-identity control FP is REJECTED/downgraded with
+  REJECT on and surfaced with it off; the manifest/scorecard records the REJECT state.
+- **Impact:** High (unblocks a fair precision measurement + a real precision lever).
+
+### [ ] B2-5 -- Gate the generic low-confidence agent guesses (the dominant FP driver)
+- **Domain:** Precision - **Effort:** M - **Depends on:** none (uses B2-3's attribution) - **Mode:** LOOP
+- **Evidence (VERIFIED):** `BLIND_SCORECARD_P0-3.md` -- "the dominant FP driver ... generic
+  low-confidence agent guesses (`Security misconfiguration`, `Broken Access Control (Workflow
+  Bypass)`, `SQL injection` at confidence 0.3-0.5) fire on nearly every exchange regardless of actual
+  target behavior" (9 spurious findings on a bare `POST /register` alone). These are SURFACED
+  findings, which is why quarantine (2/60, leads-only) did not catch them.
+- **Problem:** unconfirmed, low-confidence generic-class findings are surfaced on nearly every
+  exchange, driving the controls-clean failure.
+- **Recommendation:** an evidence-gated suppression / down-rank for UNCONFIRMED, low-confidence
+  (< floor), generic-class findings with no confirming leg -- e.g. extend `should_quarantine_as_lead`
+  to route this surfaced-but-unconfirmed class to leads, or down-rank it out of the surfaced set.
+  Must NEVER suppress a confirmed finding or a high-confidence one (recall guard). Config-gated +
+  measured, not a blanket threshold flip.
+- **Acceptance:** caller-level test -- a synthetic UNCONFIRMED generic finding at confidence 0.4 on a
+  clean exchange is NOT surfaced (-> leads/down-ranked); a CONFIRMED finding and a high-confidence
+  finding on the same exchange ARE surfaced (recall negative control); on a small fixture the
+  surfaced-FP count drops with no TP lost.
+- **Impact:** High (directly targets the measured 0/5 controls-clean).
+
+> **OWNER/LIVE follow-ups this batch unblocks (not loop-consumable):** the P2-2 ablation re-run once
+> B2-1/B2-2 land (prioritise A-vs-B -- B ran clean); the cross-identity REJECT-on live precision run
+> (B2-4, needs the Flask app + active-validator opt-in); the >=5-run variance pass; and the RB-2b
+> `curated` flip decision, now gated on a REJECT-on, issue-level, variance-backed number -- not the
+> single REJECT-off raw-count sample.

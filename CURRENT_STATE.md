@@ -1,98 +1,82 @@
-# Current state — 2026-09-20
+# Current state — 2026-09-22
 
 ## Checkout
 
-Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
-refactor and the precision & blind-control sprint (Items 1–3) are committed
-(base `02de8bf`, HEAD of that batch `bc5f599`). On top, the improvement-loop items
-below landed; re-verified green (full suite 2414 OK / 2 skip).
+Branch `reconciliation-backlog`, ahead of `main`, 0 behind. HEAD `0f047e8`.
+The agents-subsystem refactor, the precision & blind-control sprint (Items
+1–3, base `02de8bf`), the Astra T02–T08 workstream, and the 2026-09-21
+consensus-batch RB-1..RB-8 items are all committed and reconciled into this
+branch. Full per-item Result lines (evidence tags, tests, commits) live in
+[IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md) — this file tracks current
+status and pointers only, not session history.
 
-## Astra T02–T08 workstream — merged, not open (verified 2026-09-21)
-
-The Astra roadmap (`reviews/review-Astra-Medium-10-09-06-30/`) T02–T08 is complete
-and reconciled **below** sprint base `02de8bf`, so it is already in this branch:
-W-13/W-14 (`1553178`), W-15 orchestrator split (`99c5712`), W-16 single
-`TargetTransport` (`cfb4504`, `routing_gaps()` empty), on the per-oracle T08
-migration + T08u websocket (`fa20bf7`); T04/T06 milestones wired
-(`test_smoke_authorization_workflow.py`, `issues.py`). Full suite re-verified green
-here 2026-09-21 (2365 OK / 2 skip). The `.worktrees/astra-*`, `supplemental-evidence`,
-`t08-final` and `../AgenticVibe-impl` checkouts hold only **superseded drafts** —
-do not resume them; the one un-merged commit, `t08-final 5aa4a1a` (T08v), was redone
-as W-16.
-
-## Improvement loop (IMPROVEMENT_BACKLOG.md)
-
-Full per-item Result lines (evidence tags, tests, commits) live in the backlog.
-Shipped code items this session:
-- **P0-1** `25a737a` EvidenceLedger wiring · **P0-2** `533928c` run-derived leg trust
-  tiers · **P0-4** `0e993da` safe-default guard (`allowed_hosts→[]`) · **P1-1** `33392c9`
-  injection fence neutralization · **P1-2** `e54cfb6` scope-escape · **P1-4** `1e084e1`
-  operating profiles.
-- **P0-5** `c7e0ce4` — `passive-only` now safety-authoritative (force-off all 10
-  active knobs unconditionally) + `explicit_keys` provenance seam; fixes a P1-4 gap.
-- **P0-7** `ec03060` — leg qualification requires an EXECUTED negative control;
-  throttle isolated to a scoped contextvar; fixes a P0-2 gap.
-- **INV-1..4 dispatch COMPLETE** (`e0ba0aa`, `40104a9`, `cc8e817`, `a6e125f`):
-  evidence-tagged read-only diagnoses with filed tickets — INV-1 quarantine knob no-op
-  on `run_blind_eval.py`; INV-2 PASS2 confirm path persists no ProofRecord (9/13→6/13);
-  INV-3 graph `chains` computed on a pre-confirmation snapshot; INV-4 1914/641/107 is a
-  driver-side un-deduped union + no timing instrumentation. Production fixes are
-  separate tickets.
-- **P0-6 SKIPPED (still `[ ]`):** can't land as one offline unit — needs new per-hop
-  transport evidence emission + request/response storage that P0-6 gates behind P3-1
-  (unstarted). Left for the owner.
-- **P1-6 done (`4054135`):** `EngagementPolicy` dataclass extracts the 13 active/
-  engagement toggles from `Orchestrator.__init__` — behavior-preserving (parity +
-  safe-defaults tests). Single source for "what active traffic is on".
-- **P1-7 done (`912df45`):** `/investigate` enforces pre-authorized scope + route/
-  `base_url` host consistency before job allocation; removed the implicit `base_url`
-  self-grant (was silently widening scope). +3 tests.
-- **P1-8 done (`6a42cc6`):** bounded `/investigate` admission (`_MAX_RUNNING_JOBS=4`
-  → 503) + terminal-job retention/eviction (900s / max 50, running never evicted,
-  expired id → 404). Module constants only. +6 tests.
-- **P1-9 done (`bd96d9b`):** documented the scope contract honestly (hostname-string,
-  not address-pinning); corrected a P1-2 overclaim; +characterization test. Filed P1-10.
-- **P3-5 (`349a51a`) + P3-4 (`6d1950c`) done:** fence defang extended to prior-context/knowledge blocks; `EvidenceLedger` bounded (5000 FIFO) + reset seam. +7 tests. (P1-10 DNS pin → owner/live below.)
-- **LOOP_DONE (2026-09-21 consensus batch — all 8 RB items landed, nothing pushed):** the
-  four-way reconciliation (`reviews/2026-09-21/`) INV-1..4 production fixes + new items are
-  all shipped offline; full per-item Result lines in the backlog:
-  **RB-1** `f24ff8e` local-API CSRF/token · **RB-4** `301d848` engagement proof persistence
-  (INV-2) · **RB-3** `3028cf7` dependency/banner dedupe (INV-4) · **RB-8** `dd104f9` blind-eval
-  harness repair (INV-1) · **RB-5** `4c78f2d` chain re-link (INV-3) · **RB-2** `35e5f4f`
-  fail-open flag caller-test · **RB-7** `fa3dd95` A–F ablation harness · **RB-6** `5fa1a57`
-  execution-plane capability matrix (LOOP half). Full suite 2482 OK / 2 skip.
-  **No loop-consumable items remain — loop stopped.** Owner/live next: P0-3 blind-scorecard RUN
-  (via RB-8), P2-2 ablation RUN (via RB-7), RB-1b (Java token reader), RB-6 OWNER/JDK half
-  (Java→shared trail + fix stale HarnessPanel subset), RB-2b (`curated` flip, gated on RB-8's
-  delta), P1-10 (DNS pin), P0-6/P3-1 (redaction), P1-5 (Burp UX), P3-2/3-3.
-
-## Committed this session (agents refactor + sprint Items 1–3)
-
-Five focused commits `02de8bf..bc5f599`: `4dfa89c` agents refactor
-(`get_all_agent_classes()`), `50fe65a` ollama hardening, and sprint Items 1–3
-(`a549d0b`, `ee54d02`, `bc5f599`). The two new `config.yaml` knobs ship safe:
-`oracle.safe_passive_default: true` (zero live traffic) and
-`reporting.quarantine_unverified_leads: false`; `oracle.enabled` stays `false`. The
-vendored `testing/blind-test-kit/harness/config.yaml` is updated separately (bare
-`yaml.safe_load`, no overlay inheritance).
-
-Owner action required (NOT verified here): re-run PixelMart + blind helpdesk under
-`fail_open_mode=curated` and `quarantine_unverified_leads=true`; record precision AND
-recall deltas in this file as owner-reported.
+**Loop re-opened (2026-09-22): Batch 2 (B2-1..B2-5)** filed in
+[IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md) from the P0-3/P2-2 live runs —
+offline, loop-consumable. Pick order B2-1→B2-2→B2-3→B2-4→B2-5 (reliability:
+B2-1 circuit-breaker `degraded` flag, B2-2 per-run breaker isolation; precision:
+B2-3 issue-level controls-clean, B2-4 REJECT stubbed-testable, B2-5 gate the
+low-confidence FP guesses). The RB-1..RB-8 consensus batch is closed.
 
 ## Verified here (2026-09-21, current HEAD)
 
-From repo root, `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14, isolated):
-`-m harness.suite smoke` = **90 OK**, exit 0; `-m harness.suite full` = **green, exit 0**
-(unittest **2418 OK, 2 skip** ~260s; pytest-native 13 OK; evaluation 42 OK). These are
-offline/stubbed-model, owned-loopback results only — no real-model benchmark,
-blind-target run, hosted CI or Java build was performed here.
+From repo root, `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14,
+isolated): `-m harness.suite smoke` = **90 OK**, exit 0; `-m harness.suite
+full` = **green, exit 0** (unittest **2482 OK, 2 skip** ~260s; pytest-native
+38 OK; testing 27 OK; evaluation 42 OK). Offline/stubbed-model, owned-loopback
+results only. (Was 2418 pre-RB; RB-1..RB-8 added 64 tests.)
+
+## P0-3 blind-scorecard — RUN done (2026-09-22, owner-reported)
+
+Single live pass, real `qwen3:8b` Ollama, `run_blind_eval.py` (RB-8's fixed
+harness) at HEAD `0f047e8`. 2/2 `confirmed_vuln` exchanges detected
+(unchanged from the 2026-09-20 pre-RB-8 run); 0/5 unique control URLs clean
+by raw count (a URL-reuse artifact between one vuln/secure exchange pair
+means this overstates the true FP rate slightly — see the report's
+methodology caveat). Full detail, exact command, config fingerprint:
+[reviews/2026-09-22/BLIND_SCORECARD_P0-3.md](reviews/2026-09-22/BLIND_SCORECARD_P0-3.md).
+
+Not done in this pass (flagged as follow-ups, not run): the
+`run_eval_n_times` variance pass (n≥5, ~2h of local Ollama compute), and the
+`cross_identity_reject=1` live-traffic run (needs blind-target-2's Flask app
+running plus owner opt-in to active validators).
+
+## P2-2 A-F ablation — RUN attempted (2026-09-22), inconclusive by a
+## reproduced hardware/infra finding, not a code bug
+
+Ran RB-7's `harness/ablation_harness.py` live via a new driver
+(`testing/test-target/run_ablation_live.py`) against the PixelMart
+(test-target) corpus. **Does not answer P2-2's keep/collapse question**: two
+of the three variants built to probe it (D minus-critique, F curated-routing)
+each independently hit a known, already-documented failure mode — a
+sequential specialist-agent call stalled the full 240s timeout 3× in a row
+(720s), tripping `harness.circuit_breaker`'s shared "ollama" breaker OPEN,
+which then silently zeroed every remaining agent call for the rest of that
+run with no error surfaced (exactly what `harness/config.yaml`'s own
+committed comments already warn about from a prior incident on this
+hardware — the existing mitigation, `max_parallel_agents: 1` + 240s timeout,
+is evidently not sufficient here). Both D and F degenerated to C's
+(zero-agent) exact numbers; reproduced independently twice, so this is
+systematic, not a fluke. A's own run is real but has ~5/22 exchanges with an
+unreviewed critique pass from a milder, later-stage version of the same
+issue. Full diagnosis (including a single-exchange log trace proving the
+mechanism), the one clean comparison this run does support (B, single
+forced agent, 0 errors, recall 0.364 vs A/C's degraded 0.182), and concrete
+next steps before re-attempting:
+[reviews/2026-09-22/ABLATION_P2-2.md](reviews/2026-09-22/ABLATION_P2-2.md).
 
 ## Open work and pointers
 
-- Owner: run both corpora under curated + quarantine; record precision/recall deltas here (sprint exit criterion).
-- Items 4–6 are scoped in [PRECISION_BLIND_CONTROLS_PLAN.md](reviews/2026-09-19/PRECISION_BLIND_CONTROLS_PLAN.md)
+- **Owner/live remaining:** P2-2 ablation RE-RUN (needs the reliability fix
+  in the report above before A/D/F numbers can be trusted), RB-1b (Java
+  token reader), RB-6 OWNER/JDK half (Java→shared trail + stale HarnessPanel
+  subset), RB-2b (`fail_open_mode: curated` default flip, gated on RB-8's
+  measured recall delta — the P0-3 run above is a first data point but not
+  the ≥5-run variance basis RB-2b should be gated on), P1-10 (DNS pin),
+  P0-6/P3-1 (redaction), P1-5 (Burp UX), P3-2/3-3.
+- Items 4–6 of the precision/blind-control sprint are scoped in
+  [PRECISION_BLIND_CONTROLS_PLAN.md](reviews/2026-09-19/PRECISION_BLIND_CONTROLS_PLAN.md)
   (negative-control builders, per-endpoint baseline, coordinator model split).
-  Do not start until Items 1–3 are measured.
-- Concurrent branch history and implementation review remain revision-bound; do not
-  restart unrelated processes based on old notes.
+- The `.worktrees/astra-*`, `supplemental-evidence`, `t08-final` and
+  `../AgenticVibe-impl` checkouts hold only superseded drafts — do not resume
+  them. Concurrent branch history and implementation review remain
+  revision-bound; do not restart unrelated processes based on old notes.
