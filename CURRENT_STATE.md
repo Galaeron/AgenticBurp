@@ -55,14 +55,15 @@ Shipped code items this session:
 - **P3-5 (`349a51a`) + P3-4 (`6d1950c`) done:** fence defang extended to prior-context/knowledge blocks; `EvidenceLedger` bounded (5000 FIFO) + reset seam. +7 tests. (P1-10 DNS pin → owner/live below.)
 - **LOOP RUNNING (2026-09-21 consensus batch):** LOOP_DONE hold lifted; the four-way
   reconciliation (`reviews/2026-09-21/`) filed the INV-1..4 production fixes as the
-  **Consensus batch** in `IMPROVEMENT_BACKLOG.md`. Pick order
-  RB-1 → RB-4 → RB-8 → RB-3 → RB-5 → RB-2 → RB-7 → RB-6.
-  - **RB-1 done (`f24ff8e`):** local-API CSRF/token — ephemeral bearer token to a 0600
-    lockfile + `Origin`/`Sec-Fetch-Site` cross-site middleware; token required on mutating
-    routes even on loopback (GET unchanged; no-Origin callers preserved). +8 tests; full
-    2426 OK / 2 skip. **Owner must land RB-1b** (Java extension reads the token) before
-    shipping a token-enabled server, else the packaged extension can't authenticate.
-  - **Next: RB-4** (INV-2 proof persistence on the engagement confirm path; deps P0-1 [x]).
+  **Consensus batch** in `IMPROVEMENT_BACKLOG.md`. Order (deps-corrected): RB-1 → RB-4 →
+  RB-3 → RB-8 → RB-5 → RB-2 → RB-7 → RB-6 (RB-8 `Depends on RB-3`, so RB-3 precedes it).
+  - **RB-1 done (`f24ff8e`):** local-API CSRF/token — ephemeral token to a 0600 lockfile +
+    `Origin`/`Sec-Fetch-Site` middleware; token required on mutating routes even on loopback.
+    **Owner must land RB-1b** (Java reads the token) before shipping a token-enabled server.
+  - **RB-4 done (`301d848`):** engagement confirm path persists `ProofRecord` +
+    `VALIDATION_DECISION` via shared `_persist_confirmation_proof` (INV-2; confirmed-only, no
+    orphans; +EXECUTION event). +2 defect-injection tests; full 2428 OK / 2 skip.
+  - **Next: RB-3** (INV-4 driver-side dependency dedupe; deps none).
   Owner/live, skip in loop: P0-3 (blind scorecard RUN, via RB-8), P2-2 (ablation RUN, via
   RB-7), P1-10 (DNS pin), RB-2b (`curated` flip, gated on RB-8's delta), P0-6/P3-1, P1-5,
   P3-2/3-3.

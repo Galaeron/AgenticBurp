@@ -911,7 +911,28 @@ Verify every proposed diff against the code before implementing.
   preserved (per INV-4).
 - **Impact:** Medium (directly lifts the measured blind-negative precision).
 
-### [ ] RB-4 — Persist ProofRecord + ledger events on the engagement confirm path (INV-2 fix)
+### [x] RB-4 — Persist ProofRecord + ledger events on the engagement confirm path (INV-2 fix)
+- **Result (VERIFIED):** `301d848` — extracted `ConfirmMixin._persist_confirmation_proof`
+  as the ONE place a case-bound `ProofRecord` is built/persisted and the matching
+  `evidence_ledger` `VALIDATION_DECISION` is emitted; PASS1 (`orchestrator_confirm._validate_findings`)
+  now calls it with behavior byte-for-byte preserved, and PASS2 (`orchestrator_chain._apply`,
+  the engagement/graph loop) is wired through the SAME helper — reused, not reimplemented
+  (no 2nd ledger, per INV-2). Persistence sits strictly inside the `res.confirmed is True`
+  block so a suppressed/not-confirmed leg persists nothing (no orphan proofs); it also emits
+  one summary `EXECUTION` event (the shape legs don't thread `case_ref` through
+  `TargetTransport`) so `reconstruct_persisted` returns non-empty `what_sent`/`what_came_back`.
+  All bookkeeping is best-effort/try-excepted and never alters the already-decided verdict;
+  `_apply` is now `async` and every dispatch call site awaits it. **Tests:** `test_pipeline_gate`
+  gained a `run_live()` context manager so store/ledger assertions read the run's OWN temp DB
+  while live — the initial failures were a test-harness DB-lifecycle bug (assertions ran after
+  `.run()` teardown had reset `store._DB_PATH` to the shared, pollution-laden dev DB), NOT a
+  production gap; verified by reading the wiring + deterministic pass. +2 caller-level tests:
+  positive (engagement-path confirmed IDOR → persisted `ProofRecord` + `reconstruct_persisted`
+  complete, non-empty what_sent/what_came_back) and defect-injection negative control
+  (suppressed cross-identity leg → `confirmed=False` AND zero confirmed-idor proofs in the run
+  DB). `test_pipeline_gate` 8/8 OK on two consecutive runs (determinism); full suite **2428 OK
+  / 2 skip, exit 0**. Opus-reviewed APPROVE (production audit: PASS1 parity, confirmed-only
+  gating, all `_apply` callers awaited). Coordinates with P0-6 (single ledger).
 - **Domain:** Trust / Evidence · **Effort:** M · **Depends on:** P0-1 · **Mode:** LOOP
 - **Evidence (VERIFIED):** `CURRENT_STATE` INV-2 and `testing/SCORECARD.md`: the
   proof-linked audit drops confirmations 9/13 → 6/13 because the active engagement
