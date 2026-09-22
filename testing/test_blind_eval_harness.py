@@ -689,6 +689,76 @@ class ScorecardShapeTests(unittest.TestCase):
         self.assertEqual(sc["n_errors"], 0)
 
 
+class CrossIdentityRejectScorecardFieldTests(unittest.TestCase):
+    """B2-4(b): the scorecard must record whether the deterministic
+    cross-identity REJECT/downgrade path (harness/orchestrator_confirm.py's
+    inline block -- NOT gated by any config flag; it fires whenever an
+    active `cross_identity` validator is armed and returns not_confirmed on
+    an unconfirmed finding) was even reachable this run, so a REJECT-on run
+    is self-describing from its own manifest/scorecard alone."""
+
+    def setUp(self):
+        self.runner = _load_runner_module()
+
+    def test_build_scorecard_records_true_when_requested(self):
+        sc = self.runner.build_scorecard(
+            [], [], quarantine_leads=True, fail_open_mode="curated",
+            config_fingerprint_value="fp", fail_open_stats_before={}, fail_open_stats_final={},
+            cross_identity_reject=True,
+        )
+        self.assertTrue(sc["cross_identity_reject"])
+
+    def test_build_scorecard_records_false_when_disabled(self):
+        sc = self.runner.build_scorecard(
+            [], [], quarantine_leads=True, fail_open_mode="curated",
+            config_fingerprint_value="fp", fail_open_stats_before={}, fail_open_stats_final={},
+            cross_identity_reject=False,
+        )
+        self.assertFalse(sc["cross_identity_reject"])
+
+    def test_build_scorecard_defaults_to_false_when_omitted(self):
+        # Negative control on the PARAMETER itself: callers that don't pass
+        # cross_identity_reject at all (e.g. any pre-B2-4 call site) must
+        # still get an explicit False, not a missing key.
+        sc = self.runner.build_scorecard(
+            [], [], quarantine_leads=True, fail_open_mode="curated",
+            config_fingerprint_value="fp", fail_open_stats_before={}, fail_open_stats_final={},
+        )
+        self.assertIn("cross_identity_reject", sc)
+        self.assertFalse(sc["cross_identity_reject"])
+
+    def test_run_once_computes_true_when_active_cross_identity_armed_in_config(self):
+        # Config-level wiring: run_once must derive cross_identity_reject from
+        # validators.active_enabled + validators.cross_identity.enabled, not
+        # just accept a caller-supplied bool -- proven via a real run_once
+        # call (stub model only, no live active validator ever executes here
+        # since no exchange triggers cross_identity's finding classes).
+        exchanges = [_exchange(_CLEAN_CONTROL_URL, "control", "secure")]
+        stub = _CannedFindingModel()
+        cfg = _test_config(self.runner, quarantine_leads=True)
+        cfg.setdefault("validators", {})["active_enabled"] = True
+        cfg["validators"].setdefault("cross_identity", {})["enabled"] = True
+        with _isolated_store() as tmp:
+            sc = self.runner.run_once(
+                exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
+                orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+            )
+        self.assertTrue(sc["cross_identity_reject"])
+
+    def test_run_once_computes_false_when_cross_identity_not_armed(self):
+        # Negative control: same driver, committed-default config (no active
+        # validators) -> the field must read False, not just be present.
+        exchanges = [_exchange(_CLEAN_CONTROL_URL, "control", "secure")]
+        stub = _CannedFindingModel()
+        cfg = _test_config(self.runner, quarantine_leads=True)
+        with _isolated_store() as tmp:
+            sc = self.runner.run_once(
+                exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
+                orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+            )
+        self.assertFalse(sc["cross_identity_reject"])
+
+
 class MultiRunVarianceTests(unittest.TestCase):
     """P3: N>=5 stubbed runs, aggregated per-metric mean/variance."""
 

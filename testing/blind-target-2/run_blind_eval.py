@@ -235,6 +235,7 @@ def build_scorecard(
     config_fingerprint_value: str,
     fail_open_stats_before: dict,
     fail_open_stats_final: dict,
+    cross_identity_reject: bool = False,
 ) -> dict:
     from harness import store
     from harness.report_generator import generate_markdown_report
@@ -383,6 +384,14 @@ def build_scorecard(
         "config_fingerprint": config_fingerprint_value,
         "fail_open_mode": fail_open_mode,
         "quarantine_leads": quarantine_leads,
+        # B2-4: records whether the deterministic cross-identity REJECT/downgrade
+        # path (harness/orchestrator_confirm.py's inline block, NOT gated by any
+        # config flag) was even reachable this run -- i.e. whether the active
+        # cross_identity validator was armed at all. "REJECT on" == the validator
+        # ran and could downgrade a finding; "REJECT off" == it never appeared in
+        # for_finding's output, so the block never fired. Makes a REJECT-on run
+        # self-describing in its own manifest/scorecard.
+        "cross_identity_reject": cross_identity_reject,
         "fail_open_stats_before": fail_open_stats_before,
         "fail_open_stats_final": fail_open_stats_final,
         "hosts": hosts,
@@ -454,6 +463,11 @@ def run_once(
     outcomes = asyncio.run(run_exchanges(exchanges, orch, force_agents=force_agents, on_result=on_result))
 
     stats_final = fail_open_stats()
+    validators_cfg = config.get("validators") or {}
+    cross_identity_reject = bool(
+        validators_cfg.get("active_enabled")
+        and (validators_cfg.get("cross_identity") or {}).get("enabled")
+    )
     return build_scorecard(
         outcomes, exchanges,
         quarantine_leads=bool((config.get("reporting") or {}).get("quarantine_unverified_leads", False)),
@@ -461,6 +475,7 @@ def run_once(
         config_fingerprint_value=fingerprint,
         fail_open_stats_before=stats_before,
         fail_open_stats_final=stats_final,
+        cross_identity_reject=cross_identity_reject,
     )
 
 
@@ -575,6 +590,7 @@ def _live_main() -> None:
           f"({scorecard['n_controls_clean_issue_level']}/{scorecard['n_controls_issue_level']} clean, "
           f"{scorecard['n_controls_excluded_ambiguous']} excluded ambiguous)")
     print(f"fail-open triggered: {scorecard['fail_open_stats_final']['count']} times  (mode={fail_open_mode!r})")
+    print(f"cross_identity_reject: {scorecard['cross_identity_reject']}")
     print(f"timing: {scorecard['timing']}")
     print(f"results -> {DEFAULT_OUT_PATH}")
 
