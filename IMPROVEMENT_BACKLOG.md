@@ -1024,7 +1024,25 @@ Verify every proposed diff against the code before implementing.
   set (e.g. B dispatches 1, C dispatches 0 agents). No accuracy claim from the loop.
 - **Impact:** High (unblocks the #1 architectural decision). Feeds P2-2.
 
-### [ ] RB-8 — Fix the blind-eval harness so an owner run yields a valid scorecard (INV-1 fix)
+### [x] RB-8 — Fix the blind-eval harness so an owner run yields a valid scorecard (INV-1 fix)
+- **Result (VERIFIED):** `dd104f9` — INV-1 no-op fixed: `testing/blind-target-2/run_blind_eval.py`
+  refactored into importable functions with the live path (fresh `C:\tmp` DBs, live Ollama, real
+  curated corpus) gated behind `if __name__ == "__main__":` → importing now runs nothing and
+  mutates no global `store`/`cache` (independently verified). `build_scorecard` round-trips
+  `store.all_host_findings` → `report_generator.generate_markdown_report(quarantine_leads=...)`
+  (the sole caller of `should_quarantine_as_lead`), so the quarantine path is ACTUALLY exercised,
+  mirroring the report generator's own branch (nothing quarantined when the knob is off). Added
+  `controls_clean` (dirty controls listed) + timing (total/mean/max elapsed, token deltas) +
+  `run_eval_n_times(n≥5)`/`aggregate_variance` (pvariance). Cross-identity REJECT is injected at
+  RUNTIME only (`HARNESS_CROSS_IDENTITY_REJECT`); committed `config.yaml` untouched (asserted).
+  +14 OFFLINE tests (`testing/test_blind_eval_harness.py`): a canned-finding stub + synthetic
+  `eval-fixture.invalid` fixtures (NO answer-key/real-corpus read) prove the quarantine path is
+  invoked, the knob gates it, `controls_clean` discriminates a dirty control (basis="derived"
+  not quarantine-eligible), and import triggers no live run. testing tier 13→27; full suite
+  green (harness 2434 OK / 2 skip), exit 0. Diff is testing-only (no `harness/` core change).
+  Opus-reviewed APPROVE (safeguards + import-safety re-verified). **The RUN with a real model
+  stays OWNER/LIVE → feeds P0-3.** Documented residual: this harness has no narrower "just
+  REJECT" toggle (cross_identity needs `active_enabled`), so that axis is owner/live-only.
 - **Domain:** Evaluation · **Effort:** M · **Depends on:** RB-3 (dedupe first) · **Mode:**
   LOOP builds/repairs the harness (stubbed-model testable); **OWNER/LIVE** runs it
 - **Evidence (VERIFIED):** INV-1 — `run_blind_eval.py` set `quarantine_unverified_leads`

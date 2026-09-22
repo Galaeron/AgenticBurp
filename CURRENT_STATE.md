@@ -57,13 +57,11 @@ Shipped code items this session:
   reconciliation (`reviews/2026-09-21/`) filed the INV-1..4 production fixes as the
   **Consensus batch** in `IMPROVEMENT_BACKLOG.md`. Order (deps-corrected): RB-1 → RB-4 →
   RB-3 → RB-8 → RB-5 → RB-2 → RB-7 → RB-6 (RB-8 `Depends on RB-3`, so RB-3 precedes it).
-  - **RB-1 (`f24ff8e`):** local-API CSRF/token — ephemeral token→0600 lockfile + cross-site
-    `Origin`/`Sec-Fetch-Site` middleware; mutating routes need the token even on loopback.
-  - **RB-4 (`301d848`):** engagement confirm path persists `ProofRecord` + `VALIDATION_DECISION`
-    via shared `_persist_confirmation_proof` (INV-2; confirmed-only). +2 tests.
-  - **RB-3 (`3028cf7`):** identical dependency/banner findings collapse to one issue via
-    `issue_key` (INV-4 surfacing gap; non-dependency keys byte-identical). +6 tests.
-  - **Next: RB-8** (INV-1 blind-eval harness repair; deps RB-3 [x]; LOOP builds, owner runs).
+  - **RB-1 (`f24ff8e`):** local-API CSRF/token — ephemeral token→0600 lockfile + cross-site Origin/Sec-Fetch-Site middleware; token required on mutating routes even on loopback.
+  - **RB-4 (`301d848`):** engagement confirm path persists ProofRecord + VALIDATION_DECISION via shared `_persist_confirmation_proof` (INV-2; confirmed-only). +2 tests.
+  - **RB-3 (`3028cf7`):** identical dependency/banner findings collapse to one issue via `issue_key` (INV-4 surfacing gap; non-dependency keys byte-identical). +6 tests.
+  - **RB-8 (`dd104f9`):** blind-eval harness importable + quarantine path actually invoked; scorecard w/ controls-clean+variance+timing; +14 offline tests (INV-1). Live RUN owner-only.
+  - **Next: RB-5** (INV-3 chain re-link after 2nd-order+coverage phases; deps RB-4 [x]).
   Owner/live, skip in loop: RB-1b (Java token reader), P0-3 (blind scorecard RUN, via RB-8),
   P2-2 (ablation RUN, via RB-7), P1-10 (DNS pin), RB-2b (`curated` flip, gated on RB-8's
   delta), P0-6/P3-1, P1-5, P3-2/3-3.
