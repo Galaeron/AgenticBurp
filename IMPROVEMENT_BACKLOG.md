@@ -1753,7 +1753,28 @@ apply (safe config defaults, a caller-test + negative control per item, never re
 - **Impact:** High (removes a class of silently degraded live runs; prerequisite for trusting the
   P2-2 re-run).
 
-### [ ] AR-3 -- Record which captured exchange produced each finding (exchange provenance)
+### [x] AR-3 -- Record which captured exchange produced each finding (exchange provenance)
+- **Result (VERIFIED):** `07d650b` -- additive `HttpExchange.capture_id` (trusted transport field);
+  `store.py` findings gains additive `exchange_id`/`run_id` (via `_SCHEMA` + the PRAGMA table_info
+  migration guard, identities dup-column idiom) + a new `finding_observations(fingerprint, run_id,
+  exchange_id, created_at)` link table (`CREATE TABLE IF NOT EXISTS`, `UNIQUE(fingerprint,run_id,
+  exchange_id)`). `persist_findings` derives `exchange_id = capture_id or compute_exchange_hash[:16]`,
+  `run_id = telemetry.current_run_id()`, and writes one `INSERT OR IGNORE` observation per (finding,
+  exchange) -- so a DEDUPED finding still records every distinct exchange that produced it. Neither
+  column enters `finding_fingerprint`/`idx_findings_fingerprint_case` -> dedup counts/fingerprints
+  byte-for-byte unchanged. `all_host_findings` surfaces the ids; new `finding_observations()` reader.
+  `build_scorecard` disambiguates shared method+url control pairs off `finding_observations` (a control
+  scored on ITS OWN exchange's observations, never the vuln's finding), falling back to the exact
+  B2-3b `(method.upper(),url)` logic when no observation data exists (legacy DB); new
+  `n_controls_exchange_disambiguated`. This CLOSES the B2-3b follow-on (attribute rather than exclude).
+  Additive/back-compat: no destructive migration, pre-AR-3 DBs migrate cleanly (legacy rows default
+  ''); no config change; no safety flag/default. +tests (test_store `TestExchangeProvenanceAR3`:
+  round-trip, content-hash fallback, second-observation-row, pre-AR3-DB migration; test_blind_eval
+  `ExchangeProvenanceAttributionAR3Tests`: same-url control now SCORED, no-dup corpus byte-for-byte
+  unchanged); pre-existing mixed-case B2-3b test updated to the more-precise disambiguated-clean
+  outcome (case-normalization regression still caught via the disambiguation counter). smoke 92 OK;
+  full **2548 OK / 2 skip**, exit 0. Opus-reviewed APPROVE (dedup unchanged, back-compat migration,
+  attribution-off-observations + legacy fallback, legitimate B2-3b test update all confirmed at source).
 - **Domain:** Evaluation / Data model - **Effort:** M - **Depends on:** none (B2-3b is the method+url stopgap) - **Mode:** LOOP
 - **Evidence (VERIFIED by source inspection, 2026-09-22):** the `findings` table (`store.py:58-84`)
   has host/url/method/agent/fingerprint/case/proof ids but no exchange or run identifier, and
