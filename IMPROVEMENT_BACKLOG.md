@@ -1517,7 +1517,23 @@ caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.
   behaviourally identical to today. `full` suite green.
 - **Impact:** Medium-High (a clean elapsed-time stop, complementary to B2-2's breaker isolation).
 
-### [ ] ER-2 -- Emit one canonical per-run trace summary onto the EvidenceLedger
+### [x] ER-2 -- Emit one canonical per-run trace summary onto the EvidenceLedger
+- **Result (VERIFIED):** `0ad91e6` -- new additive `EventType.RUN_SUMMARY`; `analyze()` captures
+  `_run_start` (monotonic) + `owns_run = run_context is None` at method top (before it self-creates
+  a RunContext), and just before return, when `owns_run`, emits ONE `RUN_SUMMARY` via the EXISTING
+  `evidence_ledger.emit` onto the default ledger (single-ledger reuse, no second ledger) with
+  `Provenance.capture`. Payload: `tokens_total` (== `EffortLedger.total_tokens`), `tokens_breakdown`,
+  `elapsed_s`, `degraded` (== the B2-1 `agents_circuit_open` flag), `validator_count`/`leg_count`;
+  `finding_ref`/`case_ref` = `run_context.run_id` (non-empty so the event lands). Wrapped best-effort
+  (try/except log-and-continue) -> can NEVER raise into `analyze()` or alter the response; no
+  verdict/severity/scope/config change. `owns_run` gating => exactly one summary per standalone run,
+  ZERO when `analyze()` is nested in an engagement (shared run_context) -> no per-exchange
+  multiplication; cache-hit early return emits nothing. +4 tests (`test_run_summary_ledger.py`, stub
+  model, breaker+default-ledger reset in setUp/tearDown): exactly-one positive, healthy negative
+  control (degraded False + non-zero elapsed), degraded positive (breaker forced open), multiplication
+  guard (nested analyze -> 0 summaries). smoke 92 OK; full **2519 OK / 2 skip**, exit 0. Opus-reviewed
+  APPROVE (single-ledger reuse, best-effort isolation, owns_run captured pre-self-create, non-empty
+  finding_ref all confirmed at source).
 - **Domain:** Observability / Evaluation - **Effort:** S - **Depends on:** B2-1 - **Mode:** LOOP
 - **Evidence (VERIFIED by source inspection):** `harness/ablation_harness.py:231-278` recomputes
   tokens / wall-clock / tp-fp-fn ad hoc per arm; `EffortLedger.breakdown()` (`effort.py:90-94`) and
