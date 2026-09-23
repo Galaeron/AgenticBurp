@@ -1651,7 +1651,31 @@ prerequisite; AR-1 supplies the collapse candidate). The non-negotiables at the 
 apply (safe config defaults, a caller-test + negative control per item, never read
 `*ANSWER_KEY*`/a blind `app.py`, `python -m harness.suite full` before closing).
 
-### [ ] AR-1 -- Opt-in agent-family routing mode as the P2-2 collapse candidate (ablation variant G)
+### [x] AR-1 (LOOP half) -- Opt-in agent-family routing mode as the P2-2 collapse candidate (ablation variant G)
+- **Result (VERIFIED):** `994e5a0` -- owner decided the P2-2 ablation = COLLAPSE with a required
+  revert path; this lands the reversible opt-in mechanism. New `harness/agent_families.py` (routing/
+  composition module OUTSIDE `harness/agents/`; NO new agent modules, NO new detection class):
+  `DEFAULT_FAMILIES` (6 disjoint families covering all 36 registered agents, membership verified
+  against the live plugin registry at runtime), `group_dispatched_agents`, `compose_family_prompt`,
+  `FamilyRunner` (one composed model call per routed family from members' existing
+  `specialty_prompt`/`tactical_guide`, preserves each finding's `vulnerability_class` verbatim, labels
+  `AgentReport.agent="family:<name>"` for observability). `agent_manager.run_multiple_agents` branches
+  on `coordinator.routing_mode`: default `"agents"` = `_run_multiple_agents_default` (original body
+  VERBATIM) -> **OFF is the byte-for-byte revert state**; `"families"` = one call per routed family
+  (solo fallback for agents in no family, never dropped). `_choose_agents`/dispatch untouched;
+  confirmation/validator routing keys on `vulnerability_class` (not `AgentReport.agent`) so it is
+  invariant (parity tested). `config_schema` adds `routing_mode` + `_VALID_ROUTING_MODES` (NOT a
+  SafeDefaultGuard SAFE_CHECK -- reduces model calls, no traffic/scope); `config.yaml` adds
+  `coordinator.routing_mode: "agents"` (safe default, no existing default flipped). `ablation_harness`
+  gains `Variant("G")` (reuses RB-7's mechanism). +16 tests incl. the 3 owner-mandated REVERT tests
+  (OFF==baseline byte-for-byte; ON deterministic; ON->OFF==original with NO residual state), call-count
+  (families<agents), confirmation parity, stub reachability. Updated 8 `test_ablation_harness`
+  assertions A-F->A-G (acceptance requires VARIANTS to list G; no defect-injection/arm assertion
+  weakened -- reviewer-verified). smoke 92 OK; full **2539 OK / 2 skip**, exit 0. Opus-reviewed APPROVE
+  (revert guarantee + no residual state, confirmation parity, legitimate ablation edits, config safety
+  all confirmed at source). **OWNER measures** in the P2-2 re-run via variant G: recall/precision/model-
+  cost of `routing_mode: families` vs the full agents set; keep the collapse only if recall holds, and
+  revert by flipping the flag back to `"agents"` (default) if it doesn't.
 - **Domain:** AI / Architecture / Performance - **Effort:** M - **Depends on:** none (feeds P2-2) - **Mode:** LOOP builds; OWNER measures in the P2-2 re-run
 - **Evidence (VERIFIED by source inspection, 2026-09-22):** 36 specialist agent modules in
   `harness/agents/`, most 33-55 lines of prompt wrapper over `base_agent.py` (411 lines). Routing

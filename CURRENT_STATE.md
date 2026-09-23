@@ -38,10 +38,19 @@ standalone `analyze()` run). **ER-4 done** (`bf8cea3`: config-gated `confirm_rep
 DEFAULT OFF — an active ssrf/ssti/command_injection leg re-runs its confirming
 `validate()` once and downgrades to provisional on disagreement; OFF is
 byte-for-byte). **All loop-consumable Batch 2 + ER items are now `[x]`.**
-Remaining `[ ]` are OWNER/LIVE or frozen: ER-3/ER-5 (frozen behind P2-2), the
-peer-filed **AR-1..AR-3** (owner's-call placement, recommended before the P2-2
-re-run), plus the standing OWNER/live queue below. Full suite 2523 OK / 2 skip.
-The RB-1..RB-8 consensus batch is closed.
+**P2-2 ablation: owner decided COLLAPSE (with a required revert path).** **AR-1
+done** (`994e5a0`: opt-in `coordinator.routing_mode: agents|families` collapses
+per-agent model calls into 6 family calls; default `agents` = today's behavior =
+the byte-for-byte REVERT state; ships OFF, ablation variant G). **Next pick: AR-2**
+(run-scoped breaker/fail-open counters on `RunContext`, LOOP; then AR-3 exchange
+provenance). Full suite 2539 OK / 2 skip.
+
+**P2-2 checkbox still `[ ]`** pending the owner's ablation results artifact — the
+collapse DECISION is recorded (owner-made) and AR-1 implements it, but P2-2 will
+be flipped to `[x]` only when the results file (reviews/<date>/) is provided; do
+not mark it VERIFIED on the verbal decision alone. ER-3/ER-5 (new detection
+surface) stay deprioritized under the collapse decision. The RB-1..RB-8 consensus
+batch is closed.
 
 **External-review borrow batch (2026-09-22): ER-1, ER-2, ER-4** loop-consumable
 (pick order ER-1→ER-2→ER-4), filed from a user-requested eval of external
