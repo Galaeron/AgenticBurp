@@ -1412,7 +1412,25 @@ B ran clean and is the P2-2 crux).
   REJECT on and surfaced with it off; the manifest/scorecard records the REJECT state.
 - **Impact:** High (unblocks a fair precision measurement + a real precision lever).
 
-### [ ] B2-5 -- Gate the generic low-confidence agent guesses (the dominant FP driver)
+### [x] B2-5 -- Gate the generic low-confidence agent guesses (the dominant FP driver)
+- **Result (VERIFIED):** `53d6d66` -- evidence-gated suppression shipped OFF. New SIBLING
+  predicate `is_low_confidence_generic_guess` in `confirmation_gate.py`
+  (`should_quarantine_as_lead` untouched): True only when NOT confirmed, NOT oracle_verified,
+  confidence is a real number `< floor`, and the canonicalized class is in a narrow 3-element
+  `DEFAULT_GENERIC_CLASSES` (misconfig / broken-access-control-workflow-bypass / sqli; exact-key,
+  no substring). RECALL GUARD (hard invariant, reviewer-confirmed airtight): confirmed /
+  oracle_verified / at-or-above-floor findings are NEVER gated (strict `<`). `generate_markdown_report`
+  gains `gate_low_confidence_generic` (default False) + `generic_confidence_floor` (0.5); matches route
+  into the existing leads bucket. Both flags False => byte-for-byte the pre-B2-5 output (proven by an
+  `assertEqual` on the full report string). `config.yaml`: `reporting.gate_low_confidence_generic: false`
+  + `generic_confidence_floor: 0.5` ADDED, both OFF; NO existing default flipped (SafeDefaultGuardTests +
+  `test_committed_config_defaults_stay_safe` green). `run_blind_eval.py` threads both flags from config so
+  the measurement driver can enable them; B2-3/B2-3b metric code untouched. +16 tests
+  (`test_gate_generic_guesses.py`): positive routed-to-leads, recall negative control (confirmed +
+  high-confidence same class stay surfaced), flag-off byte-for-byte no-op, FP-drop-no-TP-loss, predicate
+  units. smoke 92 OK; full **2510 OK / 2 skip**, exit 0. Opus-reviewed APPROVE (config-safe, recall guard,
+  no-op equivalence all verified at source). **OWNER-reported:** the real FP-drop on the blind corpus is
+  measured by a real-model run with the flag on (the lever is now available + measured offline).
 - **Domain:** Precision - **Effort:** M - **Depends on:** none (uses B2-3's attribution) - **Mode:** LOOP
 - **Evidence (VERIFIED):** `BLIND_SCORECARD_P0-3.md` -- "the dominant FP driver ... generic
   low-confidence agent guesses (`Security misconfiguration`, `Broken Access Control (Workflow
