@@ -413,6 +413,88 @@ def should_quarantine_as_lead(finding) -> bool:
     return leg_tier(vc) == "live"
 
 
+# 2026-09-23 B2-5: the scorecard's dominant FP driver across blind runs is a
+# narrow set of generic-class, low-confidence agent GUESSES with no
+# confirming leg -- named offenders (2026-09-22 reviews/2026-09-22/
+# BLIND_SCORECARD_P0-3.md): "Security misconfiguration",
+# "Broken Access Control (Workflow Bypass)", "SQL injection" at confidence
+# 0.3-0.5, firing on nearly every exchange regardless of actual target
+# behavior. `is_low_confidence_generic_guess` below is a SIBLING gate to
+# `should_quarantine_as_lead` -- same recall guard (never a confirmed /
+# oracle-verified / at-or-above-floor finding), a different trigger (class +
+# raw confidence number, rather than basis + leg_tier).
+#
+# `categories.canonicalize()` deliberately returns None for ambiguous
+# OWASP-style category names it refuses to guess at (see
+# test_categories.py's assertion that canonicalize("Broken Access Control")
+# is None -- a real OWASP Top 10 heading that could mean idor, business
+# logic, or auth) -- so "Broken Access Control (Workflow Bypass)" can't be
+# reached purely through the canonical-key synonym table. The default set
+# below is built from canonicalize()'s result where it succeeds, falling
+# back to the raw lowercased phrase where it refuses to guess; the SAME
+# canonicalize-or-lowercase rule is applied to the finding under test in
+# `_generic_class_key`, so matching stays a single narrow exact-key lookup
+# either way -- never a substring/fuzzy match.
+_GENERIC_CLASS_SOURCE_PHRASES: tuple[str, ...] = (
+    "Security misconfiguration",
+    "Broken Access Control (Workflow Bypass)",
+    "SQL injection",
+)
+
+
+def _generic_class_key(vuln_class) -> str:
+    from harness.categories import canonicalize
+    vc = vuln_class or ""
+    return canonicalize(vc) or vc.strip().lower()
+
+
+DEFAULT_GENERIC_CLASSES: frozenset = frozenset(
+    _generic_class_key(p) for p in _GENERIC_CLASS_SOURCE_PHRASES
+)
+
+
+def is_low_confidence_generic_guess(finding, floor: float = 0.5, generic_classes=None) -> bool:
+    """Sibling predicate to `should_quarantine_as_lead`: True when a finding is
+    an UNCONFIRMED, LOW-CONFIDENCE guess in one of a narrow set of generic
+    vulnerability classes, with no confirming leg -- the dominant FP driver
+    identified in the 2026-09-22 blind scorecard.
+
+    ALL of the following must hold:
+      - Not confirmed (confirmed is False) -- no confirming leg.
+      - Not oracle-verified (oracle_verified is False).
+      - `confidence` is a real number strictly below `floor`.
+      - The finding's vulnerability_class resolves (via
+        `_generic_class_key`: categories.canonicalize, falling back to the
+        raw lowercased string where canonicalize refuses to guess) to one of
+        `generic_classes`.
+
+    This is the SAME recall guard as `should_quarantine_as_lead`: a confirmed
+    or oracle-verified finding is NEVER routed here, and neither is one at or
+    above the confidence floor -- regardless of class. `generic_classes`
+    defaults to `DEFAULT_GENERIC_CLASSES`, a deliberately narrow, reviewable
+    set -- never a broad substring match.
+
+    Accepts a dict-or-object finding, mirroring `should_quarantine_as_lead`."""
+    generic_classes = DEFAULT_GENERIC_CLASSES if generic_classes is None else generic_classes
+
+    if isinstance(finding, dict):
+        confirmed = bool(finding.get("confirmed", False))
+        oracle_verified = bool(finding.get("oracle_verified", False))
+        confidence = finding.get("confidence", None)
+        vc = finding.get("vulnerability_class", "")
+    else:
+        confirmed = bool(getattr(finding, "confirmed", False))
+        oracle_verified = bool(getattr(finding, "oracle_verified", False))
+        confidence = getattr(finding, "confidence", None)
+        vc = getattr(finding, "vulnerability_class", "")
+
+    if confirmed or oracle_verified:
+        return False
+    if not isinstance(confidence, (int, float)) or confidence >= floor:
+        return False
+    return _generic_class_key(vc) in generic_classes
+
+
 def _controlled_negative_classes(validation_reports: list | None) -> set:
     """Canonical finding classes for which a validator produced a real controlled
     NEGATIVE -- it actually ran and returned `not_confirmed` (R08). This is what

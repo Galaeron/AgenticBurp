@@ -236,6 +236,8 @@ def build_scorecard(
     fail_open_stats_before: dict,
     fail_open_stats_final: dict,
     cross_identity_reject: bool = False,
+    gate_low_confidence_generic: bool = False,
+    generic_confidence_floor: float = 0.5,
 ) -> dict:
     from harness import store
     from harness.report_generator import generate_markdown_report
@@ -253,7 +255,11 @@ def build_scorecard(
     for host in hosts:
         stored = store.all_host_findings(host)
         all_stored.extend(stored)
-        markdown_reports[host] = generate_markdown_report(host, stored, quarantine_leads=quarantine_leads)
+        markdown_reports[host] = generate_markdown_report(
+            host, stored, quarantine_leads=quarantine_leads,
+            gate_low_confidence_generic=gate_low_confidence_generic,
+            generic_confidence_floor=generic_confidence_floor,
+        )
 
     individual_stored = [f for f in all_stored
                           if not f["vulnerability_class"].startswith("potential-attack-chain:")]
@@ -384,6 +390,12 @@ def build_scorecard(
         "config_fingerprint": config_fingerprint_value,
         "fail_open_mode": fail_open_mode,
         "quarantine_leads": quarantine_leads,
+        # B2-5: informational, mirrors "quarantine_leads" above -- whether the
+        # low-confidence generic-class gate was armed for the markdown report
+        # this run produced (does not affect n_quarantined_leads/n_surfaced_
+        # findings/controls_clean above, which stay on B2-3/B2-3b's existing
+        # should_quarantine_as_lead-only accounting).
+        "gate_low_confidence_generic": gate_low_confidence_generic,
         # B2-4: records whether the deterministic cross-identity REJECT/downgrade
         # path (harness/orchestrator_confirm.py's inline block, NOT gated by any
         # config flag) was even reachable this run -- i.e. whether the active
@@ -468,14 +480,17 @@ def run_once(
         validators_cfg.get("active_enabled")
         and (validators_cfg.get("cross_identity") or {}).get("enabled")
     )
+    reporting_cfg = config.get("reporting") or {}
     return build_scorecard(
         outcomes, exchanges,
-        quarantine_leads=bool((config.get("reporting") or {}).get("quarantine_unverified_leads", False)),
+        quarantine_leads=bool(reporting_cfg.get("quarantine_unverified_leads", False)),
         fail_open_mode=str((config.get("coordinator") or {}).get("fail_open_mode", "")),
         config_fingerprint_value=fingerprint,
         fail_open_stats_before=stats_before,
         fail_open_stats_final=stats_final,
         cross_identity_reject=cross_identity_reject,
+        gate_low_confidence_generic=bool(reporting_cfg.get("gate_low_confidence_generic", False)),
+        generic_confidence_floor=float(reporting_cfg.get("generic_confidence_floor", 0.5)),
     )
 
 

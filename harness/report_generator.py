@@ -315,7 +315,9 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
 
 def generate_markdown_report(host: str, findings: list[dict], generated_at: datetime | None = None,
                               effort_ledger: EffortLedger | None = None, suppressed_count: int = 0,
-                              quarantine_leads: bool = False) -> str:
+                              quarantine_leads: bool = False,
+                              gate_low_confidence_generic: bool = False,
+                              generic_confidence_floor: float = 0.5) -> str:
     """
     Build a submission-ready Markdown report from store.all_host_findings()
     -shaped dicts (or anything with the same keys). Chain hypotheses
@@ -336,8 +338,18 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     "Test Suggestions" section rather than counting toward reported findings.
     Intended for blind / no-oracle measurement runs. SHIPPED OFF (False) so a
     fully-confirmed run is unaffected.
+
+    `gate_low_confidence_generic`: when True, UNCONFIRMED findings matching
+    `confirmation_gate.is_low_confidence_generic_guess` (a narrow, generic
+    vulnerability class at confidence below `generic_confidence_floor`, no
+    confirming leg) are ALSO routed to the same leads bucket as
+    `quarantine_leads` -- down-ranked out of the surfaced set rather than
+    reported as findings. SHIPPED OFF (False) so a fully-confirmed run, and
+    any run that doesn't opt in, is byte-for-byte unaffected (B2-5). Never
+    routes a confirmed or oracle-verified finding, nor one at/above the floor
+    -- see `is_low_confidence_generic_guess`'s own recall-guard docstring.
     """
-    from harness.confirmation_gate import should_quarantine_as_lead
+    from harness.confirmation_gate import should_quarantine_as_lead, is_low_confidence_generic_guess
 
     generated_at = generated_at or datetime.now(timezone.utc)
 
@@ -349,20 +361,23 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     individual_pairs = [(r, f) for r, f in pairs if not f.is_chain]
     chains = [f for _, f in pairs if f.is_chain]
 
-    # Quarantine: route assumed/recalled live-class unverified findings to a
-    # separate bucket rather than the main list. The predicate uses the raw dict
-    # so it sees oracle_verified / basis / confirmed exactly as stored.
-    if quarantine_leads:
-        leads_bucket: list = []
-        individual: list = []
-        for raw, f in individual_pairs:
-            if should_quarantine_as_lead(raw):
-                leads_bucket.append(f)
-            else:
-                individual.append(f)
-    else:
-        individual = [f for _, f in individual_pairs]
-        leads_bucket = []
+    # Quarantine / gate: route assumed/recalled live-class unverified findings
+    # (quarantine_leads) and/or low-confidence generic-class guesses
+    # (gate_low_confidence_generic) into a shared leads bucket rather than the
+    # main list. Both predicates read the raw dict so they see oracle_verified
+    # / basis / confirmed / confidence exactly as stored. With both flags
+    # False (the shipped default), every finding falls through to `individual`
+    # in the same order as before either flag existed -- byte-for-byte
+    # unchanged output.
+    leads_bucket: list = []
+    individual: list = []
+    for raw, f in individual_pairs:
+        if quarantine_leads and should_quarantine_as_lead(raw):
+            leads_bucket.append(f)
+        elif gate_low_confidence_generic and is_low_confidence_generic_guess(raw, generic_confidence_floor):
+            leads_bucket.append(f)
+        else:
+            individual.append(f)
 
     # Collapse per-(endpoint-family, class) duplicates, floating confirmed. A
     # max-coverage run's 225 findings / 45 confirmed were heavy duplicates over ~4

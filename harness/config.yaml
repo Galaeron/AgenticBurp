@@ -563,6 +563,19 @@ reporting:
   # unaffected; enable in the measurement overlay (config.local.yaml or the
   # runner's explicit config dict) for blind/no-oracle evaluation.
   quarantine_unverified_leads: false
+  # B2-5: gate UNCONFIRMED, low-confidence (< generic_confidence_floor)
+  # findings in a narrow, named set of generic vulnerability classes
+  # (Security misconfiguration, Broken Access Control (Workflow Bypass), SQL
+  # injection -- the scorecard's dominant FP driver, see
+  # confirmation_gate.is_low_confidence_generic_guess) into the same `leads`
+  # bucket as quarantine_unverified_leads, instead of the main findings list.
+  # Never routes a confirmed/oracle-verified finding, nor one at/above the
+  # floor, regardless of class (hard recall guard). SHIPPED OFF so a
+  # fully-confirmed run, and any run that doesn't opt in, is byte-for-byte
+  # unaffected; enable in the measurement overlay (config.local.yaml or the
+  # runner's explicit config dict) for blind/no-oracle evaluation.
+  gate_low_confidence_generic: false
+  generic_confidence_floor: 0.5
 
 # Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
 # off. When enabled, a CONFIRMED finding's host-agnostic structural shape
