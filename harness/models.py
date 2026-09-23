@@ -14,6 +14,11 @@ class HttpExchange(BaseModel):
     response_body: str = ""
     # Free-text notes the analyst typed in Burp before sending, if any.
     analyst_note: str = ""
+    # Trusted transport identifier set by the capture driver (eval harness /
+    # Burp extension), NOT agent-authored JSON. Additive/optional for
+    # back-compat: empty for older callers, which fall back to a content
+    # hash of the exchange (see cache.ExchangeCache.compute_exchange_hash).
+    capture_id: str = ""
 
 
 class ComponentCandidate(BaseModel):

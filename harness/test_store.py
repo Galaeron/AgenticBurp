@@ -89,6 +89,178 @@ class TestFindingsPersistenceRoundTrip(unittest.TestCase):
         self.assertEqual(classes, {"xss", "idor"})
 
 
+class TestExchangeProvenanceAR3(unittest.TestCase):
+    """AR-3 (LOOP half): findings carry the exact id of the exchange that
+    produced them (exchange_id), additively, instead of only the
+    (method, url) coordinates the findings table already had. Covers the
+    round-trip, re-observation-after-dedup, and back-compat/no-op cases the
+    Opus scoper's acceptance criteria call for."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "test_ar3_state.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def test_capture_id_round_trips_through_all_host_findings(self):
+        # POSITIVE (round-trip): a finding persisted from a known synthetic
+        # exchange with an explicit capture_id reads back carrying that
+        # exact exchange id, not just its (method, url).
+        exchange = HttpExchange(
+            url="https://example.com/api/orders/1", method="GET",
+            request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+            capture_id="exch-known-42",
+        )
+        finding = Finding(
+            vulnerability_class="idor", confidence=0.7, summary="s",
+            evidence="e", suggested_test="t", basis="derived",
+        )
+        store.persist_findings(exchange, "idor_agent", [finding])
+        results = store.all_host_findings(exchange.url)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["exchange_id"], "exch-known-42")
+        # run_id is additive too; absent any bound telemetry run, it is ''.
+        self.assertEqual(results[0]["run_id"], "")
+
+    def test_no_capture_id_falls_back_to_content_hash_and_reads_back(self):
+        # NEGATIVE (legacy/back-compat, no explicit capture_id): a finding
+        # persisted from an exchange with NO capture_id set still reads back
+        # fine, and gets a non-empty exchange_id -- the stable content hash
+        # fallback (cache.ExchangeCache.compute_exchange_hash), not ''.
+        exchange = HttpExchange(
+            url="https://example.com/api/orders/2", method="GET",
+            request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+        )
+        self.assertEqual(exchange.capture_id, "")
+        finding = Finding(
+            vulnerability_class="idor", confidence=0.6, summary="s",
+            evidence="e", suggested_test="t", basis="derived",
+        )
+        store.persist_findings(exchange, "idor_agent", [finding])
+        results = store.all_host_findings(exchange.url)
+        self.assertEqual(len(results), 1)
+        self.assertNotEqual(results[0]["exchange_id"], "")
+
+        from harness import cache as cache_mod
+        expected = cache_mod.ExchangeCache.compute_exchange_hash(exchange)[:16]
+        self.assertEqual(results[0]["exchange_id"], expected)
+
+    def test_deduped_finding_records_second_observation_row(self):
+        # POSITIVE (re-observation): two exchanges sharing the SAME (host,
+        # method, endpoint, vulnerability_class) -- so they fingerprint
+        # identically and collapse into ONE findings row (INSERT OR IGNORE,
+        # unchanged dedup) -- still each get their own row in
+        # finding_observations, keyed by their own exchange_id.
+        url = "https://example.com/api/tickets/9"
+        exchange_a = HttpExchange(
+            url=url, method="GET", request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+            capture_id="exch-a",
+        )
+        exchange_b = HttpExchange(
+            url=url, method="GET", request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+            capture_id="exch-b",
+        )
+        finding = Finding(
+            vulnerability_class="idor", confidence=0.65, summary="s",
+            evidence="e", suggested_test="t", basis="derived",
+        )
+        store.persist_findings(exchange_a, "idor_agent", [finding])
+        store.persist_findings(exchange_b, "idor_agent", [finding])
+
+        results = store.all_host_findings(url)
+        # Dedup unchanged: one findings row, keeping the first-seen exchange_id.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["exchange_id"], "exch-a")
+
+        fp = results[0]["fingerprint"]
+        observed = store.finding_observations([fp])
+        self.assertIn(fp, observed)
+        self.assertCountEqual(observed[fp], ["exch-a", "exch-b"])
+
+    def test_pre_ar3_db_migrates_without_error(self):
+        # NEGATIVE (migration/back-compat): a DB created by a build that
+        # predates AR-3 -- findings table with no exchange_id/run_id columns,
+        # no finding_observations table at all -- must migrate cleanly the
+        # next time it is opened, with no destructive rewrite of existing
+        # rows (they simply default to '').
+        import sqlite3
+        conn = sqlite3.connect(store._DB_PATH)
+        try:
+            # Exact pre-AR-3 schema: every column store.py's findings table has
+            # had for a while, EXCEPT exchange_id/run_id (the two this item
+            # adds) -- so the only thing the migration guard has to do here is
+            # add those two, not paper over unrelated pre-existing gaps.
+            conn.executescript("""
+                CREATE TABLE findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    vulnerability_class TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    summary TEXT NOT NULL,
+                    basis TEXT NOT NULL,
+                    evidence TEXT NOT NULL DEFAULT '',
+                    suggested_test TEXT NOT NULL DEFAULT '',
+                    owasp_category TEXT,
+                    review_verdict TEXT,
+                    confirmed INTEGER NOT NULL DEFAULT 0,
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    prompt_version TEXT NOT NULL DEFAULT '',
+                    finding_id TEXT NOT NULL DEFAULT '',
+                    case_id TEXT NOT NULL DEFAULT '',
+                    proof_id TEXT NOT NULL DEFAULT '',
+                    oracle_verified INTEGER NOT NULL DEFAULT 0,
+                    verification_state TEXT NOT NULL DEFAULT 'candidate',
+                    oracle_capsule_id TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
+                );
+                INSERT INTO findings (host, url, method, agent, vulnerability_class,
+                                       severity, confidence, summary, basis, fingerprint, created_at)
+                VALUES ('example.com', 'https://example.com/legacy', 'GET', 'legacy_agent',
+                        'xss', 'medium', 0.5, 'pre-AR-3 row', 'derived', 'legacy-fp-1', 0.0);
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Opening it through the normal path must not raise, must add the
+        # new columns/table, and the pre-existing row must remain readable
+        # with the new columns defaulting to ''.
+        conn = store._connect()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)")}
+            self.assertIn("exchange_id", cols)
+            self.assertIn("run_id", cols)
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn("finding_observations", tables)
+            row = conn.execute(
+                "SELECT exchange_id, run_id, summary FROM findings WHERE url = ?",
+                ("https://example.com/legacy",),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row[0], "")
+        self.assertEqual(row[1], "")
+        self.assertEqual(row[2], "pre-AR-3 row")
+
+        results = store.all_host_findings("https://example.com/legacy")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["exchange_id"], "")
+        self.assertEqual(results[0]["run_id"], "")
+
+
 class TestFindingSuppression(unittest.TestCase):
     """
     Tests for the cross-run finding suppression feature -- the workflow

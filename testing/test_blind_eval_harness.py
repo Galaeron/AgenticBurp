@@ -572,14 +572,13 @@ class IssueLevelControlsCleanTests(unittest.TestCase):
         self.assertEqual(sc["host_level_issues_on_controls"][0]["affected_instances"], [_CLEAN_CONTROL_URL])
 
     def test_mixed_case_method_still_detected_as_ambiguous_and_excluded(self):
-        # (B2-3b review fix, NEW -- case-normalization regression guard) A
+        # (B2-3b review fix -- case-normalization regression guard) A
         # control record method="delete" (lowercase) vs a confirmed_vuln
         # method="DELETE" (uppercase) on the SAME url -- the SAME underlying
         # HTTP method, just recorded with inconsistent casing (the exact
-        # scenario the review's blocker names). Correct behavior: this pair
-        # is genuinely ambiguous and must be excluded from the fair
-        # denominator entirely, case-insensitively, exactly like the
-        # same-case ambiguity test above.
+        # scenario the review's blocker names). Case-insensitive pair
+        # matching must still treat this as the same (method, url) pair the
+        # same-case ambiguity test above does.
         #
         # If method were compared in its RAW (un-normalized) case only at
         # set-construction time -- normalizing only later, downstream, for
@@ -592,6 +591,17 @@ class IssueLevelControlsCleanTests(unittest.TestCase):
         # mismatch. Verified empirically to go RED against that
         # raw-case-then-downstream-uppercase construction and GREEN once
         # method is normalized to uppercase AT CONSTRUCTION for every set.
+        #
+        # AR-3 (LOOP half) update: only the vuln's own exchange ever
+        # produces a finding here (the control's own exchange gets none),
+        # so exchange-level provenance now POSITIVELY confirms the control
+        # is clean -- rather than leaving it excluded as merely ambiguous,
+        # it is exchange-disambiguated into the fair, clean denominator.
+        # That is strictly more informative than the old exclusion, so this
+        # regression guard is updated to assert the new (correct) outcome
+        # instead of the old "excluded" one; the case-insensitive pairing
+        # this test exists to guard is still exercised (see
+        # pair_to_control_cid's own case-normalized pair construction).
         shared_url = _VULN_URL
         exchanges = [
             _exchange(shared_url, "control", "control record, lowercase delete", method="delete"),
@@ -599,7 +609,7 @@ class IssueLevelControlsCleanTests(unittest.TestCase):
         ]
         # Only the vuln's own (lead-eligible, so surfaced when quarantine is
         # off) finding fires -- isolating whether it gets wrongly attributed
-        # to the "control" bucket instead of being excluded as ambiguous.
+        # to the "control" bucket instead of being correctly scored clean.
         stub = _CannedFindingModel(assumed_pairs=frozenset({("DELETE", shared_url)}))
         cfg = _test_config(self.runner, quarantine_leads=False)
         with _isolated_store() as tmp:
@@ -607,8 +617,11 @@ class IssueLevelControlsCleanTests(unittest.TestCase):
                 exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
                 orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
             )
-        self.assertEqual(sc["n_controls_excluded_ambiguous"], 1)
-        self.assertEqual(sc["n_controls_issue_level"], 0)
+        self.assertEqual(sc["n_controls_excluded_ambiguous"], 0, sc)
+        self.assertEqual(sc["n_controls_exchange_disambiguated"], 1, sc)
+        self.assertEqual(sc["n_controls_issue_level"], 1)
+        # Scored clean, not merely excluded -- no finding was ever observed
+        # via the control's OWN exchange, only the vuln's.
         self.assertTrue(sc["controls_clean_issue_level"], sc["per_control_drivers"])
         self.assertEqual(sc["per_control_drivers"], [])
 
@@ -658,6 +671,118 @@ class IssueLevelControlsCleanTests(unittest.TestCase):
         self.assertFalse(sc["controls_clean_issue_level"])
         self.assertEqual(len(sc["per_control_drivers"]), 1)
         self.assertEqual(sc["per_control_drivers"][0]["url"], _DIRTY_CONTROL_URL)
+
+
+class ExchangeProvenanceAttributionAR3Tests(unittest.TestCase):
+    """AR-3 (LOOP half): exact finding->exchange attribution closes the
+    B2-3b follow-on -- a control sharing the SAME (method, url) as a vuln
+    exchange is no longer excluded from the fair denominator as
+    "ambiguous"; it is scored on its own exchange, using
+    harness.store.finding_observations (not the single, dedup-collapsed
+    findings.exchange_id column)."""
+
+    def setUp(self):
+        self.runner = _load_runner_module()
+
+    def test_same_method_url_control_is_scored_not_excluded(self):
+        # POSITIVE (attribution): a GET vuln exchange and a GET control
+        # exchange sharing the IDENTICAL (method, url) both trigger the
+        # same canned idor finding (assumed_urls matches on url alone, not
+        # method+url, so BOTH exchanges get it) -- same host/method/
+        # endpoint/class, so they fingerprint identically and dedup into
+        # ONE findings row. Under the legacy (method, url)-only rule this
+        # pair is "ambiguous" and excluded entirely (n_controls_excluded_
+        # ambiguous == 1, the control never scored). With exchange-level
+        # provenance available (finding_observations carries BOTH
+        # exchanges' capture ids for this fingerprint), the control is
+        # instead scored on its OWN exchange and found dirty -- it produced
+        # a real surfaced finding, previously hidden by the exclusion.
+        shared_url = _VULN_URL
+        exchanges = [
+            _exchange(shared_url, "confirmed_vuln", "the real vuln", method="GET"),
+            _exchange(shared_url, "control", "control sharing method+url with the vuln", method="GET"),
+        ]
+        stub = _CannedFindingModel(assumed_urls=frozenset({shared_url}))
+        # quarantine off: keep the (lead-eligible) assumed-basis finding
+        # surfaced so it is in play for control scoring, matching the
+        # existing shared-url B2-3 tests' own pattern.
+        cfg = _test_config(self.runner, quarantine_leads=False)
+        from harness import store
+        with _isolated_store() as tmp:
+            sc = self.runner.run_once(
+                exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
+                orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+            )
+            # The underlying provenance, queried while the isolated DB is
+            # still live: one findings row (dedup unchanged), but
+            # finding_observations records BOTH exchanges independently --
+            # this is what makes the exchange-first scoring below possible.
+            stored = store.all_host_findings(store.host_of(shared_url))
+            idor_rows = [r for r in stored if r["vulnerability_class"] == "idor"]
+            self.assertEqual(len(idor_rows), 1, idor_rows)
+            observed = store.finding_observations([idor_rows[0]["fingerprint"]])
+            self.assertEqual(len(observed.get(idor_rows[0]["fingerprint"], [])), 2, observed)
+        # No longer excluded as ambiguous -- disambiguated via exchange id.
+        self.assertEqual(sc["n_controls_excluded_ambiguous"], 0, sc)
+        self.assertEqual(sc["n_controls_exchange_disambiguated"], 1, sc)
+        self.assertEqual(sc["n_controls_issue_level"], 1, sc)
+        # SCORED, not excluded -- and found dirty, since the control's own
+        # exchange really did produce this finding (not just the vuln's).
+        self.assertFalse(sc["controls_clean_issue_level"], sc["per_control_drivers"])
+        self.assertEqual(len(sc["per_control_drivers"]), 1)
+        self.assertEqual(sc["per_control_drivers"][0]["method"], "GET")
+        self.assertEqual(sc["per_control_drivers"][0]["url"], shared_url)
+
+    def test_no_duplicates_corpus_scoring_unchanged_from_pair_based_path(self):
+        # NEGATIVE (no-op): a corpus with NO (method, url) collisions between
+        # a control and a vuln exchange has nothing for exchange-first
+        # attribution to disambiguate -- finding counts, fingerprints, and
+        # the generated markdown report must be byte-identical to the
+        # pre-AR-3 (method, url)-only path. This is a same-corpus rerun
+        # rather than a golden-file diff, but the corpus is deliberately
+        # unambiguous, so the exchange-first branch is a no-op by
+        # construction (n_controls_exchange_disambiguated == 0) and both
+        # runs must produce identical output.
+        # quarantine ON: the vuln's own lead-eligible finding, AND the clean
+        # control's own (spurious, but also lead-eligible) guess -- prior-
+        # context text from the first exchange legitimately leaks into the
+        # second's prompt (run_exchanges runs sequentially on purpose, see
+        # its own docstring), so the stub's substring match also fires on
+        # the control exchange. That is fine and matches the existing
+        # ControlsCleanMetricTests pattern: both are quarantined, so neither
+        # is ever "surfaced", and the corpus has NO (method, url) collision
+        # between a control and a vuln for exchange-first attribution to
+        # act on either way.
+        exchanges = [
+            _exchange(_VULN_URL, "confirmed_vuln", "the real vuln", method="GET"),
+            _exchange(_CLEAN_CONTROL_URL, "control", "unrelated clean control", method="GET"),
+        ]
+        stub = _CannedFindingModel(assumed_urls=frozenset({_VULN_URL, _CLEAN_CONTROL_URL}))
+        cfg = _test_config(self.runner, quarantine_leads=True)
+
+        def _run():
+            with _isolated_store() as tmp:
+                return self.runner.run_once(
+                    exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
+                    orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+                )
+
+        sc1 = _run()
+        sc2 = _run()
+
+        self.assertEqual(sc1["n_controls_exchange_disambiguated"], 0, sc1)
+        self.assertEqual(sc2["n_controls_exchange_disambiguated"], 0, sc2)
+        for sc in (sc1, sc2):
+            self.assertEqual(sc["n_controls_excluded_ambiguous"], 0)
+            self.assertTrue(sc["controls_clean_issue_level"], sc["per_control_drivers"])
+            self.assertEqual(sc["n_surfaced_findings"], 0)
+            self.assertEqual(sc["n_quarantined_leads"], 2)
+
+        self.assertEqual(sc1["n_findings_total"], sc2["n_findings_total"])
+        self.assertEqual(sc1["surfaced_finding_ids"], sc2["surfaced_finding_ids"])
+        self.assertEqual(sc1["n_controls_issue_level"], sc2["n_controls_issue_level"])
+        self.assertEqual(sc1["controls_clean_issue_level"], sc2["controls_clean_issue_level"])
+        self.assertEqual(sc1["markdown_reports"], sc2["markdown_reports"])
 
 
 class ScorecardShapeTests(unittest.TestCase):

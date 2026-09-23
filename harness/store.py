@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS findings (
     oracle_verified INTEGER NOT NULL DEFAULT 0,
     verification_state TEXT NOT NULL DEFAULT 'candidate',
     oracle_capsule_id TEXT NOT NULL DEFAULT '',
+    exchange_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_findings_host ON findings(host);
@@ -344,6 +346,24 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE findings ADD COLUMN verification_state TEXT NOT NULL DEFAULT 'candidate'")
     if "oracle_capsule_id" not in cols:
         conn.execute("ALTER TABLE findings ADD COLUMN oracle_capsule_id TEXT NOT NULL DEFAULT ''")
+    # AR-3 (LOOP half): exact finding->exchange provenance, additive. `exchange_id`
+    # is the capture-driver-supplied HttpExchange.capture_id (or, when absent, a
+    # stable content hash -- see persist_findings) and `run_id` the run that
+    # produced the finding (from telemetry's ambient current-run binding). Neither
+    # column feeds finding_fingerprint or the unique dedup index below -- they are
+    # provenance metadata only. Legacy rows default to '' and stay valid/readable.
+    if "exchange_id" not in cols:
+        try:
+            conn.execute("ALTER TABLE findings ADD COLUMN exchange_id TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
+    if "run_id" not in cols:
+        try:
+            conn.execute("ALTER TABLE findings ADD COLUMN run_id TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
     # T06/R08: dedup on (fingerprint, case_id), not fingerprint alone, so a
     # patched-fixture RETEST -- same coordinates, a NEW case identity -- is retained
     # as its own row (append-only retest history) instead of being IGNORE'd. Legacy
@@ -435,6 +455,26 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     knowledge_cols = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_notes)")}
     if "engagement_id" not in knowledge_cols:
         conn.execute("ALTER TABLE knowledge_notes ADD COLUMN engagement_id TEXT NOT NULL DEFAULT ''")
+
+    # AR-3 (LOOP half): finding -> exchange provenance link table. One row per
+    # (finding, exchange) OBSERVATION -- so a finding that is deduped by the
+    # findings table's (fingerprint, case_id) unique index (INSERT OR IGNORE)
+    # still records every distinct exchange that produced it, not just the
+    # first-seen one. Scored/read by exchange-first attribution (see
+    # testing/blind-target-2/run_blind_eval.py's build_scorecard); never used
+    # for dedup itself.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS finding_observations (
+            fingerprint TEXT NOT NULL,
+            run_id TEXT NOT NULL DEFAULT '',
+            exchange_id TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_observations_unique
+        ON finding_observations(fingerprint, run_id, exchange_id)
+    """)
     conn.commit()
 
 
@@ -451,9 +491,20 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
         return
     host = host_of(exchange.url)
     now = time.time()
+    # AR-3 (LOOP half): exact provenance. Prefer the capture driver's own id
+    # (trusted transport field, not agent JSON); fall back to a stable content
+    # hash of the exchange -- the same hash orchestrator_detect.py already uses
+    # at :460/:944, so two exchanges with identical method+url but different
+    # bodies/headers still get distinct ids even without an explicit capture_id.
+    from harness import cache as _cache
+    exchange_id = getattr(exchange, "capture_id", "") or \
+        _cache.ExchangeCache.compute_exchange_hash(exchange)[:16]
+    from harness import telemetry as _telemetry
+    run_id = _telemetry.current_run_id() or ""
     conn = _connect()
     try:
         rows = []
+        fingerprints = []
         for f in findings:
             fingerprint = finding_fingerprint(
                 host, exchange.method, exchange.url, f.vulnerability_class,
@@ -461,25 +512,73 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
                 parameter_name=getattr(f, "parameter_name", "") or "",
                 principal_id=getattr(f, "principal_id", "") or "",
             )
+            fingerprints.append(fingerprint)
             rows.append((host, exchange.url, exchange.method, agent_name, f.vulnerability_class,
                          f.severity, f.confidence, f.summary, f.basis, f.evidence, f.suggested_test,
                          f.owasp_category, f.review_verdict, int(f.confirmed), fingerprint,
                          model, prompt_version, f.finding_id, f.case_id, f.proof_id,
                          int(getattr(f, "oracle_verified", False)),
                          getattr(f, "verification_state", "candidate") or "candidate",
-                         getattr(f, "oracle_capsule_id", "") or "", now))
+                         getattr(f, "oracle_capsule_id", "") or "", exchange_id, run_id, now))
         conn.executemany(
             """INSERT OR IGNORE INTO findings
                (host, url, method, agent, vulnerability_class, severity,
                 confidence, summary, basis, evidence, suggested_test, owasp_category,
                 review_verdict, confirmed, fingerprint, model, prompt_version,
                 finding_id, case_id, proof_id, oracle_verified, verification_state,
-                oracle_capsule_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                oracle_capsule_id, exchange_id, run_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+        # AR-3: one observation row per (finding, exchange), regardless of
+        # whether the findings INSERT above was a fresh row or an IGNOREd
+        # duplicate -- a deduped finding still records this exchange as a
+        # distinct sighting. INSERT OR IGNORE on the (fingerprint, run_id,
+        # exchange_id) unique index makes this idempotent on retries.
+        conn.executemany(
+            """INSERT OR IGNORE INTO finding_observations
+               (fingerprint, run_id, exchange_id, created_at)
+               VALUES (?, ?, ?, ?)""",
+            [(fp, run_id, exchange_id, now) for fp in fingerprints],
+        )
         conn.commit()
     finally:
         conn.close()
 
+
+def finding_observations(fingerprints: list[str] | None = None) -> dict[str, list[str]]:
+    """fingerprint -> the list of exchange_ids that produced it (AR-3 LOOP
+    half), read from the finding_observations link table -- NOT from
+    findings.exchange_id, which only keeps the first-seen exchange for a
+    finding that dedup collapsed (see persist_findings). This is how a
+    caller (e.g. testing/blind-target-2/run_blind_eval.py's build_scorecard)
+    recovers exact per-exchange provenance even after dedup: a fingerprint
+    observed via two different exchanges gets two entries here.
+
+    Rows with an empty exchange_id (persisted before this column existed, on
+    a DB migrated from a pre-AR-3 build) are excluded, so a caller can treat
+    an empty/missing entry for a fingerprint as "no exchange-level provenance
+    available -- fall back to legacy (method, url) attribution."
+    With `fingerprints` given, restricts to those; otherwise returns every
+    fingerprint with at least one recorded observation.
+    """
+    conn = _connect()
+    try:
+        if fingerprints:
+            placeholders = ",".join("?" for _ in fingerprints)
+            rows = conn.execute(
+                f"SELECT fingerprint, exchange_id FROM finding_observations "
+                f"WHERE fingerprint IN ({placeholders}) AND exchange_id != ''",
+                list(fingerprints),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT fingerprint, exchange_id FROM finding_observations WHERE exchange_id != ''"
+            ).fetchall()
+    finally:
+        conn.close()
+    result: dict[str, list[str]] = {}
+    for fp, exid in rows:
+        result.setdefault(fp, []).append(exid)
+    return result
 
 
 def _persist_test_plans_for(host: str, url: str, plans: list[TestPlan]) -> None:
@@ -811,7 +910,8 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
                       (SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       s.fingerprint IS NOT NULL AS suppressed,
-                      f.oracle_verified, f.verification_state, f.oracle_capsule_id
+                      f.oracle_verified, f.verification_state, f.oracle_capsule_id,
+                      f.exchange_id, f.run_id
                FROM findings f
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                WHERE f.host = ?
@@ -842,10 +942,13 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
          # absent here and `derive_verification_state()` silently defaulted
          # every finding to "candidate" regardless of what was persisted.
          "oracle_verified": bool(oracle_verified), "verification_state": vstate or "candidate",
-         "oracle_capsule_id": capsule_id or ""}
+         "oracle_capsule_id": capsule_id or "",
+         # AR-3 (LOOP half): exact finding->exchange/run provenance. Additive
+         # keys; '' for legacy rows persisted before this column existed.
+         "exchange_id": exchange_id or "", "run_id": run_id or ""}
         for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
              finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed,
-             oracle_verified, vstate, capsule_id) in rows
+             oracle_verified, vstate, capsule_id, exchange_id, run_id) in rows
     ]
     if not include_suppressed:
         results = [r for r in results if not r["suppressed"]]

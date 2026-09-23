@@ -134,12 +134,24 @@ def load_exchanges(path: Path | str = DEFAULT_EXCHANGES_PATH) -> list[dict]:
         return json.load(f)
 
 
-def exchange_from_dict(e: dict):
+def capture_id_for(e: dict, idx: int) -> str:
+    """The stable per-exchange identifier used both to stamp HttpExchange.
+    capture_id (AR-3 LOOP half) and to key exchange-first attribution in
+    build_scorecard below -- the corpus's own "id" field when present
+    (curated corpora may assign explicit ids), else the exchange's
+    position in the loaded list. Always non-empty, so every exchange run
+    through this driver carries real per-exchange provenance."""
+    cid = e.get("id")
+    return str(cid) if cid not in (None, "") else str(idx)
+
+
+def exchange_from_dict(e: dict, idx: int = 0):
     from harness.models import HttpExchange
     return HttpExchange(
         url=e["url"], method=e["method"], request_headers=e["request_headers"],
         request_body=e["request_body"], response_status=e["response_status"],
         response_headers=e["response_headers"], response_body=e["response_body"],
+        capture_id=capture_id_for(e, idx),
     )
 
 
@@ -189,7 +201,7 @@ async def run_exchanges(
     outcomes: list[ExchangeOutcome] = []
     prev_tokens = 0
     for idx, e in enumerate(exchanges):
-        ex = exchange_from_dict(e)
+        ex = exchange_from_dict(e, idx)
         t0 = time.monotonic()
         try:
             r = await orch.analyze(ex, force_agents=force_agents)
@@ -323,7 +335,49 @@ def build_scorecard(
     endpoint_scoped_surfaced = [f for f in surfaced if not _is_dependency_class(f.get("vulnerability_class", ""))]
     dependency_surfaced = [f for f in surfaced if _is_dependency_class(f.get("vulnerability_class", ""))]
 
-    fair_control_findings = [f for f in endpoint_scoped_surfaced if _pair(f) in fair_control_pairs]
+    # --- AR-3 (LOOP half): exchange-first attribution, additive ---
+    # The block above disambiguates by (method, url) alone, so a control
+    # sharing method+url with a labeled vuln exchange is EXCLUDED from the
+    # fair denominator entirely (ambiguous_control_pairs) instead of being
+    # scored on its own merits -- the B2-3b follow-on this closes. When exact
+    # per-exchange provenance is available (harness.store.finding_observations,
+    # keyed off each exchange's own capture_id -- see capture_id_for /
+    # exchange_from_dict / harness/store.py's persist_findings), a
+    # previously-ambiguous control is instead scored using ONLY the findings
+    # actually observed via ITS OWN exchange id, not every finding sharing its
+    # (method, url). Falls back to the pair-based exclusion above, EXACTLY
+    # UNCHANGED, whenever no exchange-level observation data exists at all for
+    # the fingerprints in play (legacy DB / pre-AR-3 data).
+    fingerprints_in_play = {f["fingerprint"] for f in endpoint_scoped_surfaced}
+    observations = store.finding_observations(list(fingerprints_in_play)) if fingerprints_in_play else {}
+    exchange_level_data_available = any(observations.values())
+
+    pair_to_control_cid: dict[tuple[str, str], str] = {}
+    if exchange_level_data_available:
+        for idx, e in enumerate(exchanges):
+            if (e.get("ground_truth") or "").lower() not in CONTROL_GROUND_TRUTH_LABELS:
+                continue
+            pair = ((e.get("method") or "").upper(), e["url"])
+            if pair in ambiguous_control_pairs:
+                pair_to_control_cid[pair] = capture_id_for(e, idx)
+
+    exchange_disambiguated_pairs = set(pair_to_control_cid)
+    # Mutate the legacy sets in place: a disambiguated pair moves out of
+    # "ambiguous" (excluded) and into "fair" (scored) -- this is what makes
+    # the control SCORED rather than excluded once we can tell its own
+    # exchange apart from a same-URL vuln exchange's.
+    fair_control_pairs = fair_control_pairs | exchange_disambiguated_pairs
+    ambiguous_control_pairs = ambiguous_control_pairs - exchange_disambiguated_pairs
+    fair_control_urls = {u for _m, u in fair_control_pairs}
+
+    def _observed_via(f: dict, exchange_id: str) -> bool:
+        return exchange_id in observations.get(f.get("fingerprint") or "", ())
+
+    fair_control_findings = [
+        f for f in endpoint_scoped_surfaced
+        if (_pair(f) in fair_control_pairs and _pair(f) not in exchange_disambiguated_pairs)
+        or (_pair(f) in exchange_disambiguated_pairs and _observed_via(f, pair_to_control_cid[_pair(f)]))
+    ]
     dirty_control_issues = group_findings_into_issues(fair_control_findings)
     controls_clean_issue_level = len(dirty_control_issues) == 0
 
@@ -428,6 +482,10 @@ def build_scorecard(
         "n_controls_issue_level": n_controls_issue_level,
         "n_controls_clean_issue_level": n_controls_clean_issue_level,
         "n_controls_excluded_ambiguous": len(ambiguous_control_pairs),
+        # AR-3 (LOOP half): how many of those originally-ambiguous pairs were
+        # instead exactly scored via exchange-level provenance (0 whenever no
+        # exchange_id data is available -- the legacy/back-compat path).
+        "n_controls_exchange_disambiguated": len(exchange_disambiguated_pairs),
         "controls_clean_issue_level": controls_clean_issue_level,
         "per_control_drivers": per_control_drivers,
         "host_level_issues_on_controls": host_level_issues_on_controls,
