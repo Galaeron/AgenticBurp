@@ -1,6 +1,8 @@
 from __future__ import annotations
+import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 
 class BudgetMode(str, Enum):
@@ -98,12 +100,24 @@ class EffortLedger:
 class EffortBudget:
     """
     Gates further spend. `total_tokens=None` means "track but never
-    block" (still useful for visibility even with no cap set).
+    block" (still useful for visibility even with no cap set), and
+    `max_duration_s=None` is the same no-op default for wall-clock: with
+    both left unset this class behaves exactly as it did before the
+    duration dimension was added.
     """
     mode: BudgetMode
     total_tokens: int | None = None
+    max_duration_s: int | None = None
     ledger: EffortLedger = field(default_factory=EffortLedger)
+    # Injectable monotonic-clock seam so tests can drive elapsed time
+    # deterministically (a fake incrementing counter) instead of relying
+    # on real sleeps. Defaults to the real clock in production.
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
     _overspend_confirmed: bool = field(default=False, repr=False)
+    # Set on the FIRST call to record(), not at construction, so an
+    # unused budget with max_duration_s set never trips just from time
+    # passing before any work was dispatched.
+    _deadline: float | None = field(default=None, repr=False)
 
     @property
     def spent(self) -> int:
@@ -116,7 +130,14 @@ class EffortBudget:
         return max(0, self.total_tokens - self.spent)
 
     def exhausted(self) -> bool:
+        """Token-only, deliberately -- duration is folded into `allow()`
+        separately so this stays a pure token predicate."""
         return self.total_tokens is not None and self.spent >= self.total_tokens
+
+    def _deadline_passed(self) -> bool:
+        if self.max_duration_s is None or self._deadline is None:
+            return False
+        return self.clock() >= self._deadline
 
     def allow(self) -> tuple[bool, str]:
         """
@@ -126,27 +147,43 @@ class EffortBudget:
         allowed=True but over budget under operator confirmation, so a
         caller can log/display it either way rather than silently
         proceeding.
+
+        Folds in both token exhaustion (`exhausted()`) and the duration
+        deadline (`_deadline_passed()`), reusing the same SOFT/HARD
+        semantics for both: HARD stops dispatch outright and cannot be
+        talked past; SOFT blocks until `confirm_overspend()` is called,
+        after which it allows further spend regardless of which limit
+        (token or duration) triggered it.
         """
-        if not self.exhausted():
+        token_exhausted = self.exhausted()
+        duration_passed = self._deadline_passed()
+        if not token_exhausted and not duration_passed:
             return True, ""
+        if token_exhausted:
+            limit_desc = f"({self.spent}/{self.total_tokens} tokens)"
+        else:
+            limit_desc = f"(duration limit {self.max_duration_s}s reached)"
         if self.mode == BudgetMode.HARD:
             return False, (
-                f"effort budget exhausted ({self.spent}/{self.total_tokens} tokens) in hard mode -- "
+                f"effort budget exhausted {limit_desc} in hard mode -- "
                 f"dispatch stopped. Raise the budget or switch to soft mode to continue."
             )
         if self._overspend_confirmed:
-            return True, f"over budget ({self.spent}/{self.total_tokens} tokens) -- continuing on operator confirmation"
+            return True, f"over budget {limit_desc} -- continuing on operator confirmation"
         return False, (
-            f"effort budget exhausted ({self.spent}/{self.total_tokens} tokens) in soft mode -- "
+            f"effort budget exhausted {limit_desc} in soft mode -- "
             f"awaiting operator confirmation to continue past it (see confirm_overspend)"
         )
 
     def confirm_overspend(self) -> None:
         """Soft mode only, in practice -- hard mode's `allow()` never
-        checks this flag, by design: hard mode cannot be talked past."""
+        checks this flag, by design: hard mode cannot be talked past.
+        Applies to either limit (token or duration)."""
         self._overspend_confirmed = True
 
     def record(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int) -> None:
+        if self.max_duration_s is not None and self._deadline is None:
+            self._deadline = self.clock() + self.max_duration_s
         self.ledger.record(kind, model, prompt_tokens, completion_tokens)
 
 
