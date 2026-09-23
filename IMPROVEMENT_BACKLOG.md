@@ -1551,7 +1551,26 @@ caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.
   control -- a healthy run reports `degraded=False` and non-zero elapsed. `full` suite green.
 - **Impact:** Medium (cheaper, auditable variance/ablation measurement).
 
-### [ ] ER-4 -- Optional reproduction-replay determinism gate for active confirmation legs
+### [x] ER-4 -- Optional reproduction-replay determinism gate for active confirmation legs
+- **Result (VERIFIED):** `bf8cea3` -- config-gated `confirm_replay` (DEFAULT OFF). `orchestrator.py`
+  reads `self.confirm_replay = validators.confirm_replay`; `orchestrator_confirm._maybe_replay`
+  wraps `validator.validate()` at the dispatch loop (one job per finding/validator preserved, `zip`
+  untouched). When ON AND `validator.name in {ssrf,ssti,command_injection}` AND the first result
+  confirmed, it re-runs `validate()` ONCE through the SAME scope/throttle/budget/mutating gating
+  (never a hand-rolled re-send): both agree -> stays CONFIRMED; disagree -> returns a
+  `confirmed=False`/`status="not_confirmed"` result so the EXISTING `confirmation_gate` routes the
+  finding to its provisional/unproven tier (no new downgrade mechanism, only existing
+  `ValidationResult` fields). When OFF / out-of-scope marker / first-not-confirmed -> returns the
+  ORIGINAL result object, exactly one `validate()` call, byte-for-byte unchanged. `config.yaml`:
+  `validators.confirm_replay: false` (OFF; `active_enabled`/`allow_mutating_replay` untouched;
+  SafeDefaultGuardTests green with the key present-and-false). +4 tests (`test_confirm_replay.py`,
+  scripted stub validator through the REAL `_validate_findings`): positive-agree (confirmed, validate
+  called TWICE), downgrade-disagree (unconfirmed, status not_confirmed), OFF byte-for-byte negative
+  control (validate called ONCE, confirmed True), out-of-scope marker not replayed (one call). smoke
+  92 OK; full **2523 OK / 2 skip**, exit 0. Opus-reviewed APPROVE (OFF identity-return + single call,
+  replay-via-validate()-only, scope+first.confirmed short-circuit, downgrade-reuse, zip in-sync all
+  confirmed at source). **OWNER (owner-reported efficacy):** measure precision with `confirm_replay`
+  on vs off on the blind corpus; doubles active traffic only when explicitly enabled.
 - **Domain:** Precision / Trust - **Effort:** M - **Depends on:** none - **Mode:** LOOP
 - **Evidence (VERIFIED by source inspection):** active legs stamp `confirmed=True` from a single
   successful observation (e.g. one OOB callback / one differential); `confirmation_gate` then trusts
