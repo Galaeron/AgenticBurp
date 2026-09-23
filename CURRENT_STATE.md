@@ -31,10 +31,11 @@ production change — + recorded in the scorecard; OWNER/LIVE REJECT-on precisio
 run stays open). **B2-5 done** (`53d6d66`: `is_low_confidence_generic_guess`
 sibling + `reporting.gate_low_confidence_generic` flag shipped OFF, routes
 unconfirmed low-confidence generic-class guesses to leads; recall guard airtight,
-flag-off byte-for-byte no-op). **Batch 2 LOOP halves all complete.** **Next pick:
-ER-1** (add optional `max_duration_s` wall-clock dimension to `EffortBudget`,
-default None=no-op). Full suite 2510 OK / 2 skip (testing tier 41). The RB-1..RB-8
-consensus batch is closed.
+flag-off byte-for-byte no-op). **Batch 2 LOOP halves all complete.** **ER-1 done**
+(`ad6e829`: optional `max_duration_s` wall-clock dimension on `EffortBudget`,
+default None=no-op, injectable clock seam, reuses SOFT/HARD). **Next pick: ER-2**
+(emit one canonical per-run trace summary onto the EvidenceLedger; Depends on
+B2-1 [x]). Full suite 2515 OK / 2 skip. The RB-1..RB-8 consensus batch is closed.
 
 **External-review borrow batch (2026-09-22): ER-1, ER-2, ER-4** loop-consumable
 (pick order ER-1→ER-2→ER-4), filed from a user-requested eval of external

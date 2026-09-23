@@ -1481,7 +1481,23 @@ stubbed-model-testable. The non-negotiables at the top of this file apply (safe 
 caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.py`,
 `python -m harness.suite full` before closing).
 
-### [ ] ER-1 -- Add a wall-clock/duration dimension to `EffortBudget`
+### [x] ER-1 -- Add a wall-clock/duration dimension to `EffortBudget`
+- **Result (VERIFIED):** `ad6e829` -- `EffortBudget` gains `max_duration_s: int|None=None`
+  (mirrors `total_tokens=None`: track-but-never-block) + an injectable per-instance
+  `clock: Callable=time.monotonic` seam (deterministically testable, no real sleeps). A
+  monotonic `_deadline` is set on the FIRST `record()` (not construction), so an idle
+  never-dispatched budget never trips; `_deadline_passed()` is False when unset/None. `allow()`
+  folds the deadline into the EXISTING SOFT/HARD branching -- no new `BudgetMode`, one reused
+  `_overspend_confirmed` flag: HARD deadline stop is not talk-past-able; SOFT returns
+  awaiting-confirmation and `confirm_overspend()` unblocks either the token OR duration limit;
+  token-exhaustion reason takes precedence if both trip; `exhausted()` stays token-only. Ships
+  UNSET => byte-for-byte no-op; `config.yaml`/`orchestrator.py` untouched (constructor-arg-only,
+  all existing call sites pass only mode+total_tokens and still work). +5 tests
+  (`EffortBudgetDurationTests`, `_FakeClock` counter): HARD block+ignore-confirm, SOFT
+  block-until-confirm-then-allow, None no-op negative control (advances clock 10Ms -> still
+  `(True,"")`), before-deadline negative control, deadline-on-first-spend-not-construction. smoke
+  92 OK; full **2515 OK / 2 skip**, exit 0. Opus-reviewed APPROVE (strict None no-op, no HARD
+  bypass, deterministic clock, additive-only allow() all confirmed at source).
 - **Domain:** Reliability / Governance - **Effort:** S - **Depends on:** none - **Mode:** LOOP
 - **Evidence (VERIFIED by source inspection):** `harness/effort.py:98-150` -- `EffortBudget` gates
   only on `total_tokens` (SOFT/HARD) and `spent`; there is no time dimension. `allow()` never
