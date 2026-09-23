@@ -100,6 +100,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         self.ollama = OllamaClient(
             base_url=config["ollama"]["base_url"],
             timeout_seconds=config["ollama"].get("timeout_seconds", 120),
+            num_ctx=config["ollama"].get("num_ctx"),  # opt-in; None => unchanged
         )
         
         # Configuration

@@ -95,6 +95,7 @@ class AnalysisPipeline:
             self.ollama_client = OllamaClient(
                 base_url=config["ollama"]["base_url"],
                 timeout_seconds=config["ollama"].get("timeout_seconds", 120),
+                num_ctx=config["ollama"].get("num_ctx"),  # opt-in; None => unchanged
             )
 
         # Known-vulnerability resolution (GitHub Advisories + KEV) and the

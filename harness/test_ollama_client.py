@@ -117,6 +117,59 @@ class ThinkingModeDisabledTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(captured["body"]["think"])
 
 
+class NumCtxOptInTests(unittest.IsolatedAsyncioTestCase):
+    """options.num_ctx is opt-in: sent ONLY when the client was built with a
+    num_ctx, omitted (byte-for-byte the prior payload) otherwise. Motivated by
+    a VRAM finding on this hardware -- qwen3:8b at its 32768 default context
+    loads at 10GB and spills 41% onto CPU (~19s/call), while the same model
+    pinned to a context that still covers the harness's <4k-token prompts stays
+    fully GPU-resident (6.2GB, 100% GPU, ~3s/call). The pin must never change
+    behavior for a caller that leaves it unset."""
+
+    def _capture_client(self, num_ctx):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "message": {"content": json.dumps({"ok": True})},
+                "done": True,
+            })
+        client = OllamaClient(base_url="http://fake-ollama:11434", num_ctx=num_ctx)
+
+        class PatchedAsyncClient(_REAL_ASYNC_CLIENT):
+            def __init__(self, *args, **kwargs):
+                kwargs["transport"] = httpx.MockTransport(handler)
+                super().__init__(*args, **kwargs)
+
+        import harness.ollama_client as mod
+        mod.httpx.AsyncClient = PatchedAsyncClient
+        self.addCleanup(setattr, mod.httpx, "AsyncClient", _REAL_ASYNC_CLIENT)
+        return client, captured
+
+    async def test_num_ctx_sent_when_set(self):
+        client, captured = self._capture_client(8192)
+        await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
+        self.assertEqual(captured["body"]["options"].get("num_ctx"), 8192)
+        # temperature still present alongside it
+        self.assertIn("temperature", captured["body"]["options"])
+
+    async def test_num_ctx_absent_when_unset(self):
+        # NEGATIVE CONTROL: default client (no num_ctx) must not emit the key at
+        # all -- the options block is exactly {temperature: ...} as before.
+        client, captured = self._capture_client(None)
+        await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
+        self.assertNotIn("num_ctx", captured["body"]["options"])
+        self.assertEqual(list(captured["body"]["options"].keys()), ["temperature"])
+
+    async def test_zero_or_falsy_num_ctx_is_treated_as_unset(self):
+        # 0 is not a meaningful context window; guard against it silently
+        # being sent (Ollama would reject/ignore it) -- falsy => omitted.
+        client, captured = self._capture_client(0)
+        await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
+        self.assertNotIn("num_ctx", captured["body"]["options"])
+
+
 class ModelNotFoundDoesNotTripSharedBreakerTests(unittest.IsolatedAsyncioTestCase):
     """
     Regression test for a live bug found this session: a nonexistent model
