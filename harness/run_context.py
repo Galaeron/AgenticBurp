@@ -537,6 +537,19 @@ class RunContext:
     # aclose(). Not a contextvars.Token: see push_gate's docstring for why.
     _gate_restore: object = field(default=None, repr=False, compare=False)
     _gate_pushed: bool = field(default=False, repr=False, compare=False)
+    # AR-2 (LOOP half): a per-run Ollama circuit breaker + fail-open counter,
+    # pushed ambient alongside the gate in __aenter__ and popped in aclose(),
+    # so concurrent/sequential runs cannot poison each other's model-backend
+    # state. Lazily constructed ONLY inside __aenter__ (never at plain
+    # create()/field-default time) so the ~70 existing tests that build a
+    # RunContext directly and never `async with` it see no new object at all,
+    # matching the same guard the gate push already relies on.
+    _ollama_breaker: object = field(default=None, repr=False, compare=False)
+    _ollama_breaker_restore: object = field(default=None, repr=False, compare=False)
+    _ollama_breaker_pushed: bool = field(default=False, repr=False, compare=False)
+    fail_open_counters: object = field(default=None, repr=False, compare=False)
+    _fail_open_restore: object = field(default=None, repr=False, compare=False)
+    _fail_open_pushed: bool = field(default=False, repr=False, compare=False)
 
     @classmethod
     def create(cls, *, run_id: str | None = None, allowed_hosts=None, gate_config: dict | None = None,
@@ -587,6 +600,16 @@ class RunContext:
             pop_gate(self._gate_restore)
             self._gate_pushed = False
             self._gate_restore = None
+        if self._ollama_breaker_pushed:
+            from harness.circuit_breaker import pop_ollama_breaker
+            pop_ollama_breaker(self._ollama_breaker_restore)
+            self._ollama_breaker_pushed = False
+            self._ollama_breaker_restore = None
+        if self._fail_open_pushed:
+            from harness.coordinator import pop_fail_open_counters
+            pop_fail_open_counters(self._fail_open_restore)
+            self._fail_open_pushed = False
+            self._fail_open_restore = None
 
     async def __aenter__(self) -> "RunContext":
         # Install this run's gate as the AMBIENT one (safety_gate.get_default_gate)
@@ -604,6 +627,47 @@ class RunContext:
         from harness.safety_gate import push_gate
         self._gate_restore = push_gate(self.gate)
         self._gate_pushed = True
+
+        # AR-2 (LOOP half): install this run's OWN Ollama circuit breaker and
+        # fail-open counters as ambient, alongside the gate above, so model-
+        # backend state cannot leak between concurrent/sequential runs.
+        # Constructed here (not at create()/field-default time) so a
+        # RunContext that is never `async with`-entered -- the ~70 existing
+        # tests that build one directly -- never allocates these at all,
+        # matching the gate's own lazy-push guard.
+        from harness.circuit_breaker import (
+            CircuitBreakerConfig,
+            OllamaCircuitBreaker,
+            push_ollama_breaker,
+        )
+        if self._ollama_breaker is None:
+            # Same config OllamaClient.__init__ uses (ollama_client.py:130-137),
+            # so a per-run breaker trips/heals identically to the shared
+            # singleton, including which exceptions don't count as failures.
+            from harness.ollama_client import (
+                OllamaInvalidJSONError,
+                OllamaModelNotFoundError,
+            )
+            self._ollama_breaker = OllamaCircuitBreaker(
+                "ollama",
+                CircuitBreakerConfig(
+                    failure_threshold=3,
+                    success_threshold=2,
+                    timeout_seconds=60.0,
+                    half_open_max_requests=1,
+                    excluded_exceptions=(OllamaModelNotFoundError, OllamaInvalidJSONError),
+                    enabled=True,
+                ),
+            )
+        self._ollama_breaker_restore = push_ollama_breaker(self._ollama_breaker)
+        self._ollama_breaker_pushed = True
+
+        from harness.coordinator import push_fail_open_counters
+        if self.fail_open_counters is None:
+            self.fail_open_counters = {"count": 0, "by_reason": {}}
+        self._fail_open_restore = push_fail_open_counters(self.fail_open_counters)
+        self._fail_open_pushed = True
+
         return self
 
     async def __aexit__(self, *exc) -> None:

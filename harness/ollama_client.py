@@ -206,8 +206,14 @@ class OllamaClient:
         }
         url = f"{self.base_url}/api/chat"
         
-        # Use circuit breaker and rate limiter
-        async with self.circuit_breaker:
+        # Use circuit breaker and rate limiter. Resolved AT CALL TIME (not
+        # self.circuit_breaker, cached at __init__) via current_ollama_breaker
+        # (AR-2, LOOP half): when a RunContext has pushed a per-run breaker,
+        # this call is governed by THAT run's isolated breaker; otherwise it
+        # falls back to self.circuit_breaker -- the same process-wide shared
+        # singleton this always used, unchanged for every no-run caller.
+        breaker = circuit_breaker.current_ollama_breaker("ollama")
+        async with breaker:
             async with self.rate_limiter:
                 try:
                     async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:

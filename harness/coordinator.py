@@ -7,6 +7,7 @@ This module handles the coordination of agents, including:
 - Handling agent routing decisions
 """
 from __future__ import annotations
+import contextvars
 import json
 import logging
 from typing import TYPE_CHECKING
@@ -26,10 +27,48 @@ log = logging.getLogger("harness.coordinator")
 # to the activity feed so that state is observable, never silent.
 _FAIL_OPEN = {"count": 0, "by_reason": {}}
 
+# AR-2 (LOOP half): ambient per-run fail-open counters, mirroring
+# circuit_breaker.py's _ollama_breaker_ctx pattern exactly. A RunContext MAY
+# push its own {"count": 0, "by_reason": {}} dict here in __aenter__; when it
+# does, _record_fail_open/fail_open_stats operate on THAT dict instead of the
+# module-global _FAIL_OPEN, so concurrent/sequential runs get independent
+# counters. OFF by default: no ambient run -> resolves to _FAIL_OPEN exactly
+# as before, same object identity.
+_fail_open_ctx: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
+    "harness_fail_open_ambient", default=None
+)
+
+
+def push_fail_open_counters(counters: dict) -> "dict | None":
+    """Make `counters` the ambient per-run fail-open counters for the
+    dynamic extent of the current invocation, until `pop_fail_open_counters`
+    is called with the returned handle. Mirrors
+    circuit_breaker.push_ollama_breaker / safety_gate.push_gate."""
+    previous = _fail_open_ctx.get()
+    _fail_open_ctx.set(counters)
+    return previous
+
+
+def pop_fail_open_counters(previous: "dict | None") -> None:
+    """Undo a `push_fail_open_counters`, restoring whatever counters (or
+    none) were ambient before it."""
+    _fail_open_ctx.set(previous)
+
+
+def _current_counters() -> dict:
+    """The counters dict that should record/report THIS invocation's
+    fail-opens: the ambient per-run dict if a RunContext pushed one, else
+    the process-wide module global -- identical object identity to today's
+    behavior when no run is active."""
+    ambient = _fail_open_ctx.get()
+    return ambient if ambient is not None else _FAIL_OPEN
+
 
 def fail_open_stats() -> dict:
-    """Snapshot of process-wide coordinator fail-open telemetry."""
-    return {"count": _FAIL_OPEN["count"], "by_reason": dict(_FAIL_OPEN["by_reason"])}
+    """Snapshot of the current invocation's coordinator fail-open telemetry
+    (per-run if a RunContext is active, else process-wide)."""
+    counters = _current_counters()
+    return {"count": counters["count"], "by_reason": dict(counters["by_reason"])}
 
 
 def reset_fail_open_stats() -> None:
@@ -49,12 +88,13 @@ def is_fallback_reason(reason: str) -> bool:
 
 
 def _record_fail_open(mode: str, reason: str, n_agents: int) -> None:
-    _FAIL_OPEN["count"] += 1
+    counters = _current_counters()
+    counters["count"] += 1
     key = f"{mode}:{reason}"
-    _FAIL_OPEN["by_reason"][key] = _FAIL_OPEN["by_reason"].get(key, 0) + 1
+    counters["by_reason"][key] = counters["by_reason"].get(key, 0) + 1
     log.warning(
         "Coordinator FAIL-OPEN (%s: %s) -- dispatching all %d agents "
-        "[process fail_open_count=%d]", mode, reason, n_agents, _FAIL_OPEN["count"],
+        "[process fail_open_count=%d]", mode, reason, n_agents, counters["count"],
     )
     try:
         from harness import activity_feed

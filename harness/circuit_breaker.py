@@ -17,6 +17,7 @@ States:
 """
 from __future__ import annotations
 import asyncio
+import contextvars
 import logging
 import time
 from typing import Optional, Callable, Any
@@ -581,7 +582,7 @@ def raise_if_ollama_starved(context: str = "", name: str = "ollama") -> None:
     Raises:
         CircuitStarvationError: if the breaker is OPEN.
     """
-    breaker = get_ollama_circuit_breaker(name)
+    breaker = current_ollama_breaker(name)
     if breaker.is_open:
         suffix = f" ({context})" if context else ""
         raise CircuitStarvationError(
@@ -589,3 +590,63 @@ def raise_if_ollama_starved(context: str = "", name: str = "ollama") -> None:
             f"starved of a working model backend. Results from this run are "
             f"unreliable (silent fail-open/degraded), not a clean signal."
         )
+
+
+# =============================================================================
+# Run-scoped ambient breaker (AR-2, LOOP half)
+# =============================================================================
+#
+# scoped_ollama_breaker (above) snapshot-and-restores the ONE shared registry
+# instance's *state* around a `with` block -- it cannot isolate two runs that
+# are genuinely CONCURRENT in the same process, because both runs would still
+# be mutating the same object at the same time. AR-2 fixes that by mirroring
+# safety_gate.py's ambient-ContextVar pattern (_gate_ctx / push_gate /
+# pop_gate / get_default_gate): a run that wants isolation constructs its OWN
+# OllamaCircuitBreaker instance (the existing class, no new registry) and
+# pushes it onto a ContextVar for the dynamic extent of its `async with`
+# block. Because a ContextVar is task-local, two concurrent asyncio Tasks
+# each see only their own pushed breaker.
+#
+# OFF by default: when no RunContext has pushed a per-run breaker (server
+# default, scripts, the ~70 existing tests that construct a RunContext but
+# never `async with` it), current_ollama_breaker() returns EXACTLY what
+# get_ollama_circuit_breaker(name) returns today -- same object identity,
+# same shared state. Nothing here changes behavior unless a caller opts in.
+_ollama_breaker_ctx: "contextvars.ContextVar[OllamaCircuitBreaker | None]" = (
+    contextvars.ContextVar("harness_ollama_breaker_ambient", default=None)
+)
+
+
+def push_ollama_breaker(breaker: "OllamaCircuitBreaker") -> "OllamaCircuitBreaker | None":
+    """Make `breaker` the ambient per-run Ollama circuit breaker for
+    `current_ollama_breaker()` calls made anywhere in the dynamic extent of
+    the current invocation, until `pop_ollama_breaker` is called with the
+    returned handle. Mirrors safety_gate.push_gate exactly, including the
+    plain get()/set() (not Token) rationale: a RunContext may be pushed in
+    one asyncio Task and popped in another (e.g. a background job Task), and
+    `Token.reset()` raises across that boundary while plain get/set does
+    not."""
+    previous = _ollama_breaker_ctx.get()
+    _ollama_breaker_ctx.set(breaker)
+    return previous
+
+
+def pop_ollama_breaker(previous: "OllamaCircuitBreaker | None") -> None:
+    """Undo a `push_ollama_breaker`, restoring whatever breaker (or none)
+    was ambient before it."""
+    _ollama_breaker_ctx.set(previous)
+
+
+def current_ollama_breaker(name: str = "ollama") -> "OllamaCircuitBreaker":
+    """Return the breaker that should govern the CURRENT invocation.
+
+    Prefers the ambient per-run breaker pushed by an enclosing RunContext
+    (task-local via ContextVar, so concurrent runs cannot see each other's
+    breaker). Falls back to the process-wide shared singleton
+    (`get_ollama_circuit_breaker(name)`) when no run has pushed one --
+    identical object identity to today's behavior, so every existing call
+    site with no RunContext in play is byte-for-byte unchanged."""
+    ambient = _ollama_breaker_ctx.get()
+    if ambient is not None:
+        return ambient
+    return get_ollama_circuit_breaker(name)
