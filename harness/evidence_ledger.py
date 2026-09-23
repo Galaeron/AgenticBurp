@@ -48,6 +48,7 @@ class EventType(str, Enum):
     EXECUTION = "execution"                            # the actual send: request/response/tool io
     VALIDATION_DECISION = "validation_decision"        # confirmed / refuted / inconclusive
     FINDING_REVISION = "finding_revision"              # a lifecycle/severity change to the finding
+    RUN_SUMMARY = "run_summary"                        # ER-2: one canonical per-run trace summary
 
 
 # Canonical order for reconstructing a chain when timestamps tie.
