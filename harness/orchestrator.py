@@ -117,6 +117,13 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         self.max_concurrent_validations = max(1, int(_conc.get("max_concurrent_validations", 6)))
         self.early_termination_batch_size = max(1, int(_conc.get("early_termination_batch_size", 3)))
 
+        # ER-4: reproduction-replay determinism gate. DEFAULT OFF -- when a
+        # scoped active leg (ssrf/ssti/command_injection) confirms, replaying
+        # its confirming request once and requiring both runs to agree guards
+        # against a flaky one-shot confirmation inflating precision. Off ships
+        # byte-for-byte unchanged (see orchestrator_confirm._maybe_replay).
+        self.confirm_replay = bool((config.get("validators") or {}).get("confirm_replay", False))
+
         # Initialize GitHub Advisories client
         gha_cfg = config.get("github_advisories", {})
         self.gha_enabled = gha_cfg.get("enabled", True)

@@ -419,6 +419,14 @@ validators:
   # exchange used. SAFE DEFAULT: off here; a live local run turns it on via
   # config.local.yaml (like active_enabled above), never by a committed flip.
   allow_mutating_replay: false
+  # ER-4: reproduction-replay determinism gate. When on, an active leg
+  # confirming ssrf/ssti/command_injection re-runs its confirming request ONCE
+  # via the same validate() path and keeps confirmed=True only if both runs
+  # agree; on disagreement it downgrades to the existing provisional/unproven
+  # path instead of surfacing a possibly-flaky one-shot confirmation. SAFE
+  # DEFAULT: off here -- ships byte-for-byte unchanged (one validate() call,
+  # no extra traffic). A live/local run turns it on via config.local.yaml.
+  confirm_replay: false
   # Ceiling on how many times the race-condition validator repeats a
   # mutating request concurrently. This can only lower the effective
   # limit below safety_gate.py's own hard ceiling (20) -- it cannot raise

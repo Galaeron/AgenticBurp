@@ -10,6 +10,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 from __future__ import annotations
 
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.validators.base import ValidationResult
 
 
 class ConfirmMixin:
@@ -291,6 +292,59 @@ class ConfirmMixin:
             return True, pr.to_dict(), reason
         return False, None, reason
 
+    # ER-4: names scoped for the reproduction-replay determinism gate. A
+    # single successful observation can confirm one of these active legs; a
+    # flaky one-shot confirmation would not reproduce, inflating precision.
+    _CONFIRM_REPLAY_SCOPE = frozenset({"ssrf", "ssti", "command_injection"})
+
+    async def _maybe_replay(self, validator, finding, exchange):
+        """ER-4: optional determinism gate wrapping validator.validate().
+
+        DEFAULT OFF (self.confirm_replay false, or not set on this instance):
+        awaits validate() exactly ONCE and returns that result object
+        UNCHANGED -- byte-for-byte identical to calling validator.validate()
+        directly. This is the common/shipped path.
+
+        When confirm_replay is on AND validator.name is in the scoped set
+        AND the first attempt confirmed, awaits validate() a SECOND time (via
+        the same validate() path, so scope lock / global_throttle / safety
+        gate budget / allow_mutating_replay the leg already enforces still
+        apply -- no hand-rolled re-send). If the second run agrees
+        (confirmed), the original (first) confirmed result is returned
+        unchanged. If it disagrees, a downgraded ValidationResult (confirmed
+        False, status "not_confirmed") is returned instead -- this is NOT a
+        new downgrade mechanism, it simply means the finding never gets
+        `finding.confirmed = True` set at the call site (~line 488), so
+        confirmation_gate routes it through the existing provisional/unproven
+        path exactly as it would any other not-confirmed active leg.
+        """
+        first = await validator.validate(finding, exchange)
+        if not getattr(self, "confirm_replay", False):
+            return first
+        if getattr(validator, "name", None) not in self._CONFIRM_REPLAY_SCOPE:
+            return first
+        if not first.confirmed:
+            return first
+        second = await validator.validate(finding, exchange)
+        if second.confirmed:
+            return first
+        # Disagreement: downgrade. Let the existing provisional/unproven path
+        # (confirmation_gate) handle this finding from here -- no new
+        # mechanism, just a not-confirmed result like any other.
+        note = "replay disagreed: second confirmation attempt did not reproduce"
+        summary = (first.summary or "") + ((" " + note) if first.summary else note)
+        return ValidationResult(
+            validator=first.validator,
+            status="not_confirmed",
+            finding_class=first.finding_class,
+            confidence=first.confidence,
+            confirmed=False,
+            summary=summary,
+            evidence=first.evidence,
+            raw_output=first.raw_output,
+            command=first.command,
+        )
+
     async def _validate_findings(
         self, exchange: HttpExchange, reports: list[AgentReport], *, run_context=None
     ) -> tuple[list[ValidationReport], list[dict]]:
@@ -395,7 +449,7 @@ class ConfirmMixin:
                     except Exception:
                         pass
                 for validator in validators:
-                    jobs.append(validator.validate(finding, exchange))
+                    jobs.append(self._maybe_replay(validator, finding, exchange))
                     plans.append(validator.plan(finding, exchange))
                     metas.append((finding, validator, case))
         if not jobs:
