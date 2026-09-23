@@ -1703,7 +1703,27 @@ apply (safe config defaults, a caller-test + negative control per item, never re
 - **Impact:** High (gives P2-2 the real collapse candidate; if recall holds, it cuts serial model
   calls per exchange several-fold on the hardware that currently starves).
 
-### [ ] AR-2 -- Run-scoped model-backend state by default (breaker + fail-open counters on `RunContext`)
+### [x] AR-2 (LOOP half) -- Run-scoped model-backend state by default (breaker + fail-open counters on `RunContext`)
+- **Result (VERIFIED):** `077b772` -- generalizes B2-2's opt-in seam: a RunContext now owns its own
+  `OllamaCircuitBreaker` (built with the SAME config as `OllamaClient.__init__`) + fail-open counters,
+  resolved via an ambient ContextVar mirroring `safety_gate._gate_ctx` (the concurrency requirement
+  B2-2's snapshot/restore singleton could not meet). `circuit_breaker.py`: `_ollama_breaker_ctx` +
+  push/pop (plain get/set, cross-Task safe) + `current_ollama_breaker(name)` (ambient if pushed, ELSE
+  `get_ollama_circuit_breaker(name)` unchanged); `raise_if_ollama_starved` generalized; B2-2 primitives
+  untouched (no second breaker/registry). `run_context.py`: per-run breaker + counter dict built and
+  pushed in `__aenter__` alongside `push_gate`, popped in `aclose()` -- lazy/opt-in (nothing built
+  unless `async with`). `coordinator.py`: `fail_open_stats`/`_record_fail_open` resolve the ambient
+  run's counters else module-global `_FAIL_OPEN`. `ollama_client._chat` resolves at CALL TIME (keeps
+  `self.circuit_breaker` fallback); `orchestrator_detect` `.is_open` sites use `current_ollama_breaker()`.
+  **Ships OFF byte-for-byte:** with no ambient RunContext every resolver returns the IDENTICAL pre-existing
+  singleton/module-global object (assertIs-tested); NO config.yaml key; no safety flag/default touched.
+  +5 tests (`test_run_scoped_backend_state.py`, singleton reset in setUp/tearDown): sequential no-poison,
+  concurrent isolation (two asyncio tasks), within-run OPEN still short-circuits (isolation != disabling),
+  no-run identical-singleton, never-entered allocates nothing. smoke 92 OK; full **2544 OK / 2 skip**,
+  exit 0. Opus-reviewed APPROVE (byte-for-byte OFF via object-identity fallback, ContextVar task-locality,
+  within-run breaker intact, reuse-not-fork + hot-path safety all confirmed). **OWNER half stays open:**
+  wire `run_blind_eval.run_once` / `run_ablation_live.py` to create one RunContext per run and call
+  `raise_if_ollama_starved` / record `degraded` at run end (needs live Ollama/Docker).
 - **Domain:** Reliability / Architecture - **Effort:** M - **Depends on:** B2-2 (LOOP half, done) - **Mode:** LOOP
 - **Evidence (VERIFIED by source inspection, 2026-09-22):** the "ollama" breaker is a process-wide
   registry singleton (`circuit_breaker.py:345-359`, `get_ollama_circuit_breaker` at :397), bound

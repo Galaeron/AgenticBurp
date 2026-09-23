@@ -41,9 +41,11 @@ byte-for-byte). **All loop-consumable Batch 2 + ER items are now `[x]`.**
 **P2-2 ablation: owner decided COLLAPSE (with a required revert path).** **AR-1
 done** (`994e5a0`: opt-in `coordinator.routing_mode: agents|families` collapses
 per-agent model calls into 6 family calls; default `agents` = today's behavior =
-the byte-for-byte REVERT state; ships OFF, ablation variant G). **Next pick: AR-2**
-(run-scoped breaker/fail-open counters on `RunContext`, LOOP; then AR-3 exchange
-provenance). Full suite 2539 OK / 2 skip.
+the byte-for-byte REVERT state; ships OFF, ablation variant G). **AR-2 LOOP half done**
+(`077b772`: per-run breaker + fail-open counters on `RunContext` via an ambient
+ContextVar; ships OFF byte-for-byte; OWNER live-driver wiring stays open).
+**Next pick: AR-3** (record which captured exchange produced each finding —
+exchange provenance). Full suite 2544 OK / 2 skip.
 
 **P2-2 checkbox still `[ ]`** pending the owner's ablation results artifact — the
 collapse DECISION is recorded (owner-made) and AR-1 implements it, but P2-2 will
