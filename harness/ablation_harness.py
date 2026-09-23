@@ -45,8 +45,17 @@ and `variant_analyze_kwargs` for the exact code path each rides):
                             `Coordinator._curated_fallback`'s high-value
                             shape-keyed subset instead of firing every
                             available agent.
+  G  agent-families      -- pure config: `coordinator.routing_mode =
+                            "families"` (AR-1, harness/agent_families.py).
+                            AgentManager.run_multiple_agents collapses the
+                            SAME dispatched agent set into one composed
+                            model call per routed family instead of one
+                            call per agent; agent SELECTION is untouched.
+                            MECHANISM/revertibility only here -- whether
+                            the collapse retains recall (P2-2) is owner-
+                            reported, not measured by this harness.
 
-Only A/E are pure passthrough; B/D/F are runtime config and/or call-kwarg
+Only A/E are pure passthrough; B/D/F/G are runtime config and/or call-kwarg
 overrides applied to a DEEP-COPIED base config (`copy.deepcopy`, never
 `harness/config.yaml` on disk and never a dict the caller still holds a
 reference to) -- the same "load once, override at runtime" shape as
@@ -159,6 +168,18 @@ def _strong_single(cfg):
     return c
 
 
+def _family_routing(cfg):
+    # AR-1's P2-2 collapse candidate: pure config, same shape as D/F --
+    # AgentManager.run_multiple_agents reads coordinator.routing_mode
+    # (see harness/agent_families.py) and collapses the SAME dispatched
+    # agent set into per-family composed calls. Agent SELECTION
+    # (_choose_agents/dispatch) is untouched by this transform or by the
+    # mode it sets; only the model-call fan-out changes.
+    c = _tag(cfg, "G")
+    c.setdefault("coordinator", {})["routing_mode"] = "families"
+    return c
+
+
 @dataclass(frozen=True)
 class Variant:
     key: str
@@ -182,6 +203,9 @@ VARIANTS: tuple[Variant, ...] = (
             _minus_graph_loop, True),
     Variant("F", "strong-single", "baseline routing forced to the curated fail-open subset "
             "(closest available seam to a single, more selective policy)", _strong_single),
+    Variant("G", "agent-families", "baseline routing collapsed to per-family composed model "
+            "calls (coordinator.routing_mode='families') -- AR-1's P2-2 collapse candidate; "
+            "MECHANISM/revertibility only, efficacy is owner-reported", _family_routing),
 )
 
 

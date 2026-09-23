@@ -207,9 +207,10 @@ class _TempStoreCase(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 
 class VariantDefinitionTests(unittest.TestCase):
-    def test_all_six_variants_present_and_tagged(self):
+    def test_all_seven_variants_present_and_tagged(self):
+        # AR-1 added "G" (agent-families) alongside the original A-F.
         keys = [v.key for v in ah.VARIANTS]
-        self.assertEqual(keys, ["A", "B", "C", "D", "E", "F"])
+        self.assertEqual(keys, ["A", "B", "C", "D", "E", "F", "G"])
 
     def test_config_transforms_tag_and_do_not_mutate_base(self):
         base = {"critique": {"enabled": True}}
@@ -246,7 +247,7 @@ class RunAndAggregateTests(unittest.TestCase):
 
         def runner(variant: Variant, config: dict, corpus) -> RunMetrics:
             calls["n"] += 1
-            base_tp = {"A": 10, "B": 8, "C": 5, "D": 9, "E": 6, "F": 9}[variant.key]
+            base_tp = {"A": 10, "B": 8, "C": 5, "D": 9, "E": 6, "F": 9, "G": 9}[variant.key]
             spread = calls["n"] % 2  # 0 or 1
             return RunMetrics(tp=base_tp + spread, fp=2, fn=13 - base_tp,
                               confirmed_tp=base_tp - 2, confirmed_fp=1,
@@ -257,7 +258,7 @@ class RunAndAggregateTests(unittest.TestCase):
 
     def test_run_ablation_runs_every_variant_repeatedly(self):
         results = run_ablation("corpus", self._stub_runner(), repeats=3)
-        self.assertEqual(len(results), 6)
+        self.assertEqual(len(results), 7)
         for r in results:
             self.assertEqual(len(r.runs), 3)
 
@@ -296,7 +297,7 @@ class RunAndAggregateTests(unittest.TestCase):
         results = run_ablation("corpus", self._stub_runner(), repeats=1)
         table = ah.render_table(results)
         lines = {r["variant"]: r for r in (ah.aggregate(x) for x in results)}
-        for key in ("A", "B", "C", "D", "F"):
+        for key in ("A", "B", "C", "D", "F", "G"):
             self.assertFalse(lines[key]["needs_implementation"], key)
         self.assertTrue(lines["E"]["needs_implementation"])
 
@@ -308,7 +309,7 @@ class RunAndAggregateTests(unittest.TestCase):
             return RunMetrics()
 
         run_ablation("corpus", runner, repeats=1)
-        self.assertEqual(seen, {k: k for k in ("A", "B", "C", "D", "E", "F")})
+        self.assertEqual(seen, {k: k for k in ("A", "B", "C", "D", "E", "F", "G")})
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +487,7 @@ class MetricsTableTests(_TempStoreCase):
             return runner_inner(variant, config, exchanges)
 
         results = run_ablation(None, variant_runner, base_config=base, repeats=1)
-        self.assertEqual([r.variant.key for r in results], list("ABCDEF"))
+        self.assertEqual([r.variant.key for r in results], list("ABCDEFG"))
 
         table = ah.render_table(results)
         for v in ah.VARIANTS:

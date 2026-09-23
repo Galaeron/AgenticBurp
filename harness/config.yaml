@@ -108,6 +108,29 @@ coordinator:
   # needs OFF-HOST, so enable it only where that data egress is acceptable. Flip
   # at runtime via POST /settings {"coordinator": {"cloud_reasoning": true}}.
   cloud_reasoning: false
+  # AR-1 (P2-2 collapse candidate, ablation variant G): agent-call FAN-OUT
+  # mode. Does not touch agent SELECTION (_choose_agents/dispatch) -- only
+  # how many model calls the dispatched agent set produces. "agents"
+  # (default, shipped) is today's behavior: one model call per dispatched
+  # agent, unchanged. "families" collapses dispatched agents into per-family
+  # composed calls, one call per routed family, via
+  # harness/agent_families.py's DEFAULT_FAMILIES grouping:
+  #   injection        -- sqli, nosql, command_injection, ssti, xss, xxe
+  #   access_control    -- idor, auth, csrf, oauth, jwt, race_condition
+  #   server_side       -- ssrf, deserialization, http_request_smuggling,
+  #                        web_cache_poisoning, open_redirect, websocket
+  #   config_headers    -- cors, csp, header_injection, misconfig,
+  #                        info_disclosure, crypto
+  #   api_logic         -- api_security, graphql, business_logic,
+  #                        business_logic_enhanced, rate_limit, ai_security
+  #   recon_supply      -- recon, subdomain_takeover, supply_chain, anomaly,
+  #                        ai_llm, file_upload
+  # A dispatched agent outside every family still runs its own solo call
+  # (never dropped). NOT a safety flag (fewer model calls, no live traffic,
+  # no wider scope) -- do not add to SafeDefaultGuardTests.SAFE_CHECKS.
+  # Whether "families" retains recall vs. "agents" is an owner-reported
+  # ablation (P2-2 / VARIANTS "G"), not claimed by this default.
+  routing_mode: "agents"
 
 # Adaptive re-spin loop (SESSION_HANDOVER.md §7). DEFAULT OFF, and further
 # a no-op unless coordinator.cloud_primary above is also on -- the loop is

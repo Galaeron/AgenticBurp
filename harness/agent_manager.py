@@ -46,6 +46,17 @@ class AgentManager:
         self._agent_configs = config.get("agents", {})
         self._plugin_system = None
 
+        # AR-1 (LOOP half): opt-in agent-family routing. SHIPS OFF -- absent
+        # or "agents" (the default) is today's per-agent fan-out, unchanged.
+        # "families" collapses the model-call FAN-OUT in run_multiple_agents
+        # below; it never touches _choose_agents/dispatch (agent SELECTION
+        # stays byte-for-byte identical in both modes -- see
+        # harness/agent_families.py's module docstring). Schema-validated by
+        # config_schema._VALID_ROUTING_MODES; read here defensively (falls
+        # back to "agents") so a config assembled ad hoc in a test/caller
+        # that skips validate_config() still gets the safe default.
+        self.routing_mode = (config.get("coordinator", {}) or {}).get("routing_mode", "agents")
+
         # Bound how many agents run concurrently against Ollama through THIS
         # AgentManager instance.  The application orchestrator owns one manager,
         # so its semaphore is shared by overlapping exchanges/jobs routed through
@@ -364,12 +375,15 @@ class AgentManager:
                                   max_body_chars: int = 6000, prior_context: str = "",
                                   effort_budget=None) -> list:
         """
-        Run multiple agents on an exchange concurrently, bounded by
-        `concurrency.max_parallel_agents` in config (see __init__) so a
-        large dispatch doesn't fire every agent's inference request at
-        once and exhaust GPU memory. The bound is manager-scoped and therefore
-        also covers simultaneous calls for different exchanges when they share
-        this manager; it does not coordinate separate manager instances.
+        Run multiple agents on an exchange. Dispatches to the per-agent path
+        (today's behavior, one model call per agent) unless
+        `coordinator.routing_mode == "families"`, in which case dispatched
+        agents that belong to a `harness.agent_families.DEFAULT_FAMILIES`
+        family are collapsed into one composed model call per routed family
+        (AR-1). Either way, agent SELECTION (`agent_names`, produced by
+        `_choose_agents`/dispatch upstream) is untouched -- only the number
+        of model calls the dispatched set produces changes. Return shape
+        (list of AgentReport) is identical in both modes.
 
         Args:
             agent_names: List of agent names to run
@@ -381,6 +395,21 @@ class AgentManager:
         Returns:
             List of AgentReport objects
         """
+        if self.routing_mode == "families":
+            return await self._run_multiple_agents_families(
+                agent_names, exchange, max_body_chars, prior_context)
+        return await self._run_multiple_agents_default(
+            agent_names, exchange, max_body_chars, prior_context)
+
+    async def _run_multiple_agents_default(self, agent_names: list[str], exchange,
+                                           max_body_chars: int = 6000,
+                                           prior_context: str = "") -> list:
+        """Unchanged pre-AR-1 behavior: one model call per dispatched agent,
+        bounded by `concurrency.max_parallel_agents` in config (see __init__)
+        so a large dispatch doesn't fire every agent's inference request at
+        once and exhaust GPU memory. The bound is manager-scoped and therefore
+        also covers simultaneous calls for different exchanges when they share
+        this manager; it does not coordinate separate manager instances."""
         reports = []
         tasks = []
 
@@ -404,6 +433,67 @@ class AgentManager:
                 if isinstance(result, Exception):
                     log.error(f"Agent failed with exception: {result}")
                     # Create error report
+                    from harness.models import AgentReport
+                    reports.append(AgentReport(
+                        agent="unknown",
+                        model="unknown",
+                        findings=[],
+                        raw_error=str(result)
+                    ))
+                else:
+                    reports.append(result)
+
+        return reports
+
+    async def _run_multiple_agents_families(self, agent_names: list[str], exchange,
+                                            max_body_chars: int = 6000,
+                                            prior_context: str = "") -> list:
+        """AR-1 families path: group `agent_names` (already filtered to
+        agents this manager actually has initialized) into
+        `agent_families.DEFAULT_FAMILIES` families -- only members present in
+        THIS dispatch form a routed family, so a family with zero dispatched
+        members costs zero calls. One `FamilyRunner.run` call per routed
+        family; any dispatched agent that isn't in any family still runs its
+        own single call via the default per-agent path (fallback -- never
+        silently dropped). Bounded by the same `_agent_semaphore` as the
+        default path, one permit per model call (family or solo), so overall
+        concurrent-inference pressure is governed identically."""
+        from harness.agent_families import group_dispatched_agents, FamilyRunner
+
+        available = [name for name in agent_names if name in self.agents]
+        for name in agent_names:
+            if name not in self.agents:
+                log.warning(f"Agent {name} not found, skipping")
+
+        families, solo = group_dispatched_agents(available)
+
+        reports = []
+        tasks = []
+
+        async def _run_family_bounded(family_name: str, members: list[str]):
+            runner = FamilyRunner(family_name, [self.agents[m] for m in members])
+            effort_budget = getattr(self, '_effort_budget', None)
+            if self._agent_semaphore is not None:
+                async with self._agent_semaphore:
+                    return await runner.run(exchange, max_body_chars, prior_context, effort_budget)
+            return await runner.run(exchange, max_body_chars, prior_context, effort_budget)
+
+        async def _run_solo_bounded(name: str):
+            if self._agent_semaphore is not None:
+                async with self._agent_semaphore:
+                    return await self.run_agent_async(name, exchange, max_body_chars, prior_context)
+            return await self.run_agent_async(name, exchange, max_body_chars, prior_context)
+
+        for family_name, members in families.items():
+            tasks.append(asyncio.create_task(_run_family_bounded(family_name, members)))
+        for name in solo:
+            tasks.append(asyncio.create_task(_run_solo_bounded(name)))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    log.error(f"Agent/family failed with exception: {result}")
                     from harness.models import AgentReport
                     reports.append(AgentReport(
                         agent="unknown",
