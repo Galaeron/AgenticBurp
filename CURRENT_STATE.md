@@ -38,32 +38,47 @@ standalone `analyze()` run). **ER-4 done** (`bf8cea3`: config-gated `confirm_rep
 DEFAULT OFF — an active ssrf/ssti/command_injection leg re-runs its confirming
 `validate()` once and downgrades to provisional on disagreement; OFF is
 byte-for-byte). **All loop-consumable Batch 2 + ER items are now `[x]`.**
-**P2-2 ablation: owner decided COLLAPSE (with a required revert path).** **AR-1
-done** (`994e5a0`: opt-in `coordinator.routing_mode: agents|families` collapses
-per-agent model calls into 6 family calls; default `agents` = today's behavior =
-the byte-for-byte REVERT state; ships OFF, ablation variant G). **AR-2 LOOP half done**
-(`077b772`: per-run breaker + fail-open counters on `RunContext`; OWNER live-driver
-wiring stays open). **AR-3 done** (`07d650b`: exchange provenance — `capture_id`/
-`exchange_id`/`run_id` + `finding_observations` link table; scorecard now attributes
-a shared-url control to its OWN exchange, closing the B2-3b follow-on; additive/
-back-compat, dedup unchanged). **AR batch complete.** **No loop-consumable items
-remain** — every `[ ]` is OWNER/LIVE or frozen (see below). Full suite 2548 OK /
-2 skip.
+**P2-2 ablation: CLOSED `[x]` 2026-09-23 — COLLAPSE, now evidence-backed** (clean
+A/B/C/G re-run; G holds recall+precision vs the full 38; see the P2-2 section
+below). **AR-1 done** (`994e5a0`: opt-in `coordinator.routing_mode: agents|families`
+collapses per-agent model calls into 6 family calls; default `agents` = today's
+behavior = the byte-for-byte REVERT state; ships OFF, ablation variant G — this is
+what the re-run measured). **AR-2 LOOP half done** (`077b772`: per-run breaker +
+fail-open counters on `RunContext`; the OWNER live-driver wiring is now done — the
+09-23 driver uses per-run breaker isolation + loud starvation exclusion). **AR-3
+done** (`07d650b`: exchange provenance — `capture_id`/`exchange_id`/`run_id` +
+`finding_observations` link table; scorecard now attributes a shared-url control to
+its OWN exchange, closing the B2-3b follow-on; additive/back-compat, dedup
+unchanged). **AR batch complete.** Also landed 2026-09-23 (uncommitted): opt-in
+`ollama.num_ctx` context pin (default off; the VRAM/starvation fix) + read-only
+model-call/token counters on `OllamaClient`. **No loop-consumable items remain** —
+every `[ ]` is OWNER/LIVE or deprioritized (see below). Full suite 2551 OK / 2 skip.
 
-**P2-2 checkbox still `[ ]`** pending the owner's ablation results artifact — the
-collapse DECISION is recorded (owner-made) and AR-1 implements it, but P2-2 will
-be flipped to `[x]` only when the results file (reviews/<date>/) is provided; do
-not mark it VERIFIED on the verbal decision alone. ER-3/ER-5 (new detection
-surface) stay deprioritized under the collapse decision. The RB-1..RB-8 consensus
-batch is closed.
+**P2-2 CLOSED `[x]` (2026-09-23) — decision=COLLAPSE, now evidence-backed.** The
+clean A/B/C/G re-run (3 repeats, `num_ctx=8192`, 0/12 starved) shows G
+(agent-families) holds detection quality vs A (full 38): recall 0.818±0.074 vs
+0.788±0.043, precision 0.191±0.019 vs 0.176±0.004 — parity within noise — at ~10%
+fewer model calls / ~6% fewer tokens / ~15% less wall. Ladder A≈G ≫ B (0.394) ≫ C
+(0.182). Results:
+[reviews/2026-09-23/ABLATION_P2-2_RERUN.md](reviews/2026-09-23/ABLATION_P2-2_RERUN.md).
+The 2026-09-22 attempt was invalidated by a VRAM-spill breaker cascade (qwen3:8b
+at its 32768 default = 10GB/41%-CPU); root-caused and fixed by pinning
+`num_ctx=8192` (6.2GB/100% GPU/~3s per call) — A's recall recovered 0.182→0.788
+from that alone, so the old numbers are not comparable. Cost win is MODEST (do not
+oversell). Enable via `config.local.yaml` `coordinator.routing_mode: "families"`;
+committed default stays `"agents"` (byte-for-byte revert). ER-3/ER-5 (new
+detection surface) stay deprioritized under the collapse decision — the freeze
+resolved *against* adding surface, they are not auto-unblocked by P2-2 being
+`[x]`. The RB-1..RB-8 consensus batch is closed.
 
 **External-review borrow batch (2026-09-22): ER-1, ER-2, ER-4** loop-consumable
 (pick order ER-1→ER-2→ER-4), filed from a user-requested eval of external
 LLM-pentest projects (burpai / hackingBuddyGPT / Strix) against this codebase:
 ER-1 wall-clock dimension for `EffortBudget`, ER-2 canonical per-run ledger trace
 summary, ER-4 optional reproduction-replay determinism gate. ER-3 (timing-based
-blind leg) and ER-5 (per-class agent methodology priming) are filed but FROZEN
-behind P2-2's new-surface freeze — leave `[ ]`, do not pick until P2-2 is `[x]`.
+blind leg) and ER-5 (per-class agent methodology priming) are filed but
+DEPRIORITIZED — P2-2 decided COLLAPSE, so their new-surface freeze resolved
+against them; leave `[ ]`, do not pick unless the collapse is shown to hurt recall.
 Most borrow ideas were already present here in more mature form (leg-tiered gate,
 evidence ledger, token `EffortBudget`) and were deliberately not re-filed; B2-1/
 B2-2 already cover breaker-`degraded`/isolation, so ER items reuse them.
@@ -100,34 +115,31 @@ Not done in this pass (flagged as follow-ups, not run): the
 `cross_identity_reject=1` live-traffic run (needs blind-target-2's Flask app
 running plus owner opt-in to active validators).
 
-## P2-2 A-F ablation — RUN attempted (2026-09-22), inconclusive by a
-## reproduced hardware/infra finding, not a code bug
+## P2-2 A/B/C/G ablation — CLEAN re-run (2026-09-23), CLOSED, decision=COLLAPSE
 
-Ran RB-7's `harness/ablation_harness.py` live via a new driver
-(`testing/test-target/run_ablation_live.py`) against the PixelMart
-(test-target) corpus. **Does not answer P2-2's keep/collapse question**: two
-of the three variants built to probe it (D minus-critique, F curated-routing)
-each independently hit a known, already-documented failure mode — a
-sequential specialist-agent call stalled the full 240s timeout 3× in a row
-(720s), tripping `harness.circuit_breaker`'s shared "ollama" breaker OPEN,
-which then silently zeroed every remaining agent call for the rest of that
-run with no error surfaced (exactly what `harness/config.yaml`'s own
-committed comments already warn about from a prior incident on this
-hardware — the existing mitigation, `max_parallel_agents: 1` + 240s timeout,
-is evidently not sufficient here). Both D and F degenerated to C's
-(zero-agent) exact numbers; reproduced independently twice, so this is
-systematic, not a fluke. A's own run is real but has ~5/22 exchanges with an
-unreviewed critique pass from a milder, later-stage version of the same
-issue. Full diagnosis (including a single-exchange log trace proving the
-mechanism), the one clean comparison this run does support (B, single
-forced agent, 0 errors, recall 0.364 vs A/C's degraded 0.182), and concrete
-next steps before re-attempting:
-[reviews/2026-09-22/ABLATION_P2-2.md](reviews/2026-09-22/ABLATION_P2-2.md).
+Re-ran A/B/C/G live (3 repeats, `num_ctx=8192`, 0/12 starved) after fixing the
+2026-09-22 blocker. **G (agent-families) holds detection quality vs A (full 38):
+recall 0.818±0.074 vs 0.788±0.043, precision 0.191±0.019 vs 0.176±0.004 — parity
+within noise — at ~10% fewer calls / ~6% fewer tokens / ~15% less wall.** Ladder
+A≈G ≫ B (single agent 0.394) ≫ C (0 agents 0.182) → quality lives in the routed
+multi-specialist behavior, which G preserves and B destroys. The 09-22 run was
+invalidated by a VRAM-spill breaker cascade (qwen3:8b at its 32768 default =
+10GB/41%-CPU → 80-100s calls → 3×240s timeouts trip the shared breaker → silent
+zeroing); root-caused (harness prompts p99 <4k tokens) and fixed with
+`num_ctx=8192` (6.2GB/100% GPU/~3s per call) + per-run breaker isolation in the
+driver. A's recall recovered 0.182→0.788 from that fix alone, so the old A/B/D/F
+numbers measured a broken pipeline and are superseded. Cost win is MODEST (fixed
+coordinator+critique floor + larger family prompts offset the collapse). Full
+detail, commands, per-type call decomposition, caveats (single corpus/model,
+E residual):
+[reviews/2026-09-23/ABLATION_P2-2_RERUN.md](reviews/2026-09-23/ABLATION_P2-2_RERUN.md)
+(superseding [reviews/2026-09-22/ABLATION_P2-2.md](reviews/2026-09-22/ABLATION_P2-2.md)).
 
 ## Open work and pointers
 
-- **Owner/live remaining:** P2-2 ablation RE-RUN (needs the reliability fix
-  in the report above before A/D/F numbers can be trusted), RB-1b (Java
+- **Owner/live remaining:** P2-2 ablation — **DONE 2026-09-23 (COLLAPSE, see
+  above)**; residual only: E (minus-graph) needs an engagement corpus, and a
+  broader-corpus/second-model confirmation would harden the A≈G parity. RB-1b (Java
   token reader), RB-6 OWNER/JDK half (Java→shared trail + stale HarnessPanel
   subset), RB-2b (`fail_open_mode: curated` default flip, gated on RB-8's
   measured recall delta — the P0-3 run above is a first data point but not

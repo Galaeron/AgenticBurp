@@ -419,9 +419,34 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 - **Impact:** High → Transformational (this is a genuine differentiator vs. DAST and
   vs. per-request LLM tools) — **but gate its retention on the ablation.**
 
-### [ ] P2-2 — Agent-count ablation (justify or collapse the 38 specialists)
-- **Result (owner-reported, 2026-09-22, INCONCLUSIVE — reliability finding, not
-  a code fix):** ran RB-7's ablation harness live (`testing/test-target/
+### [x] P2-2 — Agent-count ablation (justify or collapse the 38 specialists)
+- **Result (VERIFIED owner/live re-run, 2026-09-23 — CLOSED, decision=COLLAPSE):**
+  clean A/B/C/G re-run, 3 repeats, `num_ctx=8192`, 0/12 runs starved. **G
+  (collapsed agent-families) holds detection quality vs A (full 38): recall
+  0.818±0.074 vs 0.788±0.043, precision 0.191±0.019 vs 0.176±0.004** — parity
+  within noise — at ~10% fewer model calls (142.7 vs 157.7), ~6% fewer tokens,
+  ~15% less wall. Ladder A≈G ≫ B (single agent, recall 0.394) ≫ C (0 agents,
+  0.182) shows the quality lives in the *routed multi-specialist* behavior, which
+  G preserves and B destroys → the right collapse is agents→families, not
+  agents→one. Acceptance met (results table + decision + numbers):
+  [reviews/2026-09-23/ABLATION_P2-2_RERUN.md](reviews/2026-09-23/ABLATION_P2-2_RERUN.md)
+  + [ablation_results_A-B-C-G.json](reviews/2026-09-23/ablation_results_A-B-C-G.json).
+  Cost win is MODEST (fixed coordinator+critique floor + larger family prompts
+  offset the fan-out collapse — do not oversell families as a big efficiency
+  gain; the win is quality-parity + fewer serial round-trips + smaller
+  starvation surface). Enabled via `coordinator.routing_mode: "families"` in
+  `config.local.yaml`; committed default stays `"agents"` (byte-for-byte revert,
+  AR-1). Residuals: E (minus-graph) still not run (needs engagement corpus,
+  `NO_GRAPH_RESIDUAL`); single corpus/model/3-repeats — parity, not a proven
+  improvement; low absolute precision is orthogonal (B2-3/B2-5/RB-2b).
+- **Why this supersedes the 2026-09-22 attempt:** that run was invalidated by a
+  circuit-breaker starvation cascade (qwen3:8b at its 32768 default context =
+  10GB/41%-CPU → 80-100s calls → 3×240s timeouts trip the shared breaker →
+  silent zeroing). Root-caused to VRAM spill (harness prompts p99 <4k tokens, so
+  the 32k window is waste): `num_ctx=8192` → 6.2GB/100% GPU/~3s per call. A's
+  recall recovered 0.182 (degraded) → 0.788 (healthy) from that fix alone, so
+  the old A/B/D/F numbers measured a broken pipeline and are not comparable.
+- **Result (SUPERSEDED — owner-reported, 2026-09-22, INCONCLUSIVE):** ran RB-7's ablation harness live (`testing/test-target/
   run_ablation_live.py`, new owner-run driver) against the PixelMart corpus,
   real `qwen3:8b`. Does NOT answer keep/collapse: D (minus-critique) and F
   (curated-routing) each independently hit the SAME reproduced failure — 3
@@ -1472,11 +1497,13 @@ more mature form (leg-tiered `confirmation_gate`, controlled-negative refutation
 per-run breaker isolation + loud-fail on a starvation cascade is already **B2-2**. ER items must
 REUSE those, not build a parallel mechanism.
 
-**Freeze compliance:** the "Explicitly NOT to build yet" section above freezes *new validators /
-specialist agents* until the **P2-2 ablation** decision lands. ER-3 (new timing leg) and ER-5
-(agent methodology priming) therefore carry `Depends on: P2-2 [ ]` and MUST NOT be picked until
-P2-2 is `[x]` -- they are filed now so the idea isn't lost, not opened for immediate work. **Loop
-pick order (only the unblocked ones):** ER-1 -> ER-2 -> ER-4. `Mode: LOOP` = offline,
+**Freeze compliance (updated 2026-09-23):** P2-2 landed = **COLLAPSE**
+([reviews/2026-09-23/ABLATION_P2-2_RERUN.md](reviews/2026-09-23/ABLATION_P2-2_RERUN.md)).
+The freeze that gated ER-3/ER-5 has therefore *resolved against adding surface*: both widen the
+detection surface the collapse just trimmed, so they stay **DEPRIORITIZED**, not auto-unblocked
+into pickable work. Do NOT pick ER-3/ER-5 on the strength of "P2-2 is now `[x]`"; reopen them only
+if the collapse is later shown to hurt recall on a broader corpus. **Loop pick order (only the
+unblocked ones):** ER-1 -> ER-2 -> ER-4. `Mode: LOOP` = offline,
 stubbed-model-testable. The non-negotiables at the top of this file apply (safe config defaults, a
 caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.py`,
 `python -m harness.suite full` before closing).
@@ -1590,7 +1617,7 @@ caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.
   are byte-for-byte unchanged. `full` suite green.
 - **Impact:** Medium (a precision guard for the single-shot-confirmation risk P0-3/P0-6 name).
 
-### [ ] ER-3 -- Time-based blind-injection fallback confirmation leg (provisional tier)  [FROZEN by P2-2]
+### [ ] ER-3 -- Time-based blind-injection fallback confirmation leg (provisional tier)  [DEPRIORITIZED — P2-2 decided COLLAPSE]
 - **Domain:** Efficacy / Coverage - **Effort:** L - **Depends on:** P2-2 [ ] (new-validator freeze) - **Mode:** LOOP-BUILD (gated)
 - **Evidence (VERIFIED by source inspection):** no timing/latency confirmation exists -- `grep`
   `elapsed|latency|timing|perf_counter|response_time` across `harness/validators/` returns nothing;
@@ -1599,7 +1626,7 @@ caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.
   timing-anomaly: response `> N s` absolute OR `> K x` baseline.)
 - **Problem:** the OOB legs cannot confirm on egress-filtered targets where the collaborator callback
   can't return -- a real blind spot with no fallback today.
-- **Recommendation (do NOT start until P2-2 is `[x]`):** add a `timing_validator` that samples a
+- **Recommendation (DEPRIORITIZED — P2-2 decided COLLAPSE; do not start unless the collapse is shown to hurt recall):** add a `timing_validator` that samples a
   per-endpoint baseline and flags a payload whose latency exceeds an absolute floor AND a
   baseline-multiple, requiring multiple confirming samples to control jitter FPs. Register it
   `active=True` (gated by `active_enabled` + `allow_mutating_replay`); add its markers to
@@ -1611,7 +1638,7 @@ caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.
 - **Impact:** Medium-High if P2-2 keeps the validator layer; **held** so it doesn't widen detection
   surface before the ablation decides keep/collapse.
 
-### [ ] ER-5 -- Per-class methodology priming for specialist agents  [FROZEN by P2-2]
+### [ ] ER-5 -- Per-class methodology priming for specialist agents  [DEPRIORITIZED — P2-2 decided COLLAPSE]
 - **Domain:** AI / Efficacy - **Effort:** M - **Depends on:** P2-2 [ ] (new-surface freeze) - **Mode:** LOOP-BUILD (gated)
 - **Evidence (SUPPORTED):** external `SnailSploit/Claude-Red` (MIT) carries ~20 concrete web/API/auth
   attack-methodology skills (SQLi/IDOR/SSRF/etc.) usable as detect-side priming; VulnBot shows the
@@ -1619,7 +1646,7 @@ caller-test + negative control per item, never read `*ANSWER_KEY*`/a blind `app.
   + a specialty prompt, with no per-class methodology corpus keyed off `categories.py`.
 - **Problem:** detection priming is generic; concrete per-class methodology could lift recall on the
   detect side -- but this expands the detection surface the P2-2 ablation is meant to justify first.
-- **Recommendation (do NOT start until P2-2 is `[x]`):** curate the MIT web/API/auth methodology
+- **Recommendation (DEPRIORITIZED — P2-2 decided COLLAPSE; do not start unless the collapse is shown to hurt recall):** curate the MIT web/API/auth methodology
   into per-class prompt snippets keyed on `categories.canonicalize`, injected into the matching
   specialist agent's prompt only. Prompt-only (no new agent module, no new send authority); attribute
   the MIT source. Keep behind a default-off flag and measure recall ON vs OFF on P0-3's corpus.
