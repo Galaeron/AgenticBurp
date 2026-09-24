@@ -28,6 +28,7 @@ from harness.models import (
     UrlEstimateItem,
     EffortStatus,
     ComponentCandidate,
+    StageOutcome,
 )
 from harness import store
 from harness import evidence

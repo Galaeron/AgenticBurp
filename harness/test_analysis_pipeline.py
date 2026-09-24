@@ -194,7 +194,7 @@ class NoDuplicateKnownVulnerabilityResolutionTests(unittest.IsolatedAsyncioTestC
             url="https://example.com/x", method="GET",
             response_headers={"Server": "Werkzeug/3.1.7"},
         )
-        reports, _, _ = await pipeline.run_full_analysis(exchange, ["misconfig"], "", 6000)
+        reports, _, _, _ = await pipeline.run_full_analysis(exchange, ["misconfig"], "", 6000)
 
         self.assertEqual([r.agent for r in reports], ["misconfig"])
         self.assertNotIn("known_vuln_lookup", [r.agent for r in reports])
