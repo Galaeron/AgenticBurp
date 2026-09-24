@@ -751,7 +751,19 @@ an overlapping recommendation, and reuse applicable work rather than duplicating
   rebinding protection from an unlisted-host rejection test.
 - **Impact:** Medium-High.
 
-### [ ] P1-10 — Address-bound connect-time resolution pin (DNS-rebinding enforcement)
+### [~] P1-10 — Address-bound connect-time resolution pin (DNS-rebinding enforcement)
+- **Result (offline half VERIFIED):** `aad2dce` — opt-in `security.pin_connect_address` (OFF by default;
+  config.local.yaml live toggle, never committed). `TargetTransport.execute` resolves each hop's host
+  ONCE via an injectable resolver seam and directs the connect to that pinned address, preserving Host +
+  TLS SNI, so a later/alternate resolution can't redirect it; applied per hop (redirects re-pin); resolver
+  failure → honest error, never an unpinned send; IP literals untouched; credential/scope/gate logic
+  still keys on the hostname (only the CONNECT target pins). Default/off path keeps the exact original
+  `client.request` signature. 7 caller-level tests (mock resolver + mock transport recording the connect
+  target): pinned IP used never a later resolution's, https sni_hostname, redirect re-pin, resolver-fail
+  sends nothing, OFF-by-default connects to hostname with resolver never called. Suite: harness 2658 OK
+  (skip 2) / testing 163 OK / evaluation_integrity 42 OK. **OWNER/LIVE half remains:** two-origin /
+  real-HTTPS DNS-rebinding proof (why it ships OFF); also the socket-level pin vs httpx's own re-resolution
+  under real TLS is validated live, not by the mock transport.
 - **Domain:** Security · **Effort:** M · **Depends on:** P1-9 [x]
 - **Evidence (VERIFIED-by-inspection):** filed from the P1-9 review. P1-9 documented
   that scope is hostname-string only and does NOT pin the resolved address, so an

@@ -66,9 +66,16 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   safety-defaults drift manifest + snapshot; **NC-4 `[x]` `0f0f107`** per-sink secret canaries —
   found + fixed a real leak (report chains section emitted evidence/suggested_test unredacted).
   Suite: harness 2645 OK (skip 2) / testing 163 OK / evaluation_integrity 42 OK; `config.yaml` untouched.
-- **Remaining work is OWNER/LIVE only** (NC-O1..NC-O5, PR-A..PR-E, live halves of PR-10/11/13):
-  tool-egress proof, connect-time address pinning, two-origin browser proof, recall re-measure +
-  independent corpus, Java pairing/build. None loop-consumable. Canonical re-review spec:
+- **Pre-existing loop items drained (2026-09-24, Opus):** **P0-6 `[x]` `5b41eec`** honest ledger
+  reproducibility signal (`reconstruct().completeness.resolvable` + `missing[]`; report states
+  reproducibility honestly; `complete` unchanged — R10 offline). **P1-10 `[~]` `aad2dce`** connect-time
+  address pinning against DNS rebinding, opt-in `security.pin_connect_address` OFF by default (resolver
+  seam pins each hop's connect to its resolved address preserving Host+SNI; default path byte-identical);
+  live two-origin/real-HTTPS proof stays OWNER (R03/N03 offline half). Suite: harness 2658 OK (skip 2) /
+  testing 163 OK / evaluation_integrity 42 OK.
+- **Remaining work is OWNER/LIVE only** (NC-O1/O3/O4/O5, PR-A..PR-E, live halves of PR-10/11/13/P1-10):
+  tool-egress proof (N02), two-origin browser proof, recall re-measure + independent corpus, Java
+  pairing/build, live DNS-rebinding proof. None loop-consumable. Canonical re-review spec:
   [reviews/PRINCIPAL_REVIEW_PROMPT.md](reviews/PRINCIPAL_REVIEW_PROMPT.md).
 - Benchmark path: [BP-0 through BP-7](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md).
   Seed exact labels first; BP-1a strict scorer and BP-1b evidence grading are
