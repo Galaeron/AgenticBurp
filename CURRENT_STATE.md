@@ -49,8 +49,10 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   manifest/loader; **PR-3 `[x]` `809dd9c`** strict exact-class scorer + baselines
   (fixes R06 csrf≠ssrf/sqli≠xss; indiscriminate baselines fail the precision gate);
   **PR-4 `[x]` `112a884`** evidence-supported grading tier (supported TP needs
-  exact-class AND resolvable proof; `unavailable`≠0); suite green). PR-2 surfaced a
-  corpus-contamination hazard
+  exact-class AND resolvable proof; `unavailable`≠0); **PR-5 `[x]` `81558ab`**
+  shared eval adapter (raw/surfaced/lead + provenance, visibility can't drift from
+  the report) + read-only historical rescoring; suite green, testing tier 110).
+  PR-2 surfaced a corpus-contamination hazard
   (PixelMart TP10 response embeds `testing/test-target/app.py` source with `BUG:`
   ground-truth comments → detector can cheat) — filed as **PR-13** (offline audit
   + sanitizer). PR-A..PR-E and the live halves of PR-10/11 stay OWNER/LIVE.

@@ -1937,7 +1937,17 @@ green before close.
   `unavailable`, distinct from a real zero.
 - **Impact:** High.
 
-### [ ] PR-5 — One maintained runner + read-only historical rescoring (BP-2)
+### [x] PR-5 — One maintained runner + read-only historical rescoring (BP-2)
+- **Result (VERIFIED):** `81558ab` — `testing/eval_adapter.py`: `build_eval_artifact()` (raw/surfaced/
+  lead stages, AR-3 exchange attribution w/ ambiguous→unresolved, reused `ScoreProvenance`, strict +
+  evidence-supported metrics) and `rescore_saved_run()` (recomputes from a saved artifact with no
+  model/store/network). Visibility reuses `should_quarantine_as_lead`+`is_low_confidence_generic_guess`
+  in report order; the report's declared lead count is diffed and a mismatch RAISES. Missing
+  instrumentation → `unavailable`, never a fabricated 0. 15 caller-level tests via a controlled-model
+  stub (only stubbed boundary) through the real analyze→store→report path, incl. all four negative
+  controls (label leakage / dropped findings / wrong-exchange joins / scorer-report disagreement, last
+  proven non-vacuous). Drivers NOT migrated (documented follow-on). smoke 92, testing 110 (95+15),
+  full 2558 OK/2 skip. Opus-reviewed APPROVE (purely additive; focused 15 OK re-run; reuse verified).
 - **Domain:** Evaluation / architecture - **Effort:** M/L - **Depends on:** PR-3 - **Mode:** LOOP
 - **Evidence (VERIFIED, R14):** `scratchpad/bench_blindstyle.py` (the repro driver) is absent;
   saved runs cannot be reconstructed. Two drivers (`run_blind_eval.py`, `run_ablation_live.py`)
