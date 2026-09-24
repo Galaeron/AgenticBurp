@@ -2175,7 +2175,19 @@ test + negative control, never read `*ANSWER_KEY*`/blind `app.py`, `full` green)
   gate THROUGH the runner (negative controls); a clean run is unchanged. `full` green.
 - **Impact:** High (makes R06 load-bearing rather than a tested island).
 
-### [ ] NC-2 — Verify + gate browser-validator interception (N04 / R01,R11)
+### [x] NC-2 — Verify + gate browser-validator interception (N04 / R01,R11)
+- **Result (VERIFIED):** `d505bd6` — audit correction: the browser plane is already single-source, so
+  N04 does NOT materialize today. `harness/test_browser_interception_gate.py` (13 pure/offline tests)
+  locks it in: (a) `default_driver()` returns the intercepting `PlaywrightDriver` or `None` (fail-closed);
+  (b) a **source scan asserts NO browser context is created outside `browser_driver.py`** (the
+  `.new_context`/`async_playwright`/`connect_over_cdp`/`chromium.launch` anti-bypass guard) and each of
+  the 3 browser validators uses `default_driver()`; (c) PR-10's policy re-asserted under the exact
+  same-host fallback the validators rely on (cross-host blocked, same-host different-port allowed but
+  credentials withheld, non-GET nav blocked, ws/download/non-http blocked); (d) the `is_cancelled` seam.
+  Note the `:157` "legacy visit" in the original evidence was the `BrowserDriver` **Protocol** signature,
+  not a competing concrete driver. **Residual (follow-up):** the validators rely on the safe same-host
+  fallback rather than threading the run's full `ScopePolicy`/cancel token into `visit()` — fold into the
+  R11 capability-catalogue work. Suite: harness 2638 OK (skip 2) / testing 156 OK / evaluation_integrity 42 OK.
 - **Domain:** Security / architecture - **Effort:** M/L - **Depends on:** PR-10 - **Mode:** LOOP
 - **Evidence (VERIFIED):** `browser_driver.py` has two `visit` paths (`:157` legacy, `:239`
   intercepting); only the intercepting one carries PR-10's per-request `evaluate_browser_request`
