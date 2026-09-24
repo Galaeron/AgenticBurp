@@ -633,7 +633,18 @@ an overlapping recommendation, and reuse applicable work rather than duplicating
   profile `none` preserves existing behavior. Keep shipped defaults safe.
 - **Impact:** High.
 
-### [ ] P0-6 — Require resolvable evidence for ledger completeness and reproduction
+### [x] P0-6 — Require resolvable evidence for ledger completeness and reproduction
+- **Result (VERIFIED):** `5b41eec` — `reconstruct()` now returns a `completeness` block reporting
+  reproducibility honestly (`resolvable` = an EXECUTION with BOTH a real request AND response; plus
+  `has_conclusion`/`has_execution`/`has_request`/`has_response`/`has_captured_observation`/`missing[]`),
+  computed only from events on hand so a durable record whose EXECUTION event failed to persist
+  reconstructs as verdict-but-NOT-resolvable (never a silent reproducible record). `complete` kept its
+  "a verdict was reached" meaning (separate axis, unchanged — passive path + existing assertions
+  untouched). `report_generator` states it at the export boundary ("complete verdict; NOT independently
+  reproducible (<missing>)"). 6 tests incl. verdict-only + empty-response + persistence-failure negative
+  controls. **Offline-complete; the fuller durable per-hop request/response capture (thin `request_ref`/
+  `response_ref`) stays as follow-on evidence-richness work.** Suite: harness 2651 OK (skip 2) /
+  evaluation_integrity 42 OK (testing tier's lone failure was a pre-existing timestamp flake, unrelated).
 - **Domain:** Trust / Evidence · **Effort:** M · **Depends on:** P0-1
 - **Evidence (VERIFIED by source inspection):** `TargetTransport._artifact` records
   the URL as `request_ref` and an HTTP status summary as `response_ref`.
