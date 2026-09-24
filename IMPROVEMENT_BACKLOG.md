@@ -2033,8 +2033,19 @@ green before close.
   field is preserved. No real credentials.
 - **Impact:** High.
 
-### [ ] PR-10 — Policy-bound browser adapter (offline half) (R01)
-- **Domain:** Security / execution - **Effort:** L - **Depends on:** transport/capability contract - **Mode:** LOOP (offline half); OWNER/LIVE (two-origin verification)
+### [~] PR-10 — Policy-bound browser adapter (offline half done; live half OWNER) (R01)
+- **Result (VERIFIED, offline half):** `4913488` — pure `evaluate_browser_request` +
+  `BrowserRequestDecision` (playwright-free, reuses `ScopePolicy`, fail-closed): blocks
+  non-http(s) schemes, service_worker/websocket/download + unknown resource types, out-of-scope
+  origins, non-GET off-origin; `attach_credentials` only when request origin == run_origin.
+  `visit()` drops blanket `extra_http_headers`, installs `context.route("**/*")` that aborts
+  disallowed requests + attaches creds per-decision; cancel checked at 3 points; same-origin default
+  preserves the XSS validators. 30 offline tests (playwright absent) incl. off-origin block,
+  cross-origin credential refusal, redirect re-eval, cancel seam, same-origin negative control.
+  smoke 92, harness 2611 OK/2 skip, testing 135, full green. Opus-reviewed APPROVE.
+- **OWNER/LIVE half still `[ ]`:** two-origin real-browser proof that an owned off-scope listener
+  receives zero requests/credentials (needs a playwright install + browser run). Leave for owner.
+- **Domain:** Security / execution - **Effort:** L - **Depends on:** transport/capability contract - **Mode:** LOOP (offline half done); OWNER/LIVE (two-origin verification)
 - **Evidence (VERIFIED, R01):** `browser_driver.py:56,156` projects captured `Authorization` to
   context `extra_http_headers`; no `route`/interception; only the initial URL is scope-checked.
 - **Problem:** redirects/subresources/fetches are separate network actions that bypass Python
