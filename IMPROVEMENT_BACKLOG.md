@@ -7,6 +7,15 @@ re-reading the whole review.
 
 ## How the loop should use this file
 
+**2026-09-24 benchmark follow-up:** The BP-0 through BP-7 implementation
+path is in [Benchmark precision implementation path](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md).
+Start with provenance-tracked seed labels, then BP-1a strict scoring and BP-1b
+separate evidence grading, caller integration, historical rescoring, adjudication
+and targeted fixes. BP-5C corpus expansion/evaluation adequacy is mandatory before
+confirmatory live validation; model repeats cannot replace independent cases.
+This is a planning pointer, not an automation dispatch or a completion claim;
+it preserves existing queue rules and completed B2/AR work.
+
 **Evaluation correction (2026-09-20):** Read
 [the reassessment](docs/EVALUATION_REASSESSMENT_2026-09-20.md) when interpreting
 the original review. Completed items' original Evidence/Problem paragraphs are
@@ -1823,3 +1832,184 @@ apply (safe config defaults, a caller-test + negative control per item, never re
   controls -- finding counts, fingerprints and report output are unchanged for a corpus without
   duplicates; an existing DB migrates without error. `full` suite green.
 - **Impact:** Medium-High (fair per-exchange scoring; retires the exclusion heuristics).
+
+## Principal review batch — 2026-09-24 (PR-*)
+
+**Dispatch (2026-09-24, user-requested):** Filed from the
+[principal review](reviews/2026-09-24/principal-review/REVIEW.md) (findings
+R01–R16, independently re-verified for R01/R04/R05/R06/R07/R14). Full sequenced
+spec, do-not-duplicate map and acceptance detail:
+[docs/PRINCIPAL_REVIEW_IMPLEMENTATION_PATH.md](docs/PRINCIPAL_REVIEW_IMPLEMENTATION_PATH.md).
+Loop order: **PR-1 → PR-2 → PR-3 → PR-4 → PR-5 → PR-6 → PR-7 → PR-9 →
+PR-10(offline) → PR-11(offline)**. `Mode: OWNER/LIVE` items (PR-A..PR-E) are NOT
+loop-consumable — leave `[ ]`, skip, and note why in the report. R03 -> P1-10,
+R10 -> P0-6, R04 -> RB-1b, R07 -> P2-2/RB-7, R11/R12 -> P1-3 already exist; do not
+re-file. Honour the non-negotiables above: safe defaults only, caller test +
+negative control per item, never read `*ANSWER_KEY*`/blind `app.py`, `full` suite
+green before close.
+
+### [ ] PR-1 — Portable, injectable audit sink; construction never blocks on unwritable audit storage
+- **Domain:** Reliability / DX - **Effort:** S - **Depends on:** none - **Mode:** LOOP
+- **Evidence (VERIFIED, R05):** `audit_logger.py` catches `os.makedirs` failure (~line 204) but
+  NOT the `RotatingFileHandler` file-open (~line 227); default `log_file=/var/log/{name}/audit.log`
+  becomes `C:\var\log\agentic_burp\audit.log`. Fresh `smoke` = 30 errors, `full` = 183 errors, all
+  `PermissionError` opening that file (`reviews/2026-09-24/principal-review/{smoke,full}.log`).
+- **Problem:** an unprivileged/sandboxed tester cannot initialise the pipeline even for offline
+  fixtures; earlier green-suite claims cannot be carried forward.
+- **Recommendation:** platform-appropriate per-user data dir default (keep the setter injectable);
+  guard the handler open, degrade to `enable_file=False` with ONE diagnostic on `OSError`/
+  `PermissionError`; add a deliberate policy hook for "required audit storage unavailable"
+  (default degrade-with-warning). Do not disable audit checks or require admin.
+- **Acceptance:** caller-level tests construct the logger AND a pipeline entry point with (a) an
+  unwritable directory and (b) an unwritable EXISTING file — both degrade, no exception. NEGATIVE
+  control: a writable path still attaches the handler and writes a record. `smoke`+`full` reach a
+  green tier in a restricted (non-admin, no `C:\var`) workspace.
+- **Impact:** High (unblocks the entire suite; prerequisite for trustworthy re-runs).
+
+### [ ] PR-2 — Seed exact-class label manifest (BP-0)
+- **Domain:** Evaluation - **Effort:** S/M - **Depends on:** none - **Mode:** LOOP
+- **Evidence (VERIFIED, R06):** `testing/score.py` has only coarse OWASP-category labels; no
+  per-exchange exact-class ground truth exists for most corpora.
+- **Problem:** every strict metric needs per-exchange expected exact classes + tested-negatives;
+  this is the load-bearing input and does not yet exist.
+- **Recommendation:** hand-seed a provenance-tracked manifest (stable IDs, >=1 expected exact class,
+  tested-negative classes, label scope, `positive|negative|inconclusive|setup`) from PERMITTED
+  captured evidence only. Unknown/unresolved stay visible and unscored.
+- **Acceptance:** loader tests prove multiple expected classes, per-class negatives, surfaced
+  unresolved labels, and setup rows never scored as positive/FP. NEGATIVE control: a label-leaking
+  or malformed manifest is rejected. Never read answer-key/blind `app.py`.
+- **Impact:** Transformational (spine of strict scoring).
+
+### [ ] PR-3 — Strict exact-class scorer + indiscriminate baselines (BP-1a)
+- **Domain:** Evaluation / trust - **Effort:** M - **Depends on:** PR-2 - **Mode:** LOOP
+- **Evidence (VERIFIED, R06):** "cross-site request forgery" -> SSRF via `request forgery` substring
+  (`score.py:41`); literal `csrf` unmapped; SQLi and XSS share A03; blind corpora count any finding.
+- **Problem:** wrong-class alerts count as TP; an indiscriminate detector looks high-recall.
+- **Recommendation:** new versioned scorer (keep `score.py` as explicit coarse/historical), exact
+  aliases separating SQLi/XSS/SSTI/cmdi/SSRF/CSRF; emit any-alert vs exact-class vs
+  evidence-supported metrics; explicit dedup/matching units.
+- **Acceptance:** fixtures prove wrong-class != TP, SQLi != XSS, CSRF != SSRF, dedup holds, absent
+  predictions are misses. Mandatory baselines as NEGATIVE controls: always-alert and
+  all-classes-on-every-exchange MUST fail the exact-class precision gate at perfect coverage; the
+  silent baseline MUST fail recall.
+- **Impact:** Transformational.
+
+### [ ] PR-4 — Evidence-supported grading tier (BP-1b)
+- **Domain:** Evaluation / trust - **Effort:** M - **Depends on:** PR-3 - **Mode:** LOOP
+- **Evidence (VERIFIED, R06):** `ablation_harness.run_variant_async` leaves `confirmed_tp/
+  confirmed_fp` at default 0; `evaluation_integrity/evidence_audit.py` already grades proof claims.
+- **Problem:** unavailable evidence scoring reads as a genuine zero.
+- **Recommendation:** grade captured / differential-reproduced / unsupported / insufficient tiers,
+  reusing `evidence_audit.py`; emit `unavailable` when instrumentation is absent (never fabricate 0).
+- **Acceptance:** fixtures grade bare-`true`-no-proof as unsupported, mismatched-case proof as
+  unsupported, adequate proof as supported. NEGATIVE control: a no-instrumentation run reports
+  `unavailable`, distinct from a real zero.
+- **Impact:** High.
+
+### [ ] PR-5 — One maintained runner + read-only historical rescoring (BP-2)
+- **Domain:** Evaluation / architecture - **Effort:** M/L - **Depends on:** PR-3 - **Mode:** LOOP
+- **Evidence (VERIFIED, R14):** `scratchpad/bench_blindstyle.py` (the repro driver) is absent;
+  saved runs cannot be reconstructed. Two drivers (`run_blind_eval.py`, `run_ablation_live.py`)
+  diverge.
+- **Problem:** benchmarks are not reproducible; scorer and rendered report can disagree.
+- **Recommendation:** shared adapter/schema; attribute by exchange observations (AR-3); export
+  finding IDs at raw/surfaced/lead stages from the real report decision; record full provenance
+  (hashes, effective config+overrides, model identity, calls/tokens -> `unavailable` if missing);
+  strip scoring annotations before `analyze()`; read-only rescoring with no model/target traffic.
+- **Acceptance:** caller-level tests drive real driver->orchestrator->store->report with synthetic
+  exchanges + controlled model output. NEGATIVE controls detect label leakage, dropped findings,
+  wrong-exchange joins, scorer/report disagreement. Synthetic CLI run needs no Docker/Ollama/network.
+- **Impact:** High.
+
+### [ ] PR-6 — Rescore + correct historical benchmark; config-drift manifest (BP-3)
+- **Domain:** Reproducibility / documentation - **Effort:** S/M - **Depends on:** PR-5 - **Mode:** LOOP
+- **Evidence (VERIFIED, R14):** saved runs `fail_open_mode: curated` + `quarantine_leads: true`;
+  shipped `config.yaml` `fail_open_mode: all` (l.89) + `quarantine_unverified_leads: false` (l.596)
+  + `routing_mode: agents` (l.133). PixelMart table `tokens=0` vs log `model_tokens=447k`;
+  footer "no run starved" vs `breaker_failures=2`.
+- **Problem:** contributors could tune/market the wrong runtime profile from mismatched artifacts.
+- **Recommendation:** versioned corrected assessment under `reviews/2026-09-23/benchmark/` +
+  config-diff manifest; recompute only what artifacts support (mark historical); preserve originals
+  with a dated correction pointer; remove/annotate "recall solved"/"quarantine buys nothing"/parity.
+- **Acceptance:** a reconciliation script asserts generated totals match each input file (including
+  the token and breaker contradictions above) and documents control units (exchange vs method/URL
+  vs issue). NEGATIVE control: the script fails if a total is inferred from broad categories alone.
+- **Impact:** High.
+
+### [ ] PR-7 — Typed stage health; a degraded run is never reported clean (R08)
+- **Domain:** Reliability / observability - **Effort:** M - **Depends on:** none (coord. P0-6) - **Mode:** LOOP
+- **Evidence (VERIFIED, R08):** `analysis_pipeline.py:247` returns `(0,0)` on error; PixelMart log
+  shows an HTTP 500 critique failure under a "breaker-healthy" footer.
+- **Problem:** no-candidates, disabled-critique and FAILED-critique produce identical counters; a
+  breaker not opening is an insufficient health predicate.
+- **Recommendation:** typed stage outcomes (attempted/completed/failed/skipped + affected finding
+  ids); `degraded` response/report status; preserve labelled partial results.
+- **Acceptance:** caller-level tests show the three failure modes produce DISTINCT inspectable
+  outcomes. NEGATIVE control: a healthy full run reports no degradation and identical findings (no
+  false-degraded). Report/response never reads clean when a stage failed.
+- **Impact:** High.
+
+### [ ] PR-9 — Schema-aware recursive redaction across sinks (R09)
+- **Domain:** Security / privacy - **Effort:** L - **Depends on:** none - **Mode:** LOOP
+- **Evidence (VERIFIED synthetic, R09):** header bearer is redacted, but a JSON password, a query
+  token and a nested password dict survive into agent prompts / audit events
+  (`security.redact_headers`, `base_agent._user_prompt`, `audit_logger._sanitize_data`).
+- **Problem:** opt-in remote reasoning or persisted events can leak secrets in body/URL/nested state.
+- **Recommendation:** classify sinks; recursive schema-aware redaction of nested/body/URL/query
+  secrets; keep prompt logs storing hashes/lengths; explicit egress preview/policy. No claim that
+  all sensitive data is auto-removable.
+- **Acceptance:** synthetic canaries in header/URL/query/body/nested state are ABSENT from every
+  prohibited sink across each provider/export boundary. NEGATIVE control: a task-relevant non-secret
+  field is preserved. No real credentials.
+- **Impact:** High.
+
+### [ ] PR-10 — Policy-bound browser adapter (offline half) (R01)
+- **Domain:** Security / execution - **Effort:** L - **Depends on:** transport/capability contract - **Mode:** LOOP (offline half); OWNER/LIVE (two-origin verification)
+- **Evidence (VERIFIED, R01):** `browser_driver.py:56,156` projects captured `Authorization` to
+  context `extra_http_headers`; no `route`/interception; only the initial URL is scope-checked.
+- **Problem:** redirects/subresources/fetches are separate network actions that bypass Python
+  request-budget/method/credential policy.
+- **Recommendation:** run-bound adapter intercepting EVERY request (scheme/origin/method/address +
+  credentials only to approved origins; block service-worker/download/uncontrolled WS; honor cancel).
+- **Acceptance (OFFLINE, loop-consumable):** unit tests over the interception-decision function —
+  off-origin subresource BLOCKED, credential only on approved origin, new-origin redirect
+  re-checked, cancel stops dispatch. NEGATIVE control: in-scope same-origin GET allowed with
+  expected headers. OWNER/LIVE (leave `[ ]`): two-origin real-browser proof of zero off-scope traffic.
+- **Impact:** High.
+
+### [ ] PR-11 — External-tool egress boundary (offline half) (R02)
+- **Domain:** Security / reliability - **Effort:** L - **Depends on:** transport/capability contract - **Mode:** LOOP (offline half); OWNER/LIVE (container egress verification)
+- **Evidence (VERIFIED, R02):** `sqlmap.py` launches argv after an initial check without routing
+  requests through `TargetTransport`; the direct path uses `docker_cmd` not the cleanup wrapper.
+- **Problem:** tool-generated redirects/probes can exceed request/credential/destination assumptions;
+  a subprocess timeout is not a bound on container activity.
+- **Recommendation:** per-run egress-proxy/network-sandbox seam; scoped container identity;
+  cancellation/cleanup in `finally`; tool/version/digest + request receipts; route direct sqlmap
+  through the cleanup wrapper. Keep structured argv.
+- **Acceptance (OFFLINE):** tests assert the invocation is built WITH the proxy/sandbox params and
+  that cancel triggers `finally` cleanup + a receipt. NEGATIVE control: with no proxy seam
+  configured the run refuses to launch (fails closed). OWNER/LIVE (leave `[ ]`): container proof
+  that off-scope egress is blocked and killed on cancel.
+- **Impact:** High.
+
+### [ ] PR-A — Secure local Burp<->API token pairing (R04 / RB-1b)  — **Mode: OWNER/LIVE (skip)**
+- Needs JDK/Burp build. Server writes an ephemeral token to `.harness_token.lock`; `HarnessClient.java:63`
+  reads only `HARNESS_BEARER_TOKEN` env (no lockfile reader / setter caller). Finish pairing/refresh,
+  token-file perms, actionable 401 UI. Do not weaken API auth. Leave `[ ]` for the owner.
+
+### [ ] PR-B — True A–G ablations (R07 / P2-2)  — **Mode: OWNER/LIVE (skip)**
+- Needs real model/GPU. Real generalist (not `force_agents=['sqli']`), a no-model provider that
+  RAISES on any inference, a genuinely stronger model for F, an interaction corpus for E,
+  stage-level invocation assertions, predeclared noninferiority margins. Leave `[ ]`.
+
+### [ ] PR-C — Reproducible Java build + release gate (R13)  — **Mode: OWNER/LIVE (skip)**
+- Gradle wrapper/toolchain, PR Java build/tests, wheel/JAR install smoke, SBOM, checksummed release
+  manifest, digest-pinned tool images. Verification needs a JDK. Leave `[ ]`.
+
+### [ ] PR-D — Independent labeled corpus expansion (R15 / BP-5C)  — **Mode: OWNER/LIVE (skip)**
+- Independent case authoring, clustered splits, frozen sampling/decision design, untouched curated
+  holdout. Not automatable; mandatory before confirmatory live validation. Leave `[ ]`.
+
+### [ ] PR-E — Evidence-workflow design-partner pilot (R16)  — **Mode: OWNER (skip)**
+- Five practitioners, paired tasks, measure analyst minutes saved per accepted reproducible issue.
+  Non-code. Leave `[ ]`.
