@@ -1987,7 +1987,17 @@ green before close.
   vs issue). NEGATIVE control: the script fails if a total is inferred from broad categories alone.
 - **Impact:** High.
 
-### [ ] PR-7 — Typed stage health; a degraded run is never reported clean (R08)
+### [x] PR-7 — Typed stage health; a degraded run is never reported clean (R08)
+- **Result (VERIFIED):** `a33a1ab` — typed `StageOutcome` (completed/failed/skipped/disabled +
+  counts + affected_finding_ids) on `models.py`; `_critique` returns it (all four paths distinct;
+  affected-id ref does NOT mutate finding_id so healthy runs stay side-effect-free);
+  `run_full_analysis` 4-tuple, all callers updated; `orchestrator_detect` sets additive
+  `stage_outcomes[]` + `degraded = circuit_open OR any-stage-failed`; findings never dropped.
+  Caller-level tests over the real analyze() path for all 3 modes + mandatory negative control
+  (healthy run not degraded, keeps its exact finding). 2 existing tests updated for 4-tuple arity
+  (legitimate). smoke 92, harness 2563 OK/2 skip, testing 135, full green. **Salvaged** from a
+  rate-limit-interrupted coder; Opus finished one stale-rename assertion + reviewed the full diff +
+  ran the full suite. Opus-reviewed APPROVE (existing-test edits legitimate; no config/safety change).
 - **Domain:** Reliability / observability - **Effort:** M - **Depends on:** none (coord. P0-6) - **Mode:** LOOP
 - **Evidence (VERIFIED, R08):** `analysis_pipeline.py:247` returns `(0,0)` on error; PixelMart log
   shows an HTTP 500 critique failure under a "breaker-healthy" footer.
