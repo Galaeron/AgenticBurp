@@ -1962,7 +1962,17 @@ green before close.
   wrong-exchange joins, scorer/report disagreement. Synthetic CLI run needs no Docker/Ollama/network.
 - **Impact:** High.
 
-### [ ] PR-6 — Rescore + correct historical benchmark; config-drift manifest (BP-3)
+### [x] PR-6 — Rescore + correct historical benchmark; config-drift manifest (BP-3)
+- **Result (VERIFIED):** `605863b` — `testing/reconcile_benchmark.py` recomputes saved-run aggregates
+  and flags the contradictions (wall 1330 = repeat-3 not the 1138.631 mean; tokens=0 vs ~447k =
+  `unavailable`; "no starved" vs breaker `[2,0,2]`). `CONFIG_DRIFT_MANIFEST` (4 blind corpora ran
+  curated/quarantine-on ≠ shipped all/quarantine-off; PixelMart no fingerprint) +
+  `CORRECTED_ASSESSMENT_2026-09-24.md` (marks "recall solved"/"quarantine buys nothing"/parity
+  superseded). Strict recall refused (`unavailable`) for all 5, never inferred from broad category.
+  Originals preserved; BENCHMARK_REPORT.md pointer-only. 25 tests incl. synthetic corrupted-total /
+  fabricated-recall negative controls; real-artifact tests skip-guarded (logs git-ignored). smoke 92,
+  testing 135 (110+25), full 2558 OK/2 skip. Opus-reviewed APPROVE + added artifact skip-guards
+  during review (fresh-checkout safe); config/score.py byte-unchanged; no forbidden read.
 - **Domain:** Reproducibility / documentation - **Effort:** S/M - **Depends on:** PR-5 - **Mode:** LOOP
 - **Evidence (VERIFIED, R14):** saved runs `fail_open_mode: curated` + `quarantine_leads: true`;
   shipped `config.yaml` `fail_open_mode: all` (l.89) + `quarantine_unverified_leads: false` (l.596)

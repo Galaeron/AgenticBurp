@@ -51,7 +51,9 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   **PR-4 `[x]` `112a884`** evidence-supported grading tier (supported TP needs
   exact-class AND resolvable proof; `unavailable`≠0); **PR-5 `[x]` `81558ab`**
   shared eval adapter (raw/surfaced/lead + provenance, visibility can't drift from
-  the report) + read-only historical rescoring; suite green, testing tier 110).
+  the report) + read-only historical rescoring; **PR-6 `[x]` `605863b`** benchmark
+  reconciliation + config-drift manifest + dated corrected assessment (originals
+  preserved; strict recall refused where no manifest); suite green, testing 135).
   PR-2 surfaced a corpus-contamination hazard
   (PixelMart TP10 response embeds `testing/test-target/app.py` source with `BUG:`
   ground-truth comments → detector can cheat) — filed as **PR-13** (offline audit
