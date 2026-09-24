@@ -2152,7 +2152,14 @@ Coding constraint: Sonnet coder weekly-limited until 2026-09-28 → loop items a
 Opus-authored or deferred. Honour cycle-1 non-negotiables (safe defaults, caller
 test + negative control, never read `*ANSWER_KEY*`/blind `app.py`, `full` green).
 
-### [ ] NC-1 — Apply the strict scorer in an offline runner (N01 / R06)
+### [x] NC-1 — Apply the strict scorer in an offline runner (N01 / R06)
+- **Result (VERIFIED):** `ed555dd` — `testing/rescore_run.py` applies `eval_adapter.rescore_saved_run`
+  to a saved run (read-only) AND runs the three indiscriminate baselines through `strict_score`'s
+  precision/recall gates as a built-in negative control; refuses (raises `StrictScorecardError`) when
+  any baseline passes a gate it must fail. Coarse metrics only under an explicit `historical_coarse`
+  label; `run_from_files`/`main` CLI (exit 0 certified / 2 refused). 8 tests incl. the "baselines fail
+  the gate THROUGH the runner" control and the low-gate refusal negative control. Opus-authored (Sonnet
+  weekly-limited). Suite: harness 2625 OK (skip 2) / testing 156 OK / evaluation_integrity 42 OK.
 - **Domain:** Evaluation - **Effort:** M - **Depends on:** PR-3/PR-5 (done) - **Mode:** LOOP
 - **Evidence (VERIFIED):** grep of `harness/` finds no importer of `strict_score`/`eval_adapter`/
   `classify_exact`; only `testing/evidence_grade.py:103` (a sibling instrument) imports it. A
