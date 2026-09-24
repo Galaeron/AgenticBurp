@@ -1848,7 +1848,14 @@ re-file. Honour the non-negotiables above: safe defaults only, caller test +
 negative control per item, never read `*ANSWER_KEY*`/blind `app.py`, `full` suite
 green before close.
 
-### [ ] PR-1 — Portable, injectable audit sink; construction never blocks on unwritable audit storage
+### [x] PR-1 — Portable, injectable audit sink; construction never blocks on unwritable audit storage
+- **Result (VERIFIED):** `c26d769` — default audit path moved off `/var/log` to a per-user
+  platform dir (LOCALAPPDATA/APPDATA/home on Windows; XDG/`~/.local/state` on POSIX); the
+  `RotatingFileHandler` OPEN is now guarded (not just `makedirs`) via `_disable_file_logging` —
+  default degrades to `enable_file=False`+warning, new `require_file=True` raises
+  `AuditStorageUnavailable`. `log_file` arg + `set_default_audit_logger` still override.
+  Caller-level tests + writable-path negative control added; smoke 92 OK, focused 28 OK,
+  full 2558 OK / 2 skip. Opus-reviewed APPROVE (isolated 2-file diff; setter/override intact).
 - **Domain:** Reliability / DX - **Effort:** S - **Depends on:** none - **Mode:** LOOP
 - **Evidence (VERIFIED, R05):** `audit_logger.py` catches `os.makedirs` failure (~line 204) but
   NOT the `RotatingFileHandler` file-open (~line 227); default `log_file=/var/log/{name}/audit.log`
