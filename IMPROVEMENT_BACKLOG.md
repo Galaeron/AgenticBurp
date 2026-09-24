@@ -2140,3 +2140,85 @@ green before close.
 ### [ ] PR-E — Evidence-workflow design-partner pilot (R16)  — **Mode: OWNER (skip)**
 - Five practitioners, paired tasks, measure analyst minutes saved per accepted reproducible issue.
   Non-code. Leave `[ ]`.
+
+## Re-review cycle-2 batch — 2026-09-24 (NC-*)
+
+**Dispatch (2026-09-24, cycle 2):** filed from the delta re-review
+[reviews/2026-09-24/principal-review-r2/REVIEW.md](reviews/2026-09-24/principal-review-r2/REVIEW.md)
+(new findings N01–N05). Full spec + do-not-duplicate map:
+[reviews/2026-09-24/principal-review-r2/IMPLEMENTATION_PATH.md](reviews/2026-09-24/principal-review-r2/IMPLEMENTATION_PATH.md).
+Loop order **NC-1 → NC-2 → NC-3 → NC-4**; NC-O1..NC-O5 are OWNER/LIVE (skip).
+Coding constraint: Sonnet coder weekly-limited until 2026-09-28 → loop items are
+Opus-authored or deferred. Honour cycle-1 non-negotiables (safe defaults, caller
+test + negative control, never read `*ANSWER_KEY*`/blind `app.py`, `full` green).
+
+### [ ] NC-1 — Apply the strict scorer in an offline runner (N01 / R06)
+- **Domain:** Evaluation - **Effort:** M - **Depends on:** PR-3/PR-5 (done) - **Mode:** LOOP
+- **Evidence (VERIFIED):** grep of `harness/` finds no importer of `strict_score`/`eval_adapter`/
+  `classify_exact`; only `testing/evidence_grade.py:103` (a sibling instrument) imports it. A
+  live/benchmark run still scores through coarse `testing/score.py`.
+- **Problem:** the strict scorer (PR-3), evidence grade (PR-4) and adapter (PR-5) are a correct,
+  tested toolkit that no run consumes — "implemented ≠ working" one level up. R06 is an available
+  instrument, not an applied contract.
+- **Recommendation:** an offline entry point that takes a saved run artifact and emits the strict
+  scorecard via `eval_adapter.rescore_saved_run`/`strict_score.score`; coarse metrics only under an
+  explicit `historical` label; `ScoreProvenance` stamped on the output. Do not rewrite PR-3/PR-5.
+- **Acceptance:** caller-level test — a saved-run fixture scored end-to-end yields exact-class
+  precision/recall; the always-alert / all-class / silent baselines each FAIL the strict precision
+  gate THROUGH the runner (negative controls); a clean run is unchanged. `full` green.
+- **Impact:** High (makes R06 load-bearing rather than a tested island).
+
+### [ ] NC-2 — Verify + gate browser-validator interception (N04 / R01,R11)
+- **Domain:** Security / architecture - **Effort:** M/L - **Depends on:** PR-10 - **Mode:** LOOP
+- **Evidence (VERIFIED):** `browser_driver.py` has two `visit` paths (`:157` legacy, `:239`
+  intercepting); only the intercepting one carries PR-10's per-request `evaluate_browser_request`
+  policy + `context.route`.
+- **Problem:** PR-10 hardened one driver; a browser-using validator on the other path gets none of
+  its guarantees (R11 duplication intact).
+- **Recommendation:** confirm every browser-using validator routes through the intercepting `visit`;
+  make a non-intercepted context refuse to send. Begin the typed capability catalogue with the
+  browser family (no big-bang).
+- **Acceptance:** test that a browser request without the interceptor installed is rejected/raises;
+  enumeration test that each browser validator uses the intercepting path. NEGATIVE control: an
+  in-scope request through the intercepting path still succeeds. `full` green.
+- **Impact:** High.
+
+### [ ] NC-3 — Regenerable config/profile drift manifest (R14 residual)
+- **Domain:** Reproducibility - **Effort:** S - **Depends on:** PR-6 - **Mode:** LOOP
+- **Problem:** PR-6's reconciliation is a one-off artifact; drift can silently recur.
+- **Recommendation:** a generator that emits the config/profile/egress manifest from `config.yaml`
+  on demand + a test that the committed manifest matches regeneration (fails on drift).
+- **Acceptance:** mutating a tracked default fails the drift check; unchanged config passes. `full` green.
+- **Impact:** Medium.
+
+### [ ] NC-4 — Per-sink secret-canary tests (R09 residual)
+- **Domain:** Security / privacy - **Effort:** M - **Depends on:** PR-9 - **Mode:** LOOP
+- **Problem:** PR-9 redaction is wired but only prompt-path coverage is proven; export/provider/
+  nested-audit sinks need canary proof.
+- **Recommendation:** synthetic secret canaries in header/URL/body/nested-state asserted absent at
+  every export/provider boundary. Do not re-implement redaction.
+- **Acceptance:** canary test per sink; NEGATIVE control — a `q`/`search` SQLi/XSS payload survives
+  verbatim (redaction is name-scoped). `full` green.
+- **Impact:** High for remote-reasoning opt-in.
+
+### [ ] NC-O1 — Prove tool egress containment (N02 / R02)  — **Mode: OWNER/LIVE (skip)**
+- Seam only today: sqlmap caller passes `proxy_url=None`, `network="bridge"` → container keeps full
+  egress, `allowed_hosts` inert. Stand up per-run proxy (or `--network none` + host alias); prove an
+  off-scope listener receives zero packets. Needs Docker. Leave `[ ]`.
+
+### [ ] NC-O2 — Connect-time address pinning (N03 / R03)  — **Mode: OWNER/LIVE (skip)**
+- `run_context.py:64-75` states the scope "deliberately does not build" address pinning; PR-10's
+  per-request browser checks inherit the same address-blind `ScopePolicy`. Build shared HTTP+browser
+  address pinning, or a gated lab-mode; prove with a two-origin/DNS-rebinding test. Leave `[ ]`.
+
+### [ ] NC-O3 — Two-origin browser credential-forwarding proof (R01 live)  — **Mode: OWNER/LIVE (skip)**
+- Live proof that PR-10's adapter attaches credentials only to approved origins and forwards none to
+  a second owned origin. Needs a browser engine + two owned origins. Leave `[ ]`.
+
+### [ ] NC-O4 — Recall re-measure + independent corpus (PR-13 live / R15)  — **Mode: OWNER/LIVE (skip)**
+- Quantify sanitized-vs-contaminated PixelMart recall inflation with a real model; BP-4/BP-5C
+  independent labeled-case collection + holdout. Needs GPU/Ollama. Leave `[ ]`.
+
+### [ ] NC-O5 — Java/API pairing + reproducible build gate (R04 / R13)  — **Mode: OWNER/LIVE (skip)**
+- Supersedes PR-A/PR-C: secure local token pairing/refresh + Gradle wrapper/toolchain + PR Java
+  build/test + checksummed release. Needs JDK/Gradle. Leave `[ ]`.

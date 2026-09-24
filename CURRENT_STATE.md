@@ -34,44 +34,36 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
 - The review identifies browser/tool execution-boundary gaps, absent connect-time
   DNS pinning, default Java/API token-pairing mismatch, and hidden critique
   degradation as high-priority trust/operability work. See R01–R10 for evidence.
-- **Principal-review implementation path (2026-09-24):**
+- **Cycle-1 principal-review batch (2026-09-24):** path
   [docs/PRINCIPAL_REVIEW_IMPLEMENTATION_PATH.md](docs/PRINCIPAL_REVIEW_IMPLEMENTATION_PATH.md);
-  loop-consumable **PR-1..PR-11** filed in IMPROVEMENT_BACKLOG.md (order
-  PR-1→2→3→4→5→6→7→9→10→11). R01/R04/R05/R06/R07/R14 independently re-verified.
-  An unattended improve-loop is draining the offline PR batch (**PR-1 `[x]`
-  `c26d769`** portable audit sink; **PR-2 `[x]` `b8fd09b`** exact-class label
-  manifest/loader; **PR-3 `[x]` `809dd9c`** strict exact-class scorer + baselines
-  (fixes R06 csrf≠ssrf/sqli≠xss; indiscriminate baselines fail the precision gate);
-  **PR-4 `[x]` `112a884`** evidence-supported grading tier (supported TP needs
-  exact-class AND resolvable proof; `unavailable`≠0); **PR-5 `[x]` `81558ab`**
-  shared eval adapter (raw/surfaced/lead + provenance, visibility can't drift from
-  the report) + read-only historical rescoring; **PR-6 `[x]` `605863b`** benchmark
-  reconciliation + config-drift manifest + dated corrected assessment (originals
-  preserved; strict recall refused where no manifest); **PR-7 `[x]` `a33a1ab`**
-  typed stage health (`StageOutcome` + `degraded`; a failed critique can no longer
-  read as clean; findings never dropped); **PR-9 `[x]` `07d1e13`** schema-aware
-  recursive secret redaction (nested audit dicts; URL/body secret-name redaction
-  that preserves injection payloads verbatim); **PR-10 offline half `[~]` `4913488`**
-  policy-bound browser adapter (per-request interception; no cross-origin credential
-  forwarding — live two-origin proof stays OWNER); **PR-11 offline half `[~]` `d82aab9`**
-  tool-egress seam (fail-closed EgressPolicy + force-clean wrapper + receipts; sqlmap
-  container path rerouted — live container-egress proof stays OWNER);
-  **PR-13 offline half `[~]` `2d66c5e`** corpus contamination audit + sanitizer
-  (PR-2 surfaced PixelMart TP10 embedding `testing/test-target/app.py` source with
-  19 `BUG:`/`ANSWER_KEY` ground-truth markers → detector can cheat; `corpus_sanitize.py`
-  audits read-only and strips ONLY annotations, keeping the disclosed source
-  byte-for-byte; VERIFIED PixelMart 19 markers, DVWA/WebGoat 0; live recall-inflation
-  re-measure stays OWNER). Suite green: harness 2625 OK (skip 2) / testing 148 OK /
-  evaluation_integrity 42 OK.
-- **Offline loop = LOOP_DONE (2026-09-24):** every loop-consumable item landed
-  (PR-1..PR-11 + PR-13). Remaining work is OWNER/LIVE only: the live halves of
-  PR-10/11/13 and PR-A..PR-E. **Sonnet coder hit its weekly limit (resets
-  2026-09-28)**, so PR-11 and PR-13 were Opus-authored; any further unattended
-  coding loop must wait for that quota or continue Opus-hands-on. Next per the
-  user's standing instruction: full principal re-review against
-  [reviews/PRINCIPAL_REVIEW_PROMPT.md](reviews/PRINCIPAL_REVIEW_PROMPT.md), then
-  translate its findings into a fresh implementation path + backlog batch and
-  restart the loop.
+  commits/details per-item in IMPROVEMENT_BACKLOG.md ("Principal review batch").
+  Landed `c26d769`..`8afa49d`: PR-1 portable audit sink (R05 closed) · PR-2 exact-class
+  label manifest · PR-3 strict scorer + baselines (csrf≠ssrf) · PR-4 evidence grading ·
+  PR-5 eval adapter + rescoring · PR-6 benchmark reconciliation/drift · PR-7 typed stage
+  health + `degraded` (wired) · PR-9 recursive/URL/body redaction (wired) · PR-10 `[~]`
+  policy-bound browser adapter (offline) · PR-11 `[~]` tool-egress seam (offline) ·
+  PR-13 `[~]` corpus contamination sanitizer (offline). Suite green: harness 2625 OK
+  (skip 2) / testing 148 OK / evaluation_integrity 42 OK; `config.yaml` untouched.
+- **Cycle-1 offline loop = LOOP_DONE (2026-09-24):** every loop-consumable item
+  landed (PR-1..PR-11 + PR-13). **Sonnet coder hit its weekly limit (resets
+  2026-09-28)** → PR-11/PR-13 were Opus-authored.
+- **Cycle-2 re-review done (2026-09-24):**
+  [reviews/2026-09-24/principal-review-r2/REVIEW.md](reviews/2026-09-24/principal-review-r2/REVIEW.md)
+  + [VERIFICATION.md](reviews/2026-09-24/principal-review-r2/VERIFICATION.md). Verdict:
+  the batch raised the trust *floor* (suite green, R05 closed; redaction + stage
+  health wired into prod, R08/R09 mitigated) but not the *ceiling*. Key honest
+  findings: **N01** the strict eval toolkit (PR-3/4/5/6) is correct+tested but NO
+  `harness/` runner imports it — not load-bearing; **N02** the egress boundary is a
+  fail-closed seam, not enforcement (`proxy_url=None`, `network=bridge` → container
+  unconfined); **N03** R03 address pinning still open, now explicitly "deliberately
+  not built", and PR-10's per-request browser checks inherit the same address-blind
+  scope. Cycle-2 batch **NC-1..NC-4** (loop) + **NC-O1..NC-O5** (OWNER/LIVE) filed in
+  IMPROVEMENT_BACKLOG.md; spec:
+  [.../principal-review-r2/IMPLEMENTATION_PATH.md](reviews/2026-09-24/principal-review-r2/IMPLEMENTATION_PATH.md).
+  The high-value remaining work (containment/efficacy proofs) is OWNER/LIVE and
+  cannot be looped; NC-1..4 are the only offline remainder.
+  Canonical re-review spec:
+  [reviews/PRINCIPAL_REVIEW_PROMPT.md](reviews/PRINCIPAL_REVIEW_PROMPT.md).
 - Benchmark path: [BP-0 through BP-7](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md).
   Seed exact labels first; BP-1a strict scorer and BP-1b evidence grading are
   separate. BP-2 restores the runner. BP-5C corpus expansion is mandatory before
