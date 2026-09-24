@@ -20,15 +20,123 @@ rest of the harness never hard-depends on it:
     tests inject a fake driver and the validator's whole decision logic is
     exercised with no browser present.
 
-Navigation is GET-only and the caller is responsible for scope-gating the URL;
-this module just drives the browser and reports what executed.
+Navigation is GET-only. That used to be where policy stopped: only the initial
+URL was scope-checked, and the captured identity's Authorization was handed to
+the browser context wholesale (`extra_http_headers`), so it rode along on
+*every* request the page went on to make -- a redirect, a cross-origin
+subresource, a fetch the page's own JS fired -- none of which were re-checked
+(R01). `PlaywrightDriver.visit` now intercepts EVERY request the browser makes
+(navigation, redirects, subresources) through `evaluate_browser_request` below
+and attaches credentials only to requests that land on the exact origin the
+run navigated to. `evaluate_browser_request` and the cancel-signal helper are
+pure stdlib code with no Playwright import, so the policy itself is fully
+unit-tested with Playwright ABSENT; only `PlaywrightDriver.visit` touches the
+real `playwright.async_api` module, and only inside its existing
+try/except-guarded lazy import.
 """
 from __future__ import annotations
+import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
+from urllib.parse import urlsplit
+
+from harness.run_context import ScopePolicy
 
 log = logging.getLogger("harness.browser_driver")
+
+
+# ---------------------------------------------------------------------------
+# Per-request interception policy (PR-10 / R01) -- pure, no Playwright import.
+# ---------------------------------------------------------------------------
+
+# Schemes a browser-driven request may use. Fail closed: ws/wss, blob:,
+# file:, data: (and anything else) are blocked outright, as a navigation or
+# as a subresource.
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+# Playwright's `request.resource_type` values this driver forwards. Everything
+# else -- "websocket", "eventsource", "media", "manifest", "texttrack",
+# Playwright's "other" catch-all (what a download-style response typically
+# surfaces as through routing, since there is no distinct "download"
+# resource_type), and any resource_type this driver has never seen -- is
+# blocked by NOT being in this allow-list. Fail-closed by construction.
+_ALLOWED_RESOURCE_TYPES = frozenset({
+    "document", "script", "xhr", "fetch", "image", "stylesheet", "font",
+})
+
+
+@dataclass(frozen=True)
+class BrowserRequestDecision:
+    """The outcome for one intercepted browser request."""
+    allow: bool
+    attach_credentials: bool
+    reason: str
+
+
+def evaluate_browser_request(*, url: str, method: str, resource_type: str,
+                              is_navigation: bool, run_origin: str,
+                              scope: ScopePolicy) -> "BrowserRequestDecision":
+    """Decide whether one browser-driven request may proceed, and whether the
+    captured identity's credentials (Authorization) may be attached to it.
+
+    Pure and synchronous -- no Playwright, no I/O -- so it is exercised
+    directly by unit tests and reused unchanged by the real interception
+    handler in `PlaywrightDriver.visit`. FAIL CLOSED throughout: an
+    unrecognised scheme, an unrecognised resource_type, or an out-of-scope
+    origin blocks the request; credentials attach only when the request's
+    origin is the exact origin the run navigated to (`run_origin`) -- never
+    forwarded cross-origin, even to another in-scope host.
+    """
+    method_u = (method or "GET").upper()
+    resource_type_l = (resource_type or "").lower()
+    scheme = (urlsplit(url).scheme or "").lower()
+    request_origin = ScopePolicy.origin_of(url)
+    same_origin_as_run = request_origin == ScopePolicy.origin_of(run_origin)
+
+    def blocked(reason: str) -> "BrowserRequestDecision":
+        return BrowserRequestDecision(allow=False, attach_credentials=False, reason=reason)
+
+    if scheme not in _ALLOWED_SCHEMES:
+        return blocked(f"scheme '{scheme or url[:32]}' is not http/https")
+
+    if resource_type_l not in _ALLOWED_RESOURCE_TYPES:
+        return blocked(
+            f"resource_type '{resource_type_l or '(unknown)'}' is not permitted "
+            "(service worker / websocket / download-like / unrecognised types "
+            "are conservatively blocked)")
+
+    if not scope.in_scope(url):
+        return blocked(f"origin '{request_origin}' is not in scope")
+
+    if is_navigation:
+        if method_u != "GET":
+            return blocked(f"navigation method '{method_u}' is not GET")
+    else:
+        if method_u != "GET" and not same_origin_as_run:
+            return blocked(
+                f"non-GET subrequest to '{request_origin}' is not same-origin as "
+                f"run origin '{run_origin}'")
+
+    return BrowserRequestDecision(
+        allow=True,
+        attach_credentials=same_origin_as_run,
+        reason=("in scope, same-origin -- credentials attached" if same_origin_as_run
+                else "in scope, cross-origin -- no credentials attached"))
+
+
+def is_cancelled(cancel) -> bool:
+    """Normalises the two accepted cancel-signal shapes -- an `asyncio.Event`,
+    or a zero-arg callable returning truthy -- into a plain bool. `None` means
+    never cancelled. Stdlib-only, so the cancellation seam the route handler
+    checks on every request is directly unit-testable without a browser."""
+    if cancel is None:
+        return False
+    if isinstance(cancel, asyncio.Event):
+        return cancel.is_set()
+    if callable(cancel):
+        return bool(cancel())
+    return False
 
 
 @dataclass
@@ -129,8 +237,34 @@ class PlaywrightDriver:
         self.cdp_endpoint = cdp_endpoint or None
 
     async def visit(self, url: str, *, wait_ms: int = 1500,
-                    headers: dict | None = None) -> ExecutionObservation:
+                    headers: dict | None = None,
+                    scope: "ScopePolicy | None" = None,
+                    cancel: "asyncio.Event | Callable[[], bool] | None" = None,
+                    ) -> ExecutionObservation:
+        """Navigate to `url` and report what executed.
+
+        `scope` is the run's approved-origin policy (PR-10 / R01): every
+        request the browser makes -- navigation, redirects, subresources,
+        fetch/XHR -- is checked against it via `evaluate_browser_request`
+        through Playwright request interception, and credentials (the
+        captured identity's Authorization, split out by
+        `_extra_headers_and_cookies`) are attached only to requests on the
+        exact origin `url` itself is on. When `scope` is omitted, the visit is
+        conservatively restricted to that same origin -- a caller that does
+        not pass a scope gets "same-origin only", never "everywhere".
+
+        `cancel` (an `asyncio.Event` or a zero-arg callable) lets an in-flight
+        visit be stopped cooperatively: once it reads cancelled, no further
+        request is dispatched (each is aborted at the interception point) and
+        navigation is skipped if it hasn't started yet.
+        """
         obs = ExecutionObservation(url=url)
+        if is_cancelled(cancel):
+            obs.load_error = "cancelled before navigation"
+            return obs
+        run_origin = ScopePolicy.origin_of(url)
+        effective_scope = scope if scope is not None else ScopePolicy(
+            allowed_hosts=frozenset({ScopePolicy.host_of(url)}))
         try:
             from playwright.async_api import async_playwright
         except Exception as e:  # pragma: no cover - guarded by available()
@@ -151,9 +285,51 @@ class PlaywrightDriver:
                 try:
                     # R25: load the page AS the supplied identity (auth headers +
                     # cookies), not anonymously, so authenticated XSS sinks are
-                    # reachable. None -> anonymous, as before.
+                    # reachable. None -> anonymous, as before. R01: credentials
+                    # are NO LONGER handed to the context wholesale via
+                    # extra_http_headers (that projected Authorization onto
+                    # every request the page went on to make, any origin). The
+                    # context starts with none; the route handler below adds
+                    # `_extra` back in per-request, only when
+                    # evaluate_browser_request says the request is on the
+                    # run's own origin.
                     _extra, _cookies = _extra_headers_and_cookies(headers, url)
-                    context = await browser.new_context(extra_http_headers=_extra)
+                    context = await browser.new_context()
+
+                    async def _handle_route(route, request):
+                        if is_cancelled(cancel):
+                            try:
+                                await route.abort()
+                            except Exception:
+                                pass
+                            return
+                        decision = evaluate_browser_request(
+                            url=request.url,
+                            method=request.method,
+                            resource_type=request.resource_type,
+                            is_navigation=request.is_navigation_request(),
+                            run_origin=run_origin,
+                            scope=effective_scope)
+                        if not decision.allow:
+                            log.info("browser_driver: blocked %s %s (%s)",
+                                     request.method, request.url, decision.reason)
+                            try:
+                                await route.abort()
+                            except Exception:
+                                pass
+                            return
+                        try:
+                            if decision.attach_credentials and _extra:
+                                merged_headers = dict(request.headers)
+                                merged_headers.update(_extra)
+                                await route.continue_(headers=merged_headers)
+                            else:
+                                await route.continue_()
+                        except Exception:
+                            pass
+
+                    await context.route("**/*", _handle_route)
+
                     if _cookies:
                         try:
                             await context.add_cookies(_cookies)
@@ -172,8 +348,11 @@ class PlaywrightDriver:
                     page.on("console", lambda msg: obs.console.append(msg.text))
                     page.on("pageerror", lambda err: obs.page_errors.append(str(err)))
 
-                    await page.goto(url, timeout=self.launch_timeout_ms, wait_until="load")
-                    await page.wait_for_timeout(wait_ms)
+                    if is_cancelled(cancel):
+                        obs.load_error = "cancelled before navigation"
+                    else:
+                        await page.goto(url, timeout=self.launch_timeout_ms, wait_until="load")
+                        await page.wait_for_timeout(wait_ms)
                 finally:
                     if context is not None:
                         try:
