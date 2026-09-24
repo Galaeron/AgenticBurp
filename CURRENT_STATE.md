@@ -19,18 +19,12 @@ Durable implementation records remain in [IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BA
 
 Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
 
-- `-m harness.suite smoke`: exit 1; 92 tests, 30 errors.
-- `-m harness.suite full`: exit 1; unittest 2534, 183 errors, 2 skips;
-  native 35 passed / 1 failed / 2 errors; testing 43 / 21 errors;
-  evaluation_integrity 42 OK.
-- `-m unittest harness.test_orchestrator_precondition`: 60 tests, 2 errors.
-- Dominant blocker: audit logger opens `C:\var\log\agentic_burp\audit.log`,
-  denied in this restricted environment. Full failure causes are not all triaged.
-- Diagnostic rerun with explicit workspace audit sink and corrected testing
-  import path: **305 selected checks passed** (48.804s), including local pipeline
-  positive/negative/defect controls. This is not canonical full-suite green.
+- At review time `full`/`smoke` failed (exit 1, 183/30 errors) — dominant blocker
+  was the audit logger opening `C:\var\log\agentic_burp\audit.log` in this
+  restricted environment. **Fixed by PR-1 (`c26d769`)**; the loop batch now runs
+  `full` green (harness 2625 OK skip 2 / testing 148 OK / evaluation_integrity 42 OK).
 - Synthetic probes reproduced coarse scoring errors and prompt/nested-log
-  redaction gaps. Details and scripts are beside the review.
+  redaction gaps (now addressed by PR-3/PR-9). Scripts are beside the review.
 - Ollama version endpoint responded 0.34.3; no fresh model efficacy run.
   Docker access denied; readiness unknown. JDK/Gradle not found in checked
   locations; Java build and real Burp workflow remain unverified.
@@ -61,13 +55,23 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   policy-bound browser adapter (per-request interception; no cross-origin credential
   forwarding — live two-origin proof stays OWNER); **PR-11 offline half `[~]` `d82aab9`**
   tool-egress seam (fail-closed EgressPolicy + force-clean wrapper + receipts; sqlmap
-  container path rerouted — live container-egress proof stays OWNER); suite green,
-  harness 2625 / testing 135). PR-2 surfaced a corpus-contamination hazard
-  (PixelMart TP10 response embeds `testing/test-target/app.py` source with `BUG:`
-  ground-truth comments → detector can cheat) — filed as **PR-13** (offline audit
-  + sanitizer). PR-A..PR-E and the live halves of PR-10/11 stay OWNER/LIVE.
-  Canonical re-review spec:
-  [reviews/PRINCIPAL_REVIEW_PROMPT.md](reviews/PRINCIPAL_REVIEW_PROMPT.md).
+  container path rerouted — live container-egress proof stays OWNER);
+  **PR-13 offline half `[~]` `2d66c5e`** corpus contamination audit + sanitizer
+  (PR-2 surfaced PixelMart TP10 embedding `testing/test-target/app.py` source with
+  19 `BUG:`/`ANSWER_KEY` ground-truth markers → detector can cheat; `corpus_sanitize.py`
+  audits read-only and strips ONLY annotations, keeping the disclosed source
+  byte-for-byte; VERIFIED PixelMart 19 markers, DVWA/WebGoat 0; live recall-inflation
+  re-measure stays OWNER). Suite green: harness 2625 OK (skip 2) / testing 148 OK /
+  evaluation_integrity 42 OK.
+- **Offline loop = LOOP_DONE (2026-09-24):** every loop-consumable item landed
+  (PR-1..PR-11 + PR-13). Remaining work is OWNER/LIVE only: the live halves of
+  PR-10/11/13 and PR-A..PR-E. **Sonnet coder hit its weekly limit (resets
+  2026-09-28)**, so PR-11 and PR-13 were Opus-authored; any further unattended
+  coding loop must wait for that quota or continue Opus-hands-on. Next per the
+  user's standing instruction: full principal re-review against
+  [reviews/PRINCIPAL_REVIEW_PROMPT.md](reviews/PRINCIPAL_REVIEW_PROMPT.md), then
+  translate its findings into a fresh implementation path + backlog batch and
+  restart the loop.
 - Benchmark path: [BP-0 through BP-7](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md).
   Seed exact labels first; BP-1a strict scorer and BP-1b evidence grading are
   separate. BP-2 restores the runner. BP-5C corpus expansion is mandatory before

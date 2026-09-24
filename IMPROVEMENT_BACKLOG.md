@@ -2085,7 +2085,14 @@ green before close.
   that off-scope egress is blocked and killed on cancel.
 - **Impact:** High.
 
-### [ ] PR-13 — Corpus ground-truth contamination audit + sanitized benchmark corpora (new, from PR-2)
+### [~] PR-13 — Corpus ground-truth contamination audit + sanitized benchmark corpora (offline half done `2d66c5e`; OWNER re-measure) (new, from PR-2)
+- **Status (2026-09-24):** offline audit + sanitizer DONE — `2d66c5e` (Opus-authored; Sonnet coder weekly-limited until 2026-09-28).
+  `testing/corpus_sanitize.py` (`marker_hits`/`audit_exchanges`/`audit_corpus_file` read-only detection; `sanitize_text`/`sanitize_exchanges`
+  strip ONLY annotations, keep the disclosed source byte-for-byte, clean body returns the original object). 13 tests
+  (`testing/test_corpus_sanitize.py`), incl. byte-identical negative control + CRLF preservation + skip-guarded real-corpus audit.
+  Audit report `reviews/2026-09-24/CORPUS_CONTAMINATION_AUDIT.md`: **PixelMart TP10 = 19 markers (contaminated); DVWA/WebGoat = 0 (clean)**.
+  Suite: harness 2625 OK (skip 2) / testing 148 OK / evaluation_integrity 42 OK. **OWNER/LIVE half remains `[ ]`:** re-measure detection on
+  sanitized vs contaminated PixelMart with a real model to quantify the recall inflation (needs GPU/Ollama).
 - **Domain:** Evaluation integrity - **Effort:** M - **Depends on:** none - **Mode:** LOOP (audit + sanitize offline); OWNER re-run to re-measure
 - **Evidence (VERIFIED by the PR-2 coder, 2026-09-24):** the permitted PixelMart corpus
   `C:/tmp/pixelmart_exchanges.json` includes a TP10 path-traversal exchange whose captured
