@@ -1895,7 +1895,15 @@ green before close.
   or malformed manifest is rejected. Never read answer-key/blind `app.py`.
 - **Impact:** Transformational (spine of strict scoring).
 
-### [ ] PR-3 — Strict exact-class scorer + indiscriminate baselines (BP-1a)
+### [x] PR-3 — Strict exact-class scorer + indiscriminate baselines (BP-1a)
+- **Result (VERIFIED):** `809dd9c` — `testing/strict_score.py`: `classify_exact()` fixes R06
+  (longest-keyword match; `csrf`≠`ssrf`, sqli≠xss; import-time drift assert vs `EXACT_CLASSES`).
+  Three metric families side by side (any-alert coverage / exact-class P·R / `evidence_supported`
+  = `unavailable` sentinel + hook for PR-4). Baselines as negative controls on a balanced fixture:
+  all-classes prec 0.038 & always-alert prec 0.125 FAIL the precision gate at coverage 1.0; silent
+  FAILS recall. 20 caller-level tests (wrong-class≠TP, csrf≠ssrf, dedup, absent=miss, setup/
+  inconclusive excluded). `score.py` unchanged. smoke 92, testing 78 (58+20), full 2558 OK/2 skip.
+  Opus-reviewed APPROVE (purely additive; R06 fix + baselines independently re-verified).
 - **Domain:** Evaluation / trust - **Effort:** M - **Depends on:** PR-2 - **Mode:** LOOP
 - **Evidence (VERIFIED, R06):** "cross-site request forgery" -> SSRF via `request forgery` substring
   (`score.py:41`); literal `csrf` unmapped; SQLi and XSS share A03; blind corpora count any finding.
