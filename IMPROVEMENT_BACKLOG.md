@@ -2217,7 +2217,14 @@ test + negative control, never read `*ANSWER_KEY*`/blind `app.py`, `full` green)
 - **Acceptance:** mutating a tracked default fails the drift check; unchanged config passes. `full` green.
 - **Impact:** Medium.
 
-### [ ] NC-4 — Per-sink secret-canary tests (R09 residual)
+### [x] NC-4 — Per-sink secret-canary tests (R09 residual)
+- **Result (VERIFIED):** `0f0f107` — canaries across every sink (`harness/test_secret_canary_sinks.py`,
+  7 tests): headers, URL secret param, body + NESTED body field, audit recursive `_sanitize_data`,
+  and report export (individual + chain finding); each asserts the secret CANARY is gone and a
+  non-secret-field injection payload (`q=`/`<script>`) survives verbatim. **Found + fixed a real leak:**
+  `report_generator`'s attack-chains render loop emitted a chain's `evidence`/`suggested_test`
+  UNREDACTED (the R03 render-boundary fix never reached the chains twin) — both now route through the
+  existing `issues.redact`. Suite: harness 2645 OK (skip 2) / testing 163 OK / evaluation_integrity 42 OK.
 - **Domain:** Security / privacy - **Effort:** M - **Depends on:** PR-9 - **Mode:** LOOP
 - **Problem:** PR-9 redaction is wired but only prompt-path coverage is proven; export/provider/
   nested-audit sinks need canary proof.

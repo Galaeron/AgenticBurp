@@ -57,12 +57,18 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   fail-closed seam, not enforcement (`proxy_url=None`, `network=bridge` → container
   unconfined); **N03** R03 address pinning still open, now explicitly "deliberately
   not built", and PR-10's per-request browser checks inherit the same address-blind
-  scope. Cycle-2 batch **NC-1..NC-4** (loop) + **NC-O1..NC-O5** (OWNER/LIVE) filed in
-  IMPROVEMENT_BACKLOG.md; spec:
+  scope. Cycle-2 batch spec:
   [.../principal-review-r2/IMPLEMENTATION_PATH.md](reviews/2026-09-24/principal-review-r2/IMPLEMENTATION_PATH.md).
-  The high-value remaining work (containment/efficacy proofs) is OWNER/LIVE and
-  cannot be looped; NC-1..4 are the only offline remainder.
-  Canonical re-review spec:
+- **Cycle-2 offline loop = LOOP_DONE (2026-09-24):** NC-1..NC-4 all landed (Opus-authored).
+  **NC-1 `[x]` `ed555dd`** strict scorer applied in a runner + baseline gate (closes N01);
+  **NC-2 `[x]` `d505bd6`** browser interception plane locked in (13 guards + anti-bypass source
+  scan; N04 corrected — plane already single-source); **NC-3 `[x]` `b8c573d`** regenerable config
+  safety-defaults drift manifest + snapshot; **NC-4 `[x]` `0f0f107`** per-sink secret canaries —
+  found + fixed a real leak (report chains section emitted evidence/suggested_test unredacted).
+  Suite: harness 2645 OK (skip 2) / testing 163 OK / evaluation_integrity 42 OK; `config.yaml` untouched.
+- **Remaining work is OWNER/LIVE only** (NC-O1..NC-O5, PR-A..PR-E, live halves of PR-10/11/13):
+  tool-egress proof, connect-time address pinning, two-origin browser proof, recall re-measure +
+  independent corpus, Java pairing/build. None loop-consumable. Canonical re-review spec:
   [reviews/PRINCIPAL_REVIEW_PROMPT.md](reviews/PRINCIPAL_REVIEW_PROMPT.md).
 - Benchmark path: [BP-0 through BP-7](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md).
   Seed exact labels first; BP-1a strict scorer and BP-1b evidence grading are
