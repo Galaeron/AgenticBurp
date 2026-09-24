@@ -51,13 +51,10 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   [reviews/2026-09-24/principal-review-r2/REVIEW.md](reviews/2026-09-24/principal-review-r2/REVIEW.md)
   + [VERIFICATION.md](reviews/2026-09-24/principal-review-r2/VERIFICATION.md). Verdict:
   the batch raised the trust *floor* (suite green, R05 closed; redaction + stage
-  health wired into prod, R08/R09 mitigated) but not the *ceiling*. Key honest
-  findings: **N01** the strict eval toolkit (PR-3/4/5/6) is correct+tested but NO
-  `harness/` runner imports it — not load-bearing; **N02** the egress boundary is a
-  fail-closed seam, not enforcement (`proxy_url=None`, `network=bridge` → container
-  unconfined); **N03** R03 address pinning still open, now explicitly "deliberately
-  not built", and PR-10's per-request browser checks inherit the same address-blind
-  scope. Cycle-2 batch spec:
+  health wired into prod) but not the *ceiling*. Key honest findings: **N01** strict
+  eval toolkit built but no runner imported it (now closed by NC-1); **N02** egress
+  is a fail-closed seam, not enforcement (OWNER); **N03** address pinning open (now
+  NC-O2/P1-10 offline half done). Cycle-2 batch spec:
   [.../principal-review-r2/IMPLEMENTATION_PATH.md](reviews/2026-09-24/principal-review-r2/IMPLEMENTATION_PATH.md).
 - **Cycle-2 offline loop = LOOP_DONE (2026-09-24):** NC-1..NC-4 all landed (Opus-authored).
   **NC-1 `[x]` `ed555dd`** strict scorer applied in a runner + baseline gate (closes N01);
