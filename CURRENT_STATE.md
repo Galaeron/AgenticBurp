@@ -45,8 +45,12 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   loop-consumable **PR-1..PR-11** filed in IMPROVEMENT_BACKLOG.md (order
   PR-1→2→3→4→5→6→7→9→10→11). R01/R04/R05/R06/R07/R14 independently re-verified.
   An unattended improve-loop is draining the offline PR batch (**PR-1 `[x]`
-  `c26d769`** — portable audit sink; suite stays 2558 OK / 2 skip); PR-A..PR-E and
-  the live halves of PR-10/11 stay OWNER/LIVE. Canonical re-review spec:
+  `c26d769`** portable audit sink; **PR-2 `[x]` `b8fd09b`** exact-class label
+  manifest/loader; suite green). PR-2 surfaced a corpus-contamination hazard
+  (PixelMart TP10 response embeds `testing/test-target/app.py` source with `BUG:`
+  ground-truth comments → detector can cheat) — filed as **PR-13** (offline audit
+  + sanitizer). PR-A..PR-E and the live halves of PR-10/11 stay OWNER/LIVE.
+  Canonical re-review spec:
   [reviews/PRINCIPAL_REVIEW_PROMPT.md](reviews/PRINCIPAL_REVIEW_PROMPT.md).
 - Benchmark path: [BP-0 through BP-7](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md).
   Seed exact labels first; BP-1a strict scorer and BP-1b evidence grading are

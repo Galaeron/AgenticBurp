@@ -1873,7 +1873,15 @@ green before close.
   green tier in a restricted (non-admin, no `C:\var`) workspace.
 - **Impact:** High (unblocks the entire suite; prerequisite for trustworthy re-runs).
 
-### [ ] PR-2 — Seed exact-class label manifest (BP-0)
+### [x] PR-2 — Seed exact-class label manifest (BP-0)
+- **Result (VERIFIED):** `b8fd09b` — `testing/labels/manifest.py` (typed `LabelRecord`/`Manifest`,
+  `load_manifest`, closed exact-class vocabulary, closed-key label-leak guard, sha256 record-hash
+  integrity) + `testing/labels/pixelmart.labels.json` (22 records: 11 positive/6 negative/4 setup/
+  1 inconclusive). Labels from permitted public sources only (score.py `_LABEL_CATEGORY`, bench.py
+  `KEYWORDS`, corpus public label strings); TP8 left `inconclusive`; provenance per record. 15
+  caller-level tests incl. malformed/label-leaking/tampered-hash negative controls. smoke 92 OK,
+  testing 58 OK, full green. Opus-reviewed APPROVE (new files only; no tracked/config change).
+  Coder surfaced a corpus-contamination hazard → filed as **PR-13** below.
 - **Domain:** Evaluation - **Effort:** S/M - **Depends on:** none - **Mode:** LOOP
 - **Evidence (VERIFIED, R06):** `testing/score.py` has only coarse OWASP-category labels; no
   per-exchange exact-class ground truth exists for most corpora.
@@ -1998,6 +2006,33 @@ green before close.
   configured the run refuses to launch (fails closed). OWNER/LIVE (leave `[ ]`): container proof
   that off-scope egress is blocked and killed on cancel.
 - **Impact:** High.
+
+### [ ] PR-13 — Corpus ground-truth contamination audit + sanitized benchmark corpora (new, from PR-2)
+- **Domain:** Evaluation integrity - **Effort:** M - **Depends on:** none - **Mode:** LOOP (audit + sanitize offline); OWNER re-run to re-measure
+- **Evidence (VERIFIED by the PR-2 coder, 2026-09-24):** the permitted PixelMart corpus
+  `C:/tmp/pixelmart_exchanges.json` includes a TP10 path-traversal exchange whose captured
+  `response_body` contains the ENTIRE source of `testing/test-target/app.py` verbatim — including
+  inline `BUG:` ground-truth comments for every endpoint and a reference to `ANSWER_KEY.md`.
+- **Problem:** when the harness analyses this corpus during a benchmark, the detector model reads
+  TP10's response and thereby sees ground-truth bug annotations for the WHOLE app. That is direct
+  train-on-the-test contamination that can inflate detection/recall on the other exchanges — a
+  concrete instance of the review's R06/R15 contamination concern, distinct from the source
+  disclosure a real attacker would legitimately see.
+- **Recommendation:** (1) offline audit of every benchmark corpus (`C:/tmp/pixelmart_exchanges.json`,
+  `reviews/2026-09-23/benchmark/{dvwa,webgoat}_exchanges.json`, and any others the runner reads) for
+  embedded ground-truth annotations (`BUG:`, `ANSWER_KEY`, source comments) in response bodies;
+  (2) produce SANITIZED corpus variants where a legitimately-disclosed source response has its
+  ground-truth ANNOTATIONS stripped (keep the realistic disclosure, remove the answer key) and record
+  the transform + a hash; (3) the runner/scorer (PR-5/PR-6) must consume the sanitized corpus and flag
+  any corpus that still carries annotations. Do NOT read `*ANSWER_KEY*`/blind `app.py` directly —
+  work only from the permitted corpus files, and treat the embedded annotations as data to remove.
+- **Acceptance:** an audit report enumerating which corpora/exchanges carry annotations; a sanitizer
+  with a caller-level test proving `BUG:`/`ANSWER_KEY` annotations are removed from a synthetic
+  contaminated response while the exploit-relevant content is preserved. NEGATIVE control: a clean
+  response is passed through unchanged (byte-identical). OWNER/LIVE follow-up (leave that half `[ ]`):
+  re-measure detection on sanitized vs contaminated corpora to quantify the inflation.
+- **Impact:** High (any benchmark run on the contaminated corpus overstates recall; blocks trustworthy
+  efficacy numbers until quantified).
 
 ### [ ] PR-A — Secure local Burp<->API token pairing (R04 / RB-1b)  — **Mode: OWNER/LIVE (skip)**
 - Needs JDK/Burp build. Server writes an ephemeral token to `.harness_token.lock`; `HarnessClient.java:63`
