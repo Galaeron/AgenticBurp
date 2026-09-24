@@ -32,11 +32,13 @@ per session, never shared across principals.
 """
 from __future__ import annotations
 
+import ipaddress
+import socket
 import threading
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -301,6 +303,17 @@ class TargetTransport:
 
     def __init__(self, ctx: "RunContext"):
         self.ctx = ctx
+        # P1-10 resolver seam: injectable so a caller-level test can drive
+        # rebinding scenarios without real DNS. Default is a real one-shot resolve.
+        self._resolver = _default_resolver
+
+    def _pin_connect_address(self) -> bool:
+        """P1-10 opt-in (OFF by default): pin each hop to its resolved address."""
+        cfg = getattr(self.ctx, "config", None) or {}
+        try:
+            return bool(cfg.get("security", {}).get("pin_connect_address", False))
+        except Exception:
+            return False
 
     async def send(self, method: str, url: str, *, capability: str,
                    session_ref: str | None = None, headers: dict | None = None,
@@ -442,6 +455,25 @@ class TargetTransport:
             if not ctx.budget.reserve(1):
                 return ExecutionOutcome(outcome="budget_exhausted", final_url=url,
                                         artifact=self._artifact(url, "budget_exhausted", session_ref, case_ref=case_ref))
+            # 3b. P1-10 (opt-in, OFF by default): resolve this hop's host ONCE and
+            #     pin the connection to that address, so a later/alternate resolution
+            #     cannot redirect the connect. Scope/gate/budget above ran on the
+            #     hostname URL, and credential-forwarding below still keys on the
+            #     hostname origin -- only the CONNECT target is pinned. Applied per
+            #     hop, so redirects re-resolve and re-pin.
+            pinned = None
+            if self._pin_connect_address():
+                _host = ScopePolicy.host_of(url)
+                if _host and not _is_ip_literal(_host):
+                    try:
+                        _ip = self._resolver(_host)
+                    except Exception as e:
+                        return ExecutionOutcome(
+                            outcome="error", final_url=url,
+                            error=f"address resolution failed for {_host}: {e}",
+                            artifact=self._artifact(url, f"error:resolve:{type(e).__name__}",
+                                                    session_ref, case_ref=case_ref))
+                    pinned = _pin_connect_url(url, _ip)
             # 4. Credential-forwarding rule: attach the session's auth headers ONLY
             #    when this hop is the session's own origin. Cross-origin -> no creds.
             credential_destination = bool(
@@ -454,9 +486,20 @@ class TargetTransport:
                     send_headers.setdefault(k, v)
             client = (session.client(ctx.timeout)
                       if session and credential_destination else ctx.default_client())
+            send_url = url
+            request_kwargs: dict = {"headers": send_headers or None,
+                                    "content": body if isinstance(body, str) else None}
+            if pinned is not None:
+                send_url, _host_header, _extensions = pinned
+                send_headers["Host"] = _host_header
+                request_kwargs["headers"] = send_headers or None
+                # Only pass `extensions` when pinning produced one (https SNI): the
+                # default/off path keeps the exact original call signature, so a
+                # caller's mock client that doesn't accept `extensions` is unaffected.
+                if _extensions:
+                    request_kwargs["extensions"] = _extensions
             try:
-                resp = await client.request(method, url, headers=send_headers or None,
-                                            content=body if isinstance(body, str) else None)
+                resp = await client.request(method, send_url, **request_kwargs)
             except Exception as e:  # transport error -> honest error artifact, never a crash
                 return ExecutionOutcome(outcome="error", final_url=url, error=str(e),
                                         artifact=self._artifact(url, f"error:{type(e).__name__}", session_ref, case_ref=case_ref))
@@ -481,6 +524,55 @@ class TargetTransport:
 # Back-compat alias: TargetTransport was named Executor through Astra T03-T08. The
 # 37 `.executor()` call sites and the existing `Executor(...)` references keep working.
 Executor = TargetTransport
+
+
+# ---------------------------------------------------------------------------
+# P1-10: connect-time address pinning (DNS-rebinding enforcement), OFF by default.
+#
+# ScopePolicy authorizes HOSTNAMES, not resolved addresses (see its docstring):
+# an already-allowed name whose resolution changes between the scope check and the
+# connect is not blocked at the address level. When the opt-in
+# `security.pin_connect_address` is set (via config.local.yaml -- never a committed
+# default), TargetTransport.execute resolves each hop's host ONCE, then directs the
+# connection to that pinned address while preserving the Host header and TLS SNI, so
+# a later/alternate resolution can never redirect the connection. Applied on every
+# hop, including redirects. Ships OFF; a live two-origin/DNS-rebinding proof over
+# real HTTPS is the OWNER validation.
+# ---------------------------------------------------------------------------
+
+def _default_resolver(host: str) -> str:
+    """Resolve `host` to a single IP once. Prefers IPv4; raises on failure so the
+    caller records an honest error artifact rather than sending unpinned."""
+    infos = socket.getaddrinfo(host, None)
+    for family in (socket.AF_INET, socket.AF_INET6):
+        for info in infos:
+            if info[0] == family:
+                return info[4][0]
+    return infos[0][4][0]
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _pin_connect_url(url: str, ip: str) -> tuple[str, str, dict]:
+    """Rewrite `url` to connect to `ip` while preserving the original Host header and
+    TLS SNI. Returns (connect_url, host_header, extensions)."""
+    p = urlsplit(url)
+    host = p.hostname or ""
+    scheme = (p.scheme or "http").lower()
+    port = p.port
+    default_port = 443 if scheme == "https" else 80
+    host_header = host if (port in (None, default_port)) else f"{host}:{port}"
+    ip_host = f"[{ip}]" if ":" in ip else ip
+    netloc = ip_host if port is None else f"{ip_host}:{port}"
+    connect_url = urlunsplit((scheme, netloc, p.path or "", p.query or "", p.fragment or ""))
+    extensions = {"sni_hostname": host} if scheme == "https" else {}
+    return connect_url, host_header, extensions
 
 
 def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
