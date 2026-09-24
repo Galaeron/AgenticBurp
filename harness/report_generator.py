@@ -471,14 +471,20 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                      "don't automatically compose. Each requires an explicit, deliberate test to confirm "
                      "the chain actually works before it's submitted as one finding rather than two._")
         lines.append("")
+        from harness import issues
         for f in chains:
             lines.append(f"### {f.vulnerability_class.replace('potential-attack-chain:', '').replace('+', ' → ')}")
             lines.append("")
             lines.append(f"**Severity if confirmed:** {_SEVERITY_BADGE.get(f.severity, f.severity)}")
             lines.append("")
-            lines.append(f.evidence)
+            # R03/NC-4: this chains render path shared _render_finding's leak --
+            # a captured ?token=/Authorization-shaped value interpolated into a
+            # chain's evidence/suggested_test reached the report unredacted here,
+            # even though _render_finding already masks the same fields. Redact at
+            # this boundary with the same issues.redact so export parity holds.
+            lines.append(issues.redact(f.evidence))
             lines.append("")
-            lines.append(f"**Suggested verification:** {f.suggested_test}")
+            lines.append(f"**Suggested verification:** {issues.redact(f.suggested_test)}")
             lines.append("")
 
     if leads_bucket:
