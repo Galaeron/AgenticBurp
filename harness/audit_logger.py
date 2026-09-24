@@ -171,15 +171,40 @@ class AuditEvent:
         return hashlib.sha256(event_json.encode('utf-8')).hexdigest()
 
 
+class AuditStorageUnavailable(RuntimeError):
+    """Raised when `require_file=True` and the audit file sink cannot be opened.
+
+    By default (require_file=False) the same condition degrades to a warning
+    instead of raising — see AuditLogger._disable_file_logging.
+    """
+
+
+def _default_audit_log_path(name: str) -> str:
+    """Platform-appropriate, per-user default audit log path.
+
+    Dependency-free (no platformdirs). Never defaults under `/var/log` or an
+    equivalent admin-owned location, so construction does not require
+    elevated privileges. `log_file` (constructor arg) or the `log_file`
+    setter still override this default; only the default itself changes.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_STATE_HOME") or os.environ.get("XDG_DATA_HOME")
+        if not base:
+            base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, name, "audit.log")
+
+
 class AuditLogger:
     """
     Audit logger for security-relevant events.
-    
+
     This class provides a centralized interface for logging audit events.
     It supports multiple backends (file, syslog, external service) and
     ensures that logs are tamper-evident.
     """
-    
+
     def __init__(
         self,
         name: str = "agentic_burp",
@@ -189,60 +214,89 @@ class AuditLogger:
         enable_file: bool = True,
         max_file_size: int = 10 * 1024 * 1024,  # 10MB
         max_backups: int = 5,
+        require_file: bool = False,
     ):
         self.name = name
-        self.log_file = log_file or f"/var/log/{name}/audit.log"
+        self.log_file = log_file or _default_audit_log_path(name)
         self.log_level = getattr(logging, log_level.upper(), logging.INFO)
         self.enable_console = enable_console
         self.enable_file = enable_file
         self.max_file_size = max_file_size
         self.max_backups = max_backups
-        
+        # Policy for "required audit storage unavailable": default is
+        # degrade-with-warning (construction must never block on unwritable
+        # audit storage); require_file=True opts into failing loudly instead.
+        self.require_file = require_file
+
         # Create log directory if it doesn't exist
         log_dir = os.path.dirname(self.log_file)
         if log_dir and self.enable_file:
             try:
                 os.makedirs(log_dir, exist_ok=True)
             except (OSError, PermissionError) as e:
-                logging.getLogger("harness.audit_logger").warning(f"Could not create log directory {log_dir}: {e}")
-                self.enable_file = False
-        
+                self._disable_file_logging(f"could not create log directory {log_dir}", e)
+
         # Initialize Python logger
         self._logger = logging.getLogger(f"{name}.audit")
         self._logger.setLevel(self.log_level)
-        
+
         # Remove existing handlers
         for handler in self._logger.handlers[:]:
             self._logger.removeHandler(handler)
-        
+
         # Add console handler
         if self.enable_console:
             console_handler = logging.StreamHandler()
             console_handler.setLevel(self.log_level)
             console_handler.setFormatter(logging.Formatter('%(message)s'))
             self._logger.addHandler(console_handler)
-        
-        # Add file handler
+
+        # Add file handler. Opening the file itself (not just creating its
+        # parent directory) can also fail — e.g. an existing-but-unwritable
+        # file, or a path whose parent segment is itself a file — so guard
+        # the open too. Construction of AuditLogger (and therefore anything
+        # that builds one, like OllamaClient/the pipeline) must not raise
+        # just because audit storage happens to be unwritable.
         if self.enable_file:
-            file_handler = logging.handlers.RotatingFileHandler(
-                self.log_file,
-                maxBytes=self.max_file_size,
-                backupCount=self.max_backups,
-            )
-            file_handler.setLevel(self.log_level)
-            file_handler.setFormatter(logging.Formatter('%(message)s'))
-            self._logger.addHandler(file_handler)
-        
+            try:
+                file_handler = logging.handlers.RotatingFileHandler(
+                    self.log_file,
+                    maxBytes=self.max_file_size,
+                    backupCount=self.max_backups,
+                )
+            except (OSError, PermissionError) as e:
+                self._disable_file_logging(f"could not open log file {self.log_file}", e)
+            else:
+                file_handler.setLevel(self.log_level)
+                file_handler.setFormatter(logging.Formatter('%(message)s'))
+                self._logger.addHandler(file_handler)
+
         # Track the last event hash for chaining
         self._last_hash: Optional[str] = None
         self._lock = Lock()
-        
+
         # Track statistics
         self._stats = {
             'total_events': 0,
             'events_by_type': {},
             'events_by_level': {},
         }
+
+    def _disable_file_logging(self, message: str, error: Exception) -> None:
+        """Apply the require_file policy when audit file storage fails.
+
+        Default (require_file=False): emit one explicit warning and continue
+        with enable_file=False — construction must not raise. When
+        require_file=True, raise AuditStorageUnavailable instead, for a
+        caller that has opted into failing loudly on unavailable audit
+        storage.
+        """
+        if self.require_file:
+            raise AuditStorageUnavailable(f"{message}: {error}") from error
+        logging.getLogger("harness.audit_logger").warning(
+            f"Audit file logging disabled: {message}: {error}"
+        )
+        self.enable_file = False
     
     def _sanitize_data(self, data: dict) -> dict:
         """Sanitize sensitive data from the event."""
