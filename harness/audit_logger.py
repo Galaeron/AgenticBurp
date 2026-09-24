@@ -298,23 +298,42 @@ class AuditLogger:
         )
         self.enable_file = False
     
+    # List of keys that should be redacted (exact match or substring).
+    # Module-level-equivalent constant kept as a class attribute so
+    # _sanitize_data and _sanitize_value (its recursive helper) share the
+    # exact same list at every depth.
+    _REDACTED_KEY_PATTERNS = [
+        'password', 'secret', 'api_key', 'auth_token', 'access_token',
+        'refresh_token', 'cookie', 'authorization', 'bearer',
+    ]
+
+    def _sanitize_value(self, value: Any) -> Any:
+        """Recursively apply the same key/value redaction _sanitize_data
+        applies at the top level, to nested dicts AND lists at every
+        depth. PR-9 / R09: a top-level-only sanitizer let a nested
+        credential (e.g. {"creds": {"password": "x"}}) survive into a
+        persisted audit event -- this closes that gap. Audit logs are not
+        model input (no detection-recall concern here), so this stays
+        thorough rather than narrow."""
+        if isinstance(value, dict):
+            return self._sanitize_data(value)
+        if isinstance(value, list):
+            return [self._sanitize_value(item) for item in value]
+        return value
+
     def _sanitize_data(self, data: dict) -> dict:
-        """Sanitize sensitive data from the event."""
+        """Sanitize sensitive data from the event, recursing into nested
+        dicts and lists (see _sanitize_value) so a secret buried at any
+        depth is redacted, not only ones at the top level."""
         sanitized = {}
-        
-        # List of keys that should be redacted (exact match or substring)
-        redacted_key_patterns = [
-            'password', 'secret', 'api_key', 'auth_token', 'access_token', 
-            'refresh_token', 'cookie', 'authorization', 'bearer',
-        ]
-        
+
         for key, value in data.items():
             # Check if key contains sensitive information
             # Be careful: 'token' appears in 'prompt_tokens', 'completion_tokens'
             # So we need exact matches for those
             key_lower = key.lower()
             should_redact = False
-            
+
             # Check for exact matches first
             if key_lower in ['token', 'tokens']:
                 # Only redact if it's not prompt_tokens or completion_tokens
@@ -322,11 +341,11 @@ class AuditLogger:
                     should_redact = True
             else:
                 # Check for substrings
-                for pattern in redacted_key_patterns:
+                for pattern in self._REDACTED_KEY_PATTERNS:
                     if pattern in key_lower:
                         should_redact = True
                         break
-            
+
             if should_redact:
                 sanitized[key] = "[REDACTED]"
             # Check if value is a string that might contain sensitive info
@@ -335,9 +354,11 @@ class AuditLogger:
                     sanitized[key] = "[REDACTED]"
                 else:
                     sanitized[key] = value
+            elif isinstance(value, (dict, list)):
+                sanitized[key] = self._sanitize_value(value)
             else:
                 sanitized[key] = value
-        
+
         return sanitized
     
     def _log_event(self, event: AuditEvent) -> None:

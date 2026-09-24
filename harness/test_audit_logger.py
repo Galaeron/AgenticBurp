@@ -309,7 +309,77 @@ class TestAuditLogger(unittest.TestCase):
             self.assertNotIn("abc123", content)
             self.assertNotIn("token123", content)
             self.assertIn("[REDACTED]", content)
-    
+
+    def test_nested_dict_secret_redacted_R09(self):
+        """PR-9 / R09: _sanitize_data only sanitized TOP-LEVEL keys, so a
+        credential nested inside another dict (e.g. {"creds": {"password":
+        "x"}}) survived into the persisted audit event. It must now be
+        redacted at any depth."""
+        self.logger.log(
+            event_type=AuditEventType.API_REQUEST,
+            data={
+                'endpoint': '/login',
+                'creds': {'api_key': 'CANARY-AUDIT-NESTED-9f3a1b'},
+            },
+        )
+
+        with open(self.log_file, 'r') as f:
+            content = f.read()
+            self.assertNotIn("CANARY-AUDIT-NESTED-9f3a1b", content)
+            self.assertIn('"api_key": "[REDACTED]"', content)
+            # non-secret sibling data at every depth is preserved
+            self.assertIn("/login", content)
+            self.assertIn('"creds"', content)
+
+    def test_nested_list_of_dicts_secret_redacted_R09(self):
+        """Recursion must also apply to dicts nested inside a LIST, not
+        only inside another dict."""
+        self.logger.log(
+            event_type=AuditEventType.API_REQUEST,
+            data={
+                'requests': [
+                    {'url': 'https://a.test/x', 'password': 'CANARY-AUDIT-LIST-77aa'},
+                    {'url': 'https://a.test/y', 'note': 'benign'},
+                ],
+            },
+        )
+
+        with open(self.log_file, 'r') as f:
+            content = f.read()
+            self.assertNotIn("CANARY-AUDIT-LIST-77aa", content)
+            self.assertIn("https://a.test/x", content)
+            self.assertIn("https://a.test/y", content)
+            self.assertIn("benign", content)
+
+    def test_deeply_nested_secret_redacted_R09(self):
+        """Multiple levels of nesting (dict-in-dict-in-dict) are all
+        covered, not just one level down."""
+        self.logger.log(
+            event_type=AuditEventType.API_REQUEST,
+            data={'a': {'b': {'c': {'token': 'CANARY-AUDIT-DEEP-42'}}}},
+        )
+        with open(self.log_file, 'r') as f:
+            content = f.read()
+            self.assertNotIn("CANARY-AUDIT-DEEP-42", content)
+
+    def test_non_secret_nested_field_and_key_name_preserved_R09(self):
+        """Structure-preservation negative control: a task-relevant
+        non-secret nested field is preserved verbatim, and the secret
+        field's NAME stays visible in the sanitized output -- redaction
+        replaces only the value, never the whole record."""
+        self.logger.log(
+            event_type=AuditEventType.API_REQUEST,
+            data={
+                'user': {'username': 'alice_doe', 'product_id': 4471, 'password': 'CANARY-AUDIT-STRUCT'},
+            },
+        )
+        with open(self.log_file, 'r') as f:
+            content = f.read()
+            self.assertIn("alice_doe", content)
+            self.assertIn("4471", content)
+            self.assertIn('"password": "[REDACTED]"', content)
+            self.assertNotIn("CANARY-AUDIT-STRUCT", content)
+
     def test_stats_tracking(self):
         """Statistics should be tracked."""
         self.logger.log(
