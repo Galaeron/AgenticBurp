@@ -2010,7 +2010,16 @@ green before close.
   false-degraded). Report/response never reads clean when a stage failed.
 - **Impact:** High.
 
-### [ ] PR-9 — Schema-aware recursive redaction across sinks (R09)
+### [x] PR-9 — Schema-aware recursive redaction across sinks (R09)
+- **Result (VERIFIED):** `07d1e13` — `audit_logger._sanitize_data` now recurses into nested dicts/lists
+  (top-level byte-identical); `security.py` adds `SECRET_FIELD_NAMES` + `redact_secrets_in_url`/
+  `redact_secrets_in_body` (EXACT normalized name match, values-only, no query re-encode, input
+  returned unchanged when nothing secret); `base_agent._user_prompt` routes url/request_body/
+  response_body through them (header path untouched). 18 additive tests incl. canary absence across
+  header/URL/JSON/nested + audit event, mandatory detection-preservation control (SQLi/XSS payloads
+  survive verbatim beside a scrubbed secret), structure-preservation control. smoke 92, harness 2581
+  OK/2 skip, testing 135, full green. Opus-reviewed APPROVE (no existing assertion changed —
+  verified; header semantics intact; re-ran focused 63 OK).
 - **Domain:** Security / privacy - **Effort:** L - **Depends on:** none - **Mode:** LOOP
 - **Evidence (VERIFIED synthetic, R09):** header bearer is redacted, but a JSON password, a query
   token and a nested password dict survive into agent prompts / audit events

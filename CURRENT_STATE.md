@@ -55,7 +55,9 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   reconciliation + config-drift manifest + dated corrected assessment (originals
   preserved; strict recall refused where no manifest); **PR-7 `[x]` `a33a1ab`**
   typed stage health (`StageOutcome` + `degraded`; a failed critique can no longer
-  read as clean; findings never dropped); suite green, harness 2563 / testing 135).
+  read as clean; findings never dropped); **PR-9 `[x]` `07d1e13`** schema-aware
+  recursive secret redaction (nested audit dicts; URL/body secret-name redaction
+  that preserves injection payloads verbatim); suite green, harness 2581 / testing 135).
   PR-2 surfaced a corpus-contamination hazard
   (PixelMart TP10 response embeds `testing/test-target/app.py` source with `BUG:`
   ground-truth comments → detector can cheat) — filed as **PR-13** (offline audit
