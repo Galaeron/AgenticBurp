@@ -119,6 +119,61 @@ class LedgerEvent:
         return d
 
 
+def _nonempty(s) -> bool:
+    return bool((s or "").strip()) if isinstance(s, str) else bool(s)
+
+
+def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]") -> dict:
+    """Honest reproducibility assessment for a finding (P0-6 / R10).
+
+    `complete` (elsewhere) only says a verdict was reached. That is NOT the same
+    as a tester being able to reproduce the finding: a `response_ref` like
+    ``HTTP 200`` (or an empty one when no status was captured), or a verdict with
+    no execution at all, is not a reproducible request/response. This reports what
+    reproduction evidence is actually present and, honestly, what is missing --
+    computed only from the events on hand, so a durable record whose EXECUTION
+    event failed to persist reconstructs as NOT resolvable (never a silent
+    ``complete`` durable record for un-persisted evidence).
+    """
+    executions = by_type.get(EventType.EXECUTION, [])
+    observations = by_type.get(EventType.OBSERVATION, []) + by_type.get(EventType.HYPOTHESIS, [])
+
+    has_conclusion = bool(by_type.get(EventType.VALIDATION_DECISION)
+                          or by_type.get(EventType.FINDING_REVISION))
+    has_execution = bool(executions)
+    has_request = any(_nonempty(e.data.get("request")) for e in executions)
+    has_response = any(_nonempty(e.data.get("response")) for e in executions)
+    has_captured_observation = any(_nonempty(e.summary) for e in observations)
+
+    missing: list[str] = []
+    if not has_conclusion:
+        missing.append("no verdict (validation decision / finding revision) recorded")
+    if has_execution:
+        if not has_request:
+            missing.append("execution recorded but the request reference is empty")
+        if not has_response:
+            missing.append("execution recorded but the response capture is empty")
+        # An independently re-runnable step needs both a request AND a response.
+        resolvable = has_request and has_response
+    else:
+        if not has_captured_observation:
+            missing.append("no execution and no captured observation to reproduce from")
+        # No active send was recorded: nothing independently re-runnable exists in
+        # the ledger (a passive finding's evidence is the original captured
+        # exchange, re-read, not a step this ledger can replay).
+        resolvable = False
+
+    return {
+        "resolvable": resolvable,
+        "has_conclusion": has_conclusion,
+        "has_execution": has_execution,
+        "has_request": has_request,
+        "has_response": has_response,
+        "has_captured_observation": has_captured_observation,
+        "missing": missing,
+    }
+
+
 class AppendOnlyViolation(Exception):
     """Raised on any attempt to re-append or otherwise mutate a ledger event."""
 
@@ -191,8 +246,12 @@ class EvidenceLedger:
             "what_was_never_tested": [e.data["not_tested"] for e in evs if e.data.get("not_tested")],
             "event_count": len(evs),
             "provenance": evs[0].provenance.to_dict() if evs else {},
+            # `complete` = a verdict (confirmed/refuted/revised) was reached. This is
+            # the "was it concluded?" axis and is deliberately SEPARATE from whether
+            # a tester can independently reproduce it -- see `completeness` (P0-6/R10).
             "complete": bool(by_type.get(EventType.VALIDATION_DECISION)
                              or by_type.get(EventType.FINDING_REVISION)),
+            "completeness": _assess_completeness(by_type),
         }
 
     def reproduction_recipe(self, finding_ref: str) -> dict:

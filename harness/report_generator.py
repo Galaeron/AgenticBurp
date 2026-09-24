@@ -601,8 +601,16 @@ def _render_finding(f: ReportFinding) -> list[str]:
             from harness import evidence_ledger
             recon = evidence_ledger.reconstruct_persisted(f.finding_id)
             if recon.get("event_count"):
-                completeness = "complete" if recon.get("complete") else "partial"
-                lines.append(f"_Evidence chain: `{f.finding_id}` ({completeness}, "
+                verdict = "complete" if recon.get("complete") else "partial"
+                # P0-6/R10: state reproducibility honestly -- a recorded verdict is
+                # not the same as an independently re-runnable request/response.
+                comp = recon.get("completeness") or {}
+                if comp.get("resolvable"):
+                    repro = "independently reproducible"
+                else:
+                    miss = "; ".join(comp.get("missing") or []) or "no re-runnable request/response recorded"
+                    repro = f"NOT independently reproducible ({miss})"
+                lines.append(f"_Evidence chain: `{f.finding_id}` ({verdict} verdict; {repro}; "
                               f"{recon['event_count']} recorded event(s)) -- reconstructable via "
                               f"the findings API without re-reading server logs._")
         except Exception:
