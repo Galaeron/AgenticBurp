@@ -1917,7 +1917,15 @@ green before close.
   silent baseline MUST fail recall.
 - **Impact:** Transformational.
 
-### [ ] PR-4 — Evidence-supported grading tier (BP-1b)
+### [x] PR-4 — Evidence-supported grading tier (BP-1b)
+- **Result (VERIFIED):** `112a884` — `testing/evidence_grade.py` grades findings via
+  `evaluation_integrity.audit_findings` (single call site) into differential_reproduced / captured /
+  insufficient / unsupported, fed through PR-3's `evidence_grade_hook` (zero diff to strict_score.py).
+  Evidence-supported TP requires BOTH exact-class-correct AND captured/differential. `unavailable`
+  (hook=None) only when proofs+cases+artifacts all empty — distinct from a computed genuine 0. 17
+  caller-level tests incl. bare-confirmed/wrong-case≠TP, adequate-proof→captured-TP, class-wrong-
+  but-proven≠TP, unavailable-vs-zero negative control. smoke 92, testing 95 (78+17), full 2558 OK/2
+  skip. Opus-reviewed APPROVE (purely additive; single evidence reader; re-verified focused 17 OK).
 - **Domain:** Evaluation / trust - **Effort:** M - **Depends on:** PR-3 - **Mode:** LOOP
 - **Evidence (VERIFIED, R06):** `ablation_harness.run_variant_async` leaves `confirmed_tp/
   confirmed_fp` at default 0; `evaluation_integrity/evidence_audit.py` already grades proof claims.

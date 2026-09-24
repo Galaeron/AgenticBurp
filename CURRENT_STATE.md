@@ -48,7 +48,9 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   `c26d769`** portable audit sink; **PR-2 `[x]` `b8fd09b`** exact-class label
   manifest/loader; **PR-3 `[x]` `809dd9c`** strict exact-class scorer + baselines
   (fixes R06 csrf≠ssrf/sqli≠xss; indiscriminate baselines fail the precision gate);
-  suite green). PR-2 surfaced a corpus-contamination hazard
+  **PR-4 `[x]` `112a884`** evidence-supported grading tier (supported TP needs
+  exact-class AND resolvable proof; `unavailable`≠0); suite green). PR-2 surfaced a
+  corpus-contamination hazard
   (PixelMart TP10 response embeds `testing/test-target/app.py` source with `BUG:`
   ground-truth comments → detector can cheat) — filed as **PR-13** (offline audit
   + sanitizer). PR-A..PR-E and the live halves of PR-10/11 stay OWNER/LIVE.
