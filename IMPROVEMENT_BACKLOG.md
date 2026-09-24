@@ -2058,8 +2058,20 @@ green before close.
   expected headers. OWNER/LIVE (leave `[ ]`): two-origin real-browser proof of zero off-scope traffic.
 - **Impact:** High.
 
-### [ ] PR-11 — External-tool egress boundary (offline half) (R02)
-- **Domain:** Security / reliability - **Effort:** L - **Depends on:** transport/capability contract - **Mode:** LOOP (offline half); OWNER/LIVE (container egress verification)
+### [~] PR-11 — External-tool egress boundary (offline half done; live half OWNER) (R02)
+- **Result (VERIFIED, offline half):** `d82aab9` — `tool_runner.EgressPolicy` (network/proxy/
+  allowed_hosts → docker flags before the image) + `EgressPolicyRequired`/`ToolRunCancelled` +
+  `_is_cancelled`; `docker_cmd` additive `egress` param; `run()` gains egress/enforce_egress/cancel/
+  receipt — **fails closed** without a policy when enforced, aborts on cancel, records a receipt, and
+  force-removes the container in `finally` on any non-clean exit. sqlmap's container branch now routes
+  through `tool_runner.run` with an enforced per-run policy (host path + except handlers unchanged);
+  ffuf caller unaffected. 14 tests (docker mocked): argv seam, fail-closed negative control, receipt,
+  cleanup-in-finally on timeout/exception, no-cleanup on clean exit, cancel-before-launch, sqlmap
+  routing integration. smoke 92, harness 2625 OK/2 skip, testing 135, full green. Implemented by Opus
+  (Sonnet weekly-limited) + self-reviewed; additive to existing callers.
+- **OWNER/LIVE half still `[ ]`:** real container run proving redirected/off-scope egress is blocked
+  and killed on cancel (needs Docker + a proxy/network sandbox config). Leave for owner.
+- **Domain:** Security / reliability - **Effort:** L - **Depends on:** transport/capability contract - **Mode:** LOOP (offline half done); OWNER/LIVE (container egress verification)
 - **Evidence (VERIFIED, R02):** `sqlmap.py` launches argv after an initial check without routing
   requests through `TargetTransport`; the direct path uses `docker_cmd` not the cleanup wrapper.
 - **Problem:** tool-generated redirects/probes can exceed request/credential/destination assumptions;

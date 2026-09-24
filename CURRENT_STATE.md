@@ -59,8 +59,10 @@ Repository root, `.venv-rationalisation/Scripts/python.exe`, Python 3.12.14:
   recursive secret redaction (nested audit dicts; URL/body secret-name redaction
   that preserves injection payloads verbatim); **PR-10 offline half `[~]` `4913488`**
   policy-bound browser adapter (per-request interception; no cross-origin credential
-  forwarding — live two-origin proof stays OWNER); suite green, harness 2611 / testing 135).
-  PR-2 surfaced a corpus-contamination hazard
+  forwarding — live two-origin proof stays OWNER); **PR-11 offline half `[~]` `d82aab9`**
+  tool-egress seam (fail-closed EgressPolicy + force-clean wrapper + receipts; sqlmap
+  container path rerouted — live container-egress proof stays OWNER); suite green,
+  harness 2625 / testing 135). PR-2 surfaced a corpus-contamination hazard
   (PixelMart TP10 response embeds `testing/test-target/app.py` source with `BUG:`
   ground-truth comments → detector can cheat) — filed as **PR-13** (offline audit
   + sanitizer). PR-A..PR-E and the live halves of PR-10/11 stay OWNER/LIVE.
