@@ -2202,7 +2202,14 @@ test + negative control, never read `*ANSWER_KEY*`/blind `app.py`, `full` green)
   in-scope request through the intercepting path still succeeds. `full` green.
 - **Impact:** High.
 
-### [ ] NC-3 — Regenerable config/profile drift manifest (R14 residual)
+### [x] NC-3 — Regenerable config/profile drift manifest (R14 residual)
+- **Result (VERIFIED):** `b8c573d` — `testing/config_manifest.py` extracts 12 safety/profile toggles
+  from `config.yaml` into a normalized manifest + sha256; committed snapshot
+  `testing/config_safety_manifest.snapshot.json`; `main --check` exits 2 on drift, `--write` regenerates
+  deliberately. `REQUIRED_SAFE_VALUES` asserts the safe shipped values (active_enabled/allow_mutating_replay/
+  cloud_primary/cloud_reasoning/quarantine = false) **independently of the snapshot**, so a flip can't be
+  laundered by regenerating it. 7 tests incl. the flip-detection negative control. Suite: harness 2638 OK
+  (skip 2) / testing 163 OK / evaluation_integrity 42 OK.
 - **Domain:** Reproducibility - **Effort:** S - **Depends on:** PR-6 - **Mode:** LOOP
 - **Problem:** PR-6's reconciliation is a one-off artifact; drift can silently recur.
 - **Recommendation:** a generator that emits the config/profile/egress manifest from `config.yaml`
