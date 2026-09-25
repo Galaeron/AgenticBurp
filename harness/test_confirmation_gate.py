@@ -12,11 +12,23 @@ def _finding(vc, severity="high", confidence=0.85, confirmed=False):
                    basis="derived", confirmed=confirmed)
 
 
-def _neg(finding_class, validator="v"):
+def _neg(finding_class, validator="v", parameter=""):
     """A ValidationReport representing a REAL controlled negative: a leg ran and
-    returned not_confirmed. This is what earns a REFUTED verdict (R08)."""
+    returned not_confirmed. This is what earns a REFUTED verdict (R08).
+    FR-5 (F09): `parameter` binds the negative to a specific case; the default
+    ("") is a class-level negative, preserved for backward compatibility."""
     return ValidationReport(validator=validator, status="not_confirmed",
-                            finding_class=finding_class, confirmed=False)
+                            finding_class=finding_class, confirmed=False,
+                            parameter=parameter)
+
+
+def _finding_param(vc, parameter_name, severity="high", confidence=0.85, confirmed=False):
+    """Like `_finding`, but with an explicit parameter_name -- FR-5 (F09) case
+    binding is keyed on this field."""
+    return Finding(vulnerability_class=vc, confidence=confidence, severity=severity,
+                   summary=f"{vc} on /x param={parameter_name}", evidence="e",
+                   suggested_test="t", basis="derived", confirmed=confirmed,
+                   parameter_name=parameter_name)
 
 
 def _apply(finding, **kw):
@@ -225,6 +237,66 @@ class TestLegAwareThreeState(unittest.TestCase):
         f = _apply(_finding("reflected xss", severity="high", confirmed=True))
         self.assertEqual(f.severity, "high")
         self.assertIsNone(f.review_verdict)
+
+
+class CaseBoundNegativeEvidenceTests(unittest.TestCase):
+    """FR-5 (F09): a controlled negative must refute only the SAME CASE
+    (class + parameter) it actually tested, not every same-class finding.
+    Before this fix, `_controlled_negative_classes` keyed purely on
+    canonicalize(finding_class), so one parameter's controlled negative
+    demoted ALL same-class unconfirmed findings -- including a different,
+    never-tested parameter -- to "likely false positive"."""
+
+    def test_negative_on_parameter_A_does_not_refute_parameter_B(self):
+        """Caller test (the F09 fix): two unconfirmed sqli findings on the same
+        exchange, one per parameter. A controlled negative for parameter A
+        refutes A, but B -- a different, untested parameter of the SAME class --
+        must stay UNVERIFIED, never demoted to "likely false positive"."""
+        finding_a = _finding_param("sqli", "A", severity="critical")
+        finding_b = _finding_param("sqli", "B", severity="critical")
+        report = AgentReport(agent="sqli", model="test", findings=[finding_a, finding_b])
+        validation_reports = [_neg("sqli", parameter="A")]
+
+        apply_confirmation_suppression([report], validation_reports=validation_reports)
+
+        # Parameter A: a controlled negative ran against THIS case -> REFUTED.
+        self.assertEqual(finding_a.review_verdict, "unconfirmed_hypothesis")
+        self.assertTrue(finding_a.summary.startswith("[Hypothesis] "))
+        self.assertEqual(finding_a.severity, "low")
+
+        # Parameter B: same class, but NO negative ran against IT -> UNVERIFIED,
+        # not refuted. This is the defect this fix closes.
+        self.assertEqual(finding_b.review_verdict, "inconclusive_unverified")
+        self.assertTrue(finding_b.summary.startswith("[Unverified] "))
+        self.assertNotEqual(finding_b.review_verdict, "unconfirmed_hypothesis")
+
+    def test_negative_control_1_same_case_still_refutes(self):
+        """NEGATIVE CONTROL 1: a genuine same-case controlled negative (same
+        class AND same parameter) still refutes -- proves the fix didn't just
+        disable refutation outright, only mis-scoped refutation."""
+        finding_a = _finding_param("sqli", "A", severity="critical")
+        report = AgentReport(agent="sqli", model="test", findings=[finding_a])
+        apply_confirmation_suppression(
+            [report], validation_reports=[_neg("sqli", parameter="A")])
+
+        self.assertEqual(finding_a.review_verdict, "unconfirmed_hypothesis")
+        self.assertTrue(finding_a.summary.startswith("[Hypothesis] "))
+        self.assertEqual(finding_a.severity, "low")
+
+    def test_negative_control_2_parameter_less_negative_still_refutes_class(self):
+        """NEGATIVE CONTROL 2 (backward compat): a parameter-LESS negative
+        (parameter="", e.g. an endpoint-level/non-parameter-scoped check, or a
+        pre-FR-5 producer that never populated `parameter`) still refutes a
+        same-class finding regardless of that finding's own parameter -- the
+        class-level fallback must be preserved, no regression."""
+        finding_c = _finding_param("sqli", "C", severity="critical")
+        report = AgentReport(agent="sqli", model="test", findings=[finding_c])
+        apply_confirmation_suppression(
+            [report], validation_reports=[_neg("sqli", parameter="")])
+
+        self.assertEqual(finding_c.review_verdict, "unconfirmed_hypothesis")
+        self.assertTrue(finding_c.summary.startswith("[Hypothesis] "))
+        self.assertEqual(finding_c.severity, "low")
 
 
 class ActiveConfirmationProvenanceTests(unittest.TestCase):

@@ -492,13 +492,17 @@ class ConfirmMixin:
                         output.append(ValidationReport(
                             validator=getattr(validator, "name", "validator"), status="error",
                             finding_class=finding.vulnerability_class, confirmed=False,
-                            summary=f"proof persistence failed: {reason}", evidence=str(result)[:300]))
+                            summary=f"proof persistence failed: {reason}", evidence=str(result)[:300],
+                            url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                            parameter=getattr(finding, "parameter_name", "")))
                 except Exception as e:  # proof bookkeeping must never break analysis
                     log.warning("proof bookkeeping failed for errored validator: %s", e)
                     output.append(ValidationReport(
                         validator=getattr(validator, "name", "validator"), status="error",
                         finding_class=finding.vulnerability_class, confirmed=False,
-                        summary=f"proof persistence failed: {e}", evidence=str(result)[:300]))
+                        summary=f"proof persistence failed: {e}", evidence=str(result)[:300],
+                        url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                        parameter=getattr(finding, "parameter_name", "")))
                 continue
             output.append(ValidationReport(
                 validator=result.validator,
@@ -508,6 +512,12 @@ class ConfirmMixin:
                 confirmed=result.confirmed,
                 summary=result.summary,
                 evidence=result.evidence,
+                # FR-5 (F09): case identity for this validation attempt -- lets the
+                # confirmation gate bind a controlled negative to the SAME
+                # parameter it actually tested, not just the class.
+                url=getattr(exchange, "url", ""),
+                method=getattr(exchange, "method", ""),
+                parameter=getattr(finding, "parameter_name", ""),
             ))
             # P0-1/T01 (RB-4 shared helper): VALIDATION_DECISION -- "why was it
             # concluded (vulnerable or not)" -- plus the case-bound structured
@@ -564,13 +574,17 @@ class ConfirmMixin:
                     output[-1] = ValidationReport(
                         validator=result.validator, status="error",
                         finding_class=result.finding_class, confidence=0.0, confirmed=False,
-                        summary=f"proof persistence failed: {reason}", evidence=result.evidence)
+                        summary=f"proof persistence failed: {reason}", evidence=result.evidence,
+                        url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                        parameter=getattr(finding, "parameter_name", ""))
             except Exception as e:
                 log.warning("proof bookkeeping failed for %s: %s", result.validator, e)
                 output[-1] = ValidationReport(
                     validator=result.validator, status="error",
                     finding_class=result.finding_class, confidence=0.0, confirmed=False,
-                    summary=f"proof persistence failed: {e}", evidence=result.evidence)
+                    summary=f"proof persistence failed: {e}", evidence=result.evidence,
+                    url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                    parameter=getattr(finding, "parameter_name", ""))
             if plan is not None:
                 await asyncio.to_thread(
                     store.persist_test_plans, exchange, [plan]

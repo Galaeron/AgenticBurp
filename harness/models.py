@@ -242,6 +242,15 @@ class ValidationReport(BaseModel):
     confirmed: bool = False
     summary: str = ""
     evidence: str = ""
+    # FR-5 (F09): case-identity coordinates for this validation attempt, so a
+    # controlled negative can be bound to the SAME case (parameter) it actually
+    # tested rather than just its class. Optional/default-empty for backward
+    # compatibility -- every pre-existing constructor call and serialized form
+    # stays valid; an empty `parameter` is treated as a class-level (not
+    # parameter-scoped) negative by confirmation_gate.apply_confirmation_suppression.
+    url: str = ""
+    method: str = ""
+    parameter: str = ""
 
 
 class StageOutcome(BaseModel):

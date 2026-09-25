@@ -572,20 +572,59 @@ def is_uncorroborated_catchall_guess(finding, catchall_classes=None) -> bool:
 
 
 def _controlled_negative_classes(validation_reports: list | None) -> set:
-    """Canonical finding classes for which a validator produced a real controlled
-    NEGATIVE -- it actually ran and returned `not_confirmed` (R08). This is what
-    separates a refutation ("a reliable leg ran and said no") from a leg that
+    """Back-compat wrapper: canonical finding classes for which a validator
+    produced a real controlled NEGATIVE, ignoring case identity. Superseded by
+    `_controlled_negatives` (FR-5/F09) for the gate's own matching, which binds
+    a negative to the parameter it actually tested; kept here for any external
+    caller that still wants the plain class set."""
+    return set(_controlled_negatives(validation_reports).keys())
+
+
+def _controlled_negatives(validation_reports: list | None) -> dict:
+    """Case-aware collector (FR-5/F09) of controlled NEGATIVEs: validators that
+    actually ran and returned `not_confirmed` (R08) -- as opposed to a leg that
     never produced a verdict (skipped / error / disabled / absent), which is NOT
-    evidence of a false positive and must not be labelled as one."""
+    evidence of a false positive and must not be labelled as one.
+
+    Returns {canonical_class: {parameter_or_empty, ...}}. A negative whose
+    `ValidationReport.parameter` is empty (the pre-FR-5 default, or a genuinely
+    non-parameter-scoped check) is recorded as a CLASS-LEVEL negative -- kept in
+    the set under the empty string -- and continues to refute any same-class
+    finding exactly as before (backward compatibility / endpoint-level checks).
+    A negative with a NON-EMPTY parameter only refutes a finding with that SAME
+    parameter_name: one parameter's controlled negative must not demote a
+    different, untested parameter of the same class to "likely false positive"."""
     from harness.categories import canonicalize
-    neg: set = set()
+    neg: dict = {}
     for vr in validation_reports or []:
         status = (getattr(vr, "status", "") or "").lower()
         confirmed = bool(getattr(vr, "confirmed", False))
         if status == "not_confirmed" and not confirmed:
             fc = getattr(vr, "finding_class", "") or ""
-            neg.add(canonicalize(fc) or fc.lower())
+            fc_canon = canonicalize(fc) or fc.lower()
+            param = getattr(vr, "parameter", "") or ""
+            neg.setdefault(fc_canon, set()).add(param)
     return neg
+
+
+def _has_controlled_negative(negatives: dict, fc_canon: str, parameter_name: str) -> bool:
+    """FR-5 (F09): True when `negatives` (from `_controlled_negatives`) contains
+    a controlled negative that REFUTES a finding of class `fc_canon` and
+    parameter `parameter_name` -- either:
+      - a class-level negative (recorded with an empty parameter -- backward
+        compat / genuinely non-parameter-scoped checks), or
+      - a same-case negative whose parameter equals this finding's parameter.
+
+    A same-class negative recorded under a DIFFERENT non-empty parameter does
+    NOT match here -- that is the whole point of the fix: it leaves the
+    untested parameter to fall through to the existing UNVERIFIED tier instead
+    of being refuted."""
+    params = negatives.get(fc_canon)
+    if not params:
+        return False
+    if "" in params:
+        return True
+    return bool(parameter_name) and parameter_name in params
 
 
 def apply_confirmation_suppression(
@@ -599,16 +638,22 @@ def apply_confirmation_suppression(
     Mutates findings in place; returns the number demoted. Confirmed findings and
     no-leg classes are left untouched.
 
-    - REFUTED  (live-verified leg AND a real controlled negative for the class in
-      `validation_reports`): the leg actually ran and said no -> likely false
-      positive. severity -> "low", confidence <= 0.35, verdict
-      "unconfirmed_hypothesis", prefix "[Hypothesis]".
-    - UNVERIFIED (live-verified leg but NO controlled negative executed -- the leg
-      was skipped / errored / disabled / not run, or no validation reports were
-      supplied): NOT a refutation (R08). Still capped for safety (severity -> low,
-      confidence <= 0.35 -- the precision floor), but labelled honestly: verdict
-      "inconclusive_unverified", prefix "[Unverified]", note says it was neither
-      confirmed nor refuted so it must not be treated as a false positive.
+    - REFUTED  (live-verified leg AND a real controlled negative for the SAME CASE
+      in `validation_reports`): the leg actually ran against this finding's own
+      parameter (or a class-level/parameter-less negative -- backward compat for
+      non-parameter-scoped checks) and said no -> likely false positive.
+      severity -> "low", confidence <= 0.35, verdict "unconfirmed_hypothesis",
+      prefix "[Hypothesis]". FR-5 (F09): a controlled negative recorded against a
+      DIFFERENT parameter of the same class does NOT refute this finding.
+    - UNVERIFIED (live-verified leg but NO controlled negative for this case
+      executed -- the leg was skipped / errored / disabled / not run for this
+      parameter, or no validation reports were supplied): NOT a refutation (R08).
+      Still capped for safety (severity -> low, confidence <= 0.35 -- the
+      precision floor), but labelled honestly: verdict "inconclusive_unverified",
+      prefix "[Unverified]", note says it was neither confirmed nor refuted so it
+      must not be treated as a false positive. A same-class finding whose OWN
+      parameter was never tested lands here, even when a different parameter of
+      the same class was refuted.
     - UNPROVEN (class has a leg, but only smoke/hermetic-verified): severity capped
       at "medium", confidence <= 0.5, verdict "unproven_unverified_leg", prefix
       "[Unconfirmed]".
@@ -617,7 +662,7 @@ def apply_confirmation_suppression(
     seam Phase 2 uses to promote a leg after live-verifying it.
     """
     demoted = 0
-    negatives = _controlled_negative_classes(validation_reports)
+    negatives = _controlled_negatives(validation_reports)
     from harness.categories import canonicalize as _canon
 
     def _emit_revision(finding, tier: str) -> None:
@@ -656,7 +701,11 @@ def apply_confirmation_suppression(
 
             if tier == "live":
                 fc_canon = _canon(finding.vulnerability_class) or (finding.vulnerability_class or "").lower()
-                has_controlled_negative = fc_canon in negatives
+                # FR-5 (F09): bind the negative to the SAME case (parameter), not
+                # just the class -- a controlled negative on parameter A must not
+                # refute an untested parameter B of the same class.
+                has_controlled_negative = _has_controlled_negative(
+                    negatives, fc_canon, finding.parameter_name)
                 # Cap for safety in both cases (the precision floor: an unconfirmed
                 # live-class finding never ships actionable), but DISTINGUISH why.
                 finding.confidence = min(finding.confidence, _REFUTED_CONFIDENCE_CAP)
