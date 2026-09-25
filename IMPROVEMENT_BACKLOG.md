@@ -2476,7 +2476,7 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   pytest-native 38, testing 185, evaluation_integrity 42). NOTE: generated reports now honestly render
   historical status-only findings as "NOT independently reproducible" — intended F03 behavior.
 
-### [ ] FR-5 — Bind negative evidence to the case, not the class (F09)
+### [x] FR-5 — Bind negative evidence to the case, not the class (F09)
 - **Domain:** Trust / Correctness - **Effort:** M - **Mode:** LOOP
 - **Evidence (VERIFIED):** `confirmation_gate._controlled_negative_classes()` collects a controlled
   negative keyed by `canonicalize(finding_class)`, and `apply_confirmation_suppression()` matches by
@@ -2490,6 +2490,16 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   but leaves a same-class parameter-B finding `inconclusive`; NEGATIVE control — a genuine same-case
   controlled negative still refutes. `full` green.
 - **Impact:** Medium-High (stops class-wide overconfident "secure" verdicts; complements BM-2).
+- **Result (`c4dd349`, VERIFIED):** `ValidationReport` gained optional `url`/`method`/`parameter`
+  (default ""), populated at all 5 `orchestrator_confirm.py` producer sites from the finding/exchange.
+  New `_controlled_negatives` (`{class: {parameters}}`) + `_has_controlled_negative`: a finding is REFUTED
+  only by a class-level (empty-parameter, backward-compat/endpoint-level) OR same-parameter negative; a
+  same-class negative on a DIFFERENT parameter falls through to the existing UNVERIFIED tier. The call is
+  per-exchange so url/method are invariant (key = class+parameter); caps/tiers/ledger/recall-guards
+  unchanged. Tests: caller (param-A negative refutes A `[Hypothesis]`, leaves same-class param-B
+  `[Unverified]`) + negative controls (same-case still refutes; parameter-less still refutes same-class).
+  No existing test changed. `full` green (harness 2699 OK/2 skip, pytest-native 38, testing 185,
+  evaluation_integrity 42).
 
 ### [ ] FR-6 — Credential-grant verification needs a differential (F10)
 - **Domain:** Graph / Correctness - **Effort:** M - **Mode:** LOOP

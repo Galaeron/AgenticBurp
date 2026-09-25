@@ -4,7 +4,7 @@
 
 Branch `reconciliation-backlog`; base HEAD before this session's work was
 `59ef1f536e3fffec23aff43656c26d4185124dbe`. This session filed a founder-review
-improvement batch and landed **FR-4** (`96c17ff`), **FR-3** (`7050d89`), **FR-1** (`cf0f953`) and **FR-2** (`aa0d42b`) plus doc updates.
+improvement batch and landed **FR-4/FR-3/FR-1/FR-2/FR-5** (`96c17ff`, `7050d89`, `cf0f953`, `aa0d42b`, `c4dd349`) plus doc updates.
 Pre-existing README edits and untracked runtime/evaluation/worktree artifacts
 remain — preserve them. Remote-main parity is not established.
 
@@ -17,7 +17,7 @@ The review has 23 sections, 15 findings (F01–F15), target architecture, a P0�
 roadmap, scorecard, ablation protocol and 30/60/90-day gates.
 
 Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14):
-- `full` green after FR-4+FR-3+FR-1+FR-2: harness 2696 OK (2 skips); pytest-native 38 passed;
+- `full` green after FR-4/FR-3/FR-1/FR-2/FR-5: harness 2699 OK (2 skips); pytest-native 38 passed;
   testing 185 OK; evaluation_integrity 42 OK. `config_manifest --check` clean.
 - Founder-review synthetic probes reproduce browser same-origin POST permission,
   bridge-only tool-egress flags, false ledger resolvability, and discarded runner
@@ -32,36 +32,22 @@ findings produced the **FR-\*** batch in
 [IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md). Loop order:
 **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR-6 → FR-7 → FR-8**.
 
-- **FR-4 `[x]` `96c17ff` (VERIFIED, supersedes BM-1):** fixed the generic-gate
-  class-normalization gap (the model's snake_case `security_misconfiguration` and
-  all `info_disclosure` variants now fold) and added an evidence-scoped catch-all
-  gate — `reporting.gate_uncorroborated_catchall` (ships **false**) requires a
-  confirming leg for ONLY `misconfig`/`info_disclosure`, ignoring self-reported
-  confidence; a global leg requirement is deliberately NOT introduced. Mirrored in
-  `report_generator` + `eval_adapter`, wired into `strict_benchmark`, tracked in
-  the config-drift manifest. Offline re-score (captured findings, all 12 repeats):
-  pooled P 0.236→0.283, F1 0.367→0.403, recall 0.820→0.703 (demoted → leads).
-  Default-off path byte-for-byte unchanged; `config.yaml` safe defaults intact.
-- **FR-3 `[x]` `7050d89` (VERIFIED):** new pure/offline `testing/pool_strict_runs.py`
-  recomputes benchmark headlines from the `*_strict_3x.json` artifacts; `BENCHMARK_REPORT`
-  now shows BOTH the one-repeat/per-app pool (30/101/7, P=0.229/R=0.811) and the all-12-runs
-  sum (91/294/20, P=0.236/R=0.820) with the "3 repeats ≠ 3 independent apps" caveat, and
-  footnotes `over-alert ×` as workload not FP-rate. Synthetic-only tests with a first-run-only
-  negative control.
-- **FR-1 `[x]` `cf0f953` (VERIFIED):** the strict runner (`testing/strict_benchmark.py`) now
-  health-certifies each run — `_one_run` returns its outcomes, pure `assess_run_health` marks a
-  failed/empty run ineligible (partial metrics stay visible), `complete=health.eligible` (no more
-  hardcoded `True`), a real `_inputs_identity` replaces the bare manifest hash, and the leaked
-  `harness.cache` global is restored. Offline falsifier + healthy negative control.
-- **FR-2 `[x]` `aa0d42b` (VERIFIED):** evidence resolvability is now storage-backed — a new
-  content-addressed blob store (`store.evidence_blobs`) holds REDACTED request/response blobs written
-  only at the successful-send site; `_assess_completeness` requires both blobs present+hash-verified, so
-  status-only "HTTP 200" strings are honestly not resolvable. Producer double-guarded (blob failure →
-  degraded, never breaks a send); NC-4 secret-canary proves no leak into the new sink. (Reports now
-  honestly show historical status-only findings as not reproducible — intended.)
-- **Still open (loop-consumable, offline), in order:** FR-5 (case-bound negative evidence / F09),
-  FR-6 (credential differential / F10), FR-7 (pure-inference cache / F11), FR-8 (authenticated
-  reads / F12).
+**Done (offline, VERIFIED — full Result lines in IMPROVEMENT_BACKLOG.md):**
+- **FR-4 `96c17ff`** (supersedes BM-1) — generic-gate normalization fix + evidence-scoped
+  catch-all gate `reporting.gate_uncorroborated_catchall` (ships **false**; only misconfig/
+  info_disclosure; not global). Offline re-score P 0.236→0.283.
+- **FR-3 `7050d89`** — tested all-repeat benchmark pooling (`testing/pool_strict_runs.py`);
+  report shows both the per-app (30/101/7) and all-12-runs (91/294/20) figures with the
+  "3 repeats ≠ 3 independent apps" caveat.
+- **FR-1 `cf0f953`** — strict-runner health certification (no false `complete`; `assess_run_health`);
+  fixed a leaked `harness.cache` global.
+- **FR-2 `aa0d42b`** — storage-backed resolvable evidence (content-addressed, REDACTED request/
+  response blobs; status-only strings honestly not resolvable; NC-4 canary; never breaks a send).
+- **FR-5 `c4dd349`** — case/parameter-bound negative evidence: a controlled negative on param A no
+  longer refutes an untested param B of the same class (falls through to UNVERIFIED); class-level
+  fallback preserved.
+- **Still open (loop-consumable, offline), in order:** FR-6 (credential differential / F10),
+  FR-7 (pure-inference cache / F11), FR-8 (authenticated reads / F12).
 - **Skip-only (OWNER/LIVE), cross-referenced as FR-O\*:** F01/F02/F08 enforcement
   + two-origin/egress proof (`PR-10`/`PR-11`/`NC-O1..3`, `P1-10`), F05/F14 pairing
   + build (`PR-A`/`PR-C`/`NC-O5`), F07 ablations (`PR-B`), F06 independent
