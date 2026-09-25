@@ -209,13 +209,31 @@ class ConfigDriftManifestTests(unittest.TestCase):
 
 class StrictRecallNeverInferredTests(unittest.TestCase):
 
-    @unittest.skipUnless(_HAVE_ARTIFACTS, _SKIP_REASON)
-    def test_corpus_with_no_manifest_reports_unavailable_never_a_number(self):
-        for name in ("blindtarget2", "dvwa", "webgoat", "juiceshop"):
+    def test_manifested_corpus_still_refuses_on_the_2026_09_23_artifact_shape(self):
+        # These four now HAVE exact-class manifests (seeded 2026-09-25 for the live
+        # strict benchmark: webgoat/dvwa/juiceshop from public app knowledge,
+        # blindtarget2 all-inconclusive). But the saved 2026-09-23 artifacts carry
+        # aggregate tp/fp/fn, not eval_adapter's per-finding stages/attribution, so
+        # strict recall must STILL be refused as UNAVAILABLE (never inferred from
+        # coarse coverage) -- same refusal as pixelmart, for the same reason.
+        checked = 0
+        for name in ("pixelmart", "blindtarget2", "dvwa", "webgoat", "juiceshop"):
+            if not (rb.LABELS_DIR / f"{name}.labels.json").exists():
+                continue  # some manifests are local-only evidence, not committed
             result = rb.strict_exact_class_recall(name)
             self.assertEqual(result["strict_exact_class_recall"], rb.UNAVAILABLE)
             self.assertIsInstance(result["strict_exact_class_recall"], str)
-            self.assertIn("no exact-class manifest", result["reason"])
+            self.assertIn("eval_adapter.build_eval_artifact's shape", result["reason"])
+            checked += 1
+        self.assertGreater(checked, 0, "expected at least the pixelmart manifest to exist")
+
+    def test_a_truly_manifestless_corpus_reports_no_manifest(self):
+        # The other refusal branch (no manifest at all) is still exercised, via a
+        # corpus name that has no *.labels.json -- so the "no exact-class manifest"
+        # path cannot silently rot now that the real corpora are all manifested.
+        result = rb.strict_exact_class_recall("corpus_with_no_manifest_xyz")
+        self.assertEqual(result["strict_exact_class_recall"], rb.UNAVAILABLE)
+        self.assertIn("no exact-class manifest", result["reason"])
 
     def test_pixelmart_manifest_exists_but_artifact_shape_still_refuses(self):
         # PixelMart DOES have testing/labels/pixelmart.labels.json, but the
