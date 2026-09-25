@@ -2501,7 +2501,7 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   No existing test changed. `full` green (harness 2699 OK/2 skip, pytest-native 38, testing 185,
   evaluation_integrity 42).
 
-### [ ] FR-6 — Credential-grant verification needs a differential (F10)
+### [x] FR-6 — Credential-grant verification needs a differential (F10)
 - **Domain:** Graph / Correctness - **Effort:** M - **Mode:** LOOP
 - **Evidence (VERIFIED):** `orchestrator_chain._credential_grants_access()` returns
   `out.ok and out.status < 400` (orchestrator_chain.py:252) with no anonymous / invalid-token control —
@@ -2514,6 +2514,16 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   does NOT count as a grant, and an invalid-token control matching anonymous yields no grant; NEGATIVE
   control — a resource that genuinely differs for the credentialed principal still counts. `full` green.
 - **Impact:** Medium (removes false capabilities from the engagement graph).
+- **Result (`a2aba42`, VERIFIED):** `_credential_grants_access` now runs three scope-gated + throttled
+  probes (credentialed / anonymous / invalid-token via `_invalidated_headers`) through the one throwaway
+  transport; fast-exits False on a credentialed error (controls not spent); grants only when the
+  credentialed response is not equivalent (status AND body, `_responses_equivalent`) to BOTH controls;
+  fail-closed on control exception/incomplete. Signature + both callers unchanged. Tests (offline, 17):
+  public-resource/no-diff → no grant, early-exit, fail-closed, and genuine-grant negative controls
+  (status-diff and body-only-diff → grant) + helper units. Updated `test_engagement_escalation.py`'s
+  shared mock to distinguish a genuine credential from anon/invalid (it previously returned one response
+  regardless — the assumption FR-6 removes; public assertions unchanged). `full` green (harness 2716
+  OK/2 skip, pytest-native 38, testing 185, evaluation_integrity 42).
 
 ### [ ] FR-7 — Separate pure-inference caching from run-bound proof (F11)
 - **Domain:** Performance - **Effort:** M - **Mode:** LOOP (partly research)

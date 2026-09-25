@@ -4,7 +4,7 @@
 
 Branch `reconciliation-backlog`; base HEAD before this session's work was
 `59ef1f536e3fffec23aff43656c26d4185124dbe`. This session filed a founder-review
-improvement batch and landed **FR-4/FR-3/FR-1/FR-2/FR-5** (`96c17ff`, `7050d89`, `cf0f953`, `aa0d42b`, `c4dd349`) plus doc updates.
+improvement batch and landed **FR-4/FR-3/FR-1/FR-2/FR-5/FR-6** (`96c17ff`, `7050d89`, `cf0f953`, `aa0d42b`, `c4dd349`, `a2aba42`) plus doc updates.
 Pre-existing README edits and untracked runtime/evaluation/worktree artifacts
 remain — preserve them. Remote-main parity is not established.
 
@@ -17,7 +17,7 @@ The review has 23 sections, 15 findings (F01–F15), target architecture, a P0�
 roadmap, scorecard, ablation protocol and 30/60/90-day gates.
 
 Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14):
-- `full` green after FR-4/FR-3/FR-1/FR-2/FR-5: harness 2699 OK (2 skips); pytest-native 38 passed;
+- `full` green after FR-4/FR-3/FR-1/FR-2/FR-5/FR-6: harness 2716 OK (2 skips); pytest-native 38 passed;
   testing 185 OK; evaluation_integrity 42 OK. `config_manifest --check` clean.
 - Founder-review synthetic probes reproduce browser same-origin POST permission,
   bridge-only tool-egress flags, false ledger resolvability, and discarded runner
@@ -46,8 +46,11 @@ findings produced the **FR-\*** batch in
 - **FR-5 `c4dd349`** — case/parameter-bound negative evidence: a controlled negative on param A no
   longer refutes an untested param B of the same class (falls through to UNVERIFIED); class-level
   fallback preserved.
-- **Still open (loop-consumable, offline), in order:** FR-6 (credential differential / F10),
-  FR-7 (pure-inference cache / F11), FR-8 (authenticated reads / F12).
+- **FR-6 `a2aba42`** — credential-grant differential: `_credential_grants_access` now compares the
+  credentialed response against anonymous + invalid-token controls; a public 200 / no-difference token
+  no longer grants (fail-closed on control failure). Signature/callers unchanged.
+- **Still open (loop-consumable, offline), in order:** FR-7 (pure-inference cache / F11),
+  FR-8 (authenticated reads / F12).
 - **Skip-only (OWNER/LIVE), cross-referenced as FR-O\*:** F01/F02/F08 enforcement
   + two-origin/egress proof (`PR-10`/`PR-11`/`NC-O1..3`, `P1-10`), F05/F14 pairing
   + build (`PR-A`/`PR-C`/`NC-O5`), F07 ablations (`PR-B`), F06 independent
