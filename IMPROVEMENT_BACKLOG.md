@@ -2395,7 +2395,7 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   green (harness 2684 OK/2 skip, pytest-native 38, testing 168, evaluation_integrity 42). Live
   re-measure through `strict_benchmark` with the flag ON remains OWNER/LIVE.
 
-### [ ] FR-3 — Report benchmark headlines from artifacts, all-repeat pooling (F15)
+### [x] FR-3 — Report benchmark headlines from artifacts, all-repeat pooling (F15)
 - **Domain:** Evaluation honesty - **Effort:** S - **Mode:** LOOP
 - **Evidence (VERIFIED):** the published headline `30 TP / 101 FP / 7 FN` is exactly the **first run**
   of each corpus; pooling all 12 scored runs gives **91 / 294 / 20** (P=0.236, R=0.820). The review's
@@ -2408,6 +2408,15 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   asserts the published pooled counts equal the sum over all runs (a hand-edited/first-run-only number
   fails loudly). `full` green.
 - **Impact:** High (cheap; removes a live source of manual score drift and over-claim).
+- **Result (`7050d89`, VERIFIED):** new pure/offline `testing/pool_strict_runs.py` recomputes both
+  denominators from the `*_strict_3x.json` artifacts — one-repeat/per-app 30/101/7 (P=0.229/R=0.811)
+  and all-12-runs 91/294/20 (P=0.236/R=0.820), reproduced independently. `BENCHMARK_REPORT.md` now
+  presents BOTH with named denominators + the founder-review §9 "3 repeats ≠ 3 independent apps" caveat,
+  and footnotes `over-alert ×` as workload-not-FP-rate; all prior caveats kept. Tests
+  (`testing/test_pool_strict_runs.py`, synthetic-only so CI needs no local artifacts): correctness sums
+  hand-computed; NEGATIVE control asserts a first-run-only pool differs from `all_runs_pooled` (a silent
+  revert fails loudly) + mean-vs-pooled denominators cannot be conflated. `full` green (harness 2684
+  OK/2 skip, pytest-native 38, testing 177, evaluation_integrity 42).
 
 ### [ ] FR-1 — Health-certify the strict benchmark runner; a failed run is never "complete" (F04)
 - **Domain:** Evaluation / Reliability - **Effort:** M - **Mode:** LOOP
