@@ -47,6 +47,20 @@ Do NOT flip a `config.yaml` default that carries a documented recall trade-off (
 `fail_open_mode: curated` flip is owner-gated on RB-8's measured delta, not a loop freebie).
 Every RB item names a caller-level test + negative control; honour the non-negotiables below.
 
+**2026-09-25 founder-review + FP dispatch (offline batch; reopens loop work):** The founder
+decision review (`reviews/2026-09-25/founder-review/REVIEW.md`) plus an offline re-score of the
+2026-09-25 captured benchmark findings produced the **Founder-review batch — FR-*** (end of file).
+The review's safety-enforcement, live-proof, adjudication and build findings
+(F01/F02/F05/F06/F07/F08/F14) are already filed as OWNER/LIVE `PR-A..E` / `NC-O1..O5` / `P1-10`;
+the review only reinforces them — do NOT re-file or attempt them (they are cross-referenced as
+skip-only `FR-O*`). Select the loop-consumable FR items in this order before resuming the ordinary
+queue: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR-6 → FR-7 → FR-8**. **BM-1 is superseded by FR-4** —
+an offline re-score showed BM-1's confidence-floor half is near-useless (the catch-all noise is
+emitted at confidence ≥ 0.5); the effective lever is an evidence/confirming-leg requirement scoped
+to the two catch-all classes, never a global one. Honour the non-negotiables: keep `config.yaml`
+safe (new gates ship OFF; a default flip that trades recall stays owner-gated on a measured delta),
+a caller test + negative control per item, `full` green before close.
+
 1. Work top-down: finish all `P0` items before `P1`, etc. Within a tier, respect
    `Depends on`.
 2. Pick the first item whose checkbox is `[ ]` and whose dependencies are all `[x]`.
@@ -2288,7 +2302,10 @@ now trustworthy (strict exact-class scorer + sanitized corpus + baseline gate); 
 items act on what it measured. Honour the standing non-negotiables (safe defaults,
 caller test + negative control, `full` green before close).
 
-### [ ] BM-1 — Tame the two catch-all false-positive classes (precision)
+### [ ] BM-1 — Tame the two catch-all false-positive classes (precision)  — **SUPERSEDED by FR-4 (2026-09-25)**
+- **Superseded:** FR-4 carries this forward with the measured correction — a confidence floor barely
+  moves precision here (the catch-all FPs are high-confidence), and the gate's class set does not even
+  match the model's dominant labels. Do this via FR-4, not the confidence-floor recommendation below.
 - **Domain:** Detection precision - **Effort:** M - **Mode:** LOOP
 - **Evidence (VERIFIED, 2026-09-25 run):** `security_misconfiguration` and `info_disclosure` are the
   dominant FP source on every corpus — DVWA security_misconfiguration 11 FP with ZERO support (pure
@@ -2319,3 +2336,181 @@ caller test + negative control, `full` green before close).
   classes needing multi-step inference about intent/state. Unlikely to close with an 8B local model alone.
 - **Direction:** a stronger model routed to these classes, or class-specific active probes. Needs a real
   model/GPU to measure. Leave `[ ]`.
+
+## Founder-review batch — 2026-09-25 (FR-*)
+
+Derived from the founder decision review
+([reviews/2026-09-25/founder-review/REVIEW.md](reviews/2026-09-25/founder-review/REVIEW.md)) and an
+offline re-score of the 2026-09-25 captured benchmark findings. The review's verdict: a promising
+local-first Burp copilot whose main weakness is the *distance between its safety/evidence vocabulary
+and what its boundaries actually guarantee* — a declaration used as evidence of enforcement, sparse
+metadata labelled reproducible, a failed run stamped complete, a class-level non-confirmation read as
+a refutation. The FR items below are the **offline, loop-consumable** half of that finding set: each
+tightens an honesty/precision contract with a caller test and a negative control, ships any new gate
+OFF/safe, and leaves `config.yaml` untouched. The enforcement/live/build/adjudication half is already
+filed as OWNER/LIVE and is listed as skip-only `FR-O*` at the end of this batch so the loop does not
+re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR-6 → FR-7 → FR-8**.
+
+### [x] FR-4 — Fix the generic-guess gate + scope the catch-all gate to evidence, not self-confidence (F06; supersedes BM-1)
+- **Domain:** Detection precision - **Effort:** M - **Mode:** LOOP
+- **Evidence (VERIFIED, 2026-09-25 offline re-score):** two independent defects. **(a) Normalization
+  gap:** `harness/confirmation_gate.is_low_confidence_generic_guess` keys on
+  `DEFAULT_GENERIC_CLASSES = {misconfig, sqli, broken access control (workflow bypass)}` via
+  `_generic_class_key` (`categories.canonicalize` → raw-lowercase fallback). The model's dominant FP
+  label — snake_case `security_misconfiguration` (35× in the captured runs) — canonicalizes to `None`
+  and falls to `"security_misconfiguration"`, which is NOT in the set; only the space-spelled
+  `Security misconfiguration` matches. Every `info_disclosure` variant (`information_disclosure`,
+  `verbose_error_disclosure`, `excessive_data_exposure`, `exposure_of_internal_data`, …) misses too.
+  So flipping `gate_low_confidence_generic` ON today catches ~16 of 51 misconfig labels and ZERO
+  info-disclosure. **(b) Confidence is the wrong lever:** the two classes are 69 of 101 pooled FPs but
+  only 8 of 30 TPs; yet 86/96 misconfig and 65/76 info-disclosure findings sit at confidence ≥ 0.5
+  (61 pinned at exactly 0.50 — an uncalibrated default). An offline re-score (replaying the captured
+  `surfaced` findings + real `attribution.by_exchange` through `testing/strict_score`, faithful — it
+  reproduces the report's first-run pool at P=0.232/R=0.784): a <0.5 floor moves precision +0.01;
+  requiring a **confirming leg for ONLY the two catch-all classes** lifts pooled P 0.232→0.407 and
+  F1 0.358→0.500 (R 0.784→0.649, and the demoted findings survive as quarantined leads, not deleted).
+  A **global** leg requirement collapses recall to 0.05 — do not apply it outside the two classes.
+- **Recommendation:** (1) make the gate's class key robust to the model's spelling variants — reuse
+  the strict scorer's `classify_exact` folding (or an equivalent narrow, reviewable normalizer) and add
+  `info_disclosure` to the generic set. (2) For `security_misconfiguration` + `info_disclosure` only,
+  require a corroborating signal (a confirming/oracle leg, or class-specific evidence) before the
+  finding is *surfaced*, rather than trusting the model's self-reported confidence. Leave the concrete
+  classes (sqli/xss/idor/path_traversal/jwt/csrf) untouched. Ship OFF/safe; re-measure before any
+  default flip.
+- **Acceptance:** caller test — catch-all guesses (across ALL spelling variants) on clean exchanges are
+  gated while a leg-backed catch-all finding survives; NEGATIVE control — sqli/xss/path_traversal
+  findings are unchanged and a global leg requirement is explicitly NOT introduced (a same-class
+  concrete finding without a leg still surfaces). Offline re-score on ≥2 corpora shows precision up and
+  recall noninferior within a declared bound. `full` green.
+- **Impact:** High (the measured pooled-precision lever; directly addresses the FP burden in F06).
+- **Result (`96c17ff`, VERIFIED):** normalization fixed in `categories._SYNONYMS` (snake_case + compound
+  info-disclosure/misconfig variants fold; `canonicalize("Broken Access Control")` still `None`);
+  `info_disclosure` added to `DEFAULT_GENERIC_CLASSES`; new `is_uncorroborated_catchall_guess` +
+  `reporting.gate_uncorroborated_catchall` (ships **false**) require a confirming leg for ONLY
+  `misconfig`/`info_disclosure`, ignoring confidence; mirrored identically in `report_generator` +
+  `eval_adapter`, wired into `strict_benchmark` config read, tracked in the config-drift manifest
+  (snapshot regenerated, `--check` clean). Caller test + negative controls (concrete classes never
+  gated; flag-off byte-for-byte no-op) added. Offline re-score (captured findings, all 12 repeats):
+  pooled P 0.236→0.283, F1 0.367→0.403, recall 0.820→0.703 (demoted → leads, not deleted). `full`
+  green (harness 2684 OK/2 skip, pytest-native 38, testing 168, evaluation_integrity 42). Live
+  re-measure through `strict_benchmark` with the flag ON remains OWNER/LIVE.
+
+### [ ] FR-3 — Report benchmark headlines from artifacts, all-repeat pooling (F15)
+- **Domain:** Evaluation honesty - **Effort:** S - **Mode:** LOOP
+- **Evidence (VERIFIED):** the published headline `30 TP / 101 FP / 7 FN` is exactly the **first run**
+  of each corpus; pooling all 12 scored runs gives **91 / 294 / 20** (P=0.236, R=0.820). The review's
+  #1 recommendation. `over-alert ×` is findings/exchanges (workload volume), not an FP rate against
+  ground truth; "3 repeats" are not 3 independent applications.
+- **Recommendation:** generate the report's headline counts/ratios from the `*_strict_3x.json`
+  artifacts (all repeats, denominators named, uncertainty clustered by application/case), and stop
+  hand-transcribing. Rename or footnote `over-alert ×` so it is not read as a false-positive rate.
+- **Acceptance:** a script recomputes the report's pooled numbers from the artifacts; a unit test
+  asserts the published pooled counts equal the sum over all runs (a hand-edited/first-run-only number
+  fails loudly). `full` green.
+- **Impact:** High (cheap; removes a live source of manual score drift and over-claim).
+
+### [ ] FR-1 — Health-certify the strict benchmark runner; a failed run is never "complete" (F04)
+- **Domain:** Evaluation / Reliability - **Effort:** M - **Mode:** LOOP
+- **Evidence (VERIFIED source + synthetic failure):** `testing/strict_benchmark._one_run()` runs the
+  orchestrator but discards per-exchange analyze failures, and `run_corpus_strict()` passes a hardcoded
+  `complete=True` (strict_benchmark.py:117). An all-failing synthetic orchestrator still returns
+  normally and emits a "complete" artifact from an empty/partial store. `inputs_hash` is only the label
+  manifest hash — not a corpus/config/model identity.
+- **Recommendation:** return typed run outcomes (expected/completed/failed exchanges + stage
+  degradation); certify only eligible runs; hash corpus bytes + config + prompt versions + model digest
+  + dirty diff into a real inputs identity; pass real usage; unique run IDs; fail certification on any
+  missing requirement; keep partial scores as explicitly-ineligible diagnostics; restore cache globals
+  and close owned orchestrators on exit.
+- **Acceptance:** run-health falsifier — fail all exchanges / one exchange / critique / store writes /
+  model startup: no affected run receives a healthy certification, partial metrics stay visible;
+  NEGATIVE control — a genuinely healthy run still certifies. `full` green.
+- **Impact:** High (a completion stamp currently can hide an inoperative detector).
+
+### [ ] FR-2 — Make evidence resolvability a storage-backed invariant (F03)
+- **Domain:** Trust / Reliability - **Effort:** M - **Mode:** LOOP
+- **Evidence (VERIFIED):** `run_context.TargetTransport._artifact()` records `request_ref=url` and
+  `response_ref="HTTP {status}"` (run_context.py:361-364); the P0-6 reproducibility check
+  (`evidence_ledger.py`) sets `resolvable` from *nonempty* strings, so a status-only artifact reads as
+  resolvable with `missing=[]` — a tester cannot actually reproduce a body mutation or audit an oracle
+  from it.
+- **Recommendation:** store content-addressed request/response blobs (method/body/headers/session refs
+  + payload transformations); the resolver verifies presence AND hashes; a missing blob forces
+  incomplete reproduction; a durable-logging failure marks evidence health degraded. Keep per-event
+  provenance so `reconstruct()` reports every contributing stage/model, not just the first event's.
+- **Acceptance:** caller test — a blob-backed artifact resolves reproducible; a status-only / mixed
+  artifact does NOT; the "resolvable" negative control **removes the blob** and the record flips to not
+  resolvable with a populated `missing[]`. `full` green.
+- **Impact:** High (turns "resolvable" into a real, replayable claim).
+
+### [ ] FR-5 — Bind negative evidence to the case, not the class (F09)
+- **Domain:** Trust / Correctness - **Effort:** M - **Mode:** LOOP
+- **Evidence (VERIFIED):** `confirmation_gate._controlled_negative_classes()` collects a controlled
+  negative keyed by `canonicalize(finding_class)`, and `apply_confirmation_suppression()` matches by
+  class — so one parameter's controlled negative can demote all same-class findings. The R08 work
+  already splits REFUTED / UNVERIFIED / UNPROVEN; the residual is case-binding.
+- **Recommendation:** bind a controlled negative to `(class, url, method, parameter, oracle-condition)`;
+  only a same-case finding is eligible for REFUTED; a different parameter/case of the same class stays
+  `inconclusive`, never "likely false positive". Preserve severity assessment separately from
+  verification status.
+- **Acceptance:** caller test — a controlled negative on parameter A refutes the parameter-A finding
+  but leaves a same-class parameter-B finding `inconclusive`; NEGATIVE control — a genuine same-case
+  controlled negative still refutes. `full` green.
+- **Impact:** Medium-High (stops class-wide overconfident "secure" verdicts; complements BM-2).
+
+### [ ] FR-6 — Credential-grant verification needs a differential (F10)
+- **Domain:** Graph / Correctness - **Effort:** M - **Mode:** LOOP
+- **Evidence (VERIFIED):** `orchestrator_chain._credential_grants_access()` returns
+  `out.ok and out.status < 400` (orchestrator_chain.py:252) with no anonymous / invalid-token control —
+  a public 200 or a login redirect "grants" access, inflating chain plausibility and wasting crawl
+  budget.
+- **Recommendation:** compare the credentialed response against anonymous and invalid-token controls on
+  the same protected resource; require an identity/access-change signal before asserting a grant; mark
+  uncertain tokens as candidates with limited downstream use.
+- **Acceptance:** caller test — a resource whose anonymous and credentialed responses are equivalent
+  does NOT count as a grant, and an invalid-token control matching anonymous yields no grant; NEGATIVE
+  control — a resource that genuinely differs for the credentialed principal still counts. `full` green.
+- **Impact:** Medium (removes false capabilities from the engagement graph).
+
+### [ ] FR-7 — Separate pure-inference caching from run-bound proof (F11)
+- **Domain:** Performance - **Effort:** M - **Mode:** LOOP (partly research)
+- **Evidence (VERIFIED control flow):** `orchestrator_detect.py` creates a fresh run before the cache
+  lookup and `RunContext.create()` embeds a new run UUID in the cache namespace, so two independent
+  `/analyze` calls on identical traffic re-pay all model cost; naively widening cache scope would reuse
+  stale proof references. `CacheEntry.is_stale()` keys on coordinator model + prompt version, not the
+  full behavioral config.
+- **Recommendation:** add a content/config/model/prompt-addressed *hypothesis* cache that is reusable
+  across runs, while observations are rebound to each run and active proof is revalidated per run.
+  Instrument and measure hit-rate at the API boundary before optimizing.
+- **Acceptance:** caller test — identical traffic across two fresh runs reuses hypotheses (measured
+  hit-rate > 0) while proof/evidence is re-bound per run and never shared; NEGATIVE control — a
+  config/model/prompt change invalidates the hypothesis cache. `full` green.
+- **Impact:** Medium (latency/cost on repeated captures; strictly gated on measured hit-rate).
+
+### [ ] FR-8 — Authenticate sensitive reads on the local API (F12, offline half)
+- **Domain:** Security / Privacy - **Effort:** M - **Mode:** LOOP
+- **Evidence (VERIFIED):** `server._require_auth()` bypasses the token check for loopback "safe" routes,
+  so another local process/user reaching the API can read findings/evidence without the mutation token;
+  the token requirement today guards only mutations.
+- **Recommendation:** require the operator token for routes that expose findings/evidence/reports while
+  keeping an unauthenticated health/liveness route for pairing; ship the read-auth requirement in a way
+  that does not break the extension's health handshake. (Per-user file ACLs, at-rest encryption and
+  retention/deletion are the OWNER half — see FR-O* / F12; do NOT attempt them here.)
+- **Acceptance:** caller test — a sensitive read without a valid token is rejected while the health
+  route still answers; NEGATIVE control — a valid-token read succeeds and mutation-path behavior is
+  unchanged. `full` green.
+- **Impact:** Medium-High (client traffic + discovered secrets are the product's most sensitive assets).
+
+### Skip-only cross-references (already filed OWNER/LIVE — do NOT re-file)
+- **FR-O1 (F01)** browser execution-policy enforcement + two-origin credential-forwarding proof →
+  `PR-10` (offline half done) / `NC-O3`. **Mode: OWNER/LIVE (skip).**
+- **FR-O2 (F02)** enforced tool egress via an attested proxy worker (not `--network bridge`) →
+  `PR-11` (offline half done) / `NC-O1`. **Mode: OWNER/LIVE (skip).**
+- **FR-O3 (F08)** per-engagement origin/address policy + TLS-verify-on + validated re-resolution →
+  `NC-O2` / `P1-10` live half. **Mode: OWNER/LIVE (skip).**
+- **FR-O4 (F05/F14)** secure Java↔API pairing + reproducible Java build/release gate →
+  `PR-A` / `PR-C` / `NC-O5`. **Mode: OWNER/LIVE (skip).**
+- **FR-O5 (F07)** faithful A–G ablations (rename variants to their real mechanism; instrument model
+  calls; assert treatment) → `PR-B` (harness = `RB-7`). **Mode: OWNER/LIVE (skip).**
+- **FR-O6 (F06)** independent, exhaustively-adjudicated precision + analyst-time study on held-out
+  cases → `PR-D` / `NC-O4` / `PR-E`. **Mode: OWNER/LIVE (skip).** FR-4 is the offline precision lever;
+  this is the live measurement of net operator value.
