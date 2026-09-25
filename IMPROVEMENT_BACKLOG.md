@@ -2540,7 +2540,7 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   config/model/prompt change invalidates the hypothesis cache. `full` green.
 - **Impact:** Medium (latency/cost on repeated captures; strictly gated on measured hit-rate).
 
-### [ ] FR-8 — Authenticate sensitive reads on the local API (F12, offline half)
+### [x] FR-8 — Authenticate sensitive reads on the local API (F12, offline half)
 - **Domain:** Security / Privacy - **Effort:** M - **Mode:** LOOP
 - **Evidence (VERIFIED):** `server._require_auth()` bypasses the token check for loopback "safe" routes,
   so another local process/user reaching the API can read findings/evidence without the mutation token;
@@ -2553,6 +2553,15 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   route still answers; NEGATIVE control — a valid-token read succeeds and mutation-path behavior is
   unchanged. `full` green.
 - **Impact:** Medium-High (client traffic + discovered secrets are the product's most sensitive assets).
+- **Result (`cdb238d`, VERIFIED):** new `server.require_read_auth` flag (**ships false**) + `_require_read_auth`
+  (separate from the untouched `_require_auth`; no-op when off, requires the effective `_mutation_token()`
+  when on) wired into `/report`, `/telemetry`, `/test-plans/{id}`, GET `/settings`; `/health` stays open.
+  Tracked in the config-drift manifest (snapshot regenerated; `--check` clean). Tests (offline, TestClient):
+  enabled → token-less sensitive read 401, valid-token 200, `/health` 200; NEGATIVE control disabled
+  (default) → reads 200; mutation gating unaffected by the flag. Ships OFF so the default deploy is
+  byte-identical and the extension's reads aren't broken until the Java side sends the token on GETs
+  (OWNER half of F12). `full` green (harness 2724 OK/2 skip, pytest-native 38, testing 185,
+  evaluation_integrity 42).
 
 ### Skip-only cross-references (already filed OWNER/LIVE — do NOT re-file)
 - **FR-O1 (F01)** browser execution-policy enforcement + two-origin credential-forwarding proof →
