@@ -2447,7 +2447,7 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   Live health-gated re-run remains OWNER/LIVE. (Untracked `founder-review/probes.py`, a stale F04
   reproducer, now errors on the fixed return type — left as-is; not repo/suite code.)
 
-### [ ] FR-2 — Make evidence resolvability a storage-backed invariant (F03)
+### [x] FR-2 — Make evidence resolvability a storage-backed invariant (F03)
 - **Domain:** Trust / Reliability - **Effort:** M - **Mode:** LOOP
 - **Evidence (VERIFIED):** `run_context.TargetTransport._artifact()` records `request_ref=url` and
   `response_ref="HTTP {status}"` (run_context.py:361-364); the P0-6 reproducibility check
@@ -2462,6 +2462,19 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   artifact does NOT; the "resolvable" negative control **removes the blob** and the record flips to not
   resolvable with a populated `missing[]`. `full` green.
 - **Impact:** High (turns "resolvable" into a real, replayable claim).
+- **Result (`aa0d42b`, VERIFIED):** new content-addressed blob store in `store.py`
+  (`evidence_blobs`, per-run isolated; `put_evidence_blob`/`get_evidence_blob`/`evidence_blob_resolves`
+  = present AND hash-verified). `run_context._artifact` stores REDACTED request/response blobs
+  (`security.redact_secrets_in_url`/`redact_headers`/`redact_secrets_in_body`) only at the successful-send
+  site, double-guarded so a blob failure marks `evidence_blob_degraded` and never breaks a send;
+  non-executed paths store nothing. `_assess_completeness` now requires both blobs present+hash-verified;
+  string-only/mixed/missing/degraded each get a specific `missing[]`. Tests (offline): blob round-trip +
+  corruption, resolver positive/status-only/mixed, the NEGATIVE control (delete blob → resolvable flips),
+  producer wiring (send→resolvable; patched failure→ok+degraded), and an **NC-4 secret-canary** proving a
+  canary in url/header/body is absent from both stored blobs. Three P0-6 tests asserting string-only
+  resolvability flipped to the honest contract (not weakened). `full` green (harness 2696 OK/2 skip,
+  pytest-native 38, testing 185, evaluation_integrity 42). NOTE: generated reports now honestly render
+  historical status-only findings as "NOT independently reproducible" — intended F03 behavior.
 
 ### [ ] FR-5 — Bind negative evidence to the case, not the class (F09)
 - **Domain:** Trust / Correctness - **Effort:** M - **Mode:** LOOP
