@@ -31,9 +31,9 @@ REUSE (not reimplemented here):
   * `harness.store.finding_observations` / `all_host_findings` -- exact
     per-exchange attribution (AR-3) and the store's own raw findings.
   * `harness.confirmation_gate.should_quarantine_as_lead` /
-    `is_low_confidence_generic_guess`                      -- the SAME two
-    predicates `harness.report_generator.generate_markdown_report` applies,
-    in the SAME order -- see `compute_stages` -- so this adapter's
+    `is_low_confidence_generic_guess` / `is_uncorroborated_catchall_guess` --
+    the SAME three predicates `harness.report_generator.generate_markdown_report`
+    applies, in the SAME order -- see `compute_stages` -- so this adapter's
     surfaced/lead split cannot diverge from what the report actually shows.
   * `harness.report_generator.generate_markdown_report`     -- called directly
     (it is pure over the `findings` list given -- no store/network import in
@@ -46,13 +46,13 @@ Visibility derivation intentionally goes one step further than
 `run_blind_eval.py`'s own `build_scorecard` (which only applies
 `should_quarantine_as_lead`, ignoring `gate_low_confidence_generic` in its
 OWN counts even though it passes that flag to `generate_markdown_report`):
-`compute_stages` below applies BOTH predicates, in the SAME order, exactly as
-`generate_markdown_report` does -- because the acceptance bar here is
-"scorer and report cannot disagree" for ANY config this driver might use, not
-only the default. Feeding this adapter's `individual`-stage findings straight
-back into `generate_markdown_report` and diffing the declared lead count is
-what turns that claim from "the same predicate was pasted twice" into an
-actively-checked invariant.
+`compute_stages` below applies ALL THREE predicates, in the SAME order,
+exactly as `generate_markdown_report` does -- because the acceptance bar
+here is "scorer and report cannot disagree" for ANY config this driver might
+use, not only the default. Feeding this adapter's `individual`-stage findings
+straight back into `generate_markdown_report` and diffing the declared lead
+count is what turns that claim from "the same predicate was pasted twice"
+into an actively-checked invariant.
 
 Offline, deterministic. Never reads `*ANSWER_KEY*` or a blind target's
 `app.py`. `build_eval_artifact` touches `harness.store` (to validate the
@@ -85,6 +85,7 @@ import evidence_grade as _evidence_grade  # noqa: E402
 from harness.score_provenance import ScoreProvenance  # noqa: E402
 from harness.confirmation_gate import (  # noqa: E402
     should_quarantine_as_lead, is_low_confidence_generic_guess,
+    is_uncorroborated_catchall_guess,
 )
 from harness.report_generator import generate_markdown_report  # noqa: E402
 
@@ -130,17 +131,19 @@ def exchange_descriptor(id_: str, method: str, url: str) -> dict:
 def compute_stages(
     findings: list[dict], *, quarantine_leads: bool = True,
     gate_low_confidence_generic: bool = False, generic_confidence_floor: float = 0.5,
+    gate_uncorroborated_catchall: bool = False,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Split `findings` (store-shaped dicts) into (raw, individual, surfaced,
     lead) EXACTLY as `harness.report_generator.generate_markdown_report`
-    does: same two predicates (`should_quarantine_as_lead`,
-    `is_low_confidence_generic_guess`), same order, same short-circuit
-    (`elif`, not independent checks) -- see that function's own per-finding
-    loop. `raw` is every finding given (chain hypotheses included);
-    `individual` excludes `potential-attack-chain:*` synthetic entries (a
-    chain hypothesis is never itself surfaced/quarantined, matching the
-    report's own `chains` bucket); `surfaced`/`lead` partition `individual`.
-    `individual == surfaced + lead` always, by construction."""
+    does: same three predicates (`should_quarantine_as_lead`,
+    `is_low_confidence_generic_guess`, `is_uncorroborated_catchall_guess`),
+    same order, same short-circuit (`elif`, not independent checks) -- see
+    that function's own per-finding loop. `raw` is every finding given
+    (chain hypotheses included); `individual` excludes
+    `potential-attack-chain:*` synthetic entries (a chain hypothesis is never
+    itself surfaced/quarantined, matching the report's own `chains` bucket);
+    `surfaced`/`lead` partition `individual`. `individual == surfaced + lead`
+    always, by construction."""
     raw = list(findings)
     individual = [f for f in raw
                   if not str(f.get("vulnerability_class") or "").startswith("potential-attack-chain:")]
@@ -150,6 +153,8 @@ def compute_stages(
         if quarantine_leads and should_quarantine_as_lead(f):
             lead.append(f)
         elif gate_low_confidence_generic and is_low_confidence_generic_guess(f, generic_confidence_floor):
+            lead.append(f)
+        elif gate_uncorroborated_catchall and is_uncorroborated_catchall_guess(f):
             lead.append(f)
         else:
             surfaced.append(f)
@@ -273,6 +278,7 @@ def build_eval_artifact(
     quarantine_leads: bool = True,
     gate_low_confidence_generic: bool = False,
     generic_confidence_floor: float = 0.5,
+    gate_uncorroborated_catchall: bool = False,
     git_revision: str,
     run_id: str,
     corpus_id: str,
@@ -358,6 +364,7 @@ def build_eval_artifact(
         manifest=manifest, quarantine_leads=quarantine_leads,
         gate_low_confidence_generic=gate_low_confidence_generic,
         generic_confidence_floor=generic_confidence_floor,
+        gate_uncorroborated_catchall=gate_uncorroborated_catchall,
         git_revision=git_revision, run_id=run_id, corpus_id=corpus_id, inputs_hash=inputs_hash,
         complete=complete, instrumentation=instrumentation, proofs=proofs, cases=cases,
         artifacts=artifacts, observations=observations,
@@ -367,7 +374,8 @@ def build_eval_artifact(
 def _finalize_artifact(
     *, kind: str, host: str, stored_findings: list[dict], exchanges: list[dict],
     manifest: Manifest, quarantine_leads: bool, gate_low_confidence_generic: bool,
-    generic_confidence_floor: float, git_revision: str, run_id: str, corpus_id: str,
+    generic_confidence_floor: float, gate_uncorroborated_catchall: bool = False,
+    git_revision: str, run_id: str, corpus_id: str,
     inputs_hash: str, complete: bool, instrumentation: dict | None,
     proofs: list[dict], cases: list[dict], artifacts: list[dict],
     observations: dict[str, list[str]],
@@ -378,12 +386,14 @@ def _finalize_artifact(
     raw, individual, surfaced, lead = compute_stages(
         stored_findings, quarantine_leads=quarantine_leads,
         gate_low_confidence_generic=gate_low_confidence_generic,
-        generic_confidence_floor=generic_confidence_floor)
+        generic_confidence_floor=generic_confidence_floor,
+        gate_uncorroborated_catchall=gate_uncorroborated_catchall)
 
     markdown = generate_markdown_report(
         host, stored_findings, quarantine_leads=quarantine_leads,
         gate_low_confidence_generic=gate_low_confidence_generic,
-        generic_confidence_floor=generic_confidence_floor)
+        generic_confidence_floor=generic_confidence_floor,
+        gate_uncorroborated_catchall=gate_uncorroborated_catchall)
     declared = _report_declared_lead_count(markdown)
     if declared != len(lead):
         raise EvalAdapterError(
@@ -405,6 +415,7 @@ def _finalize_artifact(
         "quarantine_leads": quarantine_leads,
         "gate_low_confidence_generic": gate_low_confidence_generic,
         "generic_confidence_floor": generic_confidence_floor,
+        "gate_uncorroborated_catchall": gate_uncorroborated_catchall,
         "exchanges": [dict(e) for e in exchanges],
         "stages": {
             "raw": [_slim(f) for f in raw],
@@ -434,6 +445,7 @@ def rescore_saved_run(
     quarantine_leads: bool | None = None,
     gate_low_confidence_generic: bool | None = None,
     generic_confidence_floor: float | None = None,
+    gate_uncorroborated_catchall: bool | None = None,
 ) -> dict:
     """Recompute strict metrics for a saved run, read-only.
 
@@ -464,6 +476,8 @@ def rescore_saved_run(
             if gate_low_confidence_generic is None else gate_low_confidence_generic)
     floor = (saved.get("generic_confidence_floor", 0.5)
              if generic_confidence_floor is None else generic_confidence_floor)
+    guc = (saved.get("gate_uncorroborated_catchall", False)
+           if gate_uncorroborated_catchall is None else gate_uncorroborated_catchall)
 
     # Historical attribution is reused verbatim from what was recorded at
     # build time (see docstring) -- reconstruct fingerprint -> [exchange_id]
@@ -485,7 +499,8 @@ def rescore_saved_run(
     artifact = _finalize_artifact(
         kind="historical_rescore", host=host, stored_findings=raw, exchanges=exchanges,
         manifest=manifest, quarantine_leads=ql, gate_low_confidence_generic=glcg,
-        generic_confidence_floor=floor, git_revision=git_revision, run_id=saved_run_id,
+        generic_confidence_floor=floor, gate_uncorroborated_catchall=guc,
+        git_revision=git_revision, run_id=saved_run_id,
         corpus_id=manifest.corpus, inputs_hash=saved.get("provenance", {}).get("inputs_hash", ""),
         complete=True, instrumentation=saved.get("instrumentation"),
         proofs=proofs, cases=cases, artifacts=artifacts, observations=observations,

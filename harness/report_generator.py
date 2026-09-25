@@ -317,7 +317,8 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                               effort_ledger: EffortLedger | None = None, suppressed_count: int = 0,
                               quarantine_leads: bool = False,
                               gate_low_confidence_generic: bool = False,
-                              generic_confidence_floor: float = 0.5) -> str:
+                              generic_confidence_floor: float = 0.5,
+                              gate_uncorroborated_catchall: bool = False) -> str:
     """
     Build a submission-ready Markdown report from store.all_host_findings()
     -shaped dicts (or anything with the same keys). Chain hypotheses
@@ -348,8 +349,21 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     any run that doesn't opt in, is byte-for-byte unaffected (B2-5). Never
     routes a confirmed or oracle-verified finding, nor one at/above the floor
     -- see `is_low_confidence_generic_guess`'s own recall-guard docstring.
+
+    `gate_uncorroborated_catchall`: when True, UNCONFIRMED, non-oracle-verified
+    findings matching `confirmation_gate.is_uncorroborated_catchall_guess`
+    (ONLY the two catch-all classes `misconfig`/`info_disclosure`, regardless
+    of confidence) are ALSO routed to the leads bucket -- the FR-4 lever:
+    confidence is the wrong signal for these two classes specifically, so
+    this ignores confidence and requires a confirming leg or oracle
+    verification instead. SHIPPED OFF (False) so a fully-confirmed run, and
+    any run that doesn't opt in, is byte-for-byte unaffected. Deliberately
+    narrow -- never a global leg requirement; every other class is untouched.
     """
-    from harness.confirmation_gate import should_quarantine_as_lead, is_low_confidence_generic_guess
+    from harness.confirmation_gate import (
+        should_quarantine_as_lead, is_low_confidence_generic_guess,
+        is_uncorroborated_catchall_guess,
+    )
 
     generated_at = generated_at or datetime.now(timezone.utc)
 
@@ -375,6 +389,8 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
         if quarantine_leads and should_quarantine_as_lead(raw):
             leads_bucket.append(f)
         elif gate_low_confidence_generic and is_low_confidence_generic_guess(raw, generic_confidence_floor):
+            leads_bucket.append(f)
+        elif gate_uncorroborated_catchall and is_uncorroborated_catchall_guess(raw):
             leads_bucket.append(f)
         else:
             individual.append(f)

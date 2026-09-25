@@ -600,5 +600,72 @@ class ComputeStagesUnitTests(unittest.TestCase):
         self.assertEqual(len(surfaced), 1)
 
 
+# ---------------------------------------------------------------------------
+# FR-4 (2026-09-25): gate_uncorroborated_catchall stage-split tests. Mirrors
+# harness/test_gate_generic_guesses.py's caller-level report tests, but at
+# the eval_adapter stage-split level -- the two must never disagree (see
+# compute_stages' docstring: it applies the SAME predicates, in the SAME
+# order, as generate_markdown_report).
+# ---------------------------------------------------------------------------
+
+class GateUncorroboratedCatchallStageSplitTests(unittest.TestCase):
+    def _finding(self, vulnerability_class, confidence=0.9, confirmed=False,
+                oracle_verified=False, fingerprint="fp"):
+        return {
+            "vulnerability_class": vulnerability_class, "basis": "assumed",
+            "confirmed": confirmed, "oracle_verified": oracle_verified,
+            "confidence": confidence, "fingerprint": fingerprint,
+        }
+
+    def test_high_confidence_catchall_variants_routed_to_lead_not_surfaced(self):
+        # confidence=0.9 on every finding -- proves the gate ignores
+        # confidence entirely, unlike gate_low_confidence_generic.
+        findings = [
+            self._finding("security_misconfiguration", fingerprint="a"),
+            self._finding("Security misconfiguration", fingerprint="b"),
+            self._finding("information_disclosure", fingerprint="c"),
+            self._finding("verbose_error_disclosure", fingerprint="d"),
+            self._finding("excessive_data_exposure", fingerprint="e"),
+        ]
+        raw, individual, surfaced, lead = compute_stages(
+            findings, quarantine_leads=False, gate_uncorroborated_catchall=True)
+        self.assertEqual(len(individual), 5)
+        self.assertEqual(surfaced, [])
+        self.assertEqual({f["fingerprint"] for f in lead}, {"a", "b", "c", "d", "e"})
+
+    def test_confirmed_and_oracle_verified_catchall_stay_surfaced(self):
+        findings = [
+            self._finding("security_misconfiguration", confirmed=True, fingerprint="a"),
+            self._finding("information_disclosure", oracle_verified=True, fingerprint="b"),
+        ]
+        raw, individual, surfaced, lead = compute_stages(
+            findings, quarantine_leads=False, gate_uncorroborated_catchall=True)
+        self.assertEqual(lead, [])
+        self.assertEqual({f["fingerprint"] for f in surfaced}, {"a", "b"})
+
+    def test_negative_control_concrete_classes_stay_surfaced(self):
+        # No global leg requirement: sqli/xss/path_traversal are untouched
+        # even with the flag on.
+        findings = [
+            self._finding("sqli", fingerprint="a"),
+            self._finding("xss", fingerprint="b"),
+            self._finding("path_traversal", fingerprint="c"),
+        ]
+        raw, individual, surfaced, lead = compute_stages(
+            findings, quarantine_leads=False, gate_uncorroborated_catchall=True)
+        self.assertEqual(lead, [])
+        self.assertEqual({f["fingerprint"] for f in surfaced}, {"a", "b", "c"})
+
+    def test_flag_off_gates_nothing(self):
+        findings = [
+            self._finding("security_misconfiguration", fingerprint="a"),
+            self._finding("information_disclosure", fingerprint="b"),
+        ]
+        raw, individual, surfaced, lead = compute_stages(
+            findings, quarantine_leads=False, gate_uncorroborated_catchall=False)
+        self.assertEqual(lead, [])
+        self.assertEqual({f["fingerprint"] for f in surfaced}, {"a", "b"})
+
+
 if __name__ == "__main__":
     unittest.main()

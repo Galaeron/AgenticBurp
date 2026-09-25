@@ -607,6 +607,20 @@ reporting:
   # runner's explicit config dict) for blind/no-oracle evaluation.
   gate_low_confidence_generic: false
   generic_confidence_floor: 0.5
+  # 2026-09-25 FR-4 (supersedes BM-1): for ONLY the two catch-all classes
+  # (misconfig, info_disclosure -- see confirmation_gate.DEFAULT_CATCHALL_CLASSES),
+  # require a confirming leg (confirmed OR oracle_verified) before the
+  # finding is surfaced, rather than trusting its self-reported confidence --
+  # an offline re-score found confidence is the wrong lever for these two
+  # classes specifically (most sit at confidence >= 0.5 already). Demoted
+  # findings are routed to the same `leads` bucket as gate_low_confidence_generic,
+  # not deleted. Deliberately narrow: sqli/xss/idor/path_traversal/jwt/csrf/etc.
+  # are NEVER affected by this flag -- a global leg requirement was measured
+  # to collapse recall to 0.05. SHIPPED OFF so a fully-confirmed run, and any
+  # run that doesn't opt in, is byte-for-byte unaffected; enable in the
+  # measurement overlay (config.local.yaml or the runner's explicit config
+  # dict) for blind/no-oracle evaluation.
+  gate_uncorroborated_catchall: false
 
 # Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
 # off. When enabled, a CONFIRMED finding's host-agnostic structural shape

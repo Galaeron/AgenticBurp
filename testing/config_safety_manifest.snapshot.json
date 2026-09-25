@@ -1,6 +1,6 @@
 {
   "config_path": "harness/config.yaml",
-  "hash": "38cd5fd324285c41e00311e9ca5111374869b87b2fa0bcf4784893a748f93c33",
+  "hash": "4030a78ce2f2acf3559702c895ce3c7882666b47fc9b21b16766e8223751c252",
   "manifest": "config-safety-defaults",
   "rationale": {
     "adaptive_respin.enabled": "adaptive respin loop; ships disabled",
@@ -11,6 +11,7 @@
     "iterative_agent.enabled": "iterative agent mode; ships disabled",
     "operating_profile": "profile selector; 'none' = shipped passive defaults",
     "reporting.gate_low_confidence_generic": "low-confidence generic gating default",
+    "reporting.gate_uncorroborated_catchall": "uncorroborated catch-all gating default",
     "reporting.quarantine_unverified_leads": "lead quarantine reporting default",
     "validators.active_enabled": "PASSIVE DEFAULT: active target probing must ship false",
     "validators.allow_mutating_replay": "MUTATION GATE: state-changing replay must ship false",
@@ -25,6 +26,7 @@
     "iterative_agent.enabled": false,
     "operating_profile": "none",
     "reporting.gate_low_confidence_generic": false,
+    "reporting.gate_uncorroborated_catchall": false,
     "reporting.quarantine_unverified_leads": false,
     "validators.active_enabled": false,
     "validators.allow_mutating_replay": false,

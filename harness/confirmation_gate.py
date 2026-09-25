@@ -439,6 +439,14 @@ _GENERIC_CLASS_SOURCE_PHRASES: tuple[str, ...] = (
     "Security misconfiguration",
     "Broken Access Control (Workflow Bypass)",
     "SQL injection",
+    # 2026-09-25 FR-4: info_disclosure joins the generic set now that
+    # categories.py's synonym table folds the model's actual info-disclosure
+    # spelling variants (information_disclosure, verbose_error_disclosure,
+    # excessive_data_exposure, exposure_of_internal_data,
+    # exposure_of_sensitive_information, information_disclosure_header, ...)
+    # into this one canonical key -- see categories._SYNONYMS. Before that
+    # fix this class could never be reached here at all.
+    "Information Disclosure",
 )
 
 
@@ -493,6 +501,74 @@ def is_low_confidence_generic_guess(finding, floor: float = 0.5, generic_classes
     if not isinstance(confidence, (int, float)) or confidence >= floor:
         return False
     return _generic_class_key(vc) in generic_classes
+
+
+# 2026-09-25 FR-4 (supersedes BM-1): offline re-score of the captured
+# benchmark findings (reviews/2026-09-25/benchmark/*_strict_3x.json) showed
+# confidence is the WRONG lever for exactly two catch-all classes --
+# `misconfig` and `info_disclosure` are 69 of 101 pooled FPs but only 8 of 30
+# pooled TPs, and 86/96 misconfig + 65/76 info-disclosure findings sit at
+# confidence >= 0.5 (many pinned at exactly 0.50, an uncalibrated default) --
+# so `is_low_confidence_generic_guess`'s confidence floor barely reaches them.
+# The measured effective lever is instead an EVIDENCE requirement: for ONLY
+# these two classes, require a confirming leg (confirmed OR oracle_verified)
+# before the finding is surfaced, regardless of its self-reported confidence.
+# Offline re-score: pooled precision 0.232 -> 0.407, F1 0.358 -> 0.500 (recall
+# 0.784 -> 0.649; demoted findings are routed to leads, not deleted).
+#
+# This is DELIBERATELY narrow -- a GLOBAL leg requirement collapses recall to
+# 0.05 (see the same re-score) and is explicitly NOT what this predicate
+# does: only `DEFAULT_CATCHALL_CLASSES` is affected. sqli/xss/idor/
+# path_traversal/jwt/csrf/etc. are untouched by this gate.
+_CATCHALL_CLASS_SOURCE_PHRASES: tuple[str, ...] = (
+    "Security misconfiguration",
+    "Information Disclosure",
+)
+
+DEFAULT_CATCHALL_CLASSES: frozenset = frozenset(
+    _generic_class_key(p) for p in _CATCHALL_CLASS_SOURCE_PHRASES
+)
+
+
+def is_uncorroborated_catchall_guess(finding, catchall_classes=None) -> bool:
+    """True when a finding is an UNCONFIRMED, UNCORROBORATED guess in one of
+    a narrow set of catch-all vulnerability classes (`misconfig`,
+    `info_disclosure` by default) -- the measured effective FP lever for
+    these two classes (see the module comment above this function).
+
+    ALL of the following must hold:
+      - Not confirmed (confirmed is False).
+      - Not oracle-verified (oracle_verified is False).
+      - The finding's vulnerability_class resolves (via `_generic_class_key`)
+        to one of `catchall_classes`.
+
+    UNLIKE `is_low_confidence_generic_guess`, this predicate ignores
+    `confidence` entirely -- that is the point: these two classes sit at
+    confidence >= 0.5 far too often for a confidence floor to catch them, so
+    the lever here is corroborating evidence (a confirming leg or an oracle
+    verification), not the model's own confidence number.
+
+    Same recall guard as its siblings: a confirmed or oracle-verified finding
+    is NEVER routed here, no matter its class. `catchall_classes` defaults to
+    `DEFAULT_CATCHALL_CLASSES`, a deliberately narrow, reviewable set --
+    never a broad substring match, and never applied globally (a same-class
+    concrete finding of any OTHER class always still surfaces).
+
+    Accepts a dict-or-object finding, mirroring `is_low_confidence_generic_guess`."""
+    catchall_classes = DEFAULT_CATCHALL_CLASSES if catchall_classes is None else catchall_classes
+
+    if isinstance(finding, dict):
+        confirmed = bool(finding.get("confirmed", False))
+        oracle_verified = bool(finding.get("oracle_verified", False))
+        vc = finding.get("vulnerability_class", "")
+    else:
+        confirmed = bool(getattr(finding, "confirmed", False))
+        oracle_verified = bool(getattr(finding, "oracle_verified", False))
+        vc = getattr(finding, "vulnerability_class", "")
+
+    if confirmed or oracle_verified:
+        return False
+    return _generic_class_key(vc) in catchall_classes
 
 
 def _controlled_negative_classes(validation_reports: list | None) -> set:

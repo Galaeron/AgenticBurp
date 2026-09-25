@@ -93,6 +93,7 @@ def run_corpus_strict(corpus_path, manifest_path, *, config=None, n_runs=3,
     host = hosts[0]
     quarantine = bool((config.get("reporting", {}) or {}).get("quarantine_unverified_leads", False))
     gate_generic = bool((config.get("reporting", {}) or {}).get("gate_low_confidence_generic", False))
+    gate_catchall = bool((config.get("reporting", {}) or {}).get("gate_uncorroborated_catchall", False))
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
@@ -113,6 +114,7 @@ def run_corpus_strict(corpus_path, manifest_path, *, config=None, n_runs=3,
             artifact = eval_adapter.build_eval_artifact(
                 host=host, stored_findings=stored, exchanges=descriptors, manifest=manifest,
                 quarantine_leads=quarantine, gate_low_confidence_generic=gate_generic,
+                gate_uncorroborated_catchall=gate_catchall,
                 git_revision=git_revision, run_id=f"{manifest.corpus}-run{i}",
                 corpus_id=manifest.corpus, inputs_hash=manifest.hash, complete=True,
                 validate_against_store=True)
