@@ -2,8 +2,11 @@
 
 **Status: complete.** 5 corpora × 3 repeats replayed through the live local model on
 2026-09-25; 4 strict-scored against exact-class manifests, blind-target-2 run for raw
-detection volume only. Headline: pooled exact-class **P=0.23, R=0.81** — a high-recall,
-low-precision detection-triage profile, replacing the prior meaningless `recall(any)=1.0`.
+detection volume only. Headline (one repeat per app, the per-application figure):
+pooled exact-class **P=0.23, R=0.81** — a high-recall, low-precision detection-triage
+profile, replacing the prior meaningless `recall(any)=1.0`. Summed over all 12 scored
+runs (3 repeats × 4 apps) the same data reads **P=0.236, R=0.820** (91 tp / 294 fp /
+20 fn) — see "Results" below for why these two numbers are not interchangeable.
 
 ## What was run and why it is trustworthy this time
 
@@ -48,21 +51,44 @@ a local 8B model — not a measure of end-to-end exploitation or of blind-target
 
 ## Results (mean of 3 repeats) — all 5 complete
 
-| Corpus | exact-class P | exact-class R | F1 | raw findings/run | #exchanges | over-alert × | baselines OK |
+| Corpus | exact-class P | exact-class R | F1 | raw findings/run | #exchanges | over-alert ×† | baselines OK |
 |---|--:|--:|--:|--:|--:|--:|---|
 | WebGoat | 0.500 | 1.000 | 0.667 | ~17 | 7 | 2.4× | ✓ |
 | DVWA | 0.233 | 1.000 | 0.378 | ~48 | 14 | 3.4× | ✓ |
 | PixelMart (sanitized) | 0.204 | **0.714** | 0.317 | ~112 | 22 | 5.1× | ✓ |
 | Juice Shop | 0.239 | 0.778 | 0.366 | ~215 | 50 | 4.3× | ✓ |
-| **POOLED (micro, 4 corpora)** | **0.229** | **0.811** | **0.357** | — | 93 | — | ✓ |
+| **POOLED — one repeat/app (4 corpora)** | **0.229** | **0.811** | **0.357** | — | 93 | — | ✓ |
+| POOLED — sum over all 12 runs | 0.236 | 0.820 | 0.367 | — | 93 | — | ✓ |
 | blind-target-2 | n/a — raw only | n/a | — | ~80 | 42 | 1.9× | n/a |
 
-Pooled micro across the 4 scored corpora: tp=30, fp=101, fn=7. Per-repeat variance is
-negligible (e.g. DVWA P = 0.235/0.235/0.229). Every run's indiscriminate baselines
-FAIL the gate (`discriminating=True`) — certified exact-class numbers, not the old
-any-alert theatre. **blind-target-2** carries no exact-class ground truth (answer key
-off-limits), so it is not scored; its ~80 findings/run for 42 exchanges is reported as
-raw detection volume only (the same ~2× over-alert ratio holds).
+Two pooled figures are reported, each with its own denominator, and neither
+supersedes the other (`testing/pool_strict_runs.py`, FR-3):
+
+- **One repeat per app (per-application figure):** tp=30, fp=101, fn=7 — P=0.229,
+  R=0.811. Four apps, one measurement each; this is the figure to trust for
+  cross-app generalization.
+- **Sum over all 12 scored runs (4 corpora × 3 repeats):** tp=91, fp=294, fn=20 —
+  P=0.236, R=0.820. **Three repeats of the same corpus/config/model are not three
+  independent applications** (founder review, §9) — summing their raw counts
+  inflates the denominator from 4 apps' worth of evidence to 12 "apps'" worth
+  without adding independent samples. Report this number as "sum over N runs,"
+  never as if it were N independent trials, and cluster uncertainty by
+  application, not by run.
+
+Both figures are recomputed from the committed `*_strict_3x.json` run artifacts by
+`testing/pool_strict_runs.py` (`all_runs_pooled` / `first_run_pool`; see
+`testing/test_pool_strict_runs.py` for the unit tests), not hand-transcribed.
+Per-repeat variance is negligible (e.g. DVWA P = 0.235/0.235/0.229). Every run's
+indiscriminate baselines FAIL the gate (`discriminating=True`) — certified
+exact-class numbers, not the old any-alert theatre. **blind-target-2** carries no
+exact-class ground truth (answer key off-limits), so it is not scored, is excluded
+from both pooled figures above, and its ~80 findings/run for 42 exchanges is
+reported as raw detection volume only (the same ~2× over-alert ratio holds).
+
+† "over-alert ×" is `raw findings/run` ÷ `#exchanges` — a **workload-volume**
+ratio (how many findings a reviewer must triage per exchange), not a false-positive
+rate against ground truth; the exact-class P column above is the actual precision
+figure.
 
 ### What the numbers say (consistent across all 4 scored corpora)
 
@@ -118,7 +144,10 @@ Sources: [XBOW pentest](https://xbow.com/pentest), [MAPTA / Multi-Agent Pentesti
 
 **This run empirically confirms what the two principal reviews argued and what this
 session's strict-scoring work was built to expose. Pooled exact-class P=0.23, R=0.81
-across 4 labeled corpora (30 tp / 101 fp / 7 fn).**
+across 4 labeled corpora, one repeat per app (30 tp / 101 fp / 7 fn); summed over all
+12 scored runs the same evidence reads P=0.236, R=0.820 (91 tp / 294 fp / 20 fn) — the
+two figures are not interchangeable (three repeats are not three independent apps; see
+"Results" above).**
 
 1. **R06 was right.** The old `recall(any)=1.0` headline was meaningless. Under exact-
    class scoring the same pipeline scores **P≈0.20–0.50, R≈0.71–1.0** — a high-recall,
@@ -155,3 +184,10 @@ model on those classes or class-specific active probes.
 scorecard + baseline gate. Manifests: `testing/labels/{webgoat,dvwa,juiceshop,
 pixelmart}.labels.json`. Raw run artifacts: `reviews/2026-09-25/benchmark/
 *_strict_3x.json`. Model `qwen3:8b`, shipped-default passive config, 2026-09-25.
+
+Pooled headline numbers (both the one-repeat-per-app and all-12-runs figures above)
+are recomputed from those raw run artifacts, not hand-transcribed:
+`python -m testing.pool_strict_runs reviews/2026-09-25/benchmark/{webgoat,dvwa,
+pixelmart,juiceshop}_strict_3x.json` (FR-3; unit-tested in
+`testing/test_pool_strict_runs.py`, synthetic-fixture-only so it needs no local
+artifacts to pass in CI).
