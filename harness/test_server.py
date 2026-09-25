@@ -1065,6 +1065,104 @@ class InvestigateJobAdmissionAndRetentionTests(unittest.TestCase):
             self._poll(f"/engagement/shop.test/investigate/{running_job_id}", {"done", "error"})
 
 
+class ReadAuthTests(unittest.TestCase):
+    """FR-8 (F12 offline half): server.require_read_auth is an opt-in gate on
+    sensitive GET reads (/report, /telemetry, /test-plans/{plan_id}, GET
+    /settings) that closes the gap _require_auth's loopback bypass otherwise
+    leaves open -- another local process/user with no token at all could
+    read findings/evidence/diagnostics, since _require_auth only checks a
+    CONFIGURED operator token and the RB-1 CSRF middleware only guards
+    mutating methods. Ships FALSE (see config.yaml's server.require_read_auth
+    comment) so the default deploy and the Burp extension's existing
+    token-less reads are byte-for-byte unchanged; these tests flip
+    `harness.server._READ_AUTH_ENABLED` directly (never config.yaml) --
+    _require_read_auth's own docstring says it re-reads that module global
+    fresh on every call for exactly this purpose.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "test_harness_state.db"
+        import importlib
+        import harness.server as server_module
+        importlib.reload(server_module)
+        self.server = server_module
+        # No default Authorization header attached to this client (unlike
+        # the other TestCase classes in this file) -- these tests need to
+        # control the header per-request to prove the without-token/
+        # with-token behavior.
+        from fastapi.testclient import TestClient
+        self.client = TestClient(server_module.app, base_url="http://localhost")
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def _auth_header(self):
+        return {"Authorization": f"Bearer {self.server._mutation_token()}"}
+
+    # --- Caller test: enabled --------------------------------------------
+
+    def test_telemetry_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/telemetry")
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get("/telemetry", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_report_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/report", params={"url": "http://localhost/x"})
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get("/report", params={"url": "http://localhost/x"}, headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_test_plan_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/test-plans/unknown-plan-id")
+        self.assertEqual(resp.status_code, 401)
+        # A valid token gets past the auth gate to the route's own logic --
+        # 404 (unknown plan) here, never 401, proving auth actually passed.
+        resp = self.client.get("/test-plans/unknown-plan-id", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 404)
+
+    def test_settings_get_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/settings")
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get("/settings", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_health_stays_open_when_enabled(self):
+        # /health must never be gated -- pairing/liveness needs it open
+        # unconditionally, flag or no flag.
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 200)
+
+    # --- NEGATIVE CONTROL: disabled (the shipped default) ------------------
+
+    def test_telemetry_and_report_unauthenticated_when_disabled(self):
+        # Proves the default (require_read_auth: false, i.e. _READ_AUTH_ENABLED
+        # is False after a fresh module reload with no config.local.yaml
+        # override) leaves these reads exactly as before FR-8 -- the Burp
+        # extension's existing token-less reads keep working.
+        self.assertFalse(self.server._READ_AUTH_ENABLED,
+                         "test env must reflect the shipped false default")
+        resp = self.client.get("/telemetry")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/report", params={"url": "http://localhost/x"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_test_plan_and_settings_unauthenticated_when_disabled(self):
+        self.assertFalse(self.server._READ_AUTH_ENABLED)
+        resp = self.client.get("/test-plans/unknown-plan-id")
+        self.assertEqual(resp.status_code, 404)  # not 401 -- no auth gate at all
+        resp = self.client.get("/settings")
+        self.assertEqual(resp.status_code, 200)
+
+
 class HostHeaderDefenseTests(unittest.TestCase):
     """W-4: DNS-rebinding / Host-header defense. Any request whose Host is not
     a trusted (loopback) host must be rejected before it reaches an endpoint,

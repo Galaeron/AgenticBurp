@@ -417,6 +417,18 @@ server:
   # Cap on request/response body bytes sent into prompts, to keep local
   # context windows sane. Bodies are truncated, not dropped, with a marker.
   max_body_chars: 6000
+  # FR-8 (F12 offline half): when true, sensitive GET reads (/report,
+  # /telemetry, /test-plans/{plan_id}, GET /settings) require the same
+  # effective bearer token already required on mutations (server.auth_token/
+  # HARNESS_BEARER_TOKEN if configured, else the ephemeral RB-1 token).
+  # /health stays open either way, for pairing/liveness.
+  #
+  # SAFE DEFAULT: false. Shipping true here would break the Burp extension's
+  # existing unauthenticated reads until its Java side is updated to send the
+  # token on GETs too (that's the OWNER half of F12, not done yet) -- so the
+  # default deploy stays byte-for-byte unchanged. An operator who wants this
+  # hardening today can flip it via the git-ignored config.local.yaml overlay.
+  require_read_auth: false
 
 # Validator/tool layer. Agents propose hypotheses; validators independently
 # test them. Active validators are OFF by default and never accept a

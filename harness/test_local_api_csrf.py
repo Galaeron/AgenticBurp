@@ -123,6 +123,24 @@ class LocalApiCsrfDefenseTests(unittest.TestCase):
         resp = self.client.post("/cache/clear", headers={"Authorization": f"Bearer {self.token}"})
         self.assertEqual(resp.status_code, 200)
 
+    # --- FR-8 regression guard: server.require_read_auth must not touch mutations ---
+
+    def test_mutation_gating_unaffected_by_read_auth_flag(self):
+        # FR-8 added a SEPARATE, opt-in gate (_require_read_auth /
+        # server._READ_AUTH_ENABLED) for sensitive GET reads. It must never
+        # change this class's existing mutation-auth behavior -- the
+        # token-less-401 / valid-token-200 result on a state-changing route
+        # is identical whether the read-auth flag is on or off, because
+        # _csrf_defense_middleware's mutation check (control 1) never
+        # consults it.
+        for read_auth_enabled in (False, True):
+            self.server._READ_AUTH_ENABLED = read_auth_enabled
+            with self.subTest(read_auth_enabled=read_auth_enabled):
+                resp = self.client.post("/cache/clear")
+                self.assertEqual(resp.status_code, 401)
+                resp = self.client.post("/cache/clear", headers={"Authorization": f"Bearer {self.token}"})
+                self.assertEqual(resp.status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,7 @@ SAFETY_KEYS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("reporting", "quarantine_unverified_leads"), "lead quarantine reporting default"),
     (("reporting", "gate_low_confidence_generic"), "low-confidence generic gating default"),
     (("reporting", "gate_uncorroborated_catchall"), "uncorroborated catch-all gating default"),
+    (("server", "require_read_auth"), "sensitive-read auth toggle default"),
     (("adaptive_respin", "enabled"), "adaptive respin loop; ships disabled"),
     (("iterative_agent", "enabled"), "iterative agent mode; ships disabled"),
 )

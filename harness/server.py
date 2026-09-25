@@ -115,6 +115,13 @@ def _is_loopback(host: str) -> bool:
 
 _BEARER_TOKEN = config.get("server", {}).get("auth_token") or os.environ.get("HARNESS_BEARER_TOKEN")
 _SERVER_HOST = config.get("server", {}).get("host", "127.0.0.1")
+# FR-8 (F12 offline half): ships false -- see the config.yaml comment on
+# server.require_read_auth for why. Read as a plain module global (not
+# wrapped in a function) so a test can flip it directly via
+# `server._READ_AUTH_ENABLED = True`/`False` without a config reload;
+# _require_read_auth below re-reads this name from the module each call
+# (never captures it in a closure/default arg) so that monkeypatch works.
+_READ_AUTH_ENABLED = bool(config.get("server", {}).get("require_read_auth", False))
 if not _is_loopback(_SERVER_HOST) and not _BEARER_TOKEN:
     raise RuntimeError(
         "Refusing non-loopback harness.server.host without authentication. "
@@ -236,6 +243,36 @@ def _mutation_token() -> str | None:
     return _BEARER_TOKEN or _EPHEMERAL_TOKEN
 
 
+def _require_read_auth(authorization: str | None) -> None:
+    """FR-8 (F12 offline half): opt-in gate for sensitive GET reads
+    (/report, /telemetry, /test-plans/{plan_id}, GET /settings) -- routes
+    that expose captured client traffic, discovered secrets and diagnostics,
+    which _require_auth's loopback bypass otherwise leaves open to any local
+    process/user with no token at all. Deliberately a SEPARATE function from
+    _require_auth (which stays exactly as it was: unchanged, still gates
+    only on the configured _BEARER_TOKEN, still bypassed on loopback with no
+    configured token) -- this one is opt-in via server.require_read_auth
+    (ships false) and, when armed, requires the SAME effective token already
+    required on mutations (_mutation_token(): the configured token if set,
+    else the RB-1 ephemeral one), not just a configured operator token. That
+    lets an operator arm this on the default no-token-configured loopback
+    deploy and still have it mean something (today's ephemeral mutation
+    token), rather than requiring them to additionally set server.auth_token.
+
+    Reads the _READ_AUTH_ENABLED module global fresh on every call (never
+    caches it in a default arg or closure) so a test can flip
+    `server._READ_AUTH_ENABLED` directly without reloading the module or
+    re-reading config.yaml. /health calls neither this nor _require_auth and
+    must stay that way -- it is the one route pairing/liveness needs open
+    unconditionally.
+    """
+    if not _READ_AUTH_ENABLED:
+        return
+    expected = f"Bearer {_mutation_token()}"
+    if not authorization or not secrets.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+
 @app.middleware("http")
 async def _csrf_defense_middleware(request, call_next):
     """Runs on every request, after TrustedHostMiddleware's Host check and
@@ -291,7 +328,8 @@ async def health():
 
 
 @app.get("/telemetry")
-async def telemetry(run_id: str | None = None):
+async def telemetry(run_id: str | None = None, authorization: str | None = Header(default=None)):
+    _require_read_auth(authorization)
     from harness import coordinator
     import harness.telemetry as _telemetry
     # W-11: the diagnostics snapshot answers "why did this target produce
@@ -323,6 +361,7 @@ async def report(url: str, authorization: str | None = Header(default=None)):
     of unconfirmed findings for real, in-session token-spend data.
     """
     _require_auth(authorization)
+    _require_read_auth(authorization)
     from harness import report_generator
     markdown = await __import__("asyncio").to_thread(
         report_generator.generate_report_for_host, url, orchestrator.effort_budget.ledger,
@@ -333,6 +372,7 @@ async def report(url: str, authorization: str | None = Header(default=None)):
 @app.get("/test-plans/{plan_id}")
 async def test_plan(plan_id: str, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
+    _require_read_auth(authorization)
     plan = await __import__("asyncio").to_thread(store.get_test_plan, plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="unknown test plan")
@@ -784,6 +824,7 @@ async def get_settings(authorization: str | None = Header(default=None)):
     the default per-vulnerability retry budget. Reflects the live values, which
     a request may have changed since startup."""
     _require_auth(authorization)
+    _require_read_auth(authorization)
     from harness import global_throttle
     from harness import llm_provider as _llm_provider
     p = orchestrator.retry_budget_policy
