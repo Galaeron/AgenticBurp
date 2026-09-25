@@ -2418,7 +2418,7 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   revert fails loudly) + mean-vs-pooled denominators cannot be conflated. `full` green (harness 2684
   OK/2 skip, pytest-native 38, testing 177, evaluation_integrity 42).
 
-### [ ] FR-1 — Health-certify the strict benchmark runner; a failed run is never "complete" (F04)
+### [x] FR-1 — Health-certify the strict benchmark runner; a failed run is never "complete" (F04)
 - **Domain:** Evaluation / Reliability - **Effort:** M - **Mode:** LOOP
 - **Evidence (VERIFIED source + synthetic failure):** `testing/strict_benchmark._one_run()` runs the
   orchestrator but discards per-exchange analyze failures, and `run_corpus_strict()` passes a hardcoded
@@ -2434,6 +2434,18 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   model startup: no affected run receives a healthy certification, partial metrics stay visible;
   NEGATIVE control — a genuinely healthy run still certifies. `full` green.
 - **Impact:** High (a completion stamp currently can hide an inoperative detector).
+- **Result (`cf0f953`, VERIFIED):** `_one_run` now returns the `ExchangeOutcome` list (+ guarded
+  orchestrator cleanup); new pure `assess_run_health` marks a run ineligible on any exchange error,
+  missing exchanges, zero completed, or empty store despite exchanges (partial metrics stay visible);
+  `run_corpus_strict` sets `complete=health.eligible`, attaches `run_health`, returns
+  `certified`/`all_runs_eligible`, and restores the leaked `harness.cache` global. New `_inputs_identity`
+  hashes corpus+config+manifest+git(+dirty); `model_digest` recorded `"unavailable"`, never fabricated.
+  Tests (`testing/test_strict_benchmark_health.py`, offline): pure layer + healthy negative control;
+  run-health falsifier monkeypatches `_one_run` (all-fail → ineligible/`complete=False`, metrics still
+  visible; healthy stub persists a real finding → `complete=True`) + asserts store/cache globals
+  restored. `full` green (harness 2684 OK/2 skip, pytest-native 38, testing 185, evaluation_integrity 42).
+  Live health-gated re-run remains OWNER/LIVE. (Untracked `founder-review/probes.py`, a stale F04
+  reproducer, now errors on the fixed return type — left as-is; not repo/suite code.)
 
 ### [ ] FR-2 — Make evidence resolvability a storage-backed invariant (F03)
 - **Domain:** Trust / Reliability - **Effort:** M - **Mode:** LOOP

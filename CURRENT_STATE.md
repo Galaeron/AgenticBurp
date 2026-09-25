@@ -4,7 +4,7 @@
 
 Branch `reconciliation-backlog`; base HEAD before this session's work was
 `59ef1f536e3fffec23aff43656c26d4185124dbe`. This session filed a founder-review
-improvement batch and landed **FR-4** (`96c17ff`) and **FR-3** (`7050d89`) plus doc updates.
+improvement batch and landed **FR-4** (`96c17ff`), **FR-3** (`7050d89`) and **FR-1** (`cf0f953`) plus doc updates.
 Pre-existing README edits and untracked runtime/evaluation/worktree artifacts
 remain — preserve them. Remote-main parity is not established.
 
@@ -17,8 +17,8 @@ The review has 23 sections, 15 findings (F01–F15), target architecture, a P0�
 roadmap, scorecard, ablation protocol and 30/60/90-day gates.
 
 Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14):
-- `full` green after FR-4+FR-3: harness 2684 OK (2 skips); pytest-native 38 passed;
-  testing 177 OK; evaluation_integrity 42 OK. `config_manifest --check` clean.
+- `full` green after FR-4+FR-3+FR-1: harness 2684 OK (2 skips); pytest-native 38 passed;
+  testing 185 OK; evaluation_integrity 42 OK. `config_manifest --check` clean.
 - Founder-review synthetic probes reproduce browser same-origin POST permission,
   bridge-only tool-egress flags, false ledger resolvability, and discarded runner
   failures (F01/F02/F03/F04).
@@ -48,10 +48,14 @@ findings produced the **FR-\*** batch in
   sum (91/294/20, P=0.236/R=0.820) with the "3 repeats ≠ 3 independent apps" caveat, and
   footnotes `over-alert ×` as workload not FP-rate. Synthetic-only tests with a first-run-only
   negative control.
-- **Still open (loop-consumable, offline), in order:** FR-1 (runner health-certification
-  / F04), FR-2 (resolvable evidence blobs / F03), FR-5 (case-bound negative evidence /
-  F09), FR-6 (credential differential / F10), FR-7 (pure-inference cache / F11), FR-8
-  (authenticated reads / F12).
+- **FR-1 `[x]` `cf0f953` (VERIFIED):** the strict runner (`testing/strict_benchmark.py`) now
+  health-certifies each run — `_one_run` returns its outcomes, pure `assess_run_health` marks a
+  failed/empty run ineligible (partial metrics stay visible), `complete=health.eligible` (no more
+  hardcoded `True`), a real `_inputs_identity` replaces the bare manifest hash, and the leaked
+  `harness.cache` global is restored. Offline falsifier + healthy negative control.
+- **Still open (loop-consumable, offline), in order:** FR-2 (resolvable evidence blobs / F03),
+  FR-5 (case-bound negative evidence / F09), FR-6 (credential differential / F10), FR-7
+  (pure-inference cache / F11), FR-8 (authenticated reads / F12).
 - **Skip-only (OWNER/LIVE), cross-referenced as FR-O\*:** F01/F02/F08 enforcement
   + two-origin/egress proof (`PR-10`/`PR-11`/`NC-O1..3`, `P1-10`), F05/F14 pairing
   + build (`PR-A`/`PR-C`/`NC-O5`), F07 ablations (`PR-B`), F06 independent
