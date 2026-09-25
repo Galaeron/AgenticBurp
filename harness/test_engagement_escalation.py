@@ -9,9 +9,9 @@ from harness.engagement import EngagementState
 
 
 class _Resp:
-    def __init__(self, status):
+    def __init__(self, status, text=""):
         self.status_code = status
-        self.text = ""
+        self.text = text
         # W-16: the credential probe now sends via run_context.TargetTransport, which
         # inspects response headers (redirect handling), so the mock must carry them.
         self.headers = {}
@@ -47,7 +47,17 @@ class AutoEscalateGuardTests(unittest.TestCase):
             return _FakeCrawlResult()
 
         async def fake_request(self, method, url, headers=None, **kw):  # W-16: transport uses .request
-            return _Resp(verify_status)
+            # FR-6: _credential_grants_access now sends credentialed + anonymous +
+            # invalid-token probes and requires a differential, so the mock must
+            # distinguish the genuine, uncorrupted credential from everything else
+            # (no credential at all, or the FR-6-corrupted invalid-token control).
+            # Only the genuine credential ever sees `verify_status`; anon/invalid
+            # always see a fixed 401 denial, so a `verify_status < 400` case is a
+            # real grant (distinguishable from both controls) and a `>= 400` case
+            # is caught by the early-exit before any control is even sent.
+            if (headers or {}).get("Authorization") == "Bearer learned":
+                return _Resp(verify_status, text="granted" if verify_status < 400 else "denied")
+            return _Resp(401, text="denied")
 
         with patch("harness.role_crawl.crawl_roles", fake_crawl), \
              patch("httpx.AsyncClient.request", fake_request):

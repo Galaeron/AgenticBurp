@@ -17,7 +17,46 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # investigate_engagement has a `run_context` parameter that would shadow the module;
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
 # standalone one when it is None".
-from harness.run_context import transport_for
+from harness.run_context import transport_for, ExecutionOutcome
+# FR-6: need the module too, for `_CREDENTIAL_HEADERS` -- aliased for the same
+# shadowing reason as above (several methods below have a `run_context` parameter).
+from harness import run_context as _run_context_mod
+
+
+# FR-6 (F10) sentinel appended to a header value to make it a genuinely invalid
+# credential control -- see `_invalidated_headers` below.
+_FR6_INVALID_SENTINEL = "_fr6_invalid"
+
+
+def _invalidated_headers(headers: dict) -> dict:
+    """Return a copy of `headers` with the credential corrupted, for the
+    invalid-token control probe in `_credential_grants_access`. Corrupts the
+    VALUE of every header recognised as a credential header
+    (`run_context._CREDENTIAL_HEADERS`: authorization/cookie/proxy-authorization)
+    so the server should reject it. If none of the supplied headers are
+    recognised credential headers (e.g. a bespoke `X-Api-Key` scheme), corrupts
+    every supplied header's value instead, so the control is always genuinely
+    invalid rather than an accidental no-op. Header NAMES are always preserved
+    so routing/auth dispatch is unchanged -- only the value is corrupted."""
+    out = dict(headers or {})
+    cred_keys = [k for k in out if k.lower() in _run_context_mod._CREDENTIAL_HEADERS]
+    for k in (cred_keys or list(out.keys())):
+        out[k] = f"{out[k]}{_FR6_INVALID_SENTINEL}"
+    return out
+
+
+def _responses_equivalent(a: ExecutionOutcome, b: ExecutionOutcome) -> bool:
+    """True when two probe outcomes represent the same access: identical status
+    AND identical body. A None/errored outcome's status is treated as None and
+    its body as "" (matching `ExecutionOutcome`'s own defaults), consistently
+    for both sides. Deliberately simple and exact -- no fuzzy body diffing --
+    so only a clear, real difference ever counts as evidence of a genuine
+    credential grant."""
+    a_status = a.status if a is not None else None
+    b_status = b.status if b is not None else None
+    a_body = (a.body or "") if a is not None else ""
+    b_body = (b.body or "") if b is not None else ""
+    return a_status == b_status and a_body == b_body
 
 
 class ChainMixin:
@@ -176,9 +215,11 @@ class ChainMixin:
           1. DEDUP -- a derived identity already escalated (its
              recrawl_as_derived task is DONE in the graph) is skipped, so the
              same leaked token never triggers a second full crawl.
-          2. VERIFY -- each credential is probed once against the source URL
-             before a crawl is spent on it; a stale/rejected token (>=400, or
-             no better than the anonymous baseline) is discarded, not crawled.
+          2. VERIFY -- each credential is probed against the source URL, together
+             with anonymous and invalid-token controls, before a crawl is spent
+             on it (FR-6/F10); a stale/rejected token (>=400), or one that is no
+             better than the anonymous/invalid baseline (a public resource or a
+             login redirect), is discarded, not crawled.
           3. CAP -- a hard per-host ceiling (engagement.max_auto_escalations) on
              how many escalations fire in this process lifetime.
         Plus the usual scope gate + throttle on every request."""
@@ -233,23 +274,64 @@ class ChainMixin:
             log.warning("engagement auto-escalate failed: %s", e)
 
     async def _credential_grants_access(self, url: str, headers: dict) -> bool:
-        """One probe to check a learned credential actually works: the source URL
-        with the credential must return a non-error (<400) response. Scope-gated +
-        throttled. A stale, revoked, or honeypot token fails here and never earns
-        a full crawl."""
+        """FR-6 (F10): a learned credential "grants access" only when it produces
+        a response DISTINGUISHABLE from both an anonymous control and an
+        invalid-token control on the same URL -- not merely a non-error (<400)
+        response. A single-probe <400 check (the old behaviour) is satisfied by
+        a public resource (anonymous 200) or a login redirect just as well as by
+        a real credential, which falsely "grants" access, inflates chain
+        plausibility, and wastes crawl budget.
+
+        Runs up to three probes on the same URL, all scope-gated + throttled,
+        through the one throwaway TargetTransport (standalone context, closed in
+        `finally` -- same shape as before):
+          1. credentialed  -- the learned credential (send_creds).
+          2. anonymous     -- no credential headers at all (send).
+          3. invalid-token -- the credential with its value corrupted (send_creds).
+        max_redirects=0 == follow_redirects=False, matching a raw client.
+
+        Fast path: if the credentialed response is itself an error (not ok,
+        no status, or status >= 400) there is no access at all -- return False
+        without spending the two control probes.
+
+        Grant (`True`) only when the credentialed response differs (status or
+        body) from BOTH controls -- i.e. the credential changed what came back,
+        not just "any request here gets <400". Conservative on control failure:
+        if a control probe raises, or does not complete (outcome != ok, e.g. it
+        was itself scope/gate/budget-denied or hit a transport error), we cannot
+        establish a differential, so we fail closed (return False) rather than
+        risk exactly the false grant this fix targets."""
         if not headers or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
             return False
         # W-16: the credential probe goes through the single TargetTransport. It is a
         # one-off throwaway send, so a standalone context; send_creds forwards the
         # learned credential (ephemeral session scoped to the URL's origin), matching
-        # a raw client that just sent it to `url`. max_redirects=0 == follow_redirects=False.
+        # a raw client that just sent it to `url`.
         _tt, _owned = transport_for(
             None, allowed_hosts=self.allowed_hosts, config=self.config)
         try:
             await global_throttle.acquire()
-            out = await _tt.send_creds("GET", url, capability="credential_probe",
-                                       headers=headers, max_redirects=0)
-            return bool(out.ok and out.status is not None and out.status < 400)
+            cred = await _tt.send_creds("GET", url, capability="credential_probe",
+                                        headers=headers, max_redirects=0)
+            if not cred.ok or cred.status is None or cred.status >= 400:
+                return False  # no access at all -- unchanged fast path, no controls needed
+
+            try:
+                await global_throttle.acquire()
+                anon = await _tt.send("GET", url, capability="credential_probe",
+                                      max_redirects=0)
+                await global_throttle.acquire()
+                invalid = await _tt.send_creds("GET", url, capability="credential_probe",
+                                               headers=_invalidated_headers(headers),
+                                               max_redirects=0)
+            except Exception:
+                return False  # control probe raised -- can't establish a differential
+            if not anon.ok or not invalid.ok:
+                return False  # control probe didn't complete -- can't establish a differential
+
+            if _responses_equivalent(cred, anon) or _responses_equivalent(cred, invalid):
+                return False  # public resource, or the token made no difference
+            return True
         except Exception:
             return False
         finally:
