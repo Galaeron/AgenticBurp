@@ -2278,3 +2278,44 @@ test + negative control, never read `*ANSWER_KEY*`/blind `app.py`, `full` green)
 ### [ ] NC-O5 — Java/API pairing + reproducible build gate (R04 / R13)  — **Mode: OWNER/LIVE (skip)**
 - Supersedes PR-A/PR-C: secure local token pairing/refresh + Gradle wrapper/toolchain + PR Java
   build/test + checksummed release. Needs JDK/Gradle. Leave `[ ]`.
+
+## Benchmark-driven batch — 2026-09-25 (BM-*)
+
+Filed from the live full performance benchmark
+([reviews/2026-09-25/benchmark/BENCHMARK_REPORT.md](reviews/2026-09-25/benchmark/BENCHMARK_REPORT.md);
+pooled exact-class P=0.23, R=0.81 across 4 corpora on `qwen3:8b`). The evaluation is
+now trustworthy (strict exact-class scorer + sanitized corpus + baseline gate); these
+items act on what it measured. Honour the standing non-negotiables (safe defaults,
+caller test + negative control, `full` green before close).
+
+### [ ] BM-1 — Tame the two catch-all false-positive classes (precision)
+- **Domain:** Detection precision - **Effort:** M - **Mode:** LOOP
+- **Evidence (VERIFIED, 2026-09-25 run):** `security_misconfiguration` and `info_disclosure` are the
+  dominant FP source on every corpus — DVWA security_misconfiguration 11 FP with ZERO support (pure
+  noise); PixelMart 16 FP; Juice Shop 14 FP; info_disclosure 8–11 FP each. They drag pooled precision to
+  0.23 while concrete classes (sqli/csrf/path_traversal) sit at 0.5–1.0.
+- **Recommendation:** require stronger evidence for these two broad classes before surfacing (a higher
+  confidence floor and/or a corroborating signal), analogous to `gate_low_confidence_generic`. Do NOT
+  suppress the concrete classes. Ship any threshold OFF/safe or as a shipped default only with a
+  before/after re-measure.
+- **Acceptance:** offline test — a synthetic finding set with N security_misconfiguration/info_disclosure
+  guesses on clean exchanges is gated out while a well-evidenced one survives; NEGATIVE control — sqli/xss/
+  path_traversal findings are unchanged. Re-run `strict_benchmark` on ≥2 corpora shows precision up,
+  recall not materially down. `full` green.
+- **Impact:** High (directly lifts the measured pooled precision).
+
+### [ ] BM-2 — Same-class secure-vs-vulnerable discriminator (stop firing on clean controls)
+- **Domain:** Detection precision - **Effort:** L - **Mode:** LOOP (harder; may be partly research)
+- **Evidence (VERIFIED):** across corpora, `fp_on_tested_negative_control ≥ 1` for sqli/xss/idor/
+  command_injection/path_traversal — the model flags a SECURE endpoint of a class as vulnerable.
+- **Recommendation:** add a control-aware check (e.g. compare against a benign baseline response for the
+  same endpoint, or require a differential signal) so a secure exchange of a known class is not reported.
+- **Acceptance:** caller test — a tested-secure exchange paired with its vulnerable twin: the secure one
+  produces no confirmed finding, the vulnerable one still does. `full` green.
+- **Impact:** High.
+
+### [ ] BM-3 — Reasoning-heavy class recall (auth_bypass / business_logic / ssrf)  — **Mode: OWNER/LIVE (skip)**
+- **Evidence (VERIFIED):** these three classes are missed (R=0) on BOTH PixelMart and Juice Shop — the
+  classes needing multi-step inference about intent/state. Unlikely to close with an 8B local model alone.
+- **Direction:** a stronger model routed to these classes, or class-specific active probes. Needs a real
+  model/GPU to measure. Leave `[ ]`.
