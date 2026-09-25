@@ -215,6 +215,25 @@ CREATE TABLE IF NOT EXISTS ledger_events (
 CREATE INDEX IF NOT EXISTS idx_ledger_finding_ref ON ledger_events(finding_ref);
 """
 
+# FR-2 (F03): content-addressed, ALREADY-REDACTED request/response evidence blobs.
+# This is a NEW persistence sink for exchange bodies/headers (today only a URL and
+# an "HTTP {status}" string are ever stored) -- callers (run_context._artifact) MUST
+# redact with harness.security before calling put_evidence_blob; this table stores
+# bytes verbatim and does not know how to redact. Keyed by sha256(data) so writing
+# the same bytes twice is a no-op (INSERT OR IGNORE) and a hash IS the durable proof
+# of content identity: evidence_blob_resolves() recomputes the hash of whatever is on
+# disk and compares, so a corrupted/truncated row is honestly reported as unresolved
+# rather than silently served. Purely additive and read-only from every verdict/
+# severity/scope decision's perspective -- only the P0-6 resolvability assessment
+# (evidence_ledger._assess_completeness) and report/API display consult it.
+_EVIDENCE_BLOB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS evidence_blobs (
+    sha256 TEXT PRIMARY KEY,
+    data BLOB NOT NULL,
+    created_at REAL NOT NULL
+);
+"""
+
 # Astra T02: observed object-ownership facts (who owns / can reach an object), with
 # provenance. Additive; unknown ownership is simply absent (never guessed). The
 # principal metadata (tenant/permissions/trust) is added to the existing identities
@@ -292,6 +311,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
+    conn.executescript(_EVIDENCE_BLOB_SCHEMA)
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -1523,3 +1543,59 @@ def ledger_events_for(finding_ref: str) -> list[dict]:
             "provenance": json.loads(r[6] or "{}"), "created_at": r[7],
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# FR-2 (F03): content-addressed evidence blob store. Callers MUST redact a
+# blob's bytes (harness.security.redact_secrets_in_url / redact_headers /
+# redact_secrets_in_body) BEFORE calling put_evidence_blob -- this store has
+# no redaction logic of its own and persists exactly what it is given.
+# ---------------------------------------------------------------------------
+
+def put_evidence_blob(data: bytes) -> str:
+    """Store `data` keyed by its own sha256 hex digest; returns that digest.
+
+    Idempotent: INSERT OR IGNORE means storing the same bytes twice is a
+    no-op, never a duplicate row or an overwrite -- the table is content-
+    addressed, so the same hash always means the same bytes.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError(f"evidence blob data must be bytes, got {type(data).__name__}")
+    digest = hashlib.sha256(data).hexdigest()
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO evidence_blobs (sha256, data, created_at) VALUES (?, ?, ?)",
+            (digest, sqlite3.Binary(bytes(data)), time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+    return digest
+
+
+def get_evidence_blob(h: str) -> bytes | None:
+    """The raw bytes stored under hash `h`, or None if absent. Does not
+    re-verify the hash -- see evidence_blob_resolves() for the verified
+    presence check that resolvability depends on."""
+    if not h:
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT data FROM evidence_blobs WHERE sha256 = ?", (h,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return bytes(row[0])
+
+
+def evidence_blob_resolves(h: str) -> bool:
+    """True iff a blob is present for hash `h` AND its bytes still hash to
+    `h`. This is the storage-backed check FR-2's resolvability depends on --
+    a present-but-corrupted row (or one that was deleted) resolves False,
+    same as a hash that was never stored at all."""
+    data = get_evidence_blob(h)
+    if data is None:
+        return False
+    return hashlib.sha256(data).hexdigest() == h

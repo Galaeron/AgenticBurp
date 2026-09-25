@@ -33,6 +33,7 @@ per session, never shared across principals.
 from __future__ import annotations
 
 import ipaddress
+import json
 import socket
 import threading
 import uuid
@@ -359,7 +360,10 @@ class TargetTransport:
                                max_redirects=max_redirects)
 
     def _artifact(self, url: str, outcome: str, session_ref: str | None,
-                  status: int | None = None, case_ref: str = "") -> "evidence.ExchangeArtifact":
+                  status: int | None = None, case_ref: str = "", *,
+                  method: str | None = None, req_headers: dict | None = None,
+                  req_body: str | None = None, resp_headers: dict | None = None,
+                  resp_body: str | None = None) -> "evidence.ExchangeArtifact":
         artifact = evidence.ExchangeArtifact.make(
             request_ref=url, response_ref="" if status is None else f"HTTP {status}",
             actual_destination=ScopePolicy.origin_of(url), transport_outcome=outcome,
@@ -381,6 +385,49 @@ class TargetTransport:
                 data = {"request": artifact.request_ref, "response": artifact.response_ref,
                         "outcome": outcome, "artifact_id": artifact.artifact_id,
                         "destination": artifact.actual_destination}
+                # FR-2 (F03): a REAL, content-addressed, hash-verified evidence
+                # blob -- not just the human-readable "request"/"response"
+                # strings above -- so the P0-6 resolver can tell "we have a URL
+                # and a status code" from "a tester can actually replay this".
+                # `method` is only ever passed by the successful-send call site
+                # in execute(); every non-executed outcome (scope/gate/budget/
+                # session denial) and every transport error/cancel path never
+                # supplies it, so those correctly store no blob and stay
+                # unresolvable. MANDATORY redaction (safety requirement): the
+                # request URL and BOTH request/response headers/bodies are run
+                # through the existing harness.security redactors before
+                # anything is hashed or written -- this is a NEW persistence
+                # sink for bodies/headers that today are never durably stored
+                # at all, so it must never leak a secret. A blob-store failure
+                # here is swallowed and recorded as a degraded marker; it must
+                # never turn a good send into a transport failure.
+                if method is not None:
+                    try:
+                        from harness import security, store
+                        req_record = {
+                            "method": method,
+                            "url": security.redact_secrets_in_url(url),
+                            "headers": security.redact_headers(req_headers or {}),
+                            "body": (security.redact_secrets_in_body(req_body)
+                                     if req_body is not None else None),
+                        }
+                        resp_record = {
+                            "status": status,
+                            "headers": security.redact_headers(resp_headers or {}),
+                            "body": (security.redact_secrets_in_body(resp_body)
+                                     if resp_body is not None else None),
+                        }
+                        req_bytes = json.dumps(req_record, sort_keys=True).encode("utf-8")
+                        resp_bytes = json.dumps(resp_record, sort_keys=True).encode("utf-8")
+                        data["request_blob"] = store.put_evidence_blob(req_bytes)
+                        data["response_blob"] = store.put_evidence_blob(resp_bytes)
+                    except Exception:
+                        # Durable blob write failed: never break the send (this
+                        # is a best-effort evidence enrichment). Mark the
+                        # EXECUTION event degraded so evidence health -- never
+                        # the send outcome itself -- reflects that reproducible
+                        # evidence was expected but not durably stored.
+                        data["evidence_blob_degraded"] = True
                 evidence_ledger.emit(
                     evidence_ledger.EventType.EXECUTION if executed
                     else evidence_ledger.EventType.AUTHORIZATION_DECISION,
@@ -515,7 +562,11 @@ class TargetTransport:
                 continue
             return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
                                     headers=dict(resp.headers), final_url=url,
-                                    artifact=self._artifact(url, "ok", session_ref, status=resp.status_code, case_ref=case_ref))
+                                    artifact=self._artifact(
+                                        url, "ok", session_ref, status=resp.status_code, case_ref=case_ref,
+                                        method=method, req_headers=send_headers,
+                                        req_body=body if isinstance(body, str) else None,
+                                        resp_headers=dict(resp.headers), resp_body=resp.text))
         # Redirect budget exhausted -> return the last hop as ok-ish (no further follow).
         return ExecutionOutcome(outcome="ok", status=None, final_url=url,
                                 artifact=self._artifact(url, "redirect_limit", session_ref, case_ref=case_ref))

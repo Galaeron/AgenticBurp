@@ -571,5 +571,62 @@ class TestConnectConcurrentMigrationIsIdempotent(unittest.TestCase):
         self.assertTrue({"tenant", "permissions_json", "trust"}.issubset(ident_cols))
 
 
+class EvidenceBlobStoreTests(unittest.TestCase):
+    """FR-2 (F03): the content-addressed blob store P0-6 resolvability now depends
+    on. Callers (run_context._artifact) are responsible for redacting bytes before
+    calling put_evidence_blob -- this store only proves the put/get/verify contract:
+    round-trip by hash, and honest False for a hash that was never stored or whose
+    bytes no longer match it (corruption), never a silent/guessed answer."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "evidence_blobs_t.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def test_put_get_round_trip_by_content_hash(self):
+        data = b'{"method":"GET","url":"http://a.test/x","headers":{},"body":null}'
+        h = store.put_evidence_blob(data)
+        self.assertEqual(len(h), 64)  # sha256 hex digest
+        import hashlib
+        self.assertEqual(h, hashlib.sha256(data).hexdigest())
+        self.assertEqual(store.get_evidence_blob(h), data)
+        self.assertTrue(store.evidence_blob_resolves(h))
+
+    def test_put_is_idempotent_for_identical_bytes(self):
+        data = b"identical evidence bytes"
+        h1 = store.put_evidence_blob(data)
+        h2 = store.put_evidence_blob(data)
+        self.assertEqual(h1, h2)
+        self.assertEqual(store.get_evidence_blob(h1), data)
+
+    def test_absent_hash_does_not_resolve(self):
+        # A hash that was never written at all -- honest False, not an exception.
+        self.assertIsNone(store.get_evidence_blob("0" * 64))
+        self.assertFalse(store.evidence_blob_resolves("0" * 64))
+
+    def test_empty_hash_does_not_resolve(self):
+        self.assertIsNone(store.get_evidence_blob(""))
+        self.assertFalse(store.evidence_blob_resolves(""))
+
+    def test_corrupted_blob_fails_hash_verification(self):
+        # NEGATIVE control: a row is present under the hash, but its bytes were
+        # tampered with (e.g. partial write, disk corruption) -- evidence_blob_
+        # resolves must recompute the hash and say False, not just check presence.
+        h = store.put_evidence_blob(b"original bytes")
+        conn = store._connect()
+        try:
+            conn.execute("UPDATE evidence_blobs SET data = ? WHERE sha256 = ?",
+                         (b"tampered bytes", h))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNotNone(store.get_evidence_blob(h))  # a row is still there...
+        self.assertFalse(store.evidence_blob_resolves(h))  # ...but it does not verify
+
+
 if __name__ == "__main__":
     unittest.main()

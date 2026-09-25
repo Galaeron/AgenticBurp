@@ -123,17 +123,46 @@ def _nonempty(s) -> bool:
     return bool((s or "").strip()) if isinstance(s, str) else bool(s)
 
 
+def _resolved_blob_hash(executions: list, field: str) -> str | None:
+    """The first hash under `field` (``request_blob``/``response_blob``) on any
+    EXECUTION event that actually STORAGE-RESOLVES (harness.store.
+    evidence_blob_resolves): present in the blob store AND its bytes still
+    hash to that value. Returns None if no such hash resolves -- whether
+    because no hash was ever recorded, or because the one recorded is
+    missing/corrupted. Imported lazily (like the rest of this module's store
+    access) to avoid a hard import-time dependency on store.py."""
+    try:
+        from harness import store
+    except Exception:
+        return None
+    for e in executions:
+        h = e.data.get(field)
+        if _nonempty(h):
+            try:
+                if store.evidence_blob_resolves(h):
+                    return h
+            except Exception:
+                pass
+    return None
+
+
 def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]") -> dict:
-    """Honest reproducibility assessment for a finding (P0-6 / R10).
+    """Honest reproducibility assessment for a finding (P0-6 / R10; FR-2 / F03).
 
     `complete` (elsewhere) only says a verdict was reached. That is NOT the same
-    as a tester being able to reproduce the finding: a `response_ref` like
-    ``HTTP 200`` (or an empty one when no status was captured), or a verdict with
-    no execution at all, is not a reproducible request/response. This reports what
-    reproduction evidence is actually present and, honestly, what is missing --
-    computed only from the events on hand, so a durable record whose EXECUTION
-    event failed to persist reconstructs as NOT resolvable (never a silent
-    ``complete`` durable record for un-persisted evidence).
+    as a tester being able to reproduce the finding. FR-2 tightens this further:
+    a nonempty `request`/`response` STRING (e.g. a bare URL, or ``HTTP 200``) is
+    a human-readable reference, not reproducible evidence -- it proves nothing
+    was hashed or stored, only that someone wrote a label. `resolvable` now
+    requires a REAL, content-addressed, hash-verified blob for BOTH the request
+    and the response (see run_context.TargetTransport._artifact, which stores
+    them, already redacted, only at the successful-send call site). A blob hash
+    that was recorded but no longer resolves (deleted/corrupted) is reported
+    exactly like one that was never recorded -- resolvability is storage-backed,
+    never a nonempty-string illusion. Computed only from the events on hand, so
+    a durable record whose EXECUTION event failed to persist reconstructs as NOT
+    resolvable (never a silent ``complete`` durable record for un-persisted
+    evidence).
     """
     executions = by_type.get(EventType.EXECUTION, [])
     observations = by_type.get(EventType.OBSERVATION, []) + by_type.get(EventType.HYPOTHESIS, [])
@@ -145,6 +174,12 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]") -> dict:
     has_response = any(_nonempty(e.data.get("response")) for e in executions)
     has_captured_observation = any(_nonempty(e.summary) for e in observations)
 
+    has_request_blob_ref = any(_nonempty(e.data.get("request_blob")) for e in executions)
+    has_response_blob_ref = any(_nonempty(e.data.get("response_blob")) for e in executions)
+    request_blob_hash = _resolved_blob_hash(executions, "request_blob")
+    response_blob_hash = _resolved_blob_hash(executions, "response_blob")
+    evidence_blob_degraded = any(e.data.get("evidence_blob_degraded") for e in executions)
+
     missing: list[str] = []
     if not has_conclusion:
         missing.append("no verdict (validation decision / finding revision) recorded")
@@ -153,8 +188,29 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]") -> dict:
             missing.append("execution recorded but the request reference is empty")
         if not has_response:
             missing.append("execution recorded but the response capture is empty")
-        # An independently re-runnable step needs both a request AND a response.
-        resolvable = has_request and has_response
+        # FR-2: an independently re-runnable step needs a STORED, HASH-VERIFIED
+        # blob for both the request and the response -- the legacy `request`/
+        # `response` strings above are display-only references and are never,
+        # by themselves, sufficient.
+        resolvable = bool(request_blob_hash and response_blob_hash)
+        if not resolvable:
+            if not has_request_blob_ref and not has_response_blob_ref:
+                missing.append(
+                    "request/response recorded only as a reference (e.g. 'HTTP 200'), "
+                    "not a stored hash-verified artifact")
+            else:
+                if has_request_blob_ref and not request_blob_hash:
+                    missing.append("referenced request blob is missing or failed hash verification")
+                elif not has_request_blob_ref:
+                    missing.append("no request blob recorded -- reference only")
+                if has_response_blob_ref and not response_blob_hash:
+                    missing.append("referenced response blob is missing or failed hash verification")
+                elif not has_response_blob_ref:
+                    missing.append("no response blob recorded -- reference only")
+            if evidence_blob_degraded:
+                missing.append(
+                    "evidence blob store failed durably at capture time; the request/response "
+                    "were not archived (evidence health degraded)")
     else:
         if not has_captured_observation:
             missing.append("no execution and no captured observation to reproduce from")
@@ -170,6 +226,9 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]") -> dict:
         "has_request": has_request,
         "has_response": has_response,
         "has_captured_observation": has_captured_observation,
+        "has_request_blob": bool(request_blob_hash),
+        "has_response_blob": bool(response_blob_hash),
+        "evidence_blob_degraded": evidence_blob_degraded,
         "missing": missing,
     }
 
