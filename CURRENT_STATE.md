@@ -3,9 +3,10 @@
 ## Checkout
 
 Branch `reconciliation-backlog`; base HEAD before this session's work was
-`c4435fc`. This session is running the improvement loop continuously and has landed
+`c4435fc`. This session is running the improvement loop continuously: it landed
 **three offline slices of P1-3** (evaluation-layer metric consolidation — now
-offline-complete; only a live single-command scorecard remains, OWNER/LIVE). The
+offline-complete; only a live single-command scorecard remains, OWNER/LIVE) and
+then a **P3-1 retention/expiry slice** (evidence-blob store, OFF by default). The
 prior founder-review batch (FR-4/FR-3/FR-1/FR-2/FR-5/FR-6/FR-8) remains landed;
 **FR-7 stays `[ ]` for the owner** (live cache hit-rate measurement). Pre-existing
 README edits and untracked runtime/evaluation/worktree artifacts remain —
@@ -33,19 +34,25 @@ ordinary-queue item: FR-* loop batch exhausted, RB-1..8 + INV-1..4 + P0 tier all
   `evidence_audit`, `coverage_summary`, `evaluation_integrity/`) carry no metric
   arithmetic — different questions, correctly not rerouted.
 - **P1-3 stays `[ ]`:** offline metric consolidation is COMPLETE; only the live
-  single-command scorecard (owner) remains. So P1-3 has no further offline slice —
-  the next iteration should move on / re-analyze. Map:
+  single-command scorecard (owner) remains. Map:
   [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
+- **Iter 4 `f45f979` (P3-1 partial):** config-gated retention/expiry for the SQLite
+  `evidence_blobs` store — `store.purge_evidence_blobs_older_than` /
+  `apply_retention_policy` / `apply_retention_from_config`, `config.yaml`
+  `store.evidence_retention_days: 0` (OFF/keep-forever default). +4 caller-level tests.
+  P3-1 stays `[ ]`: header redaction already done (FR-2/PR-9); wipe-engagement action
+  + auto-wiring remain. (P3-1 is priority-elevated to P1 per the backlog note, so it
+  is not blocked by the P3 efficacy gate.)
 
 ## Verification (this session)
 
 Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14),
 from repo root, independently rerun by the orchestrator after EACH change:
-- `python -m harness.suite full` (after iter 3) → harness 2724 OK (2 skip);
-  pytest-native 38 passed; testing 221 OK (185 baseline + 21 + 9 + 6 new);
-  evaluation_integrity 42 OK. Exit 0. Every `ERROR:`/`WARNING:` line in the log is a
-  deliberate fault-injection/negative-control assertion; no `FAILED` line present.
-- Iters 1 and 2 independent `full` runs were likewise green (testing 206, then 215 OK).
+- `python -m harness.suite full` (after iter 4) → harness 2728 OK (2 skip);
+  pytest-native 38 passed; testing 221 OK; evaluation_integrity 42 OK. Exit 0. Every
+  `ERROR:`/`WARNING:` line in the log is a deliberate fault-injection/negative-control
+  assertion; no `FAILED` line present. `config_manifest.py --check` clean.
+- Iters 1-3 independent `full` runs were likewise green (harness 2724, testing 206→215→221).
 - No live model/Docker/JDK/blind-target run performed. No `config.yaml` change.
   No `*ANSWER_KEY*` / blind-target `app.py` read.
 

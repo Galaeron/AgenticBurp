@@ -543,6 +543,20 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 ## P3 — Scale / commercialization (only once adoption + efficacy exist)
 
 ### [ ] P3-1 — Captured-data retention & redaction policy for the SQLite store
+- **Result (partial, VERIFIED offline — item stays `[ ]`):** `f45f979` — landed the
+  retention/expiry deliverable, config-gated OFF by default: `store.py` gains
+  `purge_evidence_blobs_older_than` / `apply_retention_policy` / `apply_retention_from_config`,
+  and `config.yaml` gains `store.evidence_retention_days: 0` (0 = keep forever =
+  current behavior, byte-identical; nothing auto-invokes it yet). +4 caller-level
+  tests (real temp DB): selective purge, a default-OFF no-op negative control,
+  non-positive rejection, config consumer. Safety drift manifest unchanged (retention
+  is not a traffic/egress toggle) and SafeDefaultGuardTests green. Full suite green
+  (harness 2728 OK/2 skip, exit 0). **Remaining (why open):** (a) the at-rest
+  credential-header redaction sub-part is ALREADY satisfied for the sensitive byte
+  path by FR-2/PR-9 (`run_context._artifact` redacts before `put_evidence_blob`) — no
+  new work; (b) the explicit "wipe engagement" action (note: `evidence_blobs` is
+  content-addressed with no host column, so a host-scoped wipe needs the
+  host→finding→blob-hash join); (c) auto-wiring retention to a scheduler/endpoint.
 - **Domain:** Security / Privacy · **Effort:** M · **Depends on:** none
 - **Evidence (SUPPORTED):** identity headers are in-memory only, but `store.py`
   persists requests/responses that can contain Authorization/Cookie values.
