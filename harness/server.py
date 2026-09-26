@@ -122,6 +122,14 @@ _SERVER_HOST = config.get("server", {}).get("host", "127.0.0.1")
 # _require_read_auth below re-reads this name from the module each call
 # (never captures it in a closure/default arg) so that monkeypatch works.
 _READ_AUTH_ENABLED = bool(config.get("server", {}).get("require_read_auth", False))
+# P3-1 (partial): ships false -- see the config.yaml comment on
+# server.enable_wipe_endpoint for why. Same pattern as _READ_AUTH_ENABLED
+# above: a plain module global (not wrapped in a function) so a test can
+# flip it directly via `server._WIPE_ENDPOINT_ENABLED = True`/`False`
+# without a config reload; wipe_engagement_evidence below re-reads this
+# name from the module each call (never captures it in a closure/default
+# arg) so that monkeypatch works.
+_WIPE_ENDPOINT_ENABLED = bool(config.get("server", {}).get("enable_wipe_endpoint", False))
 if not _is_loopback(_SERVER_HOST) and not _BEARER_TOKEN:
     raise RuntimeError(
         "Refusing non-loopback harness.server.host without authentication. "
@@ -1363,6 +1371,32 @@ async def engagement_investigate_cancel(host: str, job_id: str,
         if job["status"] == "running":
             job["status"] = "cancelling"
     return _job_public(job)
+
+
+@app.delete("/engagement/{host}/evidence")
+async def wipe_engagement_evidence(host: str, authorization: str | None = Header(default=None)):
+    """P3-1 (partial): opt-in, auth-gated wipe of everything this store
+    persisted for `host`, via the already-landed callable-only
+    store.wipe_engagement(host) -- see that function's docstring for the
+    table-by-table scope and the blob-sharing guard. Ships OFF
+    (server.enable_wipe_endpoint: false); an operator must deliberately
+    flip it (git-ignored config.local.yaml overlay) to arm this endpoint.
+    No scheduler/retention-apply wiring here -- those are separate
+    follow-ons; this is a single explicit, destructive, auth-gated action.
+
+    Auth: gated the same as every other mutating route by
+    _csrf_defense_middleware's Control 1 (the _mutation_token() bearer,
+    required on every POST/PUT/PATCH/DELETE even from loopback) before this
+    handler ever runs, plus _require_auth here. Not scope-gated by
+    server.allowed_hosts -- deleting one's own stored data for a host is not
+    a probe of that host, so the scope check that governs live target
+    traffic does not apply here.
+    """
+    _require_auth(authorization)
+    if not _WIPE_ENDPOINT_ENABLED:
+        raise HTTPException(status_code=403, detail="wipe endpoint disabled (set server.enable_wipe_endpoint)")
+    counts = await __import__("asyncio").to_thread(store.wipe_engagement, host)
+    return {"host": host, "wiped": counts}
 
 
 @app.get("/activity")

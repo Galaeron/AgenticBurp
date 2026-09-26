@@ -429,6 +429,17 @@ server:
   # default deploy stays byte-for-byte unchanged. An operator who wants this
   # hardening today can flip it via the git-ignored config.local.yaml overlay.
   require_read_auth: false
+  # P3-1 (partial): when true, DELETE /engagement/{host}/evidence permanently
+  # deletes every row this store persisted for that host (via the already-
+  # landed store.wipe_engagement) -- a destructive, irreversible action. The
+  # route is already gated by the same auth as every other mutating route
+  # (the CSRF middleware's mutation token, plus _require_auth); this flag is
+  # an ADDITIONAL opt-in on top of that, not a replacement for it.
+  #
+  # SAFE DEFAULT: false. Ships disabled so no deploy can wipe stored evidence
+  # by default. An operator who wants a deliberate, explicit wipe capability
+  # can flip it via the git-ignored config.local.yaml overlay.
+  enable_wipe_endpoint: false
 
 # Validator/tool layer. Agents propose hypotheses; validators independently
 # test them. Active validators are OFF by default and never accept a

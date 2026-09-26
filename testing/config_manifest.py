@@ -48,6 +48,7 @@ SAFETY_KEYS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("reporting", "gate_low_confidence_generic"), "low-confidence generic gating default"),
     (("reporting", "gate_uncorroborated_catchall"), "uncorroborated catch-all gating default"),
     (("server", "require_read_auth"), "sensitive-read auth toggle default"),
+    (("server", "enable_wipe_endpoint"), "destructive host-wipe endpoint; must ship disabled"),
     (("adaptive_respin", "enabled"), "adaptive respin loop; ships disabled"),
     (("iterative_agent", "enabled"), "iterative agent mode; ships disabled"),
 )
@@ -60,6 +61,7 @@ REQUIRED_SAFE_VALUES: dict[str, Any] = {
     "coordinator.cloud_primary": False,
     "coordinator.cloud_reasoning": False,
     "reporting.quarantine_unverified_leads": False,
+    "server.enable_wipe_endpoint": False,
 }
 
 
