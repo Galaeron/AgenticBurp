@@ -2810,3 +2810,13 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
   while a concrete finding remains; negative control — gate OFF (default) → SARIF byte-identical to today
   (finding present). `full` green.
 - **Impact:** Low-Medium (consistency; small surface).
+
+### [x] R06 — Complete opt-in read-auth over knowledge/activity/investigate-list reads
+- **Result (VERIFIED offline):** `12b4340` — from the 2026-09-26 founder-refresh (R06). `/knowledge`,
+  `/activity`, and `/engagement/{host}/investigate` (job list) called only `_require_auth` (loopback-bypassed
+  by default); each now also calls `_require_read_auth`, completing FR-8/RA-2 coverage. Behind the existing
+  `server.require_read_auth` flag (ships false) → default deploy byte-identical; no new config key. +2 tests
+  (flag ON → 401 / valid token → 200 for all three; flag OFF default → not 401 negative control). Full suite
+  green (harness 2767 OK/2 skip, exit 0).
+- **Domain:** Security / Privacy · **Effort:** S · **Depends on:** RA-2 `[x]` · **Mode:** LOOP (offline)
+- **Source:** [founder-refresh REVIEW.md](reviews/2026-09-26/founder-refresh/REVIEW.md) R06.
