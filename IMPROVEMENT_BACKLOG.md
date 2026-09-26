@@ -61,6 +61,17 @@ to the two catch-all classes, never a global one. Honour the non-negotiables: ke
 safe (new gates ship OFF; a default flip that trades recall stays owner-gated on a measured delta),
 a caller test + negative control per item, `full` green before close.
 
+**2026-09-26 re-analysis batch (offline; reopens loop work after the filed offline
+pool was exhausted):** With P1-3's offline consolidation and all of P3-1 landed, an
+Opus re-analysis pass over the production pipeline (evidence ledger, server auth,
+SARIF adapter, report generator) surfaced four new evidence-based, mostly
+offline-loop-consumable items — the **Re-analysis batch — RA-*** at the end of this
+file. Each is grounded in a `file:line` observation verified against the checkout.
+Select them in this order before resuming any older queue work: **RA-1 → RA-2 →
+RA-3 → RA-4**. Honour the non-negotiables (safe `config.yaml` defaults; a caller test
++ negative control per item; `full` green before close). RA-3 is the offline SARIF
+slice of P2-3 (cross-referenced, not a duplicate); the Burp-tab half stays under P1-5.
+
 1. Work top-down: finish all `P0` items before `P1`, etc. Within a tier, respect
    `Depends on`.
 2. Pick the first item whose checkbox is `[ ]` and whose dependencies are all `[x]`.
@@ -2643,3 +2654,91 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
 - **FR-O6 (F06)** independent, exhaustively-adjudicated precision + analyst-time study on held-out
   cases → `PR-D` / `NC-O4` / `PR-E`. **Mode: OWNER/LIVE (skip).** FR-4 is the offline precision lever;
   this is the live measurement of net operator value.
+
+---
+
+## Re-analysis batch — 2026-09-26 (RA-*)
+
+Filed by an Opus re-analysis pass after the prior offline pool was exhausted (P1-3
+offline-complete, P3-1 `[x]`). Each item is grounded in a `file:line` observation
+verified against the checkout at this session's HEAD. Dispatch order: RA-1 → RA-2 →
+RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
+
+### [ ] RA-1 — Make `reproduction_recipe` surface the resolvable evidence blobs
+- **Domain:** Evidence / Trust · **Effort:** S-M · **Depends on:** none (P0-1/P0-6/FR-2 `[x]`) · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED):** `reproduction_recipe` builds each step as
+  `{"request": e.data.get("request",""), "expected": e.data.get("expected","")}`
+  ([evidence_ledger.py:326-329](harness/evidence_ledger.py)). But the EXECUTION producer sets
+  `data = {"request": artifact.request_ref, "response": artifact.response_ref, ...}` and the REAL
+  replayable, hash-verified evidence in `data["request_blob"]`/`data["response_blob"]`
+  ([run_context.py:385-423](harness/run_context.py)); `data["expected"]` is NEVER set in production.
+  `_assess_completeness` sets `completeness.resolvable=True` only when those blobs resolve
+  ([evidence_ledger.py:195](harness/evidence_ledger.py)). So `GET /findings/{ref}/evidence`
+  ([server.py:1508](harness/server.py)) can return `resolvable=True` beside a recipe whose steps carry
+  only a redacted-URL ref and an empty `expected`, referencing none of the blobs — producer/consumer
+  out of contract.
+- **Problem:** The one artifact a triager uses to replay a finding omits the replayable request/response
+  the harness actually stored, while the sibling field asserts reproducibility — undercutting the
+  "evidence-grade, reproducible confirmation" claim.
+- **Recommendation:** In `reproduction_recipe`/`reproduction_recipe_persisted`, emit steps from the
+  EXECUTION events' `request_blob`/`response_blob` (+ method/status), and mark a step
+  "reference-only, not replayable" when no resolvable blob exists (mirroring `_assess_completeness`).
+  Read-only; no new store schema.
+- **Acceptance criteria:** Caller test — one EXECUTION with stored blobs → recipe step references the
+  resolving blob hashes (+ method) and agrees with `completeness.resolvable`. **Negative control:** a
+  status-only EXECUTION (no blob) → recipe honestly shows a non-replayable step and `resolvable=False`
+  (proving the recipe no longer over-claims). `full` green.
+- **Impact:** High (evidence-trust core).
+
+### [ ] RA-2 — Extend FR-8 read-auth to the finding/evidence/identity/session reads it missed
+- **Domain:** Security / Privacy · **Effort:** S · **Depends on:** FR-8 `[x]` · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED):** `_require_read_auth` is wired into only `/telemetry`, `/report`,
+  `/test-plans/{id}`, GET `/settings`. These sensitive reads still call only `_require_auth` (which
+  returns immediately on the default loopback+no-token deploy): `GET /findings/{finding_ref}/evidence`
+  ([server.py:1508](harness/server.py) — reconstructed request/response + reproduction recipe, the most
+  sensitive read), `/engagement/{host}` (:1045), `/identities` (:1451), `/hosts/{host}/sessions` (:1471),
+  `/findings/suppressions` (:1502), `/issues/{host}/merges` (:1561), and the investigate-job read.
+  Founder-review F12 is thus only half-closed.
+- **Problem:** With `require_read_auth` on, an operator reasonably believes findings/evidence reads are
+  token-gated; they are not for the endpoints that actually expose discovered vulns, reconstructed
+  traffic, identities and session refs.
+- **Recommendation:** Add `_require_read_auth(authorization)` to those GET handlers; keep `/health`
+  open. Ships behind the existing `server.require_read_auth` flag (already OFF by default) → default
+  deploy byte-identical. No new toggle, so no drift-manifest change.
+- **Acceptance criteria:** TestClient with `require_read_auth` on: token-less GET of each endpoint → 401;
+  valid token → 200; `/health` → 200. **Negative control:** flag off (default) → all reads 200 and
+  mutation gating unchanged. `full` green.
+- **Impact:** Medium-High (privacy/safety; completes FR-8's stated intent).
+
+### [ ] RA-3 — Offline SARIF export endpoint (surface the built-but-unused adapter)
+- **Domain:** UX / Portability · **Effort:** S-M · **Depends on:** P0-1 `[x]` · cross-refs P2-3 · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED):** `harness/sarif_adapter.py` (`export_issues_to_sarif`/`import_sarif_to_findings`,
+  fully tested in `test_sarif_adapter.py`) has ZERO production callers (grep of `harness/*.py` excluding
+  tests/its own module); there is no `/export` or `sarif` route in `server.py`. P2-3 bundles SARIF with
+  the Burp tab and gates the whole item on P1-5 (OWNER/LIVE), so the offline-shippable half never lands.
+- **Problem:** Findings are not portable into SARIF-consuming triage/CI pipelines despite the tested code
+  existing; unreachable tested code is a maintenance liability.
+- **Recommendation:** Add a read-only `GET /report?format=sarif` (or `GET /export/sarif`) that runs the
+  host's stored issues through `export_issues_to_sarif`, gated by `_require_read_auth` (per RA-2). Record
+  as the offline slice of P2-3; leave the Burp-tab surfacing under P1-5.
+- **Acceptance criteria:** TestClient — seed a finding, GET the SARIF endpoint → `validate_sarif_shape()`
+  returns `[]` and the issue round-trips. **Negative control:** empty host → a schema-valid SARIF doc with
+  zero results (not a 500). `full` green.
+- **Impact:** Medium (portability; removes dead code).
+
+### [ ] RA-4 — Batch report-time ledger/blob reads (avoid O(N·E) fresh connections)
+- **Domain:** Efficiency · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED):** `report_generator.py:618` calls `evidence_ledger.reconstruct_persisted(...)`
+  per finding; each → `ledger_from_store` → `store.ledger_events_for` opens a fresh `_connect()`
+  ([store.py:1530](harness/store.py)), then `_assess_completeness` → `evidence_blob_resolves` opens
+  ANOTHER fresh connection per blob via `get_evidence_blob` ([store.py:1582,1598](harness/store.py)). A
+  report over N findings × E execution events does ~N×(1+2E) serial connect+query cycles at render time;
+  no batch reader exists.
+- **Problem:** `GET /report` on a host with hundreds of findings pays hundreds–thousands of serial
+  connection setups; scales poorly and is invisible to callers.
+- **Recommendation:** Add a batched `store.ledger_events_for_many(refs)` (one grouped query) and reuse a
+  single connection / memoize `evidence_blob_resolves` within one report render. No change to rendered text.
+- **Acceptance criteria:** Test — render a report over K findings and assert the ledger/blob query (or
+  `_connect`) count is bounded (O(1)–O(few), not O(N·E)) via a counting shim. **Negative control:** the
+  rendered report bytes are byte-identical before/after (pure perf refactor). `full` green.
+- **Impact:** Medium (latency cliff on large engagements).

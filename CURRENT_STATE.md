@@ -47,10 +47,18 @@ FR-* loop batch exhausted (FR-7 owner-only). Ordinary queue: P0 all `[x]`; P1-3
 offline-complete (live scorecard OWNER/LIVE); P1-5 OWNER/LIVE; P1-10 `[~]` (live
 half); P2-1 (L, efficacy-gated), P2-3 (dep P1-5) not eligible; P3-1 now `[x]`; P3-2
 largely non-offline; P3-3/BM-3/PR-*/NC-O*/FR-O* OWNER/LIVE; BM-2 is L/"partly
-research"; ER-3/ER-5 deprioritized. The offline-eligible pool is now essentially
-exhausted — the next iteration is expected to reach LOOP_DONE and trigger a
-re-analysis pass to file NEW evidence-based improvements (per the standing
-instruction to keep improving after the list empties).
+research"; ER-3/ER-5 deprioritized. The filed offline pool WAS exhausted, so a
+re-analysis pass (Opus, read-only) filed a new **Re-analysis batch — RA-*** at the
+end of IMPROVEMENT_BACKLOG.md (all evidence-grounded + offline-loop-consumable):
+- **RA-1** — `reproduction_recipe` ignores FR-2's resolvable `request_blob`/`response_blob`
+  and never sets `expected`, yet `completeness.resolvable=True` is asserted beside it
+  (evidence_ledger.py:326 vs run_context.py:385-423). Evidence-trust core; do FIRST.
+- **RA-2** — extend FR-8 read-auth to the finding/evidence/identity/session GET reads it
+  missed (esp. `/findings/{ref}/evidence`, server.py:1508 uses only `_require_auth`).
+- **RA-3** — offline SARIF export endpoint (the tested `sarif_adapter.py` has no caller);
+  offline slice of P2-3, decoupled from the P1-5 Burp gate.
+- **RA-4** — batch report-time ledger/blob reads (O(N·E) fresh SQLite connections).
+Dispatch order RA-1 → RA-2 → RA-3 → RA-4. Next loop iteration implements RA-1.
 
 ## Benchmark honesty caveat
 
