@@ -288,11 +288,18 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   `aggregate_variance()`. **Slice 2 landed `491b982`:** rerouted the canonical
   `testing/strict_score.py` (both scorers' per-class + micro precision/recall/F1)
   onto the shared primitives, byte-identical (golden captured from the pre-reroute
-  scorer via git-stash diff; +9 tests in `test_strict_score_eval_metrics_reroute.py`;
-  `full` green 2724/38/215/42, exit 0). **Remaining (why open):** older layers
-  (`testing/score.py`, `nightly_precision.py`, `eval_health.py`, `score_provenance.py`,
-  `evidence_audit.py`, `coverage_summary.py`, `evaluation_integrity/`) and the
-  single-command scorecard — the last needs a live run, out of offline loop scope. Map:
+  scorer via git-stash diff; +9 tests in `test_strict_score_eval_metrics_reroute.py`).
+  **Slice 3 landed `80b9050`:** rerouted `testing/score.py`'s scalar precision/recall/F1
+  (per-category + micro) onto the shared primitives, byte-identical (+6 golden/negative-
+  control tests; `full` green 2724/38/221/42, exit 0); `nightly_precision.py` is covered
+  transitively (it delegates to `score.score`). **Offline metric-consolidation is now
+  complete:** grep-verified that the remaining older layers (`eval_health.py`,
+  `score_provenance.py`, `evidence_audit.py`, `coverage_summary.py`,
+  `evaluation_integrity/`) carry NO precision/recall/F1 arithmetic — they answer
+  different questions (provenance, stage health, coverage buckets, evidence
+  resolvability) and are correctly NOT rerouted. **Remaining (why still `[ ]`):** only the
+  single-command scorecard that emits scorecard+provenance+health+coverage in one run —
+  needs a live model run, OWNER/LIVE, out of offline loop scope. Map:
   [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
 - **Domain:** Evaluation / Maintainability · **Effort:** M · **Depends on:** P0-3
 - **Evidence (VERIFIED):** overlapping layers — `testing/score.py`,

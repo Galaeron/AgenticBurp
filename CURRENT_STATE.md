@@ -4,7 +4,8 @@
 
 Branch `reconciliation-backlog`; base HEAD before this session's work was
 `c4435fc`. This session is running the improvement loop continuously and has landed
-**two offline slices of P1-3** (evaluation-layer metric consolidation). The
+**three offline slices of P1-3** (evaluation-layer metric consolidation — now
+offline-complete; only a live single-command scorecard remains, OWNER/LIVE). The
 prior founder-review batch (FR-4/FR-3/FR-1/FR-2/FR-5/FR-6/FR-8) remains landed;
 **FR-7 stays `[ ]` for the owner** (live cache hit-rate measurement). Pre-existing
 README edits and untracked runtime/evaluation/worktree artifacts remain —
@@ -26,19 +27,25 @@ ordinary-queue item: FR-* loop batch exhausted, RB-1..8 + INV-1..4 + P0 tier all
   scorers' per-class + micro precision/recall/F1) onto the shared primitives.
   Byte-identical (golden captured from the pre-reroute scorer via git-stash diff);
   +9 tests (`testing/test_strict_score_eval_metrics_reroute.py`).
-- **P1-3 stays `[ ]` (partial):** the older eval layers and the single-command
-  scorecard (needs a live run) remain. Map:
+- **Iter 3 `80b9050`:** rerouted `testing/score.py` (OWASP-bucket scorer) scalar
+  precision/recall/F1; `nightly_precision.py` covered transitively. Byte-identical;
+  +6 tests. Grep-verified the remaining older layers (`eval_health`, `score_provenance`,
+  `evidence_audit`, `coverage_summary`, `evaluation_integrity/`) carry no metric
+  arithmetic — different questions, correctly not rerouted.
+- **P1-3 stays `[ ]`:** offline metric consolidation is COMPLETE; only the live
+  single-command scorecard (owner) remains. So P1-3 has no further offline slice —
+  the next iteration should move on / re-analyze. Map:
   [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
 
 ## Verification (this session)
 
 Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14),
 from repo root, independently rerun by the orchestrator after EACH change:
-- `python -m harness.suite full` (after iter 2) → harness 2724 OK (2 skip);
-  pytest-native 38 passed; testing 215 OK (185 baseline + 21 + 9 new);
+- `python -m harness.suite full` (after iter 3) → harness 2724 OK (2 skip);
+  pytest-native 38 passed; testing 221 OK (185 baseline + 21 + 9 + 6 new);
   evaluation_integrity 42 OK. Exit 0. Every `ERROR:`/`WARNING:` line in the log is a
   deliberate fault-injection/negative-control assertion; no `FAILED` line present.
-- Iter 1's independent `full` was likewise green (testing 206 OK).
+- Iters 1 and 2 independent `full` runs were likewise green (testing 206, then 215 OK).
 - No live model/Docker/JDK/blind-target run performed. No `config.yaml` change.
   No `*ANSWER_KEY*` / blind-target `app.py` read.
 

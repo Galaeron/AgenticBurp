@@ -92,24 +92,30 @@ testing 215 OK, evaluation_integrity 42 OK, exit 0).
   tests together), and `harness.suite full`. See the coding session's
   verbatim command output for exact counts/timestamps.
 
-## Remaining slice (why P1-3 stays open)
+## Consolidation status (across slices 1-3)
 
-This offline slice unifies exactly the two live-ish DRIVERS' scalar
-metric arithmetic. Still open, deliberately out of scope here:
+Every code path in the repo that computed precision/recall/F1 (or cross-run
+mean/variance) with its own inline arithmetic now routes through
+`testing/eval_metrics.py`:
 
-1. **Older layers not touched**: `testing/score.py` (coarse OWASP-bucket
-   scorer), `testing/nightly_precision.py`, `harness/eval_health.py`,
-   `harness/score_provenance.py`, `harness/evidence_audit.py`,
-   `harness/coverage_summary.py`, `evaluation_integrity/` all still carry
-   their own metric-shaped code paths (some overlapping, some genuinely
-   answering a different question, e.g. coarse-bucket coverage vs.
-   exact-class precision/recall) that were never in this slice's
-   dependency list.
-2. **DONE (slice 2, `491b982`)**: `strict_score.py` now routes through
-   `eval_metrics` behind a byte-identical-output regression test. No longer
-   remaining.
-3. **No single-command scorecard**: P1-3's full ambition ("one command
-   produces the scorecard") needs a real driver invocation over a real
-   corpus/model, which this offline slice explicitly does not attempt
-   (synthetic tp/fp/fn and existing artifacts only, no live Ollama/Docker
-   run, per this task's non-goals).
+1. **Slice 1 (`31aed88`)**: `harness/ablation_harness.py` + `testing/blind-target-2/
+   run_blind_eval.py` drivers. DONE.
+2. **Slice 2 (`491b982`)**: `testing/strict_score.py` (canonical exact-class scorer),
+   behind a byte-identical golden test. DONE.
+3. **Slice 3 (`80b9050`)**: `testing/score.py` (OWASP-bucket scorer) scalar
+   precision/recall/F1, behind a byte-identical golden test; `testing/nightly_precision.py`
+   is covered transitively (delegates to `score.score`/`score.format_table`). DONE.
+
+**Verified NOT to contain duplicated metric arithmetic** (grep-confirmed; they answer
+different questions and are correctly left alone): `harness/eval_health.py` (stage
+health), `harness/score_provenance.py` (provenance stamping), `harness/evidence_audit.py`
+(evidence resolvability), `harness/coverage_summary.py` (coverage buckets),
+`evaluation_integrity/` (occurrence/issue-identity diagnostics, coverage, health, audit).
+
+## Remaining (why P1-3 stays open)
+
+The only remaining piece of P1-3's full ambition ("one command produces the scorecard +
+provenance + health + coverage summary") is a **single-command entry point that emits all
+four in one run**. That needs a real driver invocation over a real corpus/model — a live
+Ollama run — so it is OWNER/LIVE and out of the offline loop's scope. The offline metric-
+arithmetic consolidation this item hinged on is complete.
