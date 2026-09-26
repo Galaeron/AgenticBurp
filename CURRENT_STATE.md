@@ -32,7 +32,8 @@ Existing `.venv-rationalisation/Scripts/python.exe`, repository root:
 
 Evidence/evaluation foundations materially improved; still an advanced prototype.
 Original finding statuses are reconciled individually in the refresh.
-R01: enforce per-execution/claim-critical artifact completeness; fix recipe method.
+R01: FIXED (`455cfe3`) — per-execution-pair resolvability (split-pair no longer
+     over-claims), producer sets data["method"], rehydration declared.
 R02: retain stage health in benchmark outcomes; separate healthy silence from
      detector sensitivity; correct certification CLI/aggregate semantics.
 R03: missing Markdown config forwarding is fixed in observed concurrent edits;

@@ -2836,3 +2836,17 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
   (harness 2769 OK/2 skip, exit 0).
 - **Domain:** Evidence / Export / UX · **Effort:** S-M · **Depends on:** RA-3 `[x]`, RA-5 `[x]` · **Mode:** LOOP (offline)
 - **Source:** [founder-refresh REVIEW.md](reviews/2026-09-26/founder-refresh/REVIEW.md) R07.
+
+### [x] R01 — Stop reproduction_recipe/completeness overstating reproducibility
+- **Result (VERIFIED offline):** `455cfe3` — from the 2026-09-26 founder-refresh (R01). New
+  `_resolvable_execution()` requires a SINGLE execution's OWN request+response blob pair to both
+  storage-resolve; `_assess_completeness.resolvable` and the RA-1 recipe top-level `resolvable` now use it
+  (still agreeing) instead of pooling request/response blobs independently across executions (which falsely
+  called a request-only A + response-only B "resolvable"). The producer (`run_context._artifact`) now sets
+  `data["method"]` so the recipe method survives round-trip (was None). Resolvable completeness/recipe/steps
+  declare `rehydration_required` (redacted blobs need session/credential/input rehydration for authenticated
+  replay). +4 tests (split-pair fails on both; single-pair passes+agrees; missing-response not resolvable;
+  method round-trip via the REAL producer). No existing test weakened. Full suite green (harness 2773 OK/2 skip,
+  exit 0). Honesty-tightening only — no verdict/confirm logic changed.
+- **Domain:** Evidence / Trust · **Effort:** M · **Depends on:** RA-1 `[x]`, FR-2 `[x]` · **Mode:** LOOP (offline)
+- **Source:** [founder-refresh REVIEW.md](reviews/2026-09-26/founder-refresh/REVIEW.md) R01.
