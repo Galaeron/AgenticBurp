@@ -46,19 +46,23 @@ ordinary-queue item: FR-* loop batch exhausted, RB-1..8 + INV-1..4 + P0 tier all
   `evidence_blobs` (content-addressed guard: delete only target-referenced minus
   any-other-host-referenced, snapshotted pre-delete, one transaction). Callable-only.
   +4 caller-level tests incl. the load-bearing shared-blob-survives control.
-- **P3-1 stays `[ ]`:** header redaction already done (FR-2/PR-9). Remaining: auto-wiring
-  retention to a scheduler/endpoint, and wiping `validation_runs` orphans (test_plans.plan_id
-  cascade). (P3-1 is priority-elevated to P1 per the backlog note, not blocked by the P3 gate.)
+- **Iter 6 `4b3fab0` (P3-1 partial):** `wipe_engagement` now cascades into `validation_runs`
+  (plan_id→test_plans.host, before the test_plans delete, same transaction), closing the
+  orphaned-row gap. +1 defect-injection test.
+- **P3-1 stays `[ ]`:** header redaction done (FR-2/PR-9), retention + wipe + validation_runs
+  cascade all landed. The ONLY remaining piece is auto-wiring retention/wipe to a
+  scheduler or auth-gated endpoint (a server-integration slice; must reuse FR-8 read-auth
+  and ship OFF). (P3-1 is priority-elevated to P1 per the backlog note.)
 
 ## Verification (this session)
 
 Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14),
 from repo root, independently rerun by the orchestrator after EACH change:
-- `python -m harness.suite full` (after iter 5) → harness 2732 OK (2 skip);
+- `python -m harness.suite full` (after iter 6) → harness 2733 OK (2 skip);
   pytest-native 38 passed; testing 221 OK; evaluation_integrity 42 OK. Exit 0. Every
   `ERROR:`/`WARNING:` line in the log is a deliberate fault-injection/negative-control
   assertion; no `FAILED` line present. `config_manifest.py --check` clean.
-- Iters 1-4 independent `full` runs were likewise green (harness 2724→2728, testing 206→221).
+- Iters 1-5 independent `full` runs were likewise green (harness 2724→2732, testing 206→221).
 - No live model/Docker/JDK/blind-target run performed. No `config.yaml` change.
   No `*ANSWER_KEY*` / blind-target `app.py` read.
 

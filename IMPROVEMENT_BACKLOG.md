@@ -563,10 +563,16 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   snapshotted before any delete, all in one transaction — so a shared blob can't be
   dropped. Callable-only (no auto-invocation). +4 caller-level tests incl. the
   load-bearing shared-blob-survives control. Full suite green (harness 2732 OK/2 skip,
-  exit 0). **Remaining (why still `[ ]`):** (a) header redaction ALREADY done by
-  FR-2/PR-9 — no work; (b) auto-wiring retention to a scheduler/endpoint; (c) wiping
-  `validation_runs` orphans (scoped only via `test_plans.plan_id`, a documented cascade
-  follow-on).
+  exit 0).
+- **Result (partial 3, VERIFIED offline — item stays `[ ]`):** `4b3fab0` — `wipe_engagement`
+  now cascades into `validation_runs` (deletes rows whose `plan_id` belongs to the host's
+  `test_plans`, BEFORE the test_plans delete, in the same transaction), closing the
+  orphaned-row gap the prior slice documented (no FK cascade; `PRAGMA foreign_keys` off).
+  +1 defect-injection caller test (A's row cleaned, B's survives, `counts["validation_runs"]`
+  reported). Full suite green (harness 2733 OK/2 skip, exit 0). **Remaining (why still `[ ]`):**
+  header redaction is ALREADY done (FR-2/PR-9); the only open piece is auto-wiring
+  retention/wipe to a scheduler or auth-gated endpoint — a separate server-integration slice
+  (if it exposes a data-deleting endpoint it must reuse the FR-8 read-auth pattern and ship OFF).
 - **Domain:** Security / Privacy · **Effort:** M · **Depends on:** none
 - **Evidence (SUPPORTED):** identity headers are in-memory only, but `store.py`
   persists requests/responses that can contain Authorization/Cookie values.
