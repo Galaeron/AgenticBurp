@@ -146,6 +146,28 @@ def _resolved_blob_hash(executions: list, field: str) -> str | None:
     return None
 
 
+def _blob_resolves(h) -> bool:
+    """True iff a single hash `h` is present and storage-resolves (harness.
+    store.evidence_blob_resolves). Same semantics/try-except-swallow pattern
+    as `_resolved_blob_hash` above, but checked against ONE specific hash
+    (e.g. one EXECUTION step's own request_blob/response_blob) rather than
+    "the first resolving hash across every EXECUTION" -- reproduction_recipe
+    needs PER-STEP replayability, not the pooled-across-executions check
+    `_assess_completeness` uses for its own resolvable flag. Imported lazily
+    to avoid a hard import-time dependency on store.py; any store error
+    (including no store available) is treated as unresolved."""
+    if not _nonempty(h):
+        return False
+    try:
+        from harness import store
+    except Exception:
+        return False
+    try:
+        return bool(store.evidence_blob_resolves(h))
+    except Exception:
+        return False
+
+
 def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]") -> dict:
     """Honest reproducibility assessment for a finding (P0-6 / R10; FR-2 / F03).
 
@@ -314,19 +336,67 @@ class EvidenceLedger:
         }
 
     def reproduction_recipe(self, finding_ref: str) -> dict:
-        """The minimal, provenance-stamped recipe to reproduce a finding."""
+        """The minimal, provenance-stamped recipe to reproduce a finding.
+
+        RA-1: the old shape only ever surfaced `request`/`expected` -- the
+        human-readable reference strings -- and `expected` is never even set
+        by the live EXECUTION producer (run_context.TargetTransport._artifact).
+        That let a recipe claim to be a "reproducible finding" while pointing
+        at none of the actual replayable evidence, even when `completeness.
+        resolvable` (see _assess_completeness) was True beside it. Each
+        EXECUTION step now also surfaces `method` and the request/response
+        blob HASHES -- but only when they storage-resolve (_blob_resolves,
+        same check `_resolved_blob_hash` uses, applied per-step rather than
+        pooled across executions) -- plus a `replayable` flag so a caller
+        never has to re-derive resolvability itself. The legacy `request`/
+        `expected` keys are kept for back-compat; nothing existing is removed.
+        """
         evs = self.events_for(finding_ref)
         executions = [e for e in evs if e.event_type == EventType.EXECUTION]
         prov = evs[0].provenance if evs else Provenance()
+
+        steps = []
+        for e in executions:
+            request_blob = e.data.get("request_blob")
+            response_blob = e.data.get("response_blob")
+            request_resolves = _blob_resolves(request_blob)
+            response_resolves = _blob_resolves(response_blob)
+            replayable = request_resolves and response_resolves
+            step = {
+                "request": e.data.get("request", ""),
+                "expected": e.data.get("expected", ""),
+                "method": e.data.get("method"),
+                "response": e.data.get("response", ""),
+                "status": e.data.get("response", ""),
+                "request_blob": request_blob if request_resolves else None,
+                "response_blob": response_blob if response_resolves else None,
+                "replayable": replayable,
+            }
+            if not replayable:
+                step["note"] = "reference-only, not replayable"
+            steps.append(step)
+
+        # Top-level `resolvable`: reuse `_resolved_blob_hash` -- the EXACT
+        # same helper `_assess_completeness` calls to compute `completeness.
+        # resolvable` -- over the SAME `executions` list, rather than folding
+        # the per-step `replayable` flags above (which are individually
+        # stricter: a per-step flag requires ONE execution's own pair to both
+        # resolve, whereas `_assess_completeness` accepts a resolving request
+        # blob from any execution and a resolving response blob from any
+        # other). Calling the identical function on the identical input is
+        # the only way to GUARANTEE this recipe's resolvability never drifts
+        # from `reconstruct(...)["completeness"]["resolvable"]" for the same
+        # finding -- which is the whole point of this fix.
+        resolvable = bool(_resolved_blob_hash(executions, "request_blob")
+                          and _resolved_blob_hash(executions, "response_blob"))
+
         return {
             "finding_ref": finding_ref,
             "code_version": prov.code_version,
             "config_fingerprint": prov.config_fingerprint,
             "evidence_schema_version": prov.evidence_schema_version,
-            "steps": [
-                {"request": e.data.get("request", ""), "expected": e.data.get("expected", "")}
-                for e in executions
-            ],
+            "resolvable": resolvable,
+            "steps": steps,
         }
 
     def to_dicts(self) -> list[dict]:

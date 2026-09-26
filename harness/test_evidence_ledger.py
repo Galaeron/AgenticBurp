@@ -1,8 +1,12 @@
 """W-24: the append-only evidence ledger reconstructs a finding's causal chain."""
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 
 import harness.evidence_ledger as el
 from harness.evidence_ledger import EventType, EvidenceLedger, LedgerEvent, Provenance
+from harness import store
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -129,6 +133,147 @@ class ReconstructionTests(unittest.TestCase):
         self.assertEqual(len(dicts), 7)
         self.assertTrue(all(isinstance(d["event_type"], str) for d in dicts))
         self.assertIn("provenance", dicts[0])
+
+
+class ReproductionRecipeBlobTests(unittest.TestCase):
+    """RA-1: reproduction_recipe must surface the actual replayable evidence
+    blobs it claims exist -- method plus resolving request/response blob
+    hashes and a per-step `replayable` flag -- rather than only the old
+    reference-only `request`/`expected` strings, and its own top-level
+    `resolvable` must AGREE with reconstruct(...)['completeness']['resolvable']
+    for the same finding (evidence_ledger.py's producer/consumer contract).
+    Uses a temp store._DB_PATH so evidence_blob_resolves() has a real,
+    isolated blob store to check against (mirrors test_evidence_ledger_wiring.
+    py's setUp/tearDown pattern)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig_db = store._DB_PATH
+        store._DB_PATH = Path(self._tmp) / "recipe_blob_t.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._orig_db
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    @staticmethod
+    def _ledger_with_execution(ref: str, data: dict) -> EvidenceLedger:
+        ledger = EvidenceLedger()
+        prov = Provenance.capture(config={}, model="m", prompt_version="p1")
+        ledger.record(EventType.OBSERVATION, ref, "saw something", provenance=prov)
+        ledger.record(EventType.EXECUTION, ref, "sent it", data=data, provenance=prov)
+        ledger.record(EventType.VALIDATION_DECISION, ref, "CONFIRMED", provenance=prov)
+        return ledger
+
+    def test_resolving_send_step_is_replayable_and_agrees_with_completeness(self):
+        req_hash = store.put_evidence_blob(b'{"method": "GET", "url": "https://a.test/x"}')
+        resp_hash = store.put_evidence_blob(b'{"status": 200, "body": "ok"}')
+        ref = "F-recipe-positive"
+        data = {"request": "GET https://a.test/x", "response": "HTTP 200",
+                "method": "GET", "request_blob": req_hash, "response_blob": resp_hash}
+        ledger = self._ledger_with_execution(ref, data)
+
+        recipe = ledger.reproduction_recipe(ref)
+        step = recipe["steps"][0]
+        self.assertEqual(step["method"], "GET")
+        self.assertEqual(step["request_blob"], req_hash)
+        self.assertEqual(step["response_blob"], resp_hash)
+        self.assertTrue(step["replayable"], step)
+        self.assertNotIn("note", step)
+        self.assertTrue(recipe["resolvable"], recipe)
+
+        recon = ledger.reconstruct(ref)
+        self.assertTrue(recon["completeness"]["resolvable"], recon["completeness"])
+        # The recipe's own resolvability must AGREE with completeness.resolvable.
+        self.assertEqual(recipe["resolvable"], recon["completeness"]["resolvable"])
+
+    def test_status_only_execution_is_not_replayable_and_completeness_agrees(self):
+        """Negative control: the historical shape (no blob refs at all, just
+        a human-readable request/response string) -- the step must be
+        honestly reference-only, and completeness.resolvable must be False
+        right alongside it, proving the recipe no longer over-claims."""
+        ref = "F-recipe-status-only"
+        data = {"request": "GET https://a.test/y", "response": "HTTP 200"}
+        ledger = self._ledger_with_execution(ref, data)
+
+        recipe = ledger.reproduction_recipe(ref)
+        step = recipe["steps"][0]
+        self.assertFalse(step["replayable"])
+        self.assertIsNone(step["request_blob"])
+        self.assertIsNone(step["response_blob"])
+        self.assertIn("note", step)
+        self.assertFalse(recipe["resolvable"], recipe)
+
+        recon = ledger.reconstruct(ref)
+        self.assertFalse(recon["completeness"]["resolvable"], recon["completeness"])
+        self.assertEqual(recipe["resolvable"], recon["completeness"]["resolvable"])
+
+    def test_referenced_blob_that_does_not_resolve_is_not_replayable(self):
+        """A blob hash was recorded but the bytes were never stored (or were
+        later corrupted/deleted) -- must resolve to not-replayable exactly
+        like no hash at all, mirroring _resolved_blob_hash's own contract."""
+        ref = "F-recipe-corrupted"
+        data = {"request": "GET https://a.test/z", "response": "HTTP 200",
+                "method": "GET",
+                "request_blob": "deadbeef" * 8, "response_blob": "cafebabe" * 8}
+        ledger = self._ledger_with_execution(ref, data)
+
+        recipe = ledger.reproduction_recipe(ref)
+        step = recipe["steps"][0]
+        self.assertFalse(step["replayable"])
+        self.assertIsNone(step["request_blob"])
+        self.assertIsNone(step["response_blob"])
+        self.assertIn("note", step)
+        self.assertFalse(recipe["resolvable"])
+
+        recon = ledger.reconstruct(ref)
+        self.assertFalse(recon["completeness"]["resolvable"])
+        self.assertEqual(recipe["resolvable"], recon["completeness"]["resolvable"])
+
+    def test_existing_keys_preserved_for_back_compat(self):
+        ref = "F-recipe-backcompat"
+        data = {"request": "GET https://a.test/w", "expected": "403", "response": "HTTP 200"}
+        ledger = self._ledger_with_execution(ref, data)
+        recipe = ledger.reproduction_recipe(ref)
+        self.assertEqual(recipe["steps"][0]["request"], "GET https://a.test/w")
+        self.assertEqual(recipe["steps"][0]["expected"], "403")
+        for key in ("finding_ref", "code_version", "config_fingerprint",
+                   "evidence_schema_version", "steps"):
+            self.assertIn(key, recipe)
+
+    def test_persisted_recipe_variant_agrees_with_persisted_completeness(self):
+        """reproduction_recipe_persisted (the durable-store-backed variant
+        that server.py's GET /findings/{ref}/evidence actually reads, beside
+        reconstruct_persisted) must show the same replayable/resolvable
+        agreement as the in-memory ledger."""
+        req_hash = store.put_evidence_blob(b'{"method": "POST", "url": "https://a.test/p"}')
+        resp_hash = store.put_evidence_blob(b'{"status": 201}')
+        ref = "F-recipe-persisted"
+        prov = Provenance.capture(config={}, model="m", prompt_version="p1")
+        events = [
+            LedgerEvent(event_type=EventType.OBSERVATION, finding_ref=ref,
+                       summary="saw something", provenance=prov),
+            LedgerEvent(event_type=EventType.EXECUTION, finding_ref=ref,
+                       summary="sent it", provenance=prov,
+                       data={"request": "POST https://a.test/p", "response": "HTTP 201",
+                             "method": "POST", "request_blob": req_hash,
+                             "response_blob": resp_hash}),
+            LedgerEvent(event_type=EventType.VALIDATION_DECISION, finding_ref=ref,
+                       summary="CONFIRMED", provenance=prov),
+        ]
+        for ev in events:
+            store.persist_ledger_event(ev.to_dict())
+
+        recipe = el.reproduction_recipe_persisted(ref)
+        self.assertTrue(recipe["steps"])
+        step = recipe["steps"][0]
+        self.assertTrue(step["replayable"], step)
+        self.assertEqual(step["request_blob"], req_hash)
+        self.assertEqual(step["response_blob"], resp_hash)
+        self.assertTrue(recipe["resolvable"], recipe)
+
+        recon = el.reconstruct_persisted(ref)
+        self.assertTrue(recon["completeness"]["resolvable"], recon["completeness"])
+        self.assertEqual(recipe["resolvable"], recon["completeness"]["resolvable"])
 
 
 if __name__ == "__main__":
