@@ -382,6 +382,33 @@ async def report(url: str, authorization: str | None = Header(default=None)):
     return PlainTextResponse(markdown, media_type="text/markdown")
 
 
+@app.get("/report/sarif")
+async def report_sarif(url: str, authorization: str | None = Header(default=None)):
+    """
+    RA-3: the SAME findings /report renders as Markdown, as a SARIF 2.1.0
+    JSON document (sarif_adapter.py) instead -- so findings are portable
+    into SARIF-consuming triage/CI tools (a dashboard, a ticketing
+    pipeline, another scanner's aggregator). sarif_adapter.py
+    (export_issues_to_sarif/validate_sarif_shape) was fully built and
+    tested (test_sarif_adapter.py) but had no caller anywhere, same
+    dead-code pattern as /report's own docstring above. A separate route
+    (not a `?format=` switch on /report) so /report's existing Markdown
+    contract stays byte-for-byte untouched. Takes the same `url` query
+    param as /report; a host with no stored findings still gets a
+    schema-valid SARIF document with zero results, not an error.
+    """
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import issues, sarif_adapter
+    from harness import evidence_ledger
+    findings = await asyncio.to_thread(store.all_host_findings, url)
+    issues_list = issues.group_findings_into_issues(findings)
+    exports = [issues.export_issue(issue) for issue in issues_list]
+    source_revision = evidence_ledger.Provenance.capture().code_version
+    doc = sarif_adapter.export_issues_to_sarif(exports, source_revision=source_revision)
+    return JSONResponse(doc)
+
+
 @app.get("/test-plans/{plan_id}")
 async def test_plan(plan_id: str, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
