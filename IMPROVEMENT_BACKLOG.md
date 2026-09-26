@@ -551,12 +551,22 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   tests (real temp DB): selective purge, a default-OFF no-op negative control,
   non-positive rejection, config consumer. Safety drift manifest unchanged (retention
   is not a traffic/egress toggle) and SafeDefaultGuardTests green. Full suite green
-  (harness 2728 OK/2 skip, exit 0). **Remaining (why open):** (a) the at-rest
-  credential-header redaction sub-part is ALREADY satisfied for the sensitive byte
-  path by FR-2/PR-9 (`run_context._artifact` redacts before `put_evidence_blob`) — no
-  new work; (b) the explicit "wipe engagement" action (note: `evidence_blobs` is
-  content-addressed with no host column, so a host-scoped wipe needs the
-  host→finding→blob-hash join); (c) auto-wiring retention to a scheduler/endpoint.
+  (harness 2728 OK/2 skip, exit 0).
+- **Result (partial 2, VERIFIED offline — item stays `[ ]`):** `81050fd` — landed the
+  explicit **`store.wipe_engagement(host)`** action: deletes a host's persisted
+  evidence across every confirmed host/finding/case/fingerprint-scoped table
+  (findings/test_plans/chains_detected/coverage_overrides/sessions/issue_merges/
+  engagement_state by host, ledger_events by finding_ref, proof_records by
+  case_id/finding_ref/proof_id, finding_observations/finding_suppressions by
+  fingerprint) plus `evidence_blobs`. Content-addressed blob guard: a blob is deleted
+  only if in (target-referenced − any-other-host-referenced), the other-host set
+  snapshotted before any delete, all in one transaction — so a shared blob can't be
+  dropped. Callable-only (no auto-invocation). +4 caller-level tests incl. the
+  load-bearing shared-blob-survives control. Full suite green (harness 2732 OK/2 skip,
+  exit 0). **Remaining (why still `[ ]`):** (a) header redaction ALREADY done by
+  FR-2/PR-9 — no work; (b) auto-wiring retention to a scheduler/endpoint; (c) wiping
+  `validation_runs` orphans (scoped only via `test_plans.plan_id`, a documented cascade
+  follow-on).
 - **Domain:** Security / Privacy · **Effort:** M · **Depends on:** none
 - **Evidence (SUPPORTED):** identity headers are in-memory only, but `store.py`
   persists requests/responses that can contain Authorization/Cookie values.
