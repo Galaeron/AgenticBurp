@@ -78,6 +78,14 @@ if str(_TESTING_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTING_DIR))
 
 from labels.manifest import EXACT_CLASSES, Manifest  # noqa: E402
+# P1-3: precision/recall/f1 arithmetic lives once in testing/eval_metrics.py.
+# Bare top-level import (not `from testing import eval_metrics`) to match how
+# this module itself is always loaded -- as a bare `strict_score` module with
+# `testing/` on sys.path (see the sys.path trick above), never as a dotted
+# `testing.strict_score` import -- so this works identically whether a caller
+# discovers it via `python -m unittest testing.test_strict_score` or loads it
+# directly off `testing/` with the same sys.path trick.
+import eval_metrics  # noqa: E402
 
 SCORER_VERSION = "1.0.0"
 
@@ -248,10 +256,13 @@ def score_exact_class(manifest: Manifest, predictions: Predictions) -> dict:
 
     rows = []
     for c in classes:
-        prec = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) else None
-        rec = tp[c] / support[c] if support[c] else None
-        f1 = (2 * prec * rec / (prec + rec)) if (prec and rec) else (
-            0.0 if (prec is not None and rec is not None) else None)
+        # support[c] == tp[c] + fn[c] by construction (the loop above
+        # increments support[c] exactly once per expected-class occurrence,
+        # alongside either tp[c] or fn[c] -- see the per-record loop above),
+        # so recall(tp[c], fn[c]) == tp[c] / support[c] exactly.
+        prec = eval_metrics.precision(tp[c], fp[c], on_zero=None)
+        rec = eval_metrics.recall(tp[c], fn[c], on_zero=None)
+        f1 = eval_metrics.f1(prec, rec)
         rows.append({
             "class": c, "support": support[c], "tp": tp[c], "fp": fp[c], "fn": fn[c],
             "fp_on_tested_negative_control": fp_on_tested_negative[c],
@@ -261,9 +272,9 @@ def score_exact_class(manifest: Manifest, predictions: Predictions) -> dict:
         })
 
     TP, FP, FN = sum(tp.values()), sum(fp.values()), sum(fn.values())
-    micro_p = TP / (TP + FP) if (TP + FP) else 0.0
-    micro_r = TP / (TP + FN) if (TP + FN) else 0.0
-    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) else 0.0
+    micro_p = eval_metrics.precision(TP, FP, on_zero=0.0)
+    micro_r = eval_metrics.recall(TP, FN, on_zero=0.0)
+    micro_f1 = eval_metrics.f1(micro_p, micro_r)
     return {
         "metric": "exact_class_precision_recall",
         "per_class": rows,
@@ -340,10 +351,13 @@ def score_evidence_supported(manifest: Manifest, predictions: Predictions,
 
     rows = []
     for c in classes:
-        prec = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) else None
-        rec = tp[c] / support[c] if support[c] else None
-        f1 = (2 * prec * rec / (prec + rec)) if (prec and rec) else (
-            0.0 if (prec is not None and rec is not None) else None)
+        # support[c] == tp[c] + fn[c] by construction here too (the loop
+        # above increments support[c] exactly once per expected-class
+        # occurrence, alongside either tp[c] or fn[c]), so
+        # recall(tp[c], fn[c]) == tp[c] / support[c] exactly.
+        prec = eval_metrics.precision(tp[c], fp[c], on_zero=None)
+        rec = eval_metrics.recall(tp[c], fn[c], on_zero=None)
+        f1 = eval_metrics.f1(prec, rec)
         rows.append({
             "class": c, "support": support[c], "tp": tp[c], "fp": fp[c], "fn": fn[c],
             "precision": round(prec, 3) if prec is not None else None,
@@ -352,9 +366,9 @@ def score_evidence_supported(manifest: Manifest, predictions: Predictions,
         })
 
     TP, FP, FN = sum(tp.values()), sum(fp.values()), sum(fn.values())
-    micro_p = TP / (TP + FP) if (TP + FP) else 0.0
-    micro_r = TP / (TP + FN) if (TP + FN) else 0.0
-    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) else 0.0
+    micro_p = eval_metrics.precision(TP, FP, on_zero=0.0)
+    micro_r = eval_metrics.recall(TP, FN, on_zero=0.0)
+    micro_f1 = eval_metrics.f1(micro_p, micro_r)
     return {
         "metric": "evidence_supported_precision_recall",
         "status": "computed",
