@@ -3,40 +3,42 @@
 ## Checkout
 
 Branch `reconciliation-backlog`; base HEAD before this session's work was
-`c4435fc`. This session ran one role-split improvement-loop iteration and landed
-the **offline first slice of P1-3** (evaluation-layer metric consolidation). The
+`c4435fc`. This session is running the improvement loop continuously and has landed
+**two offline slices of P1-3** (evaluation-layer metric consolidation). The
 prior founder-review batch (FR-4/FR-3/FR-1/FR-2/FR-5/FR-6/FR-8) remains landed;
 **FR-7 stays `[ ]` for the owner** (live cache hit-rate measurement). Pre-existing
 README edits and untracked runtime/evaluation/worktree artifacts remain —
 preserve them. Remote-main parity is not established. No push.
 
-## This session's loop iteration (VERIFIED offline)
+## This session's loop iterations (VERIFIED offline)
 
-- **Selected:** P1-3 — Unify the evaluation layers into one driver (first eligible
-  ordinary-queue item: FR-* loop batch exhausted, RB-1..8 + INV-1..4 + P0 tier all
-  `[x]`; P1-3's only dep P0-3 is `[x]`).
-- **Landed `31aed88`:** new `testing/eval_metrics.py` — shared `precision`/`recall`/
+Selected P1-3 — Unify the evaluation layers into one driver (first eligible
+ordinary-queue item: FR-* loop batch exhausted, RB-1..8 + INV-1..4 + P0 tier all
+`[x]`; P1-3's only dep P0-3 is `[x]`).
+
+- **Iter 1 `31aed88`:** new `testing/eval_metrics.py` — shared `precision`/`recall`/
   `f1` + one-pass `summarize` (mean/pstdev/pvariance/n). Routed both live-ish eval
   drivers through it: `harness/ablation_harness.py` (`_precision`/`_recall`/`_agg`)
   and `testing/blind-target-2/run_blind_eval.py` (`aggregate_variance`). Removed 3
-  private metric copies + collapsed the pstdev-vs-pvariance drift. Byte-identical
-  outputs; `strict_score.py` (canonical) left untouched, equivalence documented.
-- **Tests:** +21 caller-level/negative-control tests (`testing/test_eval_metrics.py`)
-  driving the real driver aggregation functions against hand-computed values.
-- **P1-3 stays `[ ]` (partial):** older eval layers, the `strict_score` reroute, and
-  the single-command scorecard (needs a live run) remain. Map:
+  private metric copies + collapsed the pstdev-vs-pvariance drift. +21 caller-level/
+  negative-control tests (`testing/test_eval_metrics.py`).
+- **Iter 2 `491b982`:** rerouted the canonical `testing/strict_score.py` (both
+  scorers' per-class + micro precision/recall/F1) onto the shared primitives.
+  Byte-identical (golden captured from the pre-reroute scorer via git-stash diff);
+  +9 tests (`testing/test_strict_score_eval_metrics_reroute.py`).
+- **P1-3 stays `[ ]` (partial):** the older eval layers and the single-command
+  scorecard (needs a live run) remain. Map:
   [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
 
 ## Verification (this session)
 
 Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14),
-from repo root, independently rerun by the orchestrator after the change:
-- `python -m harness.suite smoke` → 92 OK.
-- `python -m unittest testing.test_eval_metrics -v` → 21 OK.
-- `python -m harness.suite full` → harness 2724 OK (2 skip); pytest-native 38
-  passed; testing 206 OK (185 baseline + 21 new); evaluation_integrity 42 OK.
-  Exit 0. Every `ERROR:` line in the log is a deliberate fault-injection/
-  negative-control assertion; no `FAILED` line present.
+from repo root, independently rerun by the orchestrator after EACH change:
+- `python -m harness.suite full` (after iter 2) → harness 2724 OK (2 skip);
+  pytest-native 38 passed; testing 215 OK (185 baseline + 21 + 9 new);
+  evaluation_integrity 42 OK. Exit 0. Every `ERROR:`/`WARNING:` line in the log is a
+  deliberate fault-injection/negative-control assertion; no `FAILED` line present.
+- Iter 1's independent `full` was likewise green (testing 206 OK).
 - No live model/Docker/JDK/blind-target run performed. No `config.yaml` change.
   No `*ANSWER_KEY*` / blind-target `app.py` read.
 

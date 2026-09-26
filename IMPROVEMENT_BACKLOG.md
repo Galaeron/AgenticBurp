@@ -285,12 +285,14 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   computation. Byte-identical outputs (existing 79 driver tests + smoke + `full`
   green, 2724 OK/2 skip, independently rerun). +21 caller-level/negative-control
   tests (`testing/test_eval_metrics.py`) drive the real `aggregate()`/
-  `aggregate_variance()`. `strict_score.py` (canonical scorer) left untouched;
-  equivalence documented. **Remaining (why open):** older layers
+  `aggregate_variance()`. **Slice 2 landed `491b982`:** rerouted the canonical
+  `testing/strict_score.py` (both scorers' per-class + micro precision/recall/F1)
+  onto the shared primitives, byte-identical (golden captured from the pre-reroute
+  scorer via git-stash diff; +9 tests in `test_strict_score_eval_metrics_reroute.py`;
+  `full` green 2724/38/215/42, exit 0). **Remaining (why open):** older layers
   (`testing/score.py`, `nightly_precision.py`, `eval_health.py`, `score_provenance.py`,
-  `evidence_audit.py`, `coverage_summary.py`, `evaluation_integrity/`), the
-  `strict_score` reroute, and the single-command scorecard — the last needs a live
-  run, out of offline loop scope. Map:
+  `evidence_audit.py`, `coverage_summary.py`, `evaluation_integrity/`) and the
+  single-command scorecard — the last needs a live run, out of offline loop scope. Map:
   [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
 - **Domain:** Evaluation / Maintainability · **Effort:** M · **Depends on:** P0-3
 - **Evidence (VERIFIED):** overlapping layers — `testing/score.py`,

@@ -60,21 +60,20 @@ instead of maintaining two independent implementations that could drift
 further apart (e.g. one gaining a bug fix, like a `None`-filtering
 change, that the other never receives).
 
-`testing/strict_score.py` (the canonical exact-class scorer) was
-deliberately **left untouched**. Its per-class/micro precision, recall and
-F1 lines were verified by hand to be mathematically identical to
-`eval_metrics.precision`/`recall`/`f1` (per-class uses `on_zero=None`,
-micro uses `on_zero=0.0`, and its F1's `(prec and rec)`-gated branch and
-its micro F1's `(p+r)`-gated branch both collapse to the same
-`f1(p, r)` logic above) -- but `strict_score.py`'s own test suite
-(`testing/test_strict_score.py`, 79 tests incl. this driver) is the
-canonical regression gate for the harness's headline metric, and routing
-it through a new shared module was assessed as more risk than the
-consolidation needed to buy for this slice. `eval_metrics.py`'s docstring
-documents the equivalence and cites `strict_score` as the formula source
-of truth, so a future pass CAN route `strict_score` through it with a
-byte-identical-output test as the acceptance bar, without re-deriving the
-mapping from scratch.
+`testing/strict_score.py` (the canonical exact-class scorer) was left
+untouched in slice 1 and **rerouted in slice 2 (`491b982`)**. Its
+per-class/micro precision, recall and F1 lines in both `score_exact_class`
+and `score_evidence_supported` now call `eval_metrics.precision`/`recall`/
+`f1` (per-class `on_zero=None`, micro `on_zero=0.0`; per-class recall passes
+`fn[c]` directly because `support[c] == tp[c] + fn[c]` holds by construction
+in both counting loops). Output is byte-identical: the golden dicts pinned in
+`testing/test_strict_score_eval_metrics_reroute.py` (9 tests) were captured
+from the PRE-reroute scorer via a `git stash` diff and compared field-for-
+field across both scorers x no-hook/always-supported/never-supported hooks +
+an empty corpus, and a load-bearing non-vacuous negative control shows a
+wrong `on_zero=0.0` per-class (or swapped tp/fp) would have failed the golden
+comparison. The full suite stayed green (harness 2724 OK/2 skip, pytest 38,
+testing 215 OK, evaluation_integrity 42 OK, exit 0).
 
 ## Verification
 
@@ -106,9 +105,9 @@ metric arithmetic. Still open, deliberately out of scope here:
    answering a different question, e.g. coarse-bucket coverage vs.
    exact-class precision/recall) that were never in this slice's
    dependency list.
-2. **`strict_score.py` still has its own (verified-equivalent, not
-   shared) arithmetic** -- see above. A future pass can route it through
-   `eval_metrics` behind a byte-identical-output regression test.
+2. **DONE (slice 2, `491b982`)**: `strict_score.py` now routes through
+   `eval_metrics` behind a byte-identical-output regression test. No longer
+   remaining.
 3. **No single-command scorecard**: P1-3's full ambition ("one command
    produces the scorecard") needs a real driver invocation over a real
    corpus/model, which this offline slice explicitly does not attempt
