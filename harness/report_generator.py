@@ -409,6 +409,26 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     if effort_ledger is not None and unconfirmed:
         unconfirmed = _rank_unconfirmed_by_value_density(unconfirmed, effort_ledger)
 
+    # RA-4: reconstruct every rendered finding's evidence-chain summary ONCE,
+    # up front, via a single batched store read -- rather than each
+    # _render_finding call below doing its own reconstruct_persisted, which
+    # opens a fresh SQLite connection for the events query plus another per
+    # blob field it needs to resolve. Only findings that actually reach a
+    # _render_finding call need this (confirmed/unconfirmed/leads_bucket);
+    # chains render through a separate path that never calls
+    # reconstruct_persisted, so they are deliberately excluded here.
+    from harness import evidence_ledger
+    _recon_targets = confirmed + unconfirmed + leads_bucket
+    _recon_finding_ids = [f.finding_id for f in _recon_targets if f.finding_id]
+    try:
+        recon_map = evidence_ledger.reconstruct_persisted_many(_recon_finding_ids)
+    except Exception:
+        # Best-effort, same as the per-finding lookup this replaces: a total
+        # batch failure degrades to an empty map, and _render_finding's own
+        # per-finding fallback (see below) still reconstructs each finding
+        # individually rather than losing the evidence-chain line entirely.
+        recon_map = {}
+
     lines: list[str] = []
     lines.append(f"# Security Findings Report -- {host}")
     lines.append("")
@@ -460,7 +480,7 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                 lines.append("### Confirmed Exploits")
                 lines.append("")
             for f in confirmed_exploits:
-                lines.extend(_render_finding(f))
+                lines.extend(_render_finding(f, recon_map))
         if confirmed_observations:
             lines.append("### Confirmed Observations")
             lines.append("")
@@ -468,7 +488,7 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                         "findings, but not live-exploited the way the findings above were._")
             lines.append("")
             for f in confirmed_observations:
-                lines.extend(_render_finding(f))
+                lines.extend(_render_finding(f, recon_map))
 
     if unconfirmed:
         lines.append("## Unconfirmed Findings")
@@ -477,7 +497,7 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                      "them in a submission._")
         lines.append("")
         for f in unconfirmed:
-            lines.extend(_render_finding(f))
+            lines.extend(_render_finding(f, recon_map))
 
     if chains:
         lines.append("## Potential Attack Chains")
@@ -513,7 +533,7 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                      "as real findings._")
         lines.append("")
         for f in leads_bucket:
-            lines.extend(_render_finding(f))
+            lines.extend(_render_finding(f, recon_map))
 
     if not individual and not chains and not leads_bucket:
         lines.append("_No findings recorded for this host._")
@@ -541,7 +561,7 @@ _VERIFICATION_BADGE = {
 }
 
 
-def _render_finding(f: ReportFinding) -> list[str]:
+def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None) -> list[str]:
     # R03: this Markdown path did not share issues.py's redaction (redact/
     # redact_url) with the structured issue-export path -- a captured
     # ?token=... query string or an Authorization/Cookie-shaped value quoted
@@ -612,10 +632,20 @@ def _render_finding(f: ReportFinding) -> list[str]:
     # finding (what was sent, what came back, why it was concluded), when the
     # ledger actually has a chain for it. Best-effort/read-only -- a ledger
     # lookup failure never blocks the rest of the report.
+    #
+    # RA-4: `recon_map` (built once, up front, in generate_markdown_report via
+    # evidence_ledger.reconstruct_persisted_many) replaces the per-finding
+    # reconstruct_persisted call this used to make -- one fewer round of fresh
+    # SQLite connections per finding. A finding_id the map doesn't have (batch
+    # lookup failed, or this was called directly without a map -- e.g. a test
+    # or another caller) falls back to the original single-ref call, so the
+    # evidence-chain line is never silently dropped by the batching itself.
     if f.finding_id:
         try:
-            from harness import evidence_ledger
-            recon = evidence_ledger.reconstruct_persisted(f.finding_id)
+            recon = (recon_map or {}).get(f.finding_id)
+            if recon is None:
+                from harness import evidence_ledger
+                recon = evidence_ledger.reconstruct_persisted(f.finding_id)
             if recon.get("event_count"):
                 verdict = "complete" if recon.get("complete") else "partial"
                 # P0-6/R10: state reproducibility honestly -- a recorded verdict is

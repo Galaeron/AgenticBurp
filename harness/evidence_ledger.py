@@ -123,23 +123,33 @@ def _nonempty(s) -> bool:
     return bool((s or "").strip()) if isinstance(s, str) else bool(s)
 
 
-def _resolved_blob_hash(executions: list, field: str) -> str | None:
+def _resolved_blob_hash(executions: list, field: str, *, resolver=None) -> str | None:
     """The first hash under `field` (``request_blob``/``response_blob``) on any
     EXECUTION event that actually STORAGE-RESOLVES (harness.store.
     evidence_blob_resolves): present in the blob store AND its bytes still
     hash to that value. Returns None if no such hash resolves -- whether
     because no hash was ever recorded, or because the one recorded is
     missing/corrupted. Imported lazily (like the rest of this module's store
-    access) to avoid a hard import-time dependency on store.py."""
-    try:
-        from harness import store
-    except Exception:
-        return None
+    access) to avoid a hard import-time dependency on store.py.
+
+    `resolver`: optional ``hash -> bool`` override for the default
+    ``store.evidence_blob_resolves`` lookup (RA-4 batched-report perf). A
+    caller reconstructing many findings in one report can pass a memoizing
+    resolver so the SAME hash is only ever checked once across the whole
+    batch, instead of once per finding that happens to reference it. Omitted
+    (the default, and what every existing caller gets) preserves the exact
+    prior behavior: one fresh `store.evidence_blob_resolves` call per hash."""
+    if resolver is None:
+        try:
+            from harness import store
+        except Exception:
+            return None
+        resolver = store.evidence_blob_resolves
     for e in executions:
         h = e.data.get(field)
         if _nonempty(h):
             try:
-                if store.evidence_blob_resolves(h):
+                if resolver(h):
                     return h
             except Exception:
                 pass
@@ -168,7 +178,7 @@ def _blob_resolves(h) -> bool:
         return False
 
 
-def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]") -> dict:
+def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resolver=None) -> dict:
     """Honest reproducibility assessment for a finding (P0-6 / R10; FR-2 / F03).
 
     `complete` (elsewhere) only says a verdict was reached. That is NOT the same
@@ -198,8 +208,8 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]") -> dict:
 
     has_request_blob_ref = any(_nonempty(e.data.get("request_blob")) for e in executions)
     has_response_blob_ref = any(_nonempty(e.data.get("response_blob")) for e in executions)
-    request_blob_hash = _resolved_blob_hash(executions, "request_blob")
-    response_blob_hash = _resolved_blob_hash(executions, "response_blob")
+    request_blob_hash = _resolved_blob_hash(executions, "request_blob", resolver=resolver)
+    response_blob_hash = _resolved_blob_hash(executions, "response_blob", resolver=resolver)
     evidence_blob_degraded = any(e.data.get("evidence_blob_degraded") for e in executions)
 
     missing: list[str] = []
@@ -304,8 +314,15 @@ class EvidenceLedger:
             [e for e in self._events if e.finding_ref == finding_ref],
             key=lambda e: (e.created_at, _ORDER.get(e.event_type, 99)))
 
-    def reconstruct(self, finding_ref: str) -> dict:
-        """Answer the five audit questions for one finding from its events alone."""
+    def reconstruct(self, finding_ref: str, *, resolver=None) -> dict:
+        """Answer the five audit questions for one finding from its events alone.
+
+        `resolver`: optional override threaded straight through to
+        _assess_completeness's blob-hash resolution (RA-4 batched-report
+        memoization) -- see _resolved_blob_hash's docstring. Omitted (the
+        default, and what every existing caller gets) resolves each blob
+        hash via a fresh harness.store.evidence_blob_resolves() call, exactly
+        as before this parameter existed."""
         evs = self.events_for(finding_ref)
         by_type: dict[EventType, list[LedgerEvent]] = {}
         for e in evs:
@@ -332,7 +349,7 @@ class EvidenceLedger:
             # a tester can independently reproduce it -- see `completeness` (P0-6/R10).
             "complete": bool(by_type.get(EventType.VALIDATION_DECISION)
                              or by_type.get(EventType.FINDING_REVISION)),
-            "completeness": _assess_completeness(by_type),
+            "completeness": _assess_completeness(by_type, resolver=resolver),
         }
 
     def reproduction_recipe(self, finding_ref: str) -> dict:
@@ -465,24 +482,20 @@ def emit(event_type, finding_ref: str, summary: str, *, data: dict | None = None
     return ev
 
 
-def ledger_from_store(finding_ref: str) -> EvidenceLedger:
-    """Replay this finding's persisted events (store.py) into a fresh ledger.
+def _ledger_from_rows(finding_ref: str, rows: "list[dict]") -> EvidenceLedger:
+    """Replay already-fetched persisted-event rows (each shaped like one of
+    store.ledger_events_for's row dicts) into a fresh, unbounded ledger for
+    one finding_ref. The shared per-row construction ledger_from_store (one
+    ref, one query) and reconstruct_persisted_many (RA-4: many refs, one
+    batched query) both build on -- so there is exactly one place that turns
+    a persisted row back into a LedgerEvent.
 
-    Lets the findings API / report reconstruct a finding independent of the
-    in-memory singleton (e.g. after a restart, or from a different process),
-    while reconstruct()/reproduction_recipe() themselves stay pure functions
-    of whatever events a ledger holds."""
-    # Unbounded replay: the durable read path must never evict a finding's own
-    # persisted events, even in the pathological case of a single finding with
-    # more than DEFAULT_MAX_EVENTS records. The cap is only a memory guard on
-    # the long-lived in-memory singleton, not on a fresh per-finding replay.
+    Unbounded (max_events=0): the durable read path must never evict a
+    finding's own persisted events, even in the pathological case of a
+    single finding with more than DEFAULT_MAX_EVENTS records. The cap is
+    only a memory guard on the long-lived in-memory singleton, not on a
+    fresh per-finding replay."""
     led = EvidenceLedger(max_events=0)
-    try:
-        from harness import store
-        rows = store.ledger_events_for(finding_ref)
-    except Exception as e:
-        _log.debug("failed to load persisted ledger events for %s: %s", finding_ref, e)
-        return led
     for row in rows:
         try:
             prov = Provenance(**row.get("provenance", {}))
@@ -499,9 +512,97 @@ def ledger_from_store(finding_ref: str) -> EvidenceLedger:
     return led
 
 
+def ledger_from_store(finding_ref: str) -> EvidenceLedger:
+    """Replay this finding's persisted events (store.py) into a fresh ledger.
+
+    Lets the findings API / report reconstruct a finding independent of the
+    in-memory singleton (e.g. after a restart, or from a different process),
+    while reconstruct()/reproduction_recipe() themselves stay pure functions
+    of whatever events a ledger holds."""
+    try:
+        from harness import store
+        rows = store.ledger_events_for(finding_ref)
+    except Exception as e:
+        _log.debug("failed to load persisted ledger events for %s: %s", finding_ref, e)
+        return EvidenceLedger(max_events=0)
+    return _ledger_from_rows(finding_ref, rows)
+
+
 def reconstruct_persisted(finding_ref: str) -> dict:
     """reconstruct(), reading from the durable store instead of memory."""
     return ledger_from_store(finding_ref).reconstruct(finding_ref)
+
+
+def reconstruct_persisted_many(finding_refs: "list[str]") -> "dict[str, dict]":
+    """Batched form of reconstruct_persisted (RA-4 perf fix).
+
+    The report generator used to call reconstruct_persisted(ref) once PER
+    FINDING. Each of those calls did its own ledger_events_for(ref) fresh
+    connection+query, plus one MORE fresh connection per blob field
+    (evidence_blob_resolves) on every EXECUTION event it found -- an
+    N findings x E events-per-finding pile of serial SQLite connections for
+    one report. This does ONE batched events fetch for every ref
+    (store.ledger_events_for_many), builds each ref's EvidenceLedger from its
+    own slice of that single fetch (never re-querying per ref), and resolves
+    each blob hash AT MOST ONCE across the whole batch via a shared
+    {hash: bool} memo -- so a report over many findings still does a small,
+    bounded number of store reads, not one per finding times its event count.
+
+    Returns a dict keyed by finding_ref. Every ref passed in (after dropping
+    empty/duplicate entries) is present in the result -- including a ref with
+    zero persisted events, which reconstructs to the same all-defaults dict
+    reconstruct_persisted would give it -- and each value is IDENTICAL, field
+    for field, to what reconstruct_persisted(ref) returns today. This
+    function only changes HOW MANY TIMES the store is read, never what is
+    computed; reconstruct_persisted itself is untouched and still what
+    server.py's per-finding endpoint calls."""
+    refs = [r for r in dict.fromkeys(finding_refs) if r]
+    if not refs:
+        return {}
+    try:
+        from harness import store
+    except Exception:
+        return {}
+    try:
+        events_by_ref = store.ledger_events_for_many(refs)
+    except Exception as e:
+        _log.debug("failed to batch-load persisted ledger events for %d ref(s): %s", len(refs), e)
+        return {}
+
+    blob_cache: "dict[str, bool]" = {}
+    # One shared connection for EVERY blob-hash resolution in this batch,
+    # instead of evidence_blob_resolves' own default of a fresh _connect()
+    # per call -- this is what keeps the connection count bounded even when
+    # every finding's execution carries its OWN distinct request/response
+    # hashes (so the {hash: bool} memo above alone wouldn't help): the memo
+    # avoids re-resolving the SAME hash twice, this shared connection avoids
+    # a new connection for each DIFFERENT hash. Best-effort: if opening it
+    # fails, fall back to evidence_blob_resolves' own per-call connection
+    # (correct, just not batched) rather than losing resolvability entirely.
+    try:
+        shared_conn = store._connect()
+    except Exception:
+        shared_conn = None
+
+    def _memoized_resolver(h: str) -> bool:
+        cached = blob_cache.get(h)
+        if cached is None:
+            try:
+                cached = bool(store.evidence_blob_resolves(h, conn=shared_conn))
+            except Exception:
+                cached = False
+            blob_cache[h] = cached
+        return cached
+
+    try:
+        out: "dict[str, dict]" = {}
+        for ref in refs:
+            led = _ledger_from_rows(ref, events_by_ref.get(ref, []))
+            out[ref] = led.reconstruct(ref, resolver=_memoized_resolver)
+        return out
+    finally:
+        if shared_conn is not None:
+            shared_conn.close()
 
 
 def reproduction_recipe_persisted(finding_ref: str) -> dict:

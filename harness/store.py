@@ -1545,6 +1545,43 @@ def ledger_events_for(finding_ref: str) -> list[dict]:
     return out
 
 
+def ledger_events_for_many(finding_refs: "list[str]") -> "dict[str, list[dict]]":
+    """Batched form of ledger_events_for (RA-4): every persisted ledger event
+    for MANY findings in ONE query/connection, instead of one fresh
+    connection+query per finding_ref. Grouped by finding_ref; each ref's own
+    list is in the SAME oldest-first order (`ORDER BY created_at ASC`, the
+    identical clause ledger_events_for uses) and the SAME row shape --
+    calling this with `[ref]` and reading `result.get(ref, [])` gives exactly
+    what `ledger_events_for(ref)` would.
+
+    A `finding_ref` with no persisted events is simply ABSENT from the
+    result (never an empty-list placeholder) -- the same "no rows" outcome
+    ledger_events_for reports for that ref alone. Falsy/duplicate entries in
+    `finding_refs` are dropped before querying; an empty/all-falsy
+    `finding_refs` short-circuits to `{}` WITHOUT opening a connection at
+    all, since there is nothing to fetch."""
+    refs = [r for r in dict.fromkeys(finding_refs) if r]
+    if not refs:
+        return {}
+    conn = _connect()
+    try:
+        placeholders = ",".join("?" for _ in refs)
+        rows = conn.execute(
+            "SELECT event_id, event_type, finding_ref, case_ref, summary, data_json, "
+            "provenance_json, created_at FROM ledger_events WHERE finding_ref IN "
+            f"({placeholders}) ORDER BY created_at ASC", refs).fetchall()
+    finally:
+        conn.close()
+    out: "dict[str, list[dict]]" = {}
+    for r in rows:
+        out.setdefault(r[2], []).append({
+            "event_id": r[0], "event_type": r[1], "finding_ref": r[2], "case_ref": r[3],
+            "summary": r[4], "data": json.loads(r[5] or "{}"),
+            "provenance": json.loads(r[6] or "{}"), "created_at": r[7],
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # FR-2 (F03): content-addressed evidence blob store. Callers MUST redact a
 # blob's bytes (harness.security.redact_secrets_in_url / redact_headers /
@@ -1573,29 +1610,43 @@ def put_evidence_blob(data: bytes) -> str:
     return digest
 
 
-def get_evidence_blob(h: str) -> bytes | None:
+def get_evidence_blob(h: str, *, conn: "sqlite3.Connection | None" = None) -> bytes | None:
     """The raw bytes stored under hash `h`, or None if absent. Does not
     re-verify the hash -- see evidence_blob_resolves() for the verified
-    presence check that resolvability depends on."""
+    presence check that resolvability depends on.
+
+    `conn`: optional already-open connection to run this lookup on, instead
+    of opening (and closing) a fresh one just for this one hash (RA-4: lets
+    a batched report reuse ONE connection across every blob hash it needs to
+    resolve, rather than one fresh connection per hash). Omitted (the
+    default, and what every existing caller gets) preserves the exact prior
+    behavior; a caller-supplied `conn` is never closed here -- that stays
+    the caller's responsibility."""
     if not h:
         return None
-    conn = _connect()
+    owns_conn = conn is None
+    c = conn if conn is not None else _connect()
     try:
-        row = conn.execute(
+        row = c.execute(
             "SELECT data FROM evidence_blobs WHERE sha256 = ?", (h,)).fetchone()
     finally:
-        conn.close()
+        if owns_conn:
+            c.close()
     if row is None:
         return None
     return bytes(row[0])
 
 
-def evidence_blob_resolves(h: str) -> bool:
+def evidence_blob_resolves(h: str, *, conn: "sqlite3.Connection | None" = None) -> bool:
     """True iff a blob is present for hash `h` AND its bytes still hash to
     `h`. This is the storage-backed check FR-2's resolvability depends on --
     a present-but-corrupted row (or one that was deleted) resolves False,
-    same as a hash that was never stored at all."""
-    data = get_evidence_blob(h)
+    same as a hash that was never stored at all.
+
+    `conn`: optional shared connection, forwarded to get_evidence_blob (see
+    its docstring) -- RA-4 batched-report perf. Omitted (the default)
+    preserves the exact prior one-connection-per-call behavior."""
+    data = get_evidence_blob(h, conn=conn)
     if data is None:
         return False
     return hashlib.sha256(data).hexdigest() == h
