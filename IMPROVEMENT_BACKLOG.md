@@ -542,8 +542,19 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 
 ## P3 — Scale / commercialization (only once adoption + efficacy exist)
 
-### [ ] P3-1 — Captured-data retention & redaction policy for the SQLite store
-- **Result (partial, VERIFIED offline — item stays `[ ]`):** `f45f979` — landed the
+### [x] P3-1 — Captured-data retention & redaction policy for the SQLite store
+- **Result (VERIFIED offline — DONE):** all three recommended capabilities delivered and
+  tested: **redaction** already satisfied for the sensitive byte path by FR-2/PR-9
+  (`run_context._artifact` redacts before `put_evidence_blob`); **retention/expiry**
+  (`f45f979`, config-gated OFF); **wipe-engagement** as a callable (`81050fd`) with the
+  `validation_runs` orphan cascade (`4b3fab0`) and an opt-in auth-gated
+  `DELETE /engagement/{host}/evidence` endpoint (`3b83f0e`, `server.enable_wipe_endpoint`
+  ships false, tracked in the NC-3 drift manifest). Full suite green throughout (harness
+  2738 OK/2 skip, exit 0). **Optional non-blocking follow-on (not in the P3-1 recommendation):**
+  a background retention *scheduler* / a symmetric retention-apply endpoint — retention is
+  operator-callable today (`apply_retention_from_config`); auto-triggering it is a deployment
+  concern a future session or the owner can add if wanted.
+- **Result (partial, VERIFIED offline — superseded by DONE above):** `f45f979` — landed the
   retention/expiry deliverable, config-gated OFF by default: `store.py` gains
   `purge_evidence_blobs_older_than` / `apply_retention_policy` / `apply_retention_from_config`,
   and `config.yaml` gains `store.evidence_retention_days: 0` (0 = keep forever =

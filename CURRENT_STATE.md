@@ -2,94 +2,70 @@
 
 ## Checkout
 
-Branch `reconciliation-backlog`; base HEAD before this session's work was
-`c4435fc`. This session is running the improvement loop continuously: it landed
-**three offline slices of P1-3** (evaluation-layer metric consolidation — now
-offline-complete; only a live single-command scorecard remains, OWNER/LIVE) and
-then two **P3-1 slices** (evidence-blob retention/expiry OFF-by-default, and a
-callable host-scoped `wipe_engagement`). The
-prior founder-review batch (FR-4/FR-3/FR-1/FR-2/FR-5/FR-6/FR-8) remains landed;
-**FR-7 stays `[ ]` for the owner** (live cache hit-rate measurement). Pre-existing
-README edits and untracked runtime/evaluation/worktree artifacts remain —
-preserve them. Remote-main parity is not established. No push.
+Branch `reconciliation-backlog`; base HEAD before this session was `c4435fc`. This
+session ran the improvement loop continuously (Opus reviews/decides, Sonnet codes,
+orchestrator independently reruns `full` and commits). It landed **P1-3 (offline
+metric consolidation, 3 slices) and P3-1 (now `[x]` DONE, 4 slices + endpoint)**.
+Pre-existing README edits and untracked runtime/review/worktree artifacts remain —
+preserve them. No push; remote-main parity not established.
 
-## This session's loop iterations (VERIFIED offline)
+## This session's loop (all VERIFIED offline, `full` green after each)
 
-Selected P1-3 — Unify the evaluation layers into one driver (first eligible
-ordinary-queue item: FR-* loop batch exhausted, RB-1..8 + INV-1..4 + P0 tier all
-`[x]`; P1-3's only dep P0-3 is `[x]`).
+**P1-3 — unify the evaluation layers (offline metric consolidation COMPLETE; only a
+live single-command scorecard remains → OWNER/LIVE, so P1-3 stays `[ ]`):**
+- `31aed88` — new `testing/eval_metrics.py` (shared precision/recall/f1 + one-pass
+  mean/pstdev/pvariance `summarize`); rerouted `ablation_harness` + `run_blind_eval`.
+- `491b982` — rerouted canonical `strict_score.py` (byte-identical golden test).
+- `80b9050` — rerouted `score.py`; `nightly_precision` transitive. Grep-verified the
+  other older layers carry no metric arithmetic (different questions).
+- Map: [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
 
-- **Iter 1 `31aed88`:** new `testing/eval_metrics.py` — shared `precision`/`recall`/
-  `f1` + one-pass `summarize` (mean/pstdev/pvariance/n). Routed both live-ish eval
-  drivers through it: `harness/ablation_harness.py` (`_precision`/`_recall`/`_agg`)
-  and `testing/blind-target-2/run_blind_eval.py` (`aggregate_variance`). Removed 3
-  private metric copies + collapsed the pstdev-vs-pvariance drift. +21 caller-level/
-  negative-control tests (`testing/test_eval_metrics.py`).
-- **Iter 2 `491b982`:** rerouted the canonical `testing/strict_score.py` (both
-  scorers' per-class + micro precision/recall/F1) onto the shared primitives.
-  Byte-identical (golden captured from the pre-reroute scorer via git-stash diff);
-  +9 tests (`testing/test_strict_score_eval_metrics_reroute.py`).
-- **Iter 3 `80b9050`:** rerouted `testing/score.py` (OWASP-bucket scorer) scalar
-  precision/recall/F1; `nightly_precision.py` covered transitively. Byte-identical;
-  +6 tests. Grep-verified the remaining older layers (`eval_health`, `score_provenance`,
-  `evidence_audit`, `coverage_summary`, `evaluation_integrity/`) carry no metric
-  arithmetic — different questions, correctly not rerouted.
-- **P1-3 stays `[ ]`:** offline metric consolidation is COMPLETE; only the live
-  single-command scorecard (owner) remains. Map:
-  [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
-- **Iter 4 `f45f979` (P3-1 partial):** config-gated retention/expiry for the SQLite
-  `evidence_blobs` store — `store.purge_evidence_blobs_older_than` /
-  `apply_retention_policy` / `apply_retention_from_config`, `config.yaml`
-  `store.evidence_retention_days: 0` (OFF/keep-forever default). +4 caller-level tests.
-- **Iter 5 `81050fd` (P3-1 partial):** `store.wipe_engagement(host)` — host-scoped
-  deletion across all confirmed host/finding/case/fingerprint-scoped tables +
-  `evidence_blobs` (content-addressed guard: delete only target-referenced minus
-  any-other-host-referenced, snapshotted pre-delete, one transaction). Callable-only.
-  +4 caller-level tests incl. the load-bearing shared-blob-survives control.
-- **Iter 6 `4b3fab0` (P3-1 partial):** `wipe_engagement` now cascades into `validation_runs`
-  (plan_id→test_plans.host, before the test_plans delete, same transaction), closing the
-  orphaned-row gap. +1 defect-injection test.
-- **P3-1 stays `[ ]`:** header redaction done (FR-2/PR-9), retention + wipe + validation_runs
-  cascade all landed. The ONLY remaining piece is auto-wiring retention/wipe to a
-  scheduler or auth-gated endpoint (a server-integration slice; must reuse FR-8 read-auth
-  and ship OFF). (P3-1 is priority-elevated to P1 per the backlog note.)
+**P3-1 — captured-data retention & redaction (`[x]` DONE):** all three recommended
+capabilities delivered + tested.
+- redaction already done by FR-2/PR-9; retention/expiry `f45f979` (config-gated OFF);
+  `wipe_engagement` callable `81050fd`; `validation_runs` orphan cascade `4b3fab0`;
+  opt-in auth-gated `DELETE /engagement/{host}/evidence` `3b83f0e`
+  (`server.enable_wipe_endpoint` ships false, tracked in the NC-3 drift manifest).
+- Optional non-blocking follow-on (not in the recommendation): a retention scheduler /
+  retention-apply endpoint; retention is operator-callable today.
 
 ## Verification (this session)
 
 Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14),
 from repo root, independently rerun by the orchestrator after EACH change:
-- `python -m harness.suite full` (after iter 6) → harness 2733 OK (2 skip);
-  pytest-native 38 passed; testing 221 OK; evaluation_integrity 42 OK. Exit 0. Every
-  `ERROR:`/`WARNING:` line in the log is a deliberate fault-injection/negative-control
-  assertion; no `FAILED` line present. `config_manifest.py --check` clean.
-- Iters 1-5 independent `full` runs were likewise green (harness 2724→2732, testing 206→221).
-- No live model/Docker/JDK/blind-target run performed. No `config.yaml` change.
-  No `*ANSWER_KEY*` / blind-target `app.py` read.
+- Latest `python -m harness.suite full` → harness 2738 OK (2 skip); pytest-native 38
+  passed; testing 221 OK; evaluation_integrity 42 OK. Exit 0. `config_manifest.py
+  --check` clean; SafeDefaultGuardTests green. Every `ERROR:`/`WARNING:` line in the
+  log is a deliberate fault-injection/negative-control assertion; no `FAILED` present.
+- No live model/Docker/JDK/blind-target run; no `config.yaml` default weakened
+  (new `store`/`server` keys ship at safe/OFF values); no `*ANSWER_KEY*`/blind
+  `app.py` read.
 
-## Improvement loop — dispatch status
+## Improvement loop — dispatch status / what's next
 
-FR-* loop batch is exhausted for offline work (FR-7 owner-only). The ordinary
-priority queue is now active. Next eligible offline candidate after P1-3's
-remaining slices: revisit P1-3 follow-on (older layers / strict_score reroute) or
-the next open loop-consumable P-tier item; P1-5 (Burp build), P2-1/P2-2 efficacy,
-P3-3 remain OWNER/LIVE. Selection is re-derived fresh each iteration.
+FR-* loop batch exhausted (FR-7 owner-only). Ordinary queue: P0 all `[x]`; P1-3
+offline-complete (live scorecard OWNER/LIVE); P1-5 OWNER/LIVE; P1-10 `[~]` (live
+half); P2-1 (L, efficacy-gated), P2-3 (dep P1-5) not eligible; P3-1 now `[x]`; P3-2
+largely non-offline; P3-3/BM-3/PR-*/NC-O*/FR-O* OWNER/LIVE; BM-2 is L/"partly
+research"; ER-3/ER-5 deprioritized. The offline-eligible pool is now essentially
+exhausted — the next iteration is expected to reach LOOP_DONE and trigger a
+re-analysis pass to file NEW evidence-based improvements (per the standing
+instruction to keep improving after the list empties).
 
 ## Benchmark honesty caveat
 
 Saved 2026-09-25 benchmark results remain historical/reported; they measure
 captured-exchange class detection, not live exploitability. No blind keys or
-blind-target implementations were read. Model/call/token instrumentation for a
-fresh efficacy number is still unavailable offline.
+blind-target implementations were read. A fresh live efficacy number is unavailable
+offline.
 
-## Durable pointers and prior work
+## Durable pointers
 
 - [IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md): durable implementation record.
-- [founder decision review](reviews/2026-09-25/founder-review/REVIEW.md);
-  [verification](reviews/2026-09-25/founder-review/VERIFICATION.md).
-- [Precision path](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md);
-  [Testing](docs/TESTING.md): suite boundaries and dependency caveats.
+- [founder review](reviews/2026-09-25/founder-review/REVIEW.md);
+  [testing](docs/TESTING.md): suite boundaries + dependency caveats.
 
 Prior loop batches are historical completed implementation work, not proof of live
-safety or efficacy. Tool egress, browser two-origin, real HTTPS/DNS, Java
-pairing/build and independent model/target evaluation still need live evidence.
-Do not revive superseded worktrees/drafts. Keep this file under 100 lines.
+safety/efficacy. Tool egress, browser two-origin, real HTTPS/DNS, Java pairing/build
+and independent model/target evaluation still need live evidence. Keep this file
+under 100 lines.
