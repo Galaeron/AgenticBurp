@@ -705,5 +705,203 @@ class EvidenceRetentionPolicyTests(unittest.TestCase):
         self.assertTrue(store.evidence_blob_resolves(new_hash))
 
 
+class WipeEngagementTests(unittest.TestCase):
+    """P3-1 (partial): the explicit "wipe engagement" action -- host-scoped
+    deletion of a host's persisted evidence. The load-bearing property under
+    test is the evidence_blobs guard: evidence_blobs is content-addressed
+    (sha256(bytes) is the primary key), so identical bytes referenced by two
+    different hosts is ONE shared row that must survive wiping either host
+    alone -- a blanket delete of every hash the target host's ledger
+    mentions would be wrong. See store.wipe_engagement's own docstring/
+    module comment for the full table-by-table rationale."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "wipe_engagement_t.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def _seed_host(self, host: str, url: str, *, case_id: str, finding_id: str,
+                    proof_id: str, req_bytes: bytes, resp_bytes: bytes) -> dict:
+        """Seed one host with a finding (carrying case_id/finding_id/
+        proof_id), a ledger_event referencing a request/response blob pair
+        under that finding's case_id, a proof_records row, a finding_
+        observations row (automatic, via persist_findings), and an
+        engagement_state row. Returns the finding's fingerprint plus the
+        blob hashes, for assertions."""
+        exchange = HttpExchange(
+            url=url, method="GET", request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+        )
+        finding = Finding(
+            vulnerability_class="sqli", confidence=0.9, summary=f"finding for {host}",
+            evidence="e", suggested_test="t", basis="derived",
+            case_id=case_id, finding_id=finding_id, proof_id=proof_id,
+        )
+        store.persist_findings(exchange, "test_agent", [finding])
+        results = store.all_host_findings(url)
+        self.assertEqual(len(results), 1)
+        fingerprint = results[0]["fingerprint"]
+
+        req_hash = store.put_evidence_blob(req_bytes)
+        resp_hash = store.put_evidence_blob(resp_bytes)
+        store.persist_ledger_event({
+            "event_id": f"evt-{case_id}",
+            "event_type": "execution",
+            "finding_ref": case_id,
+            "case_ref": case_id,
+            "summary": f"GET {url}",
+            "data": {"request_blob": req_hash, "response_blob": resp_hash},
+            "provenance": {},
+            "created_at": time.time(),
+        })
+
+        conn = store._connect()
+        try:
+            conn.execute(
+                "INSERT INTO proof_records (proof_id, run_id, case_id, finding_ref, "
+                "verdict, created_at) VALUES (?, '', ?, ?, 'confirmed', ?)",
+                (proof_id, case_id, finding_id, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        store.save_engagement(host, {"host": host, "note": "seeded"})
+
+        return {"fingerprint": fingerprint, "req_hash": req_hash, "resp_hash": resp_hash}
+
+    def test_wipe_deletes_target_hosts_own_evidence(self):
+        # POSITIVE: everything seeded for host A disappears after wiping A.
+        seeded = self._seed_host(
+            "a.example.com", "https://a.example.com/api/x",
+            case_id="case-A-1", finding_id="finding-A-1", proof_id="proof-A-1",
+            req_bytes=b"A-only request bytes", resp_bytes=b"A-only response bytes",
+        )
+        self.assertTrue(store.evidence_blob_resolves(seeded["req_hash"]))
+        self.assertTrue(store.evidence_blob_resolves(seeded["resp_hash"]))
+
+        counts = store.wipe_engagement("a.example.com")
+
+        self.assertEqual(store.all_host_findings("https://a.example.com/api/x", include_suppressed=True), [])
+        self.assertEqual(store.ledger_events_for("case-A-1"), [])
+        self.assertFalse(store.evidence_blob_resolves(seeded["req_hash"]))
+        self.assertFalse(store.evidence_blob_resolves(seeded["resp_hash"]))
+        conn = store._connect()
+        try:
+            proof_rows = conn.execute(
+                "SELECT 1 FROM proof_records WHERE case_id = ?", ("case-A-1",)).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(proof_rows, [])
+        self.assertEqual(store.finding_observations([seeded["fingerprint"]]), {})
+        self.assertIsNone(store.load_engagement("a.example.com"))
+
+        # The returned dict reports non-zero counts for every table this
+        # seed actually populated.
+        for table in ("findings", "ledger_events", "evidence_blobs",
+                      "proof_records", "finding_observations", "engagement_state"):
+            self.assertGreater(counts[table], 0, f"expected {table} to report rows deleted")
+
+    def test_other_host_survives_untouched(self):
+        # NEGATIVE CONTROL #1: host B's own findings/ledger/blobs are
+        # completely unaffected by wiping A.
+        self._seed_host(
+            "a.example.com", "https://a.example.com/api/x",
+            case_id="case-A-1", finding_id="finding-A-1", proof_id="proof-A-1",
+            req_bytes=b"A-only request bytes", resp_bytes=b"A-only response bytes",
+        )
+        seeded_b = self._seed_host(
+            "b.example.com", "https://b.example.com/api/y",
+            case_id="case-B-1", finding_id="finding-B-1", proof_id="proof-B-1",
+            req_bytes=b"B-only request bytes", resp_bytes=b"B-only response bytes",
+        )
+
+        store.wipe_engagement("a.example.com")
+
+        self.assertEqual(len(store.all_host_findings("https://b.example.com/api/y")), 1)
+        self.assertTrue(store.evidence_blob_resolves(seeded_b["req_hash"]))
+        self.assertTrue(store.evidence_blob_resolves(seeded_b["resp_hash"]))
+        self.assertEqual(len(store.ledger_events_for("case-B-1")), 1)
+
+    def test_blob_shared_by_both_hosts_survives_wiping_one(self):
+        # NEGATIVE CONTROL #2 (LOAD-BEARING): a blob whose IDENTICAL bytes
+        # are referenced by BOTH A and B survives wipe_engagement("A") --
+        # proving the `candidate - other_referenced` guard, not a blanket
+        # delete keyed on "every hash A's ledger mentions".
+        shared_bytes = b"identical evidence bytes shared by A and B"
+        shared_hash = store.put_evidence_blob(shared_bytes)
+
+        # Host A references the shared blob (as its request_blob) plus an
+        # A-only response blob.
+        exchange_a = HttpExchange(
+            url="https://a.example.com/api/shared", method="GET",
+            request_headers={}, request_body="", response_status=200,
+            response_headers={}, response_body="",
+        )
+        finding_a = Finding(
+            vulnerability_class="sqli", confidence=0.9, summary="finding A",
+            evidence="e", suggested_test="t", basis="derived",
+            case_id="case-A-shared", finding_id="finding-A-shared", proof_id="proof-A-shared",
+        )
+        store.persist_findings(exchange_a, "test_agent", [finding_a])
+        a_only_hash = store.put_evidence_blob(b"A-only distinct bytes")
+        store.persist_ledger_event({
+            "event_id": "evt-a-shared", "event_type": "execution",
+            "finding_ref": "case-A-shared", "case_ref": "case-A-shared",
+            "summary": "GET shared", "data": {"request_blob": shared_hash,
+                                                "response_blob": a_only_hash},
+            "provenance": {}, "created_at": time.time(),
+        })
+
+        # Host B independently produced the exact same bytes (e.g. the same
+        # canned error page) and also references the shared blob.
+        exchange_b = HttpExchange(
+            url="https://b.example.com/api/shared", method="GET",
+            request_headers={}, request_body="", response_status=200,
+            response_headers={}, response_body="",
+        )
+        finding_b = Finding(
+            vulnerability_class="sqli", confidence=0.9, summary="finding B",
+            evidence="e", suggested_test="t", basis="derived",
+            case_id="case-B-shared", finding_id="finding-B-shared", proof_id="proof-B-shared",
+        )
+        store.persist_findings(exchange_b, "test_agent", [finding_b])
+        store.persist_ledger_event({
+            "event_id": "evt-b-shared", "event_type": "execution",
+            "finding_ref": "case-B-shared", "case_ref": "case-B-shared",
+            "summary": "GET shared", "data": {"request_blob": shared_hash},
+            "provenance": {}, "created_at": time.time(),
+        })
+
+        self.assertTrue(store.evidence_blob_resolves(shared_hash))
+        self.assertTrue(store.evidence_blob_resolves(a_only_hash))
+
+        store.wipe_engagement("a.example.com")
+
+        # The shared blob survives (B still references it); the A-only one is gone.
+        self.assertTrue(store.evidence_blob_resolves(shared_hash))
+        self.assertFalse(store.evidence_blob_resolves(a_only_hash))
+        # And B's own finding is untouched.
+        self.assertEqual(len(store.all_host_findings("https://b.example.com/api/shared")), 1)
+
+    def test_unknown_host_is_a_clean_no_op(self):
+        # EMPTY/NO-OP: an unseeded host returns all-zero counts and deletes
+        # nothing, including for a host with real data present elsewhere.
+        self._seed_host(
+            "a.example.com", "https://a.example.com/api/x",
+            case_id="case-A-1", finding_id="finding-A-1", proof_id="proof-A-1",
+            req_bytes=b"A-only request bytes", resp_bytes=b"A-only response bytes",
+        )
+        counts = store.wipe_engagement("nonexistent.host")
+        self.assertTrue(counts)
+        self.assertTrue(all(v == 0 for v in counts.values()), counts)
+        # And host A's own data is untouched by the no-op.
+        self.assertEqual(len(store.all_host_findings("https://a.example.com/api/x")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
