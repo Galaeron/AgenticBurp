@@ -1684,17 +1684,16 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #                                content-addressed, so a column-based filter
 #                                would be actively wrong here.
 #
+#     validation_runs  -- no host column of its own; scoped via `plan_id` FK
+#                          into test_plans.host and wiped with the correlated
+#                          subquery `plan_id IN (SELECT plan_id FROM test_plans
+#                          WHERE host=?)` BEFORE the test_plans delete (there is
+#                          no ON DELETE CASCADE and _connect() leaves PRAGMA
+#                          foreign_keys off, so this explicit delete is required
+#                          to avoid orphaned rows).
+#
 #   Deliberately LEFT OUT (no confirmed host/finding_ref/case_id/fingerprint
 #   column on the table itself -- a documented follow-on, not a guess):
-#     validation_runs  -- only has `plan_id` (FK to test_plans.plan_id, which
-#                          IS host-scoped), but `plan_id` itself is not one of
-#                          the confirmed scoping columns on validation_runs.
-#                          Wiping test_plans without also cascading into
-#                          validation_runs leaves orphaned rows reachable only
-#                          via a dangling plan_id -- a real gap, follow-on:
-#                          `DELETE FROM validation_runs WHERE plan_id IN
-#                          (SELECT plan_id FROM test_plans WHERE host = ?)`
-#                          (execute it BEFORE the test_plans delete above).
 #     identities       -- no host column; identities are not engagement-
 #                          scoped in this schema (an identity/session label
 #                          can outlive any one engagement).
@@ -1860,6 +1859,18 @@ def wipe_engagement(host: str) -> dict:
             counts["finding_observations"] = 0
 
         # (g) every other confirmed host/fingerprint-scoped table.
+        # validation_runs has no host column and no ON DELETE CASCADE (and
+        # _connect() does not enable PRAGMA foreign_keys), so it must be wiped
+        # via its plan_id FK into test_plans BEFORE test_plans is deleted --
+        # otherwise the subquery finds no plan_ids and the rows orphan. The
+        # correlated subquery makes an unknown/empty host a clean 0-row no-op.
+        cur = conn.execute(
+            "DELETE FROM validation_runs WHERE plan_id IN "
+            "(SELECT plan_id FROM test_plans WHERE host = ?)",
+            (host,),
+        )
+        counts["validation_runs"] = cur.rowcount
+
         cur = conn.execute("DELETE FROM test_plans WHERE host = ?", (host,))
         counts["test_plans"] = cur.rowcount
 

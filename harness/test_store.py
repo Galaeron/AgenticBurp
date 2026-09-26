@@ -774,6 +774,59 @@ class WipeEngagementTests(unittest.TestCase):
 
         return {"fingerprint": fingerprint, "req_hash": req_hash, "resp_hash": resp_hash}
 
+    def _seed_plan_and_validation(self, url: str, *, plan_id: str,
+                                  source_hash: str, capability: str = "sqlmap") -> str:
+        """Seed a test_plan (host derived from `url`) plus a validation_runs
+        row under it, via the production persist path. confirmed=False so the
+        confirmation-capability allowlist is not consulted -- the point is only
+        to insert a validation_runs row tied to the plan. Returns plan_id."""
+        plan = TestPlan(
+            id=plan_id, capability=capability, finding_class="sqli", category="A03",
+            source_exchange_url=url, execution_plane="burp",
+            source_exchange_hash=source_hash,
+        )
+        store.persist_retry_plan(plan)
+        ok, msg = store.persist_validation_submission(ValidationSubmission(
+            plan_id=plan_id, status="not_confirmed", confirmed=False,
+            executor=f"burp:{capability}", source_exchange_hash=source_hash,
+        ))
+        self.assertTrue(ok, msg)
+        return plan_id
+
+    def _validation_run_count(self, plan_id: str) -> int:
+        conn = store._connect()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM validation_runs WHERE plan_id = ?", (plan_id,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_wipe_cascades_into_validation_runs_and_spares_other_hosts(self):
+        # P3-1 orphan cascade (defect-injection): wiping a host must ALSO
+        # remove the validation_runs rows hanging off that host's test_plans.
+        # validation_runs has no host column, no ON DELETE CASCADE, and
+        # _connect() leaves PRAGMA foreign_keys off, so without the explicit
+        # subquery delete these rows orphan. Pre-fix, counts["validation_runs"]
+        # KeyErrors and the A row survives -- so this test is red before green.
+        a_plan = self._seed_plan_and_validation(
+            "https://a.example.com/vuln", plan_id="plan-A", source_hash="hash-A")
+        b_plan = self._seed_plan_and_validation(
+            "https://b.example.com/vuln", plan_id="plan-B", source_hash="hash-B")
+        self.assertEqual(self._validation_run_count(a_plan), 1)
+        self.assertEqual(self._validation_run_count(b_plan), 1)
+
+        counts = store.wipe_engagement("a.example.com")
+
+        # POSITIVE: A's validation_runs row is gone (query validation_runs
+        # directly -- a JOIN reader would return nothing anyway once A's
+        # test_plans are deleted, which would NOT prove the orphan is cleaned).
+        self.assertEqual(self._validation_run_count(a_plan), 0)
+        # NEGATIVE CONTROL: B's validation_runs row is untouched.
+        self.assertEqual(self._validation_run_count(b_plan), 1)
+        # The wipe reports the deletion (KeyError / 0 before the fix).
+        self.assertGreaterEqual(counts["validation_runs"], 1)
+
     def test_wipe_deletes_target_hosts_own_evidence(self):
         # POSITIVE: everything seeded for host A disappears after wiping A.
         seeded = self._seed_host(
