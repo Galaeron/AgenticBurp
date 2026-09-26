@@ -644,3 +644,12 @@ reporting:
 pattern_memory:
   enabled: false
   # path: "harness/pattern_memory.jsonl"  # default; override to relocate the log
+
+# P3-1 (partial): retention/expiry for the SQLite evidence-blob store
+# (harness/store.py evidence_blobs table). SAFE DEFAULT: 0 = keep captured
+# evidence forever (current/default behavior); set >0 to purge evidence
+# blobs older than N days. Config-gated only -- nothing calls
+# apply_retention_from_config() automatically yet; wiring it to a
+# scheduler/endpoint is a later slice.
+store:
+  evidence_retention_days: 0

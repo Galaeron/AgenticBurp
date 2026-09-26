@@ -1599,3 +1599,48 @@ def evidence_blob_resolves(h: str) -> bool:
     if data is None:
         return False
     return hashlib.sha256(data).hexdigest() == h
+
+
+# ---------------------------------------------------------------------------
+# P3-1 (partial): retention/expiry for evidence_blobs. Config-gated, OFF by
+# default (evidence_retention_days=0 => keep-forever, today's current
+# behavior, byte-identical). Purging is safe because evidence_blob_resolves()
+# above already reports a deleted (or corrupted) blob as unresolved, and
+# blobs are read-only w.r.t. every verdict/severity/scope decision (see the
+# _EVIDENCE_BLOB_SCHEMA comment). Nothing calls these automatically yet --
+# wiring this to a scheduler/endpoint, and a "wipe engagement" action, are
+# later P3-1 slices.
+# ---------------------------------------------------------------------------
+
+def purge_evidence_blobs_older_than(max_age_seconds: float, *, now: float | None = None) -> int:
+    """Delete evidence blobs whose created_at is older than `max_age_seconds`
+    before `now` (defaults to time.time()). Returns the number of rows deleted.
+    A max_age_seconds <= 0 is a no-op returning 0 (retention disabled)."""
+    if max_age_seconds <= 0:
+        return 0
+    cutoff = (now if now is not None else time.time()) - max_age_seconds
+    conn = _connect()
+    try:
+        cur = conn.execute("DELETE FROM evidence_blobs WHERE created_at < ?", (cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
+    return cur.rowcount
+
+
+def apply_retention_policy(retention_days: float, *, now: float | None = None) -> int:
+    """Explicit maintenance seam: purge evidence blobs older than
+    `retention_days`. retention_days <= 0 (the shipped default) => disabled,
+    no-op returning 0. Returns rows deleted. Wiring this to a scheduler/endpoint
+    is a later P3-1 slice."""
+    if retention_days <= 0:
+        return 0
+    return purge_evidence_blobs_older_than(retention_days * 86400.0, now=now)
+
+
+def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
+    """Read store.evidence_retention_days (default 0 = disabled) from a config
+    dict and apply it. This is the config->mechanism consumer, so the config
+    key is not dead; the default 0 makes it a no-op (byte-identical to today)."""
+    days = float((cfg.get("store") or {}).get("evidence_retention_days", 0) or 0)
+    return apply_retention_policy(days, now=now)

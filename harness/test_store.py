@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -626,6 +627,82 @@ class EvidenceBlobStoreTests(unittest.TestCase):
             conn.close()
         self.assertIsNotNone(store.get_evidence_blob(h))  # a row is still there...
         self.assertFalse(store.evidence_blob_resolves(h))  # ...but it does not verify
+
+
+class EvidenceRetentionPolicyTests(unittest.TestCase):
+    """P3-1 (partial): retention/expiry for evidence_blobs, config-gated OFF by
+    default. Purging is safe -- evidence_blob_resolves() already reports a
+    deleted blob as unresolved -- but must never fire when retention is
+    disabled (the shipped default), so both a positive purge and a negative
+    (default/OFF) control are required here."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "evidence_retention_t.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def _make_old_and_new_blobs(self, now):
+        old_hash = store.put_evidence_blob(b"stale evidence, 40 days old")
+        new_hash = store.put_evidence_blob(b"fresh evidence, just captured")
+        old_cutoff = now - 40 * 86400.0
+        conn = store._connect()
+        try:
+            conn.execute(
+                "UPDATE evidence_blobs SET created_at = ? WHERE sha256 = ?",
+                (old_cutoff, old_hash))
+            conn.commit()
+        finally:
+            conn.close()
+        return old_hash, new_hash
+
+    def test_apply_retention_policy_purges_only_blobs_older_than_threshold(self):
+        # POSITIVE: a 30-day retention policy purges a 40-day-old blob but
+        # leaves a freshly-written one alone.
+        now = time.time()
+        old_hash, new_hash = self._make_old_and_new_blobs(now)
+        deleted = store.apply_retention_policy(30, now=now)
+        self.assertEqual(deleted, 1)
+        self.assertFalse(store.evidence_blob_resolves(old_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+    def test_retention_disabled_by_default_is_a_no_op(self):
+        # NEGATIVE control: retention OFF (0, the shipped default) must not
+        # delete anything -- byte-identical to today's keep-forever behavior.
+        now = time.time()
+        old_hash, new_hash = self._make_old_and_new_blobs(now)
+        self.assertEqual(store.apply_retention_policy(0, now=now), 0)
+        self.assertEqual(store.apply_retention_from_config({}, now=now), 0)
+        self.assertTrue(store.evidence_blob_resolves(old_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+    def test_purge_evidence_blobs_older_than_rejects_non_positive_max_age(self):
+        now = time.time()
+        old_hash, new_hash = self._make_old_and_new_blobs(now)
+        self.assertEqual(store.purge_evidence_blobs_older_than(0, now=now), 0)
+        self.assertEqual(store.purge_evidence_blobs_older_than(-100, now=now), 0)
+        self.assertTrue(store.evidence_blob_resolves(old_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+    def test_apply_retention_from_config_reads_store_evidence_retention_days(self):
+        # Config->mechanism consumer: a 30-day config value purges the old
+        # blob; an empty config (no `store` section) leaves everything alone.
+        now = time.time()
+        old_hash, new_hash = self._make_old_and_new_blobs(now)
+        deleted = store.apply_retention_from_config(
+            {"store": {"evidence_retention_days": 30}}, now=now)
+        self.assertEqual(deleted, 1)
+        self.assertFalse(store.evidence_blob_resolves(old_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+        # A second, disabled config on fresh blobs must not touch anything.
+        another_hash = store.put_evidence_blob(b"yet more fresh evidence")
+        self.assertEqual(store.apply_retention_from_config({}, now=now), 0)
+        self.assertTrue(store.evidence_blob_resolves(another_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
 
 
 if __name__ == "__main__":
