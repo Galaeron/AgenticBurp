@@ -10,6 +10,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 from __future__ import annotations
 
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.validators.base import ValidationResult
 
 
 class ConfirmMixin:
@@ -248,6 +249,102 @@ class ConfirmMixin:
             log.debug("coverage proof bookkeeping failed: %s", e)
         return "", ""
 
+    async def _persist_confirmation_proof(
+        self, *, case, validator_name: str, status: str, confirmed: bool,
+        finding_ref: str, ledger_summary: str, ledger_data: dict,
+        validator_version: str = "", observed_result: str = "",
+        expected_invariant: str = "",
+    ) -> tuple[bool, dict | None, str]:
+        """RB-4/INV-2 shared proof+ledger persistence.
+
+        The ONE place a case-bound ProofRecord is built/persisted
+        (store.persist_proof_record) and the matching evidence_ledger
+        VALIDATION_DECISION is emitted, so every confirmation call site --
+        PASS1's _validate_findings below, AND PASS2's engagement graph loop
+        (orchestrator_chain.py::_apply) -- reuses the SAME mechanism instead of
+        a second, divergent implementation (the exact hazard INV-2 warns
+        against: no 2nd ledger).
+
+        Returns (ok, proof.to_dict() or None, reason). Read-only w.r.t.
+        verdict/severity/scope/gate: this only ever adds a durable record. The
+        ledger emit is best-effort and never raises (matches
+        _validate_findings' original discipline for this call); a proof
+        persistence failure DOES propagate to the caller (ok=False, or an
+        exception from a malformed case/ProofRecord), exactly as
+        _validate_findings' own try/except around this step already expects.
+        """
+        from harness import evidence_ledger
+        try:
+            evidence_ledger.emit(
+                evidence_ledger.EventType.VALIDATION_DECISION, finding_ref,
+                ledger_summary, data=ledger_data,
+                provenance=evidence_ledger.Provenance.capture(
+                    config=getattr(self, "config", {})),
+                case_ref=case.case_id)
+        except Exception:
+            pass
+        pr = evidence.ProofRecord.from_validation_result(
+            case=case, validator=validator_name, validator_version=validator_version,
+            status=status, confirmed=confirmed, observed_result=observed_result,
+            expected_invariant=expected_invariant)
+        ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
+        if ok:
+            return True, pr.to_dict(), reason
+        return False, None, reason
+
+    # ER-4: names scoped for the reproduction-replay determinism gate. A
+    # single successful observation can confirm one of these active legs; a
+    # flaky one-shot confirmation would not reproduce, inflating precision.
+    _CONFIRM_REPLAY_SCOPE = frozenset({"ssrf", "ssti", "command_injection"})
+
+    async def _maybe_replay(self, validator, finding, exchange):
+        """ER-4: optional determinism gate wrapping validator.validate().
+
+        DEFAULT OFF (self.confirm_replay false, or not set on this instance):
+        awaits validate() exactly ONCE and returns that result object
+        UNCHANGED -- byte-for-byte identical to calling validator.validate()
+        directly. This is the common/shipped path.
+
+        When confirm_replay is on AND validator.name is in the scoped set
+        AND the first attempt confirmed, awaits validate() a SECOND time (via
+        the same validate() path, so scope lock / global_throttle / safety
+        gate budget / allow_mutating_replay the leg already enforces still
+        apply -- no hand-rolled re-send). If the second run agrees
+        (confirmed), the original (first) confirmed result is returned
+        unchanged. If it disagrees, a downgraded ValidationResult (confirmed
+        False, status "not_confirmed") is returned instead -- this is NOT a
+        new downgrade mechanism, it simply means the finding never gets
+        `finding.confirmed = True` set at the call site (~line 488), so
+        confirmation_gate routes it through the existing provisional/unproven
+        path exactly as it would any other not-confirmed active leg.
+        """
+        first = await validator.validate(finding, exchange)
+        if not getattr(self, "confirm_replay", False):
+            return first
+        if getattr(validator, "name", None) not in self._CONFIRM_REPLAY_SCOPE:
+            return first
+        if not first.confirmed:
+            return first
+        second = await validator.validate(finding, exchange)
+        if second.confirmed:
+            return first
+        # Disagreement: downgrade. Let the existing provisional/unproven path
+        # (confirmation_gate) handle this finding from here -- no new
+        # mechanism, just a not-confirmed result like any other.
+        note = "replay disagreed: second confirmation attempt did not reproduce"
+        summary = (first.summary or "") + ((" " + note) if first.summary else note)
+        return ValidationResult(
+            validator=first.validator,
+            status="not_confirmed",
+            finding_class=first.finding_class,
+            confidence=first.confidence,
+            confirmed=False,
+            summary=summary,
+            evidence=first.evidence,
+            raw_output=first.raw_output,
+            command=first.command,
+        )
+
     async def _validate_findings(
         self, exchange: HttpExchange, reports: list[AgentReport], *, run_context=None
     ) -> tuple[list[ValidationReport], list[dict]]:
@@ -352,7 +449,7 @@ class ConfirmMixin:
                     except Exception:
                         pass
                 for validator in validators:
-                    jobs.append(validator.validate(finding, exchange))
+                    jobs.append(self._maybe_replay(validator, finding, exchange))
                     plans.append(validator.plan(finding, exchange))
                     metas.append((finding, validator, case))
         if not jobs:
@@ -395,13 +492,17 @@ class ConfirmMixin:
                         output.append(ValidationReport(
                             validator=getattr(validator, "name", "validator"), status="error",
                             finding_class=finding.vulnerability_class, confirmed=False,
-                            summary=f"proof persistence failed: {reason}", evidence=str(result)[:300]))
+                            summary=f"proof persistence failed: {reason}", evidence=str(result)[:300],
+                            url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                            parameter=getattr(finding, "parameter_name", "")))
                 except Exception as e:  # proof bookkeeping must never break analysis
                     log.warning("proof bookkeeping failed for errored validator: %s", e)
                     output.append(ValidationReport(
                         validator=getattr(validator, "name", "validator"), status="error",
                         finding_class=finding.vulnerability_class, confirmed=False,
-                        summary=f"proof persistence failed: {e}", evidence=str(result)[:300]))
+                        summary=f"proof persistence failed: {e}", evidence=str(result)[:300],
+                        url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                        parameter=getattr(finding, "parameter_name", "")))
                 continue
             output.append(ValidationReport(
                 validator=result.validator,
@@ -411,51 +512,50 @@ class ConfirmMixin:
                 confirmed=result.confirmed,
                 summary=result.summary,
                 evidence=result.evidence,
+                # FR-5 (F09): case identity for this validation attempt -- lets the
+                # confirmation gate bind a controlled negative to the SAME
+                # parameter it actually tested, not just the class.
+                url=getattr(exchange, "url", ""),
+                method=getattr(exchange, "method", ""),
+                parameter=getattr(finding, "parameter_name", ""),
             ))
-            # P0-1: VALIDATION_DECISION -- "why was it concluded (vulnerable or
-            # not)", the confirmation half of a finding's audit trail. Recorded
-            # for every reached verdict (confirmed, not_confirmed, skipped), not
-            # only confirmations, so a REFUTED/UNVERIFIED finding's reconstruction
-            # is just as complete. Read-only: this call cannot affect `result`,
-            # `finding`, or anything read below it.
+            # P0-1/T01 (RB-4 shared helper): VALIDATION_DECISION -- "why was it
+            # concluded (vulnerable or not)" -- plus the case-bound structured
+            # proof for this attempt, built/persisted together by
+            # _persist_confirmation_proof so PASS1 (here) and PASS2
+            # (orchestrator_chain.py) share one mechanism instead of two.
+            # Recorded for every reached verdict (confirmed, not_confirmed,
+            # skipped), not only confirmations, so a REFUTED/UNVERIFIED
+            # finding's reconstruction is just as complete, and each attempt
+            # gets its OWN proof (unique proof_id). Additive -- the class-keyed
+            # confirmed-flag binding below stays as the compatibility view
+            # during migration (full case-bound confirmation is sequenced with
+            # issue identity, T06).
             try:
-                from harness import evidence_ledger
-                evidence_ledger.emit(
-                    evidence_ledger.EventType.VALIDATION_DECISION, finding.finding_id,
-                    f"{result.validator}: {result.status}"
-                    + (" (confirmed)" if result.confirmed else "")
-                    + (f" -- {result.summary}" if result.summary else ""),
-                    data={"validator": result.validator, "status": result.status,
-                          "confirmed": result.confirmed, "confidence": result.confidence,
-                          "evidence": (result.evidence or "")[:1000]},
-                    provenance=evidence_ledger.Provenance.capture(
-                        config=getattr(self, "config", {})),
-                    case_ref=case.case_id)
-            except Exception:
-                pass
-            # Case-bound structured proof for this attempt (T01): persisted and
-            # returned through the response so a confirmation is evidence, not a bare
-            # boolean, and each attempt gets its OWN proof (unique proof_id). Additive
-            # -- the class-keyed confirmed-flag binding below stays as the
-            # compatibility view during migration (full case-bound confirmation is
-            # sequenced with issue identity, T06).
-            try:
-                pr = evidence.ProofRecord.from_validation_result(
-                    case=case, validator=result.validator,
+                ok, proof_dict, reason = await self._persist_confirmation_proof(
+                    case=case, validator_name=result.validator,
                     validator_version=getattr(validator, "version", ""),
                     status=result.status, confirmed=result.confirmed,
                     observed_result=(result.summary or result.evidence or "")[:500],
-                    expected_invariant=getattr(validator, "expected_invariant", ""))
-                ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
+                    expected_invariant=getattr(validator, "expected_invariant", ""),
+                    finding_ref=finding.finding_id,
+                    ledger_summary=(
+                        f"{result.validator}: {result.status}"
+                        + (" (confirmed)" if result.confirmed else "")
+                        + (f" -- {result.summary}" if result.summary else "")),
+                    ledger_data={"validator": result.validator, "status": result.status,
+                                 "confirmed": result.confirmed, "confidence": result.confidence,
+                                 "evidence": (result.evidence or "")[:1000]},
+                )
                 if ok:
-                    proofs.append(pr.to_dict())
+                    proofs.append(proof_dict)
                     if result.confirmed:
                         finding.confirmed = True
                         finding.confidence = max(finding.confidence, result.confidence)
                         finding.review_verdict = finding.review_verdict or "validator-confirmed"
                         finding.review_note = (finding.review_note or "") + (
                             " " if finding.review_note else "") + result.summary
-                        finding.proof_id = pr.proof_id
+                        finding.proof_id = proof_dict["proof_id"]
                         finding.case_id = case.case_id
                         # Shape-precondition placeholders start with empty evidence.
                         # Preserve any agent evidence; otherwise retain the
@@ -474,13 +574,17 @@ class ConfirmMixin:
                     output[-1] = ValidationReport(
                         validator=result.validator, status="error",
                         finding_class=result.finding_class, confidence=0.0, confirmed=False,
-                        summary=f"proof persistence failed: {reason}", evidence=result.evidence)
+                        summary=f"proof persistence failed: {reason}", evidence=result.evidence,
+                        url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                        parameter=getattr(finding, "parameter_name", ""))
             except Exception as e:
                 log.warning("proof bookkeeping failed for %s: %s", result.validator, e)
                 output[-1] = ValidationReport(
                     validator=result.validator, status="error",
                     finding_class=result.finding_class, confidence=0.0, confirmed=False,
-                    summary=f"proof persistence failed: {e}", evidence=result.evidence)
+                    summary=f"proof persistence failed: {e}", evidence=result.evidence,
+                    url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                    parameter=getattr(finding, "parameter_name", ""))
             if plan is not None:
                 await asyncio.to_thread(
                     store.persist_test_plans, exchange, [plan]

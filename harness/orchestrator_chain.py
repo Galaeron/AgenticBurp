@@ -9,12 +9,54 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
+import uuid
+
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.circuit_breaker import get_ollama_circuit_breaker
 # W-16: the single TargetTransport. Imported by name (not as the module) because
 # investigate_engagement has a `run_context` parameter that would shadow the module;
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
 # standalone one when it is None".
-from harness.run_context import transport_for
+from harness.run_context import transport_for, ExecutionOutcome
+# FR-6: need the module too, for `_CREDENTIAL_HEADERS` -- aliased for the same
+# shadowing reason as above (several methods below have a `run_context` parameter).
+from harness import run_context as _run_context_mod
+
+
+# FR-6 (F10) sentinel appended to a header value to make it a genuinely invalid
+# credential control -- see `_invalidated_headers` below.
+_FR6_INVALID_SENTINEL = "_fr6_invalid"
+
+
+def _invalidated_headers(headers: dict) -> dict:
+    """Return a copy of `headers` with the credential corrupted, for the
+    invalid-token control probe in `_credential_grants_access`. Corrupts the
+    VALUE of every header recognised as a credential header
+    (`run_context._CREDENTIAL_HEADERS`: authorization/cookie/proxy-authorization)
+    so the server should reject it. If none of the supplied headers are
+    recognised credential headers (e.g. a bespoke `X-Api-Key` scheme), corrupts
+    every supplied header's value instead, so the control is always genuinely
+    invalid rather than an accidental no-op. Header NAMES are always preserved
+    so routing/auth dispatch is unchanged -- only the value is corrupted."""
+    out = dict(headers or {})
+    cred_keys = [k for k in out if k.lower() in _run_context_mod._CREDENTIAL_HEADERS]
+    for k in (cred_keys or list(out.keys())):
+        out[k] = f"{out[k]}{_FR6_INVALID_SENTINEL}"
+    return out
+
+
+def _responses_equivalent(a: ExecutionOutcome, b: ExecutionOutcome) -> bool:
+    """True when two probe outcomes represent the same access: identical status
+    AND identical body. A None/errored outcome's status is treated as None and
+    its body as "" (matching `ExecutionOutcome`'s own defaults), consistently
+    for both sides. Deliberately simple and exact -- no fuzzy body diffing --
+    so only a clear, real difference ever counts as evidence of a genuine
+    credential grant."""
+    a_status = a.status if a is not None else None
+    b_status = b.status if b is not None else None
+    a_body = (a.body or "") if a is not None else ""
+    b_body = (b.body or "") if b is not None else ""
+    return a_status == b_status and a_body == b_body
 
 
 class ChainMixin:
@@ -173,9 +215,11 @@ class ChainMixin:
           1. DEDUP -- a derived identity already escalated (its
              recrawl_as_derived task is DONE in the graph) is skipped, so the
              same leaked token never triggers a second full crawl.
-          2. VERIFY -- each credential is probed once against the source URL
-             before a crawl is spent on it; a stale/rejected token (>=400, or
-             no better than the anonymous baseline) is discarded, not crawled.
+          2. VERIFY -- each credential is probed against the source URL, together
+             with anonymous and invalid-token controls, before a crawl is spent
+             on it (FR-6/F10); a stale/rejected token (>=400), or one that is no
+             better than the anonymous/invalid baseline (a public resource or a
+             login redirect), is discarded, not crawled.
           3. CAP -- a hard per-host ceiling (engagement.max_auto_escalations) on
              how many escalations fire in this process lifetime.
         Plus the usual scope gate + throttle on every request."""
@@ -230,28 +274,80 @@ class ChainMixin:
             log.warning("engagement auto-escalate failed: %s", e)
 
     async def _credential_grants_access(self, url: str, headers: dict) -> bool:
-        """One probe to check a learned credential actually works: the source URL
-        with the credential must return a non-error (<400) response. Scope-gated +
-        throttled. A stale, revoked, or honeypot token fails here and never earns
-        a full crawl."""
+        """FR-6 (F10): a learned credential "grants access" only when it produces
+        a response DISTINGUISHABLE from both an anonymous control and an
+        invalid-token control on the same URL -- not merely a non-error (<400)
+        response. A single-probe <400 check (the old behaviour) is satisfied by
+        a public resource (anonymous 200) or a login redirect just as well as by
+        a real credential, which falsely "grants" access, inflates chain
+        plausibility, and wastes crawl budget.
+
+        Runs up to three probes on the same URL, all scope-gated + throttled,
+        through the one throwaway TargetTransport (standalone context, closed in
+        `finally` -- same shape as before):
+          1. credentialed  -- the learned credential (send_creds).
+          2. anonymous     -- no credential headers at all (send).
+          3. invalid-token -- the credential with its value corrupted (send_creds).
+        max_redirects=0 == follow_redirects=False, matching a raw client.
+
+        Fast path: if the credentialed response is itself an error (not ok,
+        no status, or status >= 400) there is no access at all -- return False
+        without spending the two control probes.
+
+        Grant (`True`) only when the credentialed response differs (status or
+        body) from BOTH controls -- i.e. the credential changed what came back,
+        not just "any request here gets <400". Conservative on control failure:
+        if a control probe raises, or does not complete (outcome != ok, e.g. it
+        was itself scope/gate/budget-denied or hit a transport error), we cannot
+        establish a differential, so we fail closed (return False) rather than
+        risk exactly the false grant this fix targets."""
         if not headers or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
             return False
         # W-16: the credential probe goes through the single TargetTransport. It is a
         # one-off throwaway send, so a standalone context; send_creds forwards the
         # learned credential (ephemeral session scoped to the URL's origin), matching
-        # a raw client that just sent it to `url`. max_redirects=0 == follow_redirects=False.
+        # a raw client that just sent it to `url`.
         _tt, _owned = transport_for(
             None, allowed_hosts=self.allowed_hosts, config=self.config)
         try:
             await global_throttle.acquire()
-            out = await _tt.send_creds("GET", url, capability="credential_probe",
-                                       headers=headers, max_redirects=0)
-            return bool(out.ok and out.status is not None and out.status < 400)
+            cred = await _tt.send_creds("GET", url, capability="credential_probe",
+                                        headers=headers, max_redirects=0)
+            if not cred.ok or cred.status is None or cred.status >= 400:
+                return False  # no access at all -- unchanged fast path, no controls needed
+
+            try:
+                await global_throttle.acquire()
+                anon = await _tt.send("GET", url, capability="credential_probe",
+                                      max_redirects=0)
+                await global_throttle.acquire()
+                invalid = await _tt.send_creds("GET", url, capability="credential_probe",
+                                               headers=_invalidated_headers(headers),
+                                               max_redirects=0)
+            except Exception:
+                return False  # control probe raised -- can't establish a differential
+            if not anon.ok or not invalid.ok:
+                return False  # control probe didn't complete -- can't establish a differential
+
+            if _responses_equivalent(cred, anon) or _responses_equivalent(cred, invalid):
+                return False  # public resource, or the token made no difference
+            return True
         except Exception:
             return False
         finally:
             if _owned is not None:
                 await _owned.aclose()
+
+    def _relink_chains(self, state, all_findings, responses: dict) -> list:
+        """RB-5/INV-3 seam: pure chain-link recompute, no confirmation/severity/scope
+        decision of its own -- that already happened upstream in `_confirm` /
+        the second-order auto-confirm phase / the coverage-driven phase. Split out
+        of `investigate_engagement` so a test can monkeypatch this one method to
+        disable the final re-link and prove a chain composed across those later
+        phases actually depends on it (not a tautology)."""
+        from harness import chain_linker
+        link = chain_linker.link_findings(state, all_findings, responses=responses)
+        return list(link["chain_findings"])
 
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
@@ -437,7 +533,33 @@ class ChainMixin:
             _confirmation_cache[key] = result
             return result
 
-        def _apply(finding, res, leg, floor):
+        # RB-4/INV-2: this path (worklist_investigator's confirm_fn for agent
+        # findings, and its precondition_fn for every shape-driven leg dispatch
+        # through _confirm/_apply below) used to stamp `confirmed`/
+        # `confirmed_by_leg` with NO persisted ProofRecord and NO evidence_ledger
+        # VALIDATION_DECISION behind it -- the exact GT04/05/06 gap INV-2 traced
+        # (docs/investigations/INV-2-proof-gap.md). One run-scoped id (not
+        # per-call) so every case _apply builds this run shares a stable
+        # run_id, matching how PASS1's RunContext-derived run_id is stable across
+        # one analyze() call.
+        _rb4_run_id = run_context.run_id if run_context is not None else uuid.uuid4().hex
+        from harness.categories import canonicalize as _rb4_canon
+        from harness import evidence_ledger
+
+        def _rb4_principal_for(exchange) -> str:
+            """Best-effort identity label for the case: the role whose headers
+            match this exchange's request headers, else "" (anonymous/unlabelled).
+            Only affects case-identity bookkeeping, never the confirmation verdict."""
+            hdrs = dict(exchange.request_headers or {})
+            if not hdrs:
+                return "anonymous"
+            for r in roles:
+                if dict(r.headers or {}) == hdrs:
+                    pid = getattr(r, "principal_id", None)
+                    return str(pid()) if callable(pid) else (getattr(r, "role", None) or "")
+            return ""
+
+        async def _apply(finding, res, leg, floor, exchange):
             if res is not None and res.status == "confirmed" and res.confirmed:
                 finding["confirmed"] = True
                 finding["confidence"] = max(float(finding.get("confidence", 0) or 0), float(res.confidence or floor))
@@ -451,6 +573,62 @@ class ChainMixin:
                 # here), and until now it stamped confirmation ONLY into the
                 # free-text evidence string, recoverable only by regex.
                 finding["confirmed_by_leg"] = leg.replace("-", "_")
+                # RB-4/INV-2: route this GENUINE confirmation through the SAME
+                # proof persistence + evidence_ledger emission PASS1's
+                # _validate_findings uses (ConfirmMixin._persist_confirmation_proof)
+                # -- reused, not reimplemented. Only reached when res.confirmed is
+                # True (this whole block is inside that check), so a suppressed/
+                # not-confirmed leg NEVER builds a case or persists a proof here --
+                # no orphan proofs. Best-effort: any failure is logged and
+                # swallowed, exactly like the coverage-driven leg's _coverage_proof
+                # -- a proof/ledger hiccup must never sink the graph loop or alter
+                # the confirmation this function already decided above.
+                try:
+                    check_id = (_rb4_canon(finding.get("vulnerability_class") or "")
+                               or (finding.get("vulnerability_class") or ""))
+                    template_id = evidence._short(
+                        (exchange.method or "").upper(), exchange.url or "",
+                        exchange.request_body or "")
+                    case = evidence.TestCaseRef.make(
+                        run_id=_rb4_run_id, request_template_id=template_id,
+                        check_id=check_id, principal_id=_rb4_principal_for(exchange))
+                    validator_name = leg.replace("-", "_")
+                    ok, proof_dict, reason = await self._persist_confirmation_proof(
+                        case=case, validator_name=validator_name,
+                        status=res.status, confirmed=res.confirmed,
+                        observed_result=(res.summary or res.evidence or "")[:500],
+                        finding_ref=case.case_id,
+                        ledger_summary=(f"{validator_name}: {res.status} (confirmed)"
+                                        + (f" -- {res.summary}" if res.summary else "")),
+                        ledger_data={"validator": validator_name, "status": res.status,
+                                     "confirmed": True, "confidence": res.confidence,
+                                     "evidence": (res.evidence or "")[:1000]})
+                    if ok:
+                        finding["proof_id"] = proof_dict["proof_id"]
+                        finding["case_id"] = case.case_id
+                        # The shape-driven legs' own probes (e.g.
+                        # CrossIdentityValidator) don't thread case_ref through the
+                        # shared TargetTransport, so a real reconstruct_persisted()
+                        # read would otherwise see no EXECUTION event at all for
+                        # this case (what_sent/what_came_back would stay empty even
+                        # though `complete` is already True from VALIDATION_DECISION
+                        # above). Stamp one summary EXECUTION event from data
+                        # already in hand here -- instrumentation only, via the
+                        # SAME evidence_ledger.emit API, never a second ledger.
+                        evidence_ledger.emit(
+                            evidence_ledger.EventType.EXECUTION, case.case_id,
+                            f"{validator_name} probe against {exchange.url}"[:500],
+                            data={"request": f"{(exchange.method or 'GET').upper()} {exchange.url}",
+                                  "response": (res.evidence or res.summary or "")[:1000]},
+                            provenance=evidence_ledger.Provenance.capture(
+                                config=getattr(self, "config", {})),
+                            case_ref=case.case_id)
+                    else:
+                        log.debug("RB-4: engagement-path proof persistence failed for "
+                                 "%s leg on %s: %s", validator_name, exchange.url, reason)
+                except Exception as e:
+                    log.debug("RB-4: engagement-path proof bookkeeping failed for "
+                             "%s leg on %s: %s", leg, exchange.url, e)
 
         def _as_finding(finding, default_class):
             return Finding(vulnerability_class=finding.get("vulnerability_class") or default_class,
@@ -488,15 +666,15 @@ class ChainMixin:
                         if _owned is not None:
                             await _owned.aclose()
                 try:
-                    _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9)
+                    await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9, exchange)
                 except Exception:
                     return
             elif ("dom" in low and "xss" in low) or "dom_xss" in low or "dom-based" in low or "client-side xss" in low:
                 # DOM-based XSS: fragment-payload browser execution (client-side
                 # source->sink), distinct from server-reflected browser_xss.
                 try:
-                    _apply(finding, await _cached_validate(_domxss, _as_finding(finding, "dom_xss"), exchange),
-                           "dom-xss", 0.95)
+                    await _apply(finding, await _cached_validate(_domxss, _as_finding(finding, "dom_xss"), exchange),
+                           "dom-xss", 0.95, exchange)
                 except Exception:
                     return
             elif "xss" in low or "cross-site scripting" in low or "cross_site" in low:
@@ -504,49 +682,49 @@ class ChainMixin:
                 # XSS and (crucially for a JSON API) declines what never reaches an HTML
                 # sink. Skips gracefully if no browser engine is installed.
                 try:
-                    _apply(finding, await _cached_validate(_bxss, _as_finding(finding, "xss"), exchange), "browser-xss", 0.95)
+                    await _apply(finding, await _cached_validate(_bxss, _as_finding(finding, "xss"), exchange), "browser-xss", 0.95, exchange)
                     # reflected browser_xss handles GET reflections; a write-shaped
                     # exchange may instead be a STORED-XSS plant point -- try that leg too.
                     if not finding.get("confirmed") and (exchange.method or "GET").upper() in ("POST", "PUT", "PATCH"):
-                        _apply(finding, await _cached_validate(_sxss, _as_finding(finding, "xss"), exchange), "stored-xss", 0.9)
+                        await _apply(finding, await _cached_validate(_sxss, _as_finding(finding, "xss"), exchange), "stored-xss", 0.9, exchange)
                 except Exception:
                     return
             elif "jwt" in low or "algorithm confusion" in low or "algorithm_confusion" in low or "weak_token" in low:
                 try:
-                    _apply(finding, await _cached_validate(_jwt, _as_finding(finding, "jwt"), exchange), "jwt-forge", 0.9)
+                    await _apply(finding, await _cached_validate(_jwt, _as_finding(finding, "jwt"), exchange), "jwt-forge", 0.9, exchange)
                 except Exception:
                     return
             elif "ssrf" in low or "server-side request" in low or "server_side_request" in low:
                 try:
-                    _apply(finding, await _cached_validate(_ssrf, _as_finding(finding, "ssrf"), exchange), "ssrf", 0.95)
+                    await _apply(finding, await _cached_validate(_ssrf, _as_finding(finding, "ssrf"), exchange), "ssrf", 0.95, exchange)
                 except Exception:
                     return
             elif "xxe" in low or "xml external" in low or "xml_external" in low:
                 try:
-                    _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange), "xxe", 0.95)
+                    await _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange), "xxe", 0.95, exchange)
                 except Exception:
                     return
             elif "command" in low or low in ("rce", "remote code execution", "code injection", "shell injection"):
                 try:
-                    _apply(finding, await _cached_validate(_cmdi, _as_finding(finding, "command_injection"), exchange),
-                           "command-injection", 0.95)
+                    await _apply(finding, await _cached_validate(_cmdi, _as_finding(finding, "command_injection"), exchange),
+                           "command-injection", 0.95, exchange)
                 except Exception:
                     return
             elif "ssti" in low or "template injection" in low:
                 try:
-                    _apply(finding, await _cached_validate(_ssti, _as_finding(finding, "ssti"), exchange), "ssti", 0.95)
+                    await _apply(finding, await _cached_validate(_ssti, _as_finding(finding, "ssti"), exchange), "ssti", 0.95, exchange)
                 except Exception:
                     return
             elif "traversal" in low or "lfi" in low or "file inclusion" in low:
                 try:
-                    _apply(finding, await _cached_validate(_path, _as_finding(finding, "path_traversal"), exchange),
-                           "path-traversal", 0.95)
+                    await _apply(finding, await _cached_validate(_path, _as_finding(finding, "path_traversal"), exchange),
+                           "path-traversal", 0.95, exchange)
                 except Exception:
                     return
             elif "redirect" in low:
                 try:
-                    _apply(finding, await _cached_validate(_redir, _as_finding(finding, "open_redirect"), exchange),
-                           "open-redirect", 0.9)
+                    await _apply(finding, await _cached_validate(_redir, _as_finding(finding, "open_redirect"), exchange),
+                           "open-redirect", 0.9, exchange)
                 except Exception:
                     return
             elif ("toctou" in low or "time-of-check" in low or "time of check" in low
@@ -555,41 +733,41 @@ class ChainMixin:
                 # TOCTOU privilege-escalation race: concurrent check-then-write.
                 # Must precede the mass/privilege->sequence branch below.
                 try:
-                    _apply(finding, await _cached_validate(_toctou, _as_finding(finding, "toctou"), exchange),
-                           "toctou", 0.85)
+                    await _apply(finding, await _cached_validate(_toctou, _as_finding(finding, "toctou"), exchange),
+                           "toctou", 0.85, exchange)
                 except Exception:
                     return
             elif "mass" in low or "assignment" in low or "privilege" in low or low in ("api_security", "api security"):
                 try:
-                    _apply(finding, await _cached_validate(_seq, _as_finding(finding, "mass_assignment"), exchange),
-                           "sequence", 0.9)
+                    await _apply(finding, await _cached_validate(_seq, _as_finding(finding, "mass_assignment"), exchange),
+                           "sequence", 0.9, exchange)
                 except Exception:
                     return
             elif "deserial" in low or "pickle" in low or "object injection" in low:
                 try:
-                    _apply(finding, await _cached_validate(_deser, _as_finding(finding, "deserialization"), exchange),
-                           "deserialization", 0.95)
+                    await _apply(finding, await _cached_validate(_deser, _as_finding(finding, "deserialization"), exchange),
+                           "deserialization", 0.95, exchange)
                 except Exception:
                     return
             elif ("session fixation" in low or "session_fixation" in low or "weak password" in low
                   or "weak_password" in low or "enumeration" in low or "broken authentication" in low
                   or "broken_authentication" in low):
                 try:
-                    _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange),
-                           "auth-sequence", 0.85)
+                    await _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange),
+                           "auth-sequence", 0.85, exchange)
                 except Exception:
                     return
             elif "rate limit" in low or "rate_limit" in low or "lockout" in low or "brute" in low:
                 try:
-                    _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange),
-                           "rate-limit", 0.85)
+                    await _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange),
+                           "rate-limit", 0.85, exchange)
                 except Exception:
                     return
             elif ("reset_token" in low or "reset token" in low or "predictable token" in low
                   or "weak token" in low or "token entropy" in low):
                 try:
-                    _apply(finding, await _cached_validate(_reset, _as_finding(finding, "reset_token"), exchange),
-                           "reset-token", 0.9)
+                    await _apply(finding, await _cached_validate(_reset, _as_finding(finding, "reset_token"), exchange),
+                           "reset-token", 0.9, exchange)
                 except Exception:
                     return
 
@@ -926,6 +1104,43 @@ class ChainMixin:
         except Exception as e:  # coverage is a report layer -- never sink the run
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
+
+        # RB-5/INV-3: re-link chains over the FINAL findings set. The passes at
+        # ~741/771 above (kept as-is, not removed) compute `chains` from
+        # `all_findings` as it stood BEFORE the second-order auto-confirm phase
+        # (~782-897) and the coverage-driven phase (~921-1012) run -- both of
+        # which append NEW confirmed findings straight into `all_findings`/`state`
+        # (`all_findings.append(cf)` + `state.ingest_findings(...)`) without
+        # re-linking. A multi-step chain whose second constituent only confirms in
+        # one of those later phases was therefore silently absent from the
+        # returned `chains` (the SCORECARD "0 chains ... did not reproduce" gap,
+        # INV-3). `all_findings` is append-only across every phase above, so
+        # recomputing the link over the now-final superset can only ADD chains a
+        # later-phase confirmation newly enables -- it never drops or mutates a
+        # chain the 741/771 passes already linked, and it makes NO confirmation/
+        # severity/scope decision itself (`_relink_chains` is a pure recompute over
+        # already-decided findings). Best-effort, mirroring the coverage-build
+        # phase just above: a late linking error must never sink the whole
+        # engagement result, so on failure the prior `chains` snapshot is kept
+        # unchanged.
+        try:
+            chains = self._relink_chains(state, all_findings, _responses)
+        except Exception as e:
+            log.debug("investigate_engagement: final chain re-link failed: %s", e)
+            _errors.append({"phase": "final_chain_relink", "error": f"{type(e).__name__}: {e}"})
+
+        # B2-1: if the shared ollama circuit breaker is OPEN at result assembly,
+        # agent/model calls made during this engagement short-circuited without
+        # hitting the model -- reuse the existing errors -> degraded contract
+        # (R30 above) rather than adding a parallel degraded signal. Best-effort:
+        # must never sink the run.
+        try:
+            if get_ollama_circuit_breaker("ollama").is_open:
+                _errors.append({"phase": "circuit_breaker",
+                                 "error": "ollama circuit breaker is OPEN: agent calls "
+                                          "may have short-circuited during this engagement"})
+        except Exception as e:
+            log.debug("investigate_engagement: circuit breaker check failed: %s", e)
 
         return {
             "summary": state.summary(),

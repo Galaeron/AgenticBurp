@@ -1,0 +1,37 @@
+{
+  "config_path": "harness/config.yaml",
+  "hash": "758c55bc3d4380a19683ab9f07b23ade623182aee0c3abc81d2ed9f32090e525",
+  "manifest": "config-safety-defaults",
+  "rationale": {
+    "adaptive_respin.enabled": "adaptive respin loop; ships disabled",
+    "coordinator.cloud_primary": "LOCAL-INFERENCE DEFAULT: cloud primary must ship false",
+    "coordinator.cloud_reasoning": "OFF-HOST EGRESS: cloud reasoning must ship false",
+    "coordinator.fail_open_mode": "fail-open scope for coordinator model failures",
+    "coordinator.routing_mode": "agent routing mode",
+    "iterative_agent.enabled": "iterative agent mode; ships disabled",
+    "operating_profile": "profile selector; 'none' = shipped passive defaults",
+    "reporting.gate_low_confidence_generic": "low-confidence generic gating default",
+    "reporting.gate_uncorroborated_catchall": "uncorroborated catch-all gating default",
+    "reporting.quarantine_unverified_leads": "lead quarantine reporting default",
+    "server.require_read_auth": "sensitive-read auth toggle default",
+    "validators.active_enabled": "PASSIVE DEFAULT: active target probing must ship false",
+    "validators.allow_mutating_replay": "MUTATION GATE: state-changing replay must ship false",
+    "validators.enabled": "master validator switch"
+  },
+  "safety_defaults": {
+    "adaptive_respin.enabled": false,
+    "coordinator.cloud_primary": false,
+    "coordinator.cloud_reasoning": false,
+    "coordinator.fail_open_mode": "all",
+    "coordinator.routing_mode": "agents",
+    "iterative_agent.enabled": false,
+    "operating_profile": "none",
+    "reporting.gate_low_confidence_generic": false,
+    "reporting.gate_uncorroborated_catchall": false,
+    "reporting.quarantine_unverified_leads": false,
+    "server.require_read_auth": false,
+    "validators.active_enabled": false,
+    "validators.allow_mutating_replay": false,
+    "validators.enabled": true
+  }
+}

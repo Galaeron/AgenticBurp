@@ -101,7 +101,10 @@ class ScanEndpointTests(unittest.TestCase):
     def setUp(self):
         import harness.server as server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app, base_url="http://localhost")
+        # RB-1: state-changing routes require the bearer token even from
+        # loopback; attach the (ephemeral, in this test env) token.
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
 
     def test_scan_confidential_endpoint_redacts(self):
         secret = "AKIAIOSFODNN7EXAMPLE"

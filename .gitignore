@@ -6,6 +6,10 @@ __pycache__/
 # Local-only config overrides, never committed (SESSION_4_PLAN.md T0.1)
 config.local.yaml
 
+# RB-1: ephemeral per-process CSRF bearer token lockfile, never committed --
+# regenerated fresh on every server startup.
+harness/.harness_token.lock
+
 # Build output and runtime SQLite DBs (SESSION_4_PLAN.md T0.2)
 *.jar
 harness/*.db

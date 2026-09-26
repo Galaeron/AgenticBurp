@@ -1,0 +1,73 @@
+{
+  "corpus": "webgoat",
+  "version": "0.0.1",
+  "hash": "790f61c019f3de23070e73b0dd794d3de9656c995f1e1ae1a483e4125fc641a6",
+  "records": [
+    {
+      "exchange_id": "WG00",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "WG00: account registration (setup)",
+      "status": "setup",
+      "provenance": "public WebGoat lesson knowledge + corpus label/note (webgoat_exchanges.json); no answer-key file read"
+    },
+    {
+      "exchange_id": "WG01",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "sqli"
+      ],
+      "label_scope": "WG01: SQLi-5a benign account lookup",
+      "status": "negative",
+      "provenance": "public WebGoat lesson knowledge + corpus label/note (webgoat_exchanges.json); no answer-key file read"
+    },
+    {
+      "exchange_id": "WG02",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "WG02: SQLi-5a tautology dumps all rows",
+      "status": "positive",
+      "provenance": "public WebGoat lesson knowledge + corpus label/note (webgoat_exchanges.json); no answer-key file read"
+    },
+    {
+      "exchange_id": "WG03",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "WG03: SQLi-5b numeric OR 1=1 dumps rows",
+      "status": "positive",
+      "provenance": "public WebGoat lesson knowledge + corpus label/note (webgoat_exchanges.json); no answer-key file read"
+    },
+    {
+      "exchange_id": "WG04",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "WG04: IDOR lesson login as tom (setup)",
+      "status": "setup",
+      "provenance": "public WebGoat lesson knowledge + corpus label/note (webgoat_exchanges.json); no answer-key file read"
+    },
+    {
+      "exchange_id": "WG05",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "idor"
+      ],
+      "label_scope": "WG05: IDOR own profile (baseline)",
+      "status": "negative",
+      "provenance": "public WebGoat lesson knowledge + corpus label/note (webgoat_exchanges.json); no answer-key file read"
+    },
+    {
+      "exchange_id": "WG06",
+      "expected_classes": [
+        "idor"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "WG06: IDOR access another user's profile by id",
+      "status": "positive",
+      "provenance": "public WebGoat lesson knowledge + corpus label/note (webgoat_exchanges.json); no answer-key file read"
+    }
+  ]
+}

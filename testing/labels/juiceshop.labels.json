@@ -1,0 +1,441 @@
+{
+  "corpus": "juiceshop",
+  "version": "0.0.1",
+  "hash": "78e7c5c53ca194a096a54691eaeb6a6e6505168824283b0c292f5b13e62eb10d",
+  "records": [
+    {
+      "exchange_id": "JS01",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "info_disclosure"
+      ],
+      "label_scope": "JS01: robots.txt disclosure",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS02",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "info_disclosure"
+      ],
+      "label_scope": "JS02: package.json exposure (dependency/version disclosure)",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS02b",
+      "expected_classes": [
+        "auth_bypass"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS02b: default admin credentials login (admin@juice-sh.op / admin123)",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS03",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "info_disclosure"
+      ],
+      "label_scope": "JS03: .git/HEAD exposure attempt",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS04",
+      "expected_classes": [
+        "info_disclosure"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS04: /ftp legacy directory listing",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS05",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS05: /ftp static file fetch (baseline for traversal below)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS06",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS06: /ftp path traversal attempt (encoded ../)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS07",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS07: /ftp quarantine folder listing attempt",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS08",
+      "expected_classes": [
+        "info_disclosure"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS08: application-configuration disclosure (may leak keys/secrets)",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS09",
+      "expected_classes": [
+        "info_disclosure"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS09: JWT public key exposure attempt",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS10",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "info_disclosure"
+      ],
+      "label_scope": "JS10: bundled client JS (search for hardcoded secrets/comments)",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS11",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS11: SQLi login bypass via comment injection (admin' -- )",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS12",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS12: SQLi login bypass variant (' OR 1=1--)",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS13",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS13: UNION-based SQLi in product search (attempt to exfiltrate Users table)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS14",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS14: register victim account",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS15",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS15: register attacker account",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS16",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS16: victim login",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS17",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS17: attacker login",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS18",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS18: victim whoami (endpoint returns empty body in this build; real id taken from the signed JWT claim instead, captured for the record)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS19",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS19: victim adds item to own basket, using their real bid claim (setup)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS20",
+      "expected_classes": [
+        "idor"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS20: IDOR -- attacker (own bid=16) reads victim's basket (bid=15) by guessable numeric id",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS21",
+      "expected_classes": [
+        "idor"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS21: IDOR -- attacker reads victim's user record by numeric id",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS22",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "info_disclosure"
+      ],
+      "label_scope": "JS22: unauthenticated security-question disclosure by arbitrary email (account enumeration)",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS23",
+      "expected_classes": [
+        "idor"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS23: order tracking by guessable/sequential order id, unauthenticated",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS24",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS24: JWT alg:none forgery -- unsigned token accepted?",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS25",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS25: JWT signature tampering (garbled signature)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS26",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS26: failed login attempt 1/6 (rate limit probe)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS26b",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS26b: failed login attempt 2/6 (rate limit probe)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS26b_1",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS26b: failed login attempt 3/6 (rate limit probe)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS26b_2",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS26b: failed login attempt 4/6 (rate limit probe)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS26b_3",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS26b: failed login attempt 5/6 (rate limit probe)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS26b_4",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS26b: failed login attempt 6/6 (rate limit probe)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS27",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS27: failed login attempt 7 -- checking for lockout/rate-limit response",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS28",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS28: fetch product 1 (baseline price)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS29",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS29: negative-quantity basket item (business logic manipulation attempt)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS30",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS30: checkout attempt against another user's basket id (cross-account checkout)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS31",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS31: mass assignment -- self-promote to admin role via profile update",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS32",
+      "expected_classes": [
+        "business_logic"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS32: mass assignment -- register directly with role=admin in body",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS33",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS33: search endpoint reflected payload (server-side reflection check)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS34",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS34: stored XSS attempt via username field",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS35",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS35: fetch reviews for product 1 (baseline)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS36",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS36: NoSQL operator injection -- edit arbitrary review via $ne id filter (attacker token, not review owner) [no in-vocab exact class]",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS37",
+      "expected_classes": [
+        "ssrf"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS37: SSRF via profile image URL fetch -- internal admin-config URL as image source",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS38",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS38: SSRF via profile image URL -- file:// scheme attempt",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS39",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS39: open redirect via unvalidated 'to' parameter",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS40",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS40: CORS -- foreign Origin on authenticated endpoint",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS41",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS41: feedback submission missing captchaId -- expect verbose 500 with stack trace",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS42",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS42: malformed type input to login (type-confusion error disclosure probe)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS43",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "JS43: nonexistent numeric id (baseline 404 behavior / ORM error probe)",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "JS44",
+      "expected_classes": [
+        "security_misconfiguration"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "JS44: homepage response headers (CSP, X-Frame-Options, HSTS check)",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    }
+  ]
+}

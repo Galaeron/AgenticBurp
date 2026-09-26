@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 # Resolve the docker CLI: PATH first, then the Docker Desktop default location so
@@ -92,16 +93,88 @@ _HARDENING_FLAGS = [
 ]
 
 
+# PR-11 / R02: per-run egress control for a containerised tool. A scanner
+# (sqlmap/ffuf) makes its OWN outbound requests; the Python-side timeout and the
+# sandbox caps above bound host resources but NOT where those requests go, so a
+# tool-followed redirect or an out-of-scope probe can leave the intended target.
+# EgressPolicy is the seam that constrains that egress at `docker run`
+# construction time and is recorded in the run receipt. The CONCRETE network/
+# proxy containment is finalized+proven on the OWNER/live half (a real container
+# against two owned origins); here the offline guarantees are: the seam exists and
+# is threaded into the argv, a run that must enforce egress but has no policy FAILS
+# CLOSED, and the run goes through the force-clean wrapper below.
+class EgressPolicyRequired(RuntimeError):
+    """Raised when a run sets ``enforce_egress`` but supplies no EgressPolicy --
+    an uncontrolled-egress tool launch is refused rather than run (fail closed)."""
+
+
+class ToolRunCancelled(RuntimeError):
+    """Raised when a tool run is cancelled at/ before launch."""
+
+
+@dataclass(frozen=True)
+class EgressPolicy:
+    """Declares how a containerised tool's outbound network is constrained.
+
+    ``network`` is the docker network the container may use; ``proxy_url`` (when
+    set) forces the tool's HTTP(S) egress through a controlled proxy; and
+    ``allowed_hosts`` is the set of destinations the run is meant to reach (e.g.
+    the in-container host alias). ``docker_flags`` renders this to argv so a test
+    can assert the seam without running docker."""
+    network: str = "bridge"
+    proxy_url: str | None = None
+    allowed_hosts: tuple[str, ...] = ()
+
+    def docker_flags(self) -> list[str]:
+        flags: list[str] = ["--network", self.network]
+        if self.proxy_url:
+            for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                flags += ["-e", f"{var}={self.proxy_url}"]
+            if self.allowed_hosts:
+                no_proxy = ",".join(self.allowed_hosts)
+                for var in ("NO_PROXY", "no_proxy"):
+                    flags += ["-e", f"{var}={no_proxy}"]
+        return flags
+
+    def describe(self) -> dict:
+        return {"network": self.network, "proxy": self.proxy_url,
+                "allowed_hosts": list(self.allowed_hosts)}
+
+
+def _is_cancelled(cancel) -> bool:
+    """Normalise the accepted cancel-signal shapes -- an ``asyncio.Event``, a
+    zero-arg callable, or ``None`` (never cancelled). Stdlib-only."""
+    if cancel is None:
+        return False
+    try:
+        import asyncio
+        if isinstance(cancel, asyncio.Event):
+            return cancel.is_set()
+    except Exception:
+        pass
+    if callable(cancel):
+        try:
+            return bool(cancel())
+        except Exception:
+            return False
+    return False
+
+
 def docker_cmd(image: str, args: list[str], *, add_host: bool = True,
-               extra: list[str] | None = None, harden: bool = True) -> list[str]:
+               extra: list[str] | None = None, harden: bool = True,
+               egress: "EgressPolicy | None" = None) -> list[str]:
     """The full `docker run` argv for `image` + `args`. Always ephemeral (--rm)
-    and, by default, sandbox-hardened (W-26; see _HARDENING_FLAGS). Pure/
-    inspectable so callers (and tests) can assert on it without running it."""
+    and, by default, sandbox-hardened (W-26; see _HARDENING_FLAGS). When an
+    `egress` policy is given, its network/proxy flags are added before the image
+    (PR-11/R02). Pure/inspectable so callers (and tests) can assert on it without
+    running it."""
     cmd = [DOCKER, "run", "--rm"]
     if harden:
         cmd += _HARDENING_FLAGS
     if add_host:
         cmd += ["--add-host", f"{_HOST_ALIAS}:host-gateway"]
+    if egress is not None:
+        cmd += egress.docker_flags()
     if extra:
         cmd += list(extra)
     cmd.append(image)
@@ -120,20 +193,61 @@ def _force_remove(name: str) -> None:
 
 
 def run(image: str, args: list[str], *, timeout: float = 120.0,
-        add_host: bool = True, extra: list[str] | None = None) -> tuple[int, str, str]:
+        add_host: bool = True, extra: list[str] | None = None,
+        egress: "EgressPolicy | None" = None, enforce_egress: bool = False,
+        cancel=None, receipt: dict | None = None) -> tuple[int, str, str]:
     """Run `image` with `args` in a throwaway container. Returns
     (returncode, stdout, stderr). Raises subprocess.TimeoutExpired on timeout so
     the caller can treat a hung tool distinctly from a clean non-zero exit.
 
-    The container is given a unique `--name` so that on TIMEOUT we can verifiably
-    terminate it (#11) -- killing the CLI client alone does not stop the container."""
+    The container is given a unique `--name` so that on TIMEOUT (or any other
+    non-clean exit) we can verifiably terminate it (#11) -- killing the CLI client
+    alone does not stop the container. `docker run --rm` only cleans up on the
+    container's OWN clean exit, so cleanup is done in a `finally` for every path
+    that is not a clean return.
+
+    PR-11/R02: `egress` threads a per-run egress policy into the argv; with
+    `enforce_egress=True` a run that has NO policy is refused (EgressPolicyRequired,
+    fail closed). `cancel` (an asyncio.Event or zero-arg callable) aborts before
+    launch. `receipt`, when supplied, is populated with tool/image/argv/egress/
+    outcome for a caller-inspectable record."""
+    if enforce_egress and egress is None:
+        raise EgressPolicyRequired(
+            f"refusing to launch {image!r}: no egress policy configured for this run "
+            "(PR-11/R02 fail-closed -- an uncontrolled-egress tool run is not allowed)")
     import uuid
     name = f"harness_{uuid.uuid4().hex[:12]}"
     cmd = docker_cmd(image, args, add_host=add_host,
-                     extra=["--name", name] + list(extra or []))
+                     extra=["--name", name] + list(extra or []), egress=egress)
+    if receipt is not None:
+        receipt.update({
+            "tool_image": image,
+            "container_name": name,
+            "argv": list(cmd),
+            "egress_applied": egress is not None,
+            "egress": (egress.describe() if egress is not None else None),
+            "outcome": "launching",
+        })
+    if _is_cancelled(cancel):
+        _force_remove(name)   # nothing launched, but stay safe if a race left one
+        if receipt is not None:
+            receipt["outcome"] = "cancelled_before_launch"
+        raise ToolRunCancelled(f"tool run cancelled before launch: {image!r}")
+    cleanup_needed = True
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        cleanup_needed = False   # clean exit -- --rm already removed it
+        if receipt is not None:
+            receipt["outcome"] = f"exit={r.returncode}"
         return r.returncode, (r.stdout or ""), (r.stderr or "")
     except subprocess.TimeoutExpired:
-        _force_remove(name)   # the hung workload must not outlive its client
+        if receipt is not None:
+            receipt["outcome"] = "timeout"
         raise
+    except Exception:
+        if receipt is not None:
+            receipt["outcome"] = "error"
+        raise
+    finally:
+        if cleanup_needed:
+            _force_remove(name)   # the hung/killed workload must not outlive its client

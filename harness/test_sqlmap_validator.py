@@ -462,3 +462,40 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContainerEgressRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """PR-11/R02: the containerised sqlmap path routes through tool_runner.run
+    (force-clean wrapper) with an enforced per-run egress policy, NOT a bare
+    docker_cmd + subprocess.run. Docker is fully mocked -- no real container."""
+
+    async def test_container_run_routes_through_tool_runner_with_enforced_egress(self):
+        from harness import tool_runner
+        validator = SqlmapValidator(binary="sqlmap", container_image="sqlmap:test",
+                                    allowed_hosts=["127.0.0.1"])
+        exchange = HttpExchange(url="http://127.0.0.1:5000/item?id=1", method="GET",
+                                request_headers={}, response_status=200)
+        captured = {}
+
+        def fake_run(image, args, **kwargs):
+            captured["image"] = image
+            captured["kwargs"] = kwargs
+            if kwargs.get("receipt") is not None:
+                kwargs["receipt"]["argv"] = ["docker", "run", "sqlmap:test"]
+            return (0, "the back-end DBMS is MySQL; parameter 'id' is vulnerable", "")
+
+        with patch.object(tool_runner, "available", return_value=(True, "27")), \
+                patch.object(tool_runner, "run", side_effect=fake_run) as mrun, \
+                patch("subprocess.run") as mraw:
+            result = await validator.validate(_finding(), exchange)
+
+        mrun.assert_called_once()
+        self.assertEqual(captured["image"], "sqlmap:test")
+        self.assertTrue(captured["kwargs"].get("enforce_egress"),
+                        "container sqlmap must enforce egress (fail-closed seam)")
+        self.assertIsNotNone(captured["kwargs"].get("egress"),
+                             "container sqlmap must pass a per-run EgressPolicy")
+        # The container path must NOT fall through to the raw subprocess.run.
+        mraw.assert_not_called()
+        self.assertEqual(result.status, "confirmed")
+        self.assertTrue(result.confirmed)

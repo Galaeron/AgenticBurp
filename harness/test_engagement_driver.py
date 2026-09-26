@@ -145,7 +145,10 @@ class DriverEndpointTests(unittest.TestCase):
         import harness.server as server_module
         self.server_module = server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app, base_url="http://localhost")
+        # RB-1: state-changing routes require the bearer token even from
+        # loopback; attach the (ephemeral, in this test env) token.
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
 
     def tearDown(self):
         store._DB_PATH = self.orig

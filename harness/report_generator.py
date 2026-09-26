@@ -315,7 +315,10 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
 
 def generate_markdown_report(host: str, findings: list[dict], generated_at: datetime | None = None,
                               effort_ledger: EffortLedger | None = None, suppressed_count: int = 0,
-                              quarantine_leads: bool = False) -> str:
+                              quarantine_leads: bool = False,
+                              gate_low_confidence_generic: bool = False,
+                              generic_confidence_floor: float = 0.5,
+                              gate_uncorroborated_catchall: bool = False) -> str:
     """
     Build a submission-ready Markdown report from store.all_host_findings()
     -shaped dicts (or anything with the same keys). Chain hypotheses
@@ -336,8 +339,31 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     "Test Suggestions" section rather than counting toward reported findings.
     Intended for blind / no-oracle measurement runs. SHIPPED OFF (False) so a
     fully-confirmed run is unaffected.
+
+    `gate_low_confidence_generic`: when True, UNCONFIRMED findings matching
+    `confirmation_gate.is_low_confidence_generic_guess` (a narrow, generic
+    vulnerability class at confidence below `generic_confidence_floor`, no
+    confirming leg) are ALSO routed to the same leads bucket as
+    `quarantine_leads` -- down-ranked out of the surfaced set rather than
+    reported as findings. SHIPPED OFF (False) so a fully-confirmed run, and
+    any run that doesn't opt in, is byte-for-byte unaffected (B2-5). Never
+    routes a confirmed or oracle-verified finding, nor one at/above the floor
+    -- see `is_low_confidence_generic_guess`'s own recall-guard docstring.
+
+    `gate_uncorroborated_catchall`: when True, UNCONFIRMED, non-oracle-verified
+    findings matching `confirmation_gate.is_uncorroborated_catchall_guess`
+    (ONLY the two catch-all classes `misconfig`/`info_disclosure`, regardless
+    of confidence) are ALSO routed to the leads bucket -- the FR-4 lever:
+    confidence is the wrong signal for these two classes specifically, so
+    this ignores confidence and requires a confirming leg or oracle
+    verification instead. SHIPPED OFF (False) so a fully-confirmed run, and
+    any run that doesn't opt in, is byte-for-byte unaffected. Deliberately
+    narrow -- never a global leg requirement; every other class is untouched.
     """
-    from harness.confirmation_gate import should_quarantine_as_lead
+    from harness.confirmation_gate import (
+        should_quarantine_as_lead, is_low_confidence_generic_guess,
+        is_uncorroborated_catchall_guess,
+    )
 
     generated_at = generated_at or datetime.now(timezone.utc)
 
@@ -349,20 +375,25 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     individual_pairs = [(r, f) for r, f in pairs if not f.is_chain]
     chains = [f for _, f in pairs if f.is_chain]
 
-    # Quarantine: route assumed/recalled live-class unverified findings to a
-    # separate bucket rather than the main list. The predicate uses the raw dict
-    # so it sees oracle_verified / basis / confirmed exactly as stored.
-    if quarantine_leads:
-        leads_bucket: list = []
-        individual: list = []
-        for raw, f in individual_pairs:
-            if should_quarantine_as_lead(raw):
-                leads_bucket.append(f)
-            else:
-                individual.append(f)
-    else:
-        individual = [f for _, f in individual_pairs]
-        leads_bucket = []
+    # Quarantine / gate: route assumed/recalled live-class unverified findings
+    # (quarantine_leads) and/or low-confidence generic-class guesses
+    # (gate_low_confidence_generic) into a shared leads bucket rather than the
+    # main list. Both predicates read the raw dict so they see oracle_verified
+    # / basis / confirmed / confidence exactly as stored. With both flags
+    # False (the shipped default), every finding falls through to `individual`
+    # in the same order as before either flag existed -- byte-for-byte
+    # unchanged output.
+    leads_bucket: list = []
+    individual: list = []
+    for raw, f in individual_pairs:
+        if quarantine_leads and should_quarantine_as_lead(raw):
+            leads_bucket.append(f)
+        elif gate_low_confidence_generic and is_low_confidence_generic_guess(raw, generic_confidence_floor):
+            leads_bucket.append(f)
+        elif gate_uncorroborated_catchall and is_uncorroborated_catchall_guess(raw):
+            leads_bucket.append(f)
+        else:
+            individual.append(f)
 
     # Collapse per-(endpoint-family, class) duplicates, floating confirmed. A
     # max-coverage run's 225 findings / 45 confirmed were heavy duplicates over ~4
@@ -456,14 +487,20 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                      "don't automatically compose. Each requires an explicit, deliberate test to confirm "
                      "the chain actually works before it's submitted as one finding rather than two._")
         lines.append("")
+        from harness import issues
         for f in chains:
             lines.append(f"### {f.vulnerability_class.replace('potential-attack-chain:', '').replace('+', ' → ')}")
             lines.append("")
             lines.append(f"**Severity if confirmed:** {_SEVERITY_BADGE.get(f.severity, f.severity)}")
             lines.append("")
-            lines.append(f.evidence)
+            # R03/NC-4: this chains render path shared _render_finding's leak --
+            # a captured ?token=/Authorization-shaped value interpolated into a
+            # chain's evidence/suggested_test reached the report unredacted here,
+            # even though _render_finding already masks the same fields. Redact at
+            # this boundary with the same issues.redact so export parity holds.
+            lines.append(issues.redact(f.evidence))
             lines.append("")
-            lines.append(f"**Suggested verification:** {f.suggested_test}")
+            lines.append(f"**Suggested verification:** {issues.redact(f.suggested_test)}")
             lines.append("")
 
     if leads_bucket:
@@ -580,8 +617,16 @@ def _render_finding(f: ReportFinding) -> list[str]:
             from harness import evidence_ledger
             recon = evidence_ledger.reconstruct_persisted(f.finding_id)
             if recon.get("event_count"):
-                completeness = "complete" if recon.get("complete") else "partial"
-                lines.append(f"_Evidence chain: `{f.finding_id}` ({completeness}, "
+                verdict = "complete" if recon.get("complete") else "partial"
+                # P0-6/R10: state reproducibility honestly -- a recorded verdict is
+                # not the same as an independently re-runnable request/response.
+                comp = recon.get("completeness") or {}
+                if comp.get("resolvable"):
+                    repro = "independently reproducible"
+                else:
+                    miss = "; ".join(comp.get("missing") or []) or "no re-runnable request/response recorded"
+                    repro = f"NOT independently reproducible ({miss})"
+                lines.append(f"_Evidence chain: `{f.finding_id}` ({verdict} verdict; {repro}; "
                               f"{recon['event_count']} recorded event(s)) -- reconstructable via "
                               f"the findings API without re-reading server logs._")
         except Exception:

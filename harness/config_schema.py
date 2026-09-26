@@ -35,6 +35,12 @@ _log = logging.getLogger("harness.config_schema")
 
 _SECRET_KEYS = {"auth_token", "bearer_token", "api_key", "cloud_api_key", "token", "password"}
 _VALID_FAIL_OPEN_MODES = {"all", "curated"}
+# AR-1 (LOOP half): agent-family routing mode. "agents" (default, shipped) is
+# today's per-agent fan-out. "families" collapses dispatched agents into
+# per-family composed calls (harness/agent_families.py) -- NOT a safety flag
+# (it only reduces model-call count; sends no live traffic, widens no
+# scope), so it is intentionally NOT added to SafeDefaultGuardTests.SAFE_CHECKS.
+_VALID_ROUTING_MODES = {"agents", "families"}
 
 
 @dataclass
@@ -97,6 +103,7 @@ class _CoordinatorSection(BaseModel):
     cloud_reasoning: bool = False
     cloud_model: str | None = None
     fail_open_mode: str = "all"
+    routing_mode: str = "agents"
 
 
 class ConfigModel(BaseModel):
@@ -143,6 +150,11 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
         errors.append(
             f"coordinator.fail_open_mode {c.fail_open_mode!r} is not one of "
             f"{sorted(_VALID_FAIL_OPEN_MODES)}."
+        )
+    if c.routing_mode not in _VALID_ROUTING_MODES:
+        errors.append(
+            f"coordinator.routing_mode {c.routing_mode!r} is not one of "
+            f"{sorted(_VALID_ROUTING_MODES)}."
         )
 
     # --- range constraints ---

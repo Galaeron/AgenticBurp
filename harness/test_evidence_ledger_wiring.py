@@ -27,7 +27,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -302,6 +302,66 @@ class EvidenceLedgerWiringTests(unittest.IsolatedAsyncioTestCase):
             await run_context.aclose()
         self.assertTrue(outcome.ok)
         self.assertEqual(before, after, "an unlinked send must not add any ledger event")
+
+
+class EvidenceBlobProducerWiringTests(unittest.IsolatedAsyncioTestCase):
+    """FR-2 (F03): _artifact's blob-store wiring at the successful-send call
+    site. A good send must durably store a hash-verified request+response
+    blob (so the P0-6 resolver can honestly call it resolvable); a blob-store
+    failure must NEVER turn that good send into a transport failure -- it must
+    instead mark the EXECUTION event's evidence degraded so evidence health,
+    not the send outcome, reflects the gap."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig_db = store._DB_PATH
+        store._DB_PATH = Path(self._tmp) / "blob_wiring_t.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._orig_db
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    async def test_successful_send_stores_hash_verified_blobs(self):
+        run_context = RunContext.create(allowed_hosts=["a.test"], config={})
+        run_context._default_client = httpx.AsyncClient(transport=_mock_transport(b"a real response body"))
+        case_ref = "blob-wiring-finding-1"
+        try:
+            outcome = await run_context.target_transport().execute(
+                TypedRequest(method="GET", url="https://a.test/x"),
+                capability="probe", case_ref=case_ref)
+        finally:
+            await run_context.aclose()
+        self.assertTrue(outcome.ok)
+
+        comp = evidence_ledger.reconstruct_persisted(case_ref)["completeness"]
+        self.assertTrue(comp["resolvable"], comp)
+        self.assertTrue(comp["has_request_blob"] and comp["has_response_blob"], comp)
+
+    async def test_blob_store_failure_never_breaks_the_send_and_marks_degraded(self):
+        run_context = RunContext.create(allowed_hosts=["a.test"], config={})
+        run_context._default_client = httpx.AsyncClient(transport=_mock_transport(b"a real response body"))
+        case_ref = "blob-wiring-finding-2"
+        with patch("harness.store.put_evidence_blob", side_effect=RuntimeError("disk full")):
+            try:
+                outcome = await run_context.target_transport().execute(
+                    TypedRequest(method="GET", url="https://a.test/x"),
+                    capability="probe", case_ref=case_ref)
+            finally:
+                await run_context.aclose()
+        # The send itself must succeed regardless of the blob-store failure.
+        self.assertTrue(outcome.ok,
+                        "a blob-store failure must never turn a good send into a transport failure")
+
+        events = store.ledger_events_for(case_ref)
+        executions = [e for e in events if e["event_type"] == "execution"]
+        self.assertTrue(executions)
+        self.assertTrue(executions[0]["data"].get("evidence_blob_degraded"))
+        self.assertNotIn("request_blob", executions[0]["data"])
+        self.assertNotIn("response_blob", executions[0]["data"])
+
+        comp = evidence_ledger.reconstruct_persisted(case_ref)["completeness"]
+        self.assertFalse(comp["resolvable"], "a degraded/failed blob write must not be reported resolvable")
+        self.assertTrue(any("degraded" in m for m in comp["missing"]), comp["missing"])
 
 
 if __name__ == "__main__":

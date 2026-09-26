@@ -106,10 +106,36 @@ class OllamaClient:
     Docs: https://github.com/ollama/ollama/blob/main/docs/api.md
     """
 
-    def __init__(self, base_url: str, timeout_seconds: float = 120.0):
+    def __init__(self, base_url: str, timeout_seconds: float = 120.0,
+                 num_ctx: int | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
-        
+        # Optional per-request Ollama context window (options.num_ctx). Default
+        # None => the key is NOT sent, so Ollama keeps its own server/model
+        # default and every existing call site is byte-for-byte unchanged. A
+        # caller (e.g. a local/eval overlay via config.local.yaml's
+        # `ollama.num_ctx`) can pin a smaller window when the harness's prompts
+        # are far below the model's default context: on a VRAM-limited box, a
+        # model loaded at a huge default context (e.g. qwen3:8b at 32768 = 10GB)
+        # spills onto CPU and each call runs several times slower, whereas the
+        # same model pinned to a context that actually covers the prompt
+        # (measured p99 < 4k tokens here) stays fully GPU-resident. Never sent
+        # unless set, so this cannot change behavior for a caller that leaves it
+        # unset.
+        self.num_ctx = int(num_ctx) if num_ctx else None
+
+        # Pure instrumentation (added for the P2-2 ablation cost axis): count
+        # model calls and accumulate the real prompt/completion token usage this
+        # client already reads off each response for logging. Every model call in
+        # the harness (agents, coordinator, critique) goes through one
+        # OllamaClient, so these totals capture a whole run's model cost without
+        # depending on the effort budget (whose agent-token wiring is currently
+        # inert -- AgentManager._effort_budget is never set). Read-only counters;
+        # they change no control flow, no gating, and no request payload.
+        self.model_call_count = 0
+        self.model_prompt_tokens = 0
+        self.model_completion_tokens = 0
+
         # Initialize circuit breaker. Uses the shared-registry accessor
         # (not `OllamaCircuitBreaker(...)` directly) so that every
         # OllamaClient instance pointed at the same logical service shares
@@ -189,7 +215,13 @@ class OllamaClient:
             ],
             "format": "json",
             "stream": False,
-            "options": {"temperature": temperature},
+            # options.num_ctx is included ONLY when self.num_ctx is set (opt-in,
+            # see __init__); omitted otherwise so Ollama uses its own default and
+            # the payload is unchanged for every caller that never sets it.
+            "options": (
+                {"temperature": temperature, "num_ctx": self.num_ctx}
+                if self.num_ctx else {"temperature": temperature}
+            ),
             # Every call site here wants fast, structured JSON classification
             # output, never a reasoning trace -- but a "thinking"-capable
             # model (Qwen3, Gemma 4, etc.) defaults to thinking ON when this
@@ -206,8 +238,14 @@ class OllamaClient:
         }
         url = f"{self.base_url}/api/chat"
         
-        # Use circuit breaker and rate limiter
-        async with self.circuit_breaker:
+        # Use circuit breaker and rate limiter. Resolved AT CALL TIME (not
+        # self.circuit_breaker, cached at __init__) via current_ollama_breaker
+        # (AR-2, LOOP half): when a RunContext has pushed a per-run breaker,
+        # this call is governed by THAT run's isolated breaker; otherwise it
+        # falls back to self.circuit_breaker -- the same process-wide shared
+        # singleton this always used, unchanged for every no-run caller.
+        breaker = circuit_breaker.current_ollama_breaker("ollama")
+        async with breaker:
             async with self.rate_limiter:
                 try:
                     async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
@@ -270,7 +308,15 @@ class OllamaClient:
                     
                     # Record token usage
                     self.rate_limiter.record_usage(prompt_tokens, completion_tokens)
-                    
+
+                    # Instrumentation only (see __init__): a successful model
+                    # call plus its real token usage. Counted here, after a
+                    # parse, so it reflects calls that actually returned usable
+                    # output; failures raise above and are not counted.
+                    self.model_call_count += 1
+                    self.model_prompt_tokens += prompt_tokens
+                    self.model_completion_tokens += completion_tokens
+
                     return parsed, data
                 except json.JSONDecodeError as e:
                     self.audit_logger.log_llm_error(

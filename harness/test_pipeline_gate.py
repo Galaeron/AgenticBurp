@@ -8,6 +8,7 @@ suppressed confirmation. This proves these fixture paths, not live-target recall
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import tempfile
@@ -21,6 +22,7 @@ _HARNESS = Path(__file__).resolve().parent
 
 from harness import store
 from harness import cache
+from harness import evidence_ledger
 from harness import global_throttle
 from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
@@ -102,6 +104,28 @@ class _PipelineRun:
         self.defect = defect
 
     def run(self) -> tuple[dict, DiscoveryPipelineFixture]:
+        """Run and tear down before returning: store._DB_PATH/cache._cache are
+        back on the shared dev DB, and the run's temp DB is deleted, by the
+        time the caller gets the result. Fine for callers that only look at
+        the in-memory result dict/fixture. A caller that also needs to read
+        the run's OWN store/evidence_ledger state (proofs_for_case,
+        reconstruct_persisted, a raw store._connect() query, ...) must use
+        run_live() instead and do those reads inside the `with` block --
+        after this method returns, that data lives in a deleted temp dir and
+        store._DB_PATH points back at the polluted shared dev DB."""
+        with self.run_live() as (result, fx):
+            return result, fx
+
+    @contextlib.contextmanager
+    def run_live(self):
+        """Same run as run(), but stays open as a context manager so the
+        caller can inspect store/evidence_ledger state while this run's own
+        temp DB is still live -- i.e. while store._DB_PATH/cache._cache still
+        point at it, before teardown restores the shared dev DB and deletes
+        the temp dir. Do any store/evidence_ledger persistence assertions
+        inside the `with` block; outside it they would read the shared,
+        already-polluted dev DB (harness/harness_state.db) instead of this
+        run's own database."""
         tmp = tempfile.mkdtemp(prefix="pipeline_gate_")
         orig_db, orig_cache = store._DB_PATH, cache._cache
         store._DB_PATH = Path(tmp) / "state.db"
@@ -131,7 +155,7 @@ class _PipelineRun:
                 result = asyncio.run(orch.investigate_engagement(
                     fx.base, ROLES, max_nodes=8, step_budget=4,
                     max_chain_rounds=0, discovery_max_probes=self.probes))
-            return result, fx
+            yield result, fx
         finally:
             fx.close()
             global_throttle.configure(_prev_rate, _prev_burst)
@@ -250,6 +274,49 @@ class RealPipelineGateTest(unittest.TestCase):
             "GATE IS NOT TESTING CONFIRMATION: the patched (ownership-enforcing) fixture "
             "was still reported as a confirmed IDOR.")
 
+    def test_engagement_confirmed_idor_persists_proof_and_ledger(self):
+        """RB-4/INV-2 acceptance test: a confirmed=True finding produced by the
+        ENGAGEMENT path (orchestrator_chain._apply, the graph-loop/PASS2
+        confirmation -- NOT orchestrator_confirm._validate_findings/PASS1) must
+        resolve to a persisted ProofRecord AND a durable evidence_ledger
+        VALIDATION_DECISION -- exactly like PASS1 -- not merely a free-text
+        evidence stamp. Before RB-4 this is the documented INV-2 gap
+        (docs/investigations/INV-2-proof-gap.md): GT04/05/06 dropped from the
+        proof-linked audit because this exact path never persisted a proof."""
+        # store/evidence_ledger reads below must happen while this run's own
+        # temp DB is still live -- run_live() only restores store._DB_PATH to
+        # the shared dev DB, and deletes the temp dir, on exit from this
+        # `with` block. Reading after .run() would silently hit the shared,
+        # already-populated dev DB (harness/harness_state.db) instead.
+        with _PipelineRun("vulnerable").run_live() as (result, fx):
+            confirmed = _confirmed_idor(result)
+            self.assertTrue(confirmed, "precondition: no confirmed engagement-path IDOR to check proof for")
+            f = confirmed[0]
+            case_id = f.get("case_id")
+            proof_id = f.get("proof_id")
+            self.assertTrue(case_id, f"engagement-confirmed finding carries no case_id: {f}")
+            self.assertTrue(proof_id, f"engagement-confirmed finding carries no proof_id: {f}")
+
+            proofs = store.proofs_for_case(case_id)
+            match = [p for p in proofs if p["proof_id"] == proof_id]
+            self.assertTrue(
+                match, f"no persisted ProofRecord found for case_id={case_id!r} proof_id={proof_id!r} "
+                       f"(persist_proof_record was never called, or failed, on the engagement path)")
+            self.assertEqual(match[0]["verdict"], "confirmed")
+            self.assertEqual(match[0]["case"]["case_id"], case_id,
+                             "proof must resolve under the SAME case_id the finding carries (no "
+                             "cross-case identity mismatch)")
+
+            # The evidence_ledger side: reconstruct_persisted() must be able to answer
+            # the audit questions purely from the durable store, independent of the
+            # in-memory ledger singleton -- the same read path server.py's
+            # /findings/{ref}/evidence and report_generator.py use.
+            recon = evidence_ledger.reconstruct_persisted(case_id)
+            self.assertTrue(recon["complete"], f"reconstruct_persisted incomplete: {recon}")
+            self.assertTrue(recon["what_sent"], f"what_sent must be non-empty: {recon}")
+            self.assertTrue(recon["what_came_back"], f"what_came_back must be non-empty: {recon}")
+            self.assertTrue(recon["why_concluded"], f"why_concluded (VALIDATION_DECISION) must be recorded: {recon}")
+
 
 class RealPipelineGateDefectInjectionTest(unittest.TestCase):
     """The gate is only worth having if it FAILS when the pipeline breaks. Each test
@@ -307,6 +374,62 @@ class RealPipelineGateDefectInjectionTest(unittest.TestCase):
             "defect-injection is inert: an IDOR was still 'confirmed' even though the "
             "cross-identity leg was suppressed, so the gate's confirmation does not "
             "actually come from that leg")
+
+    def test_suppressed_confirmation_leg_persists_no_orphan_proof(self):
+        """RB-4/INV-2 negative control: persistence must be additive to a GENUINE
+        confirmation only. When the cross-identity leg is suppressed (never
+        confirms, same defect injection as
+        test_suppressing_the_confirmation_leg_kills_the_gate above), the
+        engagement path must not persist a CONFIRMED ProofRecord for this run at
+        all -- no orphan proof left behind by a leg that never actually
+        confirmed anything."""
+        def _defect():
+            from harness.validators import cross_identity_validator as civ
+            from harness.validators.base import ValidationResult
+
+            async def _never_confirm(self, finding, exchange, **kw):
+                return ValidationResult(
+                    validator="cross_identity", status="not_confirmed", finding_class="idor",
+                    confirmed=False, confidence=0.0,
+                    summary="suppressed for defect injection", evidence="")
+            return patch.object(civ.CrossIdentityValidator, "validate", new=_never_confirm)
+        # The store read below must happen while this run's own temp DB is
+        # still live -- run_live() only restores store._DB_PATH to the shared
+        # dev DB, and deletes the temp dir, on exit from this `with` block.
+        # Reading after .run() would hit the shared dev DB
+        # (harness/harness_state.db), which holds hundreds of pre-existing
+        # unrelated verdict='confirmed' idor rows from other runs/tests --
+        # making this assertion match pollution instead of this run's data.
+        with _PipelineRun("vulnerable", defect=_defect).run_live() as (result, fx):
+            self.assertEqual(
+                _confirmed_idor(result), [],
+                "precondition: the cross-identity leg must genuinely be suppressed")
+
+            # The finding itself must carry no case_id/proof_id -- a suppressed leg
+            # never even attempts persistence (that code path is unreachable when
+            # res.confirmed is False).
+            obj = _node(result, "GET", "/api/notes/{id}")
+            self.assertIsNotNone(obj, "precondition: the object route must still be discovered")
+            for f in obj.get("findings", []) or []:
+                self.assertFalse(f.get("case_id"), f"a suppressed leg must not stamp a case_id: {f}")
+                self.assertFalse(f.get("proof_id"), f"a suppressed leg must not stamp a proof_id: {f}")
+
+            # And the store itself -- this run's own isolated DB, still live here
+            # inside the `with` block -- must hold no CONFIRMED idor proof record
+            # at all: the "no orphan proofs" guarantee, checked directly against
+            # persistence rather than only against the in-memory finding.
+            conn = store._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT proof_id, check_id, verdict FROM proof_records WHERE verdict = 'confirmed'"
+                ).fetchall()
+            finally:
+                conn.close()
+            orphaned = [r for r in rows if "idor" in (r[1] or "").lower()]
+            self.assertEqual(
+                orphaned, [],
+                f"a suppressed cross-identity leg must never leave a CONFIRMED idor "
+                f"ProofRecord behind (no orphan proofs): {orphaned}")
 
 
 def _get_only_crawl(orig_crawl):

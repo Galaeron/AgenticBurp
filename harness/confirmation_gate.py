@@ -413,21 +413,218 @@ def should_quarantine_as_lead(finding) -> bool:
     return leg_tier(vc) == "live"
 
 
-def _controlled_negative_classes(validation_reports: list | None) -> set:
-    """Canonical finding classes for which a validator produced a real controlled
-    NEGATIVE -- it actually ran and returned `not_confirmed` (R08). This is what
-    separates a refutation ("a reliable leg ran and said no") from a leg that
-    never produced a verdict (skipped / error / disabled / absent), which is NOT
-    evidence of a false positive and must not be labelled as one."""
+# 2026-09-23 B2-5: the scorecard's dominant FP driver across blind runs is a
+# narrow set of generic-class, low-confidence agent GUESSES with no
+# confirming leg -- named offenders (2026-09-22 reviews/2026-09-22/
+# BLIND_SCORECARD_P0-3.md): "Security misconfiguration",
+# "Broken Access Control (Workflow Bypass)", "SQL injection" at confidence
+# 0.3-0.5, firing on nearly every exchange regardless of actual target
+# behavior. `is_low_confidence_generic_guess` below is a SIBLING gate to
+# `should_quarantine_as_lead` -- same recall guard (never a confirmed /
+# oracle-verified / at-or-above-floor finding), a different trigger (class +
+# raw confidence number, rather than basis + leg_tier).
+#
+# `categories.canonicalize()` deliberately returns None for ambiguous
+# OWASP-style category names it refuses to guess at (see
+# test_categories.py's assertion that canonicalize("Broken Access Control")
+# is None -- a real OWASP Top 10 heading that could mean idor, business
+# logic, or auth) -- so "Broken Access Control (Workflow Bypass)" can't be
+# reached purely through the canonical-key synonym table. The default set
+# below is built from canonicalize()'s result where it succeeds, falling
+# back to the raw lowercased phrase where it refuses to guess; the SAME
+# canonicalize-or-lowercase rule is applied to the finding under test in
+# `_generic_class_key`, so matching stays a single narrow exact-key lookup
+# either way -- never a substring/fuzzy match.
+_GENERIC_CLASS_SOURCE_PHRASES: tuple[str, ...] = (
+    "Security misconfiguration",
+    "Broken Access Control (Workflow Bypass)",
+    "SQL injection",
+    # 2026-09-25 FR-4: info_disclosure joins the generic set now that
+    # categories.py's synonym table folds the model's actual info-disclosure
+    # spelling variants (information_disclosure, verbose_error_disclosure,
+    # excessive_data_exposure, exposure_of_internal_data,
+    # exposure_of_sensitive_information, information_disclosure_header, ...)
+    # into this one canonical key -- see categories._SYNONYMS. Before that
+    # fix this class could never be reached here at all.
+    "Information Disclosure",
+)
+
+
+def _generic_class_key(vuln_class) -> str:
     from harness.categories import canonicalize
-    neg: set = set()
+    vc = vuln_class or ""
+    return canonicalize(vc) or vc.strip().lower()
+
+
+DEFAULT_GENERIC_CLASSES: frozenset = frozenset(
+    _generic_class_key(p) for p in _GENERIC_CLASS_SOURCE_PHRASES
+)
+
+
+def is_low_confidence_generic_guess(finding, floor: float = 0.5, generic_classes=None) -> bool:
+    """Sibling predicate to `should_quarantine_as_lead`: True when a finding is
+    an UNCONFIRMED, LOW-CONFIDENCE guess in one of a narrow set of generic
+    vulnerability classes, with no confirming leg -- the dominant FP driver
+    identified in the 2026-09-22 blind scorecard.
+
+    ALL of the following must hold:
+      - Not confirmed (confirmed is False) -- no confirming leg.
+      - Not oracle-verified (oracle_verified is False).
+      - `confidence` is a real number strictly below `floor`.
+      - The finding's vulnerability_class resolves (via
+        `_generic_class_key`: categories.canonicalize, falling back to the
+        raw lowercased string where canonicalize refuses to guess) to one of
+        `generic_classes`.
+
+    This is the SAME recall guard as `should_quarantine_as_lead`: a confirmed
+    or oracle-verified finding is NEVER routed here, and neither is one at or
+    above the confidence floor -- regardless of class. `generic_classes`
+    defaults to `DEFAULT_GENERIC_CLASSES`, a deliberately narrow, reviewable
+    set -- never a broad substring match.
+
+    Accepts a dict-or-object finding, mirroring `should_quarantine_as_lead`."""
+    generic_classes = DEFAULT_GENERIC_CLASSES if generic_classes is None else generic_classes
+
+    if isinstance(finding, dict):
+        confirmed = bool(finding.get("confirmed", False))
+        oracle_verified = bool(finding.get("oracle_verified", False))
+        confidence = finding.get("confidence", None)
+        vc = finding.get("vulnerability_class", "")
+    else:
+        confirmed = bool(getattr(finding, "confirmed", False))
+        oracle_verified = bool(getattr(finding, "oracle_verified", False))
+        confidence = getattr(finding, "confidence", None)
+        vc = getattr(finding, "vulnerability_class", "")
+
+    if confirmed or oracle_verified:
+        return False
+    if not isinstance(confidence, (int, float)) or confidence >= floor:
+        return False
+    return _generic_class_key(vc) in generic_classes
+
+
+# 2026-09-25 FR-4 (supersedes BM-1): offline re-score of the captured
+# benchmark findings (reviews/2026-09-25/benchmark/*_strict_3x.json) showed
+# confidence is the WRONG lever for exactly two catch-all classes --
+# `misconfig` and `info_disclosure` are 69 of 101 pooled FPs but only 8 of 30
+# pooled TPs, and 86/96 misconfig + 65/76 info-disclosure findings sit at
+# confidence >= 0.5 (many pinned at exactly 0.50, an uncalibrated default) --
+# so `is_low_confidence_generic_guess`'s confidence floor barely reaches them.
+# The measured effective lever is instead an EVIDENCE requirement: for ONLY
+# these two classes, require a confirming leg (confirmed OR oracle_verified)
+# before the finding is surfaced, regardless of its self-reported confidence.
+# Offline re-score: pooled precision 0.232 -> 0.407, F1 0.358 -> 0.500 (recall
+# 0.784 -> 0.649; demoted findings are routed to leads, not deleted).
+#
+# This is DELIBERATELY narrow -- a GLOBAL leg requirement collapses recall to
+# 0.05 (see the same re-score) and is explicitly NOT what this predicate
+# does: only `DEFAULT_CATCHALL_CLASSES` is affected. sqli/xss/idor/
+# path_traversal/jwt/csrf/etc. are untouched by this gate.
+_CATCHALL_CLASS_SOURCE_PHRASES: tuple[str, ...] = (
+    "Security misconfiguration",
+    "Information Disclosure",
+)
+
+DEFAULT_CATCHALL_CLASSES: frozenset = frozenset(
+    _generic_class_key(p) for p in _CATCHALL_CLASS_SOURCE_PHRASES
+)
+
+
+def is_uncorroborated_catchall_guess(finding, catchall_classes=None) -> bool:
+    """True when a finding is an UNCONFIRMED, UNCORROBORATED guess in one of
+    a narrow set of catch-all vulnerability classes (`misconfig`,
+    `info_disclosure` by default) -- the measured effective FP lever for
+    these two classes (see the module comment above this function).
+
+    ALL of the following must hold:
+      - Not confirmed (confirmed is False).
+      - Not oracle-verified (oracle_verified is False).
+      - The finding's vulnerability_class resolves (via `_generic_class_key`)
+        to one of `catchall_classes`.
+
+    UNLIKE `is_low_confidence_generic_guess`, this predicate ignores
+    `confidence` entirely -- that is the point: these two classes sit at
+    confidence >= 0.5 far too often for a confidence floor to catch them, so
+    the lever here is corroborating evidence (a confirming leg or an oracle
+    verification), not the model's own confidence number.
+
+    Same recall guard as its siblings: a confirmed or oracle-verified finding
+    is NEVER routed here, no matter its class. `catchall_classes` defaults to
+    `DEFAULT_CATCHALL_CLASSES`, a deliberately narrow, reviewable set --
+    never a broad substring match, and never applied globally (a same-class
+    concrete finding of any OTHER class always still surfaces).
+
+    Accepts a dict-or-object finding, mirroring `is_low_confidence_generic_guess`."""
+    catchall_classes = DEFAULT_CATCHALL_CLASSES if catchall_classes is None else catchall_classes
+
+    if isinstance(finding, dict):
+        confirmed = bool(finding.get("confirmed", False))
+        oracle_verified = bool(finding.get("oracle_verified", False))
+        vc = finding.get("vulnerability_class", "")
+    else:
+        confirmed = bool(getattr(finding, "confirmed", False))
+        oracle_verified = bool(getattr(finding, "oracle_verified", False))
+        vc = getattr(finding, "vulnerability_class", "")
+
+    if confirmed or oracle_verified:
+        return False
+    return _generic_class_key(vc) in catchall_classes
+
+
+def _controlled_negative_classes(validation_reports: list | None) -> set:
+    """Back-compat wrapper: canonical finding classes for which a validator
+    produced a real controlled NEGATIVE, ignoring case identity. Superseded by
+    `_controlled_negatives` (FR-5/F09) for the gate's own matching, which binds
+    a negative to the parameter it actually tested; kept here for any external
+    caller that still wants the plain class set."""
+    return set(_controlled_negatives(validation_reports).keys())
+
+
+def _controlled_negatives(validation_reports: list | None) -> dict:
+    """Case-aware collector (FR-5/F09) of controlled NEGATIVEs: validators that
+    actually ran and returned `not_confirmed` (R08) -- as opposed to a leg that
+    never produced a verdict (skipped / error / disabled / absent), which is NOT
+    evidence of a false positive and must not be labelled as one.
+
+    Returns {canonical_class: {parameter_or_empty, ...}}. A negative whose
+    `ValidationReport.parameter` is empty (the pre-FR-5 default, or a genuinely
+    non-parameter-scoped check) is recorded as a CLASS-LEVEL negative -- kept in
+    the set under the empty string -- and continues to refute any same-class
+    finding exactly as before (backward compatibility / endpoint-level checks).
+    A negative with a NON-EMPTY parameter only refutes a finding with that SAME
+    parameter_name: one parameter's controlled negative must not demote a
+    different, untested parameter of the same class to "likely false positive"."""
+    from harness.categories import canonicalize
+    neg: dict = {}
     for vr in validation_reports or []:
         status = (getattr(vr, "status", "") or "").lower()
         confirmed = bool(getattr(vr, "confirmed", False))
         if status == "not_confirmed" and not confirmed:
             fc = getattr(vr, "finding_class", "") or ""
-            neg.add(canonicalize(fc) or fc.lower())
+            fc_canon = canonicalize(fc) or fc.lower()
+            param = getattr(vr, "parameter", "") or ""
+            neg.setdefault(fc_canon, set()).add(param)
     return neg
+
+
+def _has_controlled_negative(negatives: dict, fc_canon: str, parameter_name: str) -> bool:
+    """FR-5 (F09): True when `negatives` (from `_controlled_negatives`) contains
+    a controlled negative that REFUTES a finding of class `fc_canon` and
+    parameter `parameter_name` -- either:
+      - a class-level negative (recorded with an empty parameter -- backward
+        compat / genuinely non-parameter-scoped checks), or
+      - a same-case negative whose parameter equals this finding's parameter.
+
+    A same-class negative recorded under a DIFFERENT non-empty parameter does
+    NOT match here -- that is the whole point of the fix: it leaves the
+    untested parameter to fall through to the existing UNVERIFIED tier instead
+    of being refuted."""
+    params = negatives.get(fc_canon)
+    if not params:
+        return False
+    if "" in params:
+        return True
+    return bool(parameter_name) and parameter_name in params
 
 
 def apply_confirmation_suppression(
@@ -441,16 +638,22 @@ def apply_confirmation_suppression(
     Mutates findings in place; returns the number demoted. Confirmed findings and
     no-leg classes are left untouched.
 
-    - REFUTED  (live-verified leg AND a real controlled negative for the class in
-      `validation_reports`): the leg actually ran and said no -> likely false
-      positive. severity -> "low", confidence <= 0.35, verdict
-      "unconfirmed_hypothesis", prefix "[Hypothesis]".
-    - UNVERIFIED (live-verified leg but NO controlled negative executed -- the leg
-      was skipped / errored / disabled / not run, or no validation reports were
-      supplied): NOT a refutation (R08). Still capped for safety (severity -> low,
-      confidence <= 0.35 -- the precision floor), but labelled honestly: verdict
-      "inconclusive_unverified", prefix "[Unverified]", note says it was neither
-      confirmed nor refuted so it must not be treated as a false positive.
+    - REFUTED  (live-verified leg AND a real controlled negative for the SAME CASE
+      in `validation_reports`): the leg actually ran against this finding's own
+      parameter (or a class-level/parameter-less negative -- backward compat for
+      non-parameter-scoped checks) and said no -> likely false positive.
+      severity -> "low", confidence <= 0.35, verdict "unconfirmed_hypothesis",
+      prefix "[Hypothesis]". FR-5 (F09): a controlled negative recorded against a
+      DIFFERENT parameter of the same class does NOT refute this finding.
+    - UNVERIFIED (live-verified leg but NO controlled negative for this case
+      executed -- the leg was skipped / errored / disabled / not run for this
+      parameter, or no validation reports were supplied): NOT a refutation (R08).
+      Still capped for safety (severity -> low, confidence <= 0.35 -- the
+      precision floor), but labelled honestly: verdict "inconclusive_unverified",
+      prefix "[Unverified]", note says it was neither confirmed nor refuted so it
+      must not be treated as a false positive. A same-class finding whose OWN
+      parameter was never tested lands here, even when a different parameter of
+      the same class was refuted.
     - UNPROVEN (class has a leg, but only smoke/hermetic-verified): severity capped
       at "medium", confidence <= 0.5, verdict "unproven_unverified_leg", prefix
       "[Unconfirmed]".
@@ -459,7 +662,7 @@ def apply_confirmation_suppression(
     seam Phase 2 uses to promote a leg after live-verifying it.
     """
     demoted = 0
-    negatives = _controlled_negative_classes(validation_reports)
+    negatives = _controlled_negatives(validation_reports)
     from harness.categories import canonicalize as _canon
 
     def _emit_revision(finding, tier: str) -> None:
@@ -498,7 +701,11 @@ def apply_confirmation_suppression(
 
             if tier == "live":
                 fc_canon = _canon(finding.vulnerability_class) or (finding.vulnerability_class or "").lower()
-                has_controlled_negative = fc_canon in negatives
+                # FR-5 (F09): bind the negative to the SAME case (parameter), not
+                # just the class -- a controlled negative on parameter A must not
+                # refute an untested parameter B of the same class.
+                has_controlled_negative = _has_controlled_negative(
+                    negatives, fc_canon, finding.parameter_name)
                 # Cap for safety in both cases (the precision floor: an unconfirmed
                 # live-class finding never ships actionable), but DISTINGUISH why.
                 finding.confidence = min(finding.confidence, _REFUTED_CONFIDENCE_CAP)

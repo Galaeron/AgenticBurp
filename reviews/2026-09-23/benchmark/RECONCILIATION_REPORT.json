@@ -1,0 +1,595 @@
+{
+  "contradictions": [
+    {
+      "check": "tokens_instrumentation",
+      "detail": "results[0].cost_tokens.mean is 0.0 (a fabricated-looking 0), but run_health/model_cost_by_variant record real token counts (recomputed mean 447693.0 tokens from [447430, 453343, 442306]). This is an instrumentation gap in RunMetrics.cost_tokens (the effort-budget token wiring is inert -- see run_ablation_live.py's _run_one docstring), NOT evidence that 0 tokens were actually spent.",
+      "status": "contradiction"
+    },
+    {
+      "check": "breaker_health_claim",
+      "detail": "run_health.breaker_failures = [2, 0, 2] (2 of 3 repeats hit circuit-breaker failures), but the log/report footer states 'no run was starved -- every row above is a clean, breaker-healthy measurement.' 'not starved' (true: starved=False and breaker_ended_open=False for every repeat) is a narrower claim than 'breaker-healthy' / 'no run starved' as used in BENCHMARK_REPORT.md's top-line status -- a breaker that recorded failures without opening is not the same as a run with zero failures.",
+      "status": "inconsistency"
+    },
+    {
+      "check": "report_wall_claim",
+      "detail": "BENCHMARK_REPORT.md cites wall/run=1330.0s for PixelMart, which matches one individual repeat's raw wall_time_s (1330.3394s) -- NOT the recomputed 3-run mean (1138.631s). The report appears to cite a single repeat instead of the mean across repeats.",
+      "status": "contradiction"
+    }
+  ],
+  "control_units": {
+    "blindtarget2": {
+      "control_unit": "recall: exchange (confirmed_vuln/confirmed_secure/inconclusive coarse ground truth). Precision: TWO units are both reported -- 'controls_clean' is per-EXCHANGE (any finding at all on a confirmed_secure exchange makes it dirty); 'controls_clean_issue_level'/'dirty_controls' is per (method+URL, vulnerability_class) ISSUE pair on that same exchange.",
+      "recall_semantics": "recall_any_finding = any finding present on a confirmed_vuln exchange; recall_surfaced_only = at least one of those findings was surfaced, not quarantined as a lead. Neither is exact-class recall -- no manifest backs this corpus.",
+      "scheme": "run_blind_eval.py-style per-run scorecard (build_scorecard shape)."
+    },
+    "dvwa": {
+      "control_unit": "recall: exchange (confirmed_vuln/confirmed_secure/inconclusive coarse ground truth). Precision: TWO units are both reported -- 'controls_clean' is per-EXCHANGE (any finding at all on a confirmed_secure exchange makes it dirty); 'controls_clean_issue_level'/'dirty_controls' is per (method+URL, vulnerability_class) ISSUE pair on that same exchange.",
+      "recall_semantics": "recall_any_finding = any finding present on a confirmed_vuln exchange; recall_surfaced_only = at least one of those findings was surfaced, not quarantined as a lead. Neither is exact-class recall -- no manifest backs this corpus.",
+      "scheme": "run_blind_eval.py-style per-run scorecard (build_scorecard shape)."
+    },
+    "juiceshop": {
+      "control_unit": "recall: exchange (confirmed_vuln/confirmed_secure/inconclusive coarse ground truth). Precision: TWO units are both reported -- 'controls_clean' is per-EXCHANGE (any finding at all on a confirmed_secure exchange makes it dirty); 'controls_clean_issue_level'/'dirty_controls' is per (method+URL, vulnerability_class) ISSUE pair on that same exchange.",
+      "recall_semantics": "recall_any_finding = any finding present on a confirmed_vuln exchange; recall_surfaced_only = at least one of those findings was surfaced, not quarantined as a lead. Neither is exact-class recall -- no manifest backs this corpus.",
+      "scheme": "run_blind_eval.py-style per-run scorecard (build_scorecard shape)."
+    },
+    "pixelmart": {
+      "control_unit": "exchange",
+      "recall_semantics": "any-finding / coarse-category coverage per exchange (recall = tp/(tp+fn) over the 11 TP-labeled exchanges) -- not exact-class recall.",
+      "scheme": "testing.score.py's _LABEL_CATEGORY coarse-OWASP-category TP/TN scheme (testing.score.score()), driven through testing/test-target/run_ablation_live.py. This is NOT the PR-2/PR-3 exact-class manifest scorer, even though testing/labels/pixelmart.labels.json exists -- the 2026-09-23 benchmark run predates that wiring."
+    },
+    "webgoat": {
+      "control_unit": "recall: exchange (confirmed_vuln/confirmed_secure/inconclusive coarse ground truth). Precision: TWO units are both reported -- 'controls_clean' is per-EXCHANGE (any finding at all on a confirmed_secure exchange makes it dirty); 'controls_clean_issue_level'/'dirty_controls' is per (method+URL, vulnerability_class) ISSUE pair on that same exchange.",
+      "recall_semantics": "recall_any_finding = any finding present on a confirmed_vuln exchange; recall_surfaced_only = at least one of those findings was surfaced, not quarantined as a lead. Neither is exact-class recall -- no manifest backs this corpus.",
+      "scheme": "run_blind_eval.py-style per-run scorecard (build_scorecard shape)."
+    }
+  },
+  "per_corpus": {
+    "blindtarget2": {
+      "flags": [
+        {
+          "check": "tokens_instrumentation",
+          "detail": "blindtarget2: total_tokens_spent is 0 on every repeat, and no other field in this artifact records a nonzero token count -- this driver's token counter is simply not wired up (unlike PixelMart, where run_health/model_cost_by_variant DO record a real, nonzero count that contradicts the 0). Report as instrumentation UNAVAILABLE, never as a verified zero-cost measurement.",
+          "status": "unavailable"
+        }
+      ],
+      "n_confirmed_vuln": 2,
+      "recall_any_finding": {
+        "mean": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "recall_surfaced_only": {
+        "mean": 0.8333333333333334,
+        "values": [
+          1.0,
+          0.5,
+          1.0
+        ]
+      },
+      "recomputed_variance": {
+        "controls_clean": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "controls_clean_issue_level": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "n_controls_clean_issue_level": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "n_findings_total": {
+          "mean": 63.333333333333336,
+          "values": [
+            62.0,
+            60.0,
+            68.0
+          ],
+          "variance": 11.555555555555555
+        },
+        "n_quarantined_leads": {
+          "mean": 4.666666666666667,
+          "values": [
+            3.0,
+            5.0,
+            6.0
+          ],
+          "variance": 1.5555555555555556
+        },
+        "n_surfaced_findings": {
+          "mean": 40.0,
+          "values": [
+            43.0,
+            35.0,
+            42.0
+          ],
+          "variance": 12.666666666666666
+        },
+        "total_elapsed_seconds": {
+          "mean": 707.7033333333334,
+          "values": [
+            968.766,
+            550.297,
+            604.047
+          ],
+          "variance": 34558.368380222215
+        },
+        "total_tokens_spent": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        }
+      },
+      "strict_recall": {
+        "reason": "unavailable: no exact-class manifest for corpus 'blindtarget2' (expected C:\\Users\\arthu\\Documents\\AgenticVibe\\testing\\labels\\blindtarget2.labels.json)",
+        "strict_exact_class_recall": "unavailable"
+      }
+    },
+    "dvwa": {
+      "flags": [
+        {
+          "check": "tokens_instrumentation",
+          "detail": "dvwa: total_tokens_spent is 0 on every repeat, and no other field in this artifact records a nonzero token count -- this driver's token counter is simply not wired up (unlike PixelMart, where run_health/model_cost_by_variant DO record a real, nonzero count that contradicts the 0). Report as instrumentation UNAVAILABLE, never as a verified zero-cost measurement.",
+          "status": "unavailable"
+        }
+      ],
+      "n_confirmed_vuln": 8,
+      "recall_any_finding": {
+        "mean": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "recall_surfaced_only": {
+        "mean": 0.9166666666666666,
+        "values": [
+          0.875,
+          1.0,
+          0.875
+        ]
+      },
+      "recomputed_variance": {
+        "controls_clean": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "controls_clean_issue_level": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "n_controls_clean_issue_level": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "n_findings_total": {
+          "mean": 121.33333333333333,
+          "values": [
+            125.0,
+            120.0,
+            119.0
+          ],
+          "variance": 6.888888888888889
+        },
+        "n_quarantined_leads": {
+          "mean": 0.3333333333333333,
+          "values": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "variance": 0.2222222222222222
+        },
+        "n_surfaced_findings": {
+          "mean": 47.0,
+          "values": [
+            48.0,
+            45.0,
+            48.0
+          ],
+          "variance": 2.0
+        },
+        "total_elapsed_seconds": {
+          "mean": 654.7860000000001,
+          "values": [
+            636.234,
+            674.515,
+            653.609
+          ],
+          "variance": 244.931824666666
+        },
+        "total_tokens_spent": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        }
+      },
+      "strict_recall": {
+        "reason": "unavailable: no exact-class manifest for corpus 'dvwa' (expected C:\\Users\\arthu\\Documents\\AgenticVibe\\testing\\labels\\dvwa.labels.json)",
+        "strict_exact_class_recall": "unavailable"
+      }
+    },
+    "juiceshop": {
+      "flags": [
+        {
+          "check": "tokens_instrumentation",
+          "detail": "juiceshop: total_tokens_spent is 0 on every repeat, and no other field in this artifact records a nonzero token count -- this driver's token counter is simply not wired up (unlike PixelMart, where run_health/model_cost_by_variant DO record a real, nonzero count that contradicts the 0). Report as instrumentation UNAVAILABLE, never as a verified zero-cost measurement.",
+          "status": "unavailable"
+        }
+      ],
+      "n_confirmed_vuln": 13,
+      "recall_any_finding": {
+        "mean": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "recall_surfaced_only": {
+        "mean": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "recomputed_variance": {
+        "controls_clean": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "controls_clean_issue_level": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "n_controls_clean_issue_level": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "n_findings_total": {
+          "mean": 372.6666666666667,
+          "values": [
+            378.0,
+            356.0,
+            384.0
+          ],
+          "variance": 144.88888888888889
+        },
+        "n_quarantined_leads": {
+          "mean": 10.333333333333334,
+          "values": [
+            16.0,
+            6.0,
+            9.0
+          ],
+          "variance": 17.555555555555557
+        },
+        "n_surfaced_findings": {
+          "mean": 201.66666666666666,
+          "values": [
+            198.0,
+            198.0,
+            209.0
+          ],
+          "variance": 26.88888888888889
+        },
+        "total_elapsed_seconds": {
+          "mean": 3009.604,
+          "values": [
+            2828.656,
+            3072.64,
+            3127.516
+          ],
+          "variance": 16872.985248000008
+        },
+        "total_tokens_spent": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        }
+      },
+      "strict_recall": {
+        "reason": "unavailable: no exact-class manifest for corpus 'juiceshop' (expected C:\\Users\\arthu\\Documents\\AgenticVibe\\testing\\labels\\juiceshop.labels.json)",
+        "strict_exact_class_recall": "unavailable"
+      }
+    },
+    "pixelmart": {
+      "breaker_failures_per_run": [
+        2,
+        0,
+        2
+      ],
+      "flags": [
+        {
+          "check": "tokens_instrumentation",
+          "detail": "results[0].cost_tokens.mean is 0.0 (a fabricated-looking 0), but run_health/model_cost_by_variant record real token counts (recomputed mean 447693.0 tokens from [447430, 453343, 442306]). This is an instrumentation gap in RunMetrics.cost_tokens (the effort-budget token wiring is inert -- see run_ablation_live.py's _run_one docstring), NOT evidence that 0 tokens were actually spent.",
+          "status": "contradiction"
+        },
+        {
+          "check": "breaker_health_claim",
+          "detail": "run_health.breaker_failures = [2, 0, 2] (2 of 3 repeats hit circuit-breaker failures), but the log/report footer states 'no run was starved -- every row above is a clean, breaker-healthy measurement.' 'not starved' (true: starved=False and breaker_ended_open=False for every repeat) is a narrower claim than 'breaker-healthy' / 'no run starved' as used in BENCHMARK_REPORT.md's top-line status -- a breaker that recorded failures without opening is not the same as a run with zero failures.",
+          "status": "inconsistency"
+        },
+        {
+          "check": "report_wall_claim",
+          "detail": "BENCHMARK_REPORT.md cites wall/run=1330.0s for PixelMart, which matches one individual repeat's raw wall_time_s (1330.3394s) -- NOT the recomputed 3-run mean (1138.631s). The report appears to cite a single repeat instead of the mean across repeats.",
+          "status": "contradiction"
+        },
+        {
+          "check": "table_md_cross_check",
+          "detail": "pixelmart_default_3x_table.md agrees with pixelmart_default_3x.json",
+          "status": "match"
+        }
+      ],
+      "recomputed": {
+        "fn": {
+          "mean": 1,
+          "n": 3,
+          "stdev": 0.816496580927726
+        },
+        "fp": {
+          "mean": 38.666666666666664,
+          "n": 3,
+          "stdev": 6.342099196813483
+        },
+        "model_total_tokens": {
+          "mean": 447693,
+          "n": 3,
+          "stdev": 4509.672493651839
+        },
+        "precision": {
+          "mean": 0.2088095238095238,
+          "n": 3,
+          "stdev": 0.02988830302302846
+        },
+        "recall": {
+          "mean": 0.9090909090909091,
+          "n": 3,
+          "stdev": 0.07422696190252052
+        },
+        "tp": {
+          "mean": 10,
+          "n": 3,
+          "stdev": 0.816496580927726
+        },
+        "wall_time_s": {
+          "mean": 1138.6310666666668,
+          "n": 3,
+          "stdev": 153.97066237508437
+        }
+      },
+      "stored": {
+        "confirmed_fp": {
+          "mean": 0.0,
+          "n": 3,
+          "stdev": 0.0
+        },
+        "confirmed_tp": {
+          "mean": 0.0,
+          "n": 3,
+          "stdev": 0.0
+        },
+        "cost_tokens": {
+          "mean": 0.0,
+          "n": 3,
+          "stdev": 0.0
+        },
+        "discovery_coverage": {
+          "mean": 0.0,
+          "n": 3,
+          "stdev": 0.0
+        },
+        "fn": {
+          "mean": 1.0,
+          "n": 3,
+          "stdev": 0.816
+        },
+        "fp": {
+          "mean": 38.667,
+          "n": 3,
+          "stdev": 6.342
+        },
+        "name": "current",
+        "needs_implementation": false,
+        "precision": {
+          "mean": 0.209,
+          "n": 3,
+          "stdev": 0.03
+        },
+        "recall": {
+          "mean": 0.909,
+          "n": 3,
+          "stdev": 0.074
+        },
+        "repeats": 3,
+        "time_to_first_finding_s": {
+          "mean": 57.459,
+          "n": 3,
+          "stdev": 4.114
+        },
+        "tp": {
+          "mean": 10.0,
+          "n": 3,
+          "stdev": 0.816
+        },
+        "variant": "A",
+        "wall_time_s": {
+          "mean": 1138.631,
+          "n": 3,
+          "stdev": 153.971
+        }
+      },
+      "strict_recall": {
+        "reason": "unavailable: an exact-class manifest exists for 'pixelmart' (pixelmart.labels.json), but the saved run is not in eval_adapter.build_eval_artifact's shape (no stages/attribution) -- rescore_saved_run needs per-finding stages, not aggregate tp/fp/fn counts, and none of the 2026-09-23 benchmark artifacts carry that shape (they predate PR-5's shared adapter).",
+        "strict_exact_class_recall": "unavailable"
+      }
+    },
+    "webgoat": {
+      "flags": [
+        {
+          "check": "tokens_instrumentation",
+          "detail": "webgoat: total_tokens_spent is 0 on every repeat, and no other field in this artifact records a nonzero token count -- this driver's token counter is simply not wired up (unlike PixelMart, where run_health/model_cost_by_variant DO record a real, nonzero count that contradicts the 0). Report as instrumentation UNAVAILABLE, never as a verified zero-cost measurement.",
+          "status": "unavailable"
+        }
+      ],
+      "n_confirmed_vuln": 3,
+      "recall_any_finding": {
+        "mean": 1.0,
+        "values": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "recall_surfaced_only": {
+        "mean": 0.6666666666666666,
+        "values": [
+          0.6666666666666666,
+          0.6666666666666666,
+          0.6666666666666666
+        ]
+      },
+      "recomputed_variance": {
+        "controls_clean": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "controls_clean_issue_level": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "n_controls_clean_issue_level": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        },
+        "n_findings_total": {
+          "mean": 28.666666666666668,
+          "values": [
+            29.0,
+            28.0,
+            29.0
+          ],
+          "variance": 0.2222222222222222
+        },
+        "n_quarantined_leads": {
+          "mean": 2.6666666666666665,
+          "values": [
+            3.0,
+            2.0,
+            3.0
+          ],
+          "variance": 0.2222222222222222
+        },
+        "n_surfaced_findings": {
+          "mean": 13.333333333333334,
+          "values": [
+            14.0,
+            13.0,
+            13.0
+          ],
+          "variance": 0.2222222222222222
+        },
+        "total_elapsed_seconds": {
+          "mean": 428.354,
+          "values": [
+            421.109,
+            441.203,
+            422.75
+          ],
+          "variance": 82.99721399999987
+        },
+        "total_tokens_spent": {
+          "mean": 0.0,
+          "values": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "variance": 0.0
+        }
+      },
+      "strict_recall": {
+        "reason": "unavailable: no exact-class manifest for corpus 'webgoat' (expected C:\\Users\\arthu\\Documents\\AgenticVibe\\testing\\labels\\webgoat.labels.json)",
+        "strict_exact_class_recall": "unavailable"
+      }
+    }
+  }
+}

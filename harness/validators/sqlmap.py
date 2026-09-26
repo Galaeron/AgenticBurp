@@ -426,32 +426,62 @@ class SqlmapValidator(Validator):
             # The safety-flag assertions above ran on the raw sqlmap `cmd`, so the
             # denied-flag invariant holds regardless of how the process is spawned.
             run_cmd = cmd
+            _use_container = False
+            _container_args: list[str] = []
+            _egress_policy = None
+            _tool_receipt: dict = {}
             if self.container_image:
                 from harness import tool_runner
                 if tool_runner.available()[0]:
-                    args = list(cmd[1:])  # drop self.binary; the image entrypoint IS sqlmap
-                    for i in range(1, len(args)):
-                        if args[i - 1] == "-u":
-                            args[i] = tool_runner.localhost_url(args[i])
-                    run_cmd = tool_runner.docker_cmd(self.container_image, args)
+                    _use_container = True
+                    _container_args = list(cmd[1:])  # drop self.binary; the image entrypoint IS sqlmap
+                    for i in range(1, len(_container_args)):
+                        if _container_args[i - 1] == "-u":
+                            _container_args[i] = tool_runner.localhost_url(_container_args[i])
+                    # PR-11/R02: a containerised sqlmap makes its OWN outbound
+                    # requests, so this run's egress is constrained by a per-run
+                    # EgressPolicy (the container should only reach the in-container
+                    # host alias the target was rewritten to), it FAILS CLOSED if
+                    # that control is unavailable, and it goes through
+                    # tool_runner.run's force-clean wrapper -- a Python-side timeout
+                    # does not bound container activity -- rather than a bare
+                    # docker_cmd + subprocess.run.
+                    _egress_policy = tool_runner.EgressPolicy(
+                        allowed_hosts=(tool_runner._HOST_ALIAS,))
+                    run_cmd = tool_runner.docker_cmd(
+                        self.container_image, _container_args, egress=_egress_policy)
 
             try:
-                proc = await asyncio.to_thread(
-                    subprocess.run,
-                    run_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout_seconds,
-                    env=os.environ.copy(),
-                    # sqlmap can block waiting on stdin in some execution
-                    # contexts even with --batch (verified by reproducing
-                    # it directly: without this, the process hung silently
-                    # until the timeout killed it, which then reported
-                    # "sqlmap timed out" -- indistinguishable from a slow
-                    # scan actually running). --batch suppresses prompts,
-                    # not stdin reads; this closes the fd explicitly.
-                    stdin=subprocess.DEVNULL,
-                )
+                if _use_container:
+                    from harness import tool_runner
+                    rc, out, err = await asyncio.to_thread(
+                        tool_runner.run,
+                        self.container_image,
+                        _container_args,
+                        timeout=self.timeout_seconds,
+                        egress=_egress_policy,
+                        enforce_egress=True,
+                        receipt=_tool_receipt,
+                    )
+                    proc = subprocess.CompletedProcess(
+                        _tool_receipt.get("argv", run_cmd), rc, out, err)
+                else:
+                    proc = await asyncio.to_thread(
+                        subprocess.run,
+                        run_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=self.timeout_seconds,
+                        env=os.environ.copy(),
+                        # sqlmap can block waiting on stdin in some execution
+                        # contexts even with --batch (verified by reproducing
+                        # it directly: without this, the process hung silently
+                        # until the timeout killed it, which then reported
+                        # "sqlmap timed out" -- indistinguishable from a slow
+                        # scan actually running). --batch suppresses prompts,
+                        # not stdin reads; this closes the fd explicitly.
+                        stdin=subprocess.DEVNULL,
+                    )
             except FileNotFoundError:
                 # sqlmap is an optional, heavier dependency -- don't let its
                 # absence silently mean "SQL injection can never be

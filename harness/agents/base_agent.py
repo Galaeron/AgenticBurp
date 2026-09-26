@@ -241,6 +241,20 @@ class BaseAgent(ABC):
         headers_req = _neutralize_fence_breakout(headers_req)
         headers_resp = _neutralize_fence_breakout(headers_resp)
 
+        # PR-9 / R09: header redaction above only withholds secrets carried
+        # in HEADERS. A secret can also ride in the URL's query string
+        # (?token=...) or in a request/response BODY field -- including
+        # nested inside another object -- so redact those by FIELD/PARAM
+        # NAME the same way, before truncation/fencing. This never touches
+        # a non-secret field, so an injection payload elsewhere in the URL
+        # or body (e.g. a SQLi/XSS payload in a "q"/"search" param) still
+        # reaches the model verbatim -- see security.redact_secrets_in_url/
+        # redact_secrets_in_body for the (best-effort, not guaranteed)
+        # secret-name-only scope.
+        exchange_url = security.redact_secrets_in_url(exchange.url)
+        request_body = security.redact_secrets_in_body(exchange.request_body)
+        response_body = security.redact_secrets_in_body(exchange.response_body)
+
         prior_block = ""
         if prior_context:
             prior_block = f"""
@@ -285,14 +299,14 @@ with this real boundary either.
 {fence}
 <exchange-data>
 METHOD: {exchange.method}
-URL: {exchange.url}
+URL: {exchange_url}
 
 <request-headers>
 {headers_req or "(none)"}
 </request-headers>
 
 <request-body>
-{trunc_and_fence(exchange.request_body) or "(empty)"}
+{trunc_and_fence(request_body) or "(empty)"}
 </request-body>
 
 RESPONSE STATUS: {exchange.response_status if exchange.response_status is not None else "(no response captured)"}
@@ -302,7 +316,7 @@ RESPONSE STATUS: {exchange.response_status if exchange.response_status is not No
 </response-headers>
 
 <response-body>
-{trunc_and_fence(exchange.response_body) or "(empty)"}
+{trunc_and_fence(response_body) or "(empty)"}
 </response-body>
 </exchange-data>
 

@@ -32,11 +32,14 @@ per session, never shared across principals.
 """
 from __future__ import annotations
 
+import ipaddress
+import json
+import socket
 import threading
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -301,6 +304,17 @@ class TargetTransport:
 
     def __init__(self, ctx: "RunContext"):
         self.ctx = ctx
+        # P1-10 resolver seam: injectable so a caller-level test can drive
+        # rebinding scenarios without real DNS. Default is a real one-shot resolve.
+        self._resolver = _default_resolver
+
+    def _pin_connect_address(self) -> bool:
+        """P1-10 opt-in (OFF by default): pin each hop to its resolved address."""
+        cfg = getattr(self.ctx, "config", None) or {}
+        try:
+            return bool(cfg.get("security", {}).get("pin_connect_address", False))
+        except Exception:
+            return False
 
     async def send(self, method: str, url: str, *, capability: str,
                    session_ref: str | None = None, headers: dict | None = None,
@@ -346,7 +360,10 @@ class TargetTransport:
                                max_redirects=max_redirects)
 
     def _artifact(self, url: str, outcome: str, session_ref: str | None,
-                  status: int | None = None, case_ref: str = "") -> "evidence.ExchangeArtifact":
+                  status: int | None = None, case_ref: str = "", *,
+                  method: str | None = None, req_headers: dict | None = None,
+                  req_body: str | None = None, resp_headers: dict | None = None,
+                  resp_body: str | None = None) -> "evidence.ExchangeArtifact":
         artifact = evidence.ExchangeArtifact.make(
             request_ref=url, response_ref="" if status is None else f"HTTP {status}",
             actual_destination=ScopePolicy.origin_of(url), transport_outcome=outcome,
@@ -368,6 +385,49 @@ class TargetTransport:
                 data = {"request": artifact.request_ref, "response": artifact.response_ref,
                         "outcome": outcome, "artifact_id": artifact.artifact_id,
                         "destination": artifact.actual_destination}
+                # FR-2 (F03): a REAL, content-addressed, hash-verified evidence
+                # blob -- not just the human-readable "request"/"response"
+                # strings above -- so the P0-6 resolver can tell "we have a URL
+                # and a status code" from "a tester can actually replay this".
+                # `method` is only ever passed by the successful-send call site
+                # in execute(); every non-executed outcome (scope/gate/budget/
+                # session denial) and every transport error/cancel path never
+                # supplies it, so those correctly store no blob and stay
+                # unresolvable. MANDATORY redaction (safety requirement): the
+                # request URL and BOTH request/response headers/bodies are run
+                # through the existing harness.security redactors before
+                # anything is hashed or written -- this is a NEW persistence
+                # sink for bodies/headers that today are never durably stored
+                # at all, so it must never leak a secret. A blob-store failure
+                # here is swallowed and recorded as a degraded marker; it must
+                # never turn a good send into a transport failure.
+                if method is not None:
+                    try:
+                        from harness import security, store
+                        req_record = {
+                            "method": method,
+                            "url": security.redact_secrets_in_url(url),
+                            "headers": security.redact_headers(req_headers or {}),
+                            "body": (security.redact_secrets_in_body(req_body)
+                                     if req_body is not None else None),
+                        }
+                        resp_record = {
+                            "status": status,
+                            "headers": security.redact_headers(resp_headers or {}),
+                            "body": (security.redact_secrets_in_body(resp_body)
+                                     if resp_body is not None else None),
+                        }
+                        req_bytes = json.dumps(req_record, sort_keys=True).encode("utf-8")
+                        resp_bytes = json.dumps(resp_record, sort_keys=True).encode("utf-8")
+                        data["request_blob"] = store.put_evidence_blob(req_bytes)
+                        data["response_blob"] = store.put_evidence_blob(resp_bytes)
+                    except Exception:
+                        # Durable blob write failed: never break the send (this
+                        # is a best-effort evidence enrichment). Mark the
+                        # EXECUTION event degraded so evidence health -- never
+                        # the send outcome itself -- reflects that reproducible
+                        # evidence was expected but not durably stored.
+                        data["evidence_blob_degraded"] = True
                 evidence_ledger.emit(
                     evidence_ledger.EventType.EXECUTION if executed
                     else evidence_ledger.EventType.AUTHORIZATION_DECISION,
@@ -442,6 +502,25 @@ class TargetTransport:
             if not ctx.budget.reserve(1):
                 return ExecutionOutcome(outcome="budget_exhausted", final_url=url,
                                         artifact=self._artifact(url, "budget_exhausted", session_ref, case_ref=case_ref))
+            # 3b. P1-10 (opt-in, OFF by default): resolve this hop's host ONCE and
+            #     pin the connection to that address, so a later/alternate resolution
+            #     cannot redirect the connect. Scope/gate/budget above ran on the
+            #     hostname URL, and credential-forwarding below still keys on the
+            #     hostname origin -- only the CONNECT target is pinned. Applied per
+            #     hop, so redirects re-resolve and re-pin.
+            pinned = None
+            if self._pin_connect_address():
+                _host = ScopePolicy.host_of(url)
+                if _host and not _is_ip_literal(_host):
+                    try:
+                        _ip = self._resolver(_host)
+                    except Exception as e:
+                        return ExecutionOutcome(
+                            outcome="error", final_url=url,
+                            error=f"address resolution failed for {_host}: {e}",
+                            artifact=self._artifact(url, f"error:resolve:{type(e).__name__}",
+                                                    session_ref, case_ref=case_ref))
+                    pinned = _pin_connect_url(url, _ip)
             # 4. Credential-forwarding rule: attach the session's auth headers ONLY
             #    when this hop is the session's own origin. Cross-origin -> no creds.
             credential_destination = bool(
@@ -454,9 +533,20 @@ class TargetTransport:
                     send_headers.setdefault(k, v)
             client = (session.client(ctx.timeout)
                       if session and credential_destination else ctx.default_client())
+            send_url = url
+            request_kwargs: dict = {"headers": send_headers or None,
+                                    "content": body if isinstance(body, str) else None}
+            if pinned is not None:
+                send_url, _host_header, _extensions = pinned
+                send_headers["Host"] = _host_header
+                request_kwargs["headers"] = send_headers or None
+                # Only pass `extensions` when pinning produced one (https SNI): the
+                # default/off path keeps the exact original call signature, so a
+                # caller's mock client that doesn't accept `extensions` is unaffected.
+                if _extensions:
+                    request_kwargs["extensions"] = _extensions
             try:
-                resp = await client.request(method, url, headers=send_headers or None,
-                                            content=body if isinstance(body, str) else None)
+                resp = await client.request(method, send_url, **request_kwargs)
             except Exception as e:  # transport error -> honest error artifact, never a crash
                 return ExecutionOutcome(outcome="error", final_url=url, error=str(e),
                                         artifact=self._artifact(url, f"error:{type(e).__name__}", session_ref, case_ref=case_ref))
@@ -472,7 +562,11 @@ class TargetTransport:
                 continue
             return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
                                     headers=dict(resp.headers), final_url=url,
-                                    artifact=self._artifact(url, "ok", session_ref, status=resp.status_code, case_ref=case_ref))
+                                    artifact=self._artifact(
+                                        url, "ok", session_ref, status=resp.status_code, case_ref=case_ref,
+                                        method=method, req_headers=send_headers,
+                                        req_body=body if isinstance(body, str) else None,
+                                        resp_headers=dict(resp.headers), resp_body=resp.text))
         # Redirect budget exhausted -> return the last hop as ok-ish (no further follow).
         return ExecutionOutcome(outcome="ok", status=None, final_url=url,
                                 artifact=self._artifact(url, "redirect_limit", session_ref, case_ref=case_ref))
@@ -481,6 +575,55 @@ class TargetTransport:
 # Back-compat alias: TargetTransport was named Executor through Astra T03-T08. The
 # 37 `.executor()` call sites and the existing `Executor(...)` references keep working.
 Executor = TargetTransport
+
+
+# ---------------------------------------------------------------------------
+# P1-10: connect-time address pinning (DNS-rebinding enforcement), OFF by default.
+#
+# ScopePolicy authorizes HOSTNAMES, not resolved addresses (see its docstring):
+# an already-allowed name whose resolution changes between the scope check and the
+# connect is not blocked at the address level. When the opt-in
+# `security.pin_connect_address` is set (via config.local.yaml -- never a committed
+# default), TargetTransport.execute resolves each hop's host ONCE, then directs the
+# connection to that pinned address while preserving the Host header and TLS SNI, so
+# a later/alternate resolution can never redirect the connection. Applied on every
+# hop, including redirects. Ships OFF; a live two-origin/DNS-rebinding proof over
+# real HTTPS is the OWNER validation.
+# ---------------------------------------------------------------------------
+
+def _default_resolver(host: str) -> str:
+    """Resolve `host` to a single IP once. Prefers IPv4; raises on failure so the
+    caller records an honest error artifact rather than sending unpinned."""
+    infos = socket.getaddrinfo(host, None)
+    for family in (socket.AF_INET, socket.AF_INET6):
+        for info in infos:
+            if info[0] == family:
+                return info[4][0]
+    return infos[0][4][0]
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _pin_connect_url(url: str, ip: str) -> tuple[str, str, dict]:
+    """Rewrite `url` to connect to `ip` while preserving the original Host header and
+    TLS SNI. Returns (connect_url, host_header, extensions)."""
+    p = urlsplit(url)
+    host = p.hostname or ""
+    scheme = (p.scheme or "http").lower()
+    port = p.port
+    default_port = 443 if scheme == "https" else 80
+    host_header = host if (port in (None, default_port)) else f"{host}:{port}"
+    ip_host = f"[{ip}]" if ":" in ip else ip
+    netloc = ip_host if port is None else f"{ip_host}:{port}"
+    connect_url = urlunsplit((scheme, netloc, p.path or "", p.query or "", p.fragment or ""))
+    extensions = {"sni_hostname": host} if scheme == "https" else {}
+    return connect_url, host_header, extensions
 
 
 def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
@@ -537,6 +680,19 @@ class RunContext:
     # aclose(). Not a contextvars.Token: see push_gate's docstring for why.
     _gate_restore: object = field(default=None, repr=False, compare=False)
     _gate_pushed: bool = field(default=False, repr=False, compare=False)
+    # AR-2 (LOOP half): a per-run Ollama circuit breaker + fail-open counter,
+    # pushed ambient alongside the gate in __aenter__ and popped in aclose(),
+    # so concurrent/sequential runs cannot poison each other's model-backend
+    # state. Lazily constructed ONLY inside __aenter__ (never at plain
+    # create()/field-default time) so the ~70 existing tests that build a
+    # RunContext directly and never `async with` it see no new object at all,
+    # matching the same guard the gate push already relies on.
+    _ollama_breaker: object = field(default=None, repr=False, compare=False)
+    _ollama_breaker_restore: object = field(default=None, repr=False, compare=False)
+    _ollama_breaker_pushed: bool = field(default=False, repr=False, compare=False)
+    fail_open_counters: object = field(default=None, repr=False, compare=False)
+    _fail_open_restore: object = field(default=None, repr=False, compare=False)
+    _fail_open_pushed: bool = field(default=False, repr=False, compare=False)
 
     @classmethod
     def create(cls, *, run_id: str | None = None, allowed_hosts=None, gate_config: dict | None = None,
@@ -587,6 +743,16 @@ class RunContext:
             pop_gate(self._gate_restore)
             self._gate_pushed = False
             self._gate_restore = None
+        if self._ollama_breaker_pushed:
+            from harness.circuit_breaker import pop_ollama_breaker
+            pop_ollama_breaker(self._ollama_breaker_restore)
+            self._ollama_breaker_pushed = False
+            self._ollama_breaker_restore = None
+        if self._fail_open_pushed:
+            from harness.coordinator import pop_fail_open_counters
+            pop_fail_open_counters(self._fail_open_restore)
+            self._fail_open_pushed = False
+            self._fail_open_restore = None
 
     async def __aenter__(self) -> "RunContext":
         # Install this run's gate as the AMBIENT one (safety_gate.get_default_gate)
@@ -604,6 +770,47 @@ class RunContext:
         from harness.safety_gate import push_gate
         self._gate_restore = push_gate(self.gate)
         self._gate_pushed = True
+
+        # AR-2 (LOOP half): install this run's OWN Ollama circuit breaker and
+        # fail-open counters as ambient, alongside the gate above, so model-
+        # backend state cannot leak between concurrent/sequential runs.
+        # Constructed here (not at create()/field-default time) so a
+        # RunContext that is never `async with`-entered -- the ~70 existing
+        # tests that build one directly -- never allocates these at all,
+        # matching the gate's own lazy-push guard.
+        from harness.circuit_breaker import (
+            CircuitBreakerConfig,
+            OllamaCircuitBreaker,
+            push_ollama_breaker,
+        )
+        if self._ollama_breaker is None:
+            # Same config OllamaClient.__init__ uses (ollama_client.py:130-137),
+            # so a per-run breaker trips/heals identically to the shared
+            # singleton, including which exceptions don't count as failures.
+            from harness.ollama_client import (
+                OllamaInvalidJSONError,
+                OllamaModelNotFoundError,
+            )
+            self._ollama_breaker = OllamaCircuitBreaker(
+                "ollama",
+                CircuitBreakerConfig(
+                    failure_threshold=3,
+                    success_threshold=2,
+                    timeout_seconds=60.0,
+                    half_open_max_requests=1,
+                    excluded_exceptions=(OllamaModelNotFoundError, OllamaInvalidJSONError),
+                    enabled=True,
+                ),
+            )
+        self._ollama_breaker_restore = push_ollama_breaker(self._ollama_breaker)
+        self._ollama_breaker_pushed = True
+
+        from harness.coordinator import push_fail_open_counters
+        if self.fail_open_counters is None:
+            self.fail_open_counters = {"count": 0, "by_reason": {}}
+        self._fail_open_restore = push_fail_open_counters(self.fail_open_counters)
+        self._fail_open_pushed = True
+
         return self
 
     async def __aexit__(self, *exc) -> None:

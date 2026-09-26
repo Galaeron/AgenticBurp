@@ -68,6 +68,73 @@ class EffortBudgetTests(unittest.TestCase):
         self.assertEqual(budget.remaining, 0)
 
 
+class _FakeClock:
+    """Deterministic, test-controlled stand-in for time.monotonic --
+    starts at 0 and only advances when the test tells it to. No real
+    sleeps anywhere in these tests."""
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class EffortBudgetDurationTests(unittest.TestCase):
+    def test_hard_mode_blocks_past_deadline_and_ignores_confirmation(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=10, clock=clock)
+        budget.record(CallKind.AGENT_DISPATCH, "m", 10, 10)  # deadline set at t=0 -> 10
+        clock.advance(11)
+        allowed, reason = budget.allow()
+        self.assertFalse(allowed)
+        self.assertIn("duration limit", reason)
+        budget.confirm_overspend()  # must NOT unblock hard mode
+        allowed2, _ = budget.allow()
+        self.assertFalse(allowed2, "hard mode duration limit must not be talked past by confirm_overspend")
+
+    def test_soft_mode_blocks_past_deadline_until_confirmed_then_allows(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.SOFT, max_duration_s=10, clock=clock)
+        budget.record(CallKind.AGENT_DISPATCH, "m", 10, 10)
+        clock.advance(11)
+        allowed, reason = budget.allow()
+        self.assertFalse(allowed)
+        self.assertIn("soft mode", reason)
+        self.assertIn("duration limit", reason)
+        budget.confirm_overspend()
+        allowed2, reason2 = budget.allow()
+        self.assertTrue(allowed2)
+        self.assertIn("operator confirmation", reason2)
+
+    def test_no_duration_limit_is_behaviorally_identical_to_today(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=None, clock=clock)
+        budget.record(CallKind.AGENT_DISPATCH, "m", 10, 10)
+        clock.advance(10_000_000)  # arbitrarily far past any plausible deadline
+        allowed, reason = budget.allow()
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "")
+
+    def test_allow_true_before_deadline_reached(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=10, clock=clock)
+        budget.record(CallKind.AGENT_DISPATCH, "m", 10, 10)  # deadline at t=10
+        clock.advance(5)  # still before the deadline
+        allowed, reason = budget.allow()
+        self.assertEqual((allowed, reason), (True, ""))
+
+    def test_deadline_set_on_first_spend_not_construction(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=10, clock=clock)
+        clock.advance(1000)  # far past what would be the deadline if it were set now
+        # record() never called -- an idle budget must never trip.
+        allowed, reason = budget.allow()
+        self.assertEqual((allowed, reason), (True, ""))
+
+
 class EstimateForUrlsTests(unittest.TestCase):
     def test_uses_unmeasured_priors_when_ledger_empty(self):
         result = estimate_for_urls([UrlEstimateInput(url="https://a.test/x")], EffortLedger())

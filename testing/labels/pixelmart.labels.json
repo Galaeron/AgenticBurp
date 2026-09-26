@@ -1,0 +1,216 @@
+{
+  "corpus": "pixelmart",
+  "version": "1.0.0",
+  "hash": "ba48299fb9e80dde4e6eb5e50361e31fb697161befde4c1d7e3c16314bd83099",
+  "records": [
+    {
+      "exchange_id": "SETUP1",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "POST /api/login (alice) -- fixture: establishes alice's real session token used by later TP3 exchange; not itself a scored case.",
+      "status": "setup",
+      "provenance": "corpus label 'setup: alice real login (not part of the test set itself)' (C:/tmp/pixelmart_exchanges.json, exchange index 0); not present in score.py's _LABEL_CATEGORY or bench.py's KEYWORDS (setup exchanges are outside both TP/TN label sets)."
+    },
+    {
+      "exchange_id": "SETUP2",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "POST /api/login (bob) -- fixture: establishes bob's real session token, later IDOR'd via TP3/TP4; not itself a scored case.",
+      "status": "setup",
+      "provenance": "corpus label 'setup: bob real login' (C:/tmp/pixelmart_exchanges.json, exchange index 1); not present in score.py's _LABEL_CATEGORY or bench.py's KEYWORDS."
+    },
+    {
+      "exchange_id": "SETUP3",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "POST /api/orders (bob, product_id=3, quantity=2) -- fixture: creates the order object TP4 later accesses as alice; not itself a scored case.",
+      "status": "setup",
+      "provenance": "corpus label 'setup: bob places an order (order id will be IDOR'd later)' (C:/tmp/pixelmart_exchanges.json, exchange index 2); not present in score.py's _LABEL_CATEGORY or bench.py's KEYWORDS."
+    },
+    {
+      "exchange_id": "SETUP4",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "POST /api/products/1/comments (author=attacker) -- fixture: plants the stored payload TP6 later renders; not itself a scored case.",
+      "status": "setup",
+      "provenance": "corpus label 'setup: attacker posts a stored-XSS comment' (C:/tmp/pixelmart_exchanges.json, exchange index 3); not present in score.py's _LABEL_CATEGORY or bench.py's KEYWORDS."
+    },
+    {
+      "exchange_id": "TP1",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "POST /api/login -- username field (payload: admin' -- ).",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP1']='A03:Injection' + bench.py:KEYWORDS['TP1']=['sql']; corpus label 'TP1: SQLi auth bypass on /api/login'."
+    },
+    {
+      "exchange_id": "TP2",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/products/search -- q parameter (UNION SELECT payload).",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP2']='A03:Injection' + bench.py:KEYWORDS['TP2']=['sql']; corpus label 'TP2: SQLi UNION exfil on /api/products/search'."
+    },
+    {
+      "exchange_id": "TP3",
+      "expected_classes": [
+        "idor"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/users/2/profile -- path user_id; alice's token used against bob's id.",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP3']='A01:Broken-Access-Control' + bench.py:KEYWORDS['TP3']=['idor','object-level','object level','access control','bola','authorization']; corpus label 'TP3: IDOR - alice reads bob's profile'."
+    },
+    {
+      "exchange_id": "TP4",
+      "expected_classes": [
+        "idor"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/orders/1 -- path order_id; alice's token used against bob's order.",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP4']='A01:Broken-Access-Control' + bench.py:KEYWORDS['TP4'] (same idor/access-control keyword set as TP3); corpus label 'TP4: IDOR - alice reads bob's order'."
+    },
+    {
+      "exchange_id": "TP5",
+      "expected_classes": [
+        "xss"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/search-page -- q parameter reflected unescaped.",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP5']='A03:Injection' + bench.py:KEYWORDS['TP5']=['xss','cross-site script','cross site script','scripting']; corpus label 'TP5: reflected XSS on /api/search-page'."
+    },
+    {
+      "exchange_id": "TP6",
+      "expected_classes": [
+        "xss"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/products/1/comments/view -- renders the stored comment body (planted by SETUP4) unescaped.",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP6']='A03:Injection' + bench.py:KEYWORDS['TP6'] (same xss keyword set as TP5); corpus label 'TP6: stored XSS on /api/products/1/comments/view'."
+    },
+    {
+      "exchange_id": "TP7",
+      "expected_classes": [
+        "business_logic"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "POST /api/orders -- quantity=-5 (negative-quantity balance manipulation).",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP7']='A04:Insecure-Design' + bench.py:KEYWORDS['TP7']=['business','logic','workflow']; corpus label 'TP7: business logic - negative quantity refund exploit'."
+    },
+    {
+      "exchange_id": "TP8",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "POST /api/coupons/redeem -- single sequential replay only; the underlying issue (if any) is a race condition provable only under concurrent replay, which this single captured exchange cannot establish.",
+      "status": "inconclusive",
+      "provenance": "score.py explicitly EXCLUDES TP8 from _LABEL_CATEGORY (comment: 'TP8 excluded (race condition, not provable from one sequential exchange)'); bench.py's KEYWORDS dict has no TP8 entry either (jumps TP7 -> TP9), matching the same exclusion. Neither permitted public source pins an exact class for a single sequential exchange, so this is left inconclusive rather than guessed."
+    },
+    {
+      "exchange_id": "TP9",
+      "expected_classes": [
+        "ssrf"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "POST /api/avatar -- url field (file:// scheme).",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP9']='A10:SSRF' + bench.py:KEYWORDS['TP9']=['ssrf','request forgery','server-side request']; corpus label 'TP9: SSRF - avatar fetch of a local file via file://'."
+    },
+    {
+      "exchange_id": "TP10",
+      "expected_classes": [
+        "path_traversal",
+        "info_disclosure"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/invoices/download -- file parameter (../ traversal); response body carries the disclosed file content.",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP10']='A01:Broken-Access-Control' + bench.py:KEYWORDS['TP10']=['path','traversal','directory','file inclusion','lfi','disclosure','source']; corpus label 'TP10: path traversal on invoice download'. The 'disclosure'/'source' keywords pin a second exact class (info_disclosure) as the impact, distinct from the traversal mechanism itself -- not merely an alternate name for the same class."
+    },
+    {
+      "exchange_id": "TP11",
+      "expected_classes": [
+        "jwt",
+        "auth_bypass"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/users/3/profile -- Authorization header carries a forged alg=none token.",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP11']='A07:Auth-Failures' + bench.py:KEYWORDS['TP11']=['jwt','alg','signature','token','authentication bypass']; corpus label 'TP11: alg=none forged admin token used against user profile'."
+    },
+    {
+      "exchange_id": "TP12",
+      "expected_classes": [
+        "security_misconfiguration",
+        "info_disclosure"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/admin/config -- no Authorization header supplied at all.",
+      "status": "positive",
+      "provenance": "score.py:_LABEL_CATEGORY['TP12']='A05:Security-Misconfiguration' + bench.py:KEYWORDS['TP12']=['auth','access control','misconfig','exposure','disclosure','sensitive']; corpus label 'TP12: unauthenticated admin config exposure'. The missing-auth-check mechanism pins security_misconfiguration and the exposed jwt_secret/db_path pin info_disclosure as a second exact class."
+    },
+    {
+      "exchange_id": "TN1",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/products -- no request parameters at all; not a targeted negative control for any single exact class.",
+      "status": "negative",
+      "provenance": "corpus label 'TN1: safe product list, no user input' (C:/tmp/pixelmart_exchanges.json); TN* labels are benign per score.py's docstring ('TN* labels are benign'). No injectable parameter exists on this exchange, so it is not treated as a tested negative for any specific class -- a benign response with no attacker-controlled input is not evidence against an attack that was never attempted."
+    },
+    {
+      "exchange_id": "TN2",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "sqli"
+      ],
+      "label_scope": "GET /api/products/1 -- id path parameter; negative control specifically for SQL injection on this parameter.",
+      "status": "negative",
+      "provenance": "corpus label 'TN2: safe parameterized product lookup' (C:/tmp/pixelmart_exchanges.json); TN* labels are benign per score.py's docstring. Scoped to sqli only -- this exchange says nothing about e.g. idor/auth on the same endpoint."
+    },
+    {
+      "exchange_id": "TN3",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "idor"
+      ],
+      "label_scope": "GET /api/users/me -- identity taken from the verified token, not a client-supplied id; negative control for IDOR.",
+      "status": "negative",
+      "provenance": "corpus label 'TN3: safe self-profile via verified token identity' (C:/tmp/pixelmart_exchanges.json); TN* labels are benign per score.py's docstring. Scoped to idor only."
+    },
+    {
+      "exchange_id": "TN4",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "sqli"
+      ],
+      "label_scope": "GET /api/products/1/comments?sort=' OR '1'='1 -- sort query parameter; negative control for SQL injection via that parameter.",
+      "status": "negative",
+      "provenance": "corpus label \"TN4: comments 'sort' param, allowlisted server-side, attack attempt\" (C:/tmp/pixelmart_exchanges.json); TN* labels are benign per score.py's docstring. The captured attack attempt is a SQLi-style payload, so scoped to sqli only."
+    },
+    {
+      "exchange_id": "TN5",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "csrf"
+      ],
+      "label_scope": "POST /api/account/change-email -- missing X-CSRF-Token header; response_status=403, negative control for CSRF.",
+      "status": "negative",
+      "provenance": "corpus label 'TN5: change-email without CSRF token, correctly rejected' (C:/tmp/pixelmart_exchanges.json); TN* labels are benign per score.py's docstring. Scoped to csrf only."
+    },
+    {
+      "exchange_id": "TN6",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "GET /api/health -- no request parameters; not a targeted negative control for any single exact class.",
+      "status": "negative",
+      "provenance": "corpus label 'TN6: health check, no sensitive data' (C:/tmp/pixelmart_exchanges.json); TN* labels are benign per score.py's docstring. No injectable parameter or sensitive-data-bearing surface is tested here, so unlike TN2/TN3/TN4/TN5 this is not scoped to a specific class."
+    }
+  ]
+}

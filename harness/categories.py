@@ -62,6 +62,12 @@ _SYNONYMS: dict[str, str] = {
     "race condition": "business_logic",
     "misconfig": "misconfig", "misconfiguration": "misconfig",
     "security misconfiguration": "misconfig",
+    # 2026-09-25 FR-4: the model's dominant snake_case spelling of this class
+    # (35x in the captured benchmark runs) was NOT covered by _normalize()'s
+    # hyphen-to-space folding (underscores are deliberately left untouched --
+    # see _normalize's docstring -- so this needs its own explicit entry
+    # rather than relying on the already-present "security misconfiguration").
+    "security_misconfiguration": "misconfig",
     "ai_llm": "ai_llm", "prompt injection": "ai_llm", "llm": "ai_llm",
     "insecure output handling": "ai_llm",
     "supply_chain": "supply_chain", "supply chain": "supply_chain",
@@ -94,6 +100,21 @@ _SYNONYMS: dict[str, str] = {
     "info_disclosure": "info_disclosure", "information disclosure": "info_disclosure",
     "info disclosure": "info_disclosure", "information leak": "info_disclosure",
     "data leak": "info_disclosure", "sensitive data exposure": "info_disclosure",
+    # 2026-09-25 FR-4: every one of these snake_case/compound variants missed
+    # entirely before this fix (canonicalize() returned None, so the gate's
+    # raw-lowercase fallback never matched the "info_disclosure" key) -- the
+    # model's dominant info-disclosure spellings in the captured benchmark
+    # runs. Same underscore-vs-space rationale as security_misconfiguration
+    # above: _normalize() folds hyphens to spaces, not underscores, so both
+    # forms are listed explicitly where they differ.
+    "information_disclosure": "info_disclosure",
+    "verbose_error_disclosure": "info_disclosure", "verbose error disclosure": "info_disclosure",
+    "excessive_data_exposure": "info_disclosure",
+    "exposure_of_internal_data": "info_disclosure", "exposure of internal data": "info_disclosure",
+    "exposure_of_sensitive_information": "info_disclosure",
+    "exposure of sensitive information": "info_disclosure",
+    "information_disclosure_header": "info_disclosure",
+    "information disclosure header": "info_disclosure",
     "business_logic_enhanced": "business_logic_enhanced", "business logic enhanced": "business_logic_enhanced",
     "workflow abuse": "business_logic_enhanced", "state manipulation": "business_logic_enhanced",
     "anomaly": "anomaly", "anomaly detection": "anomaly", "unknown vulnerability": "anomaly",

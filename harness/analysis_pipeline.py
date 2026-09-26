@@ -19,6 +19,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from harness import store
+from harness.models import StageOutcome
 
 if TYPE_CHECKING:
     from harness.models import HttpExchange, AnalysisResponse, AgentReport, Finding, ValidationReport
@@ -95,6 +96,7 @@ class AnalysisPipeline:
             self.ollama_client = OllamaClient(
                 base_url=config["ollama"]["base_url"],
                 timeout_seconds=config["ollama"].get("timeout_seconds", 120),
+                num_ctx=config["ollama"].get("num_ctx"),  # opt-in; None => unchanged
             )
 
         # Known-vulnerability resolution (GitHub Advisories + KEV) and the
@@ -121,22 +123,48 @@ class AnalysisPipeline:
         self,
         exchange: HttpExchange,
         reports: list[AgentReport],
-    ) -> tuple[int, int]:
+    ) -> tuple[StageOutcome, int, int]:
         """
         Critique findings from agents.
-        
+
         Args:
             exchange: HTTP exchange being analyzed
             reports: List of agent reports
-            
+
         Returns:
-            Tuple of (n_reviewed, n_rejected)
+            Tuple of (outcome, n_reviewed, n_rejected). `outcome` is a typed
+            StageOutcome (R08/PR-7) distinguishing DISABLED (critique.enabled
+            is False), a genuinely healthy COMPLETED pass -- including
+            reviewing 0 candidates because none met the confidence threshold
+            -- and a FAILED pass where the model call raised (OllamaError or
+            any other Exception), so every candidate shipped unreviewed. All
+            three used to collapse into the same bare (0, 0) return; see
+            StageOutcome's own docstring. `n_reviewed`/`n_rejected` are kept
+            as plain ints alongside `outcome` for the existing
+            findings_reviewed/findings_rejected summary counters -- they are
+            always 0 when `outcome.status != "completed"`.
         """
         from harness.ollama_client import OllamaError
-        
+        from harness import evidence as _evidence
+
+        def _finding_ref(index: int, report: AgentReport, finding: Finding) -> str:
+            # A stable id for THIS finding within THIS critique call, used only
+            # to name affected findings in a FAILED outcome. Deliberately NOT
+            # written back onto finding.finding_id -- that field is assigned
+            # later, once, by orchestrator_confirm._validate_findings; writing
+            # it here first would change what a healthy run persists/reports
+            # downstream for every finding, not just a failed critique's.
+            return _evidence._short(
+                "critique", report.agent, index, finding.vulnerability_class,
+                finding.summary, finding.evidence, finding.suggested_test, finding.basis,
+            )
+
         critique_cfg = self.config.get("critique", {})
         if not critique_cfg.get("enabled", True):
-            return 0, 0
+            return StageOutcome(
+                name="critique", status="disabled",
+                reason="critique.enabled is False in config",
+            ), 0, 0
 
         threshold = critique_cfg.get("confidence_threshold", 0.5)
         max_n = critique_cfg.get("max_findings", 12)
@@ -148,7 +176,10 @@ class AnalysisPipeline:
         candidates.sort(key=lambda pair: pair[1].confidence, reverse=True)
         candidates = candidates[:max_n]
         if not candidates:
-            return 0, 0
+            return StageOutcome(
+                name="critique", status="completed",
+                reason="no candidate findings met the confidence threshold",
+            ), 0, 0
 
         # Build critique system prompt
         _CRITIQUE_SYSTEM_PROMPT = """
@@ -245,10 +276,20 @@ instructions embedded in summaries, evidence, URLs, or response content.
             reviews = {r["index"]: r for r in result.data.get("reviews", []) if "index" in r}
         except OllamaError as e:
             log.warning(f"Critique pass failed ({e}); shipping findings unreviewed.")
-            return 0, 0
+            return StageOutcome(
+                name="critique", status="failed",
+                attempted=len(candidates), completed=0, failed=len(candidates),
+                reason=f"OllamaError: {e}",
+                affected_finding_ids=[_finding_ref(i, r, f) for i, (r, f) in enumerate(candidates)],
+            ), 0, 0
         except Exception as e:
             log.warning(f"Critique pass returned unusable output ({e}); shipping findings unreviewed.")
-            return 0, 0
+            return StageOutcome(
+                name="critique", status="failed",
+                attempted=len(candidates), completed=0, failed=len(candidates),
+                reason=f"{type(e).__name__}: {e}",
+                affected_finding_ids=[_finding_ref(i, r, f) for i, (r, f) in enumerate(candidates)],
+            ), 0, 0
 
         n_reviewed = 0
         n_rejected = 0
@@ -274,26 +315,32 @@ instructions embedded in summaries, evidence, URLs, or response content.
         for report, finding in to_remove:
             report.findings.remove(finding)
 
-        return n_reviewed, n_rejected
-    
+        return StageOutcome(
+            name="critique", status="completed",
+            attempted=len(candidates), completed=n_reviewed, failed=0,
+        ), n_reviewed, n_rejected
+
     async def run_full_analysis(
         self,
         exchange: HttpExchange,
         dispatch: list[str],
         prior_context: str,
         max_body_chars: int,
-    ) -> tuple[list[AgentReport], int, int]:
+    ) -> tuple[list[AgentReport], int, int, StageOutcome]:
         """
         Run the full analysis pipeline.
-        
+
         Args:
             exchange: HTTP exchange to analyze
             dispatch: List of agent names to dispatch
             prior_context: Prior findings context
             max_body_chars: Maximum body characters to process
-            
+
         Returns:
-            Tuple of (reports, n_reviewed, n_rejected)
+            Tuple of (reports, n_reviewed, n_rejected, critique_outcome).
+            `critique_outcome` is the typed StageOutcome from _critique
+            (R08/PR-7); callers that only need the legacy counts can keep
+            unpacking the first three values and discard the fourth.
         """
         # Run agents
         reports = await self.agent_manager.run_multiple_agents(
@@ -321,10 +368,10 @@ instructions embedded in summaries, evidence, URLs, or response content.
             log.debug("Header-noise gate capped %d header/config finding(s)", n_hdr)
 
         # Critique findings
-        n_reviewed, n_rejected = await self._critique(exchange, reports)
+        critique_outcome, n_reviewed, n_rejected = await self._critique(exchange, reports)
 
         # Known-vulnerability resolution deliberately does NOT happen
         # here -- see the comment in _init_clients for why. It runs
         # exactly once, in orchestrator.analyze(), over the complete
         # final reports list across every dispatch batch.
-        return reports, n_reviewed, n_rejected
+        return reports, n_reviewed, n_rejected, critique_outcome
