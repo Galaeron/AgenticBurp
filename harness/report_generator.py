@@ -721,14 +721,58 @@ def issue_exports(findings: list[dict], proofs_by_case: dict | None = None,
     return [issues.export_issue(i, proofs_by_case=proofs_by_case) for i in grouped]
 
 
-def export_issues_for_host(url: str) -> list[dict]:
+def _demoted_by_reporting_gates(finding: dict, reporting: dict) -> bool:
+    """R07/RA-6: shared predicate factored out of generate_markdown_report's own
+    leads-bucketing branch (see its `if quarantine_leads ... elif
+    gate_low_confidence_generic ... elif gate_uncorroborated_catchall` chain
+    above) -- True when `finding` is one the reporting.* surfacing gates would
+    route to the Markdown report's leads bucket. export_issues_for_host uses
+    this to OMIT the same findings from a machine-readable export instead: a
+    SARIF/MCP issue export has no leads section, so omission is the
+    export-side equivalent of the Markdown report's "leads are not reported
+    vulnerabilities" framing.
+
+    Gate-for-gate identical to generate_markdown_report's own branch, and
+    inherits each predicate's own recall guard: should_quarantine_as_lead,
+    is_low_confidence_generic_guess and is_uncorroborated_catchall_guess each
+    refuse to match a confirmed or oracle-verified finding, so a
+    concrete/leg-backed finding (sqli/xss/idor, or confirmed/oracle-verified)
+    is NEVER demoted/omitted here, no matter which gates are enabled."""
+    from harness.confirmation_gate import (
+        should_quarantine_as_lead, is_low_confidence_generic_guess,
+        is_uncorroborated_catchall_guess,
+    )
+    if reporting.get("quarantine_unverified_leads") and should_quarantine_as_lead(finding):
+        return True
+    if reporting.get("gate_low_confidence_generic") and is_low_confidence_generic_guess(
+            finding, float(reporting.get("generic_confidence_floor", 0.5))):
+        return True
+    if reporting.get("gate_uncorroborated_catchall") and is_uncorroborated_catchall_guess(finding):
+        return True
+    return False
+
+
+def export_issues_for_host(url: str, *, config: dict | None = None) -> list[dict]:
     """Convenience: pull a host's findings from store.py and return their T06 issue
     exports, enriched with the FULL append-only proof-attempt history per case
     (store.proofs_for_case) -- so every attempt, including a patched-fixture retest,
     is preserved with its own proof id and verdict (T06 history preservation).
-    Also applies any operator-declared merge overrides for this host (P1.8)."""
+    Also applies any operator-declared merge overrides for this host (P1.8).
+
+    `config` (R07/RA-6): optional effective config. When supplied, applies the
+    SAME reporting.* surfacing gates generate_report_for_host honors on the
+    Markdown report to THIS export -- a finding the operator's config would
+    demote to the Markdown leads bucket is instead OMITTED from the returned
+    list entirely (see _demoted_by_reporting_gates). Every gate ships OFF, so
+    omitting `config` -- or passing one with the shipped defaults -- returns
+    EXACTLY what this function returned before this parameter existed; every
+    existing caller (export_issues_for_host(url), no config kwarg) is
+    byte-for-byte unaffected."""
     from harness import store
     findings = store.all_host_findings(url)
+    reporting = (config or {}).get("reporting") or {}
+    if reporting:
+        findings = [f for f in findings if not _demoted_by_reporting_gates(f, reporting)]
     proofs_by_case: dict = {}
     for f in findings:
         cid = f.get("case_id")

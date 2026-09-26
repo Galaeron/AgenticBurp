@@ -403,14 +403,28 @@ async def report_sarif(url: str, authorization: str | None = Header(default=None
     contract stays byte-for-byte untouched. Takes the same `url` query
     param as /report; a host with no stored findings still gets a
     schema-valid SARIF document with zero results, not an error.
+
+    R07/RA-6: originally built directly on group_findings_into_issues +
+    export_issue -- the raw, un-enriched chain -- which silently dropped the
+    persisted proof-attempt history (a retest) and any operator merge
+    override (P1.8) that the canonical report_generator.export_issues_for_host
+    (and therefore the Markdown /report and the MCP issues resource) already
+    apply, and ignored the reporting.* surfacing gates /report honors (RA-5).
+    Now built from export_issues_for_host itself (proofs_by_case + merges,
+    config-gated) so a SARIF consumer sees the SAME view as the Markdown
+    report, not a second, less-complete one. Passing the effective config
+    applies an operator's reporting.* gates the same way /report does; SARIF
+    has no "leads" section, so a finding the gates would demote is OMITTED
+    from `results` instead (RA-6) -- never a confirmed/oracle-verified or
+    other concrete finding, per each gate predicate's own recall guard. Every
+    gate ships OFF, so the default SARIF is byte-identical to the pre-R07
+    output.
     """
     _require_auth(authorization)
     _require_read_auth(authorization)
-    from harness import issues, sarif_adapter
+    from harness import report_generator, sarif_adapter
     from harness import evidence_ledger
-    findings = await asyncio.to_thread(store.all_host_findings, url)
-    issues_list = issues.group_findings_into_issues(findings)
-    exports = [issues.export_issue(issue) for issue in issues_list]
+    exports = await asyncio.to_thread(report_generator.export_issues_for_host, url, config=config)
     source_revision = evidence_ledger.Provenance.capture().code_version
     doc = sarif_adapter.export_issues_to_sarif(exports, source_revision=source_revision)
     return JSONResponse(doc)
