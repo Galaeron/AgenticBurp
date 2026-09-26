@@ -5,7 +5,8 @@
 Branch `reconciliation-backlog`; base HEAD before this session was `c4435fc`. This
 session ran the improvement loop continuously (Opus reviews/decides, Sonnet codes,
 orchestrator independently reruns `full` and commits). It landed **P1-3 (offline
-metric consolidation, 3 slices) and P3-1 (now `[x]` DONE, 4 slices + endpoint)**.
+metric consolidation, 3 slices), P3-1 (now `[x]` DONE, 4 slices + endpoint), and the
+2026-09-26 re-analysis batch RA-1..RA-4 (all `[x]`)**.
 Pre-existing README edits and untracked runtime/review/worktree artifacts remain —
 preserve them. No push; remote-main parity not established.
 
@@ -58,9 +59,12 @@ end of IMPROVEMENT_BACKLOG.md (all evidence-grounded + offline-loop-consumable):
   the existing `require_read_auth` flag (ships false → default byte-identical). +7 tests.
 - **RA-3 `[x]` `fbf43d1`** — offline `GET /report/sarif` export endpoint gives the tested
   `sarif_adapter.py` a caller; offline slice of P2-3 (Burp-tab half stays under P1-5). +5 tests.
-- **RA-4** — batch report-time ledger/blob reads (O(N·E) fresh SQLite connections).
-Dispatch order RA-1 → RA-2 → RA-3 → RA-4. RA-1/RA-2/RA-3 landed; next is RA-4
-(batch report-time ledger/blob reads — perf).
+- **RA-4 `[x]` `1321626`** — batched report-time ledger/blob reads
+  (`store.ledger_events_for_many` + `evidence_ledger.reconstruct_persisted_many` with a shared
+  connection + per-hash memo; `generate_markdown_report` builds the map once). Byte-identical output;
+  connections constant in K. +6 tests.
+The RA-1..RA-4 re-analysis batch is now COMPLETE. The offline-eligible pool is again
+exhausted; the next step is another re-analysis pass (or stop) per the standing instruction.
 
 ## Benchmark honesty caveat
 

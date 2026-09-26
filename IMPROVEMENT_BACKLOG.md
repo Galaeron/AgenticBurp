@@ -2753,7 +2753,17 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
   zero results (not a 500). `full` green.
 - **Impact:** Medium (portability; removes dead code).
 
-### [ ] RA-4 — Batch report-time ledger/blob reads (avoid O(N·E) fresh connections)
+### [x] RA-4 — Batch report-time ledger/blob reads (avoid O(N·E) fresh connections)
+- **Result (VERIFIED offline):** `1321626` — added `store.ledger_events_for_many` (one grouped query,
+  same order/shape as `ledger_events_for`), an optional shared `conn=` on `get_evidence_blob`/
+  `evidence_blob_resolves` (default = prior behavior), an optional `resolver=` threaded through
+  `evidence_ledger.reconstruct`/`_assess_completeness`/`_resolved_blob_hash`, a shared `_ledger_from_rows`,
+  and `reconstruct_persisted_many(refs)` (one batched fetch + per-hash memo over ONE shared connection).
+  `generate_markdown_report` builds the reconstruction map once up front; `_render_finding` looks it up and
+  falls back to the single-ref call when absent → rendered output byte-identical (`reconstruct_persisted`
+  single-ref untouched). +6 tests: batched == single-ref field-for-field, `ledger_events_for_many` slices ==
+  `ledger_events_for`, and a counting shim proving connections are CONSTANT in K (K=3 == K=6) while the old
+  per-finding path opens strictly more. Full suite green (harness 2762 OK/2 skip, exit 0).
 - **Domain:** Efficiency · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED):** `report_generator.py:618` calls `evidence_ledger.reconstruct_persisted(...)`
   per finding; each → `ledger_from_store` → `store.ledger_events_for` opens a fresh `_connect()`
