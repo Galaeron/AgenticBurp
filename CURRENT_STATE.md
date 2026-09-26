@@ -1,84 +1,65 @@
-# Current state — 2026-09-25
+# Current state — 2026-09-26
 
 ## Checkout
 
 Branch `reconciliation-backlog`; base HEAD before this session's work was
-`59ef1f536e3fffec23aff43656c26d4185124dbe`. This session filed a founder-review
-improvement batch and landed **7 of 8 FR items** (FR-4/FR-3/FR-1/FR-2/FR-5/FR-6/FR-8) plus doc
-updates; **FR-7 is intentionally left `[ ]` for the owner** (see below).
-Pre-existing README edits and untracked runtime/evaluation/worktree artifacts
-remain — preserve them. Remote-main parity is not established.
+`c4435fc`. This session ran one role-split improvement-loop iteration and landed
+the **offline first slice of P1-3** (evaluation-layer metric consolidation). The
+prior founder-review batch (FR-4/FR-3/FR-1/FR-2/FR-5/FR-6/FR-8) remains landed;
+**FR-7 stays `[ ]` for the owner** (live cache hit-rate measurement). Pre-existing
+README edits and untracked runtime/evaluation/worktree artifacts remain —
+preserve them. Remote-main parity is not established. No push.
 
-## Current review and evidence
+## This session's loop iteration (VERIFIED offline)
 
-Current: [founder decision review](reviews/2026-09-25/founder-review/REVIEW.md).
-Commands, limits and external sources:
-[verification](reviews/2026-09-25/founder-review/VERIFICATION.md).
-The review has 23 sections, 15 findings (F01–F15), target architecture, a P0–P3
-roadmap, scorecard, ablation protocol and 30/60/90-day gates.
+- **Selected:** P1-3 — Unify the evaluation layers into one driver (first eligible
+  ordinary-queue item: FR-* loop batch exhausted, RB-1..8 + INV-1..4 + P0 tier all
+  `[x]`; P1-3's only dep P0-3 is `[x]`).
+- **Landed `31aed88`:** new `testing/eval_metrics.py` — shared `precision`/`recall`/
+  `f1` + one-pass `summarize` (mean/pstdev/pvariance/n). Routed both live-ish eval
+  drivers through it: `harness/ablation_harness.py` (`_precision`/`_recall`/`_agg`)
+  and `testing/blind-target-2/run_blind_eval.py` (`aggregate_variance`). Removed 3
+  private metric copies + collapsed the pstdev-vs-pvariance drift. Byte-identical
+  outputs; `strict_score.py` (canonical) left untouched, equivalence documented.
+- **Tests:** +21 caller-level/negative-control tests (`testing/test_eval_metrics.py`)
+  driving the real driver aggregation functions against hand-computed values.
+- **P1-3 stays `[ ]` (partial):** older eval layers, the `strict_score` reroute, and
+  the single-command scorecard (needs a live run) remain. Map:
+  [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
 
-Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14):
-- `full` green after the 7 landed FR items: harness 2724 OK (2 skips); pytest-native 38 passed;
-  testing 185 OK; evaluation_integrity 42 OK. `config_manifest --check` clean.
-- Founder-review synthetic probes reproduce browser same-origin POST permission,
-  bridge-only tool-egress flags, false ledger resolvability, and discarded runner
-  failures (F01/F02/F03/F04).
-- Ollama version endpoint responded 0.34.3; no fresh model efficacy run.
-  Docker access denied; JDK/Gradle/Burp execution unverified.
+## Verification (this session)
 
-## Improvement loop — active (founder-review + FP batch)
+Fresh execution with `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14),
+from repo root, independently rerun by the orchestrator after the change:
+- `python -m harness.suite smoke` → 92 OK.
+- `python -m unittest testing.test_eval_metrics -v` → 21 OK.
+- `python -m harness.suite full` → harness 2724 OK (2 skip); pytest-native 38
+  passed; testing 206 OK (185 baseline + 21 new); evaluation_integrity 42 OK.
+  Exit 0. Every `ERROR:` line in the log is a deliberate fault-injection/
+  negative-control assertion; no `FAILED` line present.
+- No live model/Docker/JDK/blind-target run performed. No `config.yaml` change.
+  No `*ANSWER_KEY*` / blind-target `app.py` read.
 
-The founder review + an offline re-score of the 2026-09-25 captured benchmark
-findings produced the **FR-\*** batch in
-[IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md). Loop order:
-**FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR-6 → FR-7 → FR-8**.
+## Improvement loop — dispatch status
 
-**Done (offline, VERIFIED — full Result lines in IMPROVEMENT_BACKLOG.md):**
-- **FR-4 `96c17ff`** (supersedes BM-1) — generic-gate normalization fix + evidence-scoped
-  catch-all gate `reporting.gate_uncorroborated_catchall` (ships **false**; only misconfig/
-  info_disclosure; not global). Offline re-score P 0.236→0.283.
-- **FR-3 `7050d89`** — tested all-repeat benchmark pooling (`testing/pool_strict_runs.py`);
-  report shows both the per-app (30/101/7) and all-12-runs (91/294/20) figures with the
-  "3 repeats ≠ 3 independent apps" caveat.
-- **FR-1 `cf0f953`** — strict-runner health certification (no false `complete`; `assess_run_health`);
-  fixed a leaked `harness.cache` global.
-- **FR-2 `aa0d42b`** — storage-backed resolvable evidence (content-addressed, REDACTED request/
-  response blobs; status-only strings honestly not resolvable; NC-4 canary; never breaks a send).
-- **FR-5 `c4dd349`** — case/parameter-bound negative evidence: a controlled negative on param A no
-  longer refutes an untested param B of the same class (falls through to UNVERIFIED); class-level
-  fallback preserved.
-- **FR-6 `a2aba42`** — credential-grant differential: `_credential_grants_access` now compares the
-  credentialed response against anonymous + invalid-token controls; a public 200 / no-difference token
-  no longer grants (fail-closed on control failure). Signature/callers unchanged.
-- **FR-8 `cdb238d`** — optional auth on sensitive local-API reads: `server.require_read_auth` (ships
-  **false**) gates `/report`/`/telemetry`/`/test-plans`/`/settings` behind the effective token; `/health`
-  open; tracked in the drift manifest. Default deploy byte-identical.
-- **FR-7 `[ ]` — DEFERRED to owner (not a loop item):** pure-inference cache / F11. Widening cache scope
-  to reuse hypotheses across runs is the one *loosening* change in the batch (silent stale-proof-reuse
-  risk on a core path), and its value is "strictly gated on measured hit-rate" — a live measurement the
-  offline loop can't do; the item says measure before optimizing. Owner: instrument real hit-rate + prove
-  per-run proof isolation under live confirmation flows before landing.
-- **Skip-only (OWNER/LIVE), cross-referenced as FR-O\*:** F01/F02/F08 enforcement
-  + two-origin/egress proof (`PR-10`/`PR-11`/`NC-O1..3`, `P1-10`), F05/F14 pairing
-  + build (`PR-A`/`PR-C`/`NC-O5`), F07 ablations (`PR-B`), F06 independent
-  adjudication + analyst-value (`PR-D`/`NC-O4`/`PR-E`), FR-3's live re-measure.
+FR-* loop batch is exhausted for offline work (FR-7 owner-only). The ordinary
+priority queue is now active. Next eligible offline candidate after P1-3's
+remaining slices: revisit P1-3 follow-on (older layers / strict_score reroute) or
+the next open loop-consumable P-tier item; P1-5 (Burp build), P2-1/P2-2 efficacy,
+P3-3 remain OWNER/LIVE. Selection is re-derived fresh each iteration.
 
 ## Benchmark honesty caveat
 
-Saved 2026-09-25 benchmark results remain historical/reported. Fresh arithmetic
-over the 4 scored corpora × 3 repeats gives TP=91/FP=294/FN=20, P=0.236/R=0.820;
-the published P=.229/R=.811 headline uses first repeats only (FR-3 fixes this).
-Artifact revision `ebe461e`; model/call/token instrumentation unavailable. These
-measure captured-exchange class detection, not live exploitability. No blind keys
-or blind-target implementations were read.
+Saved 2026-09-25 benchmark results remain historical/reported; they measure
+captured-exchange class detection, not live exploitability. No blind keys or
+blind-target implementations were read. Model/call/token instrumentation for a
+fresh efficacy number is still unavailable offline.
 
 ## Durable pointers and prior work
 
 - [IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md): durable implementation record.
-- [Cycle-1 path](docs/PRINCIPAL_REVIEW_IMPLEMENTATION_PATH.md);
-  [Cycle-2 review](reviews/2026-09-24/principal-review-r2/REVIEW.md).
-- [Benchmark report](reviews/2026-09-25/benchmark/BENCHMARK_REPORT.md): historical,
-  with aggregation/provenance/causality qualifications noted in the current review.
+- [founder decision review](reviews/2026-09-25/founder-review/REVIEW.md);
+  [verification](reviews/2026-09-25/founder-review/VERIFICATION.md).
 - [Precision path](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md);
   [Testing](docs/TESTING.md): suite boundaries and dependency caveats.
 

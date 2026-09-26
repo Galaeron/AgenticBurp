@@ -276,6 +276,22 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 - **Impact:** Medium-High.
 
 ### [ ] P1-3 — Unify the evaluation layers into one driver
+- **Result (partial, VERIFIED offline — item stays `[ ]`):** `31aed88` — landed the
+  offline first slice: new `testing/eval_metrics.py` (shared `precision`/`recall`/`f1`
+  + one-pass `summarize` giving mean/pstdev/pvariance/n) now backs both live-ish
+  drivers — `harness/ablation_harness.py` (`_precision`/`_recall`/`_agg`) and
+  `testing/blind-target-2/run_blind_eval.py` (`aggregate_variance`) — removing three
+  private metric copies and collapsing the pstdev-vs-pvariance drift into one
+  computation. Byte-identical outputs (existing 79 driver tests + smoke + `full`
+  green, 2724 OK/2 skip, independently rerun). +21 caller-level/negative-control
+  tests (`testing/test_eval_metrics.py`) drive the real `aggregate()`/
+  `aggregate_variance()`. `strict_score.py` (canonical scorer) left untouched;
+  equivalence documented. **Remaining (why open):** older layers
+  (`testing/score.py`, `nightly_precision.py`, `eval_health.py`, `score_provenance.py`,
+  `evidence_audit.py`, `coverage_summary.py`, `evaluation_integrity/`), the
+  `strict_score` reroute, and the single-command scorecard — the last needs a live
+  run, out of offline loop scope. Map:
+  [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
 - **Domain:** Evaluation / Maintainability · **Effort:** M · **Depends on:** P0-3
 - **Evidence (VERIFIED):** overlapping layers — `testing/score.py`,
   `testing/nightly_precision.py`, standalone `evaluation_integrity/`, and
