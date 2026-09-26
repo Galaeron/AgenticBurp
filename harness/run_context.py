@@ -402,6 +402,13 @@ class TargetTransport:
                 # here is swallowed and recorded as a degraded marker; it must
                 # never turn a good send into a transport failure.
                 if method is not None:
+                    # R01: the EXECUTION event's own `data` dict must carry
+                    # `method` too, not just the redacted request blob's
+                    # `req_record["method"]` below -- otherwise reproduction_
+                    # recipe's `e.data.get("method")` is always None even for
+                    # a real send, since a recipe reads the event data, not
+                    # the blob contents.
+                    data["method"] = method
                     try:
                         from harness import security, store
                         req_record = {

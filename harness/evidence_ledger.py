@@ -156,6 +156,45 @@ def _resolved_blob_hash(executions: list, field: str, *, resolver=None) -> str |
     return None
 
 
+def _resolvable_execution(executions: list, *, resolver=None) -> "LedgerEvent | None":
+    """The first EXECUTION event whose OWN ``request_blob`` AND ``response_blob``
+    BOTH storage-resolve (see ``_blob_resolves`` / ``store.evidence_blob_resolves``)
+    -- i.e. a SINGLE execution that alone supports replay.
+
+    This is the R01 fix for the cross-execution "blob pooling" over-claim:
+    ``_resolved_blob_hash`` resolves ``request_blob``/``response_blob``
+    INDEPENDENTLY across ALL executions, so a request-only execution A plus an
+    unrelated response-only execution B could together satisfy
+    ``request_blob_hash and response_blob_hash`` despite no single send being
+    replayable -- an assurance no single execution actually supports. This
+    helper requires the pair to resolve off the SAME execution's own data.
+
+    Returns the resolving execution event itself (not just a bool) so a
+    caller that wants the actual hashes can read them straight off it, or
+    None if no execution's own pair resolves.
+
+    `resolver`: same optional ``hash -> bool`` override as `_resolved_blob_hash`
+    / `_blob_resolves` (RA-4 batched-report memoization); omitted resolves via
+    a fresh `harness.store.evidence_blob_resolves()` call per hash checked."""
+    if resolver is None:
+        try:
+            from harness import store
+        except Exception:
+            return None
+        resolver = store.evidence_blob_resolves
+    for e in executions:
+        req_h = e.data.get("request_blob")
+        resp_h = e.data.get("response_blob")
+        if not (_nonempty(req_h) and _nonempty(resp_h)):
+            continue
+        try:
+            if resolver(req_h) and resolver(resp_h):
+                return e
+        except Exception:
+            pass
+    return None
+
+
 def _blob_resolves(h) -> bool:
     """True iff a single hash `h` is present and storage-resolves (harness.
     store.evidence_blob_resolves). Same semantics/try-except-swallow pattern
@@ -178,6 +217,13 @@ def _blob_resolves(h) -> bool:
         return False
 
 
+_REHYDRATION_NOTE = (
+    "stored request/response blobs are REDACTED (secrets/session/credentials "
+    "stripped before hashing, per run_context.TargetTransport._artifact) -- "
+    "authenticated replay needs session/credential/input rehydration; the "
+    "blob alone is not a literal replay.")
+
+
 def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resolver=None) -> dict:
     """Honest reproducibility assessment for a finding (P0-6 / R10; FR-2 / F03).
 
@@ -195,6 +241,17 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resol
     a durable record whose EXECUTION event failed to persist reconstructs as NOT
     resolvable (never a silent ``complete`` durable record for un-persisted
     evidence).
+
+    R01: `resolvable` requires the request+response pair to resolve off ONE
+    SINGLE execution's own data (`_resolvable_execution`), never a request
+    blob resolving on execution A pooled with a response blob resolving on a
+    DIFFERENT execution B -- that pooled check (still used below for the
+    `has_request_blob`/`has_response_blob` diagnostic fields, which answer
+    "does a resolving blob of this kind exist anywhere for this finding", not
+    "is this finding replayable") was an over-claim no single execution
+    actually supported. A resolvable finding also carries `rehydration_required`
+    -- stored blobs are redacted, so a resolvable recipe is not a literal
+    replay without session/credential/input rehydration.
     """
     executions = by_type.get(EventType.EXECUTION, [])
     observations = by_type.get(EventType.OBSERVATION, []) + by_type.get(EventType.HYPOTHESIS, [])
@@ -208,6 +265,10 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resol
 
     has_request_blob_ref = any(_nonempty(e.data.get("request_blob")) for e in executions)
     has_response_blob_ref = any(_nonempty(e.data.get("response_blob")) for e in executions)
+    # Pooled (across-all-executions) resolution: kept ONLY for the diagnostic
+    # has_request_blob/has_response_blob fields below ("does a resolving blob
+    # of this kind exist anywhere for this finding") and the per-field
+    # `missing` messages -- never for `resolvable` itself (see R01 above).
     request_blob_hash = _resolved_blob_hash(executions, "request_blob", resolver=resolver)
     response_blob_hash = _resolved_blob_hash(executions, "response_blob", resolver=resolver)
     evidence_blob_degraded = any(e.data.get("evidence_blob_degraded") for e in executions)
@@ -220,11 +281,15 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resol
             missing.append("execution recorded but the request reference is empty")
         if not has_response:
             missing.append("execution recorded but the response capture is empty")
-        # FR-2: an independently re-runnable step needs a STORED, HASH-VERIFIED
-        # blob for both the request and the response -- the legacy `request`/
-        # `response` strings above are display-only references and are never,
-        # by themselves, sufficient.
-        resolvable = bool(request_blob_hash and response_blob_hash)
+        # FR-2/R01: an independently re-runnable step needs a STORED,
+        # HASH-VERIFIED blob for both the request and the response -- the
+        # legacy `request`/`response` strings above are display-only
+        # references and are never, by themselves, sufficient -- AND that
+        # pair must resolve off ONE SINGLE execution's own data, never a
+        # request blob from execution A pooled with a response blob from a
+        # different execution B (no single send supports that "resolvable").
+        resolvable_exec = _resolvable_execution(executions, resolver=resolver)
+        resolvable = resolvable_exec is not None
         if not resolvable:
             if not has_request_blob_ref and not has_response_blob_ref:
                 missing.append(
@@ -239,6 +304,12 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resol
                     missing.append("referenced response blob is missing or failed hash verification")
                 elif not has_response_blob_ref:
                     missing.append("no response blob recorded -- reference only")
+                if request_blob_hash and response_blob_hash:
+                    # Both fields resolve SOMEWHERE, but never on the SAME
+                    # execution -- the R01 split-pair case.
+                    missing.append(
+                        "request and response blobs each resolve, but never both on the "
+                        "SAME execution -- no single send is independently replayable")
             if evidence_blob_degraded:
                 missing.append(
                     "evidence blob store failed durably at capture time; the request/response "
@@ -261,6 +332,11 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resol
         "has_request_blob": bool(request_blob_hash),
         "has_response_blob": bool(response_blob_hash),
         "evidence_blob_degraded": evidence_blob_degraded,
+        # C: a resolvable finding's stored blobs are still REDACTED (secrets/
+        # session stripped at capture, run_context.TargetTransport._artifact)
+        # -- declare that a resolvable recipe is not itself a literal replay.
+        "rehydration_required": resolvable,
+        "rehydration_note": _REHYDRATION_NOTE if resolvable else None,
         "missing": missing,
     }
 
@@ -367,6 +443,15 @@ class EvidenceLedger:
         pooled across executions) -- plus a `replayable` flag so a caller
         never has to re-derive resolvability itself. The legacy `request`/
         `expected` keys are kept for back-compat; nothing existing is removed.
+
+        R01: top-level `resolvable` (and each step's `replayable`) requires
+        the request+response pair to resolve off ONE SINGLE execution's own
+        data (`_resolvable_execution` -- the exact same per-execution-pair
+        check `_assess_completeness` now uses), never a request blob
+        resolving on execution A pooled with a response blob resolving on a
+        DIFFERENT execution B. A resolvable step/recipe also carries
+        `rehydration_required` -- stored blobs are redacted, so resolvable
+        is not itself a literal replay.
         """
         evs = self.events_for(finding_ref)
         executions = [e for e in evs if e.event_type == EventType.EXECUTION]
@@ -389,23 +474,22 @@ class EvidenceLedger:
                 "response_blob": response_blob if response_resolves else None,
                 "replayable": replayable,
             }
-            if not replayable:
+            if replayable:
+                step["rehydration_required"] = True
+                step["rehydration_note"] = _REHYDRATION_NOTE
+            else:
                 step["note"] = "reference-only, not replayable"
             steps.append(step)
 
-        # Top-level `resolvable`: reuse `_resolved_blob_hash` -- the EXACT
-        # same helper `_assess_completeness` calls to compute `completeness.
-        # resolvable` -- over the SAME `executions` list, rather than folding
-        # the per-step `replayable` flags above (which are individually
-        # stricter: a per-step flag requires ONE execution's own pair to both
-        # resolve, whereas `_assess_completeness` accepts a resolving request
-        # blob from any execution and a resolving response blob from any
-        # other). Calling the identical function on the identical input is
-        # the only way to GUARANTEE this recipe's resolvability never drifts
-        # from `reconstruct(...)["completeness"]["resolvable"]" for the same
-        # finding -- which is the whole point of this fix.
-        resolvable = bool(_resolved_blob_hash(executions, "request_blob")
-                          and _resolved_blob_hash(executions, "response_blob"))
+        # Top-level `resolvable`: reuse `_resolvable_execution` -- the EXACT
+        # same per-execution-pair helper `_assess_completeness` now calls to
+        # compute `completeness.resolvable` -- over the SAME `executions`
+        # list. This (not the old pooled `_resolved_blob_hash` check) is what
+        # GUARANTEES this recipe's resolvability never drifts from
+        # `reconstruct(...)["completeness"]["resolvable"]` for the same
+        # finding, and it now agrees with the per-step `replayable` flags
+        # above too (both require one execution's own pair to resolve).
+        resolvable = _resolvable_execution(executions) is not None
 
         return {
             "finding_ref": finding_ref,
@@ -413,6 +497,8 @@ class EvidenceLedger:
             "config_fingerprint": prov.config_fingerprint,
             "evidence_schema_version": prov.evidence_schema_version,
             "resolvable": resolvable,
+            "rehydration_required": resolvable,
+            "rehydration_note": _REHYDRATION_NOTE if resolvable else None,
             "steps": steps,
         }
 

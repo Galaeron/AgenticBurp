@@ -337,6 +337,29 @@ class EvidenceBlobProducerWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(comp["resolvable"], comp)
         self.assertTrue(comp["has_request_blob"] and comp["has_response_blob"], comp)
 
+    async def test_method_survives_round_trip_into_reproduction_recipe(self):
+        """R01: run_context.TargetTransport._artifact's EXECUTION event `data`
+        dict must itself carry `method` (not just the redacted request blob's
+        req_record['method']) -- otherwise reproduction_recipe's
+        `e.data.get('method')` is always None even for a real POST send."""
+        run_context = RunContext.create(
+            allowed_hosts=["a.test"],
+            gate_config={"active_enabled": True, "allow_mutating_replay": True})
+        run_context._default_client = httpx.AsyncClient(
+            transport=_mock_transport(b"created"))
+        case_ref = "method-roundtrip-finding-1"
+        try:
+            outcome = await run_context.target_transport().execute(
+                TypedRequest(method="POST", url="https://a.test/x", body="payload"),
+                capability="probe", case_ref=case_ref)
+        finally:
+            await run_context.aclose()
+        self.assertTrue(outcome.ok)
+
+        recipe = evidence_ledger.reproduction_recipe_persisted(case_ref)
+        self.assertTrue(recipe["steps"])
+        self.assertEqual(recipe["steps"][0]["method"], "POST")
+
     async def test_blob_store_failure_never_breaks_the_send_and_marks_degraded(self):
         run_context = RunContext.create(allowed_hosts=["a.test"], config={})
         run_context._default_client = httpx.AsyncClient(transport=_mock_transport(b"a real response body"))
