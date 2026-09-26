@@ -2794,7 +2794,10 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
 - **Domain:** Trust / UX · **Effort:** S · **Depends on:** none (FR-4/RA-3 `[x]`) · **Mode:** LOOP (offline)
 - **Impact:** Medium (a documented precision knob now reaches the live analyst-facing report).
 
-### [ ] RA-6 — Apply the `reporting.*` gates to `/report/sarif` for consistency
+### [x] RA-6 — Apply the `reporting.*` gates to `/report/sarif` for consistency
+- **Result (VERIFIED offline):** SUBSUMED by R07 (`41bec3c`). `/report/sarif` now routes through
+  `export_issues_for_host(url, config=config)`, which omits gate-demoted findings (OFF by default,
+  byte-identical); a concrete/confirmed finding is never omitted. Covered by R07's tests.
 - **Domain:** Trust / UX · **Effort:** S · **Depends on:** RA-5 `[x]`, RA-3 `[x]` · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED):** RA-5 wired the surfacing gates into `GET /report` (markdown) but `GET /report/sarif`
   ([server.py](harness/server.py)) still runs `all_host_findings → group_findings_into_issues →
@@ -2820,3 +2823,16 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
   green (harness 2767 OK/2 skip, exit 0).
 - **Domain:** Security / Privacy · **Effort:** S · **Depends on:** RA-2 `[x]` · **Mode:** LOOP (offline)
 - **Source:** [founder-refresh REVIEW.md](reviews/2026-09-26/founder-refresh/REVIEW.md) R06.
+
+### [x] R07 — Route `/report/sarif` through the canonical enriched + gated export
+- **Result (VERIFIED offline):** `41bec3c` — from the 2026-09-26 founder-refresh (R07). RA-3's SARIF endpoint
+  built issues via the raw `group_findings_into_issues`+`export_issue` chain, dropping persisted proof-attempt
+  history and operator merge overrides (which `report_generator.export_issues_for_host` — used by `/report` and
+  the MCP issues resource — applies) and ignoring the reporting.* gates. `report_sarif` now builds from
+  `export_issues_for_host(url, config=config)`: SARIF reflects proofs+merges identically to the canonical
+  export, and (subsuming RA-6) omits gate-demoted findings when the operator opts in — OFF by default →
+  byte-identical; concrete/confirmed findings never omitted (recall guard). +2 tests (merge + 2-attempt proof
+  history match the canonical export; gate ON omits catch-all / gate OFF byte-identical). Full suite green
+  (harness 2769 OK/2 skip, exit 0).
+- **Domain:** Evidence / Export / UX · **Effort:** S-M · **Depends on:** RA-3 `[x]`, RA-5 `[x]` · **Mode:** LOOP (offline)
+- **Source:** [founder-refresh REVIEW.md](reviews/2026-09-26/founder-refresh/REVIEW.md) R07.

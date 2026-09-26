@@ -40,7 +40,8 @@ R03: missing Markdown config forwarding is fixed in observed concurrent edits;
 R04: dynamic public response differences still falsely establish credential access.
 R05: unknown parameter remains a class-wide negative wildcard; oracle controls needed.
 R06: FIXED (`12b4340`) — read-auth now covers knowledge/activity/investigate-list.
-R07: SARIF endpoint bypasses canonical proof-history and merge enrichment.
+R07: FIXED (`41bec3c`) — /report/sarif now uses the canonical enriched+gated export
+     (proofs/merges + reporting gates); subsumes RA-6.
 Browser/tool/address enforcement, Java pairing/build and faithful ablations remain
 open. Offline contract work is NOT exhausted. No implementation loop dispatched.
 
