@@ -253,10 +253,15 @@ def _mutation_token() -> str | None:
 
 def _require_read_auth(authorization: str | None) -> None:
     """FR-8 (F12 offline half): opt-in gate for sensitive GET reads
-    (/report, /telemetry, /test-plans/{plan_id}, GET /settings) -- routes
-    that expose captured client traffic, discovered secrets and diagnostics,
-    which _require_auth's loopback bypass otherwise leaves open to any local
-    process/user with no token at all. Deliberately a SEPARATE function from
+    (/report, /telemetry, /test-plans/{plan_id}, GET /settings,
+    GET /findings/{finding_ref}/evidence, GET /engagement/{host},
+    GET /engagement/{host}/investigate/{job_id}, GET /identities,
+    GET /hosts/{host}/sessions, GET /findings/suppressions,
+    GET /issues/{host}/merges) -- routes that expose captured client
+    traffic, discovered secrets, reconstructed evidence/reproduction
+    recipes, identities/sessions and diagnostics, which _require_auth's
+    loopback bypass otherwise leaves open to any local process/user with
+    no token at all. Deliberately a SEPARATE function from
     _require_auth (which stays exactly as it was: unchanged, still gates
     only on the configured _BEARER_TOKEN, still bypassed on loopback with no
     configured token) -- this one is opt-in via server.require_read_auth
@@ -1049,6 +1054,7 @@ async def engagement_view(host: str, limit: int = 25, authorization: str | None 
     matrix, and findings so far -- the one picture the discrete capabilities feed.
     Empty until a crawl / analysis has populated it."""
     _require_auth(authorization)
+    _require_read_auth(authorization)
     from harness import engagement
     snap = await __import__("asyncio").to_thread(store.load_engagement, host)
     if not snap:
@@ -1339,6 +1345,7 @@ async def engagement_investigate_status(host: str, job_id: str,
                                         authorization: str | None = Header(default=None)):
     """Poll a job; the full investigate_engagement result is included once done."""
     _require_auth(authorization)
+    _require_read_auth(authorization)
     _evict_expired_jobs()
     job = _INVESTIGATE_JOBS.get(job_id)
     if not job or job["host"] != host:
@@ -1451,6 +1458,7 @@ async def create_identity(req: IdentityCreateRequest, authorization: str | None 
 @app.get("/identities")
 async def get_identities(authorization: str | None = Header(default=None)):
     _require_auth(authorization)
+    _require_read_auth(authorization)
     return await __import__("asyncio").to_thread(store.list_identities)
 
 
@@ -1471,6 +1479,7 @@ async def create_session(req: SessionCreateRequest, authorization: str | None = 
 @app.get("/hosts/{host}/sessions")
 async def sessions_for_host(host: str, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
+    _require_read_auth(authorization)
     return await __import__("asyncio").to_thread(store.sessions_for_host, host)
 
 
@@ -1502,6 +1511,7 @@ async def unsuppress_finding(fingerprint: str, authorization: str | None = Heade
 @app.get("/findings/suppressions")
 async def list_suppressions(authorization: str | None = Header(default=None)):
     _require_auth(authorization)
+    _require_read_auth(authorization)
     return await __import__("asyncio").to_thread(store.list_suppressions)
 
 
@@ -1514,6 +1524,7 @@ async def finding_evidence(finding_ref: str, authorization: str | None = Header(
     recorded, never a live re-test. Reads the durable store (not the
     in-memory ledger) so it works even after a server restart."""
     _require_auth(authorization)
+    _require_read_auth(authorization)
     from harness import evidence_ledger
     reconstruction = await __import__("asyncio").to_thread(
         evidence_ledger.reconstruct_persisted, finding_ref)
@@ -1561,6 +1572,7 @@ async def unmerge_issue(host: str, source_id: str, authorization: str | None = H
 @app.get("/issues/{host}/merges")
 async def list_issue_merges(host: str, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
+    _require_read_auth(authorization)
     return await __import__("asyncio").to_thread(store.all_issue_merges, host)
 
 

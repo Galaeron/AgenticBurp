@@ -14,6 +14,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from harness import evidence_ledger
 from harness import store
 from harness.models import HttpExchange, Finding
 
@@ -1068,13 +1069,17 @@ class InvestigateJobAdmissionAndRetentionTests(unittest.TestCase):
 class ReadAuthTests(unittest.TestCase):
     """FR-8 (F12 offline half): server.require_read_auth is an opt-in gate on
     sensitive GET reads (/report, /telemetry, /test-plans/{plan_id}, GET
-    /settings) that closes the gap _require_auth's loopback bypass otherwise
-    leaves open -- another local process/user with no token at all could
-    read findings/evidence/diagnostics, since _require_auth only checks a
-    CONFIGURED operator token and the RB-1 CSRF middleware only guards
-    mutating methods. Ships FALSE (see config.yaml's server.require_read_auth
-    comment) so the default deploy and the Burp extension's existing
-    token-less reads are byte-for-byte unchanged; these tests flip
+    /settings, and -- RA-2 -- GET /findings/{finding_ref}/evidence, GET
+    /engagement/{host}, GET /engagement/{host}/investigate/{job_id}, GET
+    /identities, GET /hosts/{host}/sessions, GET /findings/suppressions, GET
+    /issues/{host}/merges) that closes the gap _require_auth's loopback
+    bypass otherwise leaves open -- another local process/user with no
+    token at all could read findings/evidence/identities/sessions/
+    diagnostics, since _require_auth only checks a CONFIGURED operator
+    token and the RB-1 CSRF middleware only guards mutating methods. Ships
+    FALSE (see config.yaml's server.require_read_auth comment) so the
+    default deploy and the Burp extension's existing token-less reads are
+    byte-for-byte unchanged; these tests flip
     `harness.server._READ_AUTH_ENABLED` directly (never config.yaml) --
     _require_read_auth's own docstring says it re-reads that module global
     fresh on every call for exactly this purpose.
@@ -1141,6 +1146,71 @@ class ReadAuthTests(unittest.TestCase):
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
 
+    # --- RA-2: newly-gated sensitive GET reads ------------------------------
+
+    def test_engagement_view_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/engagement/shop.test")
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get("/engagement/shop.test", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_engagement_investigate_status_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/engagement/shop.test/investigate/unknown-job-id")
+        self.assertEqual(resp.status_code, 401)
+        # A valid token gets past the auth gate to the route's own logic --
+        # 404 (unknown job) here, never 401, proving auth actually passed.
+        resp = self.client.get("/engagement/shop.test/investigate/unknown-job-id",
+                               headers=self._auth_header())
+        self.assertEqual(resp.status_code, 404)
+
+    def test_identities_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/identities")
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get("/identities", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_sessions_for_host_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/hosts/shop.test/sessions")
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get("/hosts/shop.test/sessions", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_findings_suppressions_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/findings/suppressions")
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get("/findings/suppressions", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_issue_merges_requires_token_when_enabled(self):
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get("/issues/shop.test/merges")
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get("/issues/shop.test/merges", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_finding_evidence_requires_token_when_enabled(self):
+        # The most sensitive of the newly-gated reads: reconstructed
+        # request/response + reproduction recipe. Seed one real
+        # evidence-ledger event (persisted via the patched store._DB_PATH,
+        # same as the rest of this test's isolated DB) so the valid-token
+        # call proves it actually reaches the route's own logic (200, real
+        # data) rather than merely a 404 that happens not to be 401.
+        finding_ref = "ra2-test-finding-ref"
+        evidence_ledger.emit(evidence_ledger.EventType.OBSERVATION, finding_ref,
+                             "seeded for RA-2 read-auth test")
+        self.server._READ_AUTH_ENABLED = True
+        resp = self.client.get(f"/findings/{finding_ref}/evidence")
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get(f"/findings/{finding_ref}/evidence", headers=self._auth_header())
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["reconstruction"]["event_count"], 1)
+
     # --- NEGATIVE CONTROL: disabled (the shipped default) ------------------
 
     def test_telemetry_and_report_unauthenticated_when_disabled(self):
@@ -1160,6 +1230,32 @@ class ReadAuthTests(unittest.TestCase):
         resp = self.client.get("/test-plans/unknown-plan-id")
         self.assertEqual(resp.status_code, 404)  # not 401 -- no auth gate at all
         resp = self.client.get("/settings")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_ra2_endpoints_unauthenticated_when_disabled(self):
+        # Load-bearing negative control (RA-2): with the shipped default
+        # (require_read_auth: false), every newly-gated read must remain
+        # exactly as reachable with no token as it was before this change --
+        # the default deploy stays byte-identical.
+        self.assertFalse(self.server._READ_AUTH_ENABLED,
+                         "test env must reflect the shipped false default")
+        finding_ref = "ra2-test-finding-ref-disabled"
+        evidence_ledger.emit(evidence_ledger.EventType.OBSERVATION, finding_ref,
+                             "seeded for RA-2 disabled-flag negative control")
+
+        resp = self.client.get("/engagement/shop.test")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/engagement/shop.test/investigate/unknown-job-id")
+        self.assertEqual(resp.status_code, 404)  # not 401 -- no auth gate at all
+        resp = self.client.get("/identities")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/hosts/shop.test/sessions")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/findings/suppressions")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/issues/shop.test/merges")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get(f"/findings/{finding_ref}/evidence")
         self.assertEqual(resp.status_code, 200)
 
 
