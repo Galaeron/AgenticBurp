@@ -1211,6 +1211,30 @@ class ReadAuthTests(unittest.TestCase):
         body = resp.json()
         self.assertEqual(body["reconstruction"]["event_count"], 1)
 
+    # --- R06: sensitive reads FR-8/RA-2 still missed ------------------------
+
+    def test_r06_reads_require_token_when_enabled(self):
+        # R06 (founder-refresh): knowledge notes (tester-authored/remembered),
+        # the live activity feed, and the investigation job LIST (exposes base
+        # URL / error / manifest path) called only _require_auth. Each must now
+        # require the effective token when the opt-in is armed.
+        self.server._READ_AUTH_ENABLED = True
+        for path in ("/knowledge", "/activity", "/engagement/shop.test/investigate"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
+                self.assertEqual(
+                    self.client.get(path, headers=self._auth_header()).status_code, 200)
+
+    def test_r06_reads_unauthenticated_when_disabled(self):
+        # Load-bearing negative control: with the shipped default
+        # (require_read_auth: false) these reads stay reachable with no token,
+        # so the default deploy is byte-identical.
+        self.assertFalse(self.server._READ_AUTH_ENABLED,
+                         "test env must reflect the shipped false default")
+        for path in ("/knowledge", "/activity", "/engagement/shop.test/investigate"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 200)
+
     # --- NEGATIVE CONTROL: disabled (the shipped default) ------------------
 
     def test_telemetry_and_report_unauthenticated_when_disabled(self):

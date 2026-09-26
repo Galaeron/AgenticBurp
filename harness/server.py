@@ -257,9 +257,12 @@ def _require_read_auth(authorization: str | None) -> None:
     GET /findings/{finding_ref}/evidence, GET /engagement/{host},
     GET /engagement/{host}/investigate/{job_id}, GET /identities,
     GET /hosts/{host}/sessions, GET /findings/suppressions,
-    GET /issues/{host}/merges) -- routes that expose captured client
-    traffic, discovered secrets, reconstructed evidence/reproduction
-    recipes, identities/sessions and diagnostics, which _require_auth's
+    GET /issues/{host}/merges, GET /knowledge, GET /activity,
+    GET /engagement/{host}/investigate) -- routes that expose captured client
+    traffic, discovered secrets, reconstructed evidence/reproduction recipes,
+    identities/sessions, tester-authored knowledge notes, the live activity
+    feed, investigation job listings (base URL / error / manifest path) and
+    diagnostics, which _require_auth's
     loopback bypass otherwise leaves open to any local process/user with
     no token at all. Deliberately a SEPARATE function from
     _require_auth (which stays exactly as it was: unchanged, still gates
@@ -1021,6 +1024,7 @@ async def add_knowledge(req: KnowledgeNoteRequest, authorization: str | None = H
 async def list_knowledge(authorization: str | None = Header(default=None)):
     """All stored knowledge notes (tester-authored + auto-remembered findings)."""
     _require_auth(authorization)
+    _require_read_auth(authorization)
     return {"notes": await __import__("asyncio").to_thread(store.list_knowledge_notes)}
 
 
@@ -1365,6 +1369,7 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
 async def engagement_investigate_list(host: str, authorization: str | None = Header(default=None)):
     """List investigation jobs for a host (newest-first status only)."""
     _require_auth(authorization)
+    _require_read_auth(authorization)
     _evict_expired_jobs()
     jobs = [j for j in _INVESTIGATE_JOBS.values() if j["host"] == host]
     jobs.sort(key=lambda j: j.get("started_at") or 0, reverse=True)
@@ -1444,6 +1449,7 @@ async def activity(since: int = 0, limit: int = 100, authorization: str | None =
     `dropped` count if you fell behind the buffer. `since=0` (default) returns a
     recent snapshot to prime the view."""
     _require_auth(authorization)
+    _require_read_auth(authorization)
     from harness import activity_feed
     if since <= 0:
         return activity_feed.snapshot(limit=limit)
