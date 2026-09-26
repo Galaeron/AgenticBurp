@@ -667,7 +667,8 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
     return lines
 
 
-def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None) -> str:
+def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None,
+                             *, config: dict | None = None) -> str:
     """
     Convenience entry point: pulls findings from store.py for the given
     host's URL. `effort_ledger`: optional, forwarded to
@@ -676,13 +677,29 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     get cost-aware ordering of unconfirmed findings. Omitted by default
     since this function is also used as a standalone script entry point
     with no orchestrator in scope.
+
+    `config`: optional effective config. When supplied, the `reporting.*`
+    surfacing gates an operator sets (in config.local.yaml) are honored on
+    this live report -- previously they were wired only into the offline
+    eval driver, so `GET /report` silently ignored them. Each ships OFF
+    (gate flags default False, floor 0.5), so omitting `config` -- or
+    passing one with the shipped defaults -- yields a byte-identical report.
+    The gates only re-bucket a finding to "leads", never drop it, so an
+    opt-in never loses recall.
     """
     from harness import store
     findings = store.all_host_findings(url)  # excludes suppressed, by default
     all_including_suppressed = store.all_host_findings(url, include_suppressed=True)
     suppressed_count = len(all_including_suppressed) - len(findings)
     host = store.host_of(url)
-    return generate_markdown_report(host, findings, effort_ledger=effort_ledger, suppressed_count=suppressed_count)
+    reporting = (config or {}).get("reporting") or {}
+    return generate_markdown_report(
+        host, findings, effort_ledger=effort_ledger, suppressed_count=suppressed_count,
+        quarantine_leads=bool(reporting.get("quarantine_unverified_leads", False)),
+        gate_low_confidence_generic=bool(reporting.get("gate_low_confidence_generic", False)),
+        generic_confidence_floor=float(reporting.get("generic_confidence_floor", 0.5)),
+        gate_uncorroborated_catchall=bool(reporting.get("gate_uncorroborated_catchall", False)),
+    )
 
 
 def issue_exports(findings: list[dict], proofs_by_case: dict | None = None,

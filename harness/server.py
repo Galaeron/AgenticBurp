@@ -376,8 +376,12 @@ async def report(url: str, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
     _require_read_auth(authorization)
     from harness import report_generator
+    # Pass the effective config so an operator's reporting.* surfacing gates
+    # (config.local.yaml) actually apply to this live report; all gates ship
+    # OFF, so the default report is byte-identical.
     markdown = await __import__("asyncio").to_thread(
         report_generator.generate_report_for_host, url, orchestrator.effort_budget.ledger,
+        config=config,
     )
     return PlainTextResponse(markdown, media_type="text/markdown")
 
