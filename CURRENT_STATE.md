@@ -50,15 +50,15 @@ largely non-offline; P3-3/BM-3/PR-*/NC-O*/FR-O* OWNER/LIVE; BM-2 is L/"partly
 research"; ER-3/ER-5 deprioritized. The filed offline pool WAS exhausted, so a
 re-analysis pass (Opus, read-only) filed a new **Re-analysis batch — RA-*** at the
 end of IMPROVEMENT_BACKLOG.md (all evidence-grounded + offline-loop-consumable):
-- **RA-1** — `reproduction_recipe` ignores FR-2's resolvable `request_blob`/`response_blob`
-  and never sets `expected`, yet `completeness.resolvable=True` is asserted beside it
-  (evidence_ledger.py:326 vs run_context.py:385-423). Evidence-trust core; do FIRST.
+- **RA-1 `[x]` `9d3e579`** — `reproduction_recipe` now surfaces per-step `method` + resolving
+  request/response blob hashes + a `replayable` flag, and a top-level `resolvable` that reuses
+  `_resolved_blob_hash` so it agrees with `completeness.resolvable`. +5 tests.
 - **RA-2** — extend FR-8 read-auth to the finding/evidence/identity/session GET reads it
   missed (esp. `/findings/{ref}/evidence`, server.py:1508 uses only `_require_auth`).
 - **RA-3** — offline SARIF export endpoint (the tested `sarif_adapter.py` has no caller);
   offline slice of P2-3, decoupled from the P1-5 Burp gate.
 - **RA-4** — batch report-time ledger/blob reads (O(N·E) fresh SQLite connections).
-Dispatch order RA-1 → RA-2 → RA-3 → RA-4. Next loop iteration implements RA-1.
+Dispatch order RA-1 → RA-2 → RA-3 → RA-4. RA-1 landed (`9d3e579`); next is RA-2.
 
 ## Benchmark honesty caveat
 

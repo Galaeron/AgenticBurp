@@ -2664,7 +2664,15 @@ offline-complete, P3-1 `[x]`). Each item is grounded in a `file:line` observatio
 verified against the checkout at this session's HEAD. Dispatch order: RA-1 → RA-2 →
 RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
 
-### [ ] RA-1 — Make `reproduction_recipe` surface the resolvable evidence blobs
+### [x] RA-1 — Make `reproduction_recipe` surface the resolvable evidence blobs
+- **Result (VERIFIED offline):** `9d3e579` — each EXECUTION step now carries `method`, the
+  request/response blob hashes (only when they storage-resolve, via a per-step `_blob_resolves`
+  mirroring `_resolved_blob_hash`), a `replayable` flag, and a "reference-only, not replayable"
+  note otherwise; a top-level `resolvable` reuses `_resolved_blob_hash` over the same executions
+  list so the recipe's resolvability is guaranteed to agree with `completeness.resolvable`. Legacy
+  `request`/`expected` keys preserved (additive; `reproduction_recipe_persisted` fixed transitively).
+  +5 caller-level tests (positive agreement, status-only negative, corrupted-blob negative, persisted
+  variant, back-compat). Full suite green (harness 2743 OK/2 skip, exit 0).
 - **Domain:** Evidence / Trust · **Effort:** S-M · **Depends on:** none (P0-1/P0-6/FR-2 `[x]`) · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED):** `reproduction_recipe` builds each step as
   `{"request": e.data.get("request",""), "expected": e.data.get("expected","")}`
