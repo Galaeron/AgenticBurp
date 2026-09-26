@@ -53,12 +53,13 @@ end of IMPROVEMENT_BACKLOG.md (all evidence-grounded + offline-loop-consumable):
 - **RA-1 `[x]` `9d3e579`** — `reproduction_recipe` now surfaces per-step `method` + resolving
   request/response blob hashes + a `replayable` flag, and a top-level `resolvable` that reuses
   `_resolved_blob_hash` so it agrees with `completeness.resolvable`. +5 tests.
-- **RA-2** — extend FR-8 read-auth to the finding/evidence/identity/session GET reads it
-  missed (esp. `/findings/{ref}/evidence`, server.py:1508 uses only `_require_auth`).
+- **RA-2 `[x]` `e4008b1`** — extended FR-8 read-auth (`_require_read_auth`) to the 7 sensitive
+  GET reads it missed (finding/evidence/engagement/identity/session/suppressions/merges); behind
+  the existing `require_read_auth` flag (ships false → default byte-identical). +7 tests.
 - **RA-3** — offline SARIF export endpoint (the tested `sarif_adapter.py` has no caller);
   offline slice of P2-3, decoupled from the P1-5 Burp gate.
 - **RA-4** — batch report-time ledger/blob reads (O(N·E) fresh SQLite connections).
-Dispatch order RA-1 → RA-2 → RA-3 → RA-4. RA-1 landed (`9d3e579`); next is RA-2.
+Dispatch order RA-1 → RA-2 → RA-3 → RA-4. RA-1 (`9d3e579`) + RA-2 (`e4008b1`) landed; next is RA-3.
 
 ## Benchmark honesty caveat
 

@@ -2698,7 +2698,15 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
   (proving the recipe no longer over-claims). `full` green.
 - **Impact:** High (evidence-trust core).
 
-### [ ] RA-2 — Extend FR-8 read-auth to the finding/evidence/identity/session reads it missed
+### [x] RA-2 — Extend FR-8 read-auth to the finding/evidence/identity/session reads it missed
+- **Result (VERIFIED offline):** `e4008b1` — added `_require_read_auth` (after `_require_auth`) to the
+  7 sensitive GET reads FR-8 missed (`/findings/{finding_ref}/evidence`, `/engagement/{host}`,
+  `/engagement/{host}/investigate/{job_id}`, `/identities`, `/hosts/{host}/sessions`,
+  `/findings/suppressions`, `/issues/{host}/merges`); `/health` stays open. Behind the existing
+  `server.require_read_auth` flag (ships false) → default deploy byte-identical; no new config key /
+  no drift-manifest change. Docstring updated to list every covered route. +7 tests (flag ON+no token
+  → 401; flag ON+valid token → not 401; flag OFF default → not 401 negative control). Full suite green
+  (harness 2751 OK/2 skip, `config_manifest --check` clean, exit 0).
 - **Domain:** Security / Privacy · **Effort:** S · **Depends on:** FR-8 `[x]` · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED):** `_require_read_auth` is wired into only `/telemetry`, `/report`,
   `/test-plans/{id}`, GET `/settings`. These sensitive reads still call only `_require_auth` (which
