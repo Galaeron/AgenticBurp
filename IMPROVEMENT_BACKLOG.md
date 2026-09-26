@@ -2779,3 +2779,34 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
   `_connect`) count is bounded (O(1)–O(few), not O(N·E)) via a counting shim. **Negative control:** the
   rendered report bytes are byte-identical before/after (pure perf refactor). `full` green.
 - **Impact:** Medium (latency cliff on large engagements).
+
+### [x] RA-5 — Honor the `reporting.*` surfacing gates on the live `/report` route
+- **Result (VERIFIED offline):** `8e80524` — filed by re-analysis pass #2. `generate_markdown_report`
+  already consumed `gate_uncorroborated_catchall`/`gate_low_confidence_generic`/`generic_confidence_floor`/
+  `quarantine_leads`, but `generate_report_for_host` (what `GET /report` calls) never forwarded them and no
+  production code read `reporting.gate_*` — so an operator's `config.local.yaml` knob silently did nothing on
+  the live report (founder-review vocabulary-vs-enforcement theme). `generate_report_for_host` now takes an
+  optional `config` and forwards the four gates; `GET /report` passes the server's effective config. Gates
+  ship OFF and only re-bucket to "leads" (never drop), so default `/report` is byte-identical and opt-in never
+  loses recall. +3 tests (gate ON demotes a catch-all `security_misconfiguration` to leads while a concrete
+  sqli is never demoted; default byte-identical across no/empty/default config; gate ON changes the report).
+  Full suite green (harness 2765 OK/2 skip, exit 0).
+- **Domain:** Trust / UX · **Effort:** S · **Depends on:** none (FR-4/RA-3 `[x]`) · **Mode:** LOOP (offline)
+- **Impact:** Medium (a documented precision knob now reaches the live analyst-facing report).
+
+### [ ] RA-6 — Apply the `reporting.*` gates to `/report/sarif` for consistency
+- **Domain:** Trust / UX · **Effort:** S · **Depends on:** RA-5 `[x]`, RA-3 `[x]` · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED):** RA-5 wired the surfacing gates into `GET /report` (markdown) but `GET /report/sarif`
+  ([server.py](harness/server.py)) still runs `all_host_findings → group_findings_into_issues →
+  export_issues_to_sarif` with no gating, so with a gate armed the two routes disagree on what is surfaced.
+- **Problem:** Minor inconsistency: an operator who opts into catch-all gating sees it on the markdown report
+  but not the SARIF export.
+- **Recommendation:** Filter the findings through the same demote-to-leads predicates
+  (`is_uncorroborated_catchall_guess` / `is_low_confidence_generic_guess` / `should_quarantine_as_lead`)
+  before `group_findings_into_issues`, gated by the same OFF-by-default flags. Requires a small SARIF-semantics
+  decision (omit demoted findings from results, vs. tag them at a lower `level`) — pick omit-to-match the
+  markdown "leads are not reported vulnerabilities" framing, documented.
+- **Acceptance criteria:** caller test — gate ON → the catch-all finding is absent from `runs[0].results`
+  while a concrete finding remains; negative control — gate OFF (default) → SARIF byte-identical to today
+  (finding present). `full` green.
+- **Impact:** Low-Medium (consistency; small surface).
