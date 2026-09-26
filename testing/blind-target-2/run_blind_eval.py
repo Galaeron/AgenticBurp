@@ -54,7 +54,6 @@ import copy
 import dataclasses
 import json
 import os
-import statistics
 import sys
 import time
 from dataclasses import dataclass
@@ -553,11 +552,12 @@ def run_once(
 
 
 # Metrics aggregated across a multi-run variance pass (P3). Population
-# variance (statistics.pvariance) is used so a single-run call (n=1) still
-# returns a defined 0.0 rather than raising -- statistics.variance requires
-# n>=2. With a deterministic stub model, variance across runs is expected to
-# be ~0; the point of this aggregation is that the field exists and is
-# computed correctly, not that a stub disagrees with itself.
+# variance (via testing.eval_metrics.summarize, P1-3) is used so a
+# single-run call (n=1) still returns a defined 0.0 rather than raising --
+# statistics.variance requires n>=2. With a deterministic stub model,
+# variance across runs is expected to be ~0; the point of this aggregation
+# is that the field exists and is computed correctly, not that a stub
+# disagrees with itself.
 _VARIANCE_METRICS: list[tuple[str, Callable[[dict], float]]] = [
     ("n_findings_total", lambda sc: float(sc["n_findings_total"])),
     ("n_quarantined_leads", lambda sc: float(sc["n_quarantined_leads"])),
@@ -573,13 +573,21 @@ _VARIANCE_METRICS: list[tuple[str, Callable[[dict], float]]] = [
 
 
 def aggregate_variance(scorecards: list[dict]) -> dict:
+    # P1-3: mean/dispersion arithmetic lives once in testing.eval_metrics.
+    # summarize (one pass, None-filtered); this caller keeps its own
+    # "no scorecards" fallback (0.0/0.0, not None) and never rounds, so its
+    # output stays byte-identical to before. (ablation_harness.py's _agg
+    # shares the same summarize() call but rounds and defaults to None --
+    # the two drivers' differing conventions are preserved, not merged.)
+    from testing import eval_metrics
     per_metric = {}
     for name, getter in _VARIANCE_METRICS:
         values = [getter(sc) for sc in scorecards]
+        s = eval_metrics.summarize(values)
         per_metric[name] = {
             "values": values,
-            "mean": statistics.fmean(values) if values else 0.0,
-            "variance": statistics.pvariance(values) if values else 0.0,
+            "mean": s["mean"] if s["n"] else 0.0,
+            "variance": s["pvariance"] if s["n"] else 0.0,
         }
     return {"n_runs": len(scorecards), "variance": per_metric, "runs": scorecards}
 

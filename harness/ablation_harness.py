@@ -65,7 +65,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -230,24 +229,29 @@ class VariantResult:
 
 
 def _agg(values) -> dict:
-    vals = [v for v in values if v is not None]
-    if not vals:
+    # P1-3: dispersion arithmetic lives once in testing.eval_metrics.summarize
+    # (mean via fmean, spread via pstdev/pvariance, one pass, None-filtered);
+    # this caller keeps its own rounding and its own "no values" convention
+    # (None, not 0.0) so its output stays byte-identical to before.
+    from testing import eval_metrics
+    s = eval_metrics.summarize(values)
+    if s["n"] == 0:
         return {"mean": None, "stdev": None, "n": 0}
     return {
-        "mean": round(statistics.fmean(vals), 3),
-        "stdev": round(statistics.pstdev(vals), 3) if len(vals) > 1 else 0.0,
-        "n": len(vals),
+        "mean": round(s["mean"], 3),
+        "stdev": round(s["pstdev"], 3),
+        "n": s["n"],
     }
 
 
 def _precision(r: RunMetrics) -> float | None:
-    denom = r.tp + r.fp
-    return r.tp / denom if denom else None
+    from testing import eval_metrics
+    return eval_metrics.precision(r.tp, r.fp, on_zero=None)
 
 
 def _recall(r: RunMetrics) -> float | None:
-    denom = r.tp + r.fn
-    return r.tp / denom if denom else None
+    from testing import eval_metrics
+    return eval_metrics.recall(r.tp, r.fn, on_zero=None)
 
 
 def aggregate(result: VariantResult) -> dict:
