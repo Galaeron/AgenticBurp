@@ -541,6 +541,9 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 - **Impact:** High (may REMOVE complexity).
 
 ### [ ] P2-3 — Surface the reproduction recipe in Burp + export (SARIF/markdown)
+- **Progress (2026-09-26):** the offline SARIF-export half landed as **RA-3 (`fbf43d1`)** —
+  `GET /report/sarif`. Remaining (keeps this `[ ]`): surfacing the reproduction recipe in the Burp
+  tab, which needs the P1-5 (OWNER/LIVE) Burp build.
 - **Domain:** UX / Trust · **Effort:** M · **Depends on:** P0-1, P1-5
 - **Recommendation:** Once the ledger is wired, expose `reproduction_recipe` in the
   findings API, the report, and the Burp tab; add SARIF + markdown export so
@@ -2726,7 +2729,15 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
   mutation gating unchanged. `full` green.
 - **Impact:** Medium-High (privacy/safety; completes FR-8's stated intent).
 
-### [ ] RA-3 — Offline SARIF export endpoint (surface the built-but-unused adapter)
+### [x] RA-3 — Offline SARIF export endpoint (surface the built-but-unused adapter)
+- **Result (VERIFIED offline):** `fbf43d1` — new read-only `GET /report/sarif` renders a host's stored
+  findings as SARIF 2.1.0 (`all_host_findings` → `group_findings_into_issues` → `export_issue` →
+  `export_issues_to_sarif`, stamped with the Provenance `code_version`), giving the tested-but-uncalled
+  `sarif_adapter.py` a production caller. Separate route (so `/report` markdown is untouched); gated by
+  `_require_auth` + `_require_read_auth` (reachable by default like `/report`; token-gated when
+  `require_read_auth` armed). +5 tests (positive validates `[]`, empty-host zero-result not 500, read-auth
+  on→401/off→reachable, `/report` unchanged). Full suite green (harness 2756 OK/2 skip, exit 0). This is
+  the offline slice of P2-3; the Burp-tab surfacing stays under P1-5.
 - **Domain:** UX / Portability · **Effort:** S-M · **Depends on:** P0-1 `[x]` · cross-refs P2-3 · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED):** `harness/sarif_adapter.py` (`export_issues_to_sarif`/`import_sarif_to_findings`,
   fully tested in `test_sarif_adapter.py`) has ZERO production callers (grep of `harness/*.py` excluding
