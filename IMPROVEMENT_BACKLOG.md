@@ -2622,7 +2622,33 @@ re-file it. Recommended order: **FR-4 → FR-3 → FR-1 → FR-2 → FR-5 → FR
   regardless — the assumption FR-6 removes; public assertions unchanged). `full` green (harness 2716
   OK/2 skip, pytest-native 38, testing 185, evaluation_integrity 42).
 
-### [ ] FR-7 — Separate pure-inference caching from run-bound proof (F11)
+### [x] FR-7 — Separate pure-inference caching from run-bound proof (F11)
+- **Result (VERIFIED, offline; default-OFF):** `c2cb427` — added a run-INDEPENDENT hypothesis cache
+  (`cache.HypothesisCacheEntry` + sibling `hypothesis_cache_entries` table +
+  `get_hypothesis`/`put_hypothesis`/`hypothesis_stats`) keyed by exchange-hash (run namespace
+  EXCLUDED) + coordinator model + prompt versions + `config_schema.config_fingerprint(config)`. It
+  stores ONLY the pre-proof half of an analysis (the model-inference `reports` + `dispatch`/`reason`/
+  `stage_outcomes`/review counts) — never an `AnalysisResponse`, never `proof_records`/`proof_id`/
+  `case_id`/`oracle_*`. Wired into `Orchestrator.analyze()` behind `runs.hypothesis_cache.enabled`
+  (ships **false**): on a hit it reconstitutes `reports` and FALLS THROUGH to the always-run tail
+  (`_validate_findings`), so proof/case/oracle are freshly minted in the CURRENT run and never cached
+  or shared; on a miss it caches the pre-proof snapshot. The stale-cross-run-proof hazard is handled
+  structurally (capture is strictly BEFORE `_validate_findings`, so cached findings have empty
+  proof/case/oracle by construction) AND defensively (`put_hypothesis` refuses+logs if any finding
+  already carries a proof/case/oracle value). Flag-OFF is byte-for-byte identical (the original
+  dispatch/inference block is unchanged except re-indented into an `else:`; the only always-on changes
+  are a hoisted idempotent `activity_feed` import and an idempotent `CREATE TABLE IF NOT EXISTS`). +7
+  caller-level tests (`test_cache_hypothesis_reuse.py`, stub coordinator): cross-run reuse (2nd fresh
+  run does not re-invoke the model; hit-rate>0), proof rebound per run (both runs get non-empty DISTINCT
+  case_id/proof_id), raw-SQLite-row inspection (payload has no proof/case/oracle keys), 3 negative
+  controls (config-fingerprint / coordinator-model / prompt-version change → miss+re-dispatch), 2
+  default-off byte-identical controls. **DEFERRED:** live/API hit-rate measurement and any default-ON
+  (retention is owner-gated on measured hit-rate); dispatch-wiring beyond the new stats counters. New
+  `runs.hypothesis_cache.enabled` flag is perf/cost-only (no egress/scope/mutation/verification-state
+  effect), so correctly not added to SafeDefaultGuard's SAFE_CHECKS; guard stays green.
+  `test_pipeline_gate.py` untouched. Full suite green (harness 2812 OK / 2 skip, pytest 38, evaluation
+  221, evaluation-integrity 42; 2 consecutive green full runs — one earlier full run had a single
+  unattributed transient failure that did not reproduce and is unrelated to this default-OFF change).
 - **Domain:** Performance - **Effort:** M - **Mode:** LOOP (partly research)
 - **Evidence (VERIFIED control flow):** `orchestrator_detect.py` creates a fresh run before the cache
   lookup and `RunContext.create()` embeds a new run UUID in the cache namespace, so two independent

@@ -21,15 +21,21 @@ retired), **SC-4** `895dda3` (unknown workflow assertions fail closed at load+ru
 half (opt-in gate/budget seam on browser requests), **SC-8** `0522472` (EffortBudget atomic
 reserve/commit/release + deadline-at-construction). SC-1..SC-4 are strict
 verification-correctness tightenings; SC-5/SC-7/SC-8 add opt-in/presentation seams that are
-byte-for-byte no-ops until wired. **Owner-deferred:** SC-6 (wheel import needs off-host
-install + non-checkout-preserving refactor); SC-7 live browser wiring/health; SC-9..SC-15
-(measurement/live-gated). Per-item detail + Results in IMPROVEMENT_BACKLOG.md.
+byte-for-byte no-ops until wired. Also closed the last older-queue loop item: **FR-7** `c2cb427`
+(run-independent hypothesis cache, default-OFF; on a hit it falls through to `_validate_findings`
+so proof/case/oracle are re-minted per run, never cached/shared — pre-proof reports only).
+**Owner-deferred:** SC-6 (wheel import needs off-host install + non-checkout-preserving refactor);
+SC-7 live browser wiring/health; SC-9..SC-15 (measurement/live-gated); FR-7 hit-rate measurement +
+default-ON. Per-item detail + Results in IMPROVEMENT_BACKLOG.md.
 
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: exit 0 (harness unittest, 2 skipped, +31 SC-batch tests [SC-1..SC-5,SC-7,SC-8];
+- Full: exit 0 (harness unittest 2812 OK / 2 skipped, +38 loop tests [SC-1..SC-5,SC-7,SC-8,FR-7];
   pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
+  (One earlier full run showed a single unattributed transient failure that did not reproduce across
+  two subsequent green runs; FR-7 ships default-OFF as a deterministic no-op, so it is not the cause —
+  worth a separate look at flaky full-suite tests.)
 - Smoke: 92 OK. Orchestrator preconditions: 60 OK.
 - Requirement report still lists 36 gaps; offline passes do not close them.
 - Java: actual Gradle 8.7/JDK 17 `test shadowJar` succeeded; 229 tests,
@@ -46,8 +52,9 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-All loop-consumable SC-batch items (SC-1..SC-5, SC-7 offline, SC-8) are closed. Remaining
-work is owner/live-gated:
+All loop-consumable offline items are closed (SC-1..SC-5, SC-7 offline, SC-8, and the last
+older-queue item FR-7). The offline improvement loop is EXHAUSTED; remaining work is
+owner/live-gated:
 1. SC-6 (A5): package config as a resource + separate writable state + exclude tests +
    entry points; verify by a fresh-venv install outside the checkout (needs off-host
    install; not checkout-behavior-preserving in one offline pass).
@@ -60,6 +67,12 @@ work is owner/live-gated:
    on a matched-budget measurement; treat efficacy runs as OWNER/LIVE.
 4. Standing owner items: real-model accuracy / blind recall / live Burp load / container
    policy; faithful budget-matched production ablations. No AGPL upstream code imported.
+5. Higher-priority non-loop items also remain owner/live: P1-3 (single-command scorecard,
+   live model), P1-5 (Burp UX build), P2-1 (BusinessContextAgent — Effort-L feature,
+   retention ablation-gated), P2-3 (needs P1-5), P3-2 (partial: SBOM/dep-audit offline,
+   image-digest pinning off-host), P3-3 (team mode, premature). BM-2 (same-class
+   secure-vs-vulnerable discriminator) needs real-model FP data to prove. New offline
+   loop items require a fresh re-analysis pass to file.
 
 Earlier founder items and implementation history remain in
 [founder refresh](reviews/2026-09-26/founder-refresh/REVIEW.md) and
