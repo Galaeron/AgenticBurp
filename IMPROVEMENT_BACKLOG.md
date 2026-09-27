@@ -3344,3 +3344,81 @@ report polish.
   patched-fixture retest.
 - **Impact:** Medium.
 - **Source:** REVIEW.md "Technology worth adapting" #6.
+
+## Re-analysis batch 2 — 2026-09-27 (RA-7, RA-8)
+
+**Dispatch (offline; reopens loop work after the SC batch + FR-7 exhausted the pool):** A fresh
+Opus re-analysis pass over the confirmation/verification, transport/policy, engagement, and
+store/report/api clusters (after SC-1..SC-8, FR-7, RA-1..RA-6, RB-*, FR-* all closed) surfaced two
+new evidence-based offline-loop-consumable items, each grounded in a `file:line` observation verified
+against the current checkout. Select in this order: **RA-7 → RA-8**. RA-7 is the higher-value
+correctness/recall/honesty fix on an always-on gate; RA-8 is a small completion of SC-4's fail-closed
+invariant at the operand level. Honour the non-negotiables: safe `config.yaml` defaults (both are strict
+tightenings, no new flag), a caller-level test + negative control per item, `full` green before close.
+The pass found NO other offline item above the bar; the remaining backlog is owner/live/too-large.
+
+### [ ] RA-7 — Cross-identity REJECT downgrade must fire only on a genuine control-held reject, not on inconclusive observations
+- **Domain:** Confirmation-correctness / recall+honesty · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED, re-read this session):** the deterministic cross-identity reject-downgrade block
+  ([harness/orchestrator_confirm.py:622-638](harness/orchestrator_confirm.py)) fires on ANY
+  `result.validator == "cross_identity" and result.status == "not_confirmed" and not finding.confirmed and
+  finding.confidence > _CROSS_IDENTITY_REJECT_CAP` (`_CROSS_IDENTITY_REJECT_CAP = 0.15`,
+  [orchestrator_helpers.py:60](harness/orchestrator_helpers.py) — fires on essentially every real
+  finding), stamping severity=low, confidence=0.15, `review_verdict="downgraded"` (∈ `_LEAD_VERDICTS`,
+  [confirmation_gate.py:296-317](harness/confirmation_gate.py) → LEAD) and a note "access correctly
+  restricted (every configured other identity and the anonymous baseline were denied)". But
+  `cross_identity_validator` returns `not_confirmed` for THREE different outcomes: a GENUINE reject
+  (rejects==considered, conf 0.8, [cross_identity_validator.py:461-467] and BFLA :350-356) where the
+  downgrade is correct; an ownership-AUTHORIZED observation (:452-460, conf 0.3 — a principal REACHED
+  it); and a BFLA reached-but-UNPROVEN observation (`_confirm_bfla` :340-349, conf 0.4 — a non-admin
+  REACHED an admin function, "a lead, not proof"). `ValidationResult` ([validators/base.py:9-19]) carries
+  only `status`, so the block cannot tell a control-held reject from an observation. Only the genuine
+  reject is tested ([harness/test_cross_identity_reject.py]).
+- **Problem:** An inconclusive/authorized cross-identity OBSERVATION is treated as a refutation — most
+  sharply a "non-admin reached an admin function (privileged data unproven)" lead is capped to 0.15 and
+  buried as a LEAD while being stamped "access correctly restricted (every identity denied)", which is
+  both false and a recall loss. This is the SC-1 anti-pattern (a non-executed/inconclusive control must
+  not produce a verdict) inverted onto the reject side.
+- **Recommendation:** Add one structured discriminator to `ValidationResult` (e.g.
+  `control_outcome: str = ""`, trailing/defaulted — safe for existing construction). Set it to
+  `"control_held"` ONLY on the two genuine control-held rejects (BOLA rejects==considered :461-467, BFLA
+  rejects==considered :350-356); leave it unset on the ownership-authorized (:452-460) and BFLA
+  reached-unproven (:340-349) observations. Gate the `_validate_findings` reject-downgrade (:622-638) on
+  `result.control_outcome == "control_held"` instead of bare `status == "not_confirmed"`. Observation
+  not_confirmeds then fall through untouched (no false "restricted" note, no LEAD burial of a real reach).
+- **Acceptance criteria:** caller tests via `_validate_findings` (same harness as
+  test_cross_identity_reject.py): POSITIVE — a control-held reject still downgrades to low/0.15/"downgraded"
+  (existing test stays green, its stub setting `control_outcome="control_held"`); NEGATIVE CONTROL — a BFLA
+  reached-unproven `not_confirmed` (conf 0.4, no `control_outcome`) is NOT capped/demoted and NOT stamped
+  "access correctly restricted"; NEGATIVE CONTROL — an ownership-authorized `not_confirmed` (0.3) likewise
+  untouched. `full` green.
+- **Impact:** High. **Follow-on to SC-1 (same anti-pattern, reject side; a different gate/object).**
+- **Source:** 2026-09-27 re-analysis batch 2.
+
+### [ ] RA-8 — Workflow "status" assertion must validate its operand is an integer (complete SC-4's fail-closed invariant)
+- **Domain:** Workflow robustness / fail-closed · **Effort:** S · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED, re-read this session):** `_assertions_hold` does
+  `if assertion.kind == "status" and status != int(assertion.expected):`
+  ([harness/workflow_engine.py:206](harness/workflow_engine.py)) with `int(assertion.expected)` UNGUARDED;
+  `_load_assertion` (:377-386) requires `expected is not None` for status/body_contains but does NOT check
+  int-coercibility, and `workflow_from_dict` (:396) passes `a.get("expected")` raw — so
+  `{"kind":"status","expected":"twohundred"}` loads fine. `_assertions_hold` is called from `run_step`
+  (:287) with no try/except, so a raised `ValueError`/`TypeError` from `int()` propagates out of
+  `execute_workflow` (only `finally` cleanups run), crashing the workflow run. SC-4 closed unknown-KIND
+  fail-closed (load + runtime) but left operand TYPE unvalidated; test_workflow_engine.py covers only the
+  misspelled-kind case.
+- **Problem:** A loadable-but-malformed operator workflow (a `status` assertion whose `expected` isn't
+  int-coercible) crashes `execute_workflow` with an unhandled exception instead of the clean load-time
+  rejection / runtime fail-closed SC-4 established for the rest of the assertion surface.
+- **Recommendation:** In `_load_assertion`, for `kind == "status"` coerce/validate `expected` to `int` and
+  raise `ValueError` on failure (same shape as the unknown-kind raise). Belt-and-suspenders: guard the
+  `int()` in `_assertions_hold` so a slipped-through value fails the step closed
+  (`return False, "malformed status assertion operand: ..."`) rather than raising.
+- **Acceptance criteria:** NEGATIVE CONTROL (load) — `_load_assertion({"kind":"status","expected":"abc"})`
+  raises `ValueError`; `{"kind":"status","expected":200}` still returns a valid `Assertion` (positive
+  control, existing valid workflows unaffected). If the runtime guard is added: `execute_workflow` on a
+  step carrying a slipped-through malformed status assertion fails the step closed (BLOCKED/FAILED), never
+  raises out of the run. `full` green.
+- **Impact:** Medium-Low (operator-config-crash class; completes SC-4). **Follow-on to SC-4 (operand-type
+  half).**
+- **Source:** 2026-09-27 re-analysis batch 2.

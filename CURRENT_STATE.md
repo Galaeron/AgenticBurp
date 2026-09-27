@@ -52,9 +52,12 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-All loop-consumable offline items are closed (SC-1..SC-5, SC-7 offline, SC-8, and the last
-older-queue item FR-7). The offline improvement loop is EXHAUSTED; remaining work is
-owner/live-gated:
+All prior loop-consumable offline items are closed (SC-1..SC-5, SC-7 offline, SC-8, FR-7). A
+fresh 2026-09-27 re-analysis pass then filed two NEW offline items — **RA-7** (cross-identity
+REJECT downgrade fires on inconclusive observations, not just genuine control-held rejects — the
+SC-1 anti-pattern on the reject side) and **RA-8** (workflow `status` assertion operand not
+validated as int; completes SC-4) — dispatch order RA-7 → RA-8; the loop resumes on them next.
+All OTHER remaining work is owner/live-gated:
 1. SC-6 (A5): package config as a resource + separate writable state + exclude tests +
    entry points; verify by a fresh-venv install outside the checkout (needs off-host
    install; not checkout-behavior-preserving in one offline pass).
