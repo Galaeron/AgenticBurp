@@ -1,64 +1,56 @@
-# Current state — 2026-09-26
+# Current state — 2026-09-27
 
-## Checkout and latest review
+## Checkout and review
 
-Branch `reconciliation-backlog`; latest reviewed HEAD:
-`226d8bb15350d3e4340db9f14f4859cb3a8e6fff`.
-Current assessment: [founder refresh](reviews/2026-09-26/founder-refresh/REVIEW.md).
-Commands and boundaries: [verification](reviews/2026-09-26/founder-refresh/VERIFICATION.md).
-Prior loop orientation is preserved in
-[the snapshot](reviews/2026-09-26/founder-refresh/CURRENT_STATE_before_refresh.md).
-Pre-existing README edits and untracked runtime/review artifacts remain.
-Another process edited report_generator.py/server.py during the refresh;
-preserve that in-progress report-policy wiring. No review-authored production
-changes, commits, pushes or active-default changes. Remote parity unestablished.
+Branch `reconciliation-backlog`; reviewed HEAD:
+`678dcce5ce79034e0cb3d178044714a8b82b2645`.
+Latest: [Pentest-Swarm source comparison](reviews/2026-09-27/swarm-comparison/REVIEW.md).
+[Commands/evidence](reviews/2026-09-27/swarm-comparison/VERIFICATION.md).
+Compared upstream `Armur-Ai/Pentest-Swarm-AI` at
+`661c21828f8a2d0e84ee8b161037d5e9d93942f8`.
+Previous state: [snapshot](reviews/2026-09-27/swarm-comparison/CURRENT_STATE_before_comparison.md).
+Pre-existing README edits, worktrees and runtime/review artifacts remain.
+No review-authored production changes, commits, pushes or active-default changes.
+Inventoried source/config hashes remained unchanged during verification.
+Loop change since review: `0fea458a` closes **SC-1** (A1) — a non-executed negative
+control (skipped/error/blocked) no longer counts as a clean negative, so it can no
+longer manufacture a VERIFIED verdict; INCONCLUSIVE reason + candidate state instead.
 
 ## Fresh verification
 
-Existing `.venv-rationalisation/Scripts/python.exe`, repository root:
-- `full`: exit 0; harness 2762 OK (2 skipped); pytest 38 passed;
-  testing 221 OK; evaluation integrity 42 OK.
-- Files changed during full: this is a mixed-workspace result, not immutable
-  HEAD or final-patch certification. Logs preserve the boundary.
-- Follow-up report/server tests: 107 OK. Synthetic helper probe confirms
-  concurrent reporting config now moves catch-all findings into leads.
-- Fresh isolated probes: URL/status-only ledger evidence now correctly fails;
-  raised analysis exceptions now disqualify; stable public pages no longer grant
-  credentials. Residual counterexamples are recorded in the refresh.
-- No fresh model, real browser/container, JDK/Burp, or independent target run.
-  Current Docker/Ollama service availability is not established by this review.
+Repository-root Python 3.12, existing `.venv-rationalisation`:
+- Full: 2780 unittest OK (2 skipped, +7 SC-1 tests), pytest 38 passed,
+  evaluation 221 OK, evaluation integrity 42 OK. Workspace pytest temp dir required.
+- Smoke: 92 OK. Orchestrator preconditions: 60 OK.
+- Requirement report still lists 36 gaps; offline passes do not close them.
+- Java: actual Gradle 8.7/JDK 17 `test shadowJar` succeeded; 229 tests,
+  zero failures/errors/skips. Explicit UTF-8 rebuild clean.
+- Wheel builds but importing its server outside checkout fails: config.yaml absent.
+- New probes reproduce oracle failed-control promotion through `_oracle_gate`,
+  dynamic-public credential acceptance, unknown-parameter negative wildcard,
+  and unknown workflow assertion success.
+- No current real-model accuracy, blind recall, live Burp load, browser or
+  container-policy verification. Docker/Ollama readiness not established.
+- Upstream Go suite has a Windows `true` command failure; five independent
+  probes reproduce board delivery loss and weak scope/authorization/proof logic.
 
-## Assessment and immediate work
+## Open work and recommended order
 
-Evidence/evaluation foundations materially improved; still an advanced prototype.
-Original finding statuses are reconciled individually in the refresh.
-R01: FIXED (`455cfe3`) — per-execution-pair resolvability (split-pair no longer
-     over-claims), producer sets data["method"], rehydration declared.
-R02: retain stage health in benchmark outcomes; separate healthy silence from
-     detector sensitivity; correct certification CLI/aggregate semantics.
-R03: missing Markdown config forwarding is fixed in observed concurrent edits;
-     preserve it and verify cross-format reporting-policy parity.
-R04: dynamic public response differences still falsely establish credential access.
-R05: unknown parameter remains a class-wide negative wildcard; oracle controls needed.
-R06: FIXED (`12b4340`) — read-auth now covers knowledge/activity/investigate-list.
-R07: FIXED (`41bec3c`) — /report/sarif now uses the canonical enriched+gated export
-     (proofs/merges + reporting gates); subsumes RA-6.
-Browser/tool/address enforcement, Java pairing/build and faithful ablations remain
-open. Offline contract work is NOT exhausted. No implementation loop dispatched.
+1. SC-1 done (oracle inconclusive vs clean). Next: SC-2 authorization
+   discriminator for credential grants; SC-3 bind controls to the exact case
+   (retire the empty-parameter wildcard).
+2. Require positive authorization evidence for learned credentials; preserve
+   noisy public-response negative fixtures.
+3. Reject unknown workflow assertions; fix wheel resources/writable state paths.
+4. Unify browser/tool policy, cancellation, model-budget reservations and exports.
+5. Adapt typed tool contracts/versioned workflows/durable jobs from comparison;
+   preserve the local evidence model rather than adopting their BOLA/board logic.
+6. Add clean-install/JAR checks and faithful budget-matched production ablations.
 
-## Prior implementation and durable pointers
-
-P1-3 metric arithmetic consolidation, P3-1 callable retention/host wipe,
-FR-1..FR-6/FR-8 and RA-1..RA-5 landed as recorded in
-[IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md). RA-5 (`8e80524`) is the
-report-policy wiring this refresh observed in-progress (R03), now committed and
-tested; RA-6 is filed for the `/report/sarif` cross-format parity follow-on the
-refresh also flagged (R03/R07). Completion of these slices is not equivalent to
-closure of all broader founder-review requirements (R01/R02/R04/R05/R06/R07 remain).
-- [Original founder review](reviews/2026-09-25/founder-review/REVIEW.md).
-- [Metric consolidation map](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
-- [Testing](docs/TESTING.md): tier/dependency boundaries.
-- [Saved benchmark](reviews/2026-09-25/benchmark/BENCHMARK_REPORT.md): historical;
-  all-repeat P=.236/R=.820 is not a current-HEAD or live exploitation result.
-No blind keys or blind-target implementations read. Preserve existing worktrees.
-Keep this file under 100 lines; detailed findings belong in the linked review.
+Earlier founder items and implementation history remain in
+[founder refresh](reviews/2026-09-26/founder-refresh/REVIEW.md) and
+[IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md); broader requirements remain open.
+Preserve `test_pipeline_gate.py` and defect-injection controls.
+No blind keys or blind-target implementations read.
+Portable audit toolchains/clone/builds remain in `.audit-external` and build dirs.
+Keep this file under 100 lines; details belong in the linked review.

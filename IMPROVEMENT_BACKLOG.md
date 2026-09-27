@@ -72,6 +72,23 @@ RA-3 → RA-4**. Honour the non-negotiables (safe `config.yaml` defaults; a call
 + negative control per item; `full` green before close). RA-3 is the offline SARIF
 slice of P2-3 (cross-referenced, not a duplicate); the Burp-tab half stays under P1-5.
 
+**2026-09-27 swarm-comparison batch (offline; reopens loop work):** A source-inspected
+comparison against `Armur-Ai/Pentest-Swarm-AI`
+(`reviews/2026-09-27/swarm-comparison/REVIEW.md` + `VERIFICATION.md`) reproduced nine local
+verification/shipping defects and proposed six borrowable architectural patterns — the
+**Swarm-comparison batch — SC-*** at the end of this file. The review's A1–A9 findings are
+re-grounded there against current source (each `file:line` re-read this session); several are
+follow-ons to already-closed items and are scoped to the *remaining* gap, NOT a re-file:
+**SC-2 ⊃ FR-6**, **SC-3 ⊃ FR-5**, **SC-5 ⊃ RA-6/R07/RA-5**, **SC-9 ⊃ PR-11/NC-O1**. Select the
+loop-consumable items in this order before resuming older queue work:
+**SC-1 → SC-2 → SC-3 → SC-4 → SC-5 → SC-6 → SC-7 → SC-8**. SC-9 folds into PR-11's offline
+half (reinforcement, not a new dup). SC-10..SC-15 are larger architecture/product items whose
+**retention is gated on a matched-budget measurement** (keep only if it adds verified coverage
+without new false positives / scope violations) — treat their efficacy runs as OWNER/LIVE.
+Honour the non-negotiables: safe `config.yaml` defaults (new gates ship OFF), a caller-level
+test + negative control per item, `full` green before close. Do NOT import upstream code
+(**AGPL-3.0**) — reimplement patterns and document provenance.
+
 1. Work top-down: finish all `P0` items before `P1`, etc. Within a tier, respect
    `Depends on`.
 2. Pick the first item whose checkbox is `[ ]` and whose dependencies are all `[x]`.
@@ -2850,3 +2867,317 @@ RA-3 → RA-4 (all offline/loop-consumable). Standing non-negotiables apply.
   exit 0). Honesty-tightening only — no verdict/confirm logic changed.
 - **Domain:** Evidence / Trust · **Effort:** M · **Depends on:** RA-1 `[x]`, FR-2 `[x]` · **Mode:** LOOP (offline)
 - **Source:** [founder-refresh REVIEW.md](reviews/2026-09-26/founder-refresh/REVIEW.md) R01.
+
+## Swarm-comparison batch — 2026-09-27 (SC-*)
+
+Source: [reviews/2026-09-27/swarm-comparison/REVIEW.md](reviews/2026-09-27/swarm-comparison/REVIEW.md)
++ [VERIFICATION.md](reviews/2026-09-27/swarm-comparison/VERIFICATION.md). A source-inspected
+comparison against `Armur-Ai/Pentest-Swarm-AI` (upstream HEAD `661c2182`) reviewed at local HEAD
+`678dcce`. Two groups: **SC-1..SC-9** are local verification/shipping defects (the review's A1–A9),
+each re-verified against current source this session; **SC-10..SC-15** are the six borrowable
+patterns ("technology worth adapting"), each an enhancement whose *retention* is gated on a
+matched-budget measurement. The upstream repo is **AGPL-3.0**: reimplement patterns, never copy
+code, and document provenance.
+
+Delivery order (the review's own): (1) SC-1..SC-3 + proof/control identity → (2) SC-4, SC-6, SC-5
+report parity → (3) SC-7..SC-9 execution policy + budgets → (4) SC-10 tool contract + one adapter
+→ (5) SC-11 workflow packs + SC-12 durable queue → (6) SC-13..SC-15 release UX, provider routing,
+report polish.
+
+### [x] SC-1 — A failed/inconclusive negative control must not produce VERIFIED (A1)
+- **Result (VERIFIED):** `0fea458a` — `Oracle.run_negative_control` now routes control
+  cleanliness through the shared `_clean_negative` helper (clean requires the probe
+  EXECUTED to `not_confirmed`; a `skipped`/`error`/`blocked`/cancelled control is
+  inconclusive, never clean), and `Oracle.run`'s `available and not clean` branch splits
+  into control-CONFIRMED (keeps the "negative control ALSO confirmed" reason) vs
+  control-INCONCLUSIVE (new reason, `verified` stays False either way). "Ran and stayed
+  clean" and "never ran" no longer collapse into one boolean. +7 tests: 3 at `Oracle.run`
+  (skipped/error/blocked → not-clean/not-verified/INCONCLUSIVE) and 4 caller-level through
+  the real `_validate_findings`→`_oracle_gate`→`OracleRegistry` wiring (executed-clean
+  `not_confirmed` → verified [positive control]; skipped/error/blocked → `oracle_verified`
+  False + state `candidate`); the two existing framework controls
+  (`test_verified_requires_clean_negative_control`,
+  `test_not_verified_when_negative_control_also_confirms`) stay green unchanged, and the
+  new tests fail against the old code. Reuses `_clean_negative` (no second definition); no
+  signature/verdict/severity/scope/replay/`confirmation_gate` change. `config.yaml`
+  unchanged (`oracle.enabled` ships false); `test_pipeline_gate.py` preserved. Full suite
+  2780 OK / 2 skip, pytest 38, evaluation 221, evaluation-integrity 42, exit 0.
+- **Domain:** Verification / Trust · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED, re-read this session):** `OracleValidator.run_negative_control`
+  ([harness/oracle_framework.py:180](harness/oracle_framework.py)) returns
+  `(available, not _is_confirmed(res), res)` — so a control that is `skipped` / `blocked` / `error`
+  is counted `clean=True`. After N-of-N successful reproductions, `ConfirmMixin._oracle_gate`
+  ([harness/orchestrator_confirm.py:58](harness/orchestrator_confirm.py)) stamps the case
+  `verified`. The review reproduced this end-to-end through the real `_oracle_gate` + registry with a
+  stub validator (`probe_agenticvibe.py`); a confirmed control correctly leaves it `candidate`, but a
+  non-executed control verifies.
+- **Problem:** "Ran and stayed clean" and "never actually ran" are collapsed into one boolean, so an
+  inconclusive control can manufacture a VERIFIED verdict — the single most trust-critical defect.
+- **Recommendation:** Introduce a distinct `executed_clean` outcome requiring transport success AND a
+  real class-specific control observation. `error` / cancellation / missing resource / skipped /
+  unavailable control stay **inconclusive** (never clean). Preserve why reproduction succeeded and why
+  the control did or did not execute. Redesign the `negative_controls.py` builders around an immutable
+  test case + explicit attack/control requests (change only the vulnerable variable; preserve auth,
+  unrelated params, workflow state). Audit each `SELF_CONTROLLING` exception individually.
+- **Acceptance criteria:** Caller-level regressions at BOTH `_oracle_gate` and `_validate_findings`: an
+  executed-and-clean control verifies; a `skipped`/`blocked`/`error`/unavailable control leaves the case
+  `candidate`/inconclusive (negative control per terminal status). Preserve `test_pipeline_gate.py`
+  defect-injection controls.
+- **Impact:** Transformational (this is the evidence boundary A2/A3 and every later item sit on).
+- **Source:** REVIEW.md A1.
+
+### [ ] SC-2 — Credential "grant" needs an authorization discriminator, not a noise differential (A2)
+- **Domain:** Verification / Trust · **Effort:** M · **Depends on:** SC-1 (nice) · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED, re-read this session):** `_credential_grants_access`
+  ([harness/orchestrator_chain.py:276](harness/orchestrator_chain.py)) already carries the **FR-6**
+  differential (credentialed vs anonymous vs invalid-token, fail-closed on control failure). The review
+  reproduced that a credential is still "granted" when the three public responses merely *differ*
+  (nonce/timestamp/CSRF/ads/login-redirect noise) — a differential exists but proves nothing. Static
+  public responses correctly reject; dynamic public responses falsely accept. `_auto_escalate` consumes
+  the result to accept learned credentials.
+- **Problem:** FR-6 established "the response changed"; A2 is the remaining gap — a *changed* public
+  response is not authorized access, so noisy public endpoints still escalate on a bogus credential.
+- **Recommendation:** Require an **authorization discriminator**: authenticated identity, access to a
+  known protected owner-bound object, or a stable privileged capability denied to both controls.
+  Normalize noisy bodies (nonces, timestamps, CSRF, ads, rate-limit pages, login redirects) to supporting
+  evidence only — never as the grant signal. Persist the three requests + principal bindings. Reuse
+  `identity_compare.py` / `cross_identity_validator.py` rather than raw body diffing.
+- **Acceptance criteria:** Owned-loopback caller tests around `_auto_escalate`: a bogus credential against
+  a noisy public endpoint does NOT grant/escalate; a real credential reaching a protected owner-bound
+  object does (positive control). Extends, does not weaken, FR-6's tests.
+- **Impact:** High. **Follow-on to FR-6 `[x]` (scoped to the remaining gap).**
+- **Source:** REVIEW.md A2.
+
+### [ ] SC-3 — Control identity: retire the empty-parameter wildcard; bind controls to the case (A3)
+- **Domain:** Verification / Trust · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED, re-read this session):** `_has_controlled_negative`
+  ([harness/confirmation_gate.py:610](harness/confirmation_gate.py)) — **FR-5** already stops a negative
+  recorded under a *different named* parameter from refuting a finding, but the current code still has
+  `if "" in params: return True`, so a negative with an **empty/unknown parameter key** refutes any
+  finding of that class. `_controlled_negatives` keys only on `(class, parameter)` — it does not bind run
+  / principal / session / method / parameter-location / workflow state, so a control from a different run
+  or principal can suppress.
+- **Problem:** An unresolved-identity control is treated as universal refutation, and cross-run /
+  cross-principal controls can suppress a legitimate finding — evidence-correctness defect.
+- **Recommendation:** Match controls on `(run, request template, principal/session, method, parameter
+  location+name, class, workflow state)`. Distinguish a *genuinely non-parameter-scoped* check (e.g. a
+  missing-header class — may legitimately refute at class level) from an *unknown/unresolved* parameter
+  (→ unresolved evidence, the existing UNVERIFIED tier, never refutation).
+- **Acceptance criteria:** Production suppression test with two parameters (one vulnerable, one clean)
+  proving only the matching-parameter control refutes; a control from a different run/principal does NOT
+  suppress; a genuinely class-scoped check still refutes at class level (kept behaviour).
+- **Impact:** High. **Follow-on to FR-5 `[x]` (empty-key wildcard + match-tuple binding remain).**
+- **Source:** REVIEW.md A3.
+
+### [ ] SC-4 — Unknown workflow assertions must fail closed (load-time + runtime) (A4)
+- **Domain:** Verification / Reliability · **Effort:** S · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED, re-read this session):** `_assertions_hold`
+  ([harness/workflow_engine.py:198](harness/workflow_engine.py)) handles `status` / `body_contains` /
+  `json_pointer` and returns `(True, "")` for any unrecognized `kind`. A workflow with
+  `Assertion(kind="misspelled_status", expected=403)` "passes" against a `200`. Reproduced through the
+  real `execute_workflow`.
+- **Problem:** A typo'd or unsupported assertion silently satisfies a business-invariant check, so a
+  workflow can report success it never verified.
+- **Recommendation:** Closed enum / discriminated schema for assertion kinds; validate operands at
+  workflow load (the same loader API/engagement callers use); fail closed at runtime for any unknown
+  assertion. Keep "request executed" vs "assertion satisfied" vs "invariant violated" distinct.
+- **Acceptance criteria:** A malformed workflow is rejected by the loader used by the API/engagement
+  callers; at runtime an unknown assertion yields inconclusive/failed, never pass; a well-formed workflow
+  still executes (negative control). Extend crash/restart tests to extractor state, cleanup registration
+  and principal switches.
+- **Impact:** Medium-High.
+- **Source:** REVIEW.md A4.
+
+### [ ] SC-5 — One required ReportPolicy across every exporter/adapter (MCP parity) (A9)
+- **Domain:** Reporting / Trust · **Effort:** S-M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED, re-read this session):** `ReadOnlyMcpAdapter.read_resource`
+  ([harness/mcp_adapter.py:130](harness/mcp_adapter.py)) calls
+  `report_generator.export_issues_for_host(host)` with **no `config`**, so the `reporting.*` surfacing
+  gates that **RA-6 / R07 / RA-5** added to `export_issues_for_host(url, config=...)`
+  ([harness/report_generator.py:773](harness/report_generator.py)) are bypassed on the MCP path — the
+  adapter cannot reproduce a configured report policy.
+- **Problem:** The same confirmed/candidate/quarantined/merged fixtures render differently depending on
+  the export path; a finding the operator's config would demote is surfaced in full through MCP.
+- **Recommendation:** Inject one immutable `ReportPolicy` (or thread the effective `config`) into every
+  exporter/adapter — Markdown, JSON, SARIF, issue export, MCP. Presentation must never change technical
+  verification state.
+- **Acceptance criteria:** Cross-format parity test: all export paths (incl. MCP `read_resource`) agree on
+  reportable issues for the same fixture set under a given `reporting.*` config; default (gates OFF) is
+  byte-for-byte unchanged.
+- **Impact:** Medium. **Follow-on to RA-5/RA-6/R07 `[x]` (the MCP adapter path they missed).**
+- **Source:** REVIEW.md A9.
+
+### [ ] SC-6 — The built wheel must import outside the checkout (package resources + entry points) (A5)
+- **Domain:** Distribution / Shipping · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (SUPPORTED — review built + reproduced; not rebuilt this session):** `pip wheel . --no-deps`
+  succeeds but the wheel omits `harness/config.yaml`; importing `harness.server` from an extracted wheel
+  outside the repo raises `FileNotFoundError`. The wheel bundles 392 Python files incl. 193 test modules;
+  `pyproject.toml` discovers packages without declaring the config resource (VERIFICATION.md wheel-import
+  row; artifact SHA `01d02982…`).
+- **Problem:** The distributable artifact cannot boot outside a repo checkout, and it ships the test tree —
+  a shipping blocker for wheel/JAR distribution.
+- **Recommendation:** Package safe-default config as a resource read via `importlib.resources`; resolve
+  writable config/state separately from the installed package dir; exclude test modules/fixtures from the
+  runtime distribution; provide `agenticvibe init` / `doctor` / `serve` entry points. (Do not flip any
+  committed safe default — the packaged default is the same safe config.)
+- **Acceptance criteria:** A fresh-venv install from an unrelated working directory can `import
+  harness.server`, hit `/health`, analyze a captured-exchange fixture with a stub model, persist state and
+  restart — all without a checkout. A wheel-*building* job alone does not satisfy this.
+- **Impact:** High (blocks distribution). Overlaps the product-UX half of SC-14 / P1-5.
+- **Source:** REVIEW.md A5.
+
+### [ ] SC-7 — Route every browser request through the RunContext capability/budget policy (A7)
+- **Domain:** Security / Safety · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline policy adapter; live browser health = OWNER)
+- **Evidence (SUPPORTED — review source-verified; not re-read this session):** `browser_driver.py` checks
+  origin/scope for routed requests but does not pass every browser request through the RunContext
+  mutation/request-budget rules; same-origin non-GET traffic needs a policy decision too.
+  `playwright_available` only imports the package (does not prove a working browser).
+- **Problem:** Browser-originated traffic can mutate or spend outside the single execution policy that
+  governs the transport — an enforcement gap under one immutable policy.
+- **Recommendation:** A browser policy adapter that accounts for every request against the same
+  budget/mutation rules; block service workers where they bypass interception; constrain WebSocket /
+  navigation; reject unexpected mutations. Doctor should launch/attach to the configured browser and run an
+  owned health op.
+- **Acceptance criteria:** A page fixture attempting a same-origin mutation is gated/accounted; an
+  out-of-scope redirect is blocked; a benign in-scope GET still succeeds (negative control).
+- **Impact:** Medium-High.
+- **Source:** REVIEW.md A7.
+
+### [ ] SC-8 — LLM budgets need atomic reservations and a run-start deadline (A8)
+- **Domain:** Safety / Cost · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (SUPPORTED — review source-verified; not re-read this session):** `EffortBudget.allow` checks
+  already-recorded usage with no in-flight reservation, so concurrent calls can all pass before any result
+  records; the duration deadline is initialized by the first `record`
+  ([harness/effort.py:184](harness/effort.py)) — after that first call finishes.
+- **Problem:** A hard budget is not actually hard under concurrency, and a run with a slow/blocking first
+  call has no deadline until it returns.
+- **Recommendation:** Create the deadline at run creation. Reserve an upper-bound token/cost allowance
+  atomically before dispatch, reconcile actual usage afterward, refund unused reservations. Route retry /
+  critique / planning / coordinator / specialist calls through the same meter; account for streaming and
+  failed calls. Keep token budgets for local models; expose money only where a reliable price schedule
+  applies.
+- **Acceptance criteria:** A test with concurrent dispatch against a small budget cannot exceed it; a first
+  call that exceeds the deadline is stopped; every model path is charged to one run.
+- **Impact:** Medium-High. Related to (not duplicated by) FR-7.
+- **Source:** REVIEW.md A8.
+
+### [ ] SC-9 — Per-tool bounded execution broker (reinforces PR-11 / NC-O1) (A6)
+- **Domain:** Security / Safety · **Effort:** M · **Depends on:** PR-11 · **Mode:** LOOP (offline broker/args); container-confinement proof = OWNER/LIVE (see NC-O1)
+- **Evidence (SUPPORTED — review source-verified; not re-read this session):** `tool_runner.EgressPolicy`
+  defaults to Docker's bridge network and places `allowed_hosts` in `NO_PROXY` (not a firewall allowlist);
+  requiring a policy object does not confine the tool; `run` checks cancellation before execution but a
+  blocking subprocess can continue to timeout.
+- **Problem:** Egress metadata is not network confinement, and cancellation does not necessarily kill a
+  running process/container — the same boundary PR-11/NC-O1 already track, plus a lifecycle gap.
+- **Recommendation:** Give each tool a bounded execution broker: explicit image digest, timeout, output
+  cap, process/container identity, network policy, and cancellation cleanup that actually terminates the
+  owned process/container. Enforce destinations in the real network path (the live-confinement proof stays
+  under NC-O1). **This is the broker/lifecycle slice of PR-11 — extend PR-11, do not open a parallel item.**
+- **Acceptance criteria (offline slice):** cancellation removes the owned process/container; malformed
+  output is inconclusive; unsupported capability is rejected before launch. (Allowed/forbidden endpoint,
+  redirect escape, socket/proxy bypass = the OWNER/LIVE NC-O1 proof.)
+- **Impact:** Medium-High. **Folds into PR-11 `[~]` / NC-O1 (OWNER).**
+- **Source:** REVIEW.md A6.
+
+### [ ] SC-10 — Governed ToolAdapter contract + one high-value adapter (borrow #1)
+- **Domain:** Extensibility / Discovery · **Effort:** L · **Depends on:** SC-1..SC-3, SC-9 · **Mode:** build LOOP; retention OWNER/LIVE (measured)
+- **Evidence (INFERRED — design proposal):** upstream `internal/tools` is a uniform adapter/registry
+  (Name/Run/IsAvailable, standardized result, allowlist derived from names) genuinely used in production;
+  AgenticVibe has agent plugins + validators but no governed *tool* contract beneath them.
+- **Recommendation:** Add a `ToolAdapter` contract BENEATH validators/worklists (do not conflate an LLM
+  agent with a scanner). Each adapter declares version, image digest, input schema, passive/active
+  capabilities, request+mutation costs, auth support, scope behaviour, output schema, redaction, readiness;
+  output keeps bounded raw artifacts + normalized observations + provenance. First adapter addresses a
+  *measured* web gap (e.g. Nuclei with an allowed capability set); keep sqlmap container-only; do not add
+  AD/cloud tooling just to match their catalog.
+- **Acceptance criteria:** production worklist dispatch invokes a pinned adapter; unsupported capability
+  rejected before launch; forbidden destination unreachable; malformed output inconclusive; cancellation
+  removes the owned process/container; replayed output cannot confirm a different case. **Retention gated:**
+  demonstrable extra *verified* coverage under equal budgets with no new false positives / scope violations.
+- **Impact:** High (only if the ablation shows a benefit).
+- **Source:** REVIEW.md "Technology worth adapting" #1.
+
+### [ ] SC-11 — Versioned workflow/chain data packs with strict schema + fixtures (borrow #2)
+- **Domain:** Business logic / Maintainability · **Effort:** M-L · **Depends on:** SC-4 · **Mode:** LOOP (offline)
+- **Evidence (INFERRED — design proposal):** upstream `internal/plugins` (playbooks) + `internal/chains`
+  (curated CVE/KEV chains: fingerprint → safe non-weaponized verify → remediation) are clean *data*
+  organization; AgenticVibe already has a richer executable workflow engine (prereq graph, typed
+  extractors, principals, assertions, cleanup, variants).
+- **Recommendation:** Package AgenticVibe's own workflow definitions as versioned data with a strict schema
+  — schema version, supported engine range, vuln taxonomy, required capabilities, impact constraints, proof
+  contract, negative fixture, cleanup contract. Borrow their *packaging*, not their model-generated
+  commands. A fingerprint mismatch must stop execution **programmatically** (an enforced state transition),
+  not merely instruct the model (upstream's gap — see B7/chains, where "safe verify" is prose guidance).
+- **Acceptance criteria:** deterministic compile/validate command; unknown fields/assertions rejected
+  (SC-4); cyclic prerequisites rejected; a vulnerable and a patched fixture reach *opposite* final evidence
+  states through the real engagement caller.
+- **Impact:** Medium-High.
+- **Source:** REVIEW.md "Technology worth adapting" #2.
+
+### [ ] SC-12 — Durable WorkItem queue behind the existing graph (borrow #3)
+- **Domain:** Architecture / Orchestration · **Effort:** L · **Depends on:** SC-1 · **Mode:** LOOP (offline; SQLite)
+- **Evidence (INFERRED — design proposal):** upstream's event board is lossy (B1: 100 findings → 32
+  delivered; cursor commits after errors). The borrowable idea is typed work-dispatch, NOT their board.
+- **Recommendation:** Introduce durable `WorkItem` records in the current SQLite DB: case, dependencies,
+  required capability, principal, priority, attempt, lease, budget reservation, result reference. Detection
+  creates candidates → planning proposes bounded work → execution produces observations → independent
+  verification changes evidence state → reporting reads state. Keep the API and Burp UI as adapters. One
+  process + SQLite transactions first; PostgreSQL only on measured multi-user contention (no Redis/Go
+  service for "swarm" terminology).
+- **Acceptance criteria:** crash + replay produce no duplicate external mutations and no lost work; two
+  concurrent engagements cannot share credentials/policy/budget/conclusions; a failed task is retryable
+  without changing its proof identity.
+- **Impact:** High (enables resumable/team work later — P3-3 seed).
+- **Source:** REVIEW.md "Technology worth adapting" #3.
+
+### [ ] SC-13 — Provider composition + unified cost/latency trace through llm_provider (borrow #4)
+- **Domain:** LLM routing / Observability · **Effort:** M · **Depends on:** SC-8 · **Mode:** build LOOP; routing measurement OWNER/LIVE
+- **Evidence (INFERRED — design proposal):** upstream has a real provider interface + per-role routing + a
+  metering wrapper (useful composition), but its meter/token caps are not a real reservation system (do not
+  copy its cost arithmetic as a hard limit). AgenticVibe's `llm_provider.py` already supports
+  local/OpenAI/Anthropic coordinator + critique.
+- **Recommendation:** Extend the existing `Provider` protocol (no parallel abstraction). Put
+  provider/model/prompt-version, input/output usage, retries, latency and case/run identity in one shared
+  trace consumed by the run ledger. Optional role routing (cheap classify vs deeper reasoning) only where
+  evaluation justifies it. Remote use stays explicit + redacted; captured credentials/confidential payloads
+  need a data policy before dispatch.
+- **Acceptance criteria:** every model path appears in the run ledger; concurrent reservations cannot exceed
+  the SC-8 hard budget; failures/streaming accounted; role routing measured on fixed cases at the same total
+  budget (retain only if it wins).
+- **Impact:** Medium.
+- **Source:** REVIEW.md "Technology worth adapting" #4.
+
+### [ ] SC-14 — Install / doctor / serve + aligned release (borrow #5)
+- **Domain:** Product / DX · **Effort:** M · **Depends on:** SC-6 · **Mode:** offline build LOOP; Burp load + fresh-machine matrix OWNER/LIVE (see P1-5)
+- **Evidence (INFERRED — design proposal + SUPPORTED build facts):** upstream's install/doctor/progress/
+  lab-launch UX is genuinely useful; their Java build passed here under JDK 17 (explicit UTF-8 clean). Not
+  every check is substantive (a constant disk-check / TCP port check ≠ readiness); their npm downloader
+  lacks checksum/failure handling.
+- **Recommendation:** Ship an aligned wheel + JAR + machine-readable manifest with resource versions,
+  checksums, build provenance; pinned Gradle wrapper + explicit UTF-8 compile. `doctor` distinguishes
+  executable-found vs dependency-installed vs service-reachable vs auth-accepted vs model-loaded vs
+  browser-usable vs tool-allowed-for-this-engagement. Preserve Burp as the primary authenticated-context
+  source; add a coherent install/start/diagnose flow around it. Overlaps SC-6 (packaging) and P1-5 (Burp UX
+  walkthrough).
+- **Acceptance criteria:** a clean Windows + Linux machine can install, init, serve `/health`, run an
+  offline captured-exchange fixture, restart and export a report without a repo checkout; the JAR builds in
+  PR CI and is separately tested in a supported Burp version (the live half is OWNER/LIVE).
+- **Impact:** Medium-High.
+- **Source:** REVIEW.md "Technology worth adapting" #5.
+
+### [ ] SC-15 — Evidence-first report polish + retest classification (borrow #6)
+- **Domain:** Reporting / UX · **Effort:** M · **Depends on:** SC-5 · **Mode:** LOOP (offline)
+- **Evidence (INFERRED — design proposal):** upstream's shareable single-file HTML layout + remediation/
+  reproduction sections are worth adapting; AgenticVibe already has canonical issues, proof linkage,
+  reversible merges, candidate/verified tiers, leads.
+- **Recommendation:** Adapt the presentation (shareable layout, remediation/reproduction narrative) through
+  the SAME canonical report policy (SC-5) — never promote LLM prose to evidence. Show exact observed impact,
+  authorized scope, limitations, failed/inconclusive controls, replay instructions, redacted evidence.
+  Retests reference the original case and classify fixed / still-vulnerable / inconclusive / not-run.
+  Consider `.http`-style evidence export (Burp Repeater import) and a self-contained offline HTML, both
+  gated by the report policy.
+- **Acceptance criteria:** all formats agree on reportable issues (SC-5 parity); unproved prose never
+  changes verification state; secret-canary fixtures stay redacted; stable issue IDs survive export and a
+  patched-fixture retest.
+- **Impact:** Medium.
+- **Source:** REVIEW.md "Technology worth adapting" #6.
