@@ -2926,7 +2926,27 @@ report polish.
 - **Impact:** Transformational (this is the evidence boundary A2/A3 and every later item sit on).
 - **Source:** REVIEW.md A1.
 
-### [ ] SC-2 — Credential "grant" needs an authorization discriminator, not a noise differential (A2)
+### [x] SC-2 — Credential "grant" needs an authorization discriminator, not a noise differential (A2)
+- **Result (VERIFIED):** `2764a60` — `_credential_grants_access`'s grant decision no longer
+  keys on a byte-exact differential (which any per-request nonce/CSRF/timestamp/ad/rate-limit/
+  login-page noise trivially satisfied → false grant → wasted role-recrawl). New module-level
+  `_responses_materially_same(a, b)` (sibling to `_responses_equivalent`, identical None/errored
+  normalization) requires `same status AND identity_compare.similarity(bodies) >= MATCH_THRESHOLD
+  (0.70)`; the grant line now uses it in the suppression position, so a credential is granted only
+  when its response is materially distinguishable from BOTH the anonymous and invalid-token
+  controls. Strict tightening: byte-equal bodies score 1.0, so every FR-6 grant-rejection is
+  preserved (superset proof) and only previously-granted noisy-public cases now correctly reject;
+  the more-conservative direction (never a false grant). Reuses `identity_compare` (no second
+  similarity metric/normalizer); fast-path, fail-closed control branches, scope/no-headers guard,
+  `_responses_equivalent`, `_invalidated_headers` untouched. +4 tests: 2 differential
+  (noisy-nonce triple → no grant [similarity 0.9077, empirically flips old byte-exact grant→True];
+  distinct privileged body vs denied controls → grant) and 2 caller-level around the real
+  `_auto_escalate`→`_credential_grants_access` path (noisy-public bogus credential → no crawl/no
+  escalation; genuine credential → protected owner-bound object → 1 crawl). FR-6 tests green
+  unchanged (incl. `test_genuine_grant_same_status_different_body_still_counts`, bodies score
+  0.0263 < 0.70). No `config.yaml` change (strict tightening ships on unconditionally, no new
+  gate); `test_pipeline_gate.py` preserved. Full suite 2784 OK / 2 skip, pytest 38, evaluation 221,
+  evaluation-integrity 42, exit 0.
 - **Domain:** Verification / Trust · **Effort:** M · **Depends on:** SC-1 (nice) · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED, re-read this session):** `_credential_grants_access`
   ([harness/orchestrator_chain.py:276](harness/orchestrator_chain.py)) already carries the **FR-6**

@@ -12,14 +12,17 @@ Previous state: [snapshot](reviews/2026-09-27/swarm-comparison/CURRENT_STATE_bef
 Pre-existing README edits, worktrees and runtime/review artifacts remain.
 No review-authored production changes, commits, pushes or active-default changes.
 Inventoried source/config hashes remained unchanged during verification.
-Loop change since review: `0fea458a` closes **SC-1** (A1) — a non-executed negative
+Loop changes since review: `0fea458a` closes **SC-1** (A1) — a non-executed negative
 control (skipped/error/blocked) no longer counts as a clean negative, so it can no
 longer manufacture a VERIFIED verdict; INCONCLUSIVE reason + candidate state instead.
+`2764a60` closes **SC-2** (A2) — credential grants now require a noise-tolerant
+authorization discriminator (trigram similarity ≥ 0.70 vs both controls), so a merely
+noisy public response no longer reads as a grant/escalation. Both are strict tightenings.
 
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: 2780 unittest OK (2 skipped, +7 SC-1 tests), pytest 38 passed,
+- Full: 2784 unittest OK (2 skipped, +7 SC-1 +4 SC-2 tests), pytest 38 passed,
   evaluation 221 OK, evaluation integrity 42 OK. Workspace pytest temp dir required.
 - Smoke: 92 OK. Orchestrator preconditions: 60 OK.
 - Requirement report still lists 36 gaps; offline passes do not close them.
@@ -36,9 +39,9 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-1. SC-1 done (oracle inconclusive vs clean). Next: SC-2 authorization
-   discriminator for credential grants; SC-3 bind controls to the exact case
-   (retire the empty-parameter wildcard).
+1. SC-1 + SC-2 done (oracle inconclusive-vs-clean; credential-grant
+   authorization discriminator). Next: SC-3 bind controls to the exact case
+   (retire the empty-parameter wildcard); then SC-4 fail-closed workflow assertions.
 2. Require positive authorization evidence for learned credentials; preserve
    noisy public-response negative fixtures.
 3. Reject unknown workflow assertions; fix wheel resources/writable state paths.
