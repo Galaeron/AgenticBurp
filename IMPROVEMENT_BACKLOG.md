@@ -3050,7 +3050,28 @@ report polish.
 - **Impact:** Medium-High.
 - **Source:** REVIEW.md A4.
 
-### [ ] SC-5 — One required ReportPolicy across every exporter/adapter (MCP parity) (A9)
+### [x] SC-5 — One required ReportPolicy across every exporter/adapter (MCP parity) (A9)
+- **Result (VERIFIED):** `6a581d5` — `ReadOnlyMcpAdapter` gained a kw-only `config: dict | None =
+  None` (stored as `self._config`) and its `issues` export call now passes `config=self._config`
+  to `report_generator.export_issues_for_host`, so the MCP path honors the same `reporting.*`
+  surfacing gates that RA-5/RA-6/R07 added to `/report` + `/report/sarif` (the adapter previously
+  called it with no config → gates bypassed). Chose to thread the effective config (the same
+  `server.config`/`load_config()` object the HTTP routes use) rather than introduce a new
+  `ReportPolicy` type — avoids rippling across the Markdown/JSON/SARIF/issue exporters. The `issues`
+  branch was the ONLY config-omitting export call (coverage/provenance branches don't route through
+  `export_issues_for_host`). Presentation-only: the gate is a pure list-filter (`_demoted_by_reporting_
+  gates`, which refuses confirmed/oracle-verified findings) — no store write, no verification-state
+  change. Default `config=None` = gates OFF = byte-for-byte unchanged. +2 tests: parity
+  (`read_resource(...)["data"] == export_issues_for_host(host, config=<gate cfg>)` with the demotable
+  catch-all omitted on BOTH + `total` reduced + the concrete confirmed `sqli` present on both as a
+  recall guard; fails against old code) and default-no-config-still-surfaces (proves the gate, not the
+  wiring, does the omitting); the existing gates-OFF parity test stays green unchanged (negative
+  control). Scope boundary: the adapter is constructed only in tests (no live MCP server route), so
+  the constructor seam + direct config injection is the bounded fix; a future live route must pass
+  `server.config` (documented inline). No `config.yaml` change (gates already ship OFF);
+  `report_generator.py`/`server.py`/`test_pipeline_gate.py` untouched. Full suite exit 0 (evaluation
+  221 + evaluation-integrity 42 OK; targeted `test_mcp_adapter`+`test_report_gates_wired`+
+  `test_sarif_endpoint` 26 OK).
 - **Domain:** Reporting / Trust · **Effort:** S-M · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED, re-read this session):** `ReadOnlyMcpAdapter.read_resource`
   ([harness/mcp_adapter.py:130](harness/mcp_adapter.py)) calls

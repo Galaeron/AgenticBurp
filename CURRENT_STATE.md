@@ -23,12 +23,15 @@ retired (empty-neg refutes only an empty-param finding) and a resolved cross-pri
 negative no longer suppresses; fail-safe (empty principal never loses a refutation), still
 capped on demotion. `895dda3` closes **SC-4** (A4) — unknown workflow assertion kinds now
 fail closed: runtime maps them to FAILED (never PASSED) and the loader rejects a malformed
-workflow with ValueError. All four are strict correctness/safety tightenings.
+workflow with ValueError. `6a581d5` closes **SC-5** (A9) — the MCP issues export path now
+honors the same `reporting.*` surfacing gates as `/report` (adapter gained a `config` param;
+default None = gates OFF = unchanged; presentation-only). All five are strict
+correctness/safety/parity tightenings.
 
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: exit 0 (harness unittest +7 SC-1 +4 SC-2 +3 SC-3 +6 SC-4 tests, 2 skipped;
+- Full: exit 0 (harness unittest +7 SC-1 +4 SC-2 +3 SC-3 +6 SC-4 +2 SC-5 tests, 2 skipped;
   pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
 - Smoke: 92 OK. Orchestrator preconditions: 60 OK.
 - Requirement report still lists 36 gaps; offline passes do not close them.
@@ -45,9 +48,10 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-1. SC-1..SC-4 done (oracle inconclusive-vs-clean; credential-grant authorization
+1. SC-1..SC-5 done (oracle inconclusive-vs-clean; credential-grant authorization
    discriminator; control-identity case/principal binding; fail-closed workflow
-   assertions). Next: SC-5 ReportPolicy parity (MCP export path); then SC-6 wheel import.
+   assertions; MCP report-gate parity). Next: SC-6 wheel import (package resources +
+   entry points); then SC-7 browser policy, SC-8 LLM budget reservations.
 2. Require positive authorization evidence for learned credentials; preserve
    noisy public-response negative fixtures.
 3. Reject unknown workflow assertions; fix wheel resources/writable state paths.
