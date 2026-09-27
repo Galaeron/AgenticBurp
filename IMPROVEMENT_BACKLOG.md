@@ -3156,7 +3156,31 @@ report polish.
 - **Impact:** Medium-High.
 - **Source:** REVIEW.md A7.
 
-### [ ] SC-8 — LLM budgets need atomic reservations and a run-start deadline (A8)
+### [x] SC-8 — LLM budgets need atomic reservations and a run-start deadline (A8)
+- **Result (VERIFIED, offline primitive):** `0522472` — `EffortBudget` gained an ADDITIVE
+  lock-serialized reservation primitive: `reserve(est) -> (bool, reason)` checks committed `spent`
+  PLUS in-flight `_reserved` against `total_tokens` and `_deadline_passed()` under a `threading.Lock`
+  (so N concurrent reservers can't jointly overshoot the cap — the atomic check+increment is
+  serialized), reusing `allow()`'s exact HARD/SOFT/`_overspend_confirmed` branches + reason strings;
+  `commit(kind, model, pt, ct, reserved=)` releases the estimate and records ACTUAL usage (calls
+  `self.ledger.record` DIRECTLY — not `self.record` — to avoid re-locking the non-reentrant lock);
+  `release(reserved)` refunds a failed/aborted call. The wall-clock deadline is now armed in
+  `__post_init__` (construction) instead of on the first `record()`, so an idle/slow-first-call run
+  can expire from time alone. Harder-not-looser; no gate loosened. Behavior-preserving for sequential
+  callers: `allow()` is untouched, `record()` only takes the lock (same ledger append), and a
+  `reserve→commit` pair leaves `spent` identical to a bare `record()` of the actuals (proven by a twin-
+  budget test). +5 tests (new `EffortBudgetReservationTests` + `EffortBudgetDurationTests`): deterministic
+  barrier-based concurrency (10 threads reserve(1) vs total_tokens=3 → exactly 3 succeed, `_reserved==3`;
+  re-run 5× non-flaky), reserve-blocked-past-construction-deadline, reserve/commit == bare-record-of-actuals,
+  reserve/release-leaves-no-trace, and a REPLACED deadline test (`test_deadline_set_at_construction_not_
+  first_spend`) — the old one pinned the pre-SC-8 "idle budget never expires" contract that SC-8 inverts
+  (contract inversion, harder, not a weakening). **DEFERRED (not this iteration):** wiring the primitive
+  into the concurrent dispatch seam (agent_manager/retry/critique/coordinator/specialist), streaming/failed-
+  call accounting beyond release, and money/pricing — the primitive is additive and wired by nobody yet
+  (the shipped `EffortBudget` at orchestrator.py sets no `max_duration_s`, so runtime behavior is
+  unchanged this iteration). Note: the `RequestBudget.reserve` used by the SC-7 browser seam is a
+  SEPARATE class, unaffected. No `config.yaml` change; `test_pipeline_gate.py` untouched. Full suite
+  exit 0 (evaluation 221 + evaluation-integrity 42 OK; targeted 47 OK).
 - **Domain:** Safety / Cost · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (SUPPORTED — review source-verified; not re-read this session):** `EffortBudget.allow` checks
   already-recorded usage with no in-flight reservation, so concurrent calls can all pass before any result

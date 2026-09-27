@@ -12,39 +12,33 @@ Previous state: [snapshot](reviews/2026-09-27/swarm-comparison/CURRENT_STATE_bef
 Pre-existing README edits, worktrees and runtime/review artifacts remain.
 No review-authored production changes, commits, pushes or active-default changes.
 Inventoried source/config hashes remained unchanged during verification.
-Loop changes since review: `0fea458a` closes **SC-1** (A1) — a non-executed negative
-control (skipped/error/blocked) no longer counts as a clean negative, so it can no
-longer manufacture a VERIFIED verdict; INCONCLUSIVE reason + candidate state instead.
-`2764a60` closes **SC-2** (A2) — credential grants now require a noise-tolerant
-authorization discriminator (trigram similarity ≥ 0.70 vs both controls), so a merely
-noisy public response no longer reads as a grant/escalation. `debb3e7` closes **SC-3**
-(A3) — controlled negatives bind to the exact case: the empty-parameter wildcard is
-retired (empty-neg refutes only an empty-param finding) and a resolved cross-principal
-negative no longer suppresses; fail-safe (empty principal never loses a refutation), still
-capped on demotion. `895dda3` closes **SC-4** (A4) — unknown workflow assertion kinds now
-fail closed: runtime maps them to FAILED (never PASSED) and the loader rejects a malformed
-workflow with ValueError. `6a581d5` closes **SC-5** (A9) — the MCP issues export path now
-honors the same `reporting.*` surfacing gates as `/report` (adapter gained a `config` param;
-default None = gates OFF = unchanged; presentation-only). `77a0838` closes **SC-7** (A7) offline
-half — browser requests can now route through the RunContext gate/budget seam (opt-in
-`gate`/`budget` on `evaluate_browser_request`; scope→gate→budget order; behavior-preserving when
-unused). **SC-6 (A5) deferred to owner** — its fresh-venv-install acceptance needs off-host PyPI
-egress and its config/state refactor isn't checkout-behavior-preserving offline. SC-7's LIVE
-wiring + browser health remain OWNER.
+Loop batch (swarm-comparison SC-*, all loop-consumable items done): **SC-1** `0fea458a`
+(non-executed negative control → inconclusive, not VERIFIED), **SC-2** `2764a60`
+(credential grant needs a noise-tolerant authorization discriminator, not a byte diff),
+**SC-3** `debb3e7` (controlled negatives bind to case+principal; empty-param wildcard
+retired), **SC-4** `895dda3` (unknown workflow assertions fail closed at load+runtime),
+**SC-5** `6a581d5` (MCP export honors the `reporting.*` gates), **SC-7** `77a0838` offline
+half (opt-in gate/budget seam on browser requests), **SC-8** `0522472` (EffortBudget atomic
+reserve/commit/release + deadline-at-construction). SC-1..SC-4 are strict
+verification-correctness tightenings; SC-5/SC-7/SC-8 add opt-in/presentation seams that are
+byte-for-byte no-ops until wired. **Owner-deferred:** SC-6 (wheel import needs off-host
+install + non-checkout-preserving refactor); SC-7 live browser wiring/health; SC-9..SC-15
+(measurement/live-gated). Per-item detail + Results in IMPROVEMENT_BACKLOG.md.
 
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: exit 0 (harness unittest +7 SC-1 +4 SC-2 +3 SC-3 +6 SC-4 +2 SC-5 +6 SC-7 tests, 2 skipped;
+- Full: exit 0 (harness unittest, 2 skipped, +31 SC-batch tests [SC-1..SC-5,SC-7,SC-8];
   pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
 - Smoke: 92 OK. Orchestrator preconditions: 60 OK.
 - Requirement report still lists 36 gaps; offline passes do not close them.
 - Java: actual Gradle 8.7/JDK 17 `test shadowJar` succeeded; 229 tests,
   zero failures/errors/skips. Explicit UTF-8 rebuild clean.
 - Wheel builds but importing its server outside checkout fails: config.yaml absent.
-- New probes reproduce oracle failed-control promotion through `_oracle_gate`,
-  dynamic-public credential acceptance, unknown-parameter negative wildcard,
-  and unknown workflow assertion success.
+- The swarm-review probes for oracle failed-control promotion (SC-1), dynamic-public
+  credential acceptance (SC-2), unknown-parameter negative wildcard (SC-3), and unknown
+  workflow assertion success (SC-4) are now CLOSED offline (regression tests added); the
+  wheel-import failure below (A5/SC-6) remains open (owner).
 - No current real-model accuracy, blind recall, live Burp load, browser or
   container-policy verification. Docker/Ollama readiness not established.
 - Upstream Go suite has a Windows `true` command failure; five independent
@@ -52,18 +46,20 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-1. SC-1..SC-5 + SC-7(offline) done (oracle inconclusive-vs-clean; credential-grant
-   discriminator; control-identity binding; fail-closed workflow assertions; MCP
-   report-gate parity; browser gate/budget seam). SC-6 deferred to owner (off-host
-   install + non-checkout-preserving refactor). Next loop-consumable: SC-8 LLM budget
-   atomic reservations + run-start deadline. Owner: SC-6, SC-7 live wiring, SC-9..SC-15.
-2. Require positive authorization evidence for learned credentials; preserve
-   noisy public-response negative fixtures.
-3. Reject unknown workflow assertions; fix wheel resources/writable state paths.
-4. Unify browser/tool policy, cancellation, model-budget reservations and exports.
-5. Adapt typed tool contracts/versioned workflows/durable jobs from comparison;
-   preserve the local evidence model rather than adopting their BOLA/board logic.
-6. Add clean-install/JAR checks and faithful budget-matched production ablations.
+All loop-consumable SC-batch items (SC-1..SC-5, SC-7 offline, SC-8) are closed. Remaining
+work is owner/live-gated:
+1. SC-6 (A5): package config as a resource + separate writable state + exclude tests +
+   entry points; verify by a fresh-venv install outside the checkout (needs off-host
+   install; not checkout-behavior-preserving in one offline pass).
+2. SC-7 live half (A7): wire a real RunContext gate/budget into the live browser
+   `visit` call sites + browser health/doctor + WebSocket/service-worker constraints
+   (needs a working Playwright browser). SC-8 dispatch-seam wiring (agent_manager/retry/
+   critique/coordinator) similarly remains to be wired to the new reserve/commit primitive.
+3. SC-9 (A6, needs PR-11) + SC-10..SC-15 (typed tool contracts, versioned workflow packs,
+   durable queue, provider routing, install/doctor UX, report polish) — retention gated
+   on a matched-budget measurement; treat efficacy runs as OWNER/LIVE.
+4. Standing owner items: real-model accuracy / blind recall / live Burp load / container
+   policy; faithful budget-matched production ablations. No AGPL upstream code imported.
 
 Earlier founder items and implementation history remain in
 [founder refresh](reviews/2026-09-26/founder-refresh/REVIEW.md) and
