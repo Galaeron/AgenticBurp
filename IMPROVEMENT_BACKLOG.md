@@ -3091,7 +3091,17 @@ report polish.
 - **Source:** REVIEW.md A9.
 
 ### [ ] SC-6 — The built wheel must import outside the checkout (package resources + entry points) (A5)
-- **Domain:** Distribution / Shipping · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Loop deferral note (2026-09-27):** SKIPPED by the offline loop and left `[ ]` for the owner —
+  the acceptance is offline-infeasible here. (1) Its verification explicitly requires a FRESH-VENV
+  install from an unrelated directory (import `harness.server` + `/health` + stub-analyze + persist +
+  restart, "a wheel-building job alone does not satisfy this"), which needs `pip install` of
+  fastapi/uvicorn/httpx/pydantic/pyyaml (+ transitive deps) — off-host PyPI egress or an unassumable
+  local wheelhouse, outside offline loop scope. (2) The config/writable-state paths are all
+  checkout-relative via `Path(__file__).parent` (`server.py` CONFIG_PATH/TOKEN_LOCKFILE, `store._DB_PATH`,
+  `cache.py`, `pattern_memory.py`, `mcp_adapter`/`run_manifest` run-output), and ~a dozen tests rely on
+  or override those exact paths (`test_pipeline_gate.py` reasons about `harness/harness_state.db`), so
+  the importlib.resources + writable-state-separation refactor is not behavior-preserving-in-checkout
+  in one bounded iteration. Owner task (needs a real environment + package build/install).
 - **Evidence (SUPPORTED — review built + reproduced; not rebuilt this session):** `pip wheel . --no-deps`
   succeeds but the wheel omits `harness/config.yaml`; importing `harness.server` from an extracted wheel
   outside the repo raises `FileNotFoundError`. The wheel bundles 392 Python files incl. 193 test modules;
@@ -3109,7 +3119,27 @@ report polish.
 - **Impact:** High (blocks distribution). Overlaps the product-UX half of SC-14 / P1-5.
 - **Source:** REVIEW.md A5.
 
-### [ ] SC-7 — Route every browser request through the RunContext capability/budget policy (A7)
+### [x] SC-7 — Route every browser request through the RunContext capability/budget policy (A7)
+- **Result (VERIFIED, offline half):** `77a0838` — `evaluate_browser_request` gained opt-in kw-only
+  `gate`/`budget` params, applied AFTER the existing scheme/resource_type/scope/method checks and
+  immediately before the allow-return, in `TargetTransport.execute`'s scope→gate→budget order: a
+  same-origin non-GET (mutating) subrequest is routed through `SafetyGate.authorize(validator_name=
+  "browser", ...)` (GET skips the gate — ScopePolicy stays the scope authority), then `budget.reserve(1)`
+  is the LAST step for an otherwise-allowed request, so a request blocked by any prior check NEVER
+  reserves budget. Threaded (default None) through `PlaywrightDriver.visit`/`_handle_route`. Opt-in and
+  behavior-preserving: when `gate`/`budget` are both None (every shipped caller — validators pass
+  neither) the function is byte-for-byte identical, so runtime behavior is unchanged this iteration; the
+  seam can only BLOCK/ACCOUNT more, never allow more. +6 caller-level tests (new
+  `test_browser_budget_gate.py`, real ScopePolicy/SafetyGate/SafetyGateConfig/RequestBudget): mutation
+  gated-by-default (allow False, budget unspent — flips old same-origin-POST-allowed behavior); mutation
+  allowed+accounted when active; out-of-scope redirect blocked before reserve (budget unspent, negative
+  control); in-scope GET allowed+accounted; budget exhaustion (2nd GET blocked); gate=None/budget=None
+  behavior-preserving guard. The 13 `test_browser_interception_gate` tests stay green unchanged. **LIVE
+  half DEFERRED (OWNER):** wiring a real RunContext gate/budget into the live `visit` call sites +
+  browser health/doctor + WebSocket/service-worker constraints — needs a working Playwright browser,
+  out of offline scope. No `config.yaml` change; no new capability ON by default; single-context-site
+  invariant preserved; `test_pipeline_gate.py` untouched. Full suite exit 0 (evaluation 221 +
+  evaluation-integrity 42 OK; targeted 19 OK).
 - **Domain:** Security / Safety · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline policy adapter; live browser health = OWNER)
 - **Evidence (SUPPORTED — review source-verified; not re-read this session):** `browser_driver.py` checks
   origin/scope for routed requests but does not pass every browser request through the RunContext

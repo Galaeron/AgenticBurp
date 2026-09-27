@@ -25,13 +25,17 @@ capped on demotion. `895dda3` closes **SC-4** (A4) — unknown workflow assertio
 fail closed: runtime maps them to FAILED (never PASSED) and the loader rejects a malformed
 workflow with ValueError. `6a581d5` closes **SC-5** (A9) — the MCP issues export path now
 honors the same `reporting.*` surfacing gates as `/report` (adapter gained a `config` param;
-default None = gates OFF = unchanged; presentation-only). All five are strict
-correctness/safety/parity tightenings.
+default None = gates OFF = unchanged; presentation-only). `77a0838` closes **SC-7** (A7) offline
+half — browser requests can now route through the RunContext gate/budget seam (opt-in
+`gate`/`budget` on `evaluate_browser_request`; scope→gate→budget order; behavior-preserving when
+unused). **SC-6 (A5) deferred to owner** — its fresh-venv-install acceptance needs off-host PyPI
+egress and its config/state refactor isn't checkout-behavior-preserving offline. SC-7's LIVE
+wiring + browser health remain OWNER.
 
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: exit 0 (harness unittest +7 SC-1 +4 SC-2 +3 SC-3 +6 SC-4 +2 SC-5 tests, 2 skipped;
+- Full: exit 0 (harness unittest +7 SC-1 +4 SC-2 +3 SC-3 +6 SC-4 +2 SC-5 +6 SC-7 tests, 2 skipped;
   pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
 - Smoke: 92 OK. Orchestrator preconditions: 60 OK.
 - Requirement report still lists 36 gaps; offline passes do not close them.
@@ -48,10 +52,11 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-1. SC-1..SC-5 done (oracle inconclusive-vs-clean; credential-grant authorization
-   discriminator; control-identity case/principal binding; fail-closed workflow
-   assertions; MCP report-gate parity). Next: SC-6 wheel import (package resources +
-   entry points); then SC-7 browser policy, SC-8 LLM budget reservations.
+1. SC-1..SC-5 + SC-7(offline) done (oracle inconclusive-vs-clean; credential-grant
+   discriminator; control-identity binding; fail-closed workflow assertions; MCP
+   report-gate parity; browser gate/budget seam). SC-6 deferred to owner (off-host
+   install + non-checkout-preserving refactor). Next loop-consumable: SC-8 LLM budget
+   atomic reservations + run-start deadline. Owner: SC-6, SC-7 live wiring, SC-9..SC-15.
 2. Require positive authorization evidence for learned credentials; preserve
    noisy public-response negative fixtures.
 3. Reject unknown workflow assertions; fix wheel resources/writable state paths.
