@@ -3012,7 +3012,26 @@ report polish.
 - **Impact:** High. **Follow-on to FR-5 `[x]` (empty-key wildcard + match-tuple binding remain).**
 - **Source:** REVIEW.md A3.
 
-### [ ] SC-4 — Unknown workflow assertions must fail closed (load-time + runtime) (A4)
+### [x] SC-4 — Unknown workflow assertions must fail closed (load-time + runtime) (A4)
+- **Result (VERIFIED):** `895dda3` — RUNTIME: `_assertions_hold` now returns
+  `(False, "unknown assertion kind: X")` as the first check in its loop for any kind outside the
+  closed `_ASSERTION_KINDS = {status, body_contains, json_pointer}` set, so an unrecognized/misspelled
+  assertion maps to `StepStatus.FAILED` (executed-but-unverifiable, distinct from BLOCKED) via the
+  existing `execute_workflow` mapping — it can no longer fall through to `(True,"")`/PASSED. LOAD-TIME:
+  a new `_load_assertion` helper (called by `workflow_from_dict`, the loader `engagement_builder.
+  execute_declared_workflows` uses) raises `ValueError` for an unknown kind, a status/body_contains
+  missing `expected`, or a json_pointer missing `expression` — the error propagates (not swallowed), so
+  a malformed workflow is rejected before execution. Uses `expected is None` (not falsy), so a
+  legitimate `expected: 0/""/false` and an expression-only json_pointer are still accepted (no
+  over-tightening; no in-repo declaration is newly rejected). `Assertion.kind` stays a plain str (no
+  Enum churn). +6 tests: load-time unknown-kind rejected by the real loader AND end-to-end via
+  `execute_declared_workflows`; status-missing-expected and json_pointer-missing-expression rejected;
+  runtime unknown-kind → FAILED + "unknown assertion kind" in reason + explicitly NOT PASSED (the exact
+  misspelled_status/403-vs-200 repro, fails against old code); well-formed workflow still PASSES
+  (negative control). The trailing crash/restart-tests clause (extractor state / cleanup registration /
+  principal switches) is DEFERRED — separable reliability extra, remains open. No `config.yaml` change
+  (unconditional correctness); `test_pipeline_gate.py` untouched. Full suite exit 0 (harness unittest +
+  pytest 38 + evaluation 221 + evaluation-integrity 42; targeted `test_workflow_engine` 28 OK).
 - **Domain:** Verification / Reliability · **Effort:** S · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED, re-read this session):** `_assertions_hold`
   ([harness/workflow_engine.py:198](harness/workflow_engine.py)) handles `status` / `body_contains` /

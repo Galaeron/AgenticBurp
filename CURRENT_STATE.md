@@ -21,12 +21,14 @@ noisy public response no longer reads as a grant/escalation. `debb3e7` closes **
 (A3) — controlled negatives bind to the exact case: the empty-parameter wildcard is
 retired (empty-neg refutes only an empty-param finding) and a resolved cross-principal
 negative no longer suppresses; fail-safe (empty principal never loses a refutation), still
-capped on demotion. All three are strict evidence-correctness tightenings.
+capped on demotion. `895dda3` closes **SC-4** (A4) — unknown workflow assertion kinds now
+fail closed: runtime maps them to FAILED (never PASSED) and the loader rejects a malformed
+workflow with ValueError. All four are strict correctness/safety tightenings.
 
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: exit 0 (harness unittest +7 SC-1 +4 SC-2 +3 SC-3 tests, 2 skipped;
+- Full: exit 0 (harness unittest +7 SC-1 +4 SC-2 +3 SC-3 +6 SC-4 tests, 2 skipped;
   pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
 - Smoke: 92 OK. Orchestrator preconditions: 60 OK.
 - Requirement report still lists 36 gaps; offline passes do not close them.
@@ -43,9 +45,9 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-1. SC-1 + SC-2 + SC-3 done (oracle inconclusive-vs-clean; credential-grant
-   authorization discriminator; control-identity case/principal binding). Next:
-   SC-4 fail-closed workflow assertions; then SC-5 ReportPolicy parity (MCP).
+1. SC-1..SC-4 done (oracle inconclusive-vs-clean; credential-grant authorization
+   discriminator; control-identity case/principal binding; fail-closed workflow
+   assertions). Next: SC-5 ReportPolicy parity (MCP export path); then SC-6 wheel import.
 2. Require positive authorization evidence for learned credentials; preserve
    noisy public-response negative fixtures.
 3. Reject unknown workflow assertions; fix wheel resources/writable state paths.
