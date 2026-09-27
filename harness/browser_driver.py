@@ -38,10 +38,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable, Protocol, TYPE_CHECKING, runtime_checkable
 from urllib.parse import urlsplit
 
 from harness.run_context import ScopePolicy
+
+if TYPE_CHECKING:  # pragma: no cover - type-checking only, no runtime import cost
+    from harness.run_context import RequestBudget
+    from harness.safety_gate import SafetyGate
 
 log = logging.getLogger("harness.browser_driver")
 
@@ -76,17 +80,37 @@ class BrowserRequestDecision:
 
 def evaluate_browser_request(*, url: str, method: str, resource_type: str,
                               is_navigation: bool, run_origin: str,
-                              scope: ScopePolicy) -> "BrowserRequestDecision":
+                              scope: ScopePolicy,
+                              gate: "SafetyGate | None" = None,
+                              budget: "RequestBudget | None" = None,
+                              ) -> "BrowserRequestDecision":
     """Decide whether one browser-driven request may proceed, and whether the
     captured identity's credentials (Authorization) may be attached to it.
 
-    Pure and synchronous -- no Playwright, no I/O -- so it is exercised
-    directly by unit tests and reused unchanged by the real interception
-    handler in `PlaywrightDriver.visit`. FAIL CLOSED throughout: an
-    unrecognised scheme, an unrecognised resource_type, or an out-of-scope
-    origin blocks the request; credentials attach only when the request's
-    origin is the exact origin the run navigated to (`run_origin`) -- never
-    forwarded cross-origin, even to another in-scope host.
+    Pure and synchronous when `gate` and `budget` are both omitted (the
+    default, and the case for every caller/test that predates SC-7) -- no
+    Playwright, no I/O -- so it is exercised directly by unit tests and reused
+    unchanged by the real interception handler in `PlaywrightDriver.visit`.
+    FAIL CLOSED throughout: an unrecognised scheme, an unrecognised
+    resource_type, or an out-of-scope origin blocks the request; credentials
+    attach only when the request's origin is the exact origin the run
+    navigated to (`run_origin`) -- never forwarded cross-origin, even to
+    another in-scope host.
+
+    `gate`/`budget` (SC-7, opt-in): when a `gate` is supplied, a same-origin
+    MUTATING (non-GET) subrequest is additionally routed through it, mirroring
+    the scope -> gate -> budget order `TargetTransport.execute` enforces for
+    every other outbound send -- so browser-originated mutating traffic no
+    longer bypasses the run's single RunContext capability policy. A GET
+    request never consults the gate: the `scope` ScopePolicy above remains the
+    single scope authority for the browser plane, and the gate only adds the
+    mutation decision on top of it. When a `budget` is supplied, it is
+    reserved (1 unit) as the LAST step, only for a request that is otherwise
+    allowed -- a request blocked by scheme/resource_type/scope/method/gate
+    NEVER reserves budget. This makes the function SIDE-EFFECTFUL (it reserves
+    budget) ONLY when `budget` is passed; with `gate=None, budget=None` (every
+    call site before SC-7) it stays pure and is BYTE-FOR-BYTE
+    behavior-identical to before these two parameters existed.
     """
     method_u = (method or "GET").upper()
     resource_type_l = (resource_type or "").lower()
@@ -117,6 +141,19 @@ def evaluate_browser_request(*, url: str, method: str, resource_type: str,
             return blocked(
                 f"non-GET subrequest to '{request_origin}' is not same-origin as "
                 f"run origin '{run_origin}'")
+
+    # SC-7: mirror TargetTransport.execute's scope -> gate -> budget order.
+    # Everything above is a scope/method/shape check; from here on the request
+    # is otherwise allowed, so the gate (mutating methods only) and then the
+    # budget (any allowed request) get the final say -- in that order, so a
+    # gate-denied request never reserves budget.
+    if gate is not None and method_u != "GET":
+        gate_decision = gate.authorize(validator_name="browser", method=method_u, url=url)
+        if not gate_decision.allowed:
+            return blocked(f"gate denied browser {method_u}: {gate_decision.reason}")
+
+    if budget is not None and not budget.reserve(1):
+        return blocked("browser request budget exhausted")
 
     return BrowserRequestDecision(
         allow=True,
@@ -240,6 +277,8 @@ class PlaywrightDriver:
                     headers: dict | None = None,
                     scope: "ScopePolicy | None" = None,
                     cancel: "asyncio.Event | Callable[[], bool] | None" = None,
+                    gate: "SafetyGate | None" = None,
+                    budget: "RequestBudget | None" = None,
                     ) -> ExecutionObservation:
         """Navigate to `url` and report what executed.
 
@@ -257,6 +296,11 @@ class PlaywrightDriver:
         visit be stopped cooperatively: once it reads cancelled, no further
         request is dispatched (each is aborted at the interception point) and
         navigation is skipped if it hasn't started yet.
+
+        `gate`/`budget` (SC-7, opt-in, default None): threaded straight
+        through to `evaluate_browser_request` for every intercepted request,
+        unchanged otherwise. Omitting both (every caller today) keeps this
+        method's behavior exactly as before they existed.
         """
         obs = ExecutionObservation(url=url)
         if is_cancelled(cancel):
@@ -309,7 +353,9 @@ class PlaywrightDriver:
                             resource_type=request.resource_type,
                             is_navigation=request.is_navigation_request(),
                             run_origin=run_origin,
-                            scope=effective_scope)
+                            scope=effective_scope,
+                            gate=gate,
+                            budget=budget)
                         if not decision.allow:
                             log.info("browser_driver: blocked %s %s (%s)",
                                      request.method, request.url, decision.reason)
