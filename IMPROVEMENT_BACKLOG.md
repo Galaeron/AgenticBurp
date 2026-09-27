@@ -2968,7 +2968,30 @@ report polish.
 - **Impact:** High. **Follow-on to FR-6 `[x]` (scoped to the remaining gap).**
 - **Source:** REVIEW.md A2.
 
-### [ ] SC-3 — Control identity: retire the empty-parameter wildcard; bind controls to the case (A3)
+### [x] SC-3 — Control identity: retire the empty-parameter wildcard; bind controls to the case (A3)
+- **Result (VERIFIED):** `debb3e7` — `_has_controlled_negative` no longer treats an empty
+  parameter key as a wildcard (`if "" in params: return True` deleted). A controlled negative now
+  matches a finding iff `neg_param == parameter_name` (exact) AND the principals are not a
+  resolved-vs-resolved mismatch. `_controlled_negatives` stores `(parameter, principal)` tuples;
+  a new `ValidationReport.principal_id` (default "") is populated at the not_confirmed record site
+  from `finding.principal_id` (Finding already carried it — no cross-module plumbing). Effect:
+  an empty-parameter negative refutes ONLY an empty-parameter (genuinely endpoint-level) finding —
+  preserved — and no longer demotes a specific-parameter finding it never tested (falls through to
+  UNVERIFIED); a negative from a different *resolved* principal no longer suppresses. Principal
+  binding is fail-safe: an empty principal on either side never removes a refutation that fired
+  before (so no real refutation is lost), and the precision-floor cap runs BEFORE the
+  REFUTED/UNVERIFIED branch split, so a demoted finding still ships capped — only the honesty label
+  changes. run_id/method/location/workflow binding deferred (not on Finding; run-scoping already
+  enforced per-run/per-exchange). +3 net tests: `test_negative_control_2` rewritten (it previously
+  *pinned the defect* — empty-neg refuting a specific-param finding; now asserts the preserved
+  empty-neg→empty-finding case) plus a hazard-closed test (empty-neg does NOT refute a specific-param
+  finding → UNVERIFIED) and a cross-principal pair (admin-neg does NOT refute a user-finding →
+  UNVERIFIED; same-principal user-neg DOES refute → positive control). FR-5 preservation tests
+  (`test_negative_on_parameter_A_does_not_refute_parameter_B`, `test_negative_control_1...`) byte-for-byte
+  unchanged; `_controlled_negative_classes` untouched; `test_pipeline_gate.py` defect-injection controls
+  unaffected (same-case matching). No `config.yaml` change (strict correctness tightening, no gate).
+  Full suite exit 0 (harness unittest + pytest 38 + evaluation 221 + evaluation-integrity 42 all green;
+  targeted `test_confirmation_gate` 28 OK).
 - **Domain:** Verification / Trust · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED, re-read this session):** `_has_controlled_negative`
   ([harness/confirmation_gate.py:610](harness/confirmation_gate.py)) — **FR-5** already stops a negative

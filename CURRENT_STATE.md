@@ -17,13 +17,17 @@ control (skipped/error/blocked) no longer counts as a clean negative, so it can 
 longer manufacture a VERIFIED verdict; INCONCLUSIVE reason + candidate state instead.
 `2764a60` closes **SC-2** (A2) — credential grants now require a noise-tolerant
 authorization discriminator (trigram similarity ≥ 0.70 vs both controls), so a merely
-noisy public response no longer reads as a grant/escalation. Both are strict tightenings.
+noisy public response no longer reads as a grant/escalation. `debb3e7` closes **SC-3**
+(A3) — controlled negatives bind to the exact case: the empty-parameter wildcard is
+retired (empty-neg refutes only an empty-param finding) and a resolved cross-principal
+negative no longer suppresses; fail-safe (empty principal never loses a refutation), still
+capped on demotion. All three are strict evidence-correctness tightenings.
 
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: 2784 unittest OK (2 skipped, +7 SC-1 +4 SC-2 tests), pytest 38 passed,
-  evaluation 221 OK, evaluation integrity 42 OK. Workspace pytest temp dir required.
+- Full: exit 0 (harness unittest +7 SC-1 +4 SC-2 +3 SC-3 tests, 2 skipped;
+  pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
 - Smoke: 92 OK. Orchestrator preconditions: 60 OK.
 - Requirement report still lists 36 gaps; offline passes do not close them.
 - Java: actual Gradle 8.7/JDK 17 `test shadowJar` succeeded; 229 tests,
@@ -39,9 +43,9 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-1. SC-1 + SC-2 done (oracle inconclusive-vs-clean; credential-grant
-   authorization discriminator). Next: SC-3 bind controls to the exact case
-   (retire the empty-parameter wildcard); then SC-4 fail-closed workflow assertions.
+1. SC-1 + SC-2 + SC-3 done (oracle inconclusive-vs-clean; credential-grant
+   authorization discriminator; control-identity case/principal binding). Next:
+   SC-4 fail-closed workflow assertions; then SC-5 ReportPolicy parity (MCP).
 2. Require positive authorization evidence for learned credentials; preserve
    noisy public-response negative fixtures.
 3. Reject unknown workflow assertions; fix wheel resources/writable state paths.
