@@ -174,6 +174,31 @@ class TestNegativeControl(unittest.TestCase):
         self.assertFalse(cap.verified)
         self.assertFalse(cap.negative_control_available)
 
+    def _assert_inconclusive_control(self, status):
+        # A control probe that did not execute to a not_confirmed verdict (skipped/
+        # error/blocked) must be INCONCLUSIVE, never a clean negative -- SC-1.
+        benign_result = ValidationResult("fake", status, "ssrf", confirmed=False,
+                                         summary=f"control {status}")
+        v = ScriptedValidator([_confirmed(), _confirmed(), _confirmed()],
+                              benign_marker="BENIGN", benign_result=benign_result)
+        oracle = Oracle(v, n_required=3, negative_control=self._builder(),
+                        require_negative_control=True)
+        cap = run(oracle.run(_finding(), _exchange()))
+        self.assertTrue(cap.reproduced)
+        self.assertTrue(cap.negative_control_available)
+        self.assertFalse(cap.negative_control_clean)
+        self.assertFalse(cap.verified)
+        self.assertIn("INCONCLUSIVE", cap.reason)
+
+    def test_skipped_control_is_inconclusive_not_clean(self):
+        self._assert_inconclusive_control("skipped")
+
+    def test_error_control_is_inconclusive_not_clean(self):
+        self._assert_inconclusive_control("error")
+
+    def test_blocked_control_is_inconclusive_not_clean(self):
+        self._assert_inconclusive_control("blocked")
+
 
 class TestProofCapsule(unittest.TestCase):
     def test_capsule_id_stable_over_decisive_facts(self):

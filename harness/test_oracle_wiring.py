@@ -28,6 +28,18 @@ def _report(cls="ssrf"):
     return AgentReport(agent="fake_agent", model="fake_model", findings=[finding])
 
 
+def _sqli_report():
+    return _report(cls="sqli")
+
+
+def _sqli_exchange():
+    # Carries the attack marker SqlmapWiringValidator.validate() looks for. The
+    # real "sqlmap" negative-control builder (harness.negative_controls
+    # ._benign_integer) replaces every query value with "1", so the benign
+    # variant it builds from this exchange will NOT contain the marker.
+    return HttpExchange(url="http://127.0.0.1/x?id=SQLI_PAYLOAD", method="GET")
+
+
 class ConfirmingValidator(Validator):
     """Confirms once (the initial `_validate_findings` dispatch call), and
     tracks every subsequent call the oracle gate makes if it fires."""
@@ -61,6 +73,40 @@ class NeverConfirmingValidator(Validator):
         return ValidationResult(
             "ssrf", "not_confirmed", "ssrf", confidence=0.0, confirmed=False,
             summary="no callback")
+
+    def plan(self, finding, exchange):
+        return None
+
+
+class SqlmapWiringValidator(Validator):
+    """SC-1 caller-level fixture: named "sqlmap" so the real
+    negative_controls.BUILDERS["sqlmap"] (_benign_integer) is the builder the
+    oracle picks up, and "sqlmap" is NOT in negative_controls.SELF_CONTROLLING,
+    so a benign-variant control IS required to reach VERIFIED -- unlike
+    ConfirmingValidator above (name "ssrf", self-controlling).
+
+    Confirms whenever the attack marker is present in the exchange URL (the
+    original, vulnerable exchange, and every oracle reproduction of it, which
+    reuse that same exchange); on the benign variant the real builder derives
+    (marker replaced by a plain "1"), returns the scripted control result --
+    this is how SC-1's skipped/error/blocked-control paths are exercised
+    end-to-end through the real _validate_findings -> _oracle_gate wiring."""
+    name = "sqlmap"
+    finding_classes = {"sqli"}
+    active = True
+    ATTACK_MARKER = "SQLI_PAYLOAD"
+
+    def __init__(self, control_result):
+        self.calls = 0
+        self._control_result = control_result
+
+    async def validate(self, finding, exchange):
+        self.calls += 1
+        if self.ATTACK_MARKER in exchange.url:
+            return ValidationResult(
+                "sqlmap", "confirmed", "sqli", confidence=0.9, confirmed=True,
+                summary="boolean-based blind diff observed", evidence="TRUE/FALSE page diff")
+        return self._control_result
 
     def plan(self, finding, exchange):
         return None
@@ -174,6 +220,61 @@ class TestOracleGateEnabled(unittest.TestCase):
         self.assertFalse(finding.oracle_verified)
         # Only the initial dispatch call -- the oracle gate never fired.
         self.assertEqual(validator.calls, 1)
+
+
+class TestOracleGateNegativeControlTerminalStatuses(unittest.TestCase):
+    """SC-1 (REVIEW.md A1), caller-level: a failed/inconclusive negative
+    control must not produce VERIFIED. Drives the REAL _validate_findings ->
+    _oracle_gate -> OracleRegistry -> Oracle.run_negative_control path (no
+    mocking of oracle_framework itself) with a validator whose control leg
+    terminates in each status the real world can hand back."""
+
+    def _run_with_control_status(self, status):
+        control_result = ValidationResult(
+            "sqlmap", status, "sqli", confidence=0.0, confirmed=False,
+            summary=f"control probe ended: {status}")
+        validator = SqlmapWiringValidator(control_result)
+        h = Harness(validator, config={"oracle": {"enabled": True, "n_required": 2}})
+        report = _sqli_report()
+        p1, p2, p3 = _patch_persistence()
+        with p1, p2, p3:
+            run(h._validate_findings(_sqli_exchange(), [report]))
+        return report.findings[0], validator
+
+    def test_control_not_confirmed_promotes_to_verified(self):
+        # Positive case: the control probe EXECUTED and cleanly declined to
+        # confirm on the benign variant -- this is the only status that may
+        # promote the finding to verified.
+        finding, validator = self._run_with_control_status("not_confirmed")
+        self.assertTrue(finding.confirmed)
+        self.assertTrue(finding.oracle_verified)
+        self.assertEqual(finding.verification_state, "verified")
+        # One dispatch call + n_required (2) reproduction calls + 1 control call.
+        self.assertEqual(validator.calls, 4)
+
+    def test_control_skipped_stays_candidate_inconclusive(self):
+        finding, validator = self._run_with_control_status("skipped")
+        self.assertTrue(finding.confirmed)
+        self.assertFalse(finding.oracle_verified)
+        self.assertEqual(finding.verification_state, "candidate")
+        self.assertIn("INCONCLUSIVE", finding.oracle_reason)
+        self.assertEqual(validator.calls, 4)
+
+    def test_control_error_stays_candidate_inconclusive(self):
+        finding, validator = self._run_with_control_status("error")
+        self.assertTrue(finding.confirmed)
+        self.assertFalse(finding.oracle_verified)
+        self.assertEqual(finding.verification_state, "candidate")
+        self.assertIn("INCONCLUSIVE", finding.oracle_reason)
+        self.assertEqual(validator.calls, 4)
+
+    def test_control_blocked_stays_candidate_inconclusive(self):
+        finding, validator = self._run_with_control_status("blocked")
+        self.assertTrue(finding.confirmed)
+        self.assertFalse(finding.oracle_verified)
+        self.assertEqual(finding.verification_state, "candidate")
+        self.assertIn("INCONCLUSIVE", finding.oracle_reason)
+        self.assertEqual(validator.calls, 4)
 
 
 if __name__ == "__main__":
