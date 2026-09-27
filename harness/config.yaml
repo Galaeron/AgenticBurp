@@ -664,3 +664,18 @@ pattern_memory:
 # scheduler/endpoint is a later slice.
 store:
   evidence_retention_days: 0
+
+# Per-run knobs (harness/run_context.py RunContext.create reads
+# runs.cache_namespace; unset here, so cache_namespace defaults to "").
+runs:
+  # FR-7 (F11): run-INDEPENDENT reuse of the pre-proof half of an analysis
+  # (model-inference-derived reports, never proof/case/oracle fields --
+  # see cache.HypothesisCacheEntry/get_hypothesis/put_hypothesis) across
+  # DIFFERENT runs' cache_namespaces on identical traffic. The existing
+  # run-namespaced full-response cache (ExchangeCache.get/put) is untouched
+  # and remains the only cache active while this is off. SAFE DEFAULT:
+  # false -- ships off; a hit still always falls through to
+  # _validate_findings so proof/case identifiers are freshly minted for
+  # THIS run, never replayed from a prior one.
+  hypothesis_cache:
+    enabled: false

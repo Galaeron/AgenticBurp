@@ -32,7 +32,7 @@ from pathlib import Path
 import sqlite3
 from threading import Lock
 
-from harness.models import HttpExchange, AnalysisResponse
+from harness.models import HttpExchange, AnalysisResponse, AgentReport, StageOutcome
 
 log = logging.getLogger("harness.cache")
 
@@ -87,6 +87,67 @@ class CacheEntry:
     def is_stale(self, current_model: str, current_prompts: dict[str, str]) -> bool:
         """Check if this entry is stale due to model or prompt changes."""
         if self.model != current_model:
+            return True
+        for agent, version in current_prompts.items():
+            if agent in self.prompt_versions and self.prompt_versions[agent] != version:
+                return True
+        return False
+
+
+@dataclass
+class HypothesisCacheEntry:
+    """FR-7 (F11): a run-INDEPENDENT cache entry for the *pre-proof* half of an
+    analysis -- the model-inference-derived `reports` (list[AgentReport]) plus
+    exactly the tail metadata Orchestrator.analyze() needs to finish the run
+    (dispatch/reason/stage_outcomes/findings_reviewed/findings_rejected).
+
+    This is deliberately NOT an AnalysisResponse and never carries one. It is
+    captured at the point in analyze() BEFORE `_validate_findings` runs --
+    i.e. before any Finding on these reports has a proof_id, case_id, or any
+    oracle_* field (those are always "" / False / "candidate" at capture
+    time, see models.Finding's defaults) -- so there is structurally nothing
+    run-bound in here to leak across runs. put_hypothesis() additionally
+    refuses at runtime to store any report whose findings already carry one
+    of those fields, as a second, defensive guarantee.
+
+    Keyed WITHOUT the run's cache_namespace (see ExchangeCache.get/put above,
+    which use namespace=run_context.cache_namespace): this cache is meant to
+    be hit across DIFFERENT runs on identical traffic, which the namespaced
+    full-response cache (by design) can never do.
+    """
+    exchange_hash: str
+    reports: list[AgentReport]
+    dispatch: list[str]
+    reason: str
+    stage_outcomes: list[StageOutcome]
+    findings_reviewed: int
+    findings_rejected: int
+    created_at: float
+    ttl_seconds: float
+    model: str
+    prompt_versions: dict[str, str]
+    config_fingerprint: str
+
+    def is_expired(self) -> bool:
+        """Check if this cache entry has expired."""
+        return time.time() > (self.created_at + self.ttl_seconds)
+
+    def is_stale(
+        self,
+        current_model: str,
+        current_prompts: dict[str, str],
+        current_config_fingerprint: str,
+    ) -> bool:
+        """Mirrors CacheEntry.is_stale's model/prompt keying (same semantics:
+        a prompt only invalidates if THIS entry actually recorded a version
+        for that agent), plus a config_fingerprint check -- a config change
+        can change what pre-proof `reports` a given exchange should produce
+        (which agents run, which validators/detectors are active, etc.), so
+        it must invalidate a hypothesis-cache entry too, not just a model or
+        prompt-version change."""
+        if self.model != current_model:
+            return True
+        if self.config_fingerprint != current_config_fingerprint:
             return True
         for agent, version in current_prompts.items():
             if agent in self.prompt_versions and self.prompt_versions[agent] != version:
@@ -152,10 +213,16 @@ class ExchangeCache:
         self._TTL_SECONDS = ttl_seconds
         self._MAX_SIZE = max_size
         self._stats = CacheStats()
+        # FR-7: separate stats for the run-independent hypothesis cache
+        # (get_hypothesis/put_hypothesis below) -- kept apart from the
+        # full-response cache's own hits/misses/bypasses/evictions above so
+        # a caller can tell "did the run-namespaced cache hit" from "did the
+        # cross-run hypothesis cache hit" -- e.g. for hit-rate measurement.
+        self._hyp_stats = CacheStats()
         self._lock = Lock()
         self._enabled = enabled
         self._bypass_token = bypass_token
-        
+
         # Ensure database exists
         self._init_db()
     
@@ -188,6 +255,27 @@ class ExchangeCache:
                     "INSERT OR IGNORE INTO cache_stats (key, value) VALUES (?, 0)",
                     (field,)
                 )
+            # FR-7: sibling table for the run-independent hypothesis cache.
+            # Separate from cache_entries above -- never stores a
+            # response_json / AnalysisResponse, only the pre-proof payload
+            # (see HypothesisCacheEntry / put_hypothesis). Keyed by
+            # exchange_hash computed WITHOUT a run namespace (namespace="").
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS hypothesis_cache_entries (
+                    exchange_hash TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    ttl_seconds REAL NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_versions_json TEXT NOT NULL DEFAULT '{}',
+                    config_fingerprint TEXT NOT NULL DEFAULT '',
+                    access_count INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_hypothesis_cache_created
+                ON hypothesis_cache_entries(created_at)
+            """)
             conn.commit()
     
     def _get_connection(self) -> sqlite3.Connection:
@@ -399,7 +487,206 @@ class ExchangeCache:
                     
             except Exception as e:
                 log.warning(f"Cache store failed: {e}")
-    
+
+    # ------------------------------------------------------------------
+    # FR-7 (F11): run-independent hypothesis cache.
+    #
+    # Sibling of get()/put() above, but keyed WITHOUT a run namespace and
+    # storing only the pre-proof half of an analysis (reports/dispatch/
+    # reason/stage_outcomes/findings_reviewed/findings_rejected) instead of
+    # a full AnalysisResponse. This is what lets two DIFFERENT runs (each
+    # with their own cache_namespace) reuse the same model inference for
+    # identical traffic, while proof/case/oracle identifiers are always
+    # freshly minted per run by the caller's own tail (_validate_findings) --
+    # never stored or replayed from here. See HypothesisCacheEntry's
+    # docstring for the structural guarantee.
+    # ------------------------------------------------------------------
+
+    def get_hypothesis(
+        self,
+        exchange: HttpExchange,
+        current_model: str,
+        current_prompt_versions: dict[str, str],
+        config_fingerprint: str,
+        bypass: bool = False,
+    ) -> Optional["HypothesisCacheEntry"]:
+        """Look up a hypothesis-cache entry for this exchange. Returns None on
+        a miss/expiry/staleness, exactly like get() above, but the returned
+        entry (when present) carries `reports`/`dispatch`/`reason`/
+        `stage_outcomes`/`findings_reviewed`/`findings_rejected` only --
+        never an AnalysisResponse, never a proof/case/oracle field."""
+        if not self._enabled or bypass:
+            with self._lock:
+                self._hyp_stats.bypasses += 1
+            return None
+
+        exchange_hash = self.compute_exchange_hash(exchange, namespace="")
+
+        with self._lock:
+            try:
+                with self._get_connection() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM hypothesis_cache_entries WHERE exchange_hash = ?",
+                        (exchange_hash,)
+                    ).fetchone()
+
+                    if row is None:
+                        self._hyp_stats.misses += 1
+                        return None
+
+                    payload = json.loads(row["payload_json"])
+                    entry = HypothesisCacheEntry(
+                        exchange_hash=row["exchange_hash"],
+                        reports=[AgentReport.model_validate(r) for r in payload["reports"]],
+                        dispatch=list(payload["dispatch"]),
+                        reason=payload["reason"],
+                        stage_outcomes=[StageOutcome.model_validate(o) for o in payload["stage_outcomes"]],
+                        findings_reviewed=payload["findings_reviewed"],
+                        findings_rejected=payload["findings_rejected"],
+                        created_at=row["created_at"],
+                        ttl_seconds=row["ttl_seconds"],
+                        model=row["model"],
+                        prompt_versions=json.loads(row["prompt_versions_json"]),
+                        config_fingerprint=row["config_fingerprint"],
+                    )
+
+                    if entry.is_expired():
+                        conn.execute(
+                            "DELETE FROM hypothesis_cache_entries WHERE exchange_hash = ?",
+                            (exchange_hash,)
+                        )
+                        self._hyp_stats.misses += 1
+                        self._hyp_stats.evictions += 1
+                        return None
+
+                    if entry.is_stale(current_model, current_prompt_versions, config_fingerprint):
+                        conn.execute(
+                            "DELETE FROM hypothesis_cache_entries WHERE exchange_hash = ?",
+                            (exchange_hash,)
+                        )
+                        self._hyp_stats.misses += 1
+                        self._hyp_stats.evictions += 1
+                        return None
+
+                    self._hyp_stats.hits += 1
+                    conn.execute(
+                        "UPDATE hypothesis_cache_entries SET access_count = access_count + 1 "
+                        "WHERE exchange_hash = ?",
+                        (exchange_hash,)
+                    )
+                    log.debug(f"Hypothesis cache hit for exchange {exchange_hash[:16]}...")
+                    return entry
+
+            except Exception as e:
+                log.warning(f"Hypothesis cache lookup failed: {e}")
+                self._hyp_stats.misses += 1
+                return None
+
+    def put_hypothesis(
+        self,
+        exchange: HttpExchange,
+        *,
+        dispatch: list[str],
+        reason: str,
+        reports: list[AgentReport],
+        stage_outcomes: list[StageOutcome],
+        findings_reviewed: int,
+        findings_rejected: int,
+        model: str,
+        prompt_versions: dict[str, str],
+        config_fingerprint: str,
+    ) -> None:
+        """Store the pre-proof, run-independent half of an analysis.
+
+        `reports` MUST be captured before the caller's _validate_findings
+        runs (before any proof/case/oracle field is minted) -- as a second,
+        defensive guarantee (belt-and-suspenders on top of the caller-side
+        structural guarantee), this refuses to persist anything if any
+        finding already carries a non-empty proof_id/case_id or a set
+        oracle_* field, rather than risk caching a run-bound value.
+        """
+        if not self._enabled:
+            return
+
+        for r in reports:
+            for f in r.findings:
+                if (f.proof_id or f.case_id or f.oracle_verified
+                        or f.oracle_capsule_id or f.oracle_reason):
+                    log.warning(
+                        "Refusing hypothesis-cache put: a Finding already carries a "
+                        "run-bound proof/oracle field -- these must never be cached."
+                    )
+                    return
+
+        exchange_hash = self.compute_exchange_hash(exchange, namespace="")
+        payload = {
+            "reports": [r.model_dump() for r in reports],
+            "dispatch": list(dispatch),
+            "reason": reason,
+            "stage_outcomes": [o.model_dump() for o in stage_outcomes],
+            "findings_reviewed": findings_reviewed,
+            "findings_rejected": findings_rejected,
+        }
+
+        with self._lock:
+            try:
+                with self._get_connection() as conn:
+                    self._evict_hypothesis_if_needed(conn)
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO hypothesis_cache_entries
+                        (exchange_hash, payload_json, created_at, ttl_seconds, model,
+                         prompt_versions_json, config_fingerprint)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            exchange_hash,
+                            json.dumps(payload),
+                            time.time(),
+                            self._TTL_SECONDS,
+                            model,
+                            json.dumps(prompt_versions),
+                            config_fingerprint,
+                        )
+                    )
+                    log.debug(f"Cached hypothesis for exchange {exchange_hash[:16]}...")
+
+            except Exception as e:
+                log.warning(f"Hypothesis cache store failed: {e}")
+
+    def _evict_hypothesis_if_needed(self, conn: sqlite3.Connection) -> None:
+        """Evict old hypothesis-cache entries if at capacity (mirrors
+        _evict_if_needed for the full-response cache below)."""
+        count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM hypothesis_cache_entries"
+        ).fetchone()["cnt"]
+        if count >= self._MAX_SIZE:
+            delete_count = max(1, self._MAX_SIZE // 10)
+            conn.execute(
+                """
+                DELETE FROM hypothesis_cache_entries
+                WHERE exchange_hash IN (
+                    SELECT exchange_hash FROM hypothesis_cache_entries
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                )
+                """,
+                (delete_count,)
+            )
+            self._hyp_stats.evictions += delete_count
+            log.info(f"Evicted {delete_count} old hypothesis-cache entries")
+
+    def hypothesis_stats(self) -> CacheStats:
+        """Current hypothesis-cache statistics (separate from stats() above,
+        which reports the full-response cache's own counters)."""
+        with self._lock:
+            return CacheStats(
+                hits=self._hyp_stats.hits,
+                misses=self._hyp_stats.misses,
+                bypasses=self._hyp_stats.bypasses,
+                evictions=self._hyp_stats.evictions,
+            )
+
     def _evict_if_needed(self, conn: sqlite3.Connection) -> None:
         """Evict old entries if the cache is at capacity."""
         count = conn.execute("SELECT COUNT(*) as cnt FROM cache_entries").fetchone()["cnt"]
