@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 
+from harness import identity_compare
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 from harness.circuit_breaker import get_ollama_circuit_breaker
 # W-16: the single TargetTransport. Imported by name (not as the module) because
@@ -57,6 +58,22 @@ def _responses_equivalent(a: ExecutionOutcome, b: ExecutionOutcome) -> bool:
     a_body = (a.body or "") if a is not None else ""
     b_body = (b.body or "") if b is not None else ""
     return a_status == b_status and a_body == b_body
+
+
+def _responses_materially_same(a: ExecutionOutcome, b: ExecutionOutcome) -> bool:
+    """Noise-tolerant counterpart to _responses_equivalent: two probe outcomes
+    represent the SAME access (not an authorization grant) when they share a
+    status and their bodies are similar above identity_compare.MATCH_THRESHOLD.
+    Per-request noise (nonce/timestamp/CSRF/ads/rate-limit/login pages) stays
+    below the grant signal because trigram similarity of a body differing only
+    in one volatile token lands well above the match threshold, while two
+    genuinely different resources fall below it. Reuses the same
+    None->status / errored->body normalization _responses_equivalent applies."""
+    a_status = a.status if a is not None else None
+    b_status = b.status if b is not None else None
+    a_body = (a.body or "") if a is not None else ""
+    b_body = (b.body or "") if b is not None else ""
+    return a_status == b_status and identity_compare.similarity(a_body, b_body) >= identity_compare.MATCH_THRESHOLD
 
 
 class ChainMixin:
@@ -329,7 +346,7 @@ class ChainMixin:
             if not anon.ok or not invalid.ok:
                 return False  # control probe didn't complete -- can't establish a differential
 
-            if _responses_equivalent(cred, anon) or _responses_equivalent(cred, invalid):
+            if _responses_materially_same(cred, anon) or _responses_materially_same(cred, invalid):
                 return False  # public resource, or the token made no difference
             return True
         except Exception:

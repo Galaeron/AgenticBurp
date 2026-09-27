@@ -149,6 +149,33 @@ class CredentialGrantDifferentialTests(unittest.TestCase):
         )
         self.assertTrue(_run_grant(ft))
 
+    def test_noisy_public_resource_with_differing_nonce_returns_no_grant(self):
+        """SC-2: cred/anon/invalid all answer 200 with the SAME page, differing
+        only by a per-request volatile nonce (CSRF/timestamp-style token). The
+        old byte-exact `_responses_equivalent` would see three distinct bodies
+        and wrongly call this a grant; the noise-tolerant check must recognise
+        all three as materially the same access (public resource, not a
+        credential-driven differential) because their trigram similarity is
+        well above MATCH_THRESHOLD."""
+        stable = "this is a public marketing page. " * 20  # far longer than the nonce
+        ft = _FakeTransport(
+            cred=ExecutionOutcome(outcome="ok", status=200, body=f'{stable}<meta name="csrf" content="1">'),
+            anon=ExecutionOutcome(outcome="ok", status=200, body=f'{stable}<meta name="csrf" content="2">'),
+            invalid=ExecutionOutcome(outcome="ok", status=200, body=f'{stable}<meta name="csrf" content="3">'),
+        )
+        self.assertFalse(_run_grant(ft))
+
+    def test_genuinely_different_privileged_body_vs_denied_controls_returns_grant(self):
+        """SC-2 paired positive: a genuinely different privileged body (not
+        merely a differing nonce on an otherwise-shared page) against denied
+        controls must still count as a grant under the noise-tolerant check."""
+        ft = _FakeTransport(
+            cred=ExecutionOutcome(outcome="ok", status=200, body="account #4471 owner=alice balance $500"),
+            anon=ExecutionOutcome(outcome="ok", status=401, body="please log in"),
+            invalid=ExecutionOutcome(outcome="ok", status=401, body="please log in"),
+        )
+        self.assertTrue(_run_grant(ft))
+
     def test_control_probe_exception_fails_closed(self):
         """Conservative failure: if a control probe raises, we cannot establish
         a differential, so the method must fail closed (no grant) -- never the
