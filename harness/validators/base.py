@@ -17,6 +17,13 @@ class ValidationResult:
     evidence: str = ""
     raw_output: str = ""
     command: list[str] = field(default_factory=list)
+    # RA-7: set ONLY on a genuine control-held cross-identity reject (every
+    # considered identity + anon baseline denied) -- distinguishes that from
+    # an inconclusive not_confirmed observation (reached-but-unproven, or
+    # ownership-authorized). Empty string means "not a control-held reject";
+    # trailing + defaulted so all existing positional/keyword construction
+    # of ValidationResult stays valid.
+    control_outcome: str = ""
 
 
 class Validator(ABC):

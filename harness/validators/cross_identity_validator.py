@@ -353,7 +353,8 @@ class CrossIdentityValidator(Validator):
                 summary="Function-level authorization holds: every non-privileged identity was denied "
                         "this admin-namespaced function (and anonymous too).",
                 evidence=f"{considered} non-privileged identity/identities tested against {exchange.url}; "
-                         f"all denied.")
+                         f"all denied.",
+                control_outcome="control_held")
         return self._skip(fc, "function-level comparison inconclusive")
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
@@ -464,6 +465,7 @@ class CrossIdentityValidator(Validator):
                 summary="Access correctly restricted: every configured other identity, and the anonymous "
                         "baseline, were denied this resource -- the single-exchange access-control hypothesis "
                         "is contradicted by an active cross-identity test.",
-                evidence=f"{considered} identity/identities tested against {exchange.url}; all rejected")
+                evidence=f"{considered} identity/identities tested against {exchange.url}; all rejected",
+                control_outcome="control_held")
         return self._skip(fc, "cross-identity comparison inconclusive (no confirmation, and not every "
                               "identity was cleanly rejected)")

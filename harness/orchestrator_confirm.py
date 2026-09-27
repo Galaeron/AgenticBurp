@@ -619,11 +619,22 @@ class ConfirmMixin:
         # access-control hypothesis is false, exactly like access_control_gate's
         # denial rule. Cap confidence and severity so the guess stops reading as
         # actionable, while keeping it (at low) for audit.
+        #
+        # RA-7: cross_identity_validator returns status="not_confirmed" for
+        # THREE distinct outcomes -- a genuine control-held reject (every
+        # considered identity + anon denied), an ownership-authorized
+        # observation, and a BFLA reached-but-unproven observation. Only the
+        # first is a real refutation; the other two are inconclusive leads
+        # that must not be capped/demoted/stamped "access correctly
+        # restricted". control_outcome=="control_held" is the discriminator
+        # (getattr for safety against older/foreign ValidationResult
+        # instances that predate the field).
         for result, meta in zip(results, metas):
             finding, validator, _case = meta
             if (not isinstance(result, Exception)
                     and result.validator == "cross_identity"
                     and result.status == "not_confirmed"
+                    and getattr(result, "control_outcome", "") == "control_held"
                     and not finding.confirmed
                     and finding.confidence > _CROSS_IDENTITY_REJECT_CAP):
                 finding.original_confidence = finding.confidence
