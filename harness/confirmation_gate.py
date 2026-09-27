@@ -586,14 +586,21 @@ def _controlled_negatives(validation_reports: list | None) -> dict:
     never produced a verdict (skipped / error / disabled / absent), which is NOT
     evidence of a false positive and must not be labelled as one.
 
-    Returns {canonical_class: {parameter_or_empty, ...}}. A negative whose
-    `ValidationReport.parameter` is empty (the pre-FR-5 default, or a genuinely
-    non-parameter-scoped check) is recorded as a CLASS-LEVEL negative -- kept in
-    the set under the empty string -- and continues to refute any same-class
-    finding exactly as before (backward compatibility / endpoint-level checks).
-    A negative with a NON-EMPTY parameter only refutes a finding with that SAME
+    Returns {canonical_class: {(parameter_or_empty, principal_or_empty), ...}}.
+    A negative whose `ValidationReport.parameter` is empty (the pre-FR-5
+    default, or a genuinely non-parameter-scoped check) is recorded as a
+    CLASS-LEVEL negative -- kept under the empty-parameter tuple -- and
+    continues to refute any same-class finding with an EMPTY parameter_name
+    exactly as before (backward compatibility / endpoint-level checks). A
+    negative with a NON-EMPTY parameter only refutes a finding with that SAME
     parameter_name: one parameter's controlled negative must not demote a
-    different, untested parameter of the same class to "likely false positive"."""
+    different, untested parameter of the same class to "likely false
+    positive" (SC-3: nor an unknown/empty parameter -- the empty string is no
+    longer a wildcard that matches everything).
+
+    SC-3: each entry also carries the `principal_id` the validator ran under,
+    so a negative recorded for one principal cannot be used to refute a
+    finding discovered under a different, resolved principal."""
     from harness.categories import canonicalize
     neg: dict = {}
     for vr in validation_reports or []:
@@ -603,28 +610,42 @@ def _controlled_negatives(validation_reports: list | None) -> dict:
             fc = getattr(vr, "finding_class", "") or ""
             fc_canon = canonicalize(fc) or fc.lower()
             param = getattr(vr, "parameter", "") or ""
-            neg.setdefault(fc_canon, set()).add(param)
+            principal = getattr(vr, "principal_id", "") or ""
+            neg.setdefault(fc_canon, set()).add((param, principal))
     return neg
 
 
-def _has_controlled_negative(negatives: dict, fc_canon: str, parameter_name: str) -> bool:
-    """FR-5 (F09): True when `negatives` (from `_controlled_negatives`) contains
-    a controlled negative that REFUTES a finding of class `fc_canon` and
-    parameter `parameter_name` -- either:
-      - a class-level negative (recorded with an empty parameter -- backward
-        compat / genuinely non-parameter-scoped checks), or
-      - a same-case negative whose parameter equals this finding's parameter.
+def _has_controlled_negative(
+        negatives: dict, fc_canon: str, parameter_name: str, principal_id: str = "") -> bool:
+    """FR-5/SC-3 (F09): True when `negatives` (from `_controlled_negatives`)
+    contains a controlled negative that REFUTES a finding of class
+    `fc_canon`, parameter `parameter_name`, and principal `principal_id`.
 
-    A same-class negative recorded under a DIFFERENT non-empty parameter does
-    NOT match here -- that is the whole point of the fix: it leaves the
-    untested parameter to fall through to the existing UNVERIFIED tier instead
-    of being refuted."""
-    params = negatives.get(fc_canon)
-    if not params:
+    A negative (neg_param, neg_principal) matches iff:
+      - neg_param == parameter_name (exact match; SC-3 retires the old
+        `"" in params` wildcard -- an empty-parameter negative no longer
+        refutes a finding whose OWN parameter is a specific, known value; it
+        only refutes another empty-parameter [genuinely endpoint-level]
+        finding), AND
+      - principal does NOT discriminate against the match unless BOTH sides
+        are resolved (non-empty) and differ -- an empty principal on either
+        side never removes a refutation that would otherwise fire.
+
+    A same-class negative recorded under a DIFFERENT non-empty parameter, or
+    under a different resolved principal, does NOT match here -- that is the
+    whole point of the fix: it leaves the untested/different-principal case
+    to fall through to the existing UNVERIFIED tier instead of being
+    refuted."""
+    entries = negatives.get(fc_canon)
+    if not entries:
         return False
-    if "" in params:
+    for neg_param, neg_principal in entries:
+        if neg_param != parameter_name:
+            continue
+        if neg_principal and principal_id and neg_principal != principal_id:
+            continue
         return True
-    return bool(parameter_name) and parameter_name in params
+    return False
 
 
 def apply_confirmation_suppression(
@@ -705,7 +726,8 @@ def apply_confirmation_suppression(
                 # just the class -- a controlled negative on parameter A must not
                 # refute an untested parameter B of the same class.
                 has_controlled_negative = _has_controlled_negative(
-                    negatives, fc_canon, finding.parameter_name)
+                    negatives, fc_canon, finding.parameter_name,
+                    getattr(finding, "principal_id", ""))
                 # Cap for safety in both cases (the precision floor: an unconfirmed
                 # live-class finding never ships actionable), but DISTINGUISH why.
                 finding.confidence = min(finding.confidence, _REFUTED_CONFIDENCE_CAP)

@@ -251,6 +251,11 @@ class ValidationReport(BaseModel):
     url: str = ""
     method: str = ""
     parameter: str = ""
+    # SC-3: the principal (identity) this validation attempt ran under, so a
+    # controlled negative recorded under one principal cannot refute a finding
+    # discovered under a DIFFERENT principal of the same class/parameter.
+    # Optional/default-empty for backward compatibility.
+    principal_id: str = ""
 
 
 class StageOutcome(BaseModel):

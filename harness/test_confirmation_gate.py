@@ -12,23 +12,26 @@ def _finding(vc, severity="high", confidence=0.85, confirmed=False):
                    basis="derived", confirmed=confirmed)
 
 
-def _neg(finding_class, validator="v", parameter=""):
+def _neg(finding_class, validator="v", parameter="", principal=""):
     """A ValidationReport representing a REAL controlled negative: a leg ran and
     returned not_confirmed. This is what earns a REFUTED verdict (R08).
     FR-5 (F09): `parameter` binds the negative to a specific case; the default
-    ("") is a class-level negative, preserved for backward compatibility."""
+    ("") is a class-level negative, preserved for backward compatibility.
+    SC-3: `principal` binds the negative to the principal it ran under, so it
+    can't refute a finding discovered under a different, resolved principal."""
     return ValidationReport(validator=validator, status="not_confirmed",
                             finding_class=finding_class, confirmed=False,
-                            parameter=parameter)
+                            parameter=parameter, principal_id=principal)
 
 
-def _finding_param(vc, parameter_name, severity="high", confidence=0.85, confirmed=False):
+def _finding_param(vc, parameter_name, severity="high", confidence=0.85, confirmed=False,
+                    principal=""):
     """Like `_finding`, but with an explicit parameter_name -- FR-5 (F09) case
-    binding is keyed on this field."""
+    binding is keyed on this field. SC-3: `principal` sets principal_id."""
     return Finding(vulnerability_class=vc, confidence=confidence, severity=severity,
                    summary=f"{vc} on /x param={parameter_name}", evidence="e",
                    suggested_test="t", basis="derived", confirmed=confirmed,
-                   parameter_name=parameter_name)
+                   parameter_name=parameter_name, principal_id=principal)
 
 
 def _apply(finding, **kw):
@@ -283,20 +286,78 @@ class CaseBoundNegativeEvidenceTests(unittest.TestCase):
         self.assertTrue(finding_a.summary.startswith("[Hypothesis] "))
         self.assertEqual(finding_a.severity, "low")
 
-    def test_negative_control_2_parameter_less_negative_still_refutes_class(self):
-        """NEGATIVE CONTROL 2 (backward compat): a parameter-LESS negative
-        (parameter="", e.g. an endpoint-level/non-parameter-scoped check, or a
-        pre-FR-5 producer that never populated `parameter`) still refutes a
-        same-class finding regardless of that finding's own parameter -- the
-        class-level fallback must be preserved, no regression."""
+    def test_negative_control_2_parameter_less_negative_refutes_parameter_less_finding(self):
+        """NEGATIVE CONTROL 2 -- SC-3 defect-correction (REVIEW.md A3): this
+        test used to pin the DEFECT itself. It asserted that a parameter-LESS
+        negative (parameter="") refuted a finding with a SPECIFIC, known
+        parameter ("C") -- i.e. it used the empty string as a wildcard that
+        matched every case, including one that was never tested. That was
+        exactly the "unknown-parameter hazard" SC-3 closes: an empty
+        parameter on the NEGATIVE side does double duty as both "genuinely
+        endpoint-level" and "the tested finding's parameter was unknown", and
+        the old code could not tell those apart.
+
+        Corrected behaviour: a parameter-LESS negative still refutes a
+        parameter-LESS finding (a genuinely endpoint/non-parameter-scoped
+        check refuting a same-shaped finding) -- that is the real backward-
+        compatible case this control is meant to protect, and it is
+        PRESERVED. It no longer reaches across to refute a finding that DOES
+        have a specific parameter -- see
+        `test_parameter_less_negative_does_not_refute_specific_parameter_finding`
+        for that hazard-closed case."""
+        finding_empty = _finding("sqli", severity="critical")
+        self.assertEqual(finding_empty.parameter_name, "")
+        report = AgentReport(agent="sqli", model="test", findings=[finding_empty])
+        apply_confirmation_suppression(
+            [report], validation_reports=[_neg("sqli", parameter="")])
+
+        self.assertEqual(finding_empty.review_verdict, "unconfirmed_hypothesis")
+        self.assertTrue(finding_empty.summary.startswith("[Hypothesis] "))
+        self.assertEqual(finding_empty.severity, "low")
+
+    def test_parameter_less_negative_does_not_refute_specific_parameter_finding(self):
+        """SC-3 hazard-closed test: a parameter-LESS negative (parameter="")
+        must NOT refute a finding with a SPECIFIC, known parameter ("C") --
+        this is the wildcard defect `_has_controlled_negative` used to have
+        (`if "" in params: return True`). The finding's own parameter was
+        never actually tested by this negative, so it must fall through to
+        UNVERIFIED, not be demoted to "likely false positive"."""
         finding_c = _finding_param("sqli", "C", severity="critical")
         report = AgentReport(agent="sqli", model="test", findings=[finding_c])
         apply_confirmation_suppression(
             [report], validation_reports=[_neg("sqli", parameter="")])
 
-        self.assertEqual(finding_c.review_verdict, "unconfirmed_hypothesis")
-        self.assertTrue(finding_c.summary.startswith("[Hypothesis] "))
-        self.assertEqual(finding_c.severity, "low")
+        self.assertEqual(finding_c.review_verdict, "inconclusive_unverified")
+        self.assertTrue(finding_c.summary.startswith("[Unverified] "))
+        self.assertNotEqual(finding_c.review_verdict, "unconfirmed_hypothesis")
+
+    def test_cross_principal_negative_does_not_refute(self):
+        """SC-3: a controlled negative bound to one principal ("admin") must
+        not refute a finding of the SAME class and SAME parameter discovered
+        under a DIFFERENT, resolved principal ("user") -- a control from a
+        different principal is not evidence about this principal's case."""
+        finding_user = _finding_param("sqli", "A", severity="critical", principal="user")
+        report = AgentReport(agent="sqli", model="test", findings=[finding_user])
+        apply_confirmation_suppression(
+            [report], validation_reports=[_neg("sqli", parameter="A", principal="admin")])
+
+        self.assertEqual(finding_user.review_verdict, "inconclusive_unverified")
+        self.assertTrue(finding_user.summary.startswith("[Unverified] "))
+        self.assertNotEqual(finding_user.review_verdict, "unconfirmed_hypothesis")
+
+    def test_same_principal_negative_still_refutes(self):
+        """POSITIVE CONTROL for the cross-principal test above: a negative
+        bound to the SAME principal ("user") as the finding still refutes it
+        -- proves principal-binding didn't just disable refutation outright,
+        only mis-scoped (cross-principal) refutation."""
+        finding_user = _finding_param("sqli", "A", severity="critical", principal="user")
+        report = AgentReport(agent="sqli", model="test", findings=[finding_user])
+        apply_confirmation_suppression(
+            [report], validation_reports=[_neg("sqli", parameter="A", principal="user")])
+
+        self.assertEqual(finding_user.review_verdict, "unconfirmed_hypothesis")
+        self.assertTrue(finding_user.summary.startswith("[Hypothesis] "))
+        self.assertEqual(finding_user.severity, "low")
 
 
 class ActiveConfirmationProvenanceTests(unittest.TestCase):
