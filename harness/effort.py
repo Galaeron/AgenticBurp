@@ -1,4 +1,5 @@
 from __future__ import annotations
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -114,10 +115,24 @@ class EffortBudget:
     # on real sleeps. Defaults to the real clock in production.
     clock: Callable[[], float] = field(default=time.monotonic, repr=False)
     _overspend_confirmed: bool = field(default=False, repr=False)
-    # Set on the FIRST call to record(), not at construction, so an
-    # unused budget with max_duration_s set never trips just from time
-    # passing before any work was dispatched.
+    # SC-8: the deadline is now set at construction (see __post_init__),
+    # not on first record() -- a budget with max_duration_s set is live
+    # from the moment it exists, not from the moment work starts. This is
+    # a deliberate tightening (harder, not looser): an idle budget can now
+    # expire from time alone, closing the gap where dispatch could stall
+    # indefinitely before the wall-clock limit ever engaged.
     _deadline: float | None = field(default=None, repr=False)
+    # SC-8: in-flight reservations from reserve(), not yet committed or
+    # released. Only touched by reserve()/commit()/release(); a caller
+    # using only allow()/record() never moves this off 0.
+    _reserved: int = field(default=0, repr=False, compare=False)
+    # SC-8: serializes reserve()/commit()/release()/record() so concurrent
+    # dispatch cannot race the check-then-increment in reserve() past the
+    # budget. Not used by allow(), which stays a pure, lock-free check.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._deadline = self.clock() + self.max_duration_s if self.max_duration_s is not None else None
 
     @property
     def spent(self) -> int:
@@ -182,9 +197,64 @@ class EffortBudget:
         self._overspend_confirmed = True
 
     def record(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int) -> None:
-        if self.max_duration_s is not None and self._deadline is None:
-            self._deadline = self.clock() + self.max_duration_s
-        self.ledger.record(kind, model, prompt_tokens, completion_tokens)
+        with self._lock:
+            self.ledger.record(kind, model, prompt_tokens, completion_tokens)
+
+    def reserve(self, estimated_tokens: int) -> tuple[bool, str]:
+        """
+        SC-8: atomic pre-dispatch reservation for concurrent callers.
+        Mirrors allow()'s SOFT/HARD/deadline semantics, but checks
+        COMMITTED + IN-FLIGHT spend (self.spent + self._reserved) instead
+        of committed spend alone, so N concurrent dispatchers cannot all
+        pass a check that only looked at yesterday's ledger and jointly
+        overshoot the budget. Must be paired with commit() (normal
+        completion) or release() (aborted/failed call) so the reservation
+        doesn't leak.
+        """
+        with self._lock:
+            duration_passed = self._deadline_passed()
+            token_full = self.total_tokens is not None and (self.spent + self._reserved) >= self.total_tokens
+            if not duration_passed and not token_full:
+                self._reserved += max(0, estimated_tokens)
+                return True, ""
+            if token_full:
+                limit_desc = f"({self.spent + self._reserved}/{self.total_tokens} tokens)"
+            else:
+                limit_desc = f"(duration limit {self.max_duration_s}s reached)"
+            if self.mode == BudgetMode.HARD:
+                return False, (
+                    f"effort budget exhausted {limit_desc} in hard mode -- "
+                    f"dispatch stopped. Raise the budget or switch to soft mode to continue."
+                )
+            if self._overspend_confirmed:
+                self._reserved += max(0, estimated_tokens)
+                return True, f"over budget {limit_desc} -- continuing on operator confirmation"
+            return False, (
+                f"effort budget exhausted {limit_desc} in soft mode -- "
+                f"awaiting operator confirmation to continue past it (see confirm_overspend)"
+            )
+
+    def commit(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int,
+               reserved: int = 0) -> None:
+        """
+        SC-8: settle a reserve() with the real usage once a call
+        completes. Releases the estimate that reserve() held and records
+        the actual usage in one atomic step, so `spent` ends identical to
+        a bare record() of those actuals. Calls self.ledger.record
+        directly, NOT self.record -- self._lock is a plain (non-reentrant)
+        threading.Lock, so re-entering it via self.record here would
+        deadlock.
+        """
+        with self._lock:
+            self._reserved = max(0, self._reserved - max(0, reserved))
+            self.ledger.record(kind, model, prompt_tokens, completion_tokens)
+
+    def release(self, reserved: int) -> None:
+        """SC-8: full refund of a reservation for a call that failed or
+        was aborted before producing any usage to record -- no ledger
+        write, unlike commit()."""
+        with self._lock:
+            self._reserved = max(0, self._reserved - max(0, reserved))
 
 
 @dataclass
