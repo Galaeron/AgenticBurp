@@ -24,6 +24,9 @@ verification-correctness tightenings; SC-5/SC-7/SC-8 add opt-in/presentation sea
 byte-for-byte no-ops until wired. Also closed the last older-queue loop item: **FR-7** `c2cb427`
 (run-independent hypothesis cache, default-OFF; on a hit it falls through to `_validate_findings`
 so proof/case/oracle are re-minted per run, never cached/shared — pre-proof reports only).
+Re-analysis batch 2: **RA-7** `981c5ff` (cross-identity reject-downgrade now fires only on a genuine
+control-held reject via a `control_outcome` discriminator, not on inconclusive observations — the SC-1
+anti-pattern on the reject side); **RA-8** (workflow status-operand int validation) is next.
 **Owner-deferred:** SC-6 (wheel import needs off-host install + non-checkout-preserving refactor);
 SC-7 live browser wiring/health; SC-9..SC-15 (measurement/live-gated); FR-7 hit-rate measurement +
 default-ON. Per-item detail + Results in IMPROVEMENT_BACKLOG.md.
@@ -31,11 +34,11 @@ default-ON. Per-item detail + Results in IMPROVEMENT_BACKLOG.md.
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: exit 0 (harness unittest 2812 OK / 2 skipped, +38 loop tests [SC-1..SC-5,SC-7,SC-8,FR-7];
+- Full: exit 0 (harness unittest 2814 OK / 2 skipped, +40 loop tests [SC-1..SC-5,SC-7,SC-8,FR-7,RA-7];
   pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
-  (One earlier full run showed a single unattributed transient failure that did not reproduce across
-  two subsequent green runs; FR-7 ships default-OFF as a deterministic no-op, so it is not the cause —
-  worth a separate look at flaky full-suite tests.)
+  (One earlier full run during FR-7 showed a single unattributed transient failure that did not
+  reproduce across subsequent green runs; the default-OFF FR-7 no-op is not the cause — worth a
+  separate look at flaky full-suite tests.)
 - Smoke: 92 OK. Orchestrator preconditions: 60 OK.
 - Requirement report still lists 36 gaps; offline passes do not close them.
 - Java: actual Gradle 8.7/JDK 17 `test shadowJar` succeeded; 229 tests,

@@ -3357,7 +3357,26 @@ invariant at the operand level. Honour the non-negotiables: safe `config.yaml` d
 tightenings, no new flag), a caller-level test + negative control per item, `full` green before close.
 The pass found NO other offline item above the bar; the remaining backlog is owner/live/too-large.
 
-### [ ] RA-7 — Cross-identity REJECT downgrade must fire only on a genuine control-held reject, not on inconclusive observations
+### [x] RA-7 — Cross-identity REJECT downgrade must fire only on a genuine control-held reject, not on inconclusive observations
+- **Result (VERIFIED):** `981c5ff` — added a trailing `control_outcome: str = ""` to `ValidationResult`
+  and set `"control_held"` on EXACTLY the two genuine "every configured identity + the anonymous
+  baseline were denied" rejects (`cross_identity_validator` BFLA and BOLA `rejects == considered`
+  branches); the two `not_confirmed` OBSERVATION branches (BFLA reached-but-unproven conf 0.4, BOLA
+  ownership-authorized conf 0.3) are left unset. The deterministic reject-downgrade in
+  `_validate_findings` now requires `getattr(result, "control_outcome", "") == "control_held"` in
+  addition to the prior conditions, so an inconclusive observation (e.g. a non-admin that actually
+  REACHED an admin function) is no longer capped to 0.15 / demoted to LEAD / stamped the false "access
+  correctly restricted (every identity denied)" note — it falls through unmodified. This is the SC-1
+  anti-pattern (an inconclusive control must not produce a verdict) fixed on the reject side; strict
+  tightening toward honest evidence + recall, never loosening a genuine reject. Grep confirmed only 4
+  `not_confirmed` return sites (+ skip/error, unmatched by the guard), so no legitimate downgrade is
+  silently dropped. +2 negative-control tests (BFLA reached-unproven / BOLA ownership-authorized → NOT
+  downgraded, note absent; both fail against the old bare-status guard) driving the real
+  `_validate_findings`; the existing positive test's stub now sets `control_outcome="control_held"`
+  (faithful — it models the genuine reject) and still asserts low/0.15/"downgraded". No `config.yaml`
+  change (no new flag); `ValidationResult` field is trailing/defaulted (no consumer breaks — no
+  asdict/astuple/equality use); `test_pipeline_gate.py` untouched. Full suite exit 0 (harness 2814 OK /
+  2 skip, pytest 38, evaluation 221, evaluation-integrity 42; targeted 29 OK).
 - **Domain:** Confirmation-correctness / recall+honesty · **Effort:** M · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED, re-read this session):** the deterministic cross-identity reject-downgrade block
   ([harness/orchestrator_confirm.py:622-638](harness/orchestrator_confirm.py)) fires on ANY
