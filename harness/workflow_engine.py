@@ -203,8 +203,13 @@ def _assertions_hold(assertions: tuple[Assertion, ...], *, status: int | None,
     for assertion in assertions:
         if assertion.kind not in _ASSERTION_KINDS:
             return False, f"unknown assertion kind: {assertion.kind}"
-        if assertion.kind == "status" and status != int(assertion.expected):
-            return False, f"expected HTTP {assertion.expected}, got {status}"
+        if assertion.kind == "status":
+            try:
+                expected_status = int(assertion.expected)
+            except (TypeError, ValueError):
+                return False, f"malformed status assertion operand: {assertion.expected!r}"
+            if status != expected_status:
+                return False, f"expected HTTP {assertion.expected}, got {status}"
         if assertion.kind == "body_contains" and str(assertion.expected) not in (body or ""):
             return False, f"response omitted required marker {assertion.expected!r}"
         if assertion.kind == "json_pointer":
@@ -381,6 +386,11 @@ def _load_assertion(a: dict) -> Assertion:
         raise ValueError(f"unknown assertion kind: {kind}")
     if kind in ("status", "body_contains") and a.get("expected") is None:
         raise ValueError(f"assertion kind {kind!r} requires 'expected'")
+    if kind == "status":
+        try:
+            int(a.get("expected"))
+        except (TypeError, ValueError):
+            raise ValueError(f"status assertion 'expected' must be an integer, got {a.get('expected')!r}")
     if kind == "json_pointer" and not str(a.get("expression", "")):
         raise ValueError("json_pointer assertion requires 'expression'")
     return Assertion(kind, str(a.get("expression", "")), a.get("expected"))

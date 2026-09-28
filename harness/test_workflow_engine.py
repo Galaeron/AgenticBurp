@@ -255,6 +255,35 @@ class UnknownAssertionKindFailsClosedTests(unittest.TestCase):
         self.assertIn("unknown assertion kind", sr.reason)
         self.assertNotEqual(sr.status, StepStatus.PASSED)
 
+    def test_status_assertion_non_integer_expected_rejected_at_load_time(self):
+        declaration = {"id": "bad-status-expected", "version": 1, "steps": [
+            {"id": "step1", "method": "GET", "url_template": "http://t.test/x",
+             "session_ref": "alice", "assertions": [{"kind": "status", "expected": "abc"}]},
+        ]}
+        with self.assertRaises(ValueError):
+            workflow_from_dict(declaration)
+
+    def test_status_assertion_integer_expected_loads_fine(self):
+        declaration = {"id": "good-status-expected", "version": 1, "steps": [
+            {"id": "step1", "method": "GET", "url_template": "http://t.test/x",
+             "session_ref": "alice", "assertions": [{"kind": "status", "expected": 200}]},
+        ]}
+        wf = workflow_from_dict(declaration)
+        loaded = wf.steps[0].assertions[0]
+        self.assertEqual(loaded.kind, "status")
+        self.assertEqual(loaded.expected, 200)
+
+    def test_status_assertion_malformed_operand_fails_closed_at_runtime_not_passed(self):
+        step = WorkflowStep("read", "GET", "http://t.test/x", "alice",
+                            assertions=(Assertion("status", expected="abc"),))
+        wf = Workflow("w", (step,))
+        ctx = _Context([_out(200)])
+        result = asyncio.run(execute_workflow(wf, ctx))
+        sr = result.steps[0]
+        self.assertEqual(sr.status, StepStatus.FAILED)
+        self.assertNotEqual(sr.status, StepStatus.PASSED)
+        self.assertIn("malformed status assertion operand", sr.reason)
+
     def test_valid_assertions_still_execute_and_pass(self):
         step = WorkflowStep("read", "GET", "http://t.test/x", "alice",
                             assertions=(Assertion("status", expected=200),
