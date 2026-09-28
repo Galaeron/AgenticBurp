@@ -1,4 +1,4 @@
-# Current state — 2026-09-27
+# Current state — 2026-09-28
 
 ## Checkout and review
 
@@ -26,7 +26,9 @@ byte-for-byte no-ops until wired. Also closed the last older-queue loop item: **
 so proof/case/oracle are re-minted per run, never cached/shared — pre-proof reports only).
 Re-analysis batch 2: **RA-7** `981c5ff` (cross-identity reject-downgrade now fires only on a genuine
 control-held reject via a `control_outcome` discriminator, not on inconclusive observations — the SC-1
-anti-pattern on the reject side); **RA-8** (workflow status-operand int validation) is next.
+anti-pattern on the reject side); **RA-8** `c4a534b` (workflow `status` assertion operand validated
+int-coercible at load + fail-closed at runtime; completes SC-4). **All offline loop items now closed —
+pool exhausted; loop ended (LOOP_DONE).**
 **Owner-deferred:** SC-6 (wheel import needs off-host install + non-checkout-preserving refactor);
 SC-7 live browser wiring/health; SC-9..SC-15 (measurement/live-gated); FR-7 hit-rate measurement +
 default-ON. Per-item detail + Results in IMPROVEMENT_BACKLOG.md.
@@ -34,7 +36,7 @@ default-ON. Per-item detail + Results in IMPROVEMENT_BACKLOG.md.
 ## Fresh verification
 
 Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: exit 0 (harness unittest 2814 OK / 2 skipped, +40 loop tests [SC-1..SC-5,SC-7,SC-8,FR-7,RA-7];
+- Full: exit 0 (harness unittest 2817 OK / 2 skipped, +43 loop tests [SC-1..SC-5,SC-7,SC-8,FR-7,RA-7,RA-8];
   pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
   (One earlier full run during FR-7 showed a single unattributed transient failure that did not
   reproduce across subsequent green runs; the default-OFF FR-7 no-op is not the cause — worth a
@@ -55,12 +57,13 @@ Repository-root Python 3.12, existing `.venv-rationalisation`:
 
 ## Open work and recommended order
 
-All prior loop-consumable offline items are closed (SC-1..SC-5, SC-7 offline, SC-8, FR-7). A
-fresh 2026-09-27 re-analysis pass then filed two NEW offline items — **RA-7** (cross-identity
-REJECT downgrade fires on inconclusive observations, not just genuine control-held rejects — the
-SC-1 anti-pattern on the reject side) and **RA-8** (workflow `status` assertion operand not
-validated as int; completes SC-4) — dispatch order RA-7 → RA-8; the loop resumes on them next.
-All OTHER remaining work is owner/live-gated:
+ALL loop-consumable offline items are now closed (SC-1..SC-5, SC-7 offline, SC-8, FR-7, plus the
+2026-09-27 re-analysis batch 2: **RA-7** `981c5ff` + **RA-8** `c4a534b`). The offline loop pool is
+exhausted: batch 2 was itself a fresh re-analysis over the confirmation/verification, transport/policy,
+engagement, and store/report/api clusters and found NO other offline item above the bar; the analyzed
+code is unchanged since, so the loop is ended (LOOP_DONE) rather than re-running an identical pass. A
+future re-analysis is warranted only after the code changes or the owner lands live-gated work. All
+remaining work is owner/live-gated:
 1. SC-6 (A5): package config as a resource + separate writable state + exclude tests +
    entry points; verify by a fresh-venv install outside the checkout (needs off-host
    install; not checkout-behavior-preserving in one offline pass).

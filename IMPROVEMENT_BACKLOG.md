@@ -3414,7 +3414,25 @@ The pass found NO other offline item above the bar; the remaining backlog is own
 - **Impact:** High. **Follow-on to SC-1 (same anti-pattern, reject side; a different gate/object).**
 - **Source:** 2026-09-27 re-analysis batch 2.
 
-### [ ] RA-8 — Workflow "status" assertion must validate its operand is an integer (complete SC-4's fail-closed invariant)
+### [x] RA-8 — Workflow "status" assertion must validate its operand is an integer (complete SC-4's fail-closed invariant)
+- **Result (VERIFIED):** `c4a534b` — `_load_assertion` now rejects a non-int-coercible `expected` on a
+  `status` assertion at load time (ValueError, same shape as the unknown-kind / missing-operand raises,
+  placed after the existing `expected is not None` guard), so `{"kind":"status","expected":"abc"}` no
+  longer loads; int and digit-string operands (`200`, `"200"`) still load fine. Belt-and-suspenders:
+  `_assertions_hold` wraps the runtime `int(assertion.expected)` in try/except so a slipped-through operand
+  (e.g. a directly-constructed `Assertion` bypassing the loader) fails the step CLOSED
+  (`return False, "malformed status assertion operand: ..."`) instead of raising an unhandled
+  ValueError/TypeError out of `execute_workflow` (which previously crashed the run — only `finally`
+  cleanups ran). Valid operands are byte-identical (same `expected HTTP X, got Y` reason on mismatch, pass
+  on match). Completes SC-4 on the operand-TYPE half (SC-4 closed the unknown-KIND half at load+runtime).
+  +3 tests in `test_workflow_engine.py::UnknownAssertionKindFailsClosedTests`: NEGATIVE load control
+  (`workflow_from_dict` rejects `expected="abc"` → ValueError; fails against pre-change code, which loaded
+  it fine), POSITIVE load control (`expected=200` loads to a valid status Assertion), RUNTIME fail-closed
+  (a directly-constructed malformed `Assertion` → `StepStatus.FAILED`, reason "malformed status assertion
+  operand", `execute_workflow` returns rather than raising; fails against pre-change code, which raised out
+  of the run). No `config.yaml` change (no new flag; strict tightening). `test_pipeline_gate.py` untouched.
+  Full suite green: harness unittest 2817 OK / 2 skip (+3 RA-8 tests), pytest-native 38 passed, evaluation
+  221 OK, evaluation-integrity 42 OK (targeted `test_workflow_engine` 31 OK; smoke 92 OK).
 - **Domain:** Workflow robustness / fail-closed · **Effort:** S · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED, re-read this session):** `_assertions_hold` does
   `if assertion.kind == "status" and status != int(assertion.expected):`
