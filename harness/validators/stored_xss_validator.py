@@ -55,10 +55,16 @@ class StoredXssValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 driver=None):
+                 driver=None, run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._driver = driver
+        # R7: see browser_xss_validator's identical field -- bound per-dispatch
+        # by ValidatorRegistry.bind_run_context. Used both to pick THIS run's
+        # own gate for the plant/render client (instead of always the process
+        # default) and to thread scope/gate/budget/cancel into the optional
+        # execution-grade browser confirm below.
+        self.run_context = run_context
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "xss", summary=why)
@@ -111,7 +117,8 @@ class StoredXssValidator(Validator):
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and host not in self.allowed_hosts:
             return self._skip(f"host {host!r} out of scope")
-        if not get_default_gate().config.allow_mutating_replay:
+        gate = self.run_context.gate if self.run_context is not None else get_default_gate()
+        if not gate.config.allow_mutating_replay:
             return self._skip("stored-XSS plant is a mutating write; needs validators.allow_mutating_replay")
 
         method = (exchange.method or "POST").upper()
@@ -123,7 +130,7 @@ class StoredXssValidator(Validator):
             body, ctype = self._plant_body(exchange, payload)
             planted_headers = dict(headers); planted_headers["Content-Type"] = ctype
             try:
-                async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                async with GatedAsyncClient(gate, self.name, timeout=self.timeout,
                                             follow_redirects=False, verify=False) as client:
                     await global_throttle.acquire()
                     await client.request(method, exchange.url, headers=planted_headers, content=body)
@@ -164,7 +171,10 @@ class StoredXssValidator(Validator):
                 driver = browser_driver.default_driver()
                 if driver is None:
                     return ""
-            obs = await driver.visit(url, wait_ms=1200)
+            rc = self.run_context
+            visit_kw = (dict(scope=rc.scope, gate=rc.gate, budget=rc.budget, cancel=rc.cancel)
+                        if rc is not None else {})
+            obs = await driver.visit(url, wait_ms=1200, **visit_kw)
             # the payload's console.log nonce is inside the payload string; if the
             # page executed it, the nonce shows up in an execution sink.
             return ("Execution also confirmed in a headless browser."

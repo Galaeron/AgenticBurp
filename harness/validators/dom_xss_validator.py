@@ -55,13 +55,18 @@ class DomXssValidator(Validator):
 
     def __init__(self, *, timeout: float = 15.0, allowed_hosts: list[str] | None = None,
                  wait_ms: int = 1200, max_visits: int = 8, driver=None,
-                 cdp_endpoint: str | None = None):
+                 cdp_endpoint: str | None = None, run_context=None):
         self.timeout = timeout
         self.allowed_hosts = allowed_hosts or []
         self.wait_ms = wait_ms
         self.max_visits = max_visits
         self.cdp_endpoint = cdp_endpoint or None
         self._driver = driver
+        # R7: see browser_xss_validator's identical field -- bound per-dispatch
+        # by ValidatorRegistry.bind_run_context, threaded into the browser's
+        # request interception below so mid-visit redirects/subresources are
+        # policed by this run's actual scope/gate/budget.
+        self.run_context = run_context
 
     def _host_allowed(self, url: str) -> bool:
         if not self.allowed_hosts:
@@ -100,12 +105,17 @@ class DomXssValidator(Validator):
         nonce = "HARNESSDOM" + secrets.token_hex(8)
         urls = self._candidate_urls(exchange, nonce)
         errors: list[str] = []
+        # R7: only forwarded when a RunContext is bound -- see
+        # browser_xss_validator's identical comment.
+        rc = self.run_context
+        visit_kw = (dict(scope=rc.scope, gate=rc.gate, budget=rc.budget, cancel=rc.cancel)
+                    if rc is not None else {})
         for url in urls:
             await global_throttle.acquire()
             try:
                 # R25: drive the browser AS the captured identity, not anonymously.
                 obs = await driver.visit(url, wait_ms=self.wait_ms,
-                                         headers=exchange.request_headers)
+                                         headers=exchange.request_headers, **visit_kw)
             except Exception as e:
                 errors.append(f"{url[:120]}: {e.__class__.__name__}")
                 continue

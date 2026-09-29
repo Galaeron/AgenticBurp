@@ -143,6 +143,94 @@ class BrowserXssValidatorTests(unittest.TestCase):
         self.assertTrue(v.applies(_finding(), _exchange()))
 
 
+class _PolicyAwareDriver:
+    """Like _VulnDriver, but also accepts the SC-7 policy kwargs (scope/gate/
+    budget/cancel) so a test can prove R7 propagation without a real browser."""
+    def __init__(self, sink="console"):
+        self.sink = sink
+        self.calls = []
+
+    async def visit(self, url, *, wait_ms=1500, headers=None,
+                     scope=None, cancel=None, gate=None, budget=None):
+        self.calls.append(dict(scope=scope, cancel=cancel, gate=gate, budget=budget))
+        obs = ExecutionObservation(url=url)
+        m = _NONCE.search(url)
+        if m:
+            getattr(obs, self.sink).append(f"fired {m.group(0)}")
+        return obs
+
+
+class BrowserXssRunContextWiringTests(unittest.TestCase):
+    """R7: a bound RunContext's scope/gate/budget/cancel must reach the
+    browser driver's own request interception (SC-7), so a redirect or
+    subresource the payload triggers mid-visit is policed too -- not just the
+    initial navigation. Previously these validators never supplied them."""
+
+    def setUp(self):
+        global_throttle.configure(0)
+
+    def test_forwards_run_context_policy_to_driver(self):
+        from harness.run_context import RunContext
+        rc = RunContext.create(allowed_hosts=["shop.test"])
+        driver = _PolicyAwareDriver()
+        v = BrowserXssValidator(allowed_hosts=["shop.test"], driver=driver, run_context=rc)
+        r = asyncio.run(v.validate(_finding(), _exchange()))
+        self.assertEqual(r.status, "confirmed")
+        self.assertTrue(driver.calls)
+        call = driver.calls[0]
+        self.assertIs(call["scope"], rc.scope)
+        self.assertIs(call["gate"], rc.gate)
+        self.assertIs(call["budget"], rc.budget)
+        self.assertIs(call["cancel"], rc.cancel)
+
+    def test_no_run_context_calls_driver_without_policy_kwargs(self):
+        """NEGATIVE CONTROL: with no RunContext bound, the call must carry NO
+        new kwargs at all -- a driver that doesn't accept them (every
+        pre-existing fake driver, and any pre-R7 real caller) must keep
+        working unchanged."""
+        driver = _VulnDriver("console")  # legacy signature: no scope/gate/budget/cancel
+        v = BrowserXssValidator(allowed_hosts=["shop.test"], driver=driver)
+        r = asyncio.run(v.validate(_finding(), _exchange()))
+        self.assertEqual(r.status, "confirmed")
+
+    def test_budget_exhaustion_denies_visit_and_is_not_confirmed(self):
+        """R7 (denial/exhaustion actually honored, not merely passed through):
+        a driver that ENFORCES the forwarded budget (as the real SC-7 request
+        interception does) denies the navigation when the run's budget is
+        exhausted, so the payload never executes and the validator must NOT
+        confirm. Non-vacuous: pre-R7 `budget` was never forwarded, so the driver
+        would see budget=None, skip the check, fire the nonce, and (wrongly)
+        confirm -- exactly the ungoverned behavior R7 closes."""
+        from harness.run_context import RunContext
+        rc = RunContext.create(allowed_hosts=["shop.test"], max_requests=0)  # exhausted
+        driver = _BudgetEnforcingDriver()
+        v = BrowserXssValidator(allowed_hosts=["shop.test"], driver=driver, run_context=rc)
+        r = asyncio.run(v.validate(_finding(), _exchange()))
+        self.assertNotEqual(r.status, "confirmed")
+        self.assertFalse(r.confirmed)
+        self.assertGreater(driver.denied, 0, "the forwarded budget never actually denied a visit")
+
+
+class _BudgetEnforcingDriver:
+    """Simulates the real driver's SC-7 interception: consult the forwarded
+    budget before 'navigating'. If it is exhausted, deny -- the payload never
+    executes, so no sink is populated. A driver that received budget=None (the
+    pre-R7 call shape) would instead fire the nonce."""
+    def __init__(self):
+        self.denied = 0
+
+    async def visit(self, url, *, wait_ms=1500, headers=None,
+                     scope=None, cancel=None, gate=None, budget=None):
+        if budget is not None and not budget.reserve(1):
+            self.denied += 1
+            return ExecutionObservation(url=url)  # denied: no execution sink
+        obs = ExecutionObservation(url=url)
+        m = _NONCE.search(url)
+        if m:
+            obs.console.append(f"fired {m.group(0)}")
+        return obs
+
+
 class BrowserDriverAvailabilityTests(unittest.TestCase):
     def test_available_reports_reason(self):
         ok, reason = browser_driver.available()
