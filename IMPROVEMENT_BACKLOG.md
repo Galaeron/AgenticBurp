@@ -89,6 +89,23 @@ Honour the non-negotiables: safe `config.yaml` defaults (new gates ship OFF), a 
 test + negative control per item, `full` green before close. Do NOT import upstream code
 (**AGPL-3.0**) — reimplement patterns and document provenance.
 
+**2026-09-28 swarm-refresh reconciliation (offline; do this before selecting new work):** A
+delta-focused refresh (`reviews/2026-09-28/swarm-refresh/REVIEW.md` + `VERIFICATION.md`)
+re-tested the SC-1..SC-8/FR-7/RA-7/RA-8 batches against the checkout and reproduced seven
+residual/new counterexamples — **R1..R7**, filed as **Swarm-refresh batch — 2026-09-28 (R-\*)**
+at the end of this file. By the time this note was reconciled against the working tree
+(same day), **R1, R3, R4 (admission arithmetic only), R5 and R6 already had uncommitted
+production fixes on disk** — re-verified this session by re-running the review's own
+`probes.py` plus one isolated follow-up probe against the current working tree (both retained
+under the same review directory). **None of the five has a dedicated regression test or a
+commit yet** — that is the actual next step, not re-diagnosing them. R2 is genuinely partial
+(the `control_outcome` field and gate logic are correct when a validator populates it, but the
+exact site the review named has no caller-level test and an omitting validator still defaults
+to the legacy/negative reading). R7 is untouched. See CURRENT_STATE.md for the fresh full-suite
+result on this working tree and R-item-by-item status. Select **R1 → R3 → R5 → R6 → R4 → R2 →
+R7** (write the missing test + commit for the first five; finish R2's caller test and the
+analyze()-level site; then R7's caller wiring) before resuming older queue work.
+
 1. Work top-down: finish all `P0` items before `P1`, etc. Within a tier, respect
    `Depends on`.
 2. Pick the first item whose checkbox is `[ ]` and whose dependencies are all `[x]`.
@@ -3459,3 +3476,209 @@ The pass found NO other offline item above the bar; the remaining backlog is own
 - **Impact:** Medium-Low (operator-config-crash class; completes SC-4). **Follow-on to SC-4 (operand-type
   half).**
 - **Source:** 2026-09-27 re-analysis batch 2.
+
+## Swarm-refresh batch — 2026-09-28 (R-*)
+
+Source: [`reviews/2026-09-28/swarm-refresh/REVIEW.md`](reviews/2026-09-28/swarm-refresh/REVIEW.md) +
+[`VERIFICATION.md`](reviews/2026-09-28/swarm-refresh/VERIFICATION.md) (delta refresh of the SC-*/FR-7/RA-7/
+RA-8 batches against `ce387cf3`). At review time no production file was modified. By the time this batch
+was filed (same day), R1/R3/R4/R5/R6 already had **uncommitted** production fixes on disk; this session
+re-verified each by re-running the review's `probes.py` against the current working tree (it needed one
+local, scratch-only patch — a third `pipeline` side effect — because the R6 fix itself changes the call
+count the script assumes; the review's own `probes.json` is left untouched as the pre-fix historical
+record) plus one isolated follow-up probe for R2. Commands and before/after values are in
+CURRENT_STATE.md. **Same day, still within this session, R7 also landed a fix** (browser/DOM/stored-XSS
+callers now thread `run_context` through), and R1/R4/R7 picked up dedicated caller-level tests (R7's are
+new files; R1/R4's corrected two pre-existing tests that had asserted the pre-fix buggy behavior — see
+each item's own Result for which). **R2/R3/R5/R6 still have no dedicated regression test.** Every item
+below stays `[~]` (or `[ ]` for a truly untouched one) until it has both a test and a commit, per this
+file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need a test first.
+
+### [x] R1 — `_credential_grants_access` treats response dissimilarity alone as authorization
+- **Result (VERIFIED):** `c2fe5c75` — `harness/orchestrator_chain.py`'s `_credential_grants_access`
+  now requires an explicit denial (401/403, or a 3xx redirect away) from **both** the anonymous and
+  invalid-credential controls before accepting the credentialed response as authorized
+  (`_denied(anon) and _denied(invalid)`, replacing bare `_responses_materially_same`-based dissimilarity).
+  Re-verified this session via `probes.py`'s `credential_*` scenarios: both false-grant repros the review
+  reported (`public_rotating` — a per-response nonce; `public_status_variation` — 200/202/203 on an
+  identical public body) now return `False`; `public_stable`/`public_short_noise` stay `False`; the
+  positive control (`protected`: 200 vs two 401s) stays `True`. **Update (same day, still uncommitted):** a
+  caller-level test now exists — `test_credential_grant_differential.py` was corrected (the old
+  `test_genuine_grant_same_status_different_body_still_counts` asserted the pre-fix buggy behavior; it's
+  renamed to `test_same_status_different_body_without_denial_signal_returns_no_grant` and now asserts
+  `False`, with a new `test_genuine_grant_redirect_denial_controls` preserving the original scenario's
+  intent using real 302-redirect denials) plus a new `test_dissimilar_status_without_denial_returns_no_grant`
+  for the status-jitter case. **Closed (VERIFIED):** committed `c2fe5c75` with two added hardening
+  negative controls — `test_only_one_control_denied_returns_no_grant` pins the "BOTH controls must be
+  denied" `and` (an `or` mutant survived before), and `test_server_error_controls_are_not_a_denial_returns_no_grant`
+  pins `_denied`'s status set so a 5xx is not read as a denial (a `status>=300` mutant survived before);
+  `ExecutionOutcome.ok == (outcome=="ok")` was confirmed so both denied/5xx controls actually reach `_denied`.
+  `full` green: 2831 unittest OK (2 skipped), 38 pytest, 229 evaluation OK, 42 integrity OK, exit 0.
+- **Domain:** Detection precision / credential-learning trust boundary · **Effort:** S · **Depends on:**
+  none · **Mode:** LOOP (offline)
+- **Evidence:** `orchestrator_chain.py:349` (pre-fix) returned `True` whenever neither control was
+  materially similar to the credentialed response — dissimilarity, not a positive access fact.
+- **Problem:** A public endpoint with per-response nonces or jittering status codes was accepted as proof
+  bogus credentials grant access, feeding `_auto_escalate`'s learned-credential re-crawl.
+- **Recommendation:** (implemented, per Result) — add the caller test + negative controls above, then close.
+- **Acceptance criteria:** the five `credential_*` scenarios in `probes.py`, promoted to a real
+  `test_orchestrator_chain.py` (or equivalent) case; `full` green.
+- **Impact:** High. **Source:** 2026-09-28 swarm-refresh, residual A2/SC-2.
+
+### [~] R2 — RA-7's `control_outcome` discriminator still collapses at the final suppression site
+- **Result (in progress, uncommitted):** `models.py` now declares `ValidationReport.control_outcome`
+  (default `""`), `orchestrator_confirm.py` carries it from `ValidationResult` when building the report,
+  and `confirmation_gate._controlled_negatives`/`_has_controlled_negative` only count `outcome in ("",
+  "control_held")` as a controlled negative — so an explicit `control_outcome="inconclusive"` correctly
+  produces `inconclusive_unverified` instead of a refutation (re-verified in isolation this session: same
+  finding/report, `control_outcome` swept over `""`/`"control_held"`/`"inconclusive"` — only the third
+  yields the honest "neither confirmed nor refuted" verdict). `cross_identity_validator.py`'s two genuine
+  reached-but-unproven branches now set `control_outcome="inconclusive"` explicitly. **What's still
+  missing (this is the actual residual, not a re-file of the original RA-7 finding):** (a) no test drives
+  this through the full `Orchestrator.analyze()` path — the existing `test_cross_identity_reject.py`
+  fixtures stop at `_validate_findings`, and this session's attempt to exercise the full path with the
+  *existing* `_CrossIdentityBflaReachedUnprovenValidator` stub reproduced the old symptom, because that
+  stub's own docstring convention (predating this fix) is to leave `control_outcome` **unset** for
+  "inconclusive" — which the gate's backward-compat default (`""` = legacy validator = presumed negative)
+  still treats as a controlled negative. The stub needs updating to set `control_outcome="inconclusive"`
+  explicitly (matching the real validator now), and a new caller test should drive `analyze()` itself, not
+  just `_validate_findings`. (b) Any *other* validator that returns `not_confirmed` for a genuinely
+  inconclusive reason without setting `control_outcome` is still silently treated as a legacy negative —
+  worth a registry-wide audit before relying on this for a class besides cross-identity.
+- **Domain:** Confirmation-gate correctness · **Effort:** S (stub + test) · **Depends on:** none ·
+  **Mode:** LOOP (offline)
+- **Evidence:** `reviews/2026-09-28/swarm-refresh/REVIEW.md` §R2; this session's
+  `reviews/2026-09-28/swarm-refresh/probes.py` rerun (see CURRENT_STATE.md) and a standalone
+  `apply_confirmation_suppression` sweep over the three `control_outcome` values.
+- **Problem:** the plumbing is right; the one fixture/test that was supposed to prove the full pipeline
+  respects it doesn't, because it wasn't updated to the new convention it's meant to be testing.
+- **Recommendation:** update `_CrossIdentityBflaReachedUnprovenValidator` to set
+  `control_outcome="inconclusive"`; add an `analyze()`-level caller test (control-held stays a refutation,
+  inconclusive does not); audit other `not_confirmed`-returning validators for the same gap.
+- **Acceptance criteria:** `analyze()` on the inconclusive fixture yields `inconclusive_unverified`, not
+  "likely false positive"; the control-held fixture still yields the refutation; `full` green.
+- **Impact:** High (this is RA-7's whole point — don't bury a genuine reach as "access correctly
+  restricted"). **Source:** 2026-09-28 swarm-refresh, residual RA-7.
+
+### [~] R3 — Unknown/anonymous principal no longer wildcards a resolved principal
+- **Result (in progress, uncommitted):** `confirmation_gate._has_controlled_negative` now requires
+  `neg_principal == principal_id` exactly (was: skip the principal check entirely unless *both* sides were
+  non-empty and differed). Re-verified this session via `probes.py`'s `suppression_*` cases: an
+  unknown-principal negative against an `alice` finding on the same parameter now yields
+  `inconclusive_unverified` (was: `unconfirmed_hypothesis`, i.e. wrongly refuted); a different named
+  principal (`bob`) and an empty parameter still correctly yield `inconclusive_unverified`; a matching
+  principal (`alice`==`alice`) still correctly yields `unconfirmed_hypothesis` (a real controlled
+  negative). **Missing:** a caller-level test encoding these four cases, and a commit.
+- **Domain:** Confirmation-gate correctness / evidence binding · **Effort:** S · **Depends on:** none ·
+  **Mode:** LOOP (offline)
+- **Evidence:** `confirmation_gate.py:645` (pre-fix) rejected a principal mismatch only when both strings
+  were non-empty, so an unresolved/anonymous negative wildcarded onto any named principal's finding.
+- **Problem:** a negative recorded under no known principal could refute a finding scoped to a specific,
+  different principal — the "unknown-identity wildcard" half of the original A3 finding.
+- **Recommendation:** (implemented, per Result) — add the caller test above, then close. Full case/URL/
+  method binding beyond parameter+principal remains out of scope for this item.
+- **Acceptance criteria:** the four `suppression_*` cases above as a real test; `full` green.
+- **Impact:** Medium-High (evidence-correctness, not a live-exploit path by itself). **Source:** 2026-09-28
+  swarm-refresh, residual A3/SC-3.
+
+### [~] R4 — `EffortBudget.reserve` admission arithmetic omitted the requested amount (narrow scope: SC-8 covers the rest)
+- **Result (in progress, uncommitted):** `effort.py`'s `reserve` now also rejects when
+  `spent + reserved + requested > total_tokens`, not just when already at/over the ceiling before adding
+  the request. Re-verified this session: against a 100-token `HARD` budget, `reserve(60)` then `reserve(60)`
+  now admits the first and **rejects** the second (`reserved` stays `60`) — was: both admitted,
+  `reserved == 120`, i.e. 20% over a hard ceiling. **Scope note:** this item is deliberately narrow — it is
+  only the admission-arithmetic bug. SC-8's broader finding (no production caller uses the reservation API;
+  `allow`/`record` remain in dispatch paths; `Orchestrator` doesn't pass `max_duration_s` at construction)
+  is **not** touched by this diff and stays open under SC-8, not re-filed here. **Update (same day, still
+  uncommitted):** `test_effort.py` now has `test_reserve_rejects_estimate_larger_than_total_capacity` (a
+  single `reserve(1600)` against a 1000 HARD budget is refused outright) and
+  `test_reserve_rejects_second_reservation_that_would_overshoot` (two sequential `reserve(600)` calls: first
+  admitted, second refused, `_reserved` stays `600`). The pre-existing `reserve(1600)` in
+  `test_reserve_then_commit_matches_record` — an incidental setup value for an unrelated reserve-then-
+  commit-ledger assertion, not a test of admission itself — was changed to `reserve(600)` so it keeps
+  testing what it always meant to, without being confounded by the new (correct) rejection. **Missing:**
+  only the commit; concurrent-dispatch coverage stays SC-8's scope once production callers exist.
+- **Domain:** Resource governance · **Effort:** S (this item) · **Depends on:** none for this item; SC-8 for
+  production wiring · **Mode:** LOOP (offline)
+- **Evidence:** `effort.py:216` (pre-fix) computed `token_full` from `spent + reserved` only, then added the
+  new request's estimate regardless of whether it would cross the ceiling.
+- **Problem:** a hard budget's reservation primitive could itself be walked past its own ceiling.
+- **Recommendation:** (implemented, per Result) — add the caller test above, then close this item; leave
+  SC-8's dispatch-wiring gap to SC-8.
+- **Acceptance criteria:** the 100/60/60 case above plus an unequal-size case and a single request larger
+  than total capacity, as a real test; `full` green.
+- **Impact:** Medium (a real primitive bug, but unreachable from production until SC-8's wiring lands).
+  **Source:** 2026-09-28 swarm-refresh, residual A8/SC-8 (arithmetic slice only).
+
+### [~] R5 — Cache `clear()`/`size()` missed the hypothesis-cache table (FR-7 lifecycle)
+- **Result (in progress, uncommitted):** `cache.py`'s `clear()` now also deletes
+  `hypothesis_cache_entries` (counted into the eviction total), and `size()` is now
+  `exchange_size() + hypothesis_size()` with both new accessors exposed separately. Re-verified this
+  session: write a hypothesis, confirm it's retrievable, `clear()`, and it is now correctly gone
+  (`hypothesis_after_clear: False`, was `True`); reported size after clear is `0` in both the old and new
+  runs (that half was never broken). **Missing:** a caller-level test (write hypothesis + exchange entry,
+  clear, assert both miss and both size accessors read 0), and a commit.
+- **Domain:** Cache lifecycle (FR-7, ships default-OFF) · **Effort:** S · **Depends on:** none · **Mode:**
+  LOOP (offline)
+- **Evidence:** `cache.py:737` (pre-fix) `clear()` only issued `DELETE FROM cache_entries`; `size()` only
+  counted that same table.
+- **Problem:** with hypothesis reuse enabled, an operator's `/cache/clear` did not force fresh inference —
+  a cached finding could survive the exact operation meant to remove it.
+- **Recommendation:** (implemented, per Result) — add the caller test above, then close.
+- **Acceptance criteria:** post-`clear()`, both `get_hypothesis` and the equivalent exchange-cache read miss,
+  and `size()`/`exchange_size()`/`hypothesis_size()` all read 0; `full` green.
+- **Impact:** Medium (FR-7 ships off; this is a correctness gate before it can be turned on). **Source:**
+  2026-09-28 swarm-refresh, new FR-7 lifecycle defect.
+
+### [~] R6 — A failed inference stage was cached and replayed as a reusable hypothesis (FR-7 lifecycle)
+- **Result (in progress, uncommitted):** `orchestrator_detect.py` now skips `put_hypothesis` whenever any
+  `stage_outcomes` entry has `status == "failed"` — a failed stage is treated as an outage, never a
+  reusable result. Re-verified this session (and this is *why* `probes.py` needed a scratch-only patch to
+  add a third pipeline response: the fix changes the call count the script assumed): first `analyze()` on
+  a stubbed failing stage is degraded (as before); the **second**, fresh-run `analyze()` on identical
+  traffic now makes a **new** inference call and comes back healthy on its own
+  (`second_degraded: False`, `calls_after_second: 2` — was: cache-hit, stayed degraded,
+  `calls_after_second: 1`, needing an explicit bypass to recover). This is a better outcome than the
+  review's minimum ask (which only required *not reusing* the failure) — recovery is now automatic on the
+  very next call. **Missing:** a caller-level test (fail then succeed across two fresh `RunContext`s,
+  assert the second call re-invokes inference and recovers), and a commit.
+- **Domain:** Cache lifecycle (FR-7, ships default-OFF) · **Effort:** S · **Depends on:** none · **Mode:**
+  LOOP (offline)
+- **Evidence:** `orchestrator_detect.py` (pre-fix) called `put_hypothesis` whenever `_hyp_enabled`, with no
+  check on `stage_outcomes` status, so a transient failure was cached and replayed until TTL/bypass.
+- **Problem:** an opt-in reuse cache could indefinitely prolong an outage instead of just avoiding
+  redundant work.
+- **Recommendation:** (implemented, per Result) — add the caller test above, then close. A deliberate
+  short-lived negative/circuit-breaker cache, if wanted later, should be a separate, explicit policy.
+- **Acceptance criteria:** the fail-then-recover sequence above as a real test; `full` green.
+- **Impact:** Medium (FR-7 ships off; same enabling condition as R5). **Source:** 2026-09-28 swarm-refresh,
+  new FR-7 lifecycle defect.
+
+### [~] R7 — Browser/DOM/stored-XSS validator callers omitted the gate/budget objects SC-7 added
+- **Result (in progress, uncommitted; done same day, after this item was first filed above):** all three
+  validators now take an optional `run_context=None` constructor param (bound per-dispatch by the existing
+  `ValidatorRegistry.bind_run_context` seam, the same one every other active validator already uses — no
+  new wiring mechanism introduced). `browser_xss_validator.py` and `dom_xss_validator.py` forward
+  `scope`/`gate`/`budget`/`cancel` into `driver.visit(...)` only when a `run_context` is actually bound
+  (`visit_kw = {}` otherwise, so a no-context caller — including every fake driver in the existing test
+  suite — sees byte-identical behavior). `stored_xss_validator.py` additionally uses
+  `run_context.gate` instead of always `get_default_gate()` for its plant/render mutating-write gate check,
+  and forwards the same four kwargs into its own optional browser-confirm `visit()`. Caller tests landed
+  alongside: `test_browser_xss_validator.py` (+51 lines), `test_dom_xss_validator.py` (+47 lines), and a new
+  `test_stored_xss_validator.py`. **Missing:** only the commit; live interception coverage (real Chromium,
+  service-worker/WebSocket behavior, engine readiness) stays a separate OWNER/LIVE follow-up, not something
+  a mocked-driver caller test can establish.
+- **Domain:** Safety enforcement (browser execution) · **Effort:** M · **Depends on:** none · **Mode:** LOOP
+  (offline for the wiring + mocked-driver caller tests; live interception coverage is a separate,
+  OWNER/LIVE efficacy question)
+- **Evidence:** `validators/browser_xss_validator.py:123`, `validators/dom_xss_validator.py:107`, and
+  `validators/stored_xss_validator.py:167` (pre-fix) called their browser `visit()` without the gate/budget
+  parameters SC-7 added to that seam.
+- **Problem:** the safety primitive SC-7 built had no production caller, so browser-driven validation was
+  still ungoverned by the same policy every other active leg respects.
+- **Recommendation:** (implemented, per Result) — commit; confirm the new caller tests actually assert a
+  denial/exhaustion is honored (not just that the kwargs are passed through) before treating this as closed.
+- **Acceptance criteria:** all three validators pass gate/budget through; a mocked-driver test per
+  validator proves a denial/exhaustion is actually honored; `full` green.
+- **Impact:** High (production safety-enforcement gap, not just a missing feature). **Source:** 2026-09-28
+  swarm-refresh, continuation of A7/SC-7.

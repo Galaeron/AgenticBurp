@@ -1,92 +1,87 @@
 # Current state — 2026-09-28
 
-## Checkout and review
+## Checkout
 
-Branch `reconciliation-backlog`; reviewed HEAD:
-`678dcce5ce79034e0cb3d178044714a8b82b2645`.
-Latest: [Pentest-Swarm source comparison](reviews/2026-09-27/swarm-comparison/REVIEW.md).
-[Commands/evidence](reviews/2026-09-27/swarm-comparison/VERIFICATION.md).
-Compared upstream `Armur-Ai/Pentest-Swarm-AI` at
-`661c21828f8a2d0e84ee8b161037d5e9d93942f8`.
-Previous state: [snapshot](reviews/2026-09-27/swarm-comparison/CURRENT_STATE_before_comparison.md).
-Pre-existing README edits, worktrees and runtime/review artifacts remain.
-No review-authored production changes, commits, pushes or active-default changes.
-Inventoried source/config hashes remained unchanged during verification.
-Loop batch (swarm-comparison SC-*, all loop-consumable items done): **SC-1** `0fea458a`
-(non-executed negative control → inconclusive, not VERIFIED), **SC-2** `2764a60`
-(credential grant needs a noise-tolerant authorization discriminator, not a byte diff),
-**SC-3** `debb3e7` (controlled negatives bind to case+principal; empty-param wildcard
-retired), **SC-4** `895dda3` (unknown workflow assertions fail closed at load+runtime),
-**SC-5** `6a581d5` (MCP export honors the `reporting.*` gates), **SC-7** `77a0838` offline
-half (opt-in gate/budget seam on browser requests), **SC-8** `0522472` (EffortBudget atomic
-reserve/commit/release + deadline-at-construction). SC-1..SC-4 are strict
-verification-correctness tightenings; SC-5/SC-7/SC-8 add opt-in/presentation seams that are
-byte-for-byte no-ops until wired. Also closed the last older-queue loop item: **FR-7** `c2cb427`
-(run-independent hypothesis cache, default-OFF; on a hit it falls through to `_validate_findings`
-so proof/case/oracle are re-minted per run, never cached/shared — pre-proof reports only).
-Re-analysis batch 2: **RA-7** `981c5ff` (cross-identity reject-downgrade now fires only on a genuine
-control-held reject via a `control_outcome` discriminator, not on inconclusive observations — the SC-1
-anti-pattern on the reject side); **RA-8** `c4a534b` (workflow `status` assertion operand validated
-int-coercible at load + fail-closed at runtime; completes SC-4). **All offline loop items now closed —
-pool exhausted; loop ended (LOOP_DONE).**
-**Owner-deferred:** SC-6 (wheel import needs off-host install + non-checkout-preserving refactor);
-SC-7 live browser wiring/health; SC-9..SC-15 (measurement/live-gated); FR-7 hit-rate measurement +
-default-ON. Per-item detail + Results in IMPROVEMENT_BACKLOG.md.
+Branch `reconciliation-backlog`; HEAD `c2fe5c75` (R1 landed this session — its
+fix + tests committed off the reconciled working tree; R2–R7 still uncommitted
+on disk). Latest analysis:
+[swarm-refresh review](reviews/2026-09-28/swarm-refresh/REVIEW.md) +
+[verification](reviews/2026-09-28/swarm-refresh/VERIFICATION.md), which reviewed
+this HEAD with a **then-clean** working tree (its own words: "no tracked
+production-file modifications were present at the end-of-review source check").
+Original [upstream comparison](reviews/2026-09-27/swarm-comparison/REVIEW.md)
+uses Pentest-Swarm `661c21828f8a2d0e84ee8b161037d5e9d93942f8`; not refetched.
 
-## Fresh verification
+**Since that review, the working tree has picked up uncommitted production
+changes** fixing most of its R1–R7 findings (`git diff --stat`: `cache.py`,
+`confirmation_gate.py`, `effort.py`, `models.py`, `orchestrator_chain.py`,
+`orchestrator_confirm.py`, `orchestrator_detect.py`,
+`validators/{cross_identity,browser_xss,dom_xss,stored_xss}_validator.py`,
+plus new/corrected tests). **This is ongoing, concurrent work, not all of it
+from this session** — this edit reconciles what's actually on disk right now
+against the review's own reproduction script, not just narrates intent.
 
-Repository-root Python 3.12, existing `.venv-rationalisation`:
-- Full: exit 0 (harness unittest 2817 OK / 2 skipped, +43 loop tests [SC-1..SC-5,SC-7,SC-8,FR-7,RA-7,RA-8];
-  pytest 38 passed, evaluation 221 OK, evaluation integrity 42 OK). Workspace pytest temp dir required.
-  (One earlier full run during FR-7 showed a single unattributed transient failure that did not
-  reproduce across subsequent green runs; the default-OFF FR-7 no-op is not the cause — worth a
-  separate look at flaky full-suite tests.)
-- Smoke: 92 OK. Orchestrator preconditions: 60 OK.
-- Requirement report still lists 36 gaps; offline passes do not close them.
-- Java: actual Gradle 8.7/JDK 17 `test shadowJar` succeeded; 229 tests,
-  zero failures/errors/skips. Explicit UTF-8 rebuild clean.
-- Wheel builds but importing its server outside checkout fails: config.yaml absent.
-- The swarm-review probes for oracle failed-control promotion (SC-1), dynamic-public
-  credential acceptance (SC-2), unknown-parameter negative wildcard (SC-3), and unknown
-  workflow assertion success (SC-4) are now CLOSED offline (regression tests added); the
-  wheel-import failure below (A5/SC-6) remains open (owner).
-- No current real-model accuracy, blind recall, live Burp load, browser or
-  container-policy verification. Docker/Ollama readiness not established.
-- Upstream Go suite has a Windows `true` command failure; five independent
-  probes reproduce board delivery loss and weak scope/authorization/proof logic.
+## Fresh verification (this checkout, current working tree incl. the uncommitted fixes)
 
-## Open work and recommended order
+`.venv-rationalisation` (Python 3.12.14), repository root, `python -m harness.suite full`:
+- **Current (after R1 commit `c2fe5c75`, R2–R7 still on disk):** exit 0 — 2831
+  unittest OK (2 skipped), 38 pytest-native passed, 229 evaluation OK, 42
+  integrity OK. (2831 = +2 from R1's added hardening controls; the +8 evaluation
+  vs the 221 below is an unrelated untracked file, `testing/test_web_objective_benchmark.py`.)
+- **On the R1/R3/R4/R5/R6 fixes (before R7 landed):** exit 0 — 2829 unittest OK
+  (2 skipped), 38 pytest-native passed, 221 evaluation OK, 42 integrity OK.
+  (2829 vs. the review's 2817 with no test files changed at that point;
+  reported as observed, not explained.)
+  `smoke` → exit 0, 92 OK. `test_orchestrator_precondition` → 60 OK.
+- **After R7 landed, rerun in full a second time (this edit):** exit 0 — same
+  2829 unittest OK (2 skipped), 38 pytest-native passed, 221 evaluation OK, 42
+  integrity OK. **Clean — no failure.** This directly contradicts a concurrent
+  edit to this file that had reported "1 pre-existing, unrelated failure:
+  `test_playwright_is_not_installed_here`" for the same post-R7 state; that
+  claim did not reproduce against this checkout/venv and should be treated as
+  environment-specific to whatever ran it, not a real defect, unless it
+  reproduces again.
+- Java/wheel/live-model/blind-recall/browser-container/Burp-runtime results are
+  unchanged HISTORICAL claims from the swarm-refresh review.
 
-ALL loop-consumable offline items are now closed (SC-1..SC-5, SC-7 offline, SC-8, FR-7, plus the
-2026-09-27 re-analysis batch 2: **RA-7** `981c5ff` + **RA-8** `c4a534b`). The offline loop pool is
-exhausted: batch 2 was itself a fresh re-analysis over the confirmation/verification, transport/policy,
-engagement, and store/report/api clusters and found NO other offline item above the bar; the analyzed
-code is unchanged since, so the loop is ended (LOOP_DONE) rather than re-running an identical pass. A
-future re-analysis is warranted only after the code changes or the owner lands live-gated work. All
-remaining work is owner/live-gated:
-1. SC-6 (A5): package config as a resource + separate writable state + exclude tests +
-   entry points; verify by a fresh-venv install outside the checkout (needs off-host
-   install; not checkout-behavior-preserving in one offline pass).
-2. SC-7 live half (A7): wire a real RunContext gate/budget into the live browser
-   `visit` call sites + browser health/doctor + WebSocket/service-worker constraints
-   (needs a working Playwright browser). SC-8 dispatch-seam wiring (agent_manager/retry/
-   critique/coordinator) similarly remains to be wired to the new reserve/commit primitive.
-3. SC-9 (A6, needs PR-11) + SC-10..SC-15 (typed tool contracts, versioned workflow packs,
-   durable queue, provider routing, install/doctor UX, report polish) — retention gated
-   on a matched-budget measurement; treat efficacy runs as OWNER/LIVE.
-4. Standing owner items: real-model accuracy / blind recall / live Burp load / container
-   policy; faithful budget-matched production ablations. No AGPL upstream code imported.
-5. Higher-priority non-loop items also remain owner/live: P1-3 (single-command scorecard,
-   live model), P1-5 (Burp UX build), P2-1 (BusinessContextAgent — Effort-L feature,
-   retention ablation-gated), P2-3 (needs P1-5), P3-2 (partial: SBOM/dep-audit offline,
-   image-digest pinning off-host), P3-3 (team mode, premature). BM-2 (same-class
-   secure-vs-vulnerable discriminator) needs real-model FP data to prove. New offline
-   loop items require a fresh re-analysis pass to file.
+## Reconciled status of the swarm-refresh review's R1–R7
 
-Earlier founder items and implementation history remain in
-[founder refresh](reviews/2026-09-26/founder-refresh/REVIEW.md) and
-[IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md); broader requirements remain open.
-Preserve `test_pipeline_gate.py` and defect-injection controls.
-No blind keys or blind-target implementations read.
-Portable audit toolchains/clone/builds remain in `.audit-external` and build dirs.
-Keep this file under 100 lines; details belong in the linked review.
+Full evidence, commands and acceptance criteria in
+[IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md)'s **Swarm-refresh batch — 2026-09-28**.
+
+| # | Finding | Fix on disk? | Dedicated test? |
+|---|---|---|---|
+| R1 | Credential-check accepted noise/status jitter as authorization | **Committed `c2fe5c75`** | Yes (2 new + 1 corrected + 2 hardening controls at close, in `test_credential_grant_differential.py`) |
+| R2 | RA-7's `control_outcome` lost before final suppression | Partial — correct when a validator sets it explicitly; real `cross_identity_validator` now does; the one stub that should (`_CrossIdentityBflaReachedUnprovenValidator`) predates the convention and still reproduces the old symptom | No |
+| R3 | Unknown/anonymous principal wildcarded a resolved principal | Yes | No |
+| R4 | Reservation admission arithmetic could exceed a hard budget | Yes (admission arithmetic only; SC-8's "no production caller" gap is separate and untouched) | Yes (2 new + 1 corrected in `test_effort.py`) |
+| R5 | Cache `clear()`/`size()` ignored the hypothesis-cache table | Yes | No |
+| R6 | A failed inference stage was cached and replayed as reusable | Yes (auto-recovers next call — better than the minimum ask) | No |
+| R7 | Browser/DOM/stored-XSS callers omit SC-7's gate/budget objects | Yes | Yes (`test_browser_xss_validator.py`, `test_dom_xss_validator.py`, new `test_stored_xss_validator.py`) |
+
+**R1 is committed (`c2fe5c75`); R2–R7 remain uncommitted on disk.** Everything else the swarm-refresh review
+reconciled (SC-1 real-oracle-gate fix, SC-4/RA-8 fail-closed workflow
+assertions, SC-5 MCP adapter forwarding) is unaffected and stands as that
+review described. A5/SC-6 (packaging) and A6 (tool-network egress) remain open.
+
+## Current priorities
+
+Loop order: **R3 → R5 → R6 → R4 → R2 → R7** (R1 done, `c2fe5c75`).
+
+1. R3, R5, R6: each still needs its caller-level test (fixtures already worked out
+   in the backlog item) before it can close — the production fix for each is on
+   disk but has no regression coverage yet.
+2. R4/R7: fix + tests already on disk (as R1's were) — one commit away each; commit
+   after re-confirming `full` green on the isolated diff.
+3. R2 also needs the stale `_CrossIdentityBflaReachedUnprovenValidator` stub updated
+   to `control_outcome="inconclusive"` and an `analyze()`-level caller test (existing
+   tests stop at `_validate_findings`); then audit other `not_confirmed`-returning
+   validators for the same gap.
+4. Once all R-items close, rerun `reviews/2026-09-28/swarm-refresh/probes.py` and fold
+   the result into that review dir. Then SC-8 dispatch wiring, A5/SC-6 packaging, A6
+   tool-network egress; then governed integrations + matched-budget efficacy (owner-gated).
+
+Existing owner deferrals remain owner decisions; none of the counterexamples
+above needs a live model or real target to reproduce. Preserve
+`test_pipeline_gate.py` and its defect-injection controls. No blind keys or
+blind implementations read. Keep this file under 100 lines.
