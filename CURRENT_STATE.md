@@ -1,4 +1,4 @@
-# Current state — 2026-09-28
+# Current state — 2026-09-29
 
 ## Checkout
 
@@ -73,8 +73,15 @@ exhausted again (as at the pre-swarm-refresh `LOOP_DONE`, `ce387cf3`):
 
 - OWNER/LIVE: P1-3's remaining single-command live scorecard, P1-5 (Burp UX), P2-3's
   Burp-tab half, P3-3 (team mode), BM-3, PR-A..E, NC-O1..O5.
-- Too large for one clean iteration: P2-1 (a whole new business-reasoning agent),
-  SC-10..15 (multi-subsystem "borrows"); SC-9's dep PR-11 is `[~]`.
+- **P2-1 (business-reasoning agent) landed this session, OUTSIDE the loop** (it was the
+  owner-classified "too large" item): new `application_semantic_model.py` +
+  `business_context_agent.py`, wired into `investigate_engagement` behind a DEFAULT-OFF
+  `business_context.enabled` flag (re-ranks the worklist by business impact + proposes
+  chains; sends nothing, confirms nothing). Offline build VERIFIED; full suite green
+  (2859 unittest OK/2 skip, 38 pytest, 229 eval, 42 integrity, exit 0). Efficacy/retention
+  ON-vs-OFF ablation stays OWNER/LIVE. Full detail in IMPROVEMENT_BACKLOG.md's P2-1 Result.
+- Too large for one clean iteration: SC-10..15 (multi-subsystem "borrows"); SC-9's dep
+  PR-11 is `[~]`.
 - Packaging/supply-chain (needs Docker/registry or PyPI egress, not offline): P3-2, SC-6.
 - BM-2 is owner-gated in substance: its classes (sqli/xss/idor/path_traversal/command_injection)
   are exactly the ones FR-4 EXCLUDES because a corroboration gate on them collapses recall to

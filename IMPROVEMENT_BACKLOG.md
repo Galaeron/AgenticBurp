@@ -423,7 +423,38 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 
 ## P2 — Differentiators (create competitive advantage)
 
-### [ ] P2-1 — Business-reasoning agent feeding the chaining loop  ★ (requested)
+### [x] P2-1 — Business-reasoning agent feeding the chaining loop  ★ (requested)
+- **Result (build VERIFIED offline; efficacy/retention OWNER/LIVE — ships OFF pending it):**
+  `e20cb8cd` (feat) + `4ca2f253` (docs). New `harness/application_semantic_model.py` (pure-data ASM: `Role`/`BusinessObject`/
+  `Workflow`/`ValueFlow`/`SensitiveSink`/`ChainingHypothesis` + `business_impact_for`
+  re-rank scorer, `to_dict`/`from_dict`) and `harness/business_context_agent.py`
+  (`BusinessContextAgent` — a deterministic, network/LLM-free heuristic pass, NOT a
+  per-exchange specialist). Wiring: `SurfaceEndpoint.business_score`/`business_reasons`
+  add an OPT-IN additive term to `engagement.fused_score()` (None ⇒ unchanged, the
+  negative control); `EngagementState.apply_semantic_model()` re-ranks the surface and
+  records each chaining hypothesis as a BLOCKED `chain-hypothesis` proposal (never
+  auto-run, never confirmed); `orchestrator_chain._apply_business_context()` is the
+  flag-gated seam `investigate_engagement` calls BEFORE the worklist sweep (so re-rank
+  changes what the bounded budget tests first) and surfaces the ASM as the result's
+  `application_semantic_model`. `orchestrator.business_context_enabled` reads a NEW
+  top-level `business_context.enabled` block (DEFAULT OFF; guarded by
+  `SafeDefaultGuardTests.SAFE_CHECKS` and forced off under `passive-only` via
+  `_PASSIVE_FORCE_OFF_KNOBS`). Input is anonymized structure-only by default (mirrors
+  `feature_projection.py`; `built_from_raw` only when `coordinator.cloud_reasoning`);
+  every chaining hypothesis emits a P0-1 `HYPOTHESIS` ledger event keyed on its stable
+  id (reconstructable to origin + structure-only evidence). All 4 acceptance-criteria
+  groups covered by `harness/test_business_context_agent.py` (21 tests: mini-shop ASM
+  build incl. ordered checkout workflow + price/role value-flows + ≥1 object→sink
+  hypothesis; worklist re-rank present-vs-absent negative control at both the
+  `EngagementState` level and the production `_apply_business_context` seam; safety —
+  never `confirmed`, template-only endpoints not validator URLs, offline/no-transport;
+  anonymization — names kept, values/ids dropped; ledger reconstruct). Full suite green
+  (`python -m harness.suite full`, `.venv-rationalisation`): **2859 unittest OK / 2
+  skipped** (2838 baseline + 21 new), 38 pytest-native, 229 evaluation, 42 integrity,
+  exit 0. INV-3 gate honoured (`docs/investigations/INV-3-chain-funnel.md` read; the
+  ASM ADDS/re-ranks only). **Still OWNER/LIVE:** the ON-vs-OFF ablation on P0-3's corpus
+  (confirmed-chain count + business-logic/authorization recall vs precision/cost) that
+  gates *retention* — the feature ships OFF until that run justifies it.
 - **Review gate (2026-09-20):** Complete INV-3 before implementation; inventory
   existing business-logic/workflow context and reuse its consumers. Zero observed
   chains does not by itself prove a missing semantic model. Prefer one bounded
