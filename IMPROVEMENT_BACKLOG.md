@@ -3640,8 +3640,8 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
 - **Impact:** Medium (FR-7 ships off; this is a correctness gate before it can be turned on). **Source:**
   2026-09-28 swarm-refresh, new FR-7 lifecycle defect.
 
-### [~] R6 — A failed inference stage was cached and replayed as a reusable hypothesis (FR-7 lifecycle)
-- **Result (in progress, uncommitted):** `orchestrator_detect.py` now skips `put_hypothesis` whenever any
+### [x] R6 — A failed inference stage was cached and replayed as a reusable hypothesis (FR-7 lifecycle)
+- **Result (VERIFIED):** `d66e606a` — `orchestrator_detect.py` now skips `put_hypothesis` whenever any
   `stage_outcomes` entry has `status == "failed"` — a failed stage is treated as an outage, never a
   reusable result. Re-verified this session (and this is *why* `probes.py` needed a scratch-only patch to
   add a third pipeline response: the fix changes the call count the script assumed): first `analyze()` on
@@ -3650,8 +3650,12 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
   (`second_degraded: False`, `calls_after_second: 2` — was: cache-hit, stayed degraded,
   `calls_after_second: 1`, needing an explicit bypass to recover). This is a better outcome than the
   review's minimum ask (which only required *not reusing* the failure) — recovery is now automatic on the
-  very next call. **Missing:** a caller-level test (fail then succeed across two fresh `RunContext`s,
-  assert the second call re-invokes inference and recovers), and a commit.
+  very next call. **Closed (VERIFIED):** committed `d66e606a` with a caller test
+  (`FailedStageNotCachedTests.test_failed_stage_is_not_cached_and_next_run_recovers` in
+  `test_cache_hypothesis_reuse.py`): with the flag ON, run 1's pipeline fails (`StageOutcome` status
+  `failed`) and is degraded; run 2 on a fresh `RunContext` re-invokes the pipeline (`call_count == 2`) and
+  recovers (not degraded) — pre-R6 the failure was cached and run 2 hit it (`call_count 1`, still degraded).
+  `full` green: 2834 unittest OK (2 skipped), 38 pytest, 229 evaluation OK, 42 integrity OK, exit 0.
 - **Domain:** Cache lifecycle (FR-7, ships default-OFF) · **Effort:** S · **Depends on:** none · **Mode:**
   LOOP (offline)
 - **Evidence:** `orchestrator_detect.py` (pre-fix) called `put_hypothesis` whenever `_hyp_enabled`, with no
