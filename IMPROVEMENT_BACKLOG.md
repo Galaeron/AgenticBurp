@@ -3388,7 +3388,33 @@ report polish.
 - **Impact:** High (enables resumable/team work later — P3-3 seed).
 - **Source:** REVIEW.md "Technology worth adapting" #3.
 
-### [ ] SC-13 — Provider composition + unified cost/latency trace through llm_provider (borrow #4)
+### [x] SC-13 — Provider composition + unified cost/latency trace through llm_provider (borrow #4)
+- **Result (VERIFIED, build):** `068f8c6` — one shared trace path over the EXISTING `Provider`
+  protocol (no parallel abstraction), consumed by the run ledger. `harness/effort.py` (additive):
+  `CallRecord` gains SC-13 trace fields (`provider`, `prompt_version`, `latency_ms`, `retries`,
+  `outcome`, `streamed`, `case_ref`, `run_id`, all defaulted) + `to_dict()`; `EffortLedger.record`
+  / `EffortBudget.record` / `commit` forward them as `**meta` and return the appended record;
+  `EffortLedger.trace()` exports flat rows — every existing 4-arg `record()`/`commit()` call is
+  unchanged (test_effort's 25 tests stay green). New `harness/provider_trace.py`: `traced_call()`
+  reserves budget (SC-8 `reserve`), invokes `provider.chat_json` with bounded retries, times it,
+  then settles with the REAL usage (`commit`) on success or refunds (`release`) on failure;
+  `TracingProvider` is a drop-in `Provider` that traces any inner provider (`chat_json_metered`
+  aliased); `ProviderRouter` adds optional per-`CallKind` routing. 14 tests in
+  `test_provider_trace.py`, each acceptance criterion with a positive case AND a negative control:
+  (1) every model path in the ledger — a success writes one enriched record, `TracingProvider`
+  records transparently at a drop-in site; (2) concurrent reservations cannot exceed the SC-8 hard
+  budget — 10 threads × est=100 vs a hard 300-token cap admit exactly 3, block 7, `spent==300`, no
+  leaked reservation, and a blocked reservation never touches the provider nor records; (3)
+  failures/streaming accounted — a failure is traced as a zero-usage `error` row with the
+  reservation refunded, retry-then-success counts retries, exhausted retries report `error`, a
+  streamed call is flagged with usage still counted; (4) role routing — deterministic per-`CallKind`
+  selection recorded in the trace, a router with no routes always uses the default (**mechanism
+  only**; whether a routing WINS is the OWNER/LIVE measurement — fixed cases at equal total budget —
+  and is deliberately not asserted). Substrate only: nothing in the default pipeline wraps its
+  provider in this yet, so it ships **inert** (no traffic, no verdict change, no config knob); live
+  adoption across call sites + the routing win/no-win measurement are deferred. `config.yaml`
+  unchanged; `test_pipeline_gate.py` preserved. Full suite: 2938 unittest OK / 2 skip, pytest 38,
+  evaluation 231, evaluation-integrity 42, exit 0.
 - **Domain:** LLM routing / Observability · **Effort:** M · **Depends on:** SC-8 · **Mode:** build LOOP; routing measurement OWNER/LIVE
 - **Evidence (INFERRED — design proposal):** upstream has a real provider interface + per-role routing + a
   metering wrapper (useful composition), but its meter/token caps are not a real reservation system (do not
