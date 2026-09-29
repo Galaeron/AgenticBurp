@@ -2,8 +2,8 @@
 
 ## Checkout
 
-Branch `reconciliation-backlog`; HEAD `d66e606a` (R1 + R3 + R5 + R6 landed this
-session as isolated commits off the reconciled working tree; R2/R4/R7 still
+Branch `reconciliation-backlog`; HEAD `18cc1ec2` (R1 + R3 + R4 + R5 + R6 landed
+this session as isolated commits off the reconciled working tree; R2/R7 still
 uncommitted on disk). Latest analysis:
 [swarm-refresh review](reviews/2026-09-28/swarm-refresh/REVIEW.md) +
 [verification](reviews/2026-09-28/swarm-refresh/VERIFICATION.md), which reviewed
@@ -24,11 +24,11 @@ against the review's own reproduction script, not just narrates intent.
 ## Fresh verification (this checkout, current working tree incl. the uncommitted fixes)
 
 `.venv-rationalisation` (Python 3.12.14), repository root, `python -m harness.suite full`:
-- **Current (after R1 `c2fe5c75` + R3 `cd0273cf` + R5 `b23ad18c` + R6 `d66e606a`;
-  R2/R4/R7 still on disk):** exit 0 — 2834 unittest OK (2 skipped), 38 pytest-native
-  passed, 229 evaluation OK, 42 integrity OK. (2834 = +2 R1 +1 R3 +1 R5 +1 R6 caller
-  tests; the +8 evaluation vs the 221 below is an unrelated untracked file,
-  `testing/test_web_objective_benchmark.py`.)
+- **Current (after R1 `c2fe5c75` + R3 `cd0273cf` + R4 `18cc1ec2` + R5 `b23ad18c` +
+  R6 `d66e606a`; R2/R7 still on disk):** exit 0 — 2835 unittest OK (2 skipped), 38
+  pytest-native passed, 229 evaluation OK, 42 integrity OK. (2835 = +2 R1 +1 R3 +1 R4
+  +1 R5 +1 R6 caller tests; the +8 evaluation vs the 221 below is an unrelated
+  untracked file, `testing/test_web_objective_benchmark.py`.)
 - **On the R1/R3/R4/R5/R6 fixes (before R7 landed):** exit 0 — 2829 unittest OK
   (2 skipped), 38 pytest-native passed, 221 evaluation OK, 42 integrity OK.
   (2829 vs. the review's 2817 with no test files changed at that point;
@@ -55,26 +55,26 @@ Full evidence, commands and acceptance criteria in
 | R1 | Credential-check accepted noise/status jitter as authorization | **Committed `c2fe5c75`** | Yes (2 new + 1 corrected + 2 hardening controls at close, in `test_credential_grant_differential.py`) |
 | R2 | RA-7's `control_outcome` lost before final suppression | Partial — correct when a validator sets it explicitly; real `cross_identity_validator` now does; the one stub that should (`_CrossIdentityBflaReachedUnprovenValidator`) predates the convention and still reproduces the old symptom | No |
 | R3 | Unknown/anonymous principal wildcarded a resolved principal | **Committed `cd0273cf`** | Yes (4-case `suppression_*` caller test) |
-| R4 | Reservation admission arithmetic could exceed a hard budget | Yes (admission arithmetic only; SC-8's "no production caller" gap is separate and untouched) | Yes (2 new + 1 corrected in `test_effort.py`) |
+| R4 | Reservation admission arithmetic could exceed a hard budget | **Committed `18cc1ec2`** (arithmetic only; SC-8's "no production caller" gap separate) | Yes (3 tests + 1 corrected in `test_effort.py`) |
 | R5 | Cache `clear()`/`size()` ignored the hypothesis-cache table | **Committed `b23ad18c`** | Yes (clear+size caller test) |
 | R6 | A failed inference stage was cached and replayed as reusable | **Committed `d66e606a`** | Yes (fail-then-recover caller test) |
 | R7 | Browser/DOM/stored-XSS callers omit SC-7's gate/budget objects | Yes | Yes (`test_browser_xss_validator.py`, `test_dom_xss_validator.py`, new `test_stored_xss_validator.py`) |
 
-**R1 (`c2fe5c75`), R3 (`cd0273cf`), R5 (`b23ad18c`) and R6 (`d66e606a`) are committed; R2/R4/R7 remain uncommitted on disk.** Everything else the swarm-refresh review
+**R1 (`c2fe5c75`), R3 (`cd0273cf`), R4 (`18cc1ec2`), R5 (`b23ad18c`) and R6 (`d66e606a`) are committed; R2/R7 remain uncommitted on disk.** Everything else the swarm-refresh review
 reconciled (SC-1 real-oracle-gate fix, SC-4/RA-8 fail-closed workflow
 assertions, SC-5 MCP adapter forwarding) is unaffected and stands as that
 review described. A5/SC-6 (packaging) and A6 (tool-network egress) remain open.
 
 ## Current priorities
 
-Loop order: **R4 → R2 → R7** (R1 `c2fe5c75`, R3 `cd0273cf`, R5 `b23ad18c`, R6 `d66e606a` done).
+Loop order: **R2 → R7** (R1 `c2fe5c75`, R3 `cd0273cf`, R4 `18cc1ec2`, R5 `b23ad18c`, R6 `d66e606a` done).
 
-1. R4 and R7: fix + caller tests already on disk (as R1's were) — one commit away
-   each; commit after re-confirming `full` green on the isolated diff.
-2. R2 also needs the stale `_CrossIdentityBflaReachedUnprovenValidator` stub updated
-   to `control_outcome="inconclusive"` and an `analyze()`-level caller test (existing
-   tests stop at `_validate_findings`); then audit other `not_confirmed`-returning
-   validators for the same gap.
+1. R2 (the one genuinely partial item) needs the stale `_CrossIdentityBflaReachedUnprovenValidator`
+   stub updated to `control_outcome="inconclusive"` and an `analyze()`-level caller test (existing
+   tests stop at `_validate_findings`); then audit other `not_confirmed`-returning validators for
+   the same gap.
+2. R7: fix + caller tests already on disk (as R1/R4's were) — one commit away; commit after
+   re-confirming `full` green on the isolated diff.
 3. Once all R-items close, rerun `reviews/2026-09-28/swarm-refresh/probes.py` and fold
    the result into that review dir. Then SC-8 dispatch wiring, A5/SC-6 packaging, A6
    tool-network egress; then governed integrations + matched-budget efficacy (owner-gated).

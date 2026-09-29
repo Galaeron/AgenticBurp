@@ -3588,8 +3588,8 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
 - **Impact:** Medium-High (evidence-correctness, not a live-exploit path by itself). **Source:** 2026-09-28
   swarm-refresh, residual A3/SC-3.
 
-### [~] R4 — `EffortBudget.reserve` admission arithmetic omitted the requested amount (narrow scope: SC-8 covers the rest)
-- **Result (in progress, uncommitted):** `effort.py`'s `reserve` now also rejects when
+### [x] R4 — `EffortBudget.reserve` admission arithmetic omitted the requested amount (narrow scope: SC-8 covers the rest)
+- **Result (VERIFIED):** `18cc1ec2` — `effort.py`'s `reserve` now also rejects when
   `spent + reserved + requested > total_tokens`, not just when already at/over the ceiling before adding
   the request. Re-verified this session: against a 100-token `HARD` budget, `reserve(60)` then `reserve(60)`
   now admits the first and **rejects** the second (`reserved` stays `60`) — was: both admitted,
@@ -3603,8 +3603,13 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
   admitted, second refused, `_reserved` stays `600`). The pre-existing `reserve(1600)` in
   `test_reserve_then_commit_matches_record` — an incidental setup value for an unrelated reserve-then-
   commit-ledger assertion, not a test of admission itself — was changed to `reserve(600)` so it keeps
-  testing what it always meant to, without being confounded by the new (correct) rejection. **Missing:**
-  only the commit; concurrent-dispatch coverage stays SC-8's scope once production callers exist.
+  testing what it always meant to, without being confounded by the new (correct) rejection. A third test —
+  the acceptance criteria's unequal-size case — was added at close
+  (`test_reserve_admission_uses_actual_requested_amount_unequal_sizes`: reserve(700) admitted, reserve(400)
+  refused (1100 > 1000), reserve(300) admitted exactly at the 1000 ceiling, reserve(1) refused when full —
+  pinning both the overshoot and the inclusive boundary, `>` vs `>=`). **Closed (VERIFIED):** committed
+  `18cc1ec2`; `full` green (2835 unittest OK/2 skipped, 38 pytest, 229 evaluation OK, 42 integrity OK,
+  exit 0). Concurrent-dispatch coverage stays SC-8's scope once production callers exist.
 - **Domain:** Resource governance · **Effort:** S (this item) · **Depends on:** none for this item; SC-8 for
   production wiring · **Mode:** LOOP (offline)
 - **Evidence:** `effort.py:216` (pre-fix) computed `token_full` from `spent + reserved` only, then added the
