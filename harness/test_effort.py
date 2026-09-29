@@ -204,9 +204,9 @@ class EffortBudgetReservationTests(unittest.TestCase):
         """A reserve() -> commit() pair must leave the ledger identical to
         a bare record() of the actuals, and must return _reserved to 0."""
         budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
-        ok, _ = budget.reserve(1600)
+        ok, _ = budget.reserve(600)
         self.assertTrue(ok)
-        budget.commit(CallKind.AGENT_DISPATCH, "m", 100, 100, reserved=1600)
+        budget.commit(CallKind.AGENT_DISPATCH, "m", 100, 100, reserved=600)
         self.assertEqual(budget.spent, 200)
         self.assertEqual(budget._reserved, 0)
         self.assertEqual(budget.remaining, 1000 - 200)
@@ -215,6 +215,55 @@ class EffortBudgetReservationTests(unittest.TestCase):
         twin.record(CallKind.AGENT_DISPATCH, "m", 100, 100)
         self.assertEqual(budget.allow(), twin.allow())
         self.assertEqual(budget.spent, twin.spent)
+
+    def test_reserve_rejects_estimate_larger_than_total_capacity(self):
+        """R4: admission must include the REQUESTED amount, not just
+        committed+in-flight spend -- a HARD budget of 1000 must reject a
+        single reserve(1600) outright instead of admitting it and ending up
+        120% over cap. (Previously accepted -- this is the exact
+        counterexample the R4 review named.)"""
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        ok, reason = budget.reserve(1600)
+        self.assertFalse(ok)
+        self.assertEqual(budget._reserved, 0)
+        self.assertTrue(reason)
+
+    def test_reserve_rejects_second_reservation_that_would_overshoot(self):
+        """R4: two reserve(600) calls against a 1000 HARD budget must not
+        both succeed -- 600 + 600 = 1200 > 1000. The first is legitimate;
+        the second must be refused rather than pushing total admitted
+        reservations past the hard cap."""
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        ok1, _ = budget.reserve(600)
+        self.assertTrue(ok1)
+        ok2, reason2 = budget.reserve(600)
+        self.assertFalse(ok2)
+        self.assertEqual(budget._reserved, 600)
+        self.assertTrue(reason2)
+
+    def test_reserve_admission_uses_actual_requested_amount_unequal_sizes(self):
+        """R4 (acceptance: the unequal-size case): admission is judged on each
+        call's ACTUAL requested amount, not a fixed step. Against a 1000 HARD
+        budget, reserve(700) is admitted; a differently-sized reserve(400) is
+        refused because 700+400=1100 > 1000, leaving _reserved at 700. A
+        reserve(300) that lands EXACTLY on the ceiling (700+300=1000) is still
+        admitted -- the check rejects only strictly-over, so the inclusive cap
+        is reachable -- after which the budget is full and reserve(1) is
+        refused."""
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        ok1, _ = budget.reserve(700)
+        self.assertTrue(ok1)
+        ok2, reason2 = budget.reserve(400)          # 700+400 = 1100 > 1000 -> refused
+        self.assertFalse(ok2)
+        self.assertEqual(budget._reserved, 700)
+        self.assertTrue(reason2)
+        ok3, _ = budget.reserve(300)                # 700+300 = 1000, exactly at cap -> admitted
+        self.assertTrue(ok3)
+        self.assertEqual(budget._reserved, 1000)
+        ok4, reason4 = budget.reserve(1)            # now full -> refused
+        self.assertFalse(ok4)
+        self.assertEqual(budget._reserved, 1000)
+        self.assertTrue(reason4)
 
     def test_reserve_then_release_leaves_no_trace(self):
         """release() is a full refund for a failed/aborted call -- no

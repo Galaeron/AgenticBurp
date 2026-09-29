@@ -213,7 +213,12 @@ class EffortBudget:
         """
         with self._lock:
             duration_passed = self._deadline_passed()
-            token_full = self.total_tokens is not None and (self.spent + self._reserved) >= self.total_tokens
+            # R4: admission includes the REQUESTED amount, so a hard budget of
+            # 100 cannot admit reserve(60) twice (120).
+            requested = max(0, estimated_tokens)
+            token_full = self.total_tokens is not None and (
+                (self.spent + self._reserved) >= self.total_tokens
+                or (self.spent + self._reserved + requested) > self.total_tokens)
             if not duration_passed and not token_full:
                 self._reserved += max(0, estimated_tokens)
                 return True, ""
