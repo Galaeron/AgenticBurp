@@ -52,10 +52,52 @@ class CallRecord:
     model: str
     prompt_tokens: int
     completion_tokens: int
+    # SC-13: unified trace metadata for every model path. All default to neutral
+    # values, so the 4-positional CallRecord(kind, model, pt, ct) construction and
+    # every existing 4-arg record()/commit() call are unchanged; a plain
+    # token-only record still round-trips exactly as before.
+    provider: str = ""
+    prompt_version: str = ""
+    latency_ms: float = 0.0
+    retries: int = 0
+    outcome: str = "ok"  # "ok" | "error"
+    streamed: bool = False
+    case_ref: str = ""
+    run_id: str = ""
 
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
+
+    def to_dict(self) -> dict:
+        """One flat trace row for the run-ledger / audit surfaces (SC-13)."""
+        return {
+            "kind": self.kind.value if isinstance(self.kind, CallKind) else str(self.kind),
+            "model": self.model, "provider": self.provider,
+            "prompt_version": self.prompt_version,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "latency_ms": self.latency_ms, "retries": self.retries,
+            "outcome": self.outcome, "streamed": self.streamed,
+            "case_ref": self.case_ref, "run_id": self.run_id,
+        }
+
+
+# SC-13: the additive trace fields record()/commit() may forward to CallRecord.
+# A key outside this set is a caller bug, so it is rejected (fail closed) rather
+# than silently dropped.
+_TRACE_FIELDS = frozenset({
+    "provider", "prompt_version", "latency_ms", "retries", "outcome",
+    "streamed", "case_ref", "run_id",
+})
+
+
+def _trace_meta(meta: dict) -> dict:
+    extra = set(meta) - _TRACE_FIELDS
+    if extra:
+        raise TypeError(f"unknown trace field(s): {sorted(extra)}")
+    return meta
 
 
 @dataclass
@@ -72,8 +114,20 @@ class EffortLedger:
     """
     records: list[CallRecord] = field(default_factory=list)
 
-    def record(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int) -> None:
-        self.records.append(CallRecord(kind, model, prompt_tokens, completion_tokens))
+    def record(self, kind: CallKind, model: str, prompt_tokens: int,
+               completion_tokens: int, **meta) -> CallRecord:
+        """Append one call. Extra keyword args (SC-13 trace fields: provider,
+        prompt_version, latency_ms, retries, outcome, streamed, case_ref,
+        run_id) enrich the row; none is required, so a bare 4-arg call is
+        unchanged. Returns the appended record so a tracer can read it back
+        without racing the list under concurrency."""
+        rec = CallRecord(kind, model, prompt_tokens, completion_tokens, **_trace_meta(meta))
+        self.records.append(rec)
+        return rec
+
+    def trace(self) -> list[dict]:
+        """The full run trace as flat rows (SC-13), oldest first."""
+        return [r.to_dict() for r in self.records]
 
     @property
     def total_tokens(self) -> int:
@@ -196,9 +250,10 @@ class EffortBudget:
         Applies to either limit (token or duration)."""
         self._overspend_confirmed = True
 
-    def record(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int) -> None:
+    def record(self, kind: CallKind, model: str, prompt_tokens: int,
+               completion_tokens: int, **meta) -> CallRecord:
         with self._lock:
-            self.ledger.record(kind, model, prompt_tokens, completion_tokens)
+            return self.ledger.record(kind, model, prompt_tokens, completion_tokens, **meta)
 
     def reserve(self, estimated_tokens: int) -> tuple[bool, str]:
         """
@@ -240,7 +295,7 @@ class EffortBudget:
             )
 
     def commit(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int,
-               reserved: int = 0) -> None:
+               reserved: int = 0, **meta) -> CallRecord:
         """
         SC-8: settle a reserve() with the real usage once a call
         completes. Releases the estimate that reserve() held and records
@@ -248,11 +303,12 @@ class EffortBudget:
         a bare record() of those actuals. Calls self.ledger.record
         directly, NOT self.record -- self._lock is a plain (non-reentrant)
         threading.Lock, so re-entering it via self.record here would
-        deadlock.
+        deadlock. SC-13 trace fields (provider, latency_ms, ...) pass
+        through as **meta; returns the appended record.
         """
         with self._lock:
             self._reserved = max(0, self._reserved - max(0, reserved))
-            self.ledger.record(kind, model, prompt_tokens, completion_tokens)
+            return self.ledger.record(kind, model, prompt_tokens, completion_tokens, **meta)
 
     def release(self, reserved: int) -> None:
         """SC-8: full refund of a reservation for a call that failed or
