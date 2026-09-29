@@ -3525,26 +3525,30 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
   `test_orchestrator_chain.py` (or equivalent) case; `full` green.
 - **Impact:** High. **Source:** 2026-09-28 swarm-refresh, residual A2/SC-2.
 
-### [~] R2 — RA-7's `control_outcome` discriminator still collapses at the final suppression site
-- **Result (in progress, uncommitted):** `models.py` now declares `ValidationReport.control_outcome`
+### [x] R2 — RA-7's `control_outcome` discriminator still collapses at the final suppression site
+- **Result (VERIFIED):** `02d21a70` — `models.py` now declares `ValidationReport.control_outcome`
   (default `""`), `orchestrator_confirm.py` carries it from `ValidationResult` when building the report,
   and `confirmation_gate._controlled_negatives`/`_has_controlled_negative` only count `outcome in ("",
   "control_held")` as a controlled negative — so an explicit `control_outcome="inconclusive"` correctly
   produces `inconclusive_unverified` instead of a refutation (re-verified in isolation this session: same
   finding/report, `control_outcome` swept over `""`/`"control_held"`/`"inconclusive"` — only the third
   yields the honest "neither confirmed nor refuted" verdict). `cross_identity_validator.py`'s two genuine
-  reached-but-unproven branches now set `control_outcome="inconclusive"` explicitly. **What's still
-  missing (this is the actual residual, not a re-file of the original RA-7 finding):** (a) no test drives
-  this through the full `Orchestrator.analyze()` path — the existing `test_cross_identity_reject.py`
-  fixtures stop at `_validate_findings`, and this session's attempt to exercise the full path with the
-  *existing* `_CrossIdentityBflaReachedUnprovenValidator` stub reproduced the old symptom, because that
-  stub's own docstring convention (predating this fix) is to leave `control_outcome` **unset** for
-  "inconclusive" — which the gate's backward-compat default (`""` = legacy validator = presumed negative)
-  still treats as a controlled negative. The stub needs updating to set `control_outcome="inconclusive"`
-  explicitly (matching the real validator now), and a new caller test should drive `analyze()` itself, not
-  just `_validate_findings`. (b) Any *other* validator that returns `not_confirmed` for a genuinely
-  inconclusive reason without setting `control_outcome` is still silently treated as a legacy negative —
-  worth a registry-wide audit before relying on this for a class besides cross-identity.
+  reached-but-unproven branches now set `control_outcome="inconclusive"` explicitly. **Closed (VERIFIED):**
+  committed `02d21a70`. (a) Both stale stubs (`_CrossIdentityBflaReachedUnprovenValidator` and
+  `_CrossIdentityOwnershipAuthorizedValidator`) now set `control_outcome="inconclusive"`, matching the real
+  validator; a new `analyze()`-level caller test
+  (`CrossIdentityAnalyzeLevelControlOutcomeTests.test_analyze_honours_control_outcome_inconclusive_vs_control_held`)
+  drives the FULL pipeline and asserts the inconclusive fixture ends `inconclusive_unverified` (not refuted)
+  while the genuine control_held fixture still yields `unconfirmed_hypothesis` — pre-R2 the inconclusive case
+  was `unconfirmed_hypothesis` (probes.json records that pre-fix value), so the test pins the fix; the six
+  existing `_validate_findings` tests stay green. (b) Registry audit: a full refutation
+  (`unconfirmed_hypothesis`) requires a LIVE-tier leg, so cross_identity is the ONLY validator emitting an
+  inconclusive `not_confirmed` for a live class (idor/bola). browser_xss/dom_xss/verbose_error return
+  `not_confirmed` as genuine executed negatives (correctly counted); deserialization/http_request_smuggling/
+  web_cache_poisoning emit observation-only `not_confirmed` but for non-live classes, so they cannot wrongly
+  refute today — they should adopt `control_outcome="inconclusive"` only if their class is ever promoted to a
+  live leg (noted, not a blocking fix). `full` green: 2836 unittest OK (2 skipped), 38 pytest, 229 evaluation
+  OK, 42 integrity OK, exit 0.
 - **Domain:** Confirmation-gate correctness · **Effort:** S (stub + test) · **Depends on:** none ·
   **Mode:** LOOP (offline)
 - **Evidence:** `reviews/2026-09-28/swarm-refresh/REVIEW.md` §R2; this session's
