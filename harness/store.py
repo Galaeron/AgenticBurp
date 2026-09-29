@@ -267,6 +267,55 @@ CREATE TABLE IF NOT EXISTS issue_merges (
 );
 """
 
+# SC-12: durable WorkItem queue behind the existing engagement graph. A WorkItem
+# is one bounded unit of proposed/pending work (detection candidate -> planned
+# probe -> execution -> verification -> report) that must survive a crash and be
+# replayed WITHOUT re-running an external mutation twice and WITHOUT losing work.
+#
+# Design invariants (each has a caller-level test + negative control in
+# test_work_queue.py):
+#   * item_id is the STABLE proof identity -- a content hash of
+#     (engagement_id, case_ref, capability, principal, payload). It never
+#     changes across a retry, so a failed task is retryable without changing its
+#     identity, and an external effect can dedupe on it. attempt / priority /
+#     lease / status are deliberately NOT part of it.
+#   * INSERT OR IGNORE on item_id makes enqueue idempotent: proposing the same
+#     logical work twice is a no-op, never a duplicate row.
+#   * engagement_id partitions everything. Leasing, budget reservation and
+#     dependency resolution are all scoped to one engagement, so two concurrent
+#     engagements can never lease each other's items or share a budget.
+#   * status is durable: pending -> leased -> done|dead. A `done` item is never
+#     leased again (no duplicate dispatch on replay); a crashed `leased` item
+#     whose lease expired is reclaimed to `pending` (no lost work); a failed
+#     `leased` item goes back to `pending` until max_attempts, then `dead`.
+# One process + SQLite transactions (BEGIN IMMEDIATE) first, per SC-12; no Redis
+# / external broker. This table is inert until a caller dispatches through it --
+# nothing in the default pipeline writes it, so it sends no traffic on its own.
+_WORK_ITEM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS work_items (
+    item_id TEXT PRIMARY KEY,
+    engagement_id TEXT NOT NULL,
+    case_ref TEXT NOT NULL DEFAULT '',
+    capability TEXT NOT NULL DEFAULT '',
+    principal TEXT NOT NULL DEFAULT '',
+    priority INTEGER NOT NULL DEFAULT 0,
+    depends_on_json TEXT NOT NULL DEFAULT '[]',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    budget_reservation REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expiry REAL NOT NULL DEFAULT 0,
+    result_ref TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_items_lease
+    ON work_items(engagement_id, status, priority);
+"""
+
 
 # Concurrent first callers on a fresh on-disk DB race on schema setup: switching
 # to WAL and the check-then-act migrations below all take a write lock, and SQLite
@@ -312,6 +361,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
     conn.executescript(_EVIDENCE_BLOB_SCHEMA)
+    conn.executescript(_WORK_ITEM_SCHEMA)
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -1580,6 +1630,287 @@ def ledger_events_for_many(finding_refs: "list[str]") -> "dict[str, list[dict]]"
             "provenance": json.loads(r[6] or "{}"), "created_at": r[7],
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# SC-12: durable WorkItem queue. Low-level, transactional persistence for the
+# work_items table (schema + invariants documented at _WORK_ITEM_SCHEMA). The
+# read-modify-write operations (lease / complete / fail / reclaim / budgeted
+# enqueue) each run inside one `BEGIN IMMEDIATE` transaction so a concurrent
+# peer can never observe a half-applied claim: SQLite serialises writers, so at
+# most one worker leases a given item. The higher-level API (WorkItem dataclass,
+# stable-identity computation, retry policy) lives in harness.work_queue; this
+# module is the SQL boundary only, exactly like the ledger functions above.
+# ---------------------------------------------------------------------------
+
+# Column order shared by every SELECT below and by _work_item_row_to_dict.
+_WORK_ITEM_COLUMNS = (
+    "item_id, engagement_id, case_ref, capability, principal, priority, "
+    "depends_on_json, payload_json, budget_reservation, status, attempt, "
+    "max_attempts, lease_owner, lease_expiry, result_ref, last_error, "
+    "created_at, updated_at"
+)
+
+# Statuses that still hold their budget reservation. A `dead` item (retries
+# exhausted) releases its reservation back to the engagement; pending/leased/done
+# keep it (done work really did spend its budget).
+_WORK_ITEM_BUDGET_STATUSES = ("pending", "leased", "done")
+
+
+def _work_item_row_to_dict(row) -> dict:
+    return {
+        "item_id": row[0],
+        "engagement_id": row[1],
+        "case_ref": row[2],
+        "capability": row[3],
+        "principal": row[4],
+        "priority": row[5],
+        "depends_on": json.loads(row[6] or "[]"),
+        "payload": json.loads(row[7] or "{}"),
+        "budget_reservation": row[8],
+        "status": row[9],
+        "attempt": row[10],
+        "max_attempts": row[11],
+        "lease_owner": row[12],
+        "lease_expiry": row[13],
+        "result_ref": row[14],
+        "last_error": row[15],
+        "created_at": row[16],
+        "updated_at": row[17],
+    }
+
+
+def _begin_immediate() -> sqlite3.Connection:
+    """A connection in autocommit (isolation_level=None) with a write lock
+    already held, so the caller owns one explicit BEGIN IMMEDIATE .. COMMIT
+    transaction and pysqlite never injects an implicit one of its own."""
+    conn = _connect()
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+    return conn
+
+
+def enqueue_work_item(item: dict, *, budget_cap: "float | None" = None) -> str:
+    """Idempotently persist one WorkItem. Returns:
+      * 'duplicate'       -- item_id already present; no row written, no budget
+                             re-checked (re-proposing the same work is a no-op).
+      * 'budget_exceeded' -- budget_cap given and this item's reservation would
+                             push the engagement's held reservations over it; no
+                             row written.
+      * 'inserted'        -- a new pending row was written.
+    The existence check + budget sum + INSERT run in one transaction so two
+    workers racing to enqueue the same/overlapping work cannot both slip past a
+    shared cap."""
+    conn = _begin_immediate()
+    try:
+        exists = conn.execute("SELECT 1 FROM work_items WHERE item_id = ?",
+                              (item["item_id"],)).fetchone()
+        if exists:
+            conn.execute("COMMIT")
+            return "duplicate"
+        reservation = float(item.get("budget_reservation", 0) or 0)
+        if budget_cap is not None:
+            placeholders = ",".join("?" for _ in _WORK_ITEM_BUDGET_STATUSES)
+            reserved = conn.execute(
+                "SELECT COALESCE(SUM(budget_reservation), 0) FROM work_items "
+                f"WHERE engagement_id = ? AND status IN ({placeholders})",
+                (item["engagement_id"], *_WORK_ITEM_BUDGET_STATUSES)).fetchone()[0]
+            if float(reserved) + reservation > float(budget_cap) + 1e-9:
+                conn.execute("COMMIT")
+                return "budget_exceeded"
+        now = float(item.get("created_at", time.time()))
+        conn.execute(
+            "INSERT INTO work_items (item_id, engagement_id, case_ref, capability, "
+            "principal, priority, depends_on_json, payload_json, budget_reservation, "
+            "status, attempt, max_attempts, lease_owner, lease_expiry, result_ref, "
+            "last_error, created_at, updated_at) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (item["item_id"], item["engagement_id"], item.get("case_ref", ""),
+             item.get("capability", ""), item.get("principal", ""),
+             int(item.get("priority", 0)),
+             json.dumps(list(item.get("depends_on", []) or [])),
+             json.dumps(item.get("payload", {}) or {}),
+             reservation, "pending", int(item.get("attempt", 0)),
+             int(item.get("max_attempts", 3)), "", 0.0, "", "",
+             now, now))
+        conn.execute("COMMIT")
+        return "inserted"
+    finally:
+        conn.close()
+
+
+def get_work_item(item_id: str) -> "dict | None":
+    conn = _connect()
+    try:
+        row = conn.execute(
+            f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items WHERE item_id = ?",
+            (item_id,)).fetchone()
+    finally:
+        conn.close()
+    return _work_item_row_to_dict(row) if row else None
+
+
+def list_work_items(engagement_id: "str | None" = None, *,
+                    status: "str | None" = None) -> "list[dict]":
+    clauses, params = [], []
+    if engagement_id is not None:
+        clauses.append("engagement_id = ?")
+        params.append(engagement_id)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items{where} "
+            "ORDER BY priority DESC, created_at ASC", params).fetchall()
+    finally:
+        conn.close()
+    return [_work_item_row_to_dict(r) for r in rows]
+
+
+def reclaim_expired_leases(*, now: "float | None" = None,
+                           engagement_id: "str | None" = None) -> int:
+    """Return every `leased` item whose lease has expired to `pending` (crash
+    recovery: a worker that died mid-lease releases its claim once the lease
+    lapses). attempt is NOT touched here -- it re-increments on the next lease,
+    so a crash costs at most one attempt. Returns the number reclaimed. Scoped
+    to one engagement when given, so recovery never crosses engagements."""
+    now = time.time() if now is None else float(now)
+    conn = _begin_immediate()
+    try:
+        if engagement_id is not None:
+            cur = conn.execute(
+                "UPDATE work_items SET status = 'pending', lease_owner = '', "
+                "lease_expiry = 0, updated_at = ? WHERE engagement_id = ? AND "
+                "status = 'leased' AND lease_expiry <= ?", (now, engagement_id, now))
+        else:
+            cur = conn.execute(
+                "UPDATE work_items SET status = 'pending', lease_owner = '', "
+                "lease_expiry = 0, updated_at = ? WHERE status = 'leased' AND "
+                "lease_expiry <= ?", (now, now))
+        reclaimed = cur.rowcount
+        conn.execute("COMMIT")
+        return reclaimed
+    finally:
+        conn.close()
+
+
+def lease_next_work_item(engagement_id: str, *, worker: str, now: "float | None" = None,
+                         lease_seconds: float = 300.0) -> "dict | None":
+    """Atomically claim the highest-priority runnable pending item for ONE
+    engagement and return it (or None). Runnable means every id in its
+    depends_on is `done`. Expired leases for this engagement are reclaimed first
+    (in the same transaction), so a crashed peer's work is picked up here.
+    attempt is incremented as the item moves to `leased` -- each dispatch is one
+    attempt. Only ever considers this engagement's rows, so no cross-engagement
+    lease is possible."""
+    now = time.time() if now is None else float(now)
+    conn = _begin_immediate()
+    try:
+        # Crash recovery: expired leases for this engagement rejoin the pool.
+        conn.execute(
+            "UPDATE work_items SET status = 'pending', lease_owner = '', "
+            "lease_expiry = 0, updated_at = ? WHERE engagement_id = ? AND "
+            "status = 'leased' AND lease_expiry <= ?", (now, engagement_id, now))
+        done_ids = {r[0] for r in conn.execute(
+            "SELECT item_id FROM work_items WHERE engagement_id = ? AND status = 'done'",
+            (engagement_id,)).fetchall()}
+        candidates = conn.execute(
+            f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items WHERE engagement_id = ? "
+            "AND status = 'pending' ORDER BY priority DESC, created_at ASC",
+            (engagement_id,)).fetchall()
+        chosen = None
+        for row in candidates:
+            deps = json.loads(row[6] or "[]")
+            if all(d in done_ids for d in deps):
+                chosen = row
+                break
+        if chosen is None:
+            conn.execute("COMMIT")
+            return None
+        item_id, attempt = chosen[0], chosen[10]
+        conn.execute(
+            "UPDATE work_items SET status = 'leased', lease_owner = ?, "
+            "lease_expiry = ?, attempt = ?, updated_at = ? WHERE item_id = ?",
+            (worker, now + float(lease_seconds), attempt + 1, now, item_id))
+        leased = conn.execute(
+            f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items WHERE item_id = ?",
+            (item_id,)).fetchone()
+        conn.execute("COMMIT")
+        return _work_item_row_to_dict(leased)
+    finally:
+        conn.close()
+
+
+def complete_work_item(item_id: str, *, result_ref: str = "",
+                       now: "float | None" = None) -> bool:
+    """Mark a `leased` item `done` with its result reference. Returns True only
+    on the leased -> done transition; False if the item is missing or not
+    currently leased (already done, or reclaimed back to pending under a stale
+    worker). A `done` item is terminal and is never leased again, so replay
+    cannot re-dispatch completed work -- this is the structural half of "no
+    duplicate external mutations"."""
+    now = time.time() if now is None else float(now)
+    conn = _begin_immediate()
+    try:
+        cur = conn.execute(
+            "UPDATE work_items SET status = 'done', result_ref = ?, lease_owner = '', "
+            "lease_expiry = 0, updated_at = ? WHERE item_id = ? AND status = 'leased'",
+            (result_ref, now, item_id))
+        changed = cur.rowcount == 1
+        conn.execute("COMMIT")
+        return changed
+    finally:
+        conn.close()
+
+
+def fail_work_item(item_id: str, *, error: str = "", now: "float | None" = None) -> str:
+    """Record a failed attempt on a `leased` item. If attempt < max_attempts the
+    item returns to `pending` for retry -- its item_id (proof identity) is
+    unchanged, so a retry never forks a new identity; otherwise it becomes
+    `dead`. Returns the resulting status, or 'missing' if the item is gone, or
+    the current status unchanged if it was not leased."""
+    now = time.time() if now is None else float(now)
+    conn = _begin_immediate()
+    try:
+        row = conn.execute(
+            "SELECT status, attempt, max_attempts FROM work_items WHERE item_id = ?",
+            (item_id,)).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return "missing"
+        status, attempt, max_attempts = row
+        if status != "leased":
+            conn.execute("COMMIT")
+            return status
+        new_status = "pending" if attempt < max_attempts else "dead"
+        conn.execute(
+            "UPDATE work_items SET status = ?, lease_owner = '', lease_expiry = 0, "
+            "last_error = ?, updated_at = ? WHERE item_id = ?",
+            (new_status, error, now, item_id))
+        conn.execute("COMMIT")
+        return new_status
+    finally:
+        conn.close()
+
+
+def engagement_budget_reserved(engagement_id: str) -> float:
+    """Sum of budget reservations an engagement is currently holding (pending +
+    leased + done; a `dead` item's reservation is released). Reservations are
+    per-engagement by construction, so one engagement's total is never affected
+    by another's -- the storage half of budget isolation."""
+    placeholders = ",".join("?" for _ in _WORK_ITEM_BUDGET_STATUSES)
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(budget_reservation), 0) FROM work_items "
+            f"WHERE engagement_id = ? AND status IN ({placeholders})",
+            (engagement_id, *_WORK_ITEM_BUDGET_STATUSES)).fetchone()
+    finally:
+        conn.close()
+    return float(row[0])
 
 
 # ---------------------------------------------------------------------------
