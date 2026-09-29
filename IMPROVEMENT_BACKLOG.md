@@ -3449,7 +3449,24 @@ report polish.
 - **Impact:** Medium-High.
 - **Source:** REVIEW.md "Technology worth adapting" #5.
 
-### [ ] SC-15 — Evidence-first report polish + retest classification (borrow #6)
+### [x] SC-15 — Evidence-first report polish + retest classification (borrow #6)
+- **Result (VERIFIED):** `a07da36` — new `harness/report_share.py` renders the SC-5
+  canonical export (`report_generator.export_issues_for_host`/`issue_exports`, already
+  redacted + policy-gated + verification-audited) into a self-contained single-file HTML
+  report and a `.http` evidence export (VS Code REST Client / Burp Repeater), plus
+  `classify_retests` (fixed / still_vulnerable / inconclusive / not_run) keyed to the
+  stable, run-independent `issue_id`. Presentation only: no new evidence, no
+  verification decision, no store write, no `config.yaml` change — ships inert (nothing
+  in the default pipeline renders it; a live `/report`/CLI route is deferred). 12
+  caller-level tests in `test_report_share.py`, each acceptance criterion a positive +
+  negative control: SC-5 parity (the REAL `export_issues_for_host` gate demotes a
+  low-confidence generic lead → absent from every format, strict subset; the solid
+  finding survives in all), prose never promotes state (a "VERIFIED CRITICAL"-prose
+  finding with no backing proof renders `candidate`; `<script>` HTML-escaped), secret
+  canary redacted from HTML + `.http` while the issue remains, stable `issue_id`
+  survives a patched-fixture retest (new case/proof ids, same coordinates) with FIXED
+  requiring an executed `controlled_negative` (blocked→inconclusive, per SC-1). Verified
+  this session: 12/12 `test_report_share` pass; `python -m harness.suite full` exit 0.
 - **Domain:** Reporting / UX · **Effort:** M · **Depends on:** SC-5 · **Mode:** LOOP (offline)
 - **Evidence (INFERRED — design proposal):** upstream's shareable single-file HTML layout + remediation/
   reproduction sections are worth adapting; AgenticVibe already has canonical issues, proof linkage,
