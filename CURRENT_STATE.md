@@ -65,15 +65,26 @@ reconciled (SC-1 real-oracle-gate fix, SC-4/RA-8 fail-closed workflow
 assertions, SC-5 MCP adapter forwarding) is unaffected and stands as that
 review described. A5/SC-6 (packaging) and A6 (tool-network egress) remain open.
 
-## Current priorities
+## Offline loop status — EXHAUSTED (LOOP_DONE)
 
-The swarm-refresh R1–R7 batch is fully committed. Remaining offline-loop work (resume the older queue):
+The swarm-refresh R1–R7 batch is fully committed, and every remaining backlog `[ ]`
+item was assessed this session as NOT offline-loop-consumable — so the offline loop is
+exhausted again (as at the pre-swarm-refresh `LOOP_DONE`, `ce387cf3`):
 
-1. Rerun `reviews/2026-09-28/swarm-refresh/probes.py` against this HEAD and fold the post-fix result
-   into that review dir as the capstone record (the checked-in `probes.json` is the pre-fix snapshot).
-2. Then the older queue's next eligible OFFLINE item: SC-8's production dispatch wiring (the reservation
-   API still has no production caller), else A5/SC-6 packaging or A6 tool-network egress as scoped.
-   Packaging/build, live-model, blind-target and matched-budget efficacy runs remain OWNER/LIVE (skip).
+- OWNER/LIVE: P1-3's remaining single-command live scorecard, P1-5 (Burp UX), P2-3's
+  Burp-tab half, P3-3 (team mode), BM-3, PR-A..E, NC-O1..O5.
+- Too large for one clean iteration: P2-1 (a whole new business-reasoning agent),
+  SC-10..15 (multi-subsystem "borrows"); SC-9's dep PR-11 is `[~]`.
+- Packaging/supply-chain (needs Docker/registry or PyPI egress, not offline): P3-2, SC-6.
+- BM-2 is owner-gated in substance: its classes (sqli/xss/idor/path_traversal/command_injection)
+  are exactly the ones FR-4 EXCLUDES because a corroboration gate on them collapses recall to
+  ~0.05 (`confirmation_gate.py:519–522`); a real control-discriminator is per-validator research
+  whose success is corpus-measured, so only a tautology-risking single-twin gate is offline. Left `[ ]`.
+
+**Owner/live follow-ups:** rerun `reviews/2026-09-28/swarm-refresh/probes.py` (needs a scratch patch
+for R6's now-3rd pipeline call) as the R-batch capstone; the reservation API still lacks a production
+caller; then packaging, tool-egress, BM-2 corpus tuning, and the matched-budget efficacy / blind-recall
+runs. A future review can reopen the loop with fresh offline items, as swarm-refresh did.
 
 Existing owner deferrals remain owner decisions; none of the counterexamples
 above needs a live model or real target to reproduce. Preserve
