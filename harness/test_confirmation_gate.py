@@ -359,6 +359,38 @@ class CaseBoundNegativeEvidenceTests(unittest.TestCase):
         self.assertTrue(finding_user.summary.startswith("[Hypothesis] "))
         self.assertEqual(finding_user.severity, "low")
 
+    def test_r3_unknown_principal_negative_is_not_a_wildcard(self):
+        """R3 (residual A3/SC-3): the four probes.py `suppression_*` cases as a
+        caller test. A finding discovered under a RESOLVED principal ("alice")
+        on parameter "id" is confronted with one not_confirmed control that
+        varies by (parameter, principal). Only a control bound to the SAME
+        parameter AND the SAME principal refutes it.
+
+        The load-bearing case is `unknown_principal`: an UNKNOWN/empty control
+        principal must NOT wildcard onto "alice". Pre-R3 that empty principal
+        was treated as a match (probes.json recorded it as
+        `unconfirmed_hypothesis` -- wrongly refuted); the fix makes it
+        `inconclusive_unverified`. The existing cross/same-principal tests use
+        two RESOLVED principals (admin/user) and so passed even before R3 --
+        they never exercised the empty-principal wildcard this pins. The other
+        three cases mirror the review's probe verbatim as regression guards."""
+        cases = [
+            # (label, neg_parameter, neg_principal, expected_verdict)
+            ("empty_param", "", "alice", "inconclusive_unverified"),
+            ("unknown_principal", "id", "", "inconclusive_unverified"),  # R3 fix (was unconfirmed_hypothesis)
+            ("other_principal", "id", "bob", "inconclusive_unverified"),
+            ("matching", "id", "alice", "unconfirmed_hypothesis"),
+        ]
+        for label, neg_param, neg_principal, expected in cases:
+            with self.subTest(case=label):
+                f = _finding_param("idor", "id", severity="high", principal="alice")
+                report = AgentReport(agent="idor", model="test", findings=[f])
+                apply_confirmation_suppression(
+                    [report],
+                    validation_reports=[_neg("idor", validator="cross_identity",
+                                             parameter=neg_param, principal=neg_principal)])
+                self.assertEqual(f.review_verdict, expected, label)
+
 
 class ActiveConfirmationProvenanceTests(unittest.TestCase):
     """2026-09-17 coverage-recovery plan, Step 4: reject an active-class

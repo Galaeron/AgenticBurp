@@ -627,9 +627,8 @@ def _has_controlled_negative(
         refutes a finding whose OWN parameter is a specific, known value; it
         only refutes another empty-parameter [genuinely endpoint-level]
         finding), AND
-      - principal does NOT discriminate against the match unless BOTH sides
-        are resolved (non-empty) and differ -- an empty principal on either
-        side never removes a refutation that would otherwise fire.
+      - principal_id matches exactly (R3: an unknown/empty principal on one
+        side no longer wildcards a resolved principal on the other).
 
     A same-class negative recorded under a DIFFERENT non-empty parameter, or
     under a different resolved principal, does NOT match here -- that is the
@@ -642,7 +641,9 @@ def _has_controlled_negative(
     for neg_param, neg_principal in entries:
         if neg_param != parameter_name:
             continue
-        if neg_principal and principal_id and neg_principal != principal_id:
+        # R3: unknown/anonymous is NOT a wildcard -- a negative only refutes a
+        # finding bound to the same principal (both empty == same "unknown").
+        if neg_principal != principal_id:
             continue
         return True
     return False
