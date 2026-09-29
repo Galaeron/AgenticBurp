@@ -33,6 +33,13 @@ class StepStatus(str, Enum):
     CLEANED = "cleaned"
 
 
+# Version of THIS workflow-execution engine (step/extractor/assertion semantics
+# above). Bumped only when those semantics change in a way a data pack could
+# depend on. SC-11 workflow packs declare a supported engine range and refuse to
+# compile outside it, so a pack authored against a newer engine cannot silently
+# run on an older one.
+ENGINE_VERSION = 1
+
 _ASSERTION_KINDS = frozenset({"status", "body_contains", "json_pointer"})
 
 
