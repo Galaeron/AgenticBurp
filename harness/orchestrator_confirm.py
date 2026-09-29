@@ -522,6 +522,7 @@ class ConfirmMixin:
                 # under, so the gate can't let a negative from one principal
                 # suppress a finding discovered under a different principal.
                 principal_id=getattr(finding, "principal_id", ""),
+                control_outcome=getattr(result, "control_outcome", "") or "",
             ))
             # P0-1/T01 (RB-4 shared helper): VALIDATION_DECISION -- "why was it
             # concluded (vulnerable or not)" -- plus the case-bound structured

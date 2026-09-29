@@ -256,6 +256,12 @@ class ValidationReport(BaseModel):
     # discovered under a DIFFERENT principal of the same class/parameter.
     # Optional/default-empty for backward compatibility.
     principal_id: str = ""
+    # R2/RA-7: carried from ValidationResult.control_outcome. "inconclusive"
+    # marks a not_confirmed that is NOT a genuine executed negative control
+    # (e.g. cross-identity reached-but-unproven); the suppression gate must not
+    # treat it as a refutation. Empty = legacy validator (not_confirmed is a
+    # negative); "control_held" = genuine held control.
+    control_outcome: str = ""
 
 
 class StageOutcome(BaseModel):

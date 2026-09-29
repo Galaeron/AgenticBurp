@@ -606,7 +606,8 @@ def _controlled_negatives(validation_reports: list | None) -> dict:
     for vr in validation_reports or []:
         status = (getattr(vr, "status", "") or "").lower()
         confirmed = bool(getattr(vr, "confirmed", False))
-        if status == "not_confirmed" and not confirmed:
+        outcome = (getattr(vr, "control_outcome", "") or "").lower()
+        if status == "not_confirmed" and not confirmed and outcome in ("", "control_held"):
             fc = getattr(vr, "finding_class", "") or ""
             fc_canon = canonicalize(fc) or fc.lower()
             param = getattr(vr, "parameter", "") or ""

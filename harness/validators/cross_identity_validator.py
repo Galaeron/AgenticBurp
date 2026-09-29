@@ -346,7 +346,8 @@ class CrossIdentityValidator(Validator):
                         f"({'no admin baseline configured' if not have_admin_baseline else 'the responses differed'}). "
                         f"An admin namespace is a lead, not proof -- delegated/read-only access may be legitimate.",
                 evidence=f"Supply an admin session for a privileged-data comparison, or verify the returned "
-                         f"content is genuinely admin-only, before treating this as a confirmed BFLA.")
+                         f"content is genuinely admin-only, before treating this as a confirmed BFLA.",
+                control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.8, confirmed=False,
@@ -458,7 +459,8 @@ class CrossIdentityValidator(Validator):
                         f"{exchange.url} with explicit ownership/share/public permission; "
                         f"all {considered} configured principals were still evaluated.",
                 evidence=f"OwnershipLedger authorized {authorized} of {considered} tested "
-                         f"principal(s) for {self._object_ref(exchange.url)!r}.")
+                         f"principal(s) for {self._object_ref(exchange.url)!r}.",
+                control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.8, confirmed=False,

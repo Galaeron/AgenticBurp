@@ -88,8 +88,9 @@ class _CrossIdentityBflaReachedUnprovenValidator:
     reached-but-unproven observation (_confirm_bfla, ~340-349) -- a
     non-privileged identity REACHED an admin-namespaced function but this leg
     could not prove it returned the same privileged data an admin sees. This
-    is status="not_confirmed" but control_outcome is UNSET (not a
-    control-held reject) -- "a lead, not proof". Must NOT be capped/demoted."""
+    is status="not_confirmed" with control_outcome="inconclusive" (matching the
+    real validator per R2, NOT a control-held reject) -- "a lead, not proof".
+    Must NOT be capped/demoted at _validate_findings, nor refuted at the gate."""
     name = "cross_identity"
     version = ""
 
@@ -105,7 +106,8 @@ class _CrossIdentityBflaReachedUnprovenValidator:
             summary="OBSERVATION (not confirmed): non-privileged identity reached the "
                     "admin-namespaced function, but this leg could not establish it "
                     "returned the same privileged data an admin sees.",
-            evidence="admin namespace is a lead, not proof")
+            evidence="admin namespace is a lead, not proof",
+            control_outcome="inconclusive")
 
 
 class _CrossIdentityOwnershipAuthorizedValidator:
@@ -113,8 +115,8 @@ class _CrossIdentityOwnershipAuthorizedValidator:
     ownership-authorized observation (~452-460) -- a principal reached the
     object but OwnershipLedger says it was explicitly authorized (own /
     shared / public), so this is authorized sharing, not BOLA. Also
-    status="not_confirmed" with control_outcome UNSET. Must NOT be
-    capped/demoted."""
+    status="not_confirmed" with control_outcome="inconclusive" (matching the
+    real validator per R2). Must NOT be capped/demoted, nor refuted at the gate."""
     name = "cross_identity"
     version = ""
 
@@ -130,7 +132,8 @@ class _CrossIdentityOwnershipAuthorizedValidator:
             summary="OBSERVATION (not confirmed): 1 authorized principal(s) reached the "
                     "resource with explicit ownership/share/public permission; all "
                     "configured principals were still evaluated.",
-            evidence="OwnershipLedger authorized 1 of 1 tested principal(s)")
+            evidence="OwnershipLedger authorized 1 of 1 tested principal(s)",
+            control_outcome="inconclusive")
 
 
 class _UnrelatedNonDowngradingValidator:
@@ -318,6 +321,71 @@ class CrossIdentityRejectTests(unittest.TestCase):
         self.assertNotEqual(finding.review_verdict, "downgraded")
         self.assertNotIn("access correctly restricted", finding.review_note or "")
         self.assertNotIn("every configured other", finding.review_note or "")
+
+
+class CrossIdentityAnalyzeLevelControlOutcomeTests(unittest.IsolatedAsyncioTestCase):
+    """R2/RA-7 (residual): drive the FULL Orchestrator.analyze() path -- not just
+    _validate_findings, which the tests above stop at -- and prove the
+    confirmation-SUPPRESSION gate (a later stage than the _validate_findings
+    REJECT block) honours control_outcome. A cross_identity not_confirmed with
+    control_outcome='inconclusive' (reached-but-unproven) must NOT be counted as
+    a controlled negative: the idor finding ends inconclusive_unverified, not
+    refuted. A genuine control_held reject still refutes it
+    (unconfirmed_hypothesis). Pre-R2 the inconclusive case was buried as
+    unconfirmed_hypothesis because the gate's legacy default treated ANY
+    not_confirmed as a negative -- probes.json recorded exactly that pre-fix
+    value, so this test's inconclusive assertion pins the fix (both the gate's
+    control_outcome filter and the stub now matching the real validator)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        from pathlib import Path
+        from harness import cache, store
+        cls._tmp = tempfile.mkdtemp(prefix="r2_analyze_control_outcome_")
+        cls._orig_store_db = store._DB_PATH
+        cls._orig_cache = cache._cache
+        store._DB_PATH = Path(cls._tmp) / "state.db"
+        cache.init_cache(db_path=str(Path(cls._tmp) / "cache.db"))
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        from harness import cache, store
+        store._DB_PATH = cls._orig_store_db
+        cache._cache = cls._orig_cache
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    async def test_analyze_honours_control_outcome_inconclusive_vs_control_held(self):
+        from unittest.mock import patch, AsyncMock
+        from harness.models import AgentReport, Finding, HttpExchange, StageOutcome
+        from harness.test_cache_hypothesis_reuse import _build
+
+        cases = [
+            ("inconclusive", _CrossIdentityBflaReachedUnprovenValidator(), "inconclusive_unverified"),
+            ("control_held", _CrossIdentityNotConfirmedValidator(), "unconfirmed_hypothesis"),
+        ]
+        for label, validator, expected in cases:
+            with self.subTest(control_outcome=label):
+                orch, _ = _build("audit.invalid", hypothesis_cache_enabled=False)
+                finding = Finding(
+                    vulnerability_class="idor", confidence=0.8, severity="high",
+                    summary="audit", evidence="audit", suggested_test="audit",
+                    basis="derived", confirmed=False, parameter_name="id")
+                report = AgentReport(agent="sqli", model="audit", findings=[finding])
+                exchange = HttpExchange(method="GET", url="http://audit.invalid/?id=1")
+                with patch.object(
+                        orch.analysis_pipeline, "run_full_analysis",
+                        new=AsyncMock(return_value=(
+                            [report], 0, 0,
+                            StageOutcome(name="critique", status="disabled")))), \
+                     patch.object(orch.validator_registry, "for_finding",
+                                  return_value=[validator]):
+                    await orch.analyze(exchange, force_agents=["sqli"], bypass_cache=True)
+                self.assertEqual(
+                    finding.review_verdict, expected,
+                    f"{label}: analyze() produced {finding.review_verdict!r}, "
+                    f"expected {expected!r}")
 
 
 if __name__ == "__main__":
