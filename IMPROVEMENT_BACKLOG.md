@@ -3325,7 +3325,30 @@ report polish.
 - **Impact:** Medium-High.
 - **Source:** REVIEW.md "Technology worth adapting" #2.
 
-### [ ] SC-12 — Durable WorkItem queue behind the existing graph (borrow #3)
+### [x] SC-12 — Durable WorkItem queue behind the existing graph (borrow #3)
+- **Result (VERIFIED):** `c4f7f76` — durable `work_items` table in `harness/store.py`
+  (schema + transactional CRUD: idempotent `enqueue_work_item`, and atomic
+  `lease_next_work_item` / `complete_work_item` / `fail_work_item` /
+  `reclaim_expired_leases` under one `BEGIN IMMEDIATE` each, plus per-engagement
+  `engagement_budget_reserved`), fronted by a new `harness/work_queue.py` (`WorkItem`
+  dataclass, content-hash `compute_item_id` proof identity, `WorkQueue` adapter bound
+  to one engagement). 26 tests in `test_work_queue.py`, each acceptance criterion with
+  a positive test AND a negative control: (1) crash+replay — `item_id` is stable across
+  retries, a `done` item is terminal and never re-leased (structural no-duplicate-
+  dispatch), an expired `leased` item is reclaimed to `pending` (no lost work), and a
+  real 8-thread lease test proves `BEGIN IMMEDIATE` makes claiming exclusive (no item
+  leased twice, none dropped); (2) engagement isolation — lease / dependency resolution
+  / budget accounting are all scoped to `engagement_id`, so two concurrent engagements
+  cannot lease each other's items or share a budget/principal (a higher-priority item in
+  engagement B is never handed to A); (3) retry keeps proof identity — `fail()` returns a
+  leased item to `pending` with `item_id` unchanged (attempt re-increments) until
+  `max_attempts` then `dead`, and re-enqueuing identical work is an idempotent no-op.
+  Substrate only: nothing in the default pipeline dispatches through the queue yet, so it
+  ships **inert** (sends no traffic, changes no verdict, no config knob to toggle);
+  API/Burp adapters + live wiring deferred per SC-12's "one process + SQLite first".
+  `config.yaml` unchanged; `test_pipeline_gate.py` and its defect-injection controls
+  preserved. Full suite from repo root (`.venv-rationalisation`): 2897 unittest OK / 2
+  skip, pytest 38, evaluation 231, evaluation-integrity 42, exit 0.
 - **Domain:** Architecture / Orchestration · **Effort:** L · **Depends on:** SC-1 · **Mode:** LOOP (offline; SQLite)
 - **Evidence (INFERRED — design proposal):** upstream's event board is lossy (B1: 100 findings → 32
   delivered; cursor commits after errors). The borrowable idea is typed work-dispatch, NOT their board.
