@@ -402,5 +402,52 @@ class HypothesisCacheDefaultOffTests(_HypothesisCacheTestBase):
         self.assertGreater(stub.calls, calls_after_run1)
 
 
+class FailedStageNotCachedTests(_HypothesisCacheTestBase):
+    """#5 -- R6 (FR-7 lifecycle): a FAILED inference stage must never be cached
+    as a reusable hypothesis. With the flag ON, run analyze() twice on identical
+    traffic under fresh RunContexts. Run 1's pipeline FAILS (a StageOutcome with
+    status='failed') and comes back degraded; because that failure is NOT cached,
+    run 2 (a fresh RunContext) RE-INVOKES the pipeline instead of replaying the
+    failure, and recovers healthy. Pre-R6, the failed stage was put_hypothesis'd,
+    so run 2 hit the cache -- staying degraded with NO new pipeline call, which
+    prolonged the outage until TTL/bypass."""
+
+    async def test_failed_stage_is_not_cached_and_next_run_recovers(self):
+        from unittest.mock import patch, AsyncMock
+        from harness.models import StageOutcome
+
+        host = "r6-failed-stage.hyp-cache.test"
+        orch, _ = _build(host, hypothesis_cache_enabled=True)
+        exchange = _exchange(host)
+
+        # side_effect has EXACTLY two entries: run 1 -> failure, run 2 -> recovery.
+        # Post-R6 that is exactly the call sequence (run 2 must re-invoke). If run 2
+        # wrongly replayed a cached failure it would never consume `recovery`.
+        failure = ([], 0, 0, StageOutcome(name="critique", status="failed", failed=1))
+        recovery = ([], 0, 0, StageOutcome(name="critique", status="completed"))
+        pipeline = AsyncMock(side_effect=[failure, recovery])
+
+        with patch.object(orch.analysis_pipeline, "run_full_analysis", new=pipeline), \
+             patch.object(orch, "_choose_agents",
+                          new=AsyncMock(return_value=(["sqli"], "audit"))):
+            first = await orch.analyze(exchange, run_context=_fresh_run_context(orch, host))
+            second = await orch.analyze(exchange, run_context=_fresh_run_context(orch, host))
+
+        self.assertTrue(
+            first.degraded,
+            "run 1's failed stage was not reported degraded -- fixture broken.",
+        )
+        self.assertEqual(
+            pipeline.call_count, 2,
+            "R6: run 2 did NOT re-invoke the pipeline -- the failed stage was cached "
+            "and replayed instead of re-running inference.",
+        )
+        self.assertFalse(
+            second.degraded,
+            "R6: run 2 stayed degraded -- it replayed a cached failed stage instead "
+            "of recovering on a fresh inference call.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
