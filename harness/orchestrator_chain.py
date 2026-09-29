@@ -348,7 +348,14 @@ class ChainMixin:
 
             if _responses_materially_same(cred, anon) or _responses_materially_same(cred, invalid):
                 return False  # public resource, or the token made no difference
-            return True
+            # R1: dissimilarity alone is not authorization (random/nonce bodies or
+            # status jitter on a public endpoint would pass). Require a positive
+            # access fact: BOTH controls were actually denied (401/403 or a
+            # redirect away) while the credentialed request succeeded.
+            def _denied(r) -> bool:
+                s = r.status
+                return s is not None and (s in (401, 403) or 300 <= s < 400)
+            return _denied(anon) and _denied(invalid)
         except Exception:
             return False
         finally:

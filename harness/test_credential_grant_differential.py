@@ -138,16 +138,66 @@ class CredentialGrantDifferentialTests(unittest.TestCase):
         )
         self.assertTrue(_run_grant(ft))
 
-    def test_genuine_grant_same_status_different_body_still_counts(self):
-        """NEGATIVE CONTROL variant: even when the anonymous/invalid probes
-        happen to share the credentialed response's status code, a distinct
-        body is still a real, observable difference and must count."""
+    def test_same_status_different_body_without_denial_signal_returns_no_grant(self):
+        """R1: body dissimilarity ALONE -- with no actual denial on either
+        control -- is not a positive access fact (a nonce-bearing or
+        content-varying public page would pass the same check). Both
+        controls here answer 200, so there is no denial signal; the
+        distinct "please log in" body must NOT be enough by itself."""
         ft = _FakeTransport(
             cred=ExecutionOutcome(outcome="ok", status=200, body="your private inbox: 3 messages"),
             anon=ExecutionOutcome(outcome="ok", status=200, body="please log in"),
             invalid=ExecutionOutcome(outcome="ok", status=200, body="please log in"),
         )
+        self.assertFalse(_run_grant(ft))
+
+    def test_genuine_grant_redirect_denial_controls(self):
+        """NEGATIVE CONTROL: a login-redirect (302) on both controls is also
+        a valid denial signal, not only 401/403; the credentialed response
+        differs and succeeds, so this must still count as a grant."""
+        ft = _FakeTransport(
+            cred=ExecutionOutcome(outcome="ok", status=200, body="account #4471 balance: $500"),
+            anon=ExecutionOutcome(outcome="ok", status=302, body="redirecting to /login"),
+            invalid=ExecutionOutcome(outcome="ok", status=302, body="redirecting to /login"),
+        )
         self.assertTrue(_run_grant(ft))
+
+    def test_dissimilar_status_without_denial_returns_no_grant(self):
+        """R1 (SC-2 residual): status jitter across controls (200/202/203),
+        none of which is an actual denial, must not be treated as a grant
+        even though `_responses_materially_same` sees them as different."""
+        ft = _FakeTransport(
+            cred=ExecutionOutcome(outcome="ok", status=200, body="same public body"),
+            anon=ExecutionOutcome(outcome="ok", status=202, body="same public body"),
+            invalid=ExecutionOutcome(outcome="ok", status=203, body="same public body"),
+        )
+        self.assertFalse(_run_grant(ft))
+
+    def test_only_one_control_denied_returns_no_grant(self):
+        """R1 core guarantee: a grant requires BOTH controls to be actually
+        denied. Here the anonymous probe is denied (401) but the invalid-token
+        probe still succeeds (200) on a distinct public body, so the
+        credentialed 200 is NOT proven to be credential-driven access. Pins the
+        `and` in `_denied(anon) and _denied(invalid)` -- an `or` would wrongly
+        grant on a single denial."""
+        ft = _FakeTransport(
+            cred=ExecutionOutcome(outcome="ok", status=200, body="account #4471 owner=alice balance $500"),
+            anon=ExecutionOutcome(outcome="ok", status=401, body="please log in"),
+            invalid=ExecutionOutcome(outcome="ok", status=200, body="public marketing landing page"),
+        )
+        self.assertFalse(_run_grant(ft))
+
+    def test_server_error_controls_are_not_a_denial_returns_no_grant(self):
+        """R1: a 5xx on the controls is a server fault, not an access denial.
+        Both controls answering 500 while the credentialed request returns 200
+        must NOT count as a grant. Pins `_denied`'s status set -- a naive
+        `status >= 300` would misread a 500 as 'denied' and wrongly grant."""
+        ft = _FakeTransport(
+            cred=ExecutionOutcome(outcome="ok", status=200, body="account #4471 owner=alice balance $500"),
+            anon=ExecutionOutcome(outcome="ok", status=500, body="internal server error"),
+            invalid=ExecutionOutcome(outcome="ok", status=500, body="internal server error"),
+        )
+        self.assertFalse(_run_grant(ft))
 
     def test_noisy_public_resource_with_differing_nonce_returns_no_grant(self):
         """SC-2: cred/anon/invalid all answer 200 with the SAME page, differing
