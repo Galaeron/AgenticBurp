@@ -3677,8 +3677,8 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
 - **Impact:** Medium (FR-7 ships off; same enabling condition as R5). **Source:** 2026-09-28 swarm-refresh,
   new FR-7 lifecycle defect.
 
-### [~] R7 — Browser/DOM/stored-XSS validator callers omitted the gate/budget objects SC-7 added
-- **Result (in progress, uncommitted; done same day, after this item was first filed above):** all three
+### [x] R7 — Browser/DOM/stored-XSS validator callers omitted the gate/budget objects SC-7 added
+- **Result (VERIFIED):** `bb421dac` — all three
   validators now take an optional `run_context=None` constructor param (bound per-dispatch by the existing
   `ValidatorRegistry.bind_run_context` seam, the same one every other active validator already uses — no
   new wiring mechanism introduced). `browser_xss_validator.py` and `dom_xss_validator.py` forward
@@ -3688,9 +3688,16 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
   `run_context.gate` instead of always `get_default_gate()` for its plant/render mutating-write gate check,
   and forwards the same four kwargs into its own optional browser-confirm `visit()`. Caller tests landed
   alongside: `test_browser_xss_validator.py` (+51 lines), `test_dom_xss_validator.py` (+47 lines), and a new
-  `test_stored_xss_validator.py`. **Missing:** only the commit; live interception coverage (real Chromium,
-  service-worker/WebSocket behavior, engine readiness) stays a separate OWNER/LIVE follow-up, not something
-  a mocked-driver caller test can establish.
+  `test_stored_xss_validator.py`. **Closed (VERIFIED):** committed `bb421dac`. Each validator has, per the
+  acceptance criteria, a mocked-driver test proving a denial/exhaustion is actually HONORED (not just passed
+  through): stored_xss skips when the run's own gate denies mutating replay even though the global default
+  allows it; browser_xss/dom_xss use a budget-enforcing fake driver that denies the navigation on an
+  exhausted forwarded budget, so the payload never fires and the validator does not confirm
+  (`driver.denied > 0` proves the budget was really forwarded — pre-R7 the driver saw `budget=None`). Plus a
+  pass-through test and a no-context negative control per validator. Live interception coverage (real
+  Chromium, service-worker/WebSocket behavior, engine readiness) stays a separate OWNER/LIVE follow-up, not
+  something a mocked-driver caller test can establish. `full` green: 2838 unittest OK (2 skipped), 38 pytest,
+  229 evaluation OK, 42 integrity OK, exit 0.
 - **Domain:** Safety enforcement (browser execution) · **Effort:** M · **Depends on:** none · **Mode:** LOOP
   (offline for the wiring + mocked-driver caller tests; live interception coverage is a separate,
   OWNER/LIVE efficacy question)

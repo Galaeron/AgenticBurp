@@ -2,9 +2,9 @@
 
 ## Checkout
 
-Branch `reconciliation-backlog`; HEAD `02d21a70` (R1–R6 landed this session as
-isolated commits off the reconciled working tree; only R7 still uncommitted on
-disk). Latest analysis:
+Branch `reconciliation-backlog`; HEAD `bb421dac` (the full swarm-refresh R1–R7
+batch is now committed as seven isolated fix commits, each paired with its own
+backlog-closure doc commit). Latest analysis:
 [swarm-refresh review](reviews/2026-09-28/swarm-refresh/REVIEW.md) +
 [verification](reviews/2026-09-28/swarm-refresh/VERIFICATION.md), which reviewed
 this HEAD with a **then-clean** working tree (its own words: "no tracked
@@ -24,11 +24,11 @@ against the review's own reproduction script, not just narrates intent.
 ## Fresh verification (this checkout, current working tree incl. the uncommitted fixes)
 
 `.venv-rationalisation` (Python 3.12.14), repository root, `python -m harness.suite full`:
-- **Current (after R1–R6 committed, `02d21a70`; only R7 still on disk):** exit 0 —
-  2836 unittest OK (2 skipped), 38 pytest-native passed, 229 evaluation OK, 42
-  integrity OK. (2836 = +2 R1 +1 R3 +1 R4 +1 R5 +1 R6 +1 R2 caller tests; the +8
-  evaluation vs the 221 below is an unrelated untracked file,
-  `testing/test_web_objective_benchmark.py`.)
+- **Current (full R1–R7 batch committed, HEAD `bb421dac`):** exit 0 — 2838 unittest
+  OK (2 skipped), 38 pytest-native passed, 229 evaluation OK, 42 integrity OK.
+  (2838 = the 2829 on-disk baseline + 9 caller tests ADDED this session: R1 +2
+  hardening, R2/R3/R4/R5/R6 +1 each, R7 +2 budget-exhaustion; the +8 evaluation vs
+  the 221 below is an unrelated untracked file, `testing/test_web_objective_benchmark.py`.)
 - **On the R1/R3/R4/R5/R6 fixes (before R7 landed):** exit 0 — 2829 unittest OK
   (2 skipped), 38 pytest-native passed, 221 evaluation OK, 42 integrity OK.
   (2829 vs. the review's 2817 with no test files changed at that point;
@@ -58,23 +58,22 @@ Full evidence, commands and acceptance criteria in
 | R4 | Reservation admission arithmetic could exceed a hard budget | **Committed `18cc1ec2`** (arithmetic only; SC-8's "no production caller" gap separate) | Yes (3 tests + 1 corrected in `test_effort.py`) |
 | R5 | Cache `clear()`/`size()` ignored the hypothesis-cache table | **Committed `b23ad18c`** | Yes (clear+size caller test) |
 | R6 | A failed inference stage was cached and replayed as reusable | **Committed `d66e606a`** | Yes (fail-then-recover caller test) |
-| R7 | Browser/DOM/stored-XSS callers omit SC-7's gate/budget objects | Yes | Yes (`test_browser_xss_validator.py`, `test_dom_xss_validator.py`, new `test_stored_xss_validator.py`) |
+| R7 | Browser/DOM/stored-XSS callers omit SC-7's gate/budget objects | **Committed `bb421dac`** | Yes (pass-through + denial-honored + negative control per validator) |
 
-**R1–R6 are committed (through `02d21a70`); only R7 remains uncommitted on disk.** Everything else the swarm-refresh review
+**All of R1–R7 are committed (through `bb421dac`) — the swarm-refresh reconciliation is complete; no R-batch production changes remain uncommitted.** Everything else the swarm-refresh review
 reconciled (SC-1 real-oracle-gate fix, SC-4/RA-8 fail-closed workflow
 assertions, SC-5 MCP adapter forwarding) is unaffected and stands as that
 review described. A5/SC-6 (packaging) and A6 (tool-network egress) remain open.
 
 ## Current priorities
 
-Loop order: **R7** (R1–R6 done through `02d21a70`).
+The swarm-refresh R1–R7 batch is fully committed. Remaining offline-loop work (resume the older queue):
 
-1. R7 (last R-item): fix + caller tests already on disk (as R1/R4's were) — one commit away; commit
-   after re-confirming `full` green on the isolated diff. Browser/DOM/stored-XSS validators now thread
-   `run_context`; the new caller tests must prove a gate denial / budget exhaustion is actually honored.
-2. Once R7 closes, rerun `reviews/2026-09-28/swarm-refresh/probes.py` and fold the result into that
-   review dir. Then SC-8 dispatch wiring, A5/SC-6 packaging, A6 tool-network egress; then governed
-   integrations + matched-budget efficacy (owner-gated).
+1. Rerun `reviews/2026-09-28/swarm-refresh/probes.py` against this HEAD and fold the post-fix result
+   into that review dir as the capstone record (the checked-in `probes.json` is the pre-fix snapshot).
+2. Then the older queue's next eligible OFFLINE item: SC-8's production dispatch wiring (the reservation
+   API still has no production caller), else A5/SC-6 packaging or A6 tool-network egress as scoped.
+   Packaging/build, live-model, blind-target and matched-budget efficacy runs remain OWNER/LIVE (skip).
 
 Existing owner deferrals remain owner decisions; none of the counterexamples
 above needs a live model or real target to reproduce. Preserve
