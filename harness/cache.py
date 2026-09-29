@@ -743,6 +743,13 @@ class ExchangeCache:
                         "SELECT COUNT(*) as cnt FROM cache_entries"
                     ).fetchone()["cnt"]
                     conn.execute("DELETE FROM cache_entries")
+                    # R5: hypothesis reuse lives in its own table; a full clear
+                    # must miss on both.
+                    hcount = conn.execute(
+                        "SELECT COUNT(*) as cnt FROM hypothesis_cache_entries"
+                    ).fetchone()["cnt"]
+                    conn.execute("DELETE FROM hypothesis_cache_entries")
+                    count += hcount
                     self._stats.evictions += count
                     self._save_stats(conn)
                 log.info("Cache cleared")
@@ -765,7 +772,11 @@ class ExchangeCache:
             )
     
     def size(self) -> int:
-        """Get the current number of cached entries."""
+        """Total cached entries (exchange cache + hypothesis cache, R5)."""
+        return self.exchange_size() + self.hypothesis_size()
+
+    def exchange_size(self) -> int:
+        """Number of entries in the exchange cache."""
         try:
             with self._get_connection() as conn:
                 return conn.execute(
@@ -773,6 +784,17 @@ class ExchangeCache:
                 ).fetchone()["cnt"]
         except Exception as e:
             log.warning(f"Cache size check failed: {e}")
+            return 0
+
+    def hypothesis_size(self) -> int:
+        """Number of entries in the hypothesis cache."""
+        try:
+            with self._get_connection() as conn:
+                return conn.execute(
+                    "SELECT COUNT(*) as cnt FROM hypothesis_cache_entries"
+                ).fetchone()["cnt"]
+        except Exception as e:
+            log.warning(f"Hypothesis cache size check failed: {e}")
             return 0
     
     def set_enabled(self, enabled: bool) -> None:
