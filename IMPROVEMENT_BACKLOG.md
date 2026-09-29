@@ -3560,15 +3560,22 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
 - **Impact:** High (this is RA-7's whole point — don't bury a genuine reach as "access correctly
   restricted"). **Source:** 2026-09-28 swarm-refresh, residual RA-7.
 
-### [~] R3 — Unknown/anonymous principal no longer wildcards a resolved principal
-- **Result (in progress, uncommitted):** `confirmation_gate._has_controlled_negative` now requires
+### [x] R3 — Unknown/anonymous principal no longer wildcards a resolved principal
+- **Result (VERIFIED):** `cd0273cf` — `confirmation_gate._has_controlled_negative` now requires
   `neg_principal == principal_id` exactly (was: skip the principal check entirely unless *both* sides were
   non-empty and differed). Re-verified this session via `probes.py`'s `suppression_*` cases: an
   unknown-principal negative against an `alice` finding on the same parameter now yields
   `inconclusive_unverified` (was: `unconfirmed_hypothesis`, i.e. wrongly refuted); a different named
   principal (`bob`) and an empty parameter still correctly yield `inconclusive_unverified`; a matching
   principal (`alice`==`alice`) still correctly yields `unconfirmed_hypothesis` (a real controlled
-  negative). **Missing:** a caller-level test encoding these four cases, and a commit.
+  negative). **Closed (VERIFIED):** committed `cd0273cf` with a caller test
+  (`test_r3_unknown_principal_negative_is_not_a_wildcard` in `test_confirmation_gate.py`) encoding the four
+  `probes.py` `suppression_*` cases. The empty-principal case pins the fix (`probes.json` recorded the pre-fix
+  `unconfirmed_hypothesis`; it now yields `inconclusive_unverified`) — the pre-existing cross/same-principal
+  tests used two resolved principals and never exercised the empty-principal wildcard. Committed in isolation
+  from R2's still-uncommitted `control_outcome` hunk in the same file (staged via a revert/restore of that hunk)
+  and re-verified to pass standalone. `full` green: 2832 unittest OK (2 skipped), 38 pytest, 229 evaluation OK,
+  42 integrity OK, exit 0.
 - **Domain:** Confirmation-gate correctness / evidence binding · **Effort:** S · **Depends on:** none ·
   **Mode:** LOOP (offline)
 - **Evidence:** `confirmation_gate.py:645` (pre-fix) rejected a principal mismatch only when both strings
