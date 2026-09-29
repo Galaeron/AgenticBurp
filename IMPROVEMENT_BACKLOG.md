@@ -3617,14 +3617,17 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
 - **Impact:** Medium (a real primitive bug, but unreachable from production until SC-8's wiring lands).
   **Source:** 2026-09-28 swarm-refresh, residual A8/SC-8 (arithmetic slice only).
 
-### [~] R5 — Cache `clear()`/`size()` missed the hypothesis-cache table (FR-7 lifecycle)
-- **Result (in progress, uncommitted):** `cache.py`'s `clear()` now also deletes
+### [x] R5 — Cache `clear()`/`size()` missed the hypothesis-cache table (FR-7 lifecycle)
+- **Result (VERIFIED):** `b23ad18c` — `cache.py`'s `clear()` now also deletes
   `hypothesis_cache_entries` (counted into the eviction total), and `size()` is now
   `exchange_size() + hypothesis_size()` with both new accessors exposed separately. Re-verified this
   session: write a hypothesis, confirm it's retrievable, `clear()`, and it is now correctly gone
   (`hypothesis_after_clear: False`, was `True`); reported size after clear is `0` in both the old and new
-  runs (that half was never broken). **Missing:** a caller-level test (write hypothesis + exchange entry,
-  clear, assert both miss and both size accessors read 0), and a commit.
+  runs (that half was never broken). **Closed (VERIFIED):** committed `b23ad18c` with a caller test
+  (`test_clear_and_size_span_the_hypothesis_cache_table` in `test_cache.py`): writes one exchange entry and
+  one hypothesis, proves both present + the hypothesis retrievable, `clear()`, then asserts both reads miss
+  and `size()`/`exchange_size()`/`hypothesis_size()` all read 0. `full` green: 2833 unittest OK (2 skipped),
+  38 pytest, 229 evaluation OK, 42 integrity OK, exit 0.
 - **Domain:** Cache lifecycle (FR-7, ships default-OFF) · **Effort:** S · **Depends on:** none · **Mode:**
   LOOP (offline)
 - **Evidence:** `cache.py:737` (pre-fix) `clear()` only issued `DELETE FROM cache_entries`; `size()` only
