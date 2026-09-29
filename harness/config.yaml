@@ -249,6 +249,21 @@ engagement:
   coverage_drive_legs: false
   coverage_leg_budget: 80
 
+# P2-1: business-context planning agent. When on, investigate_engagement runs
+# ONE application-context pass that builds an Application Semantic Model (apparent
+# roles + privilege order, business objects, ordered value-bearing workflows,
+# client-trusted value flows like price/quantity/role/is_admin/id, sensitive
+# sinks, and RANKED chaining hypotheses) and uses it to RE-RANK the worklist by
+# business impact and PROPOSE (never confirm) multi-step chains. DEFAULT OFF: with
+# it off, the loop behaves exactly as today. The pass itself sends NO traffic and
+# confirms NOTHING -- every resulting probe stays gated by validators.active_enabled
+# / allow_mutating_replay / scope / budget. Its input is anonymized structure-only
+# (method / path template / parameter NAMES / roles) by default; raw off-host
+# egress additionally requires coordinator.cloud_reasoning, like the other cloud
+# flags. Enable in the git-ignored config.local.yaml, never here.
+business_context:
+  enabled: false
+
 retry_budget:
   max_retries: 2              # extra re-dispatches after the first pass (0 = one pass)
   max_agents: 3              # distinct agent runs per vulnerability, retries included

@@ -269,6 +269,9 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     "engagement.coverage_drive_legs",
     "coordinator.cloud_primary",
     "coordinator.cloud_reasoning",
+    # P2-1: the business-context planning pass re-ranks the worklist and proposes
+    # chains; passive-only ("just analyze captured traffic") forces it off too.
+    "business_context.enabled",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

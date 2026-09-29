@@ -373,6 +373,37 @@ class ChainMixin:
         link = chain_linker.link_findings(state, all_findings, responses=responses)
         return list(link["chain_findings"])
 
+    def _apply_business_context(self, state, captured, roles):
+        """P2-1 seam: run the ONE business-context planning pass and fold its
+        Application Semantic Model into `state`.
+
+        Behind `self.business_context_enabled` (default off). When off, returns
+        None immediately and touches nothing -- the loop behaves exactly as
+        before (the negative control). When on, it builds the ASM from the
+        already-discovered surface + captured exchanges (anonymized, structure-
+        only unless coordinator.cloud_reasoning is set), RE-RANKS the worklist by
+        business impact and records ranked chaining hypotheses as BLOCKED
+        proposals. It performs ZERO live sends and NEVER confirms anything; every
+        resulting probe still flows through the existing gated worklist/legs.
+
+        Split out of investigate_engagement so it is testable at the caller level
+        against a real EngagementState without driving the whole method. Returns
+        the ApplicationSemanticModel or None."""
+        if not getattr(self, "business_context_enabled", False):
+            return None
+        from harness import business_context_agent
+        cloud_reasoning = bool(getattr(getattr(self, "coordinator", None),
+                                       "cloud_reasoning", False))
+        agent = business_context_agent.BusinessContextAgent(config=getattr(self, "config", {}))
+        asm = agent.build_model(
+            host=getattr(state, "host", "") or "",
+            surface=list(state.endpoints.values()),
+            exchanges=captured,
+            roles=roles,
+            cloud_reasoning=cloud_reasoning)
+        state.apply_semantic_model(asm)
+        return asm
+
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
                                      max_chain_rounds: int = 1, run_context=None) -> dict:
@@ -823,6 +854,20 @@ class ChainMixin:
                     confirmed.append(r)
             return confirmed
 
+        # P2-1: ONE business-context planning pass, BEFORE the worklist sweep, so
+        # its business-impact re-ranking actually changes what the bounded node
+        # budget investigates first (a checkout/payment/role endpoint ahead of a
+        # generic page). Default off -- when off this is a no-op and the ranking
+        # is unchanged. It sends nothing and confirms nothing. Best-effort: an
+        # ASM failure must never sink the engagement (same contract as the
+        # additive phases above).
+        _asm = None
+        try:
+            _asm = self._apply_business_context(state, _all_captured, roles)
+        except Exception as e:
+            log.warning("investigate_engagement: business-context pass failed: %s", e)
+            _errors.append({"phase": "business_context", "error": f"{type(e).__name__}: {e}"})
+
         worklist_summary: dict = {}
 
         async def _investigate(st, rs):
@@ -1178,6 +1223,11 @@ class ChainMixin:
             "worklist_summary": worklist_summary,
             "chains": chains,
             "chain_rounds": rounds,
+            # P2-1: the Application Semantic Model built this run (None when the
+            # business-context pass is off), so the API/report can show the
+            # inferred roles/objects/workflows/value-flows/sinks and the ranked
+            # chaining hypotheses that drove the re-ranking.
+            "application_semantic_model": _asm.to_dict() if _asm else None,
             "coverage": coverage,
             "workflows": workflow_results,
             "task_graph": state.graph.to_dict(),

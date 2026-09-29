@@ -308,5 +308,19 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # (finer fan-out = more leg traffic); bounded per cell by coverage_case_budget.
         self.engagement_coverage_case_drive = self.engagement_policy.engagement_coverage_case_drive
         self.coverage_case_budget = self.engagement_policy.coverage_case_budget
+        # P2-1: business-context planning agent (BusinessContextAgent). DEFAULT
+        # OFF. When on, investigate_engagement runs ONE application-context pass
+        # that builds an Application Semantic Model (roles/objects/workflows/
+        # value-flows/sinks + ranked chaining HYPOTHESES) and uses it to RE-RANK
+        # the worklist by business impact and PROPOSE (never confirm) chains. It
+        # is NOT in engagement_policy because it is not an active-traffic toggle:
+        # the pass sends NO requests itself, and every resulting send stays gated
+        # by validators.active_enabled / allow_mutating_replay / scope / budget,
+        # exactly as without it. Raw off-host egress additionally needs
+        # coordinator.cloud_reasoning (read by the agent), same as the other
+        # cloud flags. New top-level config block; default-off is guarded by
+        # SafeDefaultGuardTests and forced off under the passive-only profile.
+        self.business_context_enabled = bool(
+            (config.get("business_context", {}) or {}).get("enabled", False))
 
         log.info(f"Orchestrator initialized with {len(self.agent_manager.get_enabled_agents())} agents")
