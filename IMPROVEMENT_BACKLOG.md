@@ -3308,7 +3308,31 @@ report polish.
 - **Impact:** High (only if the ablation shows a benefit).
 - **Source:** REVIEW.md "Technology worth adapting" #1.
 
-### [ ] SC-11 — Versioned workflow/chain data packs with strict schema + fixtures (borrow #2)
+### [x] SC-11 — Versioned workflow/chain data packs with strict schema + fixtures (borrow #2)
+- **Result (VERIFIED):** `15d6e92` — new `harness/workflow_packs.py` packages AgenticVibe's own
+  executable workflows (`harness/workflow_engine.py`) as versioned **data** with a strict,
+  machine-checkable contract (`WorkflowPack`: `schema_version`, supported engine range via a new
+  additive `workflow_engine.ENGINE_VERSION`, vuln `taxonomy`, `required_capabilities`, `impact`,
+  a `fingerprint` precondition, a `proof_contract`, a `negative_fixture`, a `cleanup_contract`).
+  One real pack ships as data: `harness/workflow_pack_data/bola_order_approve.pack.json` (broken
+  access control — a non-manager approving an order). 27 tests in `test_workflow_packs.py`, each
+  acceptance criterion with a positive case AND a negative control: (1) deterministic
+  compile/validate — `compile_pack`/`validate_pack` + a `python -m harness.workflow_packs [PATH…]`
+  command, same input → same first error, shipped pack validated in-suite (drift-guarded against an
+  inline base); (2) unknown fields/assertions rejected (SC-4) — strict field sets reject unknown keys
+  at pack/workflow/step/extractor/assertion/fingerprint level (the engine's own `workflow_from_dict`
+  is lenient about extras), and unknown assertion kinds reuse `workflow_engine._load_assertion`;
+  (3) cyclic prerequisites rejected — an explicit DFS detector raises `cyclic prerequisites: a -> b
+  -> a` before the engine's ordering check degrades it to a generic forward-reference error; (4)
+  opposite evidence states through the REAL caller — driving `engagement_builder.execute_declared_
+  workflows` with the pack's workflow, a vulnerable fixture (approve→200) completes / proof step
+  PASSES → PROVEN while a patched fixture (approve→403) does not complete / proof step FAILS →
+  REFUTED, and `run_pack` enforces the fingerprint gate **programmatically** (a mismatch → terminal
+  `FINGERPRINT_MISMATCH`, the workflow is never dispatched — asserted: only the fingerprint probe
+  ran). Data + validator + runner only: nothing in the default pipeline compiles or runs a pack yet,
+  so it ships **inert** (no traffic, no verdict change, no config knob); auto-selecting a pack for a
+  live target is deferred. `config.yaml` unchanged; `test_pipeline_gate.py` preserved. Full suite:
+  2924 unittest OK / 2 skip, pytest 38, evaluation 231, evaluation-integrity 42, exit 0.
 - **Domain:** Business logic / Maintainability · **Effort:** M-L · **Depends on:** SC-4 · **Mode:** LOOP (offline)
 - **Evidence (INFERRED — design proposal):** upstream `internal/plugins` (playbooks) + `internal/chains`
   (curated CVE/KEV chains: fingerprint → safe non-weaponized verify → remediation) are clean *data*
