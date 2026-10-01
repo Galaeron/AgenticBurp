@@ -3916,7 +3916,27 @@ firing autonomously end-to-end "during real engagements".
 - **Impact:** High (unblocks XXE + file-upload autonomy; foundational for JS-heavy targets).
   **Source:** 2026-10-01 live-loop batch.
 
-### [ ] LB-3 — Runner cold-login retry / warmup
+### [x] LB-3 — Runner cold-login retry / warmup
+- **Result (VERIFIED, in-worktree):** `testing/run_web_objective_smoke.py` `_authenticate`
+  now wraps the login GET and POST in a bounded 3-attempt retry (`_AUTH_MAX_ATTEMPTS=3`,
+  `_AUTH_RETRY_BACKOFF=0.5`): retries on `httpx.HTTPError` or a 5xx status with a small
+  `asyncio.sleep` backoff, breaks immediately on first success (NO happy-path latency, post-
+  success form/JSON/cookie/ok logic untouched), and returns the original early-fail tuple on
+  exhaustion. Added an injectable keyword-only `transport=None` seam (passed to `AsyncClient`
+  only when provided ⇒ default construction byte-for-byte unchanged; `_run` call site
+  unchanged). New pure helper `_auth_info(requested, ok, login_status, cookie)` sets
+  `degraded=True` + `hard_error="authentication requested but not established"` ONLY when
+  `requested and not ok`; `_run` builds auth_info via it and propagates top-level
+  `result["degraded"]` — a dropped authenticated role is now fail-loud, not silently anonymous.
+  7 new tests in `testing/test_run_web_objective_auth.py` (httpx.MockTransport only, `asyncio.sleep`
+  monkeypatched — no sockets, no real sleep): retry-positive (ConnectError + 503 variants),
+  happy-path-unchanged (1 GET+1 POST, sleep not called), cap-exhaustion (bounded), degraded-positive,
+  + 2 negative controls (requested+ok → not degraded; not-requested → not degraded). Verified:
+  `test_run_web_objective_auth + test_run_web_objective_efficacy` 22 OK; smoke 92 OK; `full` green
+  (unittest 3061 OK, pytest 38, testing 272 OK incl. the new tests, integrity 42 OK, exit 0). No
+  `config.yaml` change; no existing test weakened. Edits land in the untracked benchmark-runner WIP
+  (`run_web_objective_smoke.py` + its auth test are `??`; a new test imports the untracked module so
+  it can't stand alone at HEAD) → no isolated code commit, per branch convention; this doc-close records it.
 - **Domain:** Benchmark runner · **Effort:** S · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence:** `testing/run_web_objective_smoke.py` `_authenticate` intermittently returns
   `login_status 0` on the FIRST (cold) GET to a freshly-launched instance, silently dropping

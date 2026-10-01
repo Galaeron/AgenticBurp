@@ -28,10 +28,14 @@ LB-7 is OWNER/LIVE (skip).
   `model_dump()` dicts (+ `test_ssti_readback_urls.py`, non-GET negative control both
   shapes); (B) added the `client_trust` Python-only entry to the execution-plane matrix.
   `full` now green. Fixes land in tracked-WIP (no isolated commit, per branch convention).
-- **Next: LB-3** — runner cold-login retry/warmup (benchmark runner, offline).
-  Note: LB-3 edits the untracked `testing/run_web_objective_smoke.py`, so its
-  deliverable also only lands in WIP (a new auth-retry test would import that untracked
-  module and break at HEAD) — expect a doc-close, not an isolated code commit.
+- **LB-3 — DONE (VERIFIED, in-worktree).** `_authenticate` now has a bounded 3-attempt
+  login GET/POST retry (retries on HTTPError/5xx, happy-path unchanged, injectable
+  `transport=None` seam) and a `_auth_info` helper that marks an auth-requested-but-failed
+  run `degraded` + `hard_error` (fail-loud, no silent anonymous). 7 new tests (MockTransport,
+  no sockets/sleep); `full` green. Lands in untracked runner WIP → doc-close only.
+- **Next: LB-2** — driver-based request capture for JS/XHR-built shapes (discovery).
+  Mode: LOOP for the capture plumbing + fixture (a real blind-target recall claim is OWNER/LIVE).
+  Reuses the Playwright driver; gated behind a discovery flag, OFF by default.
 
 ## Verification (this checkout)
 - **`full` is GREEN:** unittest `Ran 3061 tests … OK`; pytest-native 38 passed;
@@ -57,7 +61,7 @@ LB-7 is OWNER/LIVE (skip).
   Freemarker SSTI arithmetic (0.95), custom-exploit SSTI (0.95, non-destructive).
 
 ## Open work / pointers
-- `full` is green again; continue LB-3 → LB-2 → LB-4 → LB-5 → LB-6.
+- `full` green; continue LB-2 → LB-4 → LB-5 → LB-6.
 - Older still-open: SC-6 (wheel imports outside checkout), SC-9 (tool broker),
   SC-10/SC-14 (ToolAdapter / install-doctor-serve) — after the LB batch.
 - OWNER/LIVE (skip in loop): LB-7 (single-packet race dispatch), P0-3, P1-5, P2-2,
