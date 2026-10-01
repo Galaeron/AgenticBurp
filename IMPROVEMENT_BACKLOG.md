@@ -4006,7 +4006,29 @@ firing autonomously end-to-end "during real engagements".
 - **Impact:** Medium (race classes). **Source:** 2026-10-01 live-loop batch; cross-ref the hard-lab
   tranche ledger.
 
-### [ ] LB-NOTE — Pre-existing full-suite failures surfaced during LB-1 (track + fix)
+### [x] LB-NOTE — Pre-existing full-suite failures surfaced during LB-1 (track + fix)
+- **Result (VERIFIED, in-worktree):** both cleared; `full` now GREEN — unittest
+  `Ran 3061 tests … OK`, pytest-native 38 passed, testing 265 OK, integrity 42 OK, exit 0.
+  - **A:** root cause was benign — `_all_captured` is a union of `HttpExchange` objects
+    (feature_workflow) and `HttpExchange(...).model_dump()` dicts (role_crawl discovery
+    captures; `test_role_crawl.py` asserts dict-indexed access, so the dict shape is by
+    design). Only the SSTI-readback loop at `orchestrator_chain.py:663` never normalized,
+    unlike the two sibling sites (`_harvest_object_ids`, the objective-completion loop).
+    Fix: extracted `_ssti_readback_urls(captured)` that normalizes each item
+    (`cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)`, construction-only
+    try/except) before reading `.method`/`.url`/`.response_status`; all filter logic
+    byte-for-byte unchanged; call-site sort unchanged. New `harness/test_ssti_readback_urls.py`
+    (8 tests) incl. the required non-GET negative control for BOTH shapes. Fixed the 7
+    `RealPipelineGate*` errors with NO change to `test_pipeline_gate.py`'s assertions.
+  - **B:** added `_python_only("client_trust", "client_trust", note=…)` to the execution-plane
+    matrix in `harness/execution_planes.py` (mirrors `idor_read`; `ClientTrustValidator` is pure
+    Python/httpx, no Java/browser plane), fixing `test_every_registry_key_is_in_the_matrix`.
+    Added an explicit `ClientTrustIsPythonOnlyTests` control; no-drift test untouched.
+  - Verified: `test_pipeline_gate + test_execution_planes + test_ssti_readback_urls + test_role_crawl`
+    80 OK; smoke 92 OK; `full` green (above). No `config.yaml` change; no existing assertion
+    weakened. The fixes land in the branch's preserved tracked-WIP (orchestrator_chain.py,
+    execution_planes.py are `M`; the new test imports the uncommitted helper so it can't stand
+    alone at HEAD) → no isolated code commit, per branch convention; this doc-close records it.
 - **Domain:** Pipeline WIP hygiene · **Effort:** S each · **Depends on:** none · **Mode:** LOOP (offline)
 - Surfaced (not caused) by the LB-1 review; both block a clean `full` run and live in the
   branch's uncommitted WIP. Proven unattributable to LB-1 via reference graph + tracebacks.

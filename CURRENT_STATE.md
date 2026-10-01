@@ -2,7 +2,8 @@
 
 ## Checkout
 - Branch: `reconciliation-backlog`
-- HEAD: `6d5a2082` (LB-1 shared source-form helper + unit test).
+- HEAD: `6d5a2082` (LB-1 shared source-form helper + unit test); LB-NOTE fixes
+  landed in the working tree (tracked-WIP, no isolated commit — see below).
 - Working tree is a large, deliberately-uncommitted WIP pile (the 2026-10-01
   live-loop legs, the benchmark harness, the `objective_completion`/IDOR work,
   etc.). Branch convention: each loop iteration commits only the new standalone
@@ -21,19 +22,25 @@ LB-7 is OWNER/LIVE (skip).
   closures; auth_sequence vs client_trust CSRF rules deliberately NOT flattened).
   Committed artifact = helper + `harness/test_source_form.py` (7 tests); the
   validator refactor wiring rides in the uncommitted legs pile.
+- **LB-NOTE — DONE (VERIFIED, in-worktree).** Cleared the two pre-existing `full`
+  failures: (A) `_ssti_readback_urls` normalizes the by-design dict/object union in
+  `orchestrator_chain.py` so the SSTI-readback loop no longer crashes on role_crawl's
+  `model_dump()` dicts (+ `test_ssti_readback_urls.py`, non-GET negative control both
+  shapes); (B) added the `client_trust` Python-only entry to the execution-plane matrix.
+  `full` now green. Fixes land in tracked-WIP (no isolated commit, per branch convention).
 - **Next: LB-3** — runner cold-login retry/warmup (benchmark runner, offline).
+  Note: LB-3 edits the untracked `testing/run_web_objective_smoke.py`, so its
+  deliverable also only lands in WIP (a new auth-retry test would import that untracked
+  module and break at HEAD) — expect a doc-close, not an isolated code commit.
 
 ## Verification (this checkout)
-- LB-1 surface GREEN: `test_source_form` 7 OK; `test_leg_live_verification` 39 OK
-  (all four legs' positives + negative controls, refactor wired); `test_stored_xss_validator`
-  + `test_validators` 26 OK.
-- `full` is NOT fully green: 8 pre-existing failures, all unattributable to LB-1
-  (proven by reference graph + tracebacks), tracked as **LB-NOTE** in the backlog:
-  - LB-NOTE-A: 7 errors in `test_pipeline_gate` — `orchestrator_chain.py:663`
-    `(_captured.method ...)` on a dict, from the uncommitted objective_completion WIP.
-  - LB-NOTE-B: 1 failure in `test_execution_planes` — `client_trust` registered but
-    missing from the execution-plane matrix (same class as the old `idor_read` gap).
-- Other `full` stages green: pytest-native 38 passed; evaluation 265 OK; integrity 42 OK.
+- **`full` is GREEN:** unittest `Ran 3061 tests … OK`; pytest-native 38 passed;
+  testing 265 OK; integrity 42 OK; exit 0. The two pre-existing failures are cleared
+  by LB-NOTE (see below) — the LB-1 note's "8 pre-existing failures" are resolved.
+- LB-1 surface: `test_source_form` 7 OK; `test_leg_live_verification` 39 OK (all four
+  legs' positives + negative controls); `test_stored_xss_validator` + `test_validators` 26 OK.
+- LB-NOTE surface: `test_pipeline_gate + test_execution_planes + test_ssti_readback_urls
+  + test_role_crawl` 80 OK.
 - No offline tier establishes current model accuracy or blind-target recall.
 
 ## Web-objective benchmark
@@ -50,7 +57,7 @@ LB-7 is OWNER/LIVE (skip).
   Freemarker SSTI arithmetic (0.95), custom-exploit SSTI (0.95, non-destructive).
 
 ## Open work / pointers
-- LB-NOTE-A/B first chance to clean `full`; then continue LB-3 → LB-2 → LB-4 → LB-5 → LB-6.
+- `full` is green again; continue LB-3 → LB-2 → LB-4 → LB-5 → LB-6.
 - Older still-open: SC-6 (wheel imports outside checkout), SC-9 (tool broker),
   SC-10/SC-14 (ToolAdapter / install-doctor-serve) — after the LB batch.
 - OWNER/LIVE (skip in loop): LB-7 (single-packet race dispatch), P0-3, P1-5, P2-2,
