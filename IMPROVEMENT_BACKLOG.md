@@ -106,6 +106,19 @@ result on this working tree and R-item-by-item status. Select **R1 → R3 → R5
 R7** (write the missing test + commit for the first five; finish R2's caller test and the
 analyze()-level site; then R7's caller wiring) before resuming older queue work.
 
+**2026-10-01 live-loop build batch (from the PortSwigger detect-and-prove loop):** The
+continuation loop (`reviews/2026-09-29/web-objective-smoke/LOOP_LEDGER.md`) landed nine
+safe detect-and-prove legs (stored-XSS, JWT-unverified-sig, file-upload, 2FA-bypass,
+client-side-trust, plus the earlier SSRF/XXE/SQLi-login/IDOR), each with a positive +
+negative control in `test_leg_live_verification`. Every case that was NOT autonomous
+end-to-end failed *upstream of the validator* — the harness could not get the right request
+shape into the leg — so the **Live-loop build batch — LB-*** (end of file) targets those
+upstream gaps, not more validators. Select **LB-1 → LB-3 → LB-2 → LB-4 → LB-5 → LB-6**
+before resuming older queue work (LB-7 is OWNER/LIVE transport work, skip). LB-1 is first:
+it retroactively de-risks the four validators that each re-implemented the same in-session
+source-form/CSRF-refresh logic. Honour the non-negotiables below (safe `config.yaml`
+defaults; a caller test + negative control per item; `full` green before close).
+
 1. Work top-down: finish all `P0` items before `P1`, etc. Within a tier, respect
    `Depends on`.
 2. Pick the first item whose checkbox is `[ ]` and whose dependencies are all `[x]`.
@@ -3833,3 +3846,180 @@ file's own completion bar — R1/R4/R7 are now one commit away; R2/R3/R5/R6 need
   validator proves a denial/exhaustion is actually honored; `full` green.
 - **Impact:** High (production safety-enforcement gap, not just a missing feature). **Source:** 2026-09-28
   swarm-refresh, continuation of A7/SC-7.
+
+## Live-loop build batch — LB-* (2026-10-01, from the detect-and-prove loop)
+
+Source: `reviews/2026-09-29/web-objective-smoke/LOOP_LEDGER.md`. The validators are in good
+shape; these are the upstream shape/capture/dispatch gaps that stop the confirmed legs from
+firing autonomously end-to-end "during real engagements".
+
+### [x] LB-1 — Shared in-session source-form replay primitive
+- **Result (VERIFIED):** `6d5a208` — new `harness/validators/source_form.py`
+  (`fetch_source_form(client, candidates, headers, select) -> SourceForm | None`,
+  `SourceForm` dataclass, shared `CSRF_FIELD_RE`): GETs each candidate source page
+  in the SAME session, runs `feature_workflow.extract_forms`, and hands the forms to
+  a caller `select` closure, returning a fresh CSRF token + real field set, or `None`
+  so callers keep their captured-body fallback. All four legs (`stored_xss`,
+  `auth_sequence`, `file_upload`, `client_trust`) refactored onto it with NO behavior
+  change — per-validator form-selection rules kept as separate caller closures (the
+  auth_sequence vs client_trust CSRF-field rules legitimately differ and were NOT
+  flattened). New `harness/test_source_form.py` (7 tests, stub transport, no network):
+  CSRF refreshed from the fresh GET not the stale token, structural fields/types
+  preserved, candidate-ordering/source-page derivation, non-HTML skip, + negative
+  control (no matching form → `None`, nothing fabricated). Verified: test_source_form
+  7 OK; test_leg_live_verification 39 OK (all four legs' positives + negative controls
+  green with the refactor wired); test_stored_xss_validator + test_validators 26 OK;
+  no `config.yaml` change. The committed artifact is the helper + its unit test; the
+  four-validator refactor wiring rides in the branch's uncommitted legs WIP, where the
+  legs themselves already live (branch convention: commit new standalone files per
+  item, preserve the legs pile). Pre-existing full-suite failures (7 in
+  test_pipeline_gate via orchestrator_chain.py:663 objective_completion WIP; 1 in
+  test_execution_planes for the `client_trust` matrix gap) are NOT attributable to LB-1
+  (proven by reference graph + tracebacks) — see LB-NOTE below.
+- **Domain:** Validator infrastructure (write replay) · **Effort:** M · **Depends on:** none ·
+  **Mode:** LOOP (offline)
+- **Evidence:** the same "GET the write's source page in-session → extract the real form
+  (field names + types + a FRESH CSRF token) → build a faithful replay body" logic is now
+  duplicated in four validators: `stored_xss_validator._plant_via_source_form`,
+  `auth_sequence_validator._refresh_login_body`, `file_upload_validator._upload_form_from_source`,
+  `client_trust_validator._refresh_csrf`.
+- **Problem:** four near-identical implementations drift independently; any validator that
+  replays a CSRF-bound write must re-solve the stale-token problem from scratch, and a future
+  write-replay leg will likely get it wrong.
+- **Recommendation:** extract one helper (e.g. `validators/source_form.py` or a method on the
+  shared transport) that, given a captured write exchange, returns `(action_url, fields, fresh
+  csrf, field types)` by GETting a derived source page in the SAME session; refactor the four
+  validators onto it with NO behavior change. Reuse `feature_workflow.extract_forms`.
+- **Acceptance criteria:** all four validators call the shared helper; their existing
+  `test_leg_live_verification` positives + negative controls stay green unchanged; a unit test
+  for the helper (CSRF field refreshed, structural fields preserved, source-page derivation);
+  `full` green.
+- **Impact:** High (retroactively de-risks four shipped legs; prerequisite idiom for any new
+  write-replay leg). **Source:** 2026-10-01 live-loop batch.
+
+### [ ] LB-2 — Driver-based request capture for JS/XHR-built shapes
+- **Domain:** Discovery · **Effort:** L · **Depends on:** none · **Mode:** LOOP for the
+  capture plumbing + fixture; a real blind-target recall claim is OWNER/LIVE
+- **Evidence:** `feature_workflow` / the passive HTML parser emit only urlencoded bodies.
+  ps-xxe-file submits an XML body built by page JS (`application/xml`), and ps-upload-shell
+  submits a multipart file part — neither is reproducible passively, so both classes confirm
+  only when handed a captured exchange, never autonomously (LOOP_LEDGER "Open gaps" 2).
+- **Problem:** whole vuln classes (XXE, file-upload, any `fetch`/XHR form) are invisible to
+  autonomous discovery; the leg never receives a usable template.
+- **Recommendation:** add a driver-backed discovery mode that loads a page, records the actual
+  requests it issues (method, URL, content-type, body, headers), and feeds them into
+  `RoleCrawlResult.captured` so the existing legs fire. Gate behind a discovery flag, OFF by
+  default. Reuse the Playwright driver already used for browser-XSS.
+- **Acceptance criteria:** against an owned fixture whose form submits an XML (and a multipart)
+  body via JS, discovery captures the real shape and the XXE (and file-upload) leg confirms;
+  a passive-only negative control still misses it; `full` green.
+- **Impact:** High (unblocks XXE + file-upload autonomy; foundational for JS-heavy targets).
+  **Source:** 2026-10-01 live-loop batch.
+
+### [ ] LB-3 — Runner cold-login retry / warmup
+- **Domain:** Benchmark runner · **Effort:** S · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence:** `testing/run_web_objective_smoke.py` `_authenticate` intermittently returns
+  `login_status 0` on the FIRST (cold) GET to a freshly-launched instance, silently dropping
+  the authenticated RoleSession; it is 100% reliable in-process and on retry (LOOP_LEDGER
+  JWT note). Blocks autonomous end-to-end for every auth-gated case (JWT, IDOR, upload, 2FA,
+  client-trust).
+- **Problem:** a transient cold-connection failure during pre-attempt setup turns an
+  authenticated run into an anonymous one with no signal beyond a warning line.
+- **Recommendation:** add a bounded warmup/retry to the login GET+POST (e.g. 2–3 attempts with
+  small backoff) and surface a hard error in the artifact's `auth` block when auth was
+  requested but not established, so a dropped role never passes silently.
+- **Acceptance criteria:** a unit test with a transport that fails the first GET then succeeds
+  proves `_authenticate` retries and returns `ok=True`; a test proves an auth-requested run
+  that never authenticates is marked degraded, not silently anonymous; `full` green.
+- **Impact:** High (one small fix unblocks autonomous e2e for ~5 confirmed classes).
+  **Source:** 2026-10-01 live-loop batch.
+
+### [ ] LB-4 — Autonomous shape-precondition dispatch for the new legs
+- **Domain:** Orchestration (leg dispatch) · **Effort:** M · **Depends on:** none · **Mode:**
+  LOOP (offline)
+- **Evidence:** `_check_mfa_bypass` (`auth_sequence_validator.py`) and `ClientTrustValidator`
+  confirm live only when handed the exchange directly; there is no shape-precondition that
+  dispatches them from a real engagement's captured traffic (LOOP_LEDGER "Open gaps" 4), unlike
+  the injection legs in `orchestrator_helpers.shape_precondition_legs`.
+- **Problem:** two shipped, tested legs never run in an autonomous engagement.
+- **Recommendation:** add shape-preconditions — a login POST whose response lands on a 2FA step
+  → 2fa-bypass leg; a write body carrying a `price`/`amount`/`total` field → client-trust leg —
+  mirroring the existing injection-leg dispatch (kept only where the validator CONFIRMS).
+- **Acceptance criteria:** caller-level tests that the engagement path dispatches each leg on
+  the right captured shape and NOT on an unrelated one; the shape-routed legs confirm on a
+  fixture positive and stay silent on the matched control; `full` green.
+- **Impact:** Medium-High (turns on 2FA + client-trust for real engagements). **Source:**
+  2026-10-01 live-loop batch.
+
+### [ ] LB-5 — Cross-site browser PoC capability (CSRF no-defenses)
+- **Domain:** Browser validation · **Effort:** L · **Depends on:** none · **Mode:** LOOP for
+  the driver extension + fixture controls; ships default-OFF
+- **Evidence:** `csrf_validator.py` deliberately returns `not_confirmed` (0.4 OBSERVATION) for a
+  tokenless state-changing form — a token-strip POST does not prove ambient cross-site delivery
+  (retired 2026-09-09). `browser_driver.visit()` only loads a single URL for XSS; there is no
+  cross-origin form-submit-with-ambient-cookie primitive (LOOP_LEDGER "Open gaps" 5).
+- **Problem:** CSRF-no-defenses (and clickjacking-style classes) cannot be confirmed with
+  confidence; the validator is explicitly waiting on this capability.
+- **Recommendation:** extend the Playwright driver to load an attacker-origin auto-submit form,
+  carry the victim's ambient cookie for the target origin, submit cross-site, and independently
+  re-read the authenticated page to verify the state change — with controls for SameSite=Strict/
+  Lax blocking, Origin/Referer enforcement, and bearer-only (non-ambient) shapes. Re-add `csrf`
+  to the safety gate's LIVE set only once the controls pass.
+- **Acceptance criteria:** against an owned fixture, the leg confirms a no-defense cross-site
+  state change and stays silent on each control (SameSite / Origin-enforced / token-protected /
+  bearer-only); GET-only readback for verification; `full` green.
+- **Impact:** Medium (one apprentice class + a reusable browser-delivery primitive). **Source:**
+  2026-10-01 live-loop batch.
+
+### [ ] LB-6 — Runner objective-completion wiring (benchmark oracle only; owner-gated to turn on)
+- **Domain:** Benchmark runner / objective completion · **Effort:** M · **Depends on:** none ·
+  **Mode:** LOOP for the typed wiring + fixture; turning it on against a live lab is OWNER/LIVE
+- **Evidence:** `objective_completion.py` exists but the smoke runner never passes an
+  `objective_task`, so ssrf-basic / access-admin / ssti-basic confirm the vuln yet leave the lab
+  "Not solved" (LOOP_LEDGER "Open gaps" 6). Not required for the owner's safe-proof goal.
+- **Problem:** the benchmark's independent "Solved" oracle can never flip autonomously, so a
+  fully-autonomous benchmark pass can't be demonstrated for the "reach-a-state" labs.
+- **Recommendation:** let the runner accept a typed objective profile (required end state,
+  allowed action class, mutation/destruction level, ceilings, oracle adapter) and route it
+  through `RunContext` + the safety gate, defaulting to `objective_not_attempted`. Destructive
+  objectives stay OFF and owner-gated; an arithmetic-only SSTI must remain
+  `confirmed + objective_not_completed`.
+- **Acceptance criteria:** against an owned vulnerable/fixed fixture, a declared NON-destructive
+  objective completes and the fixed control does not; a destructive objective returns
+  `objective_not_attempted` without an explicit opt-in; `full` green.
+- **Impact:** Medium (benchmark-oracle completeness; explicitly not needed for safe-proof
+  success). **Source:** 2026-10-01 live-loop batch; restates CURRENT_STATE's "next architectural
+  repair".
+
+### [ ] LB-7 — Single-packet / last-byte-sync race dispatch in the transport  ·  Mode: OWNER/LIVE (skip)
+- **Domain:** Transport (concurrency) · **Effort:** L · **Depends on:** none · **Mode:**
+  OWNER/LIVE — not loop-consumable; left `[ ]` and skipped by the loop.
+- **Evidence:** the parallel hard-lab tranche (`reviews/2026-09-30/web-objective-smoke/`
+  race-single-*) showed HTTP/2 concurrency alone did not reproduce the single-packet race
+  window; `race_condition` returns a clean negative.
+- **Problem:** limit-overrun / single-endpoint race conditions need true last-byte
+  synchronization or single-packet dispatch, a transport primitive that does not exist.
+- **Recommendation:** implement last-byte-synchronized / single-packet dispatch in the central
+  transport; verify against an owned racey fixture. Owner-run.
+- **Acceptance criteria:** (owner) an owned fixture with a guarded limit is overrun under the new
+  dispatch and not under the atomic control.
+- **Impact:** Medium (race classes). **Source:** 2026-10-01 live-loop batch; cross-ref the hard-lab
+  tranche ledger.
+
+### [ ] LB-NOTE — Pre-existing full-suite failures surfaced during LB-1 (track + fix)
+- **Domain:** Pipeline WIP hygiene · **Effort:** S each · **Depends on:** none · **Mode:** LOOP (offline)
+- Surfaced (not caused) by the LB-1 review; both block a clean `full` run and live in the
+  branch's uncommitted WIP. Proven unattributable to LB-1 via reference graph + tracebacks.
+  - **LB-NOTE-A (7 errors):** `harness/orchestrator_chain.py:663` — `(_captured.method or "GET").upper()`
+    raises `AttributeError: 'dict' object has no attribute 'method'` in `investigate_engagement`'s
+    SSTI-readback-candidate loop (the uncommitted `objective_completion`/IDOR-harvest WIP passes a
+    dict where an object with `.method` is expected). Breaks `RealPipelineGateTest` /
+    `RealPipelineGateDefectInjectionTest` in `test_pipeline_gate.py`. Fix: normalize the captured
+    operand to the exchange type (or guard the `.method` read) and add/repair the caller-level test.
+  - **LB-NOTE-B (1 failure):** `harness/test_execution_planes.py::test_every_registry_key_is_in_the_matrix`
+    — `client_trust` is registered in `ValidatorRegistry` but absent from the execution-plane
+    ownership matrix in `harness/execution_planes.py` (same class as the previously-repaired
+    `idor_read` omission). Fix: record the `client_trust` Python-only entry in the matrix.
+- **Acceptance criteria:** each fix makes its failing test pass with a caller-level assertion (and,
+  for A, a negative control that the guard does not swallow a real non-GET method); `full`'s unittest
+  stage drops those failures; no `config.yaml` change. **Source:** 2026-10-01 LB-1 review.

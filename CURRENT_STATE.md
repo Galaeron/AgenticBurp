@@ -1,99 +1,59 @@
-# Current state — 2026-09-29
+# Current state — 2026-10-01
 
 ## Checkout
+- Branch: `reconciliation-backlog`
+- HEAD: `6d5a2082` (LB-1 shared source-form helper + unit test).
+- Working tree is a large, deliberately-uncommitted WIP pile (the 2026-10-01
+  live-loop legs, the benchmark harness, the `objective_completion`/IDOR work,
+  etc.). Branch convention: each loop iteration commits only the new standalone
+  files for its item and preserves the WIP pile. Preserve these edits.
+- `harness/config.yaml` remains at safe defaults; live overrides stay in-memory /
+  git-ignored `config.local.yaml`.
 
-Branch `reconciliation-backlog`; HEAD `bb421dac` (the full swarm-refresh R1–R7
-batch is now committed as seven isolated fix commits, each paired with its own
-backlog-closure doc commit). Latest analysis:
-[swarm-refresh review](reviews/2026-09-28/swarm-refresh/REVIEW.md) +
-[verification](reviews/2026-09-28/swarm-refresh/VERIFICATION.md), which reviewed
-this HEAD with a **then-clean** working tree (its own words: "no tracked
-production-file modifications were present at the end-of-review source check").
-Original [upstream comparison](reviews/2026-09-27/swarm-comparison/REVIEW.md)
-uses Pentest-Swarm `661c21828f8a2d0e84ee8b161037d5e9d93942f8`; not refetched.
+## Active queue — 2026-10-01 live-loop build batch (LB-*)
+Order: **LB-1 → LB-3 → LB-2 → LB-4 → LB-5 → LB-6**, before older queue work.
+LB-7 is OWNER/LIVE (skip).
+- **LB-1 — DONE (`6d5a2082`, VERIFIED).** Shared in-session source-form replay
+  primitive (`harness/validators/source_form.py`): one `fetch_source_form(...)`
+  helper + `SourceForm` dataclass + shared `CSRF_FIELD_RE`. The four source-form
+  legs (stored_xss, auth_sequence, file_upload, client_trust) are refactored onto
+  it with NO behavior change (per-validator form-selection kept as separate caller
+  closures; auth_sequence vs client_trust CSRF rules deliberately NOT flattened).
+  Committed artifact = helper + `harness/test_source_form.py` (7 tests); the
+  validator refactor wiring rides in the uncommitted legs pile.
+- **Next: LB-3** — runner cold-login retry/warmup (benchmark runner, offline).
 
-**Since that review, the working tree has picked up uncommitted production
-changes** fixing most of its R1–R7 findings (`git diff --stat`: `cache.py`,
-`confirmation_gate.py`, `effort.py`, `models.py`, `orchestrator_chain.py`,
-`orchestrator_confirm.py`, `orchestrator_detect.py`,
-`validators/{cross_identity,browser_xss,dom_xss,stored_xss}_validator.py`,
-plus new/corrected tests). **This is ongoing, concurrent work, not all of it
-from this session** — this edit reconciles what's actually on disk right now
-against the review's own reproduction script, not just narrates intent.
+## Verification (this checkout)
+- LB-1 surface GREEN: `test_source_form` 7 OK; `test_leg_live_verification` 39 OK
+  (all four legs' positives + negative controls, refactor wired); `test_stored_xss_validator`
+  + `test_validators` 26 OK.
+- `full` is NOT fully green: 8 pre-existing failures, all unattributable to LB-1
+  (proven by reference graph + tracebacks), tracked as **LB-NOTE** in the backlog:
+  - LB-NOTE-A: 7 errors in `test_pipeline_gate` — `orchestrator_chain.py:663`
+    `(_captured.method ...)` on a dict, from the uncommitted objective_completion WIP.
+  - LB-NOTE-B: 1 failure in `test_execution_planes` — `client_trust` registered but
+    missing from the execution-plane matrix (same class as the old `idor_read` gap).
+- Other `full` stages green: pytest-native 38 passed; evaluation 265 OK; integrity 42 OK.
+- No offline tier establishes current model accuracy or blind-target recall.
 
-## Fresh verification (this checkout, current working tree incl. the uncommitted fixes)
+## Web-objective benchmark
+- Contract: `testing/web-objective-benchmark/`; runner: `testing/run_web_objective_smoke.py`;
+  scorer: `testing/web_objective_benchmark.py`.
+- Durable per-case evidence under `reviews/2026-09-29/`..`2026-09-30/web-objective-smoke/`;
+  ledger `reviews/2026-09-29/web-objective-smoke/LOOP_LEDGER.md` (the LB-* source).
+- Owner goal: safe detection + non-destructive proof. Do not run destructive objectives.
 
-`.venv-rationalisation` (Python 3.12.14), repository root, `python -m harness.suite full`:
-- **Current (full R1–R7 batch committed, HEAD `bb421dac`):** exit 0 — 2838 unittest
-  OK (2 skipped), 38 pytest-native passed, 229 evaluation OK, 42 integrity OK.
-  (2838 = the 2829 on-disk baseline + 9 caller tests ADDED this session: R1 +2
-  hardening, R2/R3/R4/R5/R6 +1 each, R7 +2 budget-exhaustion; the +8 evaluation vs
-  the 221 below is an unrelated untracked file, `testing/test_web_objective_benchmark.py`.)
-- **On the R1/R3/R4/R5/R6 fixes (before R7 landed):** exit 0 — 2829 unittest OK
-  (2 skipped), 38 pytest-native passed, 221 evaluation OK, 42 integrity OK.
-  (2829 vs. the review's 2817 with no test files changed at that point;
-  reported as observed, not explained.)
-  `smoke` → exit 0, 92 OK. `test_orchestrator_precondition` → 60 OK.
-- **After R7 landed, rerun in full a second time (this edit):** exit 0 — same
-  2829 unittest OK (2 skipped), 38 pytest-native passed, 221 evaluation OK, 42
-  integrity OK. **Clean — no failure.** This directly contradicts a concurrent
-  edit to this file that had reported "1 pre-existing, unrelated failure:
-  `test_playwright_is_not_installed_here`" for the same post-R7 state; that
-  claim did not reproduce against this checkout/venv and should be treated as
-  environment-specific to whatever ran it, not a real defect, unless it
-  reproduces again.
-- Java/wheel/live-model/blind-recall/browser-container/Burp-runtime results are
-  unchanged HISTORICAL claims from the swarm-refresh review.
+## Confirmed live capabilities (historical/reported unless re-run this session)
+- SQLi hidden-data/login-bypass, reflected + stored XSS, path traversal, simple
+  command injection, SSRF, XXE, IDOR read, CSRF method bypass, unrestricted upload,
+  JWT unverified signature + RS256/HMAC algorithm confusion (0.90), NoSQL auth bypass,
+  Freemarker SSTI arithmetic (0.95), custom-exploit SSTI (0.95, non-destructive).
 
-## Reconciled status of the swarm-refresh review's R1–R7
-
-Full evidence, commands and acceptance criteria in
-[IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md)'s **Swarm-refresh batch — 2026-09-28**.
-
-| # | Finding | Fix on disk? | Dedicated test? |
-|---|---|---|---|
-| R1 | Credential-check accepted noise/status jitter as authorization | **Committed `c2fe5c75`** | Yes (2 new + 1 corrected + 2 hardening controls at close, in `test_credential_grant_differential.py`) |
-| R2 | RA-7's `control_outcome` lost before final suppression | **Committed `02d21a70`** (both stubs match the real validator; validator audit done) | Yes (`analyze()`-level caller test) |
-| R3 | Unknown/anonymous principal wildcarded a resolved principal | **Committed `cd0273cf`** | Yes (4-case `suppression_*` caller test) |
-| R4 | Reservation admission arithmetic could exceed a hard budget | **Committed `18cc1ec2`** (arithmetic only; SC-8's "no production caller" gap separate) | Yes (3 tests + 1 corrected in `test_effort.py`) |
-| R5 | Cache `clear()`/`size()` ignored the hypothesis-cache table | **Committed `b23ad18c`** | Yes (clear+size caller test) |
-| R6 | A failed inference stage was cached and replayed as reusable | **Committed `d66e606a`** | Yes (fail-then-recover caller test) |
-| R7 | Browser/DOM/stored-XSS callers omit SC-7's gate/budget objects | **Committed `bb421dac`** | Yes (pass-through + denial-honored + negative control per validator) |
-
-**All of R1–R7 are committed (through `bb421dac`) — the swarm-refresh reconciliation is complete; no R-batch production changes remain uncommitted.** Everything else the swarm-refresh review
-reconciled (SC-1 real-oracle-gate fix, SC-4/RA-8 fail-closed workflow
-assertions, SC-5 MCP adapter forwarding) is unaffected and stands as that
-review described. A5/SC-6 (packaging) and A6 (tool-network egress) remain open.
-
-## Offline loop status — EXHAUSTED (LOOP_DONE)
-
-The swarm-refresh R1–R7 batch is fully committed, and every remaining backlog `[ ]`
-item was assessed this session as NOT offline-loop-consumable — so the offline loop is
-exhausted again (as at the pre-swarm-refresh `LOOP_DONE`, `ce387cf3`):
-
-- OWNER/LIVE: P1-3's remaining single-command live scorecard, P1-5 (Burp UX), P2-3's
-  Burp-tab half, P3-3 (team mode), BM-3, PR-A..E, NC-O1..O5.
-- **P2-1 (business-reasoning agent) landed this session, OUTSIDE the loop** (it was the
-  owner-classified "too large" item): new `application_semantic_model.py` +
-  `business_context_agent.py`, wired into `investigate_engagement` behind a DEFAULT-OFF
-  `business_context.enabled` flag (re-ranks the worklist by business impact + proposes
-  chains; sends nothing, confirms nothing). Offline build VERIFIED; full suite green
-  (2859 unittest OK/2 skip, 38 pytest, 229 eval, 42 integrity, exit 0). Efficacy/retention
-  ON-vs-OFF ablation stays OWNER/LIVE. Full detail in IMPROVEMENT_BACKLOG.md's P2-1 Result.
-- Too large for one clean iteration: SC-10..15 (multi-subsystem "borrows"); SC-9's dep
-  PR-11 is `[~]`.
-- Packaging/supply-chain (needs Docker/registry or PyPI egress, not offline): P3-2, SC-6.
-- BM-2 is owner-gated in substance: its classes (sqli/xss/idor/path_traversal/command_injection)
-  are exactly the ones FR-4 EXCLUDES because a corroboration gate on them collapses recall to
-  ~0.05 (`confirmation_gate.py:519–522`); a real control-discriminator is per-validator research
-  whose success is corpus-measured, so only a tautology-risking single-twin gate is offline. Left `[ ]`.
-
-**Owner/live follow-ups:** rerun `reviews/2026-09-28/swarm-refresh/probes.py` (needs a scratch patch
-for R6's now-3rd pipeline call) as the R-batch capstone; the reservation API still lacks a production
-caller; then packaging, tool-egress, BM-2 corpus tuning, and the matched-budget efficacy / blind-recall
-runs. A future review can reopen the loop with fresh offline items, as swarm-refresh did.
-
-Existing owner deferrals remain owner decisions; none of the counterexamples
-above needs a live model or real target to reproduce. Preserve
-`test_pipeline_gate.py` and its defect-injection controls. No blind keys or
-blind implementations read. Keep this file under 100 lines.
+## Open work / pointers
+- LB-NOTE-A/B first chance to clean `full`; then continue LB-3 → LB-2 → LB-4 → LB-5 → LB-6.
+- Older still-open: SC-6 (wheel imports outside checkout), SC-9 (tool broker),
+  SC-10/SC-14 (ToolAdapter / install-doctor-serve) — after the LB batch.
+- OWNER/LIVE (skip in loop): LB-7 (single-packet race dispatch), P0-3, P1-5, P2-2,
+  efficacy/ablation runs, any real-model/blind-recall claim.
+- Handoff: `docs/DETERMINISTIC_FIRST_IMPLEMENTATION_CHECKLIST.md`. Preserve
+  `test_pipeline_gate.py` and its defect-injection controls.
