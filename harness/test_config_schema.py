@@ -135,6 +135,8 @@ class SafeDefaultGuardTests(unittest.TestCase):
          lambda cfg: cfg.get("coordinator", {}).get("cloud_reasoning", False) is False),
         ("business_context.enabled",
          lambda cfg: cfg.get("business_context", {}).get("enabled", False) is False),
+        ("driver_capture.enabled",
+         lambda cfg: cfg.get("driver_capture", {}).get("enabled", False) is False),
     ]
 
     # Unsafe replacement value used to flip each flag for the negative control.
@@ -151,6 +153,7 @@ class SafeDefaultGuardTests(unittest.TestCase):
         "coordinator.cloud_primary": True,
         "coordinator.cloud_reasoning": True,
         "business_context.enabled": True,
+        "driver_capture.enabled": True,
     }
 
     @staticmethod

@@ -272,6 +272,10 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     # P2-1: the business-context planning pass re-ranks the worklist and proposes
     # chains; passive-only ("just analyze captured traffic") forces it off too.
     "business_context.enabled",
+    # LB-2: driver-based request capture drives a real browser against the
+    # target to observe JS-issued requests -- active target traffic, same as
+    # autonomous_discovery.enabled above; passive-only forces it off too.
+    "driver_capture.enabled",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

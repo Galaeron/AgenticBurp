@@ -30,9 +30,14 @@ subresource, a fetch the page's own JS fired -- none of which were re-checked
 and attaches credentials only to requests that land on the exact origin the
 run navigated to. `evaluate_browser_request` and the cancel-signal helper are
 pure stdlib code with no Playwright import, so the policy itself is fully
-unit-tested with Playwright ABSENT; only `PlaywrightDriver.visit` touches the
-real `playwright.async_api` module, and only inside its existing
-try/except-guarded lazy import.
+unit-tested with Playwright ABSENT; only `PlaywrightDriver.visit` and its
+LB-2 sibling `PlaywrightDriver.capture_requests` (request capture for
+discovery -- see harness/driver_capture.py) touch the real
+`playwright.async_api` module, both only inside their own
+try/except-guarded lazy import, and both stay the ONLY browser/context
+creation sites in this codebase (test_browser_interception_gate.py enforces
+this: every other module, including driver_capture.py, must obtain a driver
+via this module's factory/methods rather than creating its own).
 """
 from __future__ import annotations
 import asyncio
@@ -187,6 +192,27 @@ class ExecutionObservation:
 
     def all_text(self) -> str:
         return "\n".join(self.dialogs + self.console + self.page_errors)
+
+
+@dataclass
+class CaptureObservation:
+    """What one driver-backed request-CAPTURE visit produced (LB-2) -- distinct
+    from ExecutionObservation (visit()'s dialog/console/error evidence that
+    script EXECUTED). This instead records the actual XHR/fetch requests the
+    page's own JS issued -- method, URL, headers, body, and response -- as
+    `HttpExchange(...).model_dump()` dicts, for discovery (harness.driver_capture
+    consumes this)."""
+    url: str
+    exchanges: list = field(default_factory=list)
+    load_error: str = ""
+
+
+# Playwright resource_type values that represent a request the PAGE's own JS
+# issued (fetch()/XMLHttpRequest) -- as opposed to the navigation document
+# itself or a passive subresource (image/stylesheet/font/script). These are
+# exactly the requests a passive/HTML-only crawl can never see the real shape
+# of, which is what `PlaywrightDriver.capture_requests` below exists to capture.
+_JS_ISSUED_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
 
 
 @runtime_checkable
@@ -408,6 +434,167 @@ class PlaywrightDriver:
                     # A locally-launched browser is ours to terminate; a
                     # connected one is only disconnected (never kill a shared
                     # container browser out from under other sessions).
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            obs.load_error = f"{e.__class__.__name__}: {e}"
+        return obs
+
+    async def capture_requests(self, url: str, *, wait_ms: int = 1500,
+                               headers: dict | None = None,
+                               scope: "ScopePolicy | None" = None,
+                               cancel: "asyncio.Event | Callable[[], bool] | None" = None,
+                               gate: "SafetyGate | None" = None,
+                               budget: "RequestBudget | None" = None,
+                               max_captured: int = 50) -> "CaptureObservation":
+        """LB-2: load `url` and record every XHR/fetch request the page's own
+        JS issues while it loads, as `HttpExchange(...).model_dump()` dicts
+        (harness.models, imported lazily here to keep this module's only
+        hard import at module scope limited to harness.run_context, as today).
+
+        A SIBLING entrypoint to `visit()`, not a fork of its policy: the SAME
+        `evaluate_browser_request` route handler decides every request
+        (identical scope/credential-attach/gate/budget decision `visit()`
+        would make for the same request), and the SAME cancellation seam
+        (`is_cancelled`) applies. It does NOT share `visit()`'s dialog/
+        console/pageerror evidence collection -- that is a different kind of
+        observation (did script EXECUTE) from this one (what requests did the
+        page's JS ISSUE).
+
+        Per NC-2 (test_browser_interception_gate.py's single-context-site
+        guard): browser/context creation for this capture lives HERE, inside
+        PlaywrightDriver, the one file that guard allows it in -- not in
+        harness.driver_capture, which only calls this method and never
+        touches `playwright.async_api` itself. Capture is an ADDITIONAL
+        passive listener (`page.on("requestfinished")`) layered on top of the
+        same route interceptor; it never changes whether a request is
+        allowed, only whether an already-allowed xhr/fetch request is
+        recorded.
+        """
+        from harness.models import HttpExchange
+        obs = CaptureObservation(url=url)
+        if is_cancelled(cancel):
+            obs.load_error = "cancelled before navigation"
+            return obs
+        run_origin = ScopePolicy.origin_of(url)
+        effective_scope = scope if scope is not None else ScopePolicy(
+            allowed_hosts=frozenset({ScopePolicy.host_of(url)}))
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as e:  # pragma: no cover - guarded by available()
+            obs.load_error = f"playwright import failed: {e}"
+            return obs
+        try:
+            async with async_playwright() as p:
+                connected = bool(self.cdp_endpoint)
+                if connected:
+                    browser = await p.chromium.connect_over_cdp(
+                        self.cdp_endpoint, timeout=self.launch_timeout_ms)
+                else:
+                    browser = await p.chromium.launch(headless=True)
+                context = None
+                try:
+                    _extra, _cookies = _extra_headers_and_cookies(headers, url)
+                    context = await browser.new_context()
+
+                    async def _handle_route(route, request):
+                        if is_cancelled(cancel):
+                            try:
+                                await route.abort()
+                            except Exception:
+                                pass
+                            return
+                        decision = evaluate_browser_request(
+                            url=request.url,
+                            method=request.method,
+                            resource_type=request.resource_type,
+                            is_navigation=request.is_navigation_request(),
+                            run_origin=run_origin,
+                            scope=effective_scope,
+                            gate=gate,
+                            budget=budget)
+                        if not decision.allow:
+                            log.info("browser_driver.capture_requests: blocked %s %s (%s)",
+                                     request.method, request.url, decision.reason)
+                            try:
+                                await route.abort()
+                            except Exception:
+                                pass
+                            return
+                        try:
+                            if decision.attach_credentials and _extra:
+                                merged_headers = dict(request.headers)
+                                merged_headers.update(_extra)
+                                await route.continue_(headers=merged_headers)
+                            else:
+                                await route.continue_()
+                        except Exception:
+                            pass
+
+                    await context.route("**/*", _handle_route)
+
+                    if _cookies:
+                        try:
+                            await context.add_cookies(_cookies)
+                        except Exception:
+                            pass
+                    page = await context.new_page()
+
+                    async def _record(request) -> None:
+                        if len(obs.exchanges) >= max_captured:
+                            return
+                        if (request.resource_type or "").lower() not in _JS_ISSUED_RESOURCE_TYPES:
+                            return
+                        try:
+                            body = request.post_data or ""
+                        except Exception:
+                            body = ""
+                        resp_status = None
+                        resp_headers: dict = {}
+                        resp_body = ""
+                        try:
+                            response = await request.response()
+                        except Exception:
+                            response = None
+                        if response is not None:
+                            try:
+                                resp_status = response.status
+                                resp_headers = dict(response.headers)
+                            except Exception:
+                                pass
+                            try:
+                                resp_body = await response.text()
+                            except Exception:
+                                resp_body = ""
+                        try:
+                            req_headers = dict(request.headers)
+                        except Exception:
+                            req_headers = {}
+                        obs.exchanges.append(HttpExchange(
+                            url=request.url, method=request.method,
+                            request_headers=req_headers, request_body=body,
+                            response_status=resp_status, response_headers=resp_headers,
+                            response_body=resp_body,
+                            analyst_note="driver_capture: JS-issued request observed while "
+                                         f"loading {url}",
+                        ).model_dump())
+
+                    page.on("requestfinished",
+                            lambda req: __import__("asyncio").create_task(_record(req)))
+
+                    if is_cancelled(cancel):
+                        obs.load_error = "cancelled before navigation"
+                    else:
+                        await page.goto(url, timeout=self.launch_timeout_ms, wait_until="load")
+                        await page.wait_for_timeout(wait_ms)
+                finally:
+                    if context is not None:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
                     try:
                         await browser.close()
                     except Exception:

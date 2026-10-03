@@ -200,6 +200,22 @@ browser_xss:
   # needed on the host in CDP mode.
   cdp_endpoint: ""
 
+# Driver-based request capture -- LB-2 (harness/driver_capture.py). Loads a
+# page in the SAME Playwright engine browser_xss uses and records the actual
+# requests the page's own JS issues (fetch/XHR -- method, URL, content-type,
+# body, headers), so a form that builds an XML or multipart body in JS at
+# submit time is captured with its real shape instead of a guessed/synthesized
+# one. Captures land in RoleCrawlResult.captured, feeding the SAME
+# confirmation legs passive discovery feeds (xxe, file_upload, ...).
+# SAFE DEFAULT: off in the committed config -- this drives a real browser to
+# load a page and is active-traffic-shaped (same class of knob as
+# autonomous_discovery.enabled / oracle.enabled above); a live local run
+# enables it via config.local.yaml, never by a committed flip.
+driver_capture:
+  enabled: false
+  wait_ms: 1500        # settle time after load, for async JS-issued requests
+  max_captured: 50      # cap on XHR/fetch exchanges captured per page visit
+
 # Per-vulnerability resource governance -- F5 (resource_governor.py). The
 # ceiling for testing ONE vulnerability: how many retries (re-dispatches of the
 # same class), how many distinct agent runs, and a hard per-vulnerability token
