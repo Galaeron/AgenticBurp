@@ -3,7 +3,7 @@
 ## Checkout
 - Branch: `reconciliation-backlog`
 - HEAD: `f952b107` (LB-2 driver-based capture, 6 cleanly-separable files). LB-1 helper
-  committed earlier (`6d5a2082`); LB-NOTE/LB-3 fixes + LB-2's fixture/integration test
+  committed earlier (`6d5a2082`); LB-NOTE/LB-3/LB-4 fixes + LB-2's fixture/integration test
   land in the preserved tracked-WIP (no isolated commit — see below).
 - Working tree is a large, deliberately-uncommitted WIP pile (the 2026-10-01
   live-loop legs, the benchmark harness, the `objective_completion`/IDOR work,
@@ -38,17 +38,23 @@ LB-7 is OWNER/LIVE (skip).
   in the passive force-off list / SafeDefaultGuard. 6 cleanly-separable files committed;
   the /xxe fixture + capture→confirm integration test (XXE via in-process loopback collaborator,
   offline) + passive negative control ride the legs WIP. multipart/file-upload half deferred.
-- **Next: LB-4** — autonomous shape-precondition dispatch for the 2fa-bypass + client-trust legs
-  (orchestration, offline). Then LB-5, LB-6.
+- **LB-4 — DONE (VERIFIED, in-worktree).** Two shape-preconditions in
+  `shape_precondition_legs` route the 2fa-bypass + client-trust legs from captured traffic
+  (reusing each validator's own predicate); `_confirm` gained a client_trust branch + 2fa/mfa
+  match. Dispatch-only, confirm-gated, behavior-neutral for existing classes (reviewer over-match
+  check). 6 new precondition assertions + the existing leg confirm/control cases. `full` green.
+  Lands in orchestrator WIP → doc-close.
+- **Next: LB-5** — cross-site browser PoC capability (CSRF no-defenses). Mode: LOOP for the
+  driver extension + fixture controls; ships default-OFF. Re-adds `csrf` to the safety-gate LIVE
+  set ONLY once SameSite/Origin/token/bearer controls pass. Then LB-6.
 
 ## Verification (this checkout)
-- **`full` (LB-2 run):** unittest `Ran 3067 tests … OK`; pytest-native 38 passed; integrity
-  42 OK. The `testing/` discover stage hit ONE known timestamp-flake
-  (`test_blind_eval_harness…no_duplicates_corpus_scoring`, two report renders straddling a
-  minute boundary — passes on rerun; filed as **LB-FLAKE**). All other stages green.
-- LB-2 surface: `test_driver_capture` 3 OK (real Playwright); `test_config_schema` +
-  `test_safety_gate` 77 OK (SafeDefaultGuard green); `test_leg_live_verification` 42 OK.
-- Earlier LB-1/LB-NOTE/LB-3 surfaces remain green (source_form, ssti_readback, auth retry).
+- **`full` (LB-4 run) fully GREEN:** unittest `Ran 3073 tests … OK`; pytest-native 38 passed;
+  testing 272 OK; integrity 42 OK; exit 0. (The LB-FLAKE timestamp flake did not recur this run;
+  it remains filed as a nondeterminism to fix.)
+- LB-4 surface: `test_orchestrator_precondition` 74 OK + injection/confirmation leg suites
+  (151 OK combined); LB-2: `test_driver_capture` 3 OK (real Playwright), SafeDefaultGuard green;
+  `test_leg_live_verification` 42 OK. Earlier LB-1/LB-NOTE/LB-3 surfaces remain green.
 - No offline tier establishes current model accuracy or blind-target recall.
 
 ## Web-objective benchmark
@@ -65,7 +71,7 @@ LB-7 is OWNER/LIVE (skip).
   Freemarker SSTI arithmetic (0.95), custom-exploit SSTI (0.95, non-destructive).
 
 ## Open work / pointers
-- continue LB-4 → LB-5 → LB-6; LB-FLAKE (blind-eval timestamp flake) is a quick offline fix.
+- continue LB-5 → LB-6; LB-FLAKE (blind-eval timestamp flake) is a quick offline fix.
 - Older still-open: SC-6 (wheel imports outside checkout), SC-9 (tool broker),
   SC-10/SC-14 (ToolAdapter / install-doctor-serve) — after the LB batch.
 - OWNER/LIVE (skip in loop): LB-7 (single-packet race dispatch), P0-3, P1-5, P2-2,

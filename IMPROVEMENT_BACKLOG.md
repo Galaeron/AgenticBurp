@@ -3975,7 +3975,30 @@ firing autonomously end-to-end "during real engagements".
 - **Impact:** High (one small fix unblocks autonomous e2e for ~5 confirmed classes).
   **Source:** 2026-10-01 live-loop batch.
 
-### [ ] LB-4 — Autonomous shape-precondition dispatch for the new legs
+### [x] LB-4 — Autonomous shape-precondition dispatch for the new legs
+- **Result (VERIFIED, in-worktree):** two new shape-preconditions in
+  `orchestrator_helpers.shape_precondition_legs` route the 2fa-bypass and client-trust legs from
+  captured traffic, mirroring the injection-leg dispatch. `_has_client_trust_shape` reuses
+  `client_trust_validator._parse`/`_value_field` (POST/PUT/PATCH + a server-owned value field —
+  byte-for-byte `ClientTrustValidator.applies()`) → appends `("client_trust", exchange)`.
+  `_has_2fa_step_shape` reuses `auth_sequence_validator._parse_body`/`_find_key`/`_USER_KEYS`/
+  `_PASS_KEYS`/`_MFA_MARKERS` (login body AND the captured response lands on an MFA marker in
+  Location/body) → appends `("2fa_bypass", exchange)`. `orchestrator_chain._confirm` gained a
+  `client_trust` handle/branch and the auth branch was extended to match the `2fa`/`mfa` class;
+  both route into the existing `_apply`/`_cached_validate` chain and are kept ONLY when the
+  validator confirms (`return f if f.get("confirmed") else None` — no always-on behavior). Reviewer
+  over-match analysis: the client_trust elif sits after auth and before rate_limit/csrf/reset_token;
+  no pre-existing class is re-routed (`business_logic` now reaches ClientTrustValidator but stays
+  unconfirmed without a real price-tamper differential — behavior-neutral for kept findings). 6 new
+  caller-level assertions in `test_orchestrator_precondition.ShapePreconditionLegsTests` (client_trust
+  positive + non-value negative; 2fa positive via Location + via body marker, negative no-marker,
+  negative non-login); `_ex` extended with response fields (defaults unchanged). The confirm-on-positive /
+  silent-on-control half is the pre-existing `test_leg_live_verification` 2fa + client-trust cases (42 OK).
+  Verified: test_orchestrator_precondition 74 OK; test_leg_live_verification 42 OK; + injection/confirmation
+  leg suites green (151 OK combined); smoke 92 OK; `full` green (unittest 3073 OK, pytest 38, testing 272 OK,
+  integrity 42 OK, exit 0). No `config.yaml` change; dispatch-only + confirm-gated; no existing test weakened.
+  All edit targets are tracked-WIP (orchestrator_chain/helpers + test) or untracked (ClientTrustValidator),
+  and the routing is absent at HEAD → no isolated code commit, per branch convention; this doc-close records it.
 - **Domain:** Orchestration (leg dispatch) · **Effort:** M · **Depends on:** none · **Mode:**
   LOOP (offline)
 - **Evidence:** `_check_mfa_bypass` (`auth_sequence_validator.py`) and `ClientTrustValidator`
