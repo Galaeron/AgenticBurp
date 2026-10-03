@@ -2,8 +2,9 @@
 
 ## Checkout
 - Branch: `reconciliation-backlog`
-- HEAD: `6d5a2082` (LB-1 shared source-form helper + unit test); LB-NOTE fixes
-  landed in the working tree (tracked-WIP, no isolated commit — see below).
+- HEAD: `f952b107` (LB-2 driver-based capture, 6 cleanly-separable files). LB-1 helper
+  committed earlier (`6d5a2082`); LB-NOTE/LB-3 fixes + LB-2's fixture/integration test
+  land in the preserved tracked-WIP (no isolated commit — see below).
 - Working tree is a large, deliberately-uncommitted WIP pile (the 2026-10-01
   live-loop legs, the benchmark harness, the `objective_completion`/IDOR work,
   etc.). Branch convention: each loop iteration commits only the new standalone
@@ -28,23 +29,26 @@ LB-7 is OWNER/LIVE (skip).
   `model_dump()` dicts (+ `test_ssti_readback_urls.py`, non-GET negative control both
   shapes); (B) added the `client_trust` Python-only entry to the execution-plane matrix.
   `full` now green. Fixes land in tracked-WIP (no isolated commit, per branch convention).
-- **LB-3 — DONE (VERIFIED, in-worktree).** `_authenticate` now has a bounded 3-attempt
-  login GET/POST retry (retries on HTTPError/5xx, happy-path unchanged, injectable
-  `transport=None` seam) and a `_auth_info` helper that marks an auth-requested-but-failed
-  run `degraded` + `hard_error` (fail-loud, no silent anonymous). 7 new tests (MockTransport,
-  no sockets/sleep); `full` green. Lands in untracked runner WIP → doc-close only.
-- **Next: LB-2** — driver-based request capture for JS/XHR-built shapes (discovery).
-  Mode: LOOP for the capture plumbing + fixture (a real blind-target recall claim is OWNER/LIVE).
-  Reuses the Playwright driver; gated behind a discovery flag, OFF by default.
+- **LB-3 — DONE (VERIFIED, in-worktree).** `_authenticate` bounded 3-attempt login retry +
+  `_auth_info` degraded/fail-loud marker; 7 new tests; lands in untracked runner WIP (doc-close).
+- **LB-2 — DONE (`f952b107`, VERIFIED).** Driver-based capture of JS/XHR-built request shapes:
+  `browser_driver.capture_requests` records real fetch/XHR requests (method/URL/content-type/body)
+  through the existing browser policy; `driver_capture.discover()` emits them as role_crawl-shaped
+  `HttpExchange` dicts so legs fire on JS-built shapes. New `driver_capture` flag OFF + registered
+  in the passive force-off list / SafeDefaultGuard. 6 cleanly-separable files committed;
+  the /xxe fixture + capture→confirm integration test (XXE via in-process loopback collaborator,
+  offline) + passive negative control ride the legs WIP. multipart/file-upload half deferred.
+- **Next: LB-4** — autonomous shape-precondition dispatch for the 2fa-bypass + client-trust legs
+  (orchestration, offline). Then LB-5, LB-6.
 
 ## Verification (this checkout)
-- **`full` is GREEN:** unittest `Ran 3061 tests … OK`; pytest-native 38 passed;
-  testing 265 OK; integrity 42 OK; exit 0. The two pre-existing failures are cleared
-  by LB-NOTE (see below) — the LB-1 note's "8 pre-existing failures" are resolved.
-- LB-1 surface: `test_source_form` 7 OK; `test_leg_live_verification` 39 OK (all four
-  legs' positives + negative controls); `test_stored_xss_validator` + `test_validators` 26 OK.
-- LB-NOTE surface: `test_pipeline_gate + test_execution_planes + test_ssti_readback_urls
-  + test_role_crawl` 80 OK.
+- **`full` (LB-2 run):** unittest `Ran 3067 tests … OK`; pytest-native 38 passed; integrity
+  42 OK. The `testing/` discover stage hit ONE known timestamp-flake
+  (`test_blind_eval_harness…no_duplicates_corpus_scoring`, two report renders straddling a
+  minute boundary — passes on rerun; filed as **LB-FLAKE**). All other stages green.
+- LB-2 surface: `test_driver_capture` 3 OK (real Playwright); `test_config_schema` +
+  `test_safety_gate` 77 OK (SafeDefaultGuard green); `test_leg_live_verification` 42 OK.
+- Earlier LB-1/LB-NOTE/LB-3 surfaces remain green (source_form, ssti_readback, auth retry).
 - No offline tier establishes current model accuracy or blind-target recall.
 
 ## Web-objective benchmark
@@ -61,7 +65,7 @@ LB-7 is OWNER/LIVE (skip).
   Freemarker SSTI arithmetic (0.95), custom-exploit SSTI (0.95, non-destructive).
 
 ## Open work / pointers
-- `full` green; continue LB-2 → LB-4 → LB-5 → LB-6.
+- continue LB-4 → LB-5 → LB-6; LB-FLAKE (blind-eval timestamp flake) is a quick offline fix.
 - Older still-open: SC-6 (wheel imports outside checkout), SC-9 (tool broker),
   SC-10/SC-14 (ToolAdapter / install-doctor-serve) — after the LB batch.
 - OWNER/LIVE (skip in loop): LB-7 (single-packet race dispatch), P0-3, P1-5, P2-2,

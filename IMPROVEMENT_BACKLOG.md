@@ -3897,7 +3897,28 @@ firing autonomously end-to-end "during real engagements".
 - **Impact:** High (retroactively de-risks four shipped legs; prerequisite idiom for any new
   write-replay leg). **Source:** 2026-10-01 live-loop batch.
 
-### [ ] LB-2 — Driver-based request capture for JS/XHR-built shapes
+### [x] LB-2 — Driver-based request capture for JS/XHR-built shapes
+- **Result (VERIFIED):** `f952b10` — driver-backed capture mode.
+  `browser_driver.PlaywrightDriver.capture_requests` (+ `CaptureObservation`) loads a page in
+  the SAME engine browser_xss uses, routes every request through the existing
+  `evaluate_browser_request` policy (scope/credential/gate/budget unchanged), and records the
+  real JS-issued fetch/XHR requests (method, URL, content-type, body, headers), capped by
+  `max_captured`. `driver_capture.discover()` returns them as `HttpExchange(...).model_dump()`
+  dicts in role_crawl's `captured` shape so the existing legs consume them unchanged. New
+  `driver_capture:` config block ships `enabled: false` (SAFE DEFAULT) and the knob is
+  registered in `config_schema._PASSIVE_FORCE_OFF_KNOBS` + `SafeDefaultGuardTests` SAFE_CHECKS
+  + unsafe-value control. Inert unless enabled (no default caller). `test_driver_capture.py`
+  (3 offline tests, real Playwright): JS fetch POST captured with true content-type/body;
+  navigation/img excluded; HttpExchange dict shape matches. The owned 127.0.0.1 fixture proving
+  capture→XXE-confirm (via the in-process loopback collaborator, fully offline) + the passive-only
+  negative control that MISSES it ride the uncommitted legs WIP (`vuln_fixture.py` /xxe routes +
+  `test_leg_live_verification.py` — 42 OK, up from 39). Verified: test_driver_capture 3 OK;
+  test_config_schema + test_safety_gate 77 OK (SafeDefaultGuard green); test_leg_live_verification
+  42 OK; full suite green except one unrelated timestamp-flake (LB-FLAKE below, passes on rerun).
+  Committed artifact = the 6 cleanly-separable files (driver_capture + test, browser_driver
+  capture additions, config.yaml OFF flag, config_schema + test_config_schema registration);
+  fixture + integration test ride the legs WIP per branch convention. The blind-target recall
+  claim remains OWNER/LIVE (out of scope); the multipart/file-upload half was deferred (XXE proven).
 - **Domain:** Discovery · **Effort:** L · **Depends on:** none · **Mode:** LOOP for the
   capture plumbing + fixture; a real blind-target recall claim is OWNER/LIVE
 - **Evidence:** `feature_workflow` / the passive HTML parser emit only urlencoded bodies.
@@ -4065,3 +4086,20 @@ firing autonomously end-to-end "during real engagements".
 - **Acceptance criteria:** each fix makes its failing test pass with a caller-level assertion (and,
   for A, a negative control that the guard does not swallow a real non-GET method); `full`'s unittest
   stage drops those failures; no `config.yaml` change. **Source:** 2026-10-01 LB-1 review.
+
+### [ ] LB-FLAKE — Freeze the clock in the blind-eval report-equivalence test
+- **Domain:** Test hygiene (flake) · **Effort:** S · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED):** `testing/test_blind_eval_harness.py::ExchangeProvenanceAttributionAR3Tests`
+  `test_no_duplicates_corpus_scoring_unchanged_from_pair_based_path` compares two generated report
+  strings for equality; both embed a live `… UTC` timestamp from the report generator. When the two
+  generations straddle a minute boundary during a long `full` run, the assertion fails on the minute
+  digits alone (observed `05:36 UTC` != `05:37 UTC`; passes on rerun). Surfaced by the LB-2 `full` run.
+- **Problem:** a wall-clock-dependent equality assertion makes `full` nondeterministic — a real
+  regression here could be dismissed as "just the flake", and a clean run can't be trusted at a glance.
+- **Recommendation:** freeze/inject the clock for the two report renders (or normalize/strip the
+  timestamp before comparing) so the equality check is deterministic. Prefer a single injected
+  `now` passed to both renders over regex-scrubbing the output.
+- **Acceptance criteria:** the test asserts equality on time-normalized output (or a frozen clock)
+  and passes deterministically across a minute boundary; a control proves a genuine content
+  difference still fails the assertion; `full`'s testing stage is green on repeat runs.
+- **Source:** 2026-10-03 LB-2 full run.
