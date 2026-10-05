@@ -2,9 +2,9 @@
 
 ## Checkout
 - Branch: `reconciliation-backlog`
-- HEAD: `f952b107` (LB-2 driver-based capture, 6 cleanly-separable files). LB-1 helper
-  committed earlier (`6d5a2082`); LB-NOTE/LB-3/LB-4 fixes + LB-2's fixture/integration test
-  land in the preserved tracked-WIP (no isolated commit — see below).
+- HEAD: `0de16331` (LB-5 cross-site PoC primitive, 4 cleanly-separable files). Earlier real
+  commits: `6d5a2082` (LB-1), `f952b107` (LB-2). LB-NOTE/LB-3/LB-4 fixes + the LB-2/LB-5
+  fixture/integration/validator wiring land in the preserved tracked-WIP (no isolated commit).
 - Working tree is a large, deliberately-uncommitted WIP pile (the 2026-10-01
   live-loop legs, the benchmark harness, the `objective_completion`/IDOR work,
   etc.). Branch convention: each loop iteration commits only the new standalone
@@ -44,17 +44,25 @@ LB-7 is OWNER/LIVE (skip).
   match. Dispatch-only, confirm-gated, behavior-neutral for existing classes (reviewer over-match
   check). 6 new precondition assertions + the existing leg confirm/control cases. `full` green.
   Lands in orchestrator WIP → doc-close.
-- **Next: LB-5** — cross-site browser PoC capability (CSRF no-defenses). Mode: LOOP for the
-  driver extension + fixture controls; ships default-OFF. Re-adds `csrf` to the safety-gate LIVE
-  set ONLY once SameSite/Origin/token/bearer controls pass. Then LB-6.
+- **LB-5 — DONE (`0de16331`, VERIFIED).** Cross-site CSRF PoC primitive, default-OFF:
+  `browser_driver.cross_site_submit` + a pure fail-closed policy that allows only the attacker
+  GET (fulfilled locally at a synthetic `*.localhost` site), one declared victim POST, and a
+  GET-only readback; the browser cookie jar (its SameSite attr) is the sole credential channel,
+  so SameSite/Origin/bearer are genuine browser-enforced controls. `evaluate_browser_request` and
+  the static LIVE seed untouched; csrf promotion stays run-derived + flag-gated. 4 cleanly-separable
+  files committed; csrf_validator wiring + /csrf-poc fixture + csrf LegCase ride the WIP pile.
+  Review flagged a co-resident UNGATED non-browser CSRF method-bypass branch in csrf_validator WIP
+  (unsound: manual cookie + non-independent readback) — filed **LB-CSRF-REPLAY** to gate/fix before
+  the pile is committed.
+- **Next: LB-6** — runner objective-completion wiring (benchmark oracle only; the typed wiring +
+  fixture is LOOP, turning it on against a live lab is OWNER/LIVE). Then LB-FLAKE / LB-CSRF-REPLAY.
 
 ## Verification (this checkout)
-- **`full` (LB-4 run) fully GREEN:** unittest `Ran 3073 tests … OK`; pytest-native 38 passed;
-  testing 272 OK; integrity 42 OK; exit 0. (The LB-FLAKE timestamp flake did not recur this run;
-  it remains filed as a nondeterminism to fix.)
-- LB-4 surface: `test_orchestrator_precondition` 74 OK + injection/confirmation leg suites
-  (151 OK combined); LB-2: `test_driver_capture` 3 OK (real Playwright), SafeDefaultGuard green;
-  `test_leg_live_verification` 42 OK. Earlier LB-1/LB-NOTE/LB-3 surfaces remain green.
+- **`full` (LB-5 run) fully GREEN:** unittest `Ran 3094 tests … OK`; pytest-native 38 passed;
+  testing 272 OK; integrity 42 OK; exit 0. (LB-FLAKE timestamp flake did not recur; still filed.)
+- LB-5 surface: `test_cross_site_submit` 16 OK; `test_browser_interception_gate` 13 OK
+  (evaluate_browser_request intact); `test_leg_live_verification` 47 OK (1 cross-site positive +
+  4 controls ran); SafeDefaultGuard green. Earlier LB-1..LB-4 surfaces remain green.
 - No offline tier establishes current model accuracy or blind-target recall.
 
 ## Web-objective benchmark
@@ -71,7 +79,8 @@ LB-7 is OWNER/LIVE (skip).
   Freemarker SSTI arithmetic (0.95), custom-exploit SSTI (0.95, non-destructive).
 
 ## Open work / pointers
-- continue LB-5 → LB-6; LB-FLAKE (blind-eval timestamp flake) is a quick offline fix.
+- continue LB-6; then the filed offline notes LB-FLAKE (timestamp flake) and
+  LB-CSRF-REPLAY (gate/fix the unsound co-resident method-bypass before the pile is committed).
 - Older still-open: SC-6 (wheel imports outside checkout), SC-9 (tool broker),
   SC-10/SC-14 (ToolAdapter / install-doctor-serve) — after the LB batch.
 - OWNER/LIVE (skip in loop): LB-7 (single-packet race dispatch), P0-3, P1-5, P2-2,

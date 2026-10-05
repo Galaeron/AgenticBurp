@@ -4015,7 +4015,32 @@ firing autonomously end-to-end "during real engagements".
 - **Impact:** Medium-High (turns on 2FA + client-trust for real engagements). **Source:**
   2026-10-01 live-loop batch.
 
-### [ ] LB-5 — Cross-site browser PoC capability (CSRF no-defenses)
+### [x] LB-5 — Cross-site browser PoC capability (CSRF no-defenses)
+- **Result (VERIFIED):** `0de16331` — cross-site PoC primitive, default-OFF.
+  `browser_driver.cross_site_submit` + a pure Playwright-free policy
+  `evaluate_cross_site_submit_request` (+ `CrossSitePlan`/decision dataclass) that permits
+  EXACTLY three top-level navigations — the attacker page (GET, `route.fulfill`ed locally, NEVER
+  dispatched, at a synthetic `*.localhost` site), the ONE declared victim POST (unchanged), and
+  the GET-only readback — and fails closed otherwise. NO Authorization is ever attached; the
+  browser cookie jar is the sole credential channel, so the cookie's own SameSite attribute
+  (set via `context.add_cookies`) decides cross-site delivery — making SameSite=Strict/Lax,
+  Origin/Referer and bearer-only GENUINE browser-enforced controls (verified: positive confirms
+  with `same_site=None` via Chromium's default-Lax+POST grace; each control stays silent for the
+  right reason — readback sentinel absent / 403 / no ambient cookie). `evaluate_browser_request`
+  and the NC-2 single-context invariant are byte-for-byte UNTOUCHED; `confirmation_gate.LIVE_VERIFIED_MARKERS`
+  is UNTOUCHED (csrf promotion stays run-derived + flag-gated via the new `leg_self_test` LegCase,
+  never a static default). New `cross_site_poc.enabled: false` flag in config.yaml, registered in
+  SafeDefaultGuard SAFE_CHECKS + UNSAFE_VALUES. `test_cross_site_submit.py` (16 pure policy tests).
+  Verified: test_cross_site_submit 16 OK; test_browser_interception_gate 13 OK; test_leg_live_verification
+  47 OK (1 cross-site positive + 4 controls ACTUALLY RAN); SafeDefaultGuard green; smoke 92 OK;
+  `full` green (unittest 3094 OK, pytest 38, testing 272 OK, integrity 42 OK, exit 0).
+  **Committed artifact** = the 4 cleanly-separable files (browser_driver cross_site_submit + policy,
+  test_cross_site_submit, config.yaml OFF flag, test_config_schema guard). The csrf_validator
+  confirm-branch wiring, the `/csrf-poc` fixture + 4 browser controls, and the run-derived csrf
+  LegCase (leg_self_test) ride the uncommitted WIP (they depend on the WIP validator signature) —
+  recorded here per branch convention. Flakiness watch: the positive relies on Chromium's SameSite-Lax
+  grace window (deterministic in a seconds-long test; a future Chromium bump removing the grace could
+  break it). The blind-target recall claim remains OWNER/LIVE (out of scope).
 - **Domain:** Browser validation · **Effort:** L · **Depends on:** none · **Mode:** LOOP for
   the driver extension + fixture controls; ships default-OFF
 - **Evidence:** `csrf_validator.py` deliberately returns `not_confirmed` (0.4 OBSERVATION) for a
@@ -4126,3 +4151,30 @@ firing autonomously end-to-end "during real engagements".
   and passes deterministically across a minute boundary; a control proves a genuine content
   difference still fails the assertion; `full`'s testing stage is green on repeat runs.
 - **Source:** 2026-10-03 LB-2 full run.
+
+### [ ] LB-CSRF-REPLAY — Review/gate the ungated non-browser "method-dependent CSRF token bypass"
+- **Domain:** Validator soundness · **Effort:** S-M · **Depends on:** none · **Mode:** LOOP (offline)
+- **Evidence (VERIFIED, surfaced by the LB-5 review):** `harness/validators/csrf_validator.py`
+  (uncommitted WIP, NOT part of LB-5's committed artifact) carries a second, UNGATED, non-browser
+  confirm branch — helpers `_method_bypass_url` + `_readback_matches` and a `validate()` block that,
+  when the captured body has both a token field and a non-token field (+ a Cookie, no Authorization),
+  replays the write as a tokenless top-level GET and returns `confirmed=0.95`/`not_confirmed=0.0`
+  from a readback. Its tests are in `harness/test_deferred_legs.py` (WIP); `orchestrator_helpers.py`
+  (WIP) references a "method-bypass check".
+- **Problem:** (1) it runs REGARDLESS of `cross_site_poc.enabled`, so it CHANGES csrf's flag-off
+  behavior vs HEAD (a token-bearing cookie'd capture no longer returns the retired 0.4 OBSERVATION).
+  (2) Soundness: the Cookie is attached MANUALLY by the harness (replay keeps it), so a 2xx does NOT
+  prove ambient browser delivery — exactly the fallacy the `csrf_validator` RETIRED note (2026-09-09)
+  warns against; and the "readback" is the SAME GET's own response body matched against the ORIGINAL
+  submitted value (not an independent fetch, not a fresh sentinel), so an endpoint that merely
+  reflects its query params yields a FALSE 0.95 confirm. LB-5's browser path is the sound counterpart
+  (fresh sentinel + genuinely independent readback + real ambient cookie).
+- **Recommendation:** before the WIP pile is committed, either (a) REMOVE this branch and let CSRF
+  confirmation go solely through LB-5's browser PoC, or (b) GATE it behind `cross_site_poc.enabled`
+  (or its own default-OFF flag) AND strengthen it to an independent readback against a DISTINCT state
+  endpoint with a fresh sentinel, and add a negative control proving a mere reflecting endpoint does
+  NOT confirm. Do not let LB-5's green obscure this co-resident change.
+- **Acceptance criteria:** csrf's flag-off behavior matches HEAD (0.4 OBSERVATION) unless an explicit
+  default-OFF flag is on; the branch (if kept) confirms only on an independent readback + fresh
+  sentinel and a reflecting-endpoint negative control stays `not_confirmed`; caller-level test;
+  `full` green. **Source:** 2026-10-05 LB-5 review.
