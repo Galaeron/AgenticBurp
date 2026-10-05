@@ -216,6 +216,26 @@ driver_capture:
   wait_ms: 1500        # settle time after load, for async JS-issued requests
   max_captured: 50      # cap on XHR/fetch exchanges captured per page visit
 
+# Cross-site browser PoC for CSRF confirmation -- LB-5 (harness/browser_driver.py
+# PlaywrightDriver.cross_site_submit + harness/validators/csrf_validator.py).
+# Loads a synthesized attacker-origin auto-submit form in a real browser that
+# POSTs cross-site to the captured victim endpoint carrying the victim's AMBIENT
+# session cookie, then independently re-reads (GET-only) the authenticated victim
+# state to verify it changed -- the only way to prove a CSRF is a real browser-
+# deliverable attack rather than an HTTP replay that proves nothing about
+# ambient-credential delivery (see csrf_validator.py's RETIRED note). Stays
+# SILENT when the app defends (SameSite=Strict/Lax, Origin/Referer-enforced,
+# bearer-only/non-ambient auth) -- the browser's OWN SameSite/cookie-jar logic
+# decides delivery; this never attaches credentials itself.
+# SAFE DEFAULT: off in the committed config -- same class of knob as
+# driver_capture.enabled above (drives a real browser, sends live cross-site
+# traffic). A live local run enables it via config.local.yaml, never by a
+# committed flip. With this off, csrf stays a 0.4 OBSERVATION and is never
+# promoted into any live-verified set (promotion is run-derived only, gated on
+# this flag -- see leg_self_test.py's csrf LegCase).
+cross_site_poc:
+  enabled: false
+
 # Per-vulnerability resource governance -- F5 (resource_governor.py). The
 # ceiling for testing ONE vulnerability: how many retries (re-dispatches of the
 # same class), how many distinct agent runs, and a hard per-vulnerability token

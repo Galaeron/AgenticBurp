@@ -30,17 +30,22 @@ subresource, a fetch the page's own JS fired -- none of which were re-checked
 and attaches credentials only to requests that land on the exact origin the
 run navigated to. `evaluate_browser_request` and the cancel-signal helper are
 pure stdlib code with no Playwright import, so the policy itself is fully
-unit-tested with Playwright ABSENT; only `PlaywrightDriver.visit` and its
-LB-2 sibling `PlaywrightDriver.capture_requests` (request capture for
-discovery -- see harness/driver_capture.py) touch the real
-`playwright.async_api` module, both only inside their own
-try/except-guarded lazy import, and both stay the ONLY browser/context
+unit-tested with Playwright ABSENT; only `PlaywrightDriver.visit`, its LB-2
+sibling `PlaywrightDriver.capture_requests` (request capture for discovery --
+see harness/driver_capture.py), and its LB-5 sibling
+`PlaywrightDriver.cross_site_submit` (a self-contained cross-site CSRF
+browser PoC, with its own narrow `evaluate_cross_site_submit_request` policy
+-- see harness/validators/csrf_validator.py) touch the real
+`playwright.async_api` module, each only inside its own
+try/except-guarded lazy import, and all three stay the ONLY browser/context
 creation sites in this codebase (test_browser_interception_gate.py enforces
-this: every other module, including driver_capture.py, must obtain a driver
-via this module's factory/methods rather than creating its own).
+this: every other module, including driver_capture.py and csrf_validator.py,
+must obtain a driver via this module's factory/methods rather than creating
+its own).
 """
 from __future__ import annotations
 import asyncio
+import html
 import logging
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, TYPE_CHECKING, runtime_checkable
@@ -167,6 +172,98 @@ def evaluate_browser_request(*, url: str, method: str, resource_type: str,
                 else "in scope, cross-origin -- no credentials attached"))
 
 
+# ---------------------------------------------------------------------------
+# Cross-site browser PoC primitive (LB-5) -- pure route-policy half, no
+# Playwright import. A SEPARATE, narrower policy from evaluate_browser_request
+# above: that one governs an entire run's approved-origin browsing (any
+# number of same-/cross-origin requests over the run's lifetime, credentials
+# attached by origin match). This one governs exactly ONE
+# PlaywrightDriver.cross_site_submit() call, which by construction permits
+# exactly THREE requests and nothing else:
+#   1. the synthesized "attacker" page -- never dispatched to the network at
+#      all; FULFILLED locally by cross_site_submit with no real DNS/connect,
+#      so `attacker_url` can be any placeholder hostname (on a different SITE
+#      than the victim) without needing a second real HTTP host.
+#   2. the one declared cross-origin state-changing request to `victim_url` --
+#      allowed through to the real network UNCHANGED (no header added or
+#      removed). The browser's OWN cookie jar + SameSite logic -- not this
+#      policy -- decides whether the ambient session cookie rides along; the
+#      whole point of the primitive is to observe what a real browser does
+#      with real credentials, not to simulate or control that decision.
+#   3. the GET-only independent readback at `readback_url`.
+# Anything else -- a different URL, a subresource, a non-matching method, a
+# non-navigation request, a redirect to an undeclared target -- fails closed
+# (aborted). Authorization is never attached by this policy or by
+# cross_site_submit at any point: the only identity channel an attacker-
+# controlled cross-site page actually has is whatever the browser's cookie
+# jar decides to send on its own, so that is the only channel this primitive
+# exercises.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CrossSitePlan:
+    """The exact, single-use set of requests ONE cross_site_submit() call
+    permits. Built fresh per call from the caller's declared URLs -- never
+    shared across calls, never widened after construction."""
+    attacker_url: str
+    victim_url: str
+    victim_method: str
+    readback_url: str
+
+
+@dataclass(frozen=True)
+class CrossSiteRequestDecision:
+    """The outcome for one request the cross-site-submit route handler sees."""
+    allow: bool
+    fulfill_locally: bool
+    reason: str
+
+
+def evaluate_cross_site_submit_request(*, url: str, method: str, resource_type: str,
+                                        is_navigation: bool, plan: CrossSitePlan,
+                                        ) -> CrossSiteRequestDecision:
+    """Pure, synchronous, no Playwright/I/O -- decide one request against a
+    CrossSitePlan. FAIL CLOSED: only the plan's three EXACT (method, url)
+    pairs are permitted, and only as top-level navigations
+    (`is_navigation=True`) of a "document" resource_type -- never a
+    subresource, a redirect-chain hop to a different URL, or any other
+    method. `fulfill_locally=True` only for the attacker page: the caller
+    MUST answer it with `route.fulfill(...)` (synthesized content), never
+    `route.continue_()` (which would attempt a real network fetch this
+    primitive neither needs nor controls)."""
+    method_u = (method or "GET").upper()
+    resource_type_l = (resource_type or "").lower()
+    scheme = (urlsplit(url).scheme or "").lower()
+
+    def blocked(reason: str) -> CrossSiteRequestDecision:
+        return CrossSiteRequestDecision(allow=False, fulfill_locally=False, reason=reason)
+
+    if scheme not in _ALLOWED_SCHEMES:
+        return blocked(f"scheme '{scheme or url[:32]}' is not http/https")
+    if not is_navigation:
+        return blocked("only this call's declared top-level navigations are permitted (no subresources)")
+    if resource_type_l != "document":
+        return blocked(f"resource_type '{resource_type_l or '(unknown)'}' is not a navigation document")
+
+    if url == plan.attacker_url and method_u == "GET":
+        return CrossSiteRequestDecision(
+            allow=True, fulfill_locally=True,
+            reason="the synthesized attacker page -- fulfilled locally, never sent to the network")
+
+    if url == plan.victim_url and method_u == plan.victim_method.upper():
+        return CrossSiteRequestDecision(
+            allow=True, fulfill_locally=False,
+            reason="the one declared cross-site submission -- allowed through unchanged; the "
+                   "browser's own cookie jar/SameSite logic decides credential delivery")
+
+    if url == plan.readback_url and method_u == "GET":
+        return CrossSiteRequestDecision(
+            allow=True, fulfill_locally=False, reason="GET-only independent readback")
+
+    return blocked(f"{method_u} {url} is not one of this call's three declared requests")
+
+
 def is_cancelled(cancel) -> bool:
     """Normalises the two accepted cancel-signal shapes -- an `asyncio.Event`,
     or a zero-arg callable returning truthy -- into a plain bool. `None` means
@@ -192,6 +289,25 @@ class ExecutionObservation:
 
     def all_text(self) -> str:
         return "\n".join(self.dialogs + self.console + self.page_errors)
+
+
+@dataclass
+class CrossSiteSubmitObservation:
+    """What one PlaywrightDriver.cross_site_submit() call observed. `submitted`
+    is True once the declared cross-site request was allowed through this
+    call's OWN CrossSitePlan policy and the browser actually navigated to
+    it -- it says nothing about whether the victim server accepted it (see
+    `submit_status`) or whether the ambient cookie was actually delivered
+    (that is exactly what the independent GET-only readback below exists to
+    show, rather than trusting the POST's own response)."""
+    attacker_url: str
+    victim_url: str
+    readback_url: str
+    submitted: bool = False
+    submit_status: int | None = None
+    readback_status: int | None = None
+    readback_body: str = ""
+    load_error: str = ""
 
 
 @dataclass
@@ -589,6 +705,193 @@ class PlaywrightDriver:
                     else:
                         await page.goto(url, timeout=self.launch_timeout_ms, wait_until="load")
                         await page.wait_for_timeout(wait_ms)
+                finally:
+                    if context is not None:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            obs.load_error = f"{e.__class__.__name__}: {e}"
+        return obs
+
+    async def cross_site_submit(self, *, attacker_url: str, victim_url: str,
+                                readback_url: str, victim_method: str = "POST",
+                                form_fields: dict | None = None,
+                                cookie_name: str, cookie_value: str, cookie_domain: str,
+                                same_site: str | None = None, secure: bool = False,
+                                cancel: "asyncio.Event | Callable[[], bool] | None" = None,
+                                ) -> CrossSiteSubmitObservation:
+        """LB-5: a cross-site CSRF browser PoC, SELF-CONTAINED (NC-2: context
+        creation stays here -- the one place browser_driver.py allows it --
+        never in a validator).
+
+        Loads a SYNTHESIZED attacker-origin page -- never dispatched to the
+        real network at all, FULFILLED locally by this method's own route
+        handler via `evaluate_cross_site_submit_request`, so `attacker_url`
+        can be any placeholder host on a different SITE than `victim_url`
+        without this needing a second real HTTP server. That page
+        auto-submits a hidden form carrying `form_fields` to `victim_url`.
+        Before navigating, the victim's session cookie is seeded via
+        `context.add_cookies([...])` WITH an EXPLICIT `sameSite` value when
+        `same_site` is given (the browser's OWN enforcement of that
+        attribute -- not anything this method checks -- is what then blocks
+        or allows the cross-site delivery); when `same_site` is None (no
+        declared defense), the `sameSite` key is OMITTED entirely so Chromium
+        applies its own default-Lax-with-grace-period policy to a freshly-set
+        cookie, which is what lets a real "no SameSite attribute at all"
+        ambient cookie ride along on a fresh cross-site top-level POST --
+        exactly the no-defense case this exists to confirm.
+
+        After the declared POST completes, performs an INDEPENDENT GET-only
+        readback at `readback_url` in the SAME browser context, so the proof
+        of a state change never relies on trusting the POST's own response
+        body.
+
+        NEVER attaches an Authorization header or any other identity header:
+        the only credential channel exercised is the browser's own cookie
+        jar -- exactly the one an attacker-controlled page actually has
+        access to. A bearer/non-ambient-only victim therefore cannot be
+        confirmed by this method, by construction, not by a special case.
+
+        Fails closed throughout: `evaluate_cross_site_submit_request` permits
+        EXACTLY the three requests declared by this call's own CrossSitePlan
+        and aborts everything else -- a redirect to an undeclared URL, a
+        subresource, a second form submission -- never `continue_()`s a
+        request this call did not explicitly plan for."""
+        obs = CrossSiteSubmitObservation(attacker_url=attacker_url, victim_url=victim_url,
+                                         readback_url=readback_url)
+        if is_cancelled(cancel):
+            obs.load_error = "cancelled before navigation"
+            return obs
+        plan = CrossSitePlan(attacker_url=attacker_url, victim_url=victim_url,
+                             victim_method=(victim_method or "POST").upper(),
+                             readback_url=readback_url)
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as e:  # pragma: no cover - guarded by available()
+            obs.load_error = f"playwright import failed: {e}"
+            return obs
+
+        fields = form_fields or {}
+        inputs_html = "".join(
+            f'<input type="hidden" name="{html.escape(str(k), quote=True)}" '
+            f'value="{html.escape(str(v), quote=True)}">'
+            for k, v in fields.items())
+        attacker_html = (
+            "<!doctype html><html><body>"
+            f'<form id="csrf-poc-form" action="{html.escape(victim_url, quote=True)}" '
+            f'method="{plan.victim_method}">{inputs_html}</form>'
+            '<script>document.getElementById("csrf-poc-form").submit();</script>'
+            "</body></html>")
+
+        try:
+            async with async_playwright() as p:
+                connected = bool(self.cdp_endpoint)
+                if connected:
+                    browser = await p.chromium.connect_over_cdp(
+                        self.cdp_endpoint, timeout=self.launch_timeout_ms)
+                else:
+                    browser = await p.chromium.launch(headless=True)
+                context = None
+                try:
+                    context = await browser.new_context()
+
+                    cookie: dict = {"name": cookie_name, "value": cookie_value,
+                                    "domain": cookie_domain, "path": "/",
+                                    "secure": bool(secure)}
+                    if same_site is not None:
+                        cookie["sameSite"] = same_site
+                    try:
+                        await context.add_cookies([cookie])
+                    except Exception as e:
+                        obs.load_error = f"failed to seed victim cookie: {e}"
+                        return obs
+
+                    responses: dict[str, int] = {}
+
+                    async def _record_response(resp) -> None:
+                        try:
+                            if resp.url in (plan.victim_url, plan.readback_url):
+                                responses[resp.url] = resp.status
+                        except Exception:
+                            pass
+
+                    async def _handle_route(route, request):
+                        if is_cancelled(cancel):
+                            try:
+                                await route.abort()
+                            except Exception:
+                                pass
+                            return
+                        decision = evaluate_cross_site_submit_request(
+                            url=request.url, method=request.method,
+                            resource_type=request.resource_type,
+                            is_navigation=request.is_navigation_request(), plan=plan)
+                        if decision.fulfill_locally:
+                            try:
+                                await route.fulfill(status=200, content_type="text/html",
+                                                    body=attacker_html)
+                            except Exception:
+                                pass
+                            return
+                        if not decision.allow:
+                            log.info("browser_driver.cross_site_submit: blocked %s %s (%s)",
+                                     request.method, request.url, decision.reason)
+                            try:
+                                await route.abort()
+                            except Exception:
+                                pass
+                            return
+                        # Allowed to the real network -- continue UNCHANGED.
+                        # No header is ever added or removed here: the
+                        # browser's own cookie jar + SameSite logic is the
+                        # entire credential-delivery mechanism this primitive
+                        # exists to observe, never to control.
+                        try:
+                            await route.continue_()
+                        except Exception:
+                            pass
+
+                    await context.route("**/*", _handle_route)
+                    page = await context.new_page()
+                    page.on("response",
+                            lambda r: __import__("asyncio").create_task(_record_response(r)))
+
+                    if is_cancelled(cancel):
+                        obs.load_error = "cancelled before navigation"
+                        return obs
+
+                    await page.goto(attacker_url, timeout=self.launch_timeout_ms,
+                                    wait_until="commit")
+                    try:
+                        await page.wait_for_url(victim_url, timeout=self.launch_timeout_ms)
+                    except Exception as e:
+                        obs.load_error = f"cross-site submission did not reach the victim: {e}"
+                        return obs
+                    await page.wait_for_load_state("load")
+                    obs.submitted = True
+                    obs.submit_status = responses.get(victim_url)
+
+                    if is_cancelled(cancel):
+                        obs.load_error = "cancelled before readback"
+                        return obs
+                    try:
+                        readback_resp = await page.goto(
+                            readback_url, timeout=self.launch_timeout_ms, wait_until="load")
+                    except Exception as e:
+                        obs.load_error = f"independent readback navigation failed: {e}"
+                        return obs
+                    if readback_resp is not None:
+                        obs.readback_status = readback_resp.status
+                        try:
+                            obs.readback_body = await readback_resp.text()
+                        except Exception:
+                            obs.readback_body = ""
                 finally:
                     if context is not None:
                         try:
