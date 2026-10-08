@@ -42,6 +42,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -765,6 +766,7 @@ class ExchangeProvenanceAttributionAR3Tests(unittest.TestCase):
                 return self.runner.run_once(
                     exchanges, config=cfg, state_db=tmp / "state.db", cache_db=tmp / "cache.db",
                     orchestrator_factory=_stub_orchestrator_factory(stub), force_agents=["idor"],
+                    generated_at=datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc),
                 )
 
         sc1 = _run()

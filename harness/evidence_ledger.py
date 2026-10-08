@@ -36,6 +36,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from harness.source_identity import SourceSnapshot, process_source_snapshot
 
 EVIDENCE_SCHEMA_VERSION = "1.0"
 
@@ -49,6 +50,7 @@ class EventType(str, Enum):
     VALIDATION_DECISION = "validation_decision"        # confirmed / refuted / inconclusive
     FINDING_REVISION = "finding_revision"              # a lifecycle/severity change to the finding
     RUN_SUMMARY = "run_summary"                        # ER-2: one canonical per-run trace summary
+    PERSISTENCE_FAILURE = "persistence_failure"
 
 
 # Canonical order for reconstructing a chain when timestamps tie.
@@ -76,10 +78,12 @@ class Provenance:
     model: str = ""
     prompt_version: str = ""
     evidence_schema_version: str = EVIDENCE_SCHEMA_VERSION
+    source_identity: dict = field(default_factory=dict)
 
     @classmethod
     def capture(cls, *, config: dict | None = None, model: str = "",
-                prompt_version: str = "", config_fingerprint: str = "") -> "Provenance":
+                prompt_version: str = "", config_fingerprint: str = "",
+                source_snapshot: SourceSnapshot | None = None) -> "Provenance":
         fp = config_fingerprint
         if not fp and config is not None:
             try:
@@ -88,7 +92,8 @@ class Provenance:
             except Exception:
                 fp = ""
         return cls(code_version=_code_version(), config_fingerprint=fp,
-                   model=model, prompt_version=prompt_version)
+                   model=model, prompt_version=prompt_version,
+                   source_identity=(source_snapshot or process_source_snapshot()).to_dict())
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -224,7 +229,8 @@ _REHYDRATION_NOTE = (
     "blob alone is not a literal replay.")
 
 
-def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resolver=None) -> dict:
+def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resolver=None,
+                         persistence_degraded=False) -> dict:
     """Honest reproducibility assessment for a finding (P0-6 / R10; FR-2 / F03).
 
     `complete` (elsewhere) only says a verdict was reached. That is NOT the same
@@ -274,6 +280,12 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resol
     evidence_blob_degraded = any(e.data.get("evidence_blob_degraded") for e in executions)
 
     missing: list[str] = []
+    persistence_degraded = bool(persistence_degraded
+        or by_type.get(EventType.PERSISTENCE_FAILURE)
+        or any(e.data.get("ledger_persistence_degraded")
+               for events in by_type.values() for e in events))
+    if persistence_degraded:
+        missing.append("ledger persistence failed; durable evidence is incomplete")
     if not has_conclusion:
         missing.append("no verdict (validation decision / finding revision) recorded")
     if has_execution:
@@ -323,7 +335,8 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resol
         resolvable = False
 
     return {
-        "resolvable": resolvable,
+        "resolvable": resolvable and not persistence_degraded,
+        "persistence_degraded": persistence_degraded,
         "has_conclusion": has_conclusion,
         "has_execution": has_execution,
         "has_request": has_request,
@@ -335,8 +348,8 @@ def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resol
         # C: a resolvable finding's stored blobs are still REDACTED (secrets/
         # session stripped at capture, run_context.TargetTransport._artifact)
         # -- declare that a resolvable recipe is not itself a literal replay.
-        "rehydration_required": resolvable,
-        "rehydration_note": _REHYDRATION_NOTE if resolvable else None,
+        "rehydration_required": resolvable and not persistence_degraded,
+        "rehydration_note": _REHYDRATION_NOTE if resolvable and not persistence_degraded else None,
         "missing": missing,
     }
 
@@ -365,6 +378,7 @@ class EvidenceLedger:
         self._events: list[LedgerEvent] = []
         self._ids: set[str] = set()
         self.max_events = max_events
+        self._persistence_degraded = False
 
     def append(self, event: LedgerEvent) -> LedgerEvent:
         if event.event_id in self._ids:
@@ -408,6 +422,8 @@ class EvidenceLedger:
             return [e.summary for e in by_type.get(t, [])]
 
         executions = by_type.get(EventType.EXECUTION, [])
+        completeness = _assess_completeness(by_type, resolver=resolver,
+                                            persistence_degraded=self._persistence_degraded)
         return {
             "finding_ref": finding_ref,
             "why_tested": summaries(EventType.OBSERVATION) + summaries(EventType.HYPOTHESIS),
@@ -420,12 +436,12 @@ class EvidenceLedger:
             "what_was_never_tested": [e.data["not_tested"] for e in evs if e.data.get("not_tested")],
             "event_count": len(evs),
             "provenance": evs[0].provenance.to_dict() if evs else {},
-            # `complete` = a verdict (confirmed/refuted/revised) was reached. This is
-            # the "was it concluded?" axis and is deliberately SEPARATE from whether
-            # a tester can independently reproduce it -- see `completeness` (P0-6/R10).
+            # A verdict is still separately reported as has_conclusion. A
+            # known durable-write loss must not advertise complete evidence.
             "complete": bool(by_type.get(EventType.VALIDATION_DECISION)
-                             or by_type.get(EventType.FINDING_REVISION)),
-            "completeness": _assess_completeness(by_type, resolver=resolver),
+                             or by_type.get(EventType.FINDING_REVISION))
+                        and not completeness["persistence_degraded"],
+            "completeness": completeness,
         }
 
     def reproduction_recipe(self, finding_ref: str) -> dict:
@@ -489,13 +505,22 @@ class EvidenceLedger:
         # `reconstruct(...)["completeness"]["resolvable"]` for the same
         # finding, and it now agrees with the per-step `replayable` flags
         # above too (both require one execution's own pair to resolve).
-        resolvable = _resolvable_execution(executions) is not None
+        degraded = self.reconstruct(finding_ref)["completeness"]["persistence_degraded"]
+        resolvable = _resolvable_execution(executions) is not None and not degraded
+        if degraded:
+            for step in steps:
+                step["replayable"] = False
+                step.pop("rehydration_required", None)
+                step.pop("rehydration_note", None)
+                step["note"] = "ledger persistence failed; durable evidence is incomplete"
 
         return {
             "finding_ref": finding_ref,
             "code_version": prov.code_version,
             "config_fingerprint": prov.config_fingerprint,
             "evidence_schema_version": prov.evidence_schema_version,
+            "source_identity": prov.source_identity,
+            "persistence_degraded": degraded,
             "resolvable": resolvable,
             "rehydration_required": resolvable,
             "rehydration_note": _REHYDRATION_NOTE if resolvable else None,
@@ -514,9 +539,8 @@ class EvidenceLedger:
 # emits onto, plus a persistence bridge to store.py so the stream survives a
 # process restart and the findings API / report can reconstruct a finding
 # without needing the in-memory singleton. INSTRUMENTATION ONLY: emit()
-# never raises into and never returns anything a caller branches on -- a
-# store failure is swallowed (logged) so a persistence hiccup can never
-# affect a finding's verdict, severity, or the send it is recording.
+# store failure is recorded as degraded evidence and a sanitized warning;
+# the finding's verdict/severity and any producer decision remain unchanged.
 # ---------------------------------------------------------------------------
 
 import logging as _logging
@@ -524,6 +548,18 @@ import logging as _logging
 _log = _logging.getLogger("harness.evidence_ledger")
 
 _DEFAULT_LEDGER = EvidenceLedger(max_events=DEFAULT_MAX_EVENTS)
+_PERSISTENCE_FAILURES = 0
+
+
+def evidence_write_status() -> dict:
+    """Sticky bounded process status; no finding identifiers or exception text.
+
+    A total storage outage cannot durably record its own failure. This status
+    survives ledger eviction/reset, but requires external monitoring to survive
+    process loss when even the failure marker could not be stored.
+    """
+    return {"persistence_degraded": bool(_PERSISTENCE_FAILURES),
+            "failure_count": _PERSISTENCE_FAILURES, "lifetime": "process"}
 
 
 def get_default_ledger() -> EvidenceLedger:
@@ -555,16 +591,33 @@ def emit(event_type, finding_ref: str, summary: str, *, data: dict | None = None
     confirmation, the suppression gate) calls through; it is read/record-only
     and never influences the caller's own decision.
     """
+    global _PERSISTENCE_FAILURES
     if not finding_ref:
         return None
     led = ledger if ledger is not None else _DEFAULT_LEDGER
-    ev = led.record(event_type, finding_ref, summary, data=data,
-                    provenance=provenance, case_ref=case_ref)
+    payload = dict(data or {})
+    if _PERSISTENCE_FAILURES:
+        payload["ledger_persistence_degraded"] = True
+    ev = led.record(event_type, finding_ref, summary, data=payload,
+                    provenance=provenance or Provenance.capture(), case_ref=case_ref)
     try:
         from harness import store
         store.persist_ledger_event(ev.to_dict())
-    except Exception as e:  # persistence is best-effort; never break the live pipeline
-        _log.debug("failed to persist ledger event %s for %s: %s", event_type, finding_ref, e)
+    except Exception as e:  # never change a passive verdict on a storage failure
+        _PERSISTENCE_FAILURES += 1
+        _log.warning("evidence persistence failed (%s); durable evidence incomplete", type(e).__name__)
+        led._persistence_degraded = True
+        # Each lost event needs its own best-effort durable marker. A marker
+        # attached only to the first failed finding cannot protect another
+        # finding after process loss clears the process-wide status. The
+        # existing FIFO cap bounds memory even during a sustained outage.
+        marker = led.record(EventType.PERSISTENCE_FAILURE, finding_ref,
+                            "Durable evidence incomplete: ledger write failed",
+                            data={"failure_type": type(e).__name__}, provenance=ev.provenance)
+        try:
+            store.persist_ledger_event(marker.to_dict())
+        except Exception:
+            pass
     return ev
 
 
@@ -582,6 +635,7 @@ def _ledger_from_rows(finding_ref: str, rows: "list[dict]") -> EvidenceLedger:
     only a memory guard on the long-lived in-memory singleton, not on a
     fresh per-finding replay."""
     led = EvidenceLedger(max_events=0)
+    led._persistence_degraded = bool(_PERSISTENCE_FAILURES)
     for row in rows:
         try:
             prov = Provenance(**row.get("provenance", {}))
@@ -598,7 +652,8 @@ def _ledger_from_rows(finding_ref: str, rows: "list[dict]") -> EvidenceLedger:
     return led
 
 
-def ledger_from_store(finding_ref: str) -> EvidenceLedger:
+def ledger_from_store(finding_ref: str, *, engagement_id: str | None = None,
+                       captured_principal: str | None = None) -> EvidenceLedger:
     """Replay this finding's persisted events (store.py) into a fresh ledger.
 
     Lets the findings API / report reconstruct a finding independent of the
@@ -607,19 +662,25 @@ def ledger_from_store(finding_ref: str) -> EvidenceLedger:
     of whatever events a ledger holds."""
     try:
         from harness import store
-        rows = store.ledger_events_for(finding_ref)
+        ownership = {"engagement_id": engagement_id} if engagement_id is not None else {}
+        if captured_principal is not None:
+            ownership["captured_principal"] = captured_principal
+        rows = store.ledger_events_for(finding_ref, **ownership)
     except Exception as e:
         _log.debug("failed to load persisted ledger events for %s: %s", finding_ref, e)
         return EvidenceLedger(max_events=0)
     return _ledger_from_rows(finding_ref, rows)
 
 
-def reconstruct_persisted(finding_ref: str) -> dict:
+def reconstruct_persisted(finding_ref: str, *, engagement_id: str | None = None,
+                           captured_principal: str | None = None) -> dict:
     """reconstruct(), reading from the durable store instead of memory."""
-    return ledger_from_store(finding_ref).reconstruct(finding_ref)
+    return ledger_from_store(finding_ref, engagement_id=engagement_id,
+                             captured_principal=captured_principal).reconstruct(finding_ref)
 
 
-def reconstruct_persisted_many(finding_refs: "list[str]") -> "dict[str, dict]":
+def reconstruct_persisted_many(finding_refs: "list[str]", *, engagement_id: str | None = None,
+                               captured_principal: str | None = None) -> "dict[str, dict]":
     """Batched form of reconstruct_persisted (RA-4 perf fix).
 
     The report generator used to call reconstruct_persisted(ref) once PER
@@ -650,7 +711,10 @@ def reconstruct_persisted_many(finding_refs: "list[str]") -> "dict[str, dict]":
     except Exception:
         return {}
     try:
-        events_by_ref = store.ledger_events_for_many(refs)
+        ownership = {"engagement_id": engagement_id} if engagement_id is not None else {}
+        if captured_principal is not None:
+            ownership["captured_principal"] = captured_principal
+        events_by_ref = store.ledger_events_for_many(refs, **ownership)
     except Exception as e:
         _log.debug("failed to batch-load persisted ledger events for %d ref(s): %s", len(refs), e)
         return {}
@@ -691,6 +755,8 @@ def reconstruct_persisted_many(finding_refs: "list[str]") -> "dict[str, dict]":
             shared_conn.close()
 
 
-def reproduction_recipe_persisted(finding_ref: str) -> dict:
+def reproduction_recipe_persisted(finding_ref: str, *, engagement_id: str | None = None,
+                                  captured_principal: str | None = None) -> dict:
     """reproduction_recipe(), reading from the durable store instead of memory."""
-    return ledger_from_store(finding_ref).reproduction_recipe(finding_ref)
+    return ledger_from_store(finding_ref, engagement_id=engagement_id,
+                             captured_principal=captured_principal).reproduction_recipe(finding_ref)

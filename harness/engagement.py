@@ -45,7 +45,7 @@ _TIER_W = {"critical": 1.0, "high": 0.75, "medium": 0.5, "low": 0.25, "info": 0.
 _PRIVILEGED = re.compile(
     r"/(admin|administrator|manage|management|config|configuration|settings|internal|debug|"
     r"actuator|console|dashboard|billing|payment|invoice|account|users?|profile|report|export|"
-    r"backup|token|secret|key|password|role|permission|privilege)(s)?(/|$)",
+    r"backup|token|secret|key|password|role|permission|privilege)(s)?(?:[-_/]|$)",
     re.IGNORECASE,
 )
 

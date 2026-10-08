@@ -55,8 +55,10 @@ import dataclasses
 import json
 import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -66,11 +68,16 @@ BLIND_DIR = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# --- Defaults for the live CLI path (unchanged from the pre-refactor script) -
+# --- Defaults for the live CLI path ------------------------------------------
+# Cross-platform scratch paths. Previously hardcoded to C:\tmp\... (Windows
+# only), which broke this driver on macOS/Linux; default to the OS temp dir and
+# allow env overrides (BLIND_EVAL_STATE_DB / BLIND_EVAL_CACHE_DB /
+# BLIND_EVAL_OUT). Each CLI flag below still overrides these too.
+_TMP = Path(tempfile.gettempdir())
 DEFAULT_EXCHANGES_PATH = BLIND_DIR / "blind_eval_exchanges.json"
-DEFAULT_STATE_DB = r"C:\tmp\blind_eval_state.db"
-DEFAULT_CACHE_DB = r"C:\tmp\blind_eval_cache.db"
-DEFAULT_OUT_PATH = r"C:\tmp\blind_eval_results.json"
+DEFAULT_STATE_DB = os.environ.get("BLIND_EVAL_STATE_DB", str(_TMP / "blind_eval_state.db"))
+DEFAULT_CACHE_DB = os.environ.get("BLIND_EVAL_CACHE_DB", str(_TMP / "blind_eval_cache.db"))
+DEFAULT_OUT_PATH = os.environ.get("BLIND_EVAL_OUT", str(_TMP / "blind_eval_results.json"))
 
 # Ground-truth labels (case-insensitive) treated as negative controls for
 # the controls_clean metric -- an exchange whose own findings leave a
@@ -249,6 +256,7 @@ def build_scorecard(
     cross_identity_reject: bool = False,
     gate_low_confidence_generic: bool = False,
     generic_confidence_floor: float = 0.5,
+    generated_at: datetime | None = None,
 ) -> dict:
     from harness import store
     from harness.report_generator import generate_markdown_report
@@ -267,7 +275,7 @@ def build_scorecard(
         stored = store.all_host_findings(host)
         all_stored.extend(stored)
         markdown_reports[host] = generate_markdown_report(
-            host, stored, quarantine_leads=quarantine_leads,
+            host, stored, generated_at=generated_at, quarantine_leads=quarantine_leads,
             gate_low_confidence_generic=gate_low_confidence_generic,
             generic_confidence_floor=generic_confidence_floor,
         )
@@ -508,6 +516,7 @@ def run_once(
     orchestrator_factory: Callable[[dict], Any] = default_orchestrator_factory,
     force_agents: list[str] | None = None,
     on_result: Callable[[ExchangeOutcome], None] | None = None,
+    generated_at: datetime | None = None,
 ) -> dict:
     """One complete eval pass against fresh state+cache DBs: build (or
     receive) an orchestrator, run every exchange, then build the scorecard
@@ -548,6 +557,7 @@ def run_once(
         cross_identity_reject=cross_identity_reject,
         gate_low_confidence_generic=bool(reporting_cfg.get("gate_low_confidence_generic", False)),
         generic_confidence_floor=float(reporting_cfg.get("generic_confidence_floor", 0.5)),
+        generated_at=generated_at,
     )
 
 

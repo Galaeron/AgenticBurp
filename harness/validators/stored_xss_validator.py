@@ -113,6 +113,123 @@ class StoredXssValidator(Validator):
         pairs = [(k, payload) for k, _ in parse_qsl(body, keep_blank_values=True)]
         return urlencode(pairs), "application/x-www-form-urlencoded"
 
+    def _source_page_candidates(self, exchange: HttpExchange) -> list[str]:
+        """Where the CSRF-bearing form that targets this write endpoint is most
+        likely rendered, so the plant can mint a FRESH token bound to its own
+        session (the captured token is bound to the crawl's session and a fresh
+        client would be told 'session does not contain a CSRF token'). Generic,
+        not lab-shaped: the Referer, then the parent resource carrying each
+        id-shaped body param (e.g. POST /post/comment + body postId=1 ->
+        GET /post?postId=1), then the bare parent."""
+        parts = urlsplit(exchange.url)
+        base = f"{parts.scheme}://{parts.netloc}"
+        cands: list[str] = []
+        for k, v in (exchange.request_headers or {}).items():
+            if (k or "").lower() == "referer" and v:
+                cands.append(v)
+        segs = [s for s in parts.path.split("/") if s]
+        parent = "/" + "/".join(segs[:-1]) if len(segs) >= 1 else "/"
+        from urllib.parse import parse_qsl
+        for k, val in parse_qsl(exchange.request_body or "", keep_blank_values=True):
+            low = (k or "").lower()
+            if val and (low == "id" or low.endswith("id")):
+                cands.append(f"{base}{parent}?{k}={val}")
+        cands.append(f"{base}{parent}")
+        seen, out = set(), []
+        for u in cands:
+            if u and u not in seen:
+                seen.add(u); out.append(u)
+        return out
+
+    def _form_plant_body(self, form, payload: str) -> str:
+        """Build the write body from a FRESH form: keep structural/typed fields
+        valid (hidden tokens + ids at their server value, email valid, URL fields
+        a real URL) and inject the payload only into free-text sinks, so the write
+        is accepted (a 400 stores nothing) yet the payload still reaches an HTML
+        sink. Overwriting every field -- including csrf/id/email -- guarantees a
+        rejected write, which is why the naive plant never confirmed."""
+        from urllib.parse import urlencode
+        pairs, planted = [], False
+        for fld in getattr(form, "fields", []) or []:
+            name = fld.name or ""
+            if not name:
+                continue
+            t = (fld.type or "text").lower()
+            low = name.lower()
+            if t in ("hidden", "submit", "button", "checkbox", "radio"):
+                pairs.append((name, fld.value or ""))
+            elif t == "email" or "email" in low:
+                v = fld.value if (fld.value and "@" in fld.value) else "prober@example.com"
+                pairs.append((name, v))
+            elif t == "url" or any(x in low for x in ("website", "url", "link", "homepage")):
+                pairs.append((name, "http://example.com/"))
+            elif t in ("text", "search", "textarea", ""):
+                pairs.append((name, payload)); planted = True
+            else:
+                pairs.append((name, fld.value or ""))
+        if not planted:
+            # No obvious text sink: force the payload into the first non-structural
+            # field so the write still carries it somewhere renderable.
+            for i, (name, _val) in enumerate(pairs):
+                low = name.lower()
+                if not any(x in low for x in ("csrf", "token", "email")) and not low.endswith("id"):
+                    pairs[i] = (name, payload); planted = True
+                    break
+        return urlencode(pairs)
+
+    async def _plant_via_source_form(self, exchange: HttpExchange, gate, headers: dict,
+                                     method: str, render_urls: list[str]):
+        """Session-aware plant: GET the source page in THIS client's session to
+        obtain a fresh CSRF-bound form, plant into it, then read it back. Returns
+        a ValidationResult when a matching source form was found (confirmed or
+        not), or None to let the caller fall back to the captured-body plant."""
+        from harness.validators.source_form import fetch_source_form
+        action_path = urlsplit(exchange.url).path
+        read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+
+        def select(forms):
+            return next((f for f in forms
+                        if urlsplit(f.action).path == action_path
+                        and (f.method or "POST").upper() == method), None)
+
+        try:
+            async with GatedAsyncClient(gate, self.name, timeout=self.timeout,
+                                        follow_redirects=False, verify=False) as client:
+                found = await fetch_source_form(client, self._source_page_candidates(exchange),
+                                                read_headers, select)
+                if found is None:
+                    return None  # no discoverable source form -> caller falls back
+                fresh, source_url = found.form, found.source_url
+                for payload in _payloads(secrets.token_hex(6)):
+                    plant_body = self._form_plant_body(fresh, payload)
+                    planted_headers = dict(headers)
+                    planted_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                    await global_throttle.acquire()
+                    await client.request(method, fresh.action, headers=planted_headers, content=plant_body)
+                    for rurl in [source_url, *render_urls]:
+                        await global_throttle.acquire()
+                        rr = await client.request("GET", rurl, headers=read_headers or None)
+                        if ("html" in (rr.headers.get("content-type") or "").lower()
+                                and payload in (rr.text or "")):
+                            browser_note = await self._browser_confirm(rurl)
+                            conf = 0.95 if browser_note else 0.85
+                            return ValidationResult(
+                                self.name, "confirmed", "xss", confidence=conf, confirmed=True,
+                                summary=f"Stored XSS confirmed: a payload written via {method} {action_path} "
+                                        f"is reflected UNESCAPED in the HTML of {urlsplit(rurl).path} on an independent read.",
+                                evidence=(f"Planted {payload!r} through a fresh CSRF-bound form from {source_url}; "
+                                          f"an independent GET of {rurl} returned it intact (angle brackets + handler) "
+                                          f"in a text/html response -- stored, not just reflected. {browser_note}").strip())
+                return ValidationResult(
+                    self.name, "not_confirmed", "xss", confidence=0.0, confirmed=False,
+                    summary="No stored XSS: planted payloads were not reflected unescaped in an HTML render",
+                    evidence=(f"Submitted a fresh CSRF-bound form at {action_path} and re-read the "
+                              f"rendered page; the payload never returned unescaped in a text/html response."))
+        except SafetyGateBlocked:
+            return self._skip("mutating stored-XSS plant not authorized (validators.allow_mutating_replay)")
+        except httpx.HTTPError:
+            return None
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and host not in self.allowed_hosts:
@@ -125,6 +242,16 @@ class StoredXssValidator(Validator):
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("content-length", "host")}
         render_urls = self._render_urls(exchange.url)
+
+        # Form (urlencoded) writes are commonly CSRF-token-bound: the captured
+        # token belongs to the crawl's session, so a fresh client is rejected
+        # ("session does not contain a CSRF token"). Mint a fresh token in THIS
+        # session from the source page first; only fall back to replaying the
+        # captured body when no source form is discoverable (e.g. a JSON API).
+        if self._json_object(exchange.request_body or "") is None and "=" in (exchange.request_body or ""):
+            via_source = await self._plant_via_source_form(exchange, gate, headers, method, render_urls)
+            if via_source is not None:
+                return via_source
 
         for payload in _payloads(secrets.token_hex(6)):
             body, ctype = self._plant_body(exchange, payload)

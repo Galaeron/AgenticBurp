@@ -161,7 +161,7 @@ class TestOrchestratorConcurrencyCaller(unittest.TestCase):
         peak = 0
         calls = 0
 
-        async def inert_agent(name, exchange, max_body_chars, prior_context):
+        async def inert_agent(name, exchange, max_body_chars, prior_context, effort_budget=None):
             nonlocal in_flight, peak, calls
             calls += 1
             in_flight += 1

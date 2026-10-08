@@ -19,14 +19,38 @@ therefore tests the SAME target the host means by localhost, transparently.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
-# Resolve the docker CLI: PATH first, then the Docker Desktop default location so
-# this works from a shell whose PATH doesn't include it.
-DOCKER = shutil.which("docker") or r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"
+
+def _resolve_docker() -> str:
+    """Resolve the docker CLI cross-platform: PATH first, then the OS-specific
+    default install location so this works from a shell whose PATH doesn't
+    include it (previously this hardcoded the Windows Docker Desktop path, which
+    does not exist on macOS/Linux). Falls back to the bare name "docker" so
+    available() reports a clear "not found" rather than importing a Windows path
+    on every platform."""
+    found = shutil.which("docker")
+    if found:
+        return found
+    if sys.platform == "win32":
+        candidates = [r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"]
+    elif sys.platform == "darwin":
+        candidates = ["/usr/local/bin/docker", "/opt/homebrew/bin/docker",
+                      os.path.expanduser("~/.docker/bin/docker")]
+    else:
+        candidates = ["/usr/bin/docker", "/usr/local/bin/docker", "/snap/bin/docker"]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return "docker"
+
+
+DOCKER = _resolve_docker()
 
 _LOOPBACK = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
 _HOST_ALIAS = "host.docker.internal"

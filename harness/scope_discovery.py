@@ -29,7 +29,6 @@ on this whole exchange indicate a scope change," which needs to look
 across all of an exchange's findings at once.
 """
 from __future__ import annotations
-import ipaddress
 import logging
 from urllib.parse import urlparse
 
@@ -37,56 +36,16 @@ import httpx
 
 from harness.categories import canonicalize
 from harness.models import Finding, HttpExchange
+from harness.scope_lock import scope_matches
 
 log = logging.getLogger("harness.scope_discovery")
-
-_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
-
-
-def _parse_allow_entry(entry: str):
-    """Parse one allowed_hosts entry into (scheme, host, port, network).
-
-    Supported, all backward compatible with the historical bare-host form:
-      host                     -> host (and its subdomains), any scheme/port
-      host:port                -> only that port
-      scheme://host[:port]     -> also constrain the scheme
-      1.2.3.4  or  10.0.0.0/24 -> single IP / CIDR network match
-
-    Any field left None is an unconstrained wildcard for that dimension, so a
-    plain "example.com" behaves exactly as before (matches every port/scheme).
-    """
-    entry = (entry or "").strip().lower()
-    if not entry:
-        return (None, None, None, None)
-    scheme = None
-    if "://" in entry:
-        scheme, entry = entry.split("://", 1)
-        scheme = scheme or None
-    # CIDR / bare-IP network first: a CIDR's '/' would otherwise be mistaken for
-    # a path separator below.
-    try:
-        return (scheme, None, None, ipaddress.ip_network(entry, strict=False))
-    except ValueError:
-        pass
-    entry = entry.split("/", 1)[0]  # drop any path
-    port = None
-    host = entry
-    if entry.count(":") == 1:  # host:port (bare IPv6 literals are not a scope form)
-        maybe_host, maybe_port = entry.rsplit(":", 1)
-        if maybe_port.isdigit():
-            host, port = maybe_host, int(maybe_port)
-    host = host.lstrip("*.")
-    return (scheme, host or None, port, None)
-
 
 def is_host_allowed(url: str, allowed_hosts: list[str], *, active_mode: bool = False) -> bool:
     """Decide whether `url`'s host is within the configured engagement scope.
 
-    Matching understands scheme + host + port + CIDR (see _parse_allow_entry),
-    while a bare "example.com" entry keeps its historical meaning: that host and
-    its subdomains on any scheme/port. Extracted so it can be applied per-URL,
-    not just once at analyze()'s entry -- nothing otherwise re-checked a URL a
-    validator or discovery feature constructs after that single check.
+    Uses the conservative intersection shared by transport and gate: exact
+    hosts/literal addresses only. Extended forms remain parseable but grant no
+    caller authority. See docs/SCOPE_POLICY.md for migration and limitations.
 
     Empty `allowed_hosts` means "no application-level scope configured". In
     PASSIVE mode that fails open (historical behavior -- passive analysis sends
@@ -95,36 +54,7 @@ def is_host_allowed(url: str, allowed_hosts: list[str], *, active_mode: bool = F
     never happen by default. Passive callers omit `active_mode`, so their
     behavior is unchanged.
     """
-    if not allowed_hosts:
-        return not active_mode
-    parsed = urlparse(url)
-    hostname = (parsed.hostname or "").lower()
-    if not hostname:
-        return False
-    url_port = parsed.port
-    url_scheme = (parsed.scheme or "").lower()
-    try:
-        url_ip = ipaddress.ip_address(hostname)
-    except ValueError:
-        url_ip = None
-    for entry in allowed_hosts:
-        scheme, host, port, network = _parse_allow_entry(entry)
-        if scheme and url_scheme and scheme != url_scheme:
-            continue
-        if network is not None:
-            if url_ip is not None and url_ip in network:
-                return True
-            continue
-        if not host:
-            continue
-        if not (hostname == host or hostname.endswith("." + host)):
-            continue
-        if port is not None:
-            effective = url_port if url_port is not None else _DEFAULT_PORTS.get(url_scheme)
-            if effective != port:
-                continue
-        return True
-    return False
+    return scope_matches(url, allowed_hosts, allow_unset=not active_mode)
 
 
 def _should_trigger(findings: list[Finding], trigger_categories: list[str]) -> bool:
@@ -163,6 +93,10 @@ async def discover_from_scope_change(
     missing config section) is allowed to surface as an exception.
     """
     discovery_cfg = config.get("autonomous_discovery", {})
+    from harness.target_request_policy import TargetRequestPolicy
+    target_policy = TargetRequestPolicy.from_config(config)
+    if target_policy.captured_only:
+        return []
     if not discovery_cfg.get("enabled", False):
         return []
 
@@ -191,6 +125,8 @@ async def discover_from_scope_change(
                 log.warning(
                     "scope_discovery: skipping %s -- outside server.allowed_hosts scope", candidate_url
                 )
+                continue
+            if target_policy.denial_reason(candidate_url):
                 continue
             try:
                 if run_context is not None:

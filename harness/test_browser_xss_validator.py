@@ -2,6 +2,7 @@
 import asyncio
 import re
 import unittest
+from urllib.parse import unquote
 
 from harness import global_throttle
 from harness import browser_driver
@@ -87,6 +88,12 @@ class BrowserXssValidatorTests(unittest.TestCase):
         r = self._validate(_VulnDriver("dialogs"))
         self.assertEqual(r.status, "confirmed")
         self.assertIn("dialog", r.evidence)
+
+    def test_first_payload_uses_dialog_for_external_completion_oracle(self):
+        driver = _SafeDriver()
+        self._validate(driver, max_visits=1)
+        self.assertEqual(len(driver.visited), 1)
+        self.assertIn("<script>alert('", unquote(driver.visited[0]))
 
     def test_not_confirmed_when_nothing_executes(self):
         r = self._validate(_SafeDriver())

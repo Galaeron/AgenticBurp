@@ -856,7 +856,7 @@ class WipeEngagementTests(unittest.TestCase):
         # The returned dict reports non-zero counts for every table this
         # seed actually populated.
         for table in ("findings", "ledger_events", "evidence_blobs",
-                      "proof_records", "finding_observations", "engagement_state"):
+                      "proof_records", "finding_observations", "scoped_engagement_state"):
             self.assertGreater(counts[table], 0, f"expected {table} to report rows deleted")
 
     def test_other_host_survives_untouched(self):

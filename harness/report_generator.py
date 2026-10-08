@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from harness import risk_allocator
+from harness import risk_allocator, security
 from harness.effort import CallKind, EffortLedger
 from harness.engagement import normalize_path
 from harness.categories import canonicalize
@@ -141,12 +141,17 @@ class ReportFinding:
     # reader at the full request/response/why-concluded reconstruction for
     # this exact finding instead of only the summarized evidence above.
     finding_id: str = ""
+    evidence_maturity: str = "unverified"
+    triage_priority: str = "manual_verification"
+    impact_severity: str = "info"
+    captured_principal_id: str = ""
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
     from harness import issues
     from harness.confirmation_gate import leg_tier
     vc = d.get("vulnerability_class", "")
+    from harness.confirmation_gate import finding_triage
     return ReportFinding(
         url=d.get("url", ""),
         vulnerability_class=vc,
@@ -173,6 +178,8 @@ def _from_store_dict(d: dict) -> ReportFinding:
         verification_state=__import__("harness.oracle_framework",
                       fromlist=["derive_verification_state"]).derive_verification_state(d),
         finding_id=d.get("finding_id", "") or "",
+        captured_principal_id=d.get("captured_principal_id", "") or "",
+        **finding_triage(d),
     )
 
 
@@ -298,7 +305,7 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
     groups: dict[tuple[str, str], "ReportFinding"] = {}
     order: list[tuple[str, str]] = []
     for f in findings:
-        k = _dedup_key(f)
+        k = (_dedup_key(f), f.captured_principal_id)
         cur = groups.get(k)
         if cur is None:
             f.duplicate_count = 1
@@ -318,7 +325,9 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                               quarantine_leads: bool = False,
                               gate_low_confidence_generic: bool = False,
                               generic_confidence_floor: float = 0.5,
-                              gate_uncorroborated_catchall: bool = False) -> str:
+                              gate_uncorroborated_catchall: bool = False,
+                              engagement_id: str | None = None,
+                              captured_principal: str | None = None) -> str:
     """
     Build a submission-ready Markdown report from store.all_host_findings()
     -shaped dicts (or anything with the same keys). Chain hypotheses
@@ -421,13 +430,21 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     _recon_targets = confirmed + unconfirmed + leads_bucket
     _recon_finding_ids = [f.finding_id for f in _recon_targets if f.finding_id]
     try:
-        recon_map = evidence_ledger.reconstruct_persisted_many(_recon_finding_ids)
+        ownership = {"engagement_id": engagement_id} if engagement_id is not None else {}
+        if captured_principal is not None:
+            ownership["captured_principal"] = captured_principal
+        recon_map = evidence_ledger.reconstruct_persisted_many(_recon_finding_ids, **ownership)
     except Exception:
         # Best-effort, same as the per-finding lookup this replaces: a total
         # batch failure degrades to an empty map, and _render_finding's own
         # per-finding fallback (see below) still reconstructs each finding
         # individually rather than losing the evidence-chain line entirely.
         recon_map = {}
+    if engagement_id is not None:
+        # Failed/missing scoped reconstruction may never fall back to an
+        # unfiltered lookup when rendering a shared deterministic finding id.
+        for ref in _recon_finding_ids:
+            recon_map.setdefault(ref, {})
 
     lines: list[str] = []
     lines.append(f"# Security Findings Report -- {host}")
@@ -539,7 +556,8 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
         lines.append("_No findings recorded for this host._")
         lines.append("")
 
-    return "\n".join(lines)
+    # Include metadata/headlines and chain sections in the shared export policy.
+    return security.sanitize_text("\n".join(lines))
 
 
 _STATE_BADGE = {
@@ -584,11 +602,19 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
                  f"&nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)} "
                  f"&nbsp;|&nbsp; **Confidence:** {f.confidence:.2f} ({_confidence_label(f.confidence)}) "
                  f"&nbsp;|&nbsp; **Basis:** {f.basis}")
+    lines.append(f"**Evidence maturity:** {f.evidence_maturity} &nbsp;|&nbsp; "
+                 f"**Triage priority:** {f.triage_priority} &nbsp;|&nbsp; "
+                 f"**Impact severity:** {f.impact_severity}")
+    if f.evidence_maturity == "unverified_no_leg":
+        lines.append("_Unverified: no deterministic confirmation leg exists for this class. "
+                     "Preserve the captured observation and verify manually; impact and model confidence do not prove it._")
     if f.duplicate_count > 1:
         lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** of this endpoint "
                      f"family (same class, different object id) -- collapsed into this one finding.")
     if f.owasp_category:
         lines.append(f"**OWASP category:** {f.owasp_category}")
+    if f.captured_principal_id:
+        lines.append(f"**Captured auth context:** `{f.captured_principal_id}` (pseudonymous capture label; not verified identity)")
     basis_note = _basis_note(f.basis)
     if basis_note and f.basis != "derived":
         lines.append(f"> ⚠️ {basis_note}")
@@ -668,7 +694,8 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
 
 
 def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None,
-                             *, config: dict | None = None) -> str:
+                             *, config: dict | None = None, engagement_id: str = "",
+                             captured_principal: str | None = None) -> str:
     """
     Convenience entry point: pulls findings from store.py for the given
     host's URL. `effort_ledger`: optional, forwarded to
@@ -688,8 +715,9 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     opt-in never loses recall.
     """
     from harness import store
-    findings = store.all_host_findings(url)  # excludes suppressed, by default
-    all_including_suppressed = store.all_host_findings(url, include_suppressed=True)
+    findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal)
+    all_including_suppressed = store.all_host_findings(url, include_suppressed=True, engagement_id=engagement_id,
+                                                     captured_principal=captured_principal)
     suppressed_count = len(all_including_suppressed) - len(findings)
     host = store.host_of(url)
     reporting = (config or {}).get("reporting") or {}
@@ -699,6 +727,8 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
         gate_low_confidence_generic=bool(reporting.get("gate_low_confidence_generic", False)),
         generic_confidence_floor=float(reporting.get("generic_confidence_floor", 0.5)),
         gate_uncorroborated_catchall=bool(reporting.get("gate_uncorroborated_catchall", False)),
+        engagement_id=engagement_id,
+        captured_principal=captured_principal,
     )
 
 
@@ -752,7 +782,8 @@ def _demoted_by_reporting_gates(finding: dict, reporting: dict) -> bool:
     return False
 
 
-def export_issues_for_host(url: str, *, config: dict | None = None) -> list[dict]:
+def export_issues_for_host(url: str, *, config: dict | None = None, engagement_id: str = "",
+                          captured_principal: str | None = None) -> list[dict]:
     """Convenience: pull a host's findings from store.py and return their T06 issue
     exports, enriched with the FULL append-only proof-attempt history per case
     (store.proofs_for_case) -- so every attempt, including a patched-fixture retest,
@@ -769,7 +800,7 @@ def export_issues_for_host(url: str, *, config: dict | None = None) -> list[dict
     existing caller (export_issues_for_host(url), no config kwarg) is
     byte-for-byte unaffected."""
     from harness import store
-    findings = store.all_host_findings(url)
+    findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal)
     reporting = (config or {}).get("reporting") or {}
     if reporting:
         findings = [f for f in findings if not _demoted_by_reporting_gates(f, reporting)]
@@ -778,7 +809,11 @@ def export_issues_for_host(url: str, *, config: dict | None = None) -> list[dict
         cid = f.get("case_id")
         if cid and cid not in proofs_by_case:
             attempts = store.proofs_for_case(cid)   # every recorded attempt, append-only
+            if engagement_id:
+                owned_runs = {row.get("run_id") for row in findings if row.get("case_id") == cid}
+                attempts = [attempt for attempt in attempts if attempt.get("run_id") in owned_runs]
             if attempts:
                 proofs_by_case[cid] = attempts
-    merges = store.all_issue_merges(store.host_of(url))
+    # Legacy host-wide overrides have no engagement authority.
+    merges = store.all_issue_merges(store.host_of(url)) if not engagement_id else {}
     return issue_exports(findings, proofs_by_case=proofs_by_case, merges=merges)

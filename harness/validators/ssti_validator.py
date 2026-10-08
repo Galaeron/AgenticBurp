@@ -44,6 +44,7 @@ _EXPR = f"{_A}*{_B}"
 # Velocity, Thymeleaf/Ruby, a nested variant, ERB/JSP scriptlet, single-brace.
 _SYNTAXES = ("{{%s}}", "${%s}", "#{%s}", "${{%s}}", "<%%= %s %%>", "{%s}")
 _MAX_PARAMS = 6
+_MAX_READBACKS = 12
 
 
 def _payloads(nonce: str) -> list[str]:
@@ -56,9 +57,15 @@ class SstiValidator(Validator):
                        "server side template injection"}
     active = True
 
-    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0):
+    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
+                 run_context=None, readback_urls: list[str] | None = None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        self.run_context = run_context
+        # Already-discovered, same-origin GET pages that may render a value saved
+        # by a separate settings/editor request.  The orchestrator supplies these;
+        # the validator never invents routes or crosses origin boundaries.
+        self.readback_urls = list(dict.fromkeys(readback_urls or []))[:_MAX_READBACKS]
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         return super().applies(finding, exchange) and bool(param_targets(exchange))
@@ -75,32 +82,113 @@ class SstiValidator(Validator):
             return self._skip("no parameter to inject a template expression into")
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
+        session_ref = None
+        request_headers = headers
+        if self.run_context is not None:
+            from .transport import bind_session
+            session_ref, request_headers = bind_session(self.run_context, headers)
+        async def _send(send_method: str, send_url: str, *, send_body=None,
+                        send_headers=None, redirects=0):
+            if self.run_context is not None:
+                from harness.run_context import TypedRequest
+                return await self.run_context.executor().execute(
+                    TypedRequest(send_method, send_url, headers=send_headers or {}, body=send_body),
+                    capability=self.name, session_ref=session_ref,
+                    case_ref=finding.finding_id or "", max_redirects=redirects)
+            await global_throttle.acquire()
+            async with GatedAsyncClient(get_default_gate(), self.name,
+                                        timeout=self.timeout, follow_redirects=False,
+                                        verify=False) as client:
+                resp = await client.request(send_method, send_url,
+                                            headers=send_headers or None,
+                                            content=send_body)
+            class _Outcome:
+                executed = True
+                ok = True
+                outcome = "ok"
+                body = resp.text
+            return _Outcome()
+
+        # A stored template setting can be written at one endpoint and evaluated
+        # only when a different page renders.  Establish a negative control before
+        # changing state, then require the product to appear on the same page after
+        # the write.  Credential binding and scope checks remain in RunContext.
+        readbacks = []
+        if self.run_context is not None and method in ("POST", "PUT", "PATCH"):
+            origin = f"{urlsplit(exchange.url).scheme}://{urlsplit(exchange.url).netloc}"
+            readbacks = [u for u in self.readback_urls
+                         if u.startswith(origin + "/") and u != exchange.url][:_MAX_READBACKS]
+        baseline_product = {}
+        for read_url in readbacks:
+            out = await _send("GET", read_url, send_headers=request_headers, redirects=2)
+            if out.ok:
+                baseline_product[read_url] = _PRODUCT in (out.body or "")
+
+        async def _restore_original():
+            if not readbacks:
+                return
+            try:
+                await _send(method, exchange.url,
+                            send_body=exchange.request_body or None,
+                            send_headers=request_headers, redirects=2)
+            except (SafetyGateBlocked, httpx.HTTPError):
+                pass
+
         for loc, param in targets:
-            for payload in _payloads(secrets.token_hex(3)):
+            payloads = _payloads(secrets.token_hex(3))
+            # Some preference fields hold an expression fragment (for example
+            # `user.name`) that the server later places inside its own template
+            # delimiters.  A plain arithmetic expression is the correct benign
+            # probe for that shape; the baseline read above supplies its nonce-like
+            # collision control.
+            contextual = any(token in param.lower() for token in
+                             ("template", "display", "format", "expression", "view"))
+            if contextual and readbacks:
+                payloads.insert(0, _EXPR)
+            for payload in payloads:
                 nonce = payload[:6]
                 evaluated = f"{nonce}{_PRODUCT}{nonce}"
                 url, body = mutate(exchange, loc, param, payload)
                 try:
-                    await global_throttle.acquire()
-                    async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
-                                                follow_redirects=False, verify=False) as client:
-                        resp = await client.request(method, url, headers=headers or None, content=body or None)
+                    outcome = await _send(method, url, send_body=body or None,
+                                          send_headers=request_headers, redirects=2)
+                    if not outcome.executed:
+                        return self._skip(f"SSTI replay declined: {outcome.outcome}")
+                    if not outcome.ok:
+                        continue
+                    text = outcome.body or ""
                 except SafetyGateBlocked:
                     return self._skip("mutating SSTI replay not authorized "
                                       "(set validators.allow_mutating_replay)")
                 except httpx.HTTPError:
                     continue
-                try:
-                    text = resp.text
-                except Exception:
-                    continue
                 if evaluated in text:
+                    await _restore_original()
                     return ValidationResult(
                         self.name, "confirmed", "ssti", confidence=0.95, confirmed=True,
                         summary=f"SSTI confirmed: a template expression in the {loc} parameter {param!r} "
                                 f"was evaluated server-side.",
                         evidence=f"Injected `{payload}`; the response contained the evaluated product "
                                  f"`{evaluated}` (not the literal `{_EXPR}`), proving template evaluation.")
+                if payload == _EXPR and readbacks:
+                    for read_url in readbacks:
+                        rendered = await _send("GET", read_url,
+                                               send_headers=request_headers, redirects=2)
+                        if (rendered.ok and not baseline_product.get(read_url, False)
+                                and _PRODUCT in (rendered.body or "")):
+                            # Restore the captured setting before returning.  A
+                            # failed restoration does not erase the proof, but the
+                            # attempt still travels through the same safety gate.
+                            await _restore_original()
+                            return ValidationResult(
+                                self.name, "confirmed", "ssti", confidence=0.95,
+                                confirmed=True,
+                                summary=(f"Stored SSTI confirmed: the {loc} parameter {param!r} "
+                                         "was evaluated on a separate rendered page."),
+                                evidence=(f"Baseline `{read_url}` lacked `{_PRODUCT}`; after saving "
+                                          f"`{_EXPR}`, the rendered page contained `{_PRODUCT}`. "
+                                          "The original captured setting was replayed afterward."))
+                await _restore_original()
         return ValidationResult(
             self.name, "not_confirmed", "ssti", confidence=0.0, confirmed=False,
             summary="No template expression was evaluated -- parameters are reflected literally, if at all",

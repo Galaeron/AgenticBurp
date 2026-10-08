@@ -2,9 +2,9 @@
 Unit tests for the PR-10 / R01 browser interception policy.
 
 `browser_driver.evaluate_browser_request` and `browser_driver.is_cancelled` are
-pure, stdlib-only functions -- no Playwright import anywhere in this module or
-in the code paths under test -- so these tests are deterministic and run with
-Playwright ABSENT (it is not installed in this environment). They cover the
+pure, stdlib-only functions -- no Playwright import anywhere in the policy
+decision code path -- so these tests are deterministic whether the optional
+browser extra is installed or absent. They cover the
 OFFLINE half of PR-10: the interception-DECISION function and the cancel seam.
 The LIVE half (a real two-origin browser run proving an owned off-scope
 listener gets zero requests/credentials) is OWNER/LIVE and is NOT covered here.
@@ -40,11 +40,10 @@ def _decide(url, *, method="GET", resource_type="document", is_navigation=True,
 class ModuleImportsWithoutPlaywrightTest(unittest.TestCase):
     """PR-10 requires the decision function to work with Playwright ABSENT."""
 
-    def test_playwright_is_not_installed_here(self):
-        # Documents the environment this suite actually runs in -- if this
-        # ever flips true, the other assertions in this class still hold
-        # (evaluate_browser_request never imports playwright either way).
-        self.assertFalse(playwright_available())
+    def test_playwright_availability_probe_is_environment_neutral(self):
+        # The browser extra is optional. Installing it to exercise the live XSS
+        # leg must not turn this policy suite red.
+        self.assertIsInstance(playwright_available(), bool)
 
     def test_evaluate_browser_request_runs_with_playwright_absent(self):
         decision = _decide("https://target.test/", resource_type="document")

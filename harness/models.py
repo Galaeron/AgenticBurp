@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class HttpExchange(BaseModel):
@@ -115,6 +115,23 @@ class Finding(BaseModel):
     oracle_capsule_id: str = ""
     oracle_reason: str = ""
 
+    @computed_field
+    @property
+    def evidence_maturity(self) -> str:
+        from harness.confirmation_gate import finding_triage
+        return finding_triage(self)["evidence_maturity"]
+
+    @computed_field
+    @property
+    def triage_priority(self) -> str:
+        from harness.confirmation_gate import finding_triage
+        return finding_triage(self)["triage_priority"]
+
+    @computed_field
+    @property
+    def impact_severity(self) -> str:
+        return self.original_severity or self.severity
+
 
 # R02: fields this harness's own deterministic pipeline owns -- the
 # orchestrator's confirmation/proof linkage (orchestrator_confirm.py), its
@@ -127,6 +144,7 @@ class Finding(BaseModel):
 # first -- see harness/agents/base_agent.py, harness/iterative_agent.py,
 # harness/orchestrator_detect.py's _attempt_rediscovery.
 AGENT_AUTHORITY_FIELDS = frozenset({
+    "evidence_maturity", "triage_priority", "impact_severity",
     "confirmed", "proof_id", "case_id", "review_verdict", "review_note",
     "original_confidence", "original_severity", "original_vulnerability_class",
     "shape_inconsistent", "confirmed_by_leg",
@@ -164,6 +182,8 @@ class AgentReport(BaseModel):
 
 class AnalysisRequest(BaseModel):
     exchange: HttpExchange
+    # Explicit snapshot partition. Omitted calls use their fresh run identity.
+    engagement_id: str = Field(default="", max_length=128)
     # If empty, the coordinator picks agents itself. If set, caller forces
     # a specific subset (e.g. user right-clicked "Test for SQLi only").
     force_agents: list[str] = Field(default_factory=list)
@@ -298,6 +318,8 @@ class StageOutcome(BaseModel):
 
 
 class AnalysisResponse(BaseModel):
+    engagement_id: str = ""
+    captured_principal_id: str = ""
     coordinator_model: str
     dispatched_agents: list[str]
     agent_reports: list[AgentReport]
@@ -315,6 +337,9 @@ class AnalysisResponse(BaseModel):
     # this one call) -- see effort.EffortBudget. budget_remaining is None
     # when no cap is configured (tracked but never blocking).
     effort_spent_tokens: int = 0
+    # Compatibility scalar above is a known lower bound when False; None means
+    # an older/uninstrumented response supplied no completeness declaration.
+    effort_usage_complete: bool | None = None
     effort_budget_remaining: Optional[int] = None
     effort_budget_warning: str = ""
     # Tools the harness recommends the tester reach for to confirm/exploit these
@@ -359,6 +384,15 @@ class AnalysisResponse(BaseModel):
     # Default False so a healthy run (the overwhelming common case) is
     # byte-for-byte unchanged from before this field existed.
     degraded: bool = False
+    # Top-level, structured mirror of every dispatched agent's raw_error ("<agent>:
+    # <error>"). Previously an agent failure (e.g. the model backend being down)
+    # was recorded ONLY in the per-agent raw_error buried inside agent_reports, so
+    # a run where every LLM agent failed still returned a normal-looking 200 with
+    # a few deterministic hits. This surfaces the failures where a caller/UI can
+    # see them without walking agent_reports; empty on a clean run. When EVERY
+    # dispatched agent errored (the model-unavailable case), `degraded` is also
+    # True and the summary leads with an explicit warning.
+    agent_errors: list[str] = Field(default_factory=list)
 
 
 class UrlEstimateItem(BaseModel):
@@ -387,6 +421,7 @@ class PrioritizeRequestItem(BaseModel):
 
 
 class PrioritizeRequest(BaseModel):
+    engagement_id: str = Field(default="", max_length=128)
     items: list[PrioritizeRequestItem]
 
 
@@ -399,6 +434,7 @@ class PrioritizeResultItem(BaseModel):
 
 
 class PrioritizeResponse(BaseModel):
+    engagement_id: str = ""
     results: list[PrioritizeResultItem]
 
 
@@ -409,6 +445,12 @@ class EffortStatus(BaseModel):
     remaining_tokens: Optional[int] = None
     exhausted: bool = False
     breakdown: dict[str, int] = Field(default_factory=dict)
+    # spent_tokens/breakdown are known lower bounds when any count is missing.
+    usage_complete: bool = True
+    tokens_lower_bound: bool = False
+    pending_admission_tokens: int = 0
+    unmeasured_admission_tokens: int = 0
+    call_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class IdentityCreateRequest(BaseModel):

@@ -17,7 +17,8 @@ from harness.models import AgentReport, ComponentCandidate, Finding, HttpExchang
 
 def _make_pipeline(ollama_client=None) -> AnalysisPipeline:
     agent_manager = MagicMock()
-    effort_budget = MagicMock()
+    from harness.effort import BudgetMode, EffortBudget
+    effort_budget = EffortBudget(BudgetMode.HARD)
     store = MagicMock()
     # Every _init_clients lookup other than the ollama fallback uses
     # .get() with a default; "ollama" is only required when no client is

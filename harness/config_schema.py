@@ -276,6 +276,7 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     # target to observe JS-issued requests -- active target traffic, same as
     # autonomous_discovery.enabled above; passive-only forces it off too.
     "driver_capture.enabled",
+    "iterative_agent.enabled",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

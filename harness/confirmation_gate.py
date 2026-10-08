@@ -328,6 +328,29 @@ def finding_lifecycle_state(finding) -> str:
     return lifecycle_state(confirmed, verdict)
 
 
+def finding_triage(finding) -> dict[str, str]:
+    """Evidence maturity and next action, independent of impact/probability.
+
+    Input must be harness-owned state (model authority fields are stripped at
+    ingestion). Absence of a confirming leg is never evidence of a negative.
+    Existing severity/confidence policy is unchanged; confidence is not calibrated.
+    """
+    get = finding.get if isinstance(finding, dict) else lambda key, default=None: getattr(finding, key, default)
+    verdict = (get("review_verdict", "") or "").lower()
+    if get("confirmed", False):
+        maturity = "confirmed_observation" if leg_tier(get("vulnerability_class")) == "none" else "confirmed"
+        priority = "review_confirmed"
+    elif verdict == "unconfirmed_hypothesis":
+        maturity, priority = "controlled_negative", "review_negative"
+    elif verdict in {"rejected", "downgraded"}:
+        maturity, priority = "review_rejected", "review_negative"
+    else:
+        maturity = "unverified_no_leg" if leg_tier(get("vulnerability_class")) == "none" else "unverified"
+        priority = "manual_verification"
+    return {"evidence_maturity": maturity, "triage_priority": priority,
+            "impact_severity": get("original_severity") or get("severity", "info") or "info"}
+
+
 def leg_tier(vuln_class: str | None, live_verified_markers: frozenset | None = None) -> str:
     """Verification tier of the confirmation leg for a class:
     "live" (a live-verified leg exists), "provisional" (a leg exists but is only

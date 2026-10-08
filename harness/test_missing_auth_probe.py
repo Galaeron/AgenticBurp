@@ -81,6 +81,14 @@ class MissingAuthProbeTests(unittest.TestCase):
         self.assertNotEqual(o.classification, "missing_auth")
         self.assertIsNone(o.finding)
 
+    def test_authenticated_form_with_login_css_class_is_substantive(self):
+        # Some applications reuse a `login-form` CSS class for account forms.
+        # A class-name substring alone must not discard an authenticated page.
+        html = ('<p>Your email: probe@example.com</p>'
+                '<form class="login-form" name="change-email-form" '
+                'action="/my-account/change-email"><input name="email"></form>')
+        self.assertTrue(map_._substantive(200, html))
+
     def test_empty_2xx_body_is_not_substantive(self):
         m = {("GET", "http://t.test/api/items"): {"unauth": (200, "[]")}}
         o = self._probe(m, ("GET", "/api/items"), send_garbage_token=False)

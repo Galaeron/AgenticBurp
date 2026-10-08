@@ -44,7 +44,10 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpx
 
 from harness import evidence
+from harness import scope_lock
 from harness.safety_gate import SafetyGate, SafetyGateConfig
+from harness.tls_policy import TLSPolicy
+from harness.target_request_policy import TargetRequestPolicy
 
 # Redirect status codes and the ones that rewrite the method to GET.
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
@@ -81,42 +84,29 @@ class ScopePolicy:
 
     @staticmethod
     def origin_of(url: str) -> str:
-        p = urlsplit(url)
-        host = (p.hostname or "").lower()
-        scheme = (p.scheme or "").lower()
-        port_value = p.port
-        port = "" if (scheme == "http" and port_value in (None, 80)) or \
-            (scheme == "https" and port_value in (None, 443)) else f":{port_value}"
-        return f"{scheme}://{host}{port}"
+        parsed = scope_lock.parse_scope_url(url)
+        return parsed.origin if parsed else ""
 
     @staticmethod
     def host_of(url: str) -> str:
-        return (urlsplit(url).hostname or "").lower()
+        return scope_lock.host_of(url)
 
     def in_scope(self, url: str) -> bool:
-        p = urlsplit(url)
-        if (p.scheme or "").lower() not in self.allowed_schemes:
-            return False
-        host = (p.hostname or "").lower()
-        if not host or not self.allowed_hosts:
-            return False
-        return host in self.allowed_hosts
+        return scope_lock.scope_matches(url, self.allowed_hosts,
+                                        allowed_schemes=self.allowed_schemes)
 
     def same_origin(self, a: str, b: str) -> bool:
-        return self.origin_of(a) == self.origin_of(b)
+        origin = self.origin_of(a)
+        return bool(origin) and origin == self.origin_of(b)
 
 
 @dataclass(frozen=True)
 class HostAllowScope(ScopePolicy):
-    """A ScopePolicy whose `in_scope` delegates to `scope_discovery.is_host_allowed`.
+    """Discovery compatibility adapter using the shared strict intersection.
 
-    W-16: when a send that was previously guarded by a raw
-    `scope_discovery.is_host_allowed(url, allowed_hosts)` check is migrated onto the
-    single TargetTransport, its reachability must not change. The strict base
-    ScopePolicy is exact-host + fail-CLOSED on an empty allow-list; is_host_allowed
-    is subdomain/CIDR/scheme/port aware and fail-OPEN on an empty list in passive
-    mode. This subclass keeps the base same_origin/origin_of but restores the
-    is_host_allowed reachability so full-closure routing is behaviour-preserving.
+    Bare hosts match exactly. Wildcard/CIDR/scheme/port forms grant no authority,
+    preserving strict ScopePolicy/gate denials across every adapter. Empty passive
+    admission remains compatible; active admission is closed. See SCOPE_POLICY.md.
 
     `hosts` is the ORIGINAL list (kept as a tuple so the dataclass stays hashable);
     the base `allowed_hosts` frozenset is left empty and unused by this subclass.
@@ -125,8 +115,9 @@ class HostAllowScope(ScopePolicy):
     active_mode: bool = False
 
     def in_scope(self, url: str) -> bool:
-        from harness import scope_discovery
-        return scope_discovery.is_host_allowed(url, list(self.hosts), active_mode=self.active_mode)
+        return scope_lock.scope_matches(url, self.hosts,
+                                        allow_unset=not self.active_mode,
+                                        allowed_schemes=self.allowed_schemes)
 
 
 # ---------------------------------------------------------------------------
@@ -192,17 +183,31 @@ class ManagedSession:
     principal: object | None = None
     generation: int = 0
     _client: httpx.AsyncClient | None = None
+    _fixture_clients: dict = field(default_factory=dict, repr=False)
 
-    def client(self, timeout: float) -> httpx.AsyncClient:
+    def client(self, timeout: float, *, http2: bool = False,
+               trust_policy: TLSPolicy | None = None, destination: str | None = None) -> httpx.AsyncClient:
+        policy = trust_policy or TLSPolicy.from_config()
+        profile = policy.profile_for(destination)
+        if profile.pool_key:
+            if profile.pool_key not in self._fixture_clients:
+                self._fixture_clients[profile.pool_key] = httpx.AsyncClient(
+                    follow_redirects=False, verify=profile.context, timeout=timeout,
+                    cookies=httpx.Cookies(), http2=http2)
+            return self._fixture_clients[profile.pool_key]
         if self._client is None:
-            self._client = httpx.AsyncClient(follow_redirects=False, verify=False,
-                                             timeout=timeout, cookies=httpx.Cookies())
+            self._client = httpx.AsyncClient(follow_redirects=False, verify=profile.context,
+                                             timeout=timeout, cookies=httpx.Cookies(),
+                                             http2=http2)
         return self._client
 
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        for client in self._fixture_clients.values():
+            await client.aclose()
+        self._fixture_clients.clear()
 
 
 class SessionManager:
@@ -213,6 +218,8 @@ class SessionManager:
                  allowed_origins=None, role: str = "user", name: str = "",
                  principal=None) -> ManagedSession:
         normalized = frozenset(ScopePolicy.origin_of(o) for o in (allowed_origins or []))
+        if "" in normalized:
+            raise ValueError("sessions require valid HTTP(S) allowed origins")
         if headers and not normalized:
             raise ValueError("credential-bearing sessions require an explicit allowed origin")
         s = ManagedSession(session_id=session_id, principal_id=principal_id,
@@ -385,6 +392,8 @@ class TargetTransport:
                 data = {"request": artifact.request_ref, "response": artifact.response_ref,
                         "outcome": outcome, "artifact_id": artifact.artifact_id,
                         "destination": artifact.actual_destination}
+                data['tls_trust'] = {**self.ctx.tls_policy.provenance(url),
+                                     'client_profile_applied': executed and not outcome.startswith('error:resolve:')}
                 # FR-2 (F03): a REAL, content-addressed, hash-verified evidence
                 # blob -- not just the human-readable "request"/"response"
                 # strings above -- so the P0-6 resolver can tell "we have a URL
@@ -496,6 +505,10 @@ class TargetTransport:
             if not ctx.scope.in_scope(url):
                 return ExecutionOutcome(outcome="out_of_scope", final_url=url,
                                         artifact=self._artifact(url, "out_of_scope", session_ref, case_ref=case_ref))
+            reason = ctx.target_policy.denial_reason(url)
+            if reason:
+                return ExecutionOutcome(outcome="blocked", final_url=url, error=reason,
+                                        artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref))
             # 2. Gate -- reuse the SafetyGate decision (no contradictory rules). GET is
             #    not treated as universally harmless: scope + budget still bind it, and a
             #    mutating method is gated exactly as the validators' sends are.
@@ -538,8 +551,10 @@ class TargetTransport:
             if session and credential_destination:
                 for k, v in session.headers.items():
                     send_headers.setdefault(k, v)
-            client = (session.client(ctx.timeout)
-                      if session and credential_destination else ctx.default_client())
+            use_http2 = bool((ctx.config.get("transport", {}) or {}).get("http2", False))
+            client = (session.client(ctx.timeout, http2=use_http2,
+                                     trust_policy=ctx.tls_policy, destination=url)
+                      if session and credential_destination else ctx.default_client(destination=url))
             send_url = url
             request_kwargs: dict = {"headers": send_headers or None,
                                     "content": body if isinstance(body, str) else None}
@@ -640,14 +655,15 @@ def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
     the ONE TargetTransport path instead of a raw httpx client (W-16 full closure).
 
     Its scope is a HostAllowScope, so a send previously guarded by
-    `scope_discovery.is_host_allowed(url, allowed_hosts)` keeps EXACTLY its old
-    reachability. Pass `gate` to reuse the caller's existing SafetyGate (e.g. the
+    `scope_discovery.is_host_allowed(url, allowed_hosts)` uses the same strict
+    exact-host intersection as the gate. Pass `gate` to
+    reuse the caller's existing SafetyGate (e.g. the
     iterative agent's) so mutating-method decisions are unchanged; otherwise a fresh
     per-context gate is used. The caller owns the returned context and must aclose()
     it (or use `transport_for`, which reports ownership)."""
     rc = RunContext.create(allowed_hosts=allowed_hosts, config=config, timeout=timeout,
                            max_requests=max_requests, gate=gate)
-    rc.scope = HostAllowScope(hosts=tuple((h or "") for h in (allowed_hosts or [])),
+    rc.scope = HostAllowScope(hosts=tuple(scope_lock.configured_entries(allowed_hosts)),
                               active_mode=active_mode)
     return rc
 
@@ -682,6 +698,9 @@ class RunContext:
     cache_namespace: str = ""
     timeout: float = 15.0
     _default_client: httpx.AsyncClient | None = None
+    _fixture_clients: dict = field(default_factory=dict, repr=False)
+    tls_policy: TLSPolicy = field(default_factory=TLSPolicy.from_config, repr=False)
+    target_policy: TargetRequestPolicy = field(default_factory=TargetRequestPolicy, repr=False)
     # What safety_gate.push_gate returned when this run installed its gate as
     # ambient -- the gate (or None) that was ambient before it, to restore on
     # aclose(). Not a contextvars.Token: see push_gate's docstring for why.
@@ -711,27 +730,43 @@ class RunContext:
         # gate (e.g. the caller's own) instead of building one from gate_config.
         resolved_run_id = run_id or uuid.uuid4().hex
         config_snapshot = deepcopy(config or {})
+        target_policy = TargetRequestPolicy.from_config(config_snapshot)
+        tls_policy = TLSPolicy.from_config(config_snapshot)
+        config_snapshot['transport_tls_provenance'] = tls_policy.provenance()
         configured_namespace = str(
             ((config_snapshot.get("runs", {}) or {}).get("cache_namespace") or "")
         )
         # Safety item #12: fold this run's scope into the gate config so the gate
         # itself refuses any off-scope send (central defense-in-depth), matching
         # the ScopePolicy the transport already enforces.
-        _gate_cfg = {**(gate_config or {}), "allowed_hosts": list(allowed_hosts or [])}
+        entries = scope_lock.configured_entries(allowed_hosts)
+        _gate_cfg = {**(gate_config or {}), "allowed_hosts": list(entries)}
+        _gate_cfg['target_policy'] = target_policy
         resolved_gate = gate if gate is not None else SafetyGate(SafetyGateConfig.from_dict(_gate_cfg))
         return cls(
             run_id=resolved_run_id,
-            scope=ScopePolicy(allowed_hosts=frozenset((h or "").lower() for h in (allowed_hosts or []))),
+            scope=ScopePolicy(allowed_hosts=entries),
             gate=resolved_gate,
             budget=RequestBudget(max_requests), cancel=CancelToken(),
             sessions=SessionManager(), config=config_snapshot,
+            tls_policy=tls_policy,
+            target_policy=target_policy,
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
                              if configured_namespace else resolved_run_id), timeout=timeout)
 
-    def default_client(self) -> httpx.AsyncClient:
+    def default_client(self, *, destination: str | None = None) -> httpx.AsyncClient:
+        profile = self.tls_policy.profile_for(destination)
+        use_http2 = bool((self.config.get("transport", {}) or {}).get("http2", False))
+        if profile.pool_key:
+            if profile.pool_key not in self._fixture_clients:
+                self._fixture_clients[profile.pool_key] = httpx.AsyncClient(
+                    follow_redirects=False, verify=profile.context, timeout=self.timeout,
+                    cookies=httpx.Cookies(), http2=use_http2)
+            return self._fixture_clients[profile.pool_key]
         if self._default_client is None:
-            self._default_client = httpx.AsyncClient(follow_redirects=False, verify=False,
-                                                     timeout=self.timeout, cookies=httpx.Cookies())
+            self._default_client = httpx.AsyncClient(follow_redirects=False, verify=profile.context,
+                                                     timeout=self.timeout, cookies=httpx.Cookies(),
+                                                     http2=use_http2)
         return self._default_client
 
     def target_transport(self) -> "TargetTransport":
@@ -744,6 +779,9 @@ class RunContext:
         if self._default_client is not None:
             await self._default_client.aclose()
             self._default_client = None
+        for client in self._fixture_clients.values():
+            await client.aclose()
+        self._fixture_clients.clear()
         await self.sessions.aclose()
         if self._gate_pushed:
             from harness.safety_gate import pop_gate

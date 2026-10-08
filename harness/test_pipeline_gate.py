@@ -211,6 +211,26 @@ def _confirmed_idor(result: dict) -> list[dict]:
     return out
 
 
+@contextlib.contextmanager
+def _suppress_idor_confirmation():
+    """Suppress BOTH IDOR confirmation legs -- the cross-identity (Autorize) leg
+    AND the single-principal read-differential leg -- so the defect-injection
+    invariant ('suppressing the confirmation kills the gate') still holds now that
+    IDOR has two independent confirmation paths."""
+    from harness.validators import cross_identity_validator as civ
+    from harness.validators import idor_read_validator as irv
+    from harness.validators.base import ValidationResult
+
+    async def _never_confirm(self, finding, exchange, **kw):
+        return ValidationResult(
+            validator="suppressed", status="not_confirmed", finding_class="idor",
+            confirmed=False, confidence=0.0,
+            summary="suppressed for defect injection", evidence="")
+    with patch.object(civ.CrossIdentityValidator, "validate", new=_never_confirm), \
+         patch.object(irv.IdorReadValidator, "validate", new=_never_confirm):
+        yield
+
+
 class RealPipelineGateTest(unittest.TestCase):
     """The positive gate: real discovery -> real confirmation, against a fixture the
     harness has to DISCOVER on its own."""
@@ -358,22 +378,12 @@ class RealPipelineGateDefectInjectionTest(unittest.TestCase):
         """Suppress the cross-identity confirmation (the 'findings suppressed' defect):
         the real leg is patched to never confirm. The positive gate's confirmation
         assertion must go red."""
-        def _defect():
-            from harness.validators import cross_identity_validator as civ
-            from harness.validators.base import ValidationResult
-
-            async def _never_confirm(self, finding, exchange, **kw):
-                return ValidationResult(
-                    validator="cross_identity", status="not_confirmed", finding_class="idor",
-                    confirmed=False, confidence=0.0,
-                    summary="suppressed for defect injection", evidence="")
-            return patch.object(civ.CrossIdentityValidator, "validate", new=_never_confirm)
-        result, fx = _PipelineRun("vulnerable", defect=_defect).run()
+        result, fx = _PipelineRun("vulnerable", defect=_suppress_idor_confirmation).run()
         self.assertEqual(
             _confirmed_idor(result), [],
-            "defect-injection is inert: an IDOR was still 'confirmed' even though the "
-            "cross-identity leg was suppressed, so the gate's confirmation does not "
-            "actually come from that leg")
+            "defect-injection is inert: an IDOR was still 'confirmed' even though both "
+            "IDOR confirmation legs were suppressed, so the gate's confirmation does not "
+            "actually come from those legs")
 
     def test_suppressed_confirmation_leg_persists_no_orphan_proof(self):
         """RB-4/INV-2 negative control: persistence must be additive to a GENUINE
@@ -383,16 +393,7 @@ class RealPipelineGateDefectInjectionTest(unittest.TestCase):
         engagement path must not persist a CONFIRMED ProofRecord for this run at
         all -- no orphan proof left behind by a leg that never actually
         confirmed anything."""
-        def _defect():
-            from harness.validators import cross_identity_validator as civ
-            from harness.validators.base import ValidationResult
-
-            async def _never_confirm(self, finding, exchange, **kw):
-                return ValidationResult(
-                    validator="cross_identity", status="not_confirmed", finding_class="idor",
-                    confirmed=False, confidence=0.0,
-                    summary="suppressed for defect injection", evidence="")
-            return patch.object(civ.CrossIdentityValidator, "validate", new=_never_confirm)
+        _defect = _suppress_idor_confirmation
         # The store read below must happen while this run's own temp DB is
         # still live -- run_live() only restores store._DB_PATH to the shared
         # dev DB, and deletes the temp dir, on exit from this `with` block.

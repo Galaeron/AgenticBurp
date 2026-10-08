@@ -31,6 +31,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from harness.categories import canonicalize
 from harness.engagement import normalize_path
+from harness import security
 
 _ISSUE_VERSION = 1
 
@@ -104,7 +105,8 @@ def redact(text: str) -> str:
     Authorization/Cookie lines, secret-keyed query/form/JSON values, and bare JWTs.
     Conservative and idempotent: it never fabricates, only masks recognizable
     secret shapes."""
-    out = text or ""
+    from harness import security
+    out = security.sanitize_text(text or "")
     for pat, repl in _SECRET_PATTERNS:
         out = pat.sub(repl, out)
     return out
@@ -116,6 +118,8 @@ def redact_url(url: str) -> str:
     `user:pass@` while keeping the endpoint itself legible."""
     if not url:
         return url or ""
+    from harness import security
+    url = security.redact_secrets_in_url(url)
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -473,7 +477,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
     missing_artifacts.append("raw captured request/response bytes are not stored with the finding; "
                              "replay from the linked proof/exchange artifacts")
 
-    return {
+    return security.sanitize_data({
         "issue_id": issue.issue_id,
         "version": issue.version,
         "title": f"{issue.vulnerability_class} on {redact_url(issue.host)}{issue.endpoint_family or '/'}"
@@ -482,6 +486,8 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "severity": issue.severity,
         "confidence": round(issue.confidence, 3),
         "confirmed": issue.confirmed,
+        **__import__("harness.confirmation_gate", fromlist=["finding_triage"]).finding_triage(
+            {**best, "confirmed": issue.confirmed}),
         # R01/R06: oracle verification state must survive export, distinct
         # from the legacy `confirmed` (leg fired once) axis -- a consumer
         # reading only `confirmed` cannot tell a leg-confirmed-but-unverified
@@ -519,6 +525,8 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "proof_references": proof_refs,
         "affected_instances": [redact_url(u) for u in issue.affected_instances],
         "instances_count": len(issue.members),
+        "captured_auth_contexts": sorted({member.get("captured_principal_id") for member in issue.members
+                                          if member.get("captured_principal_id")}),
         "artifacts": {"replayable": has_proof, "missing": missing_artifacts},
         "limitations": _limitations(issue),
         "retest": (
@@ -526,7 +534,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
             f"a fix means the {boundary_word} attempt no longer succeeds. This retest "
             f"maps to issue {issue.issue_id} (stable id), so the result links to this "
             f"issue -- and is appended as a new attempt -- instead of opening a new one."),
-    }
+    })
 
 
 def replay_view(issue: Issue) -> dict:
@@ -545,8 +553,8 @@ def replay_view(issue: Issue) -> dict:
         "issue_id": issue.issue_id,
         "method": issue.method,
         "host": redact_url(issue.host),
-        "endpoint_family": issue.endpoint_family,
-        "affected_input": issue.affected_input,
+        "endpoint_family": security.sanitize_text(issue.endpoint_family),
+        "affected_input": security.sanitize_text(issue.affected_input),
         "principals": steps,
         "instances": [redact_url(u) for u in issue.affected_instances],
         # request bodies/evidence are redacted even in the local view -- the

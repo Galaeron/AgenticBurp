@@ -8,8 +8,13 @@ consistently applied across all prompt-construction code paths.
 from __future__ import annotations
 import base64
 import json
+import logging
 import re
-from urllib.parse import urlsplit, urlunsplit, unquote_plus
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit, unquote_plus, quote
 
 
 # Header names whose VALUES are session-identifying secrets (bearer
@@ -31,6 +36,8 @@ SECRET_HEADER_NAMES: set[str] = {
 # string everywhere, making it easier to search for in logs or model
 # context dumps if needed.
 REDACTED_PLACEHOLDER = "[REDACTED -- header present, value withheld from model]"
+_SAFE_JWT_ALGORITHMS = {"none", "HS256", "HS384", "HS512", "RS256", "RS384", "RS512",
+                        "ES256", "ES384", "ES512", "PS256", "PS384", "PS512", "EdDSA"}
 
 
 def _decode_jwt_header_only(token: str) -> dict | None:
@@ -65,7 +72,14 @@ def _decode_jwt_header_only(token: str) -> dict | None:
     except Exception:
         return None
     if isinstance(header, dict) and "alg" in header:
-        return header
+        # A JWT header is untrusted and may itself contain credentials/PII.
+        # Preserve only recognized algorithm/type metadata, never kid/jwk or
+        # arbitrary extension fields (and never arbitrary strings as alg).
+        algorithm = header["alg"]
+        result = {"alg": algorithm if isinstance(algorithm, str) and algorithm in _SAFE_JWT_ALGORITHMS else "unrecognized"}
+        if isinstance(header.get("typ"), str) and header.get("typ") in {"JWT", "at+jwt"}:
+            result["typ"] = header["typ"]
+        return result
     return None
 
 
@@ -128,6 +142,8 @@ SECRET_FIELD_NAMES: set[str] = {
     "auth",
     "client_secret",
     "private_key",
+    "cookie", "set_cookie", "proxy_authorization", "x_auth_token", "x_api_key",
+    "id_token", "csrf", "csrf_token", "xsrf_token", "jsessionid", "session_id", "sid", "xsrf", "bearer",
 }
 
 # Placeholder used by the secret-NAME redactors below. Deliberately a
@@ -177,25 +193,31 @@ def redact_secrets_in_url(url: str) -> str:
         parsed = urlsplit(url)
     except ValueError:
         return url
-    if not parsed.query:
+    def redact_pairs(query):
+        result = []
+        for pair in query.split("&"):
+            key, separator, value = pair.partition("=")
+            if separator and value and _is_secret_field_name(unquote_plus(key)) and unquote_plus(value) not in {
+                    SECRET_VALUE_PLACEHOLDER, "<REDACTED>"}:
+                pair = f"{key}={SECRET_VALUE_PLACEHOLDER}"
+            elif separator and value:
+                # Report API query parameters can contain an encoded captured
+                # URL. Withhold its recognized secrets in diagnostic logs too.
+                decoded = unquote_plus(value)
+                if decoded.lower().startswith(("https://", "http://")):
+                    clean = redact_secrets_in_url(decoded)
+                    if clean != decoded:
+                        pair = f"{key}={quote(clean, safe='')}"
+            result.append(pair)
+        return "&".join(result)
+
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = SECRET_VALUE_PLACEHOLDER + "@" + netloc.rsplit("@", 1)[1]
+    query, fragment = redact_pairs(parsed.query), redact_pairs(parsed.fragment)
+    if (netloc, query, fragment) == (parsed.netloc, parsed.query, parsed.fragment):
         return url
-    pairs = parsed.query.split("&")
-    redacted_pairs = []
-    changed = False
-    for pair in pairs:
-        if "=" in pair:
-            key, _, value = pair.partition("=")
-            # Unquote defensively ONLY for the key-name comparison -- the
-            # key itself is never rewritten, so this can't corrupt it.
-            if value and _is_secret_field_name(unquote_plus(key)):
-                redacted_pairs.append(f"{key}={SECRET_VALUE_PLACEHOLDER}")
-                changed = True
-                continue
-        redacted_pairs.append(pair)
-    if not changed:
-        return url
-    new_query = "&".join(redacted_pairs)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
 
 
 def _redact_json_value(value):
@@ -227,10 +249,10 @@ def _redact_kv_line(line: str) -> str:
     # pairs joined by '&' on one line, and no ':' (which would suggest a
     # header-style "key: value" line instead). A line with no secret-shaped
     # key at all is returned completely untouched -- byte for byte.
-    if "&" in line and "=" in line and ":" not in line:
+    if "&" in line and "=" in line:
         segments = line.split("&")
         if not any(
-            "=" in seg and _is_secret_field_name(seg.partition("=")[0].strip())
+            "=" in seg and _is_secret_field_name(unquote_plus(seg.partition("=")[0].strip()))
             for seg in segments
         ):
             return line
@@ -238,7 +260,7 @@ def _redact_kv_line(line: str) -> str:
         for seg in segments:
             if "=" in seg:
                 k, _, v = seg.partition("=")
-                out.append(f"{k}={SECRET_VALUE_PLACEHOLDER}" if _is_secret_field_name(k.strip()) else seg)
+                out.append(f"{k}={SECRET_VALUE_PLACEHOLDER}" if _is_secret_field_name(unquote_plus(k.strip())) else seg)
             else:
                 out.append(seg)
         return "&".join(out)
@@ -294,3 +316,193 @@ def redact_secrets_in_body(body):
                 return body
             return json.dumps(redacted)
     return "\n".join(_redact_kv_line(line) for line in body.split("\n"))
+
+
+_TEXT_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_SECRET_TEXT_KEYS = "|".join(re.escape(name).replace("_", "[_ -]?") for name in
+                             sorted(SECRET_FIELD_NAMES | SECRET_HEADER_NAMES, key=len, reverse=True))
+_QUOTED_SECRET_RE = re.compile(
+    rf"(?i)([\"']?(?:{_SECRET_TEXT_KEYS})[\"']?\s*[:=]\s*)([\"'])(.*?)(\2)")
+_INLINE_SECRET_RE = re.compile(
+    rf"(?i)(\b(?:{_SECRET_TEXT_KEYS})\s*=\s*)(\[REDACTED-SECRET\]|[^\s&;,\"'\]}}]+)")
+_HEADER_LINE_RE = re.compile(
+    r"(?im)^(\s*(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token)\s*:\s*)(.*)$")
+
+
+def _safe_redacted_header(value):
+    if value in {REDACTED_PLACEHOLDER, SECRET_VALUE_PLACEHOLDER}:
+        return True
+    prefix = "Bearer [REDACTED -- payload and signature withheld from model; JWT header only: "
+    if not value.startswith(prefix) or not value.endswith("]"):
+        return False
+    try:
+        metadata = json.loads(value[len(prefix):-1])
+        return (isinstance(metadata, dict) and set(metadata) <= {"alg", "typ"}
+                and metadata.get("alg") in _SAFE_JWT_ALGORITHMS | {"unrecognized"}
+                and metadata.get("typ", "JWT") in {"JWT", "at+jwt"})
+    except (ValueError, TypeError):
+        return False
+
+
+def sanitize_text(text, *, known_values=()):
+    """Shared inference/export hygiene for recognized secret structures.
+
+    Handles embedded JSON, URL userinfo/query/fragment, named quoted/inline
+    assignments and header lines. Unknown unlabelled prose, binary encodings
+    and application-specific secret names remain outside this contract.
+    Explicit caller-supplied known_values can withhold opaque values; there is
+    no global secret registry. Nonsecret text is preserved when untouched.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    result = redact_secrets_in_body(text)
+    # Decode embedded JSON before matching inline forms, including nested
+    # objects/lists whose secret-keyed values are not simple strings.
+    decoder = json.JSONDecoder()
+    replacements = []
+    offset = 0
+    while offset < len(result):
+        brace = result.find("{", offset)
+        if brace < 0:
+            break
+        try:
+            parsed, length = decoder.raw_decode(result[brace:])
+        except ValueError:
+            offset = brace + 1
+            continue
+        clean = sanitize_data(parsed)
+        if clean != parsed:
+            replacements.append((brace, brace + length, json.dumps(clean)))
+        offset = brace + length
+    for start, end, clean in reversed(replacements):
+        result = result[:start] + clean + result[end:]
+    result = _TEXT_URL_RE.sub(lambda match: redact_secrets_in_url(match.group()), result)
+    result = _QUOTED_SECRET_RE.sub(lambda match: match[1] + match[2] + SECRET_VALUE_PLACEHOLDER + match[4], result)
+    result = _INLINE_SECRET_RE.sub(lambda match: match[0] if match[2] == "<REDACTED>"
+                                  else match[1] + SECRET_VALUE_PLACEHOLDER, result)
+    # Idempotence retains the restricted JWT metadata already emitted above.
+    result = _HEADER_LINE_RE.sub(lambda match: match[0] if _safe_redacted_header(match[2])
+                                 else match[1] + SECRET_VALUE_PLACEHOLDER, result)
+    for value in known_values:
+        if isinstance(value, str) and value:
+            result = result.replace(value, SECRET_VALUE_PLACEHOLDER)
+    return result
+
+
+def sanitize_data(value, *, known_values=()):
+    """Return a sanitized structural copy; never mutate authoritative input."""
+    if isinstance(value, dict):
+        return {key: SECRET_VALUE_PLACEHOLDER if _is_secret_field_name(str(key))
+                else sanitize_data(child, known_values=known_values) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_data(child, known_values=known_values) for child in value]
+    return sanitize_text(value, known_values=known_values) if isinstance(value, str) else value
+
+
+def sanitized_exchange(exchange):
+    """A prompt-only copy of captured traffic, retaining method/status/shape."""
+    return exchange.model_copy(update={
+        "url": redact_secrets_in_url(exchange.url),
+        "request_headers": redact_headers(exchange.request_headers),
+        "response_headers": redact_headers(exchange.response_headers),
+        "request_body": sanitize_text(exchange.request_body),
+        "response_body": sanitize_text(exchange.response_body),
+        "analyst_note": sanitize_text(exchange.analyst_note),
+    })
+
+
+def sanitize_for_inference(system_prompt, user_prompt):
+    """Final provider boundary; same policy for local and opt-in cloud roles."""
+    return sanitize_text(system_prompt), sanitize_text(user_prompt)
+
+
+def safe_error_summary(error):
+    """Retain error type without arbitrary upstream body/URL/credential text."""
+    return f"{type(error).__name__}: operation failed; sensitive upstream detail withheld"
+
+
+class PrivacyLogFilter(logging.Filter):
+    """Sanitize formatted diagnostics before handlers can persist them."""
+    def filter(self, record):
+        record.msg = sanitize_text(record.getMessage())
+        record.args = ()
+        return True
+
+
+def install_privacy_log_filters():
+    """Protect HTTP diagnostics and the harness server's existing handlers."""
+    for destination in [logging.getLogger("httpx"), logging.getLogger("httpcore"),
+                        *logging.getLogger().handlers]:
+        if not any(isinstance(item, PrivacyLogFilter) for item in destination.filters):
+            destination.addFilter(PrivacyLogFilter())
+
+
+# Provider-only use may not import the server or configure root handlers.
+install_privacy_log_filters()
+
+
+def _restrict_windows_file_acl(path: Path) -> None:
+    """Protect an empty disposable file with the current user's explicit DACL.
+
+    The subprocess receives a path only, never credential bytes. Permission
+    errors fail publication; chmod on Windows is not a confidentiality boundary.
+    Administrators/SYSTEM can take ownership; this does not provide encryption.
+    """
+    script = r"""
+    $ErrorActionPreference = 'Stop'
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetOwner($sid)
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+    $acl.AddAccessRule($rule)
+    [System.IO.File]::SetAccessControl($env:AGENTIC_CREDENTIAL_TEMP_PATH, $acl)
+    $actual = [System.IO.File]::GetAccessControl($env:AGENTIC_CREDENTIAL_TEMP_PATH)
+    if (-not $actual.AreAccessRulesProtected) { throw 'DACL inheritance remains enabled' }
+    $rules = @($actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or
+        $rules[0].AccessControlType -ne 'Allow' -or $rules[0].IsInherited) {
+        throw 'Unexpected credential file DACL'
+    }
+    """
+    environment = os.environ.copy()
+    # Use Windows PowerShell's built-in .NET Framework ACL methods; no module
+    # dependency or inherited custom module lookup is needed.
+    environment.pop("PSModulePath", None)
+    environment["AGENTIC_CREDENTIAL_TEMP_PATH"] = str(path.resolve())
+    try:
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                       env=environment, capture_output=True, check=True, timeout=15,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise PermissionError("credential file DACL could not be established") from error
+
+
+def write_private_credential_file(path: Path, value: str) -> None:
+    """Publish a private credential atomically, restricting permissions first.
+
+    Caller owns the containing directory. Existing file bytes are never read;
+    replacement retains the newly protected file's permissions. On failure the
+    old destination is untouched and the disposable file is removed. This is
+    publication only, not token discovery, backup, retention or encryption.
+    """
+    path = Path(path)
+    if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+        raise PermissionError("credential publication through symlinks is refused")
+    fd, temporary_name = tempfile.mkstemp(prefix=".credential-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        if os.name == "nt":
+            _restrict_windows_file_acl(temporary)
+        else:
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = None
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)

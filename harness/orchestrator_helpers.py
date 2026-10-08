@@ -254,6 +254,25 @@ def _lacks_csrf_token(exchange: HttpExchange) -> bool:
     return True
 
 
+def _browser_form_csrf_candidate(exchange: HttpExchange) -> bool:
+    """Whether a captured write is a browser-form CSRF confirmation target.
+
+    A present token is not proof of protection: applications sometimes validate
+    it only for one HTTP method. Cookie-backed, form-shaped writes therefore
+    warrant a bounded method-bypass check even when the original request carries
+    a token. Bearer/JSON APIs stay out because a cross-site navigation cannot
+    supply their Authorization header or JSON body.
+    """
+    if not _is_state_changing(exchange):
+        return False
+    headers = {str(k).lower(): str(v) for k, v in (exchange.request_headers or {}).items()}
+    if "cookie" not in headers or "authorization" in headers:
+        return False
+    ctype = headers.get("content-type", "").lower()
+    body = exchange.request_body or ""
+    return "application/x-www-form-urlencoded" in ctype or ("=" in body and not body.lstrip().startswith("{"))
+
+
 def _has_settable_body(exchange: HttpExchange) -> bool:
     """POST/PUT/PATCH with a JSON object or form body — mass-assignment target."""
     if (exchange.method or "GET").upper() not in ("POST", "PUT", "PATCH"):
@@ -266,6 +285,34 @@ def _has_settable_body(exchange: HttpExchange) -> bool:
     if "=" in body and not body.startswith(("<", "[")):
         return True
     return False
+
+
+def _nosql_login_candidate(exchange: HttpExchange) -> bool:
+    """A captured form login whose credential fields can carry Mongo operators."""
+    if (exchange.method or "GET").upper() != "POST":
+        return False
+    if "login" not in (urlsplit(exchange.url or "").path or "").lower():
+        return False
+    ctype = " ".join(str(v) for k, v in (exchange.request_headers or {}).items()
+                     if str(k).lower() == "content-type").lower()
+    if not any(t in ctype for t in ("application/x-www-form-urlencoded", "application/json")):
+        return False
+    from harness.validators.nosql_validator import _credential_names
+    return all(_credential_names(exchange.request_body or ""))
+
+
+def _email_change_race_candidate(exchange: HttpExchange) -> bool:
+    """A mutating form request with a settable email address.
+
+    Shape only warrants trying the race leg.  The validator still requires an
+    operator-declared target address, a controlled mailbox, and target-address
+    account readback before it can confirm anything.
+    """
+    if (exchange.method or "GET").upper() not in ("POST", "PUT", "PATCH"):
+        return False
+    from urllib.parse import parse_qsl
+    return any(k.lower() == "email" for k, _ in parse_qsl(
+        exchange.request_body or "", keep_blank_values=True))
 
 
 def _identity_signature(request_headers: dict | None) -> str:
@@ -373,6 +420,15 @@ def _has_url_param(exchange: HttpExchange) -> bool:
     return bool(_URL_PARAM_RE.search(blob))
 
 
+def _has_object_id_param(exchange: HttpExchange) -> bool:
+    """A GET that references an object through an id-like QUERY parameter
+    (?id=, ?user=, ?account=...). Path-segment ids are already `object_scoped`;
+    this catches the query-param form so query-keyed IDOR is testable too."""
+    from harness.validators.idor_read_validator import _locate_id
+    loc = _locate_id(exchange)
+    return loc is not None and loc[0] == "query"
+
+
 def _has_injectable_param(exchange: HttpExchange) -> bool:
     """Any query/body parameter to inject a shell/template payload into."""
     from harness.validators.injection_targets import param_targets
@@ -401,6 +457,35 @@ def _has_pickle_shape(exchange: HttpExchange) -> bool:
     return bool(DeserializationOobValidator()._sink_candidates(exchange))
 
 
+def _has_client_trust_shape(exchange: HttpExchange) -> bool:
+    """A mutating request whose body carries a server-owned value field
+    (price/amount/total/...). Reuses ClientTrustValidator's own predicate
+    (applies()) so the routing decision and the leg's own targeting never drift."""
+    from harness.validators.client_trust_validator import _parse, _value_field
+    if (exchange.method or "").upper() not in ("POST", "PUT", "PATCH"):
+        return False
+    fields, _ = _parse(exchange.request_body or "")
+    return _value_field(fields) is not None
+
+
+def _has_2fa_step_shape(exchange: HttpExchange) -> bool:
+    """A login-shaped POST/PUT (username/password fields) whose CAPTURED response
+    already landed on a second-factor step. Reuses AuthSequenceValidator's own
+    login-shape predicate (applies()) plus its MFA-marker check (_check_mfa_bypass)
+    so the routing decision and the leg's own targeting never drift."""
+    from harness.validators.auth_sequence_validator import (
+        _parse_body, _find_key, _USER_KEYS, _PASS_KEYS, _MFA_MARKERS,
+    )
+    if (exchange.method or "").upper() not in ("POST", "PUT"):
+        return False
+    fields, _ = _parse_body(exchange)
+    if _find_key(fields, _PASS_KEYS) is None and _find_key(fields, _USER_KEYS) is None:
+        return False
+    loc = (exchange.response_headers or {}).get("location", "") or ""
+    body = (exchange.response_body or "")[:2000]
+    return bool(_MFA_MARKERS.search(loc) or _MFA_MARKERS.search(body))
+
+
 def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url: str,
                             id_fill: str = "1") -> list[tuple[str, HttpExchange]]:
     """The proactive confirmation legs an endpoint's shape warrants, as
@@ -410,6 +495,7 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
       - JWT-carrying protected GET   -> jwt-forge (seeded from a JWT-bearing role)
       - XML-accepting request body   -> xxe (OOB)
       - URL-shaped param present      -> ssrf (OOB)
+      - query/body parameter present -> SQL injection plus other injection legs
       - settable JSON/form body on a mutating method -> mass-assignment
         (write-then-re-read differential, sequence validator)
 
@@ -426,7 +512,21 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
     from harness import worklist_investigator
     method = (node.get("method") or "GET").upper()
     legs: list[tuple[str, HttpExchange]] = []
+    # A privileged-looking read that the anonymous role already reached is the
+    # exact precondition for a missing-authentication check. Keep this separate
+    # from IDOR: it needs no second identity and the independent confirmation is
+    # a credential-stripped replay of the observed request.
+    from harness.engagement import _looks_privileged
+    if (method == "GET" and "anonymous" in (node.get("reachable_roles") or [])
+            and _looks_privileged(node.get("path") or "")):
+        legs.append(("auth_bypass", exchange))
     if node.get("object_scoped") and method == "GET":
+        legs.append(("idor", exchange))
+    elif method == "GET" and _has_object_id_param(exchange):
+        # A GET that references an object via an id-like QUERY param
+        # (/my-account?id=wiener, /invoice?num=42) is object-scoped too, even
+        # though the id is not a path segment. Dispatch the IDOR leg so the
+        # read-differential validator can attempt a safe cross-object read.
         legs.append(("idor", exchange))
     jid = _jwt_identity(node, roles)
     if jid is not None and method == "GET":
@@ -441,8 +541,10 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
     # route seed. Confirmation is kept only where the leg CONFIRMS, so breadth here
     # adds no unconfirmed noise, just cost.
     if _has_injectable_param(exchange):
+        legs.append(("sqli", exchange))
         legs.append(("command_injection", exchange))
         legs.append(("ssti", exchange))
+        legs.append(("xss", exchange))
     if _has_file_shape(exchange):
         legs.append(("path_traversal", exchange))
     if _has_redirect_param(exchange):
@@ -451,6 +553,16 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
         legs.append(("deserialization", exchange))
     if _has_settable_body(exchange):
         legs.append(("mass_assignment", exchange))
+    if _nosql_login_candidate(exchange):
+        legs.append(("nosql", exchange))
+    if _email_change_race_candidate(exchange):
+        legs.append(("race_condition", exchange))
+    if _lacks_csrf_token(exchange) or _browser_form_csrf_candidate(exchange):
+        legs.append(("csrf", exchange))
+    if _has_client_trust_shape(exchange):
+        legs.append(("client_trust", exchange))
+    if _has_2fa_step_shape(exchange):
+        legs.append(("2fa_bypass", exchange))
     return legs
 
 
@@ -488,12 +600,20 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
     # if the validator confirms (analyze() prunes shape legs to confirmed-only).
     if _has_injectable_param(exchange):
         out.append(Finding(
+            vulnerability_class="sqli", confidence=0.3, severity="high",
+            summary=f"SQL-injection precondition: injectable parameter on {exchange.url}",
+            evidence="", suggested_test="", basis="derived"))
+        out.append(Finding(
             vulnerability_class="command_injection", confidence=0.3, severity="high",
             summary=f"Command-injection precondition: injectable parameter on {exchange.url}",
             evidence="", suggested_test="", basis="derived"))
         out.append(Finding(
             vulnerability_class="ssti", confidence=0.3, severity="high",
             summary=f"SSTI precondition: injectable parameter on {exchange.url}",
+            evidence="", suggested_test="", basis="derived"))
+        out.append(Finding(
+            vulnerability_class="xss", confidence=0.3, severity="high",
+            summary=f"XSS precondition: injectable parameter on {exchange.url}",
             evidence="", suggested_test="", basis="derived"))
     if _has_file_shape(exchange):
         out.append(Finding(
@@ -510,15 +630,25 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
             vulnerability_class="deserialization", confidence=0.3, severity="critical",
             summary=f"Deserialization precondition: base64-pickle value on {exchange.url}",
             evidence="", suggested_test="", basis="derived"))
-    if _lacks_csrf_token(exchange):
+    if _lacks_csrf_token(exchange) or _browser_form_csrf_candidate(exchange):
         out.append(Finding(
             vulnerability_class="csrf", confidence=0.3, severity="medium",
-            summary=f"CSRF precondition: state-changing {(exchange.method or 'POST').upper()} without anti-CSRF token on {exchange.url}",
+            summary=f"CSRF precondition: browser-form {(exchange.method or 'POST').upper()} requires token-validation checks on {exchange.url}",
             evidence="", suggested_test="", basis="derived"))
     if _has_settable_body(exchange):
         out.append(Finding(
             vulnerability_class="mass_assignment", confidence=0.3, severity="high",
             summary=f"Mass-assignment precondition: settable JSON/form body on {(exchange.method or 'POST').upper()} {exchange.url}",
+            evidence="", suggested_test="", basis="derived"))
+    if _nosql_login_candidate(exchange):
+        out.append(Finding(
+            vulnerability_class="nosql", confidence=0.3, severity="critical",
+            summary=f"NoSQL precondition: operator-capable credential form on {exchange.url}",
+            evidence="", suggested_test="", basis="derived"))
+    if _email_change_race_candidate(exchange):
+        out.append(Finding(
+            vulnerability_class="race_condition", confidence=0.3, severity="high",
+            summary=f"Race-condition precondition: settable email transition on {exchange.url}",
             evidence="", suggested_test="", basis="derived"))
     return out
 

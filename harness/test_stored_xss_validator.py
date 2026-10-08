@@ -97,6 +97,44 @@ class StoredXssBrowserConfirmWiringTests(unittest.TestCase):
         self.assertIn("confirmed", note.lower())
 
 
+class PlantMappingTests(unittest.TestCase):
+    """The form-plant body mapping is the correctness core of the CSRF-bound
+    stored-XSS fix: overwriting EVERY field (the naive plant) clobbers the csrf
+    token / id / email and the write is rejected, storing nothing. The payload
+    must land only in free-text sinks while structural/typed fields stay valid."""
+
+    def _form(self):
+        from harness.feature_workflow import FormField, FormAction
+        return FormAction(method="POST", action="https://shop.test/blog/comment", fields=[
+            FormField(name="csrf", type="hidden", value="FRESH-TOKEN"),
+            FormField(name="postId", type="hidden", value="1"),
+            FormField(name="comment", type="textarea", value=""),
+            FormField(name="name", type="text", value=""),
+            FormField(name="email", type="email", value=""),
+            FormField(name="website", type="text", value=""),
+        ])
+
+    def test_plant_preserves_structural_fields_and_injects_text(self):
+        from urllib.parse import parse_qs
+        v = StoredXssValidator(allowed_hosts=["shop.test"])
+        payload = "<svg/onload=console.log('N')>"
+        d = parse_qs(v._form_plant_body(self._form(), payload), keep_blank_values=True)
+        self.assertEqual(d["csrf"], ["FRESH-TOKEN"])   # token kept -> write accepted
+        self.assertEqual(d["postId"], ["1"])           # id kept
+        self.assertEqual(d["comment"], [payload])      # payload in the text sink
+        self.assertEqual(d["name"], [payload])         # and the other text field
+        self.assertIn("@", d["email"][0])              # email stays valid
+        self.assertTrue(d["website"][0].startswith("http"))  # url field stays valid
+
+    def test_source_page_candidates_derive_parent_with_id(self):
+        v = StoredXssValidator(allowed_hosts=["shop.test"])
+        ex = HttpExchange(url="https://shop.test/blog/comment", method="POST",
+                          request_headers={}, request_body="csrf=x&postId=7&comment=hi",
+                          response_status=200, response_headers={}, response_body="")
+        cands = v._source_page_candidates(ex)
+        self.assertIn("https://shop.test/blog?postId=7", cands)
+
+
 class RegistryTests(unittest.TestCase):
     def test_stored_xss_registered_and_active(self):
         from harness.validators.registry import ValidatorRegistry

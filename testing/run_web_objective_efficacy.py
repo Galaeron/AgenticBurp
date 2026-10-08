@@ -200,7 +200,7 @@ def orchestrate(manifest: dict[str, Any], targets: dict[str, str], *, mode: str,
 
     run = assemble_run(mode, attempts, run_id=run_id)
     excluded = run.pop("_excluded_verified", [])
-    scorecard = wob.score(manifest, run)
+    scorecard = wob.score(manifest, run, artifact_root=output_dir)
     scorecard["excluded_verified_attempts"] = excluded
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -224,6 +224,7 @@ def render_summary(scorecard: dict[str, Any]) -> str:
         f"- **Eligible: {scorecard.get('eligible')}** "
         f"(complete={gates.get('complete_records')}, "
         f"zero_false_confirmations={gates.get('zero_false_confirmations')}, "
+        f"zero_wrong_class_confirmations={gates.get('zero_wrong_class_confirmations')}, "
         f"zero_human_interventions={gates.get('zero_human_interventions')}, "
         f"healthy_execution={gates.get('healthy_execution')})",
         "",

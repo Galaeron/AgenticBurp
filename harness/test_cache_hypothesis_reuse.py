@@ -23,6 +23,7 @@ Covers:
      exactly as before this feature existed -- every run re-dispatches.
 """
 import json
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -172,7 +173,7 @@ class CrossRunHypothesisReuseTests(_HypothesisCacheTestBase):
         exchange = _exchange(host)
 
         rc1 = _fresh_run_context(orch, host)
-        resp1 = await orch.analyze(exchange, run_context=rc1)
+        resp1 = await orch.analyze(exchange, run_context=rc1, engagement_id=host)
         calls_after_run1 = stub.calls
         self.assertGreater(
             calls_after_run1, 0,
@@ -181,7 +182,7 @@ class CrossRunHypothesisReuseTests(_HypothesisCacheTestBase):
         )
 
         rc2 = _fresh_run_context(orch, host)
-        resp2 = await orch.analyze(exchange, run_context=rc2)
+        resp2 = await orch.analyze(exchange, run_context=rc2, engagement_id=host)
 
         self.assertEqual(
             stub.calls, calls_after_run1,
@@ -235,9 +236,9 @@ class CrossRunHypothesisReuseTests(_HypothesisCacheTestBase):
         exchange = _exchange(host)
 
         rc1 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc1)
+        await orch.analyze(exchange, run_context=rc1, engagement_id=host)
 
-        exchange_hash = cache.ExchangeCache.compute_exchange_hash(exchange, namespace="")
+        exchange_hash = cache.ExchangeCache.compute_exchange_hash(exchange, namespace=json.dumps([host, hashlib.sha256(b"").hexdigest()]))
         conn = sqlite3.connect(str(cache.get_cache()._DB_PATH))
         try:
             row = conn.execute(
@@ -283,7 +284,7 @@ class HypothesisCacheNegativeControlTests(_HypothesisCacheTestBase):
         exchange = _exchange(host)
 
         rc1 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc1)
+        await orch.analyze(exchange, run_context=rc1, engagement_id=host)
         calls_after_run1 = stub.calls
         self.assertGreater(calls_after_run1, 0)
 
@@ -293,7 +294,7 @@ class HypothesisCacheNegativeControlTests(_HypothesisCacheTestBase):
         orch.config["_fr7_negative_control_marker"] = "changed"
 
         rc2 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc2)
+        await orch.analyze(exchange, run_context=rc2, engagement_id=host)
 
         self.assertGreater(
             stub.calls, calls_after_run1,
@@ -307,14 +308,14 @@ class HypothesisCacheNegativeControlTests(_HypothesisCacheTestBase):
         exchange = _exchange(host)
 
         rc1 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc1)
+        await orch.analyze(exchange, run_context=rc1, engagement_id=host)
         calls_after_run1 = stub.calls
         self.assertGreater(calls_after_run1, 0)
 
         orch.coordinator_model = orch.coordinator_model + "-changed"
 
         rc2 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc2)
+        await orch.analyze(exchange, run_context=rc2, engagement_id=host)
 
         self.assertGreater(
             stub.calls, calls_after_run1,
@@ -328,7 +329,7 @@ class HypothesisCacheNegativeControlTests(_HypothesisCacheTestBase):
         exchange = _exchange(host)
 
         rc1 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc1)
+        await orch.analyze(exchange, run_context=rc1, engagement_id=host)
         calls_after_run1 = stub.calls
         self.assertGreater(calls_after_run1, 0)
 
@@ -336,7 +337,7 @@ class HypothesisCacheNegativeControlTests(_HypothesisCacheTestBase):
         sqli_agent._prompt_version = lambda: "changed-prompt-version"
 
         rc2 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc2)
+        await orch.analyze(exchange, run_context=rc2, engagement_id=host)
 
         self.assertGreater(
             stub.calls, calls_after_run1,
@@ -357,12 +358,12 @@ class HypothesisCacheDefaultOffTests(_HypothesisCacheTestBase):
         exchange = _exchange(host)
 
         rc1 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc1)
+        await orch.analyze(exchange, run_context=rc1, engagement_id=host)
         calls_after_run1 = stub.calls
         self.assertGreater(calls_after_run1, 0)
 
         rc2 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc2)
+        await orch.analyze(exchange, run_context=rc2, engagement_id=host)
 
         self.assertGreater(
             stub.calls, calls_after_run1,
@@ -392,12 +393,12 @@ class HypothesisCacheDefaultOffTests(_HypothesisCacheTestBase):
 
         exchange = _exchange(host)
         rc1 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc1)
+        await orch.analyze(exchange, run_context=rc1, engagement_id=host)
         calls_after_run1 = stub.calls
         self.assertGreater(calls_after_run1, 0)
 
         rc2 = _fresh_run_context(orch, host)
-        await orch.analyze(exchange, run_context=rc2)
+        await orch.analyze(exchange, run_context=rc2, engagement_id=host)
 
         self.assertGreater(stub.calls, calls_after_run1)
 
@@ -430,8 +431,8 @@ class FailedStageNotCachedTests(_HypothesisCacheTestBase):
         with patch.object(orch.analysis_pipeline, "run_full_analysis", new=pipeline), \
              patch.object(orch, "_choose_agents",
                           new=AsyncMock(return_value=(["sqli"], "audit"))):
-            first = await orch.analyze(exchange, run_context=_fresh_run_context(orch, host))
-            second = await orch.analyze(exchange, run_context=_fresh_run_context(orch, host))
+            first = await orch.analyze(exchange, run_context=_fresh_run_context(orch, host), engagement_id=host)
+            second = await orch.analyze(exchange, run_context=_fresh_run_context(orch, host), engagement_id=host)
 
         self.assertTrue(
             first.degraded,

@@ -224,9 +224,9 @@ _JAVA_ONLY: tuple[CapabilityOwnership, ...] = (
                     "the only one of the two planes reachable, and today runs with no Python "
                     "SafetyGate/evidence-ledger visibility at all -- worth owner attention "
                     "independent of the dual-plane drift concern RB-6 is about."),
-    _java_only("nosql_injection", "nosql_validation",
-               note="No harness/validators/*.py implements a NoSQL-injection leg; "
-                    "harness/validators/registry.py has no 'nosql' entry."),
+    _dual("nosql_injection", "nosql", "nosql_validation",
+          note="Python confirms login operator injection with fresh-token positive/negative "
+               "differentials and administrator readback; Java retains its executor."),
 )
 
 # ---------------------------------------------------------------------------
@@ -235,6 +235,14 @@ _JAVA_ONLY: tuple[CapabilityOwnership, ...] = (
 _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
     _python_only("recon", "recon",
                  note="Active reconnaissance / attack-surface mapping; no Java equivalent."),
+    _python_only("idor_read", "idor_read",
+                 note="Read-only object-identifier substitution with differential response "
+                      "comparison; no Java case."),
+    _python_only("client_trust", "client_trust",
+                 note="Excessive trust in client-side controls: tampers a server-owned "
+                      "price/amount/total field and confirms the server reflects the "
+                      "attacker-chosen value back on an independent read "
+                      "(client_trust_validator.py); no Java case."),
     _python_only("path_traversal", "path_traversal",
                  note="In-band canonical-file-read traversal leg; no Java case."),
     _python_only("mass_assignment_sequence", "sequence",

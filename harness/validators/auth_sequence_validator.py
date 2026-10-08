@@ -45,6 +45,13 @@ _PASS_KEYS = ("password", "pass", "passwd", "pwd")
 _WEAK_PASSWORD = "123456"
 # Session-cookie name heuristics.
 _SESSION_COOKIE_RE = re.compile(r"sess|sid|token|auth|jwt|sid|phpsessid|connect", re.I)
+# A page/redirect that is asking for a SECOND authentication factor (so the session
+# that reached it has only completed step 1, username+password).
+_MFA_MARKERS = re.compile(
+    r"login2|/mfa|/2fa|/otp|verif(?:y|ication)\s*code|security\s*code|authentication\s*code|"
+    r"one[\s-]*time\s*(?:code|password)|\botp\b|two[\s-]*factor|multi[\s-]*factor|2fa", re.I)
+# Post-authentication resources to probe for reachability before the 2nd factor.
+_PROTECTED_CANDIDATES = ("/my-account", "/account", "/dashboard", "/profile", "/home", "/settings")
 
 
 def _parse_body(exchange: HttpExchange):
@@ -98,6 +105,8 @@ class AuthSequenceValidator(Validator):
         "weak_password", "weak password", "weak password policy", "weak_password_policy",
         "username_enumeration", "username enumeration", "user enumeration", "user_enumeration",
         "account enumeration",
+        "2fa_bypass", "2fa bypass", "mfa_bypass", "mfa bypass", "two_factor_bypass",
+        "two-factor bypass", "multi_factor_bypass", "second factor bypass",
         "broken_authentication", "broken authentication", "authentication",
     }
     active = True
@@ -140,6 +149,8 @@ class AuthSequenceValidator(Validator):
             return ["weak"]
         if "enum" in low:
             return ["enum"]
+        if "2fa" in low or "mfa" in low or "two" in low or "multi" in low or "second factor" in low:
+            return ["mfa"]
         # Generic "broken authentication" — run all applicable checks.
         path = urlsplit(exchange.url).path.lower()
         fields, _ = _parse_body(exchange)
@@ -151,6 +162,9 @@ class AuthSequenceValidator(Validator):
             checks.append("fixation")
             if _find_key(fields, _USER_KEYS):
                 checks.append("enum")
+            # A password present + a login (not register) flow may gate a 2nd factor.
+            if _find_key(fields, _PASS_KEYS):
+                checks.append("mfa")
         return checks
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
@@ -167,6 +181,8 @@ class AuthSequenceValidator(Validator):
                     result = await self._check_session_fixation(exchange)
                 elif check == "weak":
                     result = await self._check_weak_password(exchange)
+                elif check == "mfa":
+                    result = await self._check_mfa_bypass(exchange)
                 else:
                     result = await self._check_username_enum(exchange)
                 if result.confirmed:
@@ -220,6 +236,125 @@ class AuthSequenceValidator(Validator):
                 evidence=f"A pre-auth session cookie {list(pre_cookies)} existed but login set no new "
                          f"session cookie, so the pre-auth id remains in force post-authentication.")
         return self._not("session id rotated on login (no fixation)", fc)
+
+    # --- 2FA / MFA bypass -----------------------------------------------------
+    async def _check_mfa_bypass(self, exchange) -> ValidationResult:
+        """A step-1 (username+password) login that lands on a SECOND-factor step but
+        whose resulting session already reaches a protected resource -- the 2nd factor
+        is not enforced on the session. Confirmation is safe (GET-only reads): the
+        protected page is reachable with the partial session yet denied with none.
+        Control (enforcing MFA): the protected page redirects back to the 2FA step,
+        so it is non-substantive and this stays un-confirmed."""
+        fc = "2fa_bypass"
+        from harness.missing_auth_probe import _substantive
+        method = (exchange.method or "POST").upper()
+        fields, _ = _parse_body(exchange)
+        ukey = _find_key(fields, _USER_KEYS)
+        username = str(fields.get(ukey) or "").strip() if ukey else ""
+        p = urlsplit(exchange.url)
+        origin = f"{p.scheme}://{p.netloc}"
+
+        async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                    follow_redirects=False, verify=False) as client:
+            # Step 1: submit username + password. A CSRF-bound login needs a token
+            # minted in THIS session, so refresh it from the login page first (the
+            # captured token is bound to the crawl's session). The client's jar then
+            # carries the matching session cookie into the POST.
+            body = await self._refresh_login_body(client, exchange)
+            resp = await self._send(client, method, exchange.url, self._headers(exchange), body)
+            loc = resp.headers.get("location", "") or ""
+            at_mfa = bool(_MFA_MARKERS.search(loc))
+            if not at_mfa and loc:
+                nxt = loc if loc.startswith("http") else (origin + loc if loc.startswith("/") else None)
+                if nxt:
+                    try:
+                        page = await self._send(client, "GET", nxt, self._headers(exchange), None)
+                        at_mfa = bool(_MFA_MARKERS.search((page.text or "")[:2000]))
+                    except httpx.HTTPError:
+                        pass
+            if not at_mfa:
+                return self._not("login did not present a second authentication factor; MFA-bypass N/A", fc)
+
+            # Step 2 (the 2FA code) is DELIBERATELY skipped. Probe protected resources
+            # with the partial, step-1-only session.
+            candidates = ([f"/my-account?id={username}"] if username else []) + list(_PROTECTED_CANDIDATES)
+            seen = set()
+            for path in candidates:
+                if path in seen:
+                    continue
+                seen.add(path)
+                url = origin + path
+                try:
+                    got = await self._send(client, "GET", url, self._headers(exchange), None)
+                except httpx.HTTPError:
+                    continue
+                body = got.text or ""
+                low = body.lower()
+                # Require a POSITIVE authenticated-session signal (a logout control or
+                # the account's own username). This distinguishes the real account page
+                # from a served 2FA-prompt page, without keying on page chrome (the lab
+                # title/nav can mention "2fa") -- an enforcing app shows a code prompt
+                # here, not the logged-in account, so it lacks this signal.
+                authed = ("log out" in low or "logout" in low
+                          or (username and username.lower() in low))
+                if not (_substantive(got.status_code, body) and authed):
+                    continue
+                # Control: the same resource with NO session must be denied, else it is
+                # simply public (not a bypass).
+                async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                            follow_redirects=False, verify=False) as anon:
+                    try:
+                        anon_got = await self._send(anon, "GET", url, self._headers(exchange), None)
+                        anon_ok = _substantive(anon_got.status_code, anon_got.text or "")
+                    except httpx.HTTPError:
+                        anon_ok = False
+                if anon_ok:
+                    continue
+                return ValidationResult(
+                    self.name, "confirmed", fc, confidence=0.9, confirmed=True,
+                    summary=f"Two-factor authentication bypass confirmed: {path} is reachable with a session "
+                            f"that only completed step 1 (username+password), before the second factor.",
+                    evidence=f"Login required a second factor (marker in the login response/redirect), yet "
+                             f"GET {url} returned authenticated content (HTTP {got.status_code}) while the same "
+                             f"path with no session was denied. The protected page is reachable without the "
+                             f"2FA code -- the second factor is not enforced on the session.")
+        return self._not("no protected resource reachable before the second factor", fc)
+
+    async def _refresh_login_body(self, client, exchange) -> str:
+        """Return the login body with any CSRF field replaced by a token freshly
+        minted in THIS client's session (GET the login page). No csrf field, or the
+        page cannot be read, -> the captured body unchanged."""
+        fields, kind = _parse_body(exchange)
+        csrf_key = next((k for k in fields if re.search(r"csrf|xsrf|authenticity|_token|nonce", k, re.I)), None)
+        if csrf_key is None:
+            return exchange.request_body
+
+        from harness.validators.source_form import fetch_source_form, CSRF_FIELD_RE
+
+        def select(forms):
+            # First form carrying a (non-empty) matching field -- same rule as
+            # the original inline loop: the FIRST name-matching field in a form
+            # is taken, so a form whose only matching field is empty is skipped
+            # entirely (not its other fields).
+            for f in forms:
+                tok = next((fld.value for fld in f.fields
+                            if fld.name == csrf_key or CSRF_FIELD_RE.search(fld.name or "")), None)
+                if tok:
+                    return f
+            return None
+
+        try:
+            found = await fetch_source_form(client, [exchange.url], self._headers(exchange), select)
+        except Exception:
+            return exchange.request_body
+        if found is None:
+            return exchange.request_body
+        tok = next((fld.value for fld in found.form.fields
+                    if fld.name == csrf_key or CSRF_FIELD_RE.search(fld.name or "")), None)
+        if not tok:
+            return exchange.request_body
+        updated = dict(fields); updated[csrf_key] = tok
+        return _encode(updated, kind)
 
     # --- weak password policy -------------------------------------------------
     async def _check_weak_password(self, exchange) -> ValidationResult:

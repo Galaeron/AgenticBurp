@@ -2,6 +2,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import asyncio
+import time
 import httpx
 from dataclasses import dataclass
 
@@ -45,8 +47,9 @@ class OllamaResult:
     not assumed. See effort.EffortLedger, which is what these numbers are
     for."""
     data: dict
-    prompt_tokens: int
-    completion_tokens: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    measurement: dict | None = None
 
 
 def _strip_json_fence(s: str) -> str:
@@ -129,12 +132,18 @@ class OllamaClient:
         # client already reads off each response for logging. Every model call in
         # the harness (agents, coordinator, critique) goes through one
         # OllamaClient, so these totals capture a whole run's model cost without
-        # depending on the effort budget (whose agent-token wiring is currently
-        # inert -- AgentManager._effort_budget is never set). Read-only counters;
-        # they change no control flow, no gating, and no request payload.
+        # Run-owned accounting lives in the caller's EffortBudget. These client
+        # lifetime counters are diagnostics; token sums are known lower bounds
+        # when model_unknown_usage_count is nonzero. model_call_count counts
+        # usable JSON responses; attempted/completed/error/cancelled are separate.
         self.model_call_count = 0
         self.model_prompt_tokens = 0
         self.model_completion_tokens = 0
+        self.model_attempted_count = 0
+        self.model_completed_count = 0
+        self.model_error_count = 0
+        self.model_cancelled_count = 0
+        self.model_unknown_usage_count = 0
 
         # Initialize circuit breaker. Uses the shared-registry accessor
         # (not `OllamaCircuitBreaker(...)` directly) so that every
@@ -172,12 +181,40 @@ class OllamaClient:
         # Initialize audit logger
         self.audit_logger = audit_logger.get_audit_logger()
 
-    async def _chat(
+    async def _chat(self, model, system_prompt, user_prompt, temperature=0.1):
+        """Keep consumption independent of successful JSON parsing."""
+        started = time.monotonic()
+        self.model_attempted_count += 1
+        measurement = {"prompt_tokens": None, "completion_tokens": None,
+                       "attempted": True, "completed": False, "usable": False,
+                       "queue_ms": None, "connection_ms": None,
+                       "generation_ms": None, "wall_ms": None, "outcome": "error"}
+        try:
+            parsed, raw = await self._chat_impl(model, system_prompt, user_prompt,
+                                               temperature, measurement)
+            measurement["usable"] = True
+            measurement["outcome"] = "ok"
+            self.model_call_count += 1
+            return parsed, raw
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                measurement["outcome"] = "cancelled"
+                self.model_cancelled_count += 1
+            else:
+                self.model_error_count += 1
+            # This receipt contains only counts/timing/state, never response text.
+            setattr(exc, "inference_usage", measurement)
+            raise
+        finally:
+            measurement["wall_ms"] = (time.monotonic() - started) * 1000.0
+
+    async def _chat_impl(
         self,
         model: str,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
+        measurement: dict | None = None,
     ) -> tuple[dict, dict]:
         """Shared implementation. Returns (parsed_json_body, raw_response_dict)
         so callers needing usage fields don't have to make a second call.
@@ -188,6 +225,8 @@ class OllamaClient:
         - Rate limiting (prevents overloading)
         - Audit logging (tracks all LLM interactions)
         """
+        from harness.security import sanitize_for_inference, safe_error_summary
+        system_prompt, user_prompt = sanitize_for_inference(system_prompt, user_prompt)
         # Validate prompts
         try:
             validated_system = self.prompt_validator.validate_system_prompt(system_prompt)
@@ -195,10 +234,10 @@ class OllamaClient:
         except prompt_validator.ValidationError as e:
             self.audit_logger.log_security_event(
                 event_type="prompt_validation_failed",
-                message=f"Prompt validation failed: {e}",
+                message=f"Prompt validation failed: {safe_error_summary(e)}",
                 severity="error",
             )
-            raise OllamaError(f"Prompt validation failed: {e}") from e
+            raise OllamaError(f"Prompt validation failed: {safe_error_summary(e)}") from e
         
         # Log the prompt
         self.audit_logger.log_llm_prompt(
@@ -244,20 +283,21 @@ class OllamaClient:
         # this call is governed by THAT run's isolated breaker; otherwise it
         # falls back to self.circuit_breaker -- the same process-wide shared
         # singleton this always used, unchanged for every no-run caller.
+        queue_started = time.monotonic()
         breaker = circuit_breaker.current_ollama_breaker("ollama")
         async with breaker:
             async with self.rate_limiter:
+                measurement["queue_ms"] = (time.monotonic() - queue_started) * 1000.0
                 try:
                     async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                         resp = await client.post(url, json=payload)
                 except httpx.ConnectError as e:
                     self.audit_logger.log_llm_error(
                         model=model,
-                        error=e,
+                        error=OllamaError(safe_error_summary(e)),
                     )
                     raise OllamaError(
-                        f"Could not reach Ollama at {self.base_url}. "
-                        f"Is `ollama serve` running? ({e})"
+                        "Could not reach configured Ollama service"
                     ) from e
                 except httpx.TimeoutException as e:
                     self.audit_logger.log_llm_error(
@@ -272,7 +312,7 @@ class OllamaClient:
                     # OllamaModelNotFoundError's own docstring for why this
                     # must not count as a circuit-breaker failure.
                     err = OllamaModelNotFoundError(
-                        f"Model '{model}' not found on this Ollama instance: {resp.text[:500]}"
+                        f"Model '{model}' not found on this Ollama instance"
                     )
                     self.audit_logger.log_llm_error(model=model, error=err)
                     raise err
@@ -280,52 +320,57 @@ class OllamaClient:
                 if resp.status_code != 200:
                     self.audit_logger.log_llm_error(
                         model=model,
-                        error=OllamaError(f"Ollama returned HTTP {resp.status_code}: {resp.text[:500]}"),
+                        error=OllamaError(f"Ollama returned HTTP {resp.status_code}"),
                     )
-                    raise OllamaError(f"Ollama returned HTTP {resp.status_code}: {resp.text[:500]}")
+                    raise OllamaError(f"Ollama returned HTTP {resp.status_code}")
 
                 data = resp.json()
+                if not isinstance(data, dict):
+                    raise OllamaInvalidJSONError("Ollama returned an invalid response envelope")
+                def count(key):
+                    value = data.get(key)
+                    return value if type(value) is int and value >= 0 else None
+                prompt_tokens, completion_tokens = count("prompt_eval_count"), count("eval_count")
+                measurement.update(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                                   completed=True)
+                duration = data.get("eval_duration")
+                if type(duration) in (int, float) and duration >= 0:
+                    measurement["generation_ms"] = duration / 1_000_000.0
+                data["_inference_measurement"] = measurement
+                self.model_completed_count += 1
+                self.model_prompt_tokens += prompt_tokens or 0
+                self.model_completion_tokens += completion_tokens or 0
+                if prompt_tokens is None or completion_tokens is None:
+                    self.model_unknown_usage_count += 1
+                self.rate_limiter.record_usage(prompt_tokens, completion_tokens)
                 content = data.get("message", {}).get("content", "")
                 if not content:
                     self.audit_logger.log_llm_error(
                         model=model,
-                        error=OllamaError(f"Ollama returned an empty message body: {data}"),
+                        error=OllamaError("Ollama returned an empty message body"),
                     )
-                    raise OllamaError(f"Ollama returned an empty message body: {data}")
+                    raise OllamaError("Ollama returned an empty message body")
 
                 try:
                     parsed = _loads_lenient(_strip_json_fence(content))
+                    if not isinstance(parsed, dict):
+                        raise OllamaInvalidJSONError("Model output must be a JSON object")
 
                     # Log the response
-                    prompt_tokens = data.get("prompt_eval_count", 0) or 0
-                    completion_tokens = data.get("eval_count", 0) or 0
                     self.audit_logger.log_llm_response(
-                        model=model,
-                        response=content,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
+                        model=model, response=content,
+                        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                     )
                     
-                    # Record token usage
-                    self.rate_limiter.record_usage(prompt_tokens, completion_tokens)
-
-                    # Instrumentation only (see __init__): a successful model
-                    # call plus its real token usage. Counted here, after a
-                    # parse, so it reflects calls that actually returned usable
-                    # output; failures raise above and are not counted.
-                    self.model_call_count += 1
-                    self.model_prompt_tokens += prompt_tokens
-                    self.model_completion_tokens += completion_tokens
-
                     return parsed, data
                 except json.JSONDecodeError as e:
                     self.audit_logger.log_llm_error(
                         model=model,
-                        error=e,
+                        error=OllamaError(safe_error_summary(e)),
                     )
                     raise OllamaInvalidJSONError(
                         f"Model '{model}' did not return valid JSON. "
-                        f"Raw content (truncated): {content[:500]}"
+                        "Response content omitted."
                     ) from e
 
     async def list_models(self) -> list[str]:
@@ -347,6 +392,25 @@ class OllamaClient:
         models = data.get("models", []) if isinstance(data, dict) else []
         names = [m.get("name") for m in models if isinstance(m, dict) and m.get("name")]
         return sorted(set(names))
+
+    async def health_check(self, timeout: float = 3.0) -> dict:
+        """Fast liveness probe for GET /health: is the Ollama backend reachable,
+        and which model tags does it report? Best-effort and short-timeout (never
+        the full inference timeout) so the health endpoint answers quickly even
+        when Ollama is down. Returns {"reachable": bool, "models": [..],
+        "error": str|None}. A refused connection (the common 'ollama not running'
+        case) resolves near-instantly; `error` carries a short reason otherwise."""
+        url = f"{self.base_url}/api/tags"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
+            return {"reachable": False, "models": [], "error": f"{type(e).__name__}: {e}"}
+        models = data.get("models", []) if isinstance(data, dict) else []
+        names = sorted({m.get("name") for m in models if isinstance(m, dict) and m.get("name")})
+        return {"reachable": True, "models": names, "error": None}
 
     async def chat_json(
         self,
@@ -375,14 +439,13 @@ class OllamaClient:
         Same as chat_json, but also returns real token usage
         (prompt_eval_count / eval_count from Ollama's own response) so the
         caller can feed effort.EffortLedger with actual numbers instead of
-        the unmeasured priors in effort._DEFAULT_TOKEN_ESTIMATE. Falls back
-        to 0/0 if Ollama's response is missing these fields (older server
-        versions, or a proxy that strips them) rather than raising --
-        losing calibration data isn't worth failing an otherwise-successful
-        call over.
+        the unmeasured priors in effort._DEFAULT_TOKEN_ESTIMATE. Missing or
+        invalid counts remain None; successful output can still be used.
+        A sanitized measurement receipt accompanies errors as inference_usage,
+        so returned counts survive output-parsing failures.
         """
         parsed, raw = await self._chat(model, system_prompt, user_prompt, temperature)
-        prompt_tokens = raw.get("prompt_eval_count", 0) or 0
-        completion_tokens = raw.get("eval_count", 0) or 0
-        return OllamaResult(data=parsed, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+        measurement = raw["_inference_measurement"]
+        return OllamaResult(data=parsed, prompt_tokens=measurement["prompt_tokens"],
+                            completion_tokens=measurement["completion_tokens"], measurement=measurement)
 

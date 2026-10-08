@@ -26,6 +26,11 @@ testing/**/*.db
 testing/**/scorecard.json
 testing/**/fixture/
 
+# Captured eval corpora (regenerable via capture_exchanges.py against the
+# committed app). Kept out of git: captures carry fixture session tokens/JWTs,
+# and committing the tuned corpus is what would make the benchmark non-blind.
+testing/**/corpus/
+
 # Nightly CPU-only precision-plumbing check's output (P0.10, regenerated per CI run)
 /SCORECARD.md
 
@@ -38,3 +43,13 @@ testing/**/uploads/
 # Local test environments and editable-install metadata
 .venv*/
 *.egg-info/
+
+# Local Claude Code settings (personal, not committed)
+.claude/settings.local.json
+
+# External tooling checkouts + build/test caches (never source; these account
+# for 31k+ untracked files -- competitor repos, a Go build cache, pytest temp
+# dirs -- and must never be committed).
+.audit-external/
+*pytest-tmp/
+live-*-pytest-tmp/

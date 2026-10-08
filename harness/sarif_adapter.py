@@ -56,12 +56,62 @@ _REQUIRED_RUN_KEYS = ("tool", "results")
 def _observation_type(issue_export: dict) -> str:
     """R09: driven by the OWN issue export's oracle-verification state, not
     just the legacy `confirmed` flag -- so an oracle-verified finding and a
-    merely leg-confirmed one are no longer indistinguishable on export."""
+    merely leg-confirmed one are no longer indistinguishable on export.
+
+    R16: a confirmed finding whose class has NO deterministic leg (a passive
+    header/content check such as CORS/CSP) is a confirmed OBSERVATION -- the
+    same distinction the Markdown report draws ("Confirmed Observations" vs
+    "Confirmed Exploits") -- not a "confirmed_exploit"."""
     if issue_export.get("oracle_verified") or issue_export.get("verification_state") == "verified":
         return "oracle_verified"
     if issue_export.get("confirmed"):
+        if issue_export.get("evidence_maturity") == "confirmed_observation":
+            return "confirmed_observation"
         return "confirmed_exploit"
     return "candidate"
+
+
+# R16: the evidence-maturity vocabulary confirmation_gate.finding_triage can emit,
+# and the visible (message-text, not property-bag) marker an UNCONFIRMED result
+# carries so a SARIF viewer that shows only `level` + `message` cannot read an
+# unverified or negatively-reviewed HIGH-impact result as a confirmation. The
+# marker is derived from the harness-owned maturity, never from model text.
+_KNOWN_MATURITIES = frozenset({
+    "confirmed", "confirmed_observation", "controlled_negative", "review_rejected",
+    "unverified", "unverified_no_leg",
+})
+_MESSAGE_MARKER_BY_MATURITY = {
+    "unverified_no_leg": "[UNVERIFIED: no confirmation leg; manual verification] ",
+    "unverified": "[UNVERIFIED: confirmation not established; manual verification] ",
+    "controlled_negative": "[NOT CONFIRMED: controlled negative] ",
+    "review_rejected": "[NOT CONFIRMED: review rejected] ",
+}
+
+
+def _effective_state(issue_export: dict) -> tuple[str, str]:
+    """(evidence_maturity, triage_priority) a SARIF result may truthfully carry.
+
+    Fail-safe at the export boundary: an unknown/missing maturity is
+    "unverified", and a confirmed* maturity is honoured only when the
+    harness-owned `confirmed`/oracle fields agree (observation_type != candidate)
+    -- an export dict cannot self-declare a confirmation. Unverified states
+    always carry the manual-verification priority."""
+    maturity = issue_export.get("evidence_maturity") or "unverified"
+    priority = issue_export.get("triage_priority") or "manual_verification"
+    if maturity not in _KNOWN_MATURITIES:
+        maturity = "unverified"
+    if maturity.startswith("confirmed") and _observation_type(issue_export) == "candidate":
+        maturity = "unverified"
+    if maturity.startswith("unverified"):
+        priority = "manual_verification"
+    return maturity, priority
+
+
+def _message_marker(issue_export: dict) -> str:
+    """Visible unconfirmed-state prefix for the result message ("" when confirmed)."""
+    if _observation_type(issue_export) != "candidate":
+        return ""
+    return _MESSAGE_MARKER_BY_MATURITY.get(_effective_state(issue_export)[0], "")
 
 
 def _uri_for(issue_export: dict) -> str:
@@ -94,6 +144,7 @@ def export_issues_to_sarif(issue_exports: list[dict], *, source_revision: str = 
     rules_by_id: dict[str, dict] = {}
     results = []
     for exp in issue_exports:
+        maturity, priority = _effective_state(exp)
         rule_id = exp.get("vulnerability_class", "unknown")
         rules_by_id.setdefault(rule_id, {
             "id": rule_id, "name": rule_id,
@@ -102,12 +153,13 @@ def export_issues_to_sarif(issue_exports: list[dict], *, source_revision: str = 
         results.append({
             "ruleId": rule_id,
             "level": _LEVEL_BY_SEVERITY.get((exp.get("severity") or "info").lower(), "note"),
-            "message": {"text": exp.get("title", "") or exp.get("evidence", "")},
+            "message": {"text": _message_marker(exp) + (exp.get("title", "") or exp.get("evidence", ""))},
             "locations": [{
                 "physicalLocation": {"artifactLocation": {"uri": _uri_for(exp)}},
             }],
             "properties": {
                 "issue_id": exp.get("issue_id", ""),
+                "captured_auth_contexts": exp.get("captured_auth_contexts", []),
                 "observation_type": _observation_type(exp),
                 "evidence_refs": exp.get("proof_references", []),
                 "sourceRevision": source_revision,
@@ -118,6 +170,9 @@ def export_issues_to_sarif(issue_exports: list[dict], *, source_revision: str = 
                 "requestMethod": exp.get("method", ""),
                 "affectedInput": exp.get("affected_input", ""),
                 "originalSeverity": exp.get("severity", ""),
+                "evidence_maturity": maturity,
+                "triage_priority": priority,
+                "impact_severity": exp.get("impact_severity", exp.get("severity", "info")),
                 "propertiesSchemaVersion": "1",
             },
         })

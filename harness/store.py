@@ -4,12 +4,60 @@ import time
 import random
 import hashlib
 import json
+import contextvars
+import functools
+import hmac
+import secrets
 from pathlib import Path
 from urllib.parse import urlparse
 
 from harness.models import HttpExchange, Finding, TestPlan, ValidationSubmission
 
 _DB_PATH = Path(__file__).parent / "harness_state.db"
+_CURRENT_ENGAGEMENT = contextvars.ContextVar("passive_engagement_owner", default="")
+_CURRENT_CAPTURED_PRINCIPAL = contextvars.ContextVar("passive_captured_auth_context", default="")
+
+
+def isolate_engagement_context(fn):
+    """Keep passive record attribution local to one async caller's lifetime."""
+    @functools.wraps(fn)
+    async def wrapped(*args, **kwargs):
+        token = _CURRENT_ENGAGEMENT.set("")
+        principal_token = _CURRENT_CAPTURED_PRINCIPAL.set("")
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _CURRENT_ENGAGEMENT.reset(token)
+            _CURRENT_CAPTURED_PRINCIPAL.reset(principal_token)
+    return wrapped
+
+
+def bind_engagement_context(engagement_id: str) -> None:
+    _CURRENT_ENGAGEMENT.set(_engagement_partition(engagement_id))
+
+
+def bind_captured_principal_context(principal: str) -> None:
+    _CURRENT_CAPTURED_PRINCIPAL.set(principal)
+
+
+def captured_principal_id(exchange: HttpExchange) -> str:
+    """Opaque captured-auth context, never an authenticated identity/authority.
+
+    Recognized credential headers distinguish contexts conservatively. Custom
+    authentication schemes are unsupported. Anonymous means no recognized
+    credential header, not proof that the application treats the user as anonymous.
+    """
+    from harness import security
+    credentials = sorted((name.lower(), value) for name, value in exchange.request_headers.items()
+                         if name.lower() in security.SECRET_HEADER_NAMES)
+    if not credentials:
+        return "anonymous"
+    conn = _connect()
+    try:
+        key = bytes.fromhex(conn.execute("SELECT value FROM state_metadata WHERE name='principal-hmac-v1'").fetchone()[0])
+    finally:
+        conn.close()
+    return "captured:" + hmac.new(key, json.dumps(credentials).encode(), hashlib.sha256).hexdigest()
 
 # W-9: bump when finding_fingerprint's formula changes, so _connect re-fingerprints
 # existing rows once (guarded by PRAGMA user_version).
@@ -29,7 +77,7 @@ def _normalize_endpoint(url: str) -> str:
 
 def finding_fingerprint(host: str, method: str, url: str, vulnerability_class: str,
                         *, parameter_location: str = "", parameter_name: str = "",
-                        principal_id: str = "") -> str:
+                        principal_id: str = "", engagement_id: str = "") -> str:
     """Stable STRUCTURAL identity for a finding (W-9).
 
     Keyed on canonical vulnerability class + host + normalized endpoint +
@@ -41,7 +89,7 @@ def finding_fingerprint(host: str, method: str, url: str, vulnerability_class: s
     """
     from harness.categories import canonicalize
     check = canonicalize(vulnerability_class) or (vulnerability_class or "").lower()
-    return hashlib.sha256("\x1f".join([
+    fingerprint = hashlib.sha256("\x1f".join([
         host or "",
         (method or "").upper(),
         _normalize_endpoint(url),
@@ -53,6 +101,9 @@ def finding_fingerprint(host: str, method: str, url: str, vulnerability_class: s
         parameter_name or "",
         principal_id or "",
     ]).encode("utf-8")).hexdigest()
+    if engagement_id:
+        return hashlib.sha256(json.dumps([_engagement_partition(engagement_id), fingerprint]).encode()).hexdigest()
+    return fingerprint
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS findings (
@@ -82,6 +133,8 @@ CREATE TABLE IF NOT EXISTS findings (
     oracle_capsule_id TEXT NOT NULL DEFAULT '',
     exchange_id TEXT NOT NULL DEFAULT '',
     run_id TEXT NOT NULL DEFAULT '',
+    engagement_id TEXT NOT NULL DEFAULT '',
+    captured_principal_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_findings_host ON findings(host);
@@ -210,6 +263,8 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     summary TEXT NOT NULL DEFAULT '',
     data_json TEXT NOT NULL DEFAULT '{}',
     provenance_json TEXT NOT NULL DEFAULT '{}',
+    engagement_id TEXT NOT NULL DEFAULT '',
+    captured_principal_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_finding_ref ON ledger_events(finding_ref);
@@ -344,6 +399,11 @@ def _connect() -> sqlite3.Connection:
                 raise
             last_exc = exc
             time.sleep(_CONNECT_RETRY_BASE_SLEEP * (attempt + 1) + random.random() * 0.01)
+        except BaseException:
+            # Setup can fail outside SQLite's OperationalError class too.
+            # Ownership transfers to the caller only after successful setup.
+            conn.close()
+            raise
     assert last_exc is not None  # loop only exits early via return/raise
     raise last_exc
 
@@ -362,6 +422,21 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_LEDGER_SCHEMA)
     conn.executescript(_EVIDENCE_BLOB_SCHEMA)
     conn.executescript(_WORK_ITEM_SCHEMA)
+    conn.execute("CREATE TABLE IF NOT EXISTS state_metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('principal-hmac-v1', ?)", (secrets.token_hex(32),))
+    ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
+    if "engagement_id" not in ledger_cols:
+        try:
+            conn.execute("ALTER TABLE ledger_events ADD COLUMN engagement_id TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
+    if "captured_principal_id" not in ledger_cols:
+        try:
+            conn.execute("ALTER TABLE ledger_events ADD COLUMN captured_principal_id TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -407,6 +482,18 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     for col in ("finding_id", "case_id", "proof_id"):
         if col not in cols:
             conn.execute(f"ALTER TABLE findings ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    if "engagement_id" not in cols:
+        try:
+            conn.execute("ALTER TABLE findings ADD COLUMN engagement_id TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
+    if "captured_principal_id" not in cols:
+        try:
+            conn.execute("ALTER TABLE findings ADD COLUMN captured_principal_id TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
     # Oracle-verification axis (precision items #1/#2): the stricter verified/candidate
     # state and the id of the proof capsule that earned it. Additive, defaults keep
     # every legacy row a "candidate" (no oracle ever ran on it).
@@ -456,9 +543,10 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     # summary volatility this migration exists to remove.
     if conn.execute("PRAGMA user_version").fetchone()[0] < _FINGERPRINT_ALGO_VERSION:
         for row in conn.execute(
-            "SELECT id, host, method, url, vulnerability_class FROM findings"
+            "SELECT id, host, method, url, vulnerability_class, engagement_id, captured_principal_id FROM findings"
         ).fetchall():
-            new_fp = finding_fingerprint(row[1], row[2], row[3], row[4])
+            new_fp = finding_fingerprint(row[1], row[2], row[3], row[4], engagement_id=row[5],
+                                         principal_id=row[6] if row[5] else "")
             conn.execute("UPDATE OR IGNORE findings SET fingerprint = ? WHERE id = ?",
                          (new_fp, row[0]))
         conn.execute(f"PRAGMA user_version = {_FINGERPRINT_ALGO_VERSION}")
@@ -502,6 +590,18 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
             host TEXT PRIMARY KEY,
             state_json TEXT NOT NULL,
             updated_at REAL NOT NULL
+        )
+    """)
+    # Explicit engagement ownership; legacy host-only rows remain readable
+    # only in the empty-id compatibility partition.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scoped_engagement_state (
+            engagement_id TEXT NOT NULL,
+            host TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            state_json TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (engagement_id, host)
         )
     """)
     # Retrievable knowledge notes (knowledge.py's Memory Retriever) -- tester-
@@ -556,10 +656,12 @@ def host_of(url: str) -> str:
 
 
 def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Finding],
-                      model: str = "", prompt_version: str = "") -> None:
+                      model: str = "", prompt_version: str = "", *, engagement_id: str = "") -> None:
     if not findings:
         return
     host = host_of(exchange.url)
+    engagement_id = _engagement_partition(engagement_id)
+    captured_principal = captured_principal_id(exchange) if engagement_id else ""
     now = time.time()
     # AR-3 (LOOP half): exact provenance. Prefer the capture driver's own id
     # (trusted transport field, not agent JSON); fall back to a stable content
@@ -580,7 +682,8 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
                 host, exchange.method, exchange.url, f.vulnerability_class,
                 parameter_location=getattr(f, "parameter_location", "") or "",
                 parameter_name=getattr(f, "parameter_name", "") or "",
-                principal_id=getattr(f, "principal_id", "") or "",
+                principal_id=(captured_principal if engagement_id else getattr(f, "principal_id", "") or ""),
+                engagement_id=engagement_id,
             )
             fingerprints.append(fingerprint)
             rows.append((host, exchange.url, exchange.method, agent_name, f.vulnerability_class,
@@ -589,15 +692,15 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
                          model, prompt_version, f.finding_id, f.case_id, f.proof_id,
                          int(getattr(f, "oracle_verified", False)),
                          getattr(f, "verification_state", "candidate") or "candidate",
-                         getattr(f, "oracle_capsule_id", "") or "", exchange_id, run_id, now))
+                         getattr(f, "oracle_capsule_id", "") or "", exchange_id, run_id, engagement_id, captured_principal, now))
         conn.executemany(
             """INSERT OR IGNORE INTO findings
                (host, url, method, agent, vulnerability_class, severity,
                 confidence, summary, basis, evidence, suggested_test, owasp_category,
                 review_verdict, confirmed, fingerprint, model, prompt_version,
                 finding_id, case_id, proof_id, oracle_verified, verification_state,
-                oracle_capsule_id, exchange_id, run_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                oracle_capsule_id, exchange_id, run_id, engagement_id, captured_principal_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
         # AR-3: one observation row per (finding, exchange), regardless of
         # whether the findings INSERT above was a fresh row or an IGNOREd
         # duplicate -- a deduped finding still records this exchange as a
@@ -910,7 +1013,8 @@ def _strip_backticks(text: str) -> str:
     return text.replace("`", "'")
 
 
-def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int = 8) -> str:
+def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int = 8,
+                          *, engagement_id: str = "", captured_principal: str | None = None) -> str:
     """
     Compact, prompt-ready summary of what's already been found on this
     host, most recent first. Intentionally small and lossy (a prior, not
@@ -923,9 +1027,10 @@ def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int 
     try:
         rows = conn.execute(
             """SELECT url, vulnerability_class, severity, confidence, summary
-               FROM findings WHERE host = ? AND url != COALESCE(?, '')
+               FROM findings WHERE host = ? AND engagement_id = ?
+               AND (? IS NULL OR captured_principal_id = ?) AND url != COALESCE(?, '')
                ORDER BY created_at DESC LIMIT ?""",
-            (host, exclude_url, limit),
+            (host, _engagement_partition(engagement_id), captured_principal, captured_principal, exclude_url, limit),
         ).fetchall()
     finally:
         conn.close()
@@ -955,7 +1060,8 @@ def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int 
     return "\n".join(lines)
 
 
-def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
+def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_id: str = "",
+                      captured_principal: str | None = None) -> list[dict]:
     """
     Full (not summarized) finding records for a host, for chain detection
     and report generation.
@@ -981,12 +1087,13 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
                       (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       s.fingerprint IS NOT NULL AS suppressed,
                       f.oracle_verified, f.verification_state, f.oracle_capsule_id,
-                      f.exchange_id, f.run_id
+                      f.exchange_id, f.run_id, f.captured_principal_id
                FROM findings f
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
-               WHERE f.host = ?
+               WHERE f.host = ? AND f.engagement_id = ?
+                 AND (? IS NULL OR f.captured_principal_id = ?)
                ORDER BY f.created_at ASC""",
-            (host,),
+            (host, _engagement_partition(engagement_id), captured_principal, captured_principal),
         ).fetchall()
     finally:
         conn.close()
@@ -1006,6 +1113,7 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
          "lifecycle_state": confirmation_gate.lifecycle_state(bool(confirmed), rv),
          "parameter_location": ploc or "", "parameter_name": pname or "",
          "principal_id": principal or "", "suppressed": bool(suppressed),
+         "captured_principal_id": captured_principal_id or "",
          # P0.2-API: the oracle's verdict (item #1/#2) must be readable from the
          # SAME dict the report/API/Burp panel all consume -- previously this
          # query never selected these columns, so `oracle_verified` was always
@@ -1015,10 +1123,10 @@ def all_host_findings(url: str, include_suppressed: bool = False) -> list[dict]:
          "oracle_capsule_id": capsule_id or "",
          # AR-3 (LOOP half): exact finding->exchange/run provenance. Additive
          # keys; '' for legacy rows persisted before this column existed.
-         "exchange_id": exchange_id or "", "run_id": run_id or ""}
+         "exchange_id": exchange_id or "", "run_id": run_id or "", "engagement_id": engagement_id}
         for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
              finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed,
-             oracle_verified, vstate, capsule_id, exchange_id, run_id) in rows
+             oracle_verified, vstate, capsule_id, exchange_id, run_id, captured_principal_id) in rows
     ]
     if not include_suppressed:
         results = [r for r in results if not r["suppressed"]]
@@ -1141,35 +1249,107 @@ def all_issue_merges(host: str) -> dict[str, str]:
     return {source_id: target_id for (source_id, target_id) in rows}
 
 
-def save_engagement(host: str, state: dict) -> None:
-    """Upsert the per-host engagement snapshot (engagement.EngagementState.to_dict())."""
+class EngagementRevisionConflict(ValueError):
+    """A caller tried to replace an engagement snapshot using a stale revision."""
+
+
+def _engagement_partition(engagement_id: str) -> str:
+    if not isinstance(engagement_id, str) or len(engagement_id) > 128:
+        raise ValueError("engagement_id must be a string of at most 128 characters")
+    return engagement_id
+
+
+def _read_engagement(conn, host: str, engagement_id: str) -> tuple[dict | None, int]:
+    row = conn.execute(
+        "SELECT state_json, revision FROM scoped_engagement_state WHERE engagement_id=? AND host=?",
+        (engagement_id, host)).fetchone()
+    if row is None and not engagement_id:
+        legacy = conn.execute("SELECT state_json FROM engagement_state WHERE host=?", (host,)).fetchone()
+        row = (legacy[0], 0) if legacy else None
+    if row is None:
+        return None, 0
+    state = json.loads(row[0])
+    if not isinstance(state, dict):
+        raise ValueError("invalid engagement snapshot")
+    return state, row[1]
+
+
+def _write_engagement(conn, host, engagement_id, state, revision):
+    snapshot = dict(state)
+    snapshot.update(host=host, _engagement_id=engagement_id, _snapshot_revision=revision)
+    conn.execute(
+        "INSERT INTO scoped_engagement_state (engagement_id,host,revision,state_json,updated_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(engagement_id,host) DO UPDATE SET "
+        "revision=excluded.revision,state_json=excluded.state_json,updated_at=excluded.updated_at",
+        (engagement_id, host, revision, json.dumps(snapshot), time.time()))
+    return snapshot
+
+
+def save_engagement(host: str, state: dict, *, engagement_id: str = "",
+                    expected_revision: int | None = None) -> dict:
+    """Replace a snapshot, rejecting stale revisions when provided/loaded.
+
+    New read/modify/write callers should use mutate_engagement. Legacy callers
+    supplying an unversioned whole snapshot retain replacement semantics.
+    """
+    engagement_id = _engagement_partition(engagement_id)
+    if "_engagement_id" in state and state["_engagement_id"] != engagement_id:
+        raise EngagementRevisionConflict("engagement snapshot belongs to another partition")
+    if expected_revision is None:
+        expected_revision = state.get("_snapshot_revision")
     conn = _connect()
     try:
-        conn.execute(
-            "INSERT INTO engagement_state (host, state_json, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(host) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at",
-            (host, json.dumps(state), time.time()),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        _, revision = _read_engagement(conn, host, engagement_id)
+        if expected_revision is not None and expected_revision != revision:
+            raise EngagementRevisionConflict("stale engagement snapshot revision")
+        out = _write_engagement(conn, host, engagement_id, state, revision + 1)
         conn.commit()
+        return out
     finally:
+        if conn.in_transaction:
+            conn.rollback()
         conn.close()
 
 
-def load_engagement(host: str) -> dict | None:
-    """The stored engagement snapshot for `host`, or None if none saved yet."""
+def load_engagement(host: str, *, engagement_id: str = "") -> dict | None:
+    """Read only the requested (engagement_id, host) partition, with revision."""
+    engagement_id = _engagement_partition(engagement_id)
     conn = _connect()
     try:
-        row = conn.execute(
-            "SELECT state_json FROM engagement_state WHERE host = ?", (host,)
-        ).fetchone()
+        state, revision = _read_engagement(conn, host, engagement_id)
+        if state is not None:
+            state.update(_engagement_id=engagement_id, _snapshot_revision=revision)
+        return state
     finally:
         conn.close()
-    if not row:
-        return None
+
+
+def mutate_engagement(host: str, mutator, *, engagement_id: str = "",
+                      expected_revision: int | None = None) -> dict:
+    """Atomically read/apply/save a benign snapshot mutation.
+
+    The callback is synchronous and must perform no network/model/store I/O.
+    BEGIN IMMEDIATE serializes writers across connections/processes. Errors
+    roll back without publishing a partial snapshot; revisions are monotonic.
+    """
+    engagement_id = _engagement_partition(engagement_id)
+    conn = _connect()
     try:
-        return json.loads(row[0])
-    except (json.JSONDecodeError, TypeError):
-        return None
+        conn.execute("BEGIN IMMEDIATE")
+        state, revision = _read_engagement(conn, host, engagement_id)
+        if expected_revision is not None and expected_revision != revision:
+            raise EngagementRevisionConflict("stale engagement snapshot revision")
+        updated = mutator(state or {"host": host})
+        if not isinstance(updated, dict):
+            raise ValueError("engagement mutator must return a snapshot dictionary")
+        out = _write_engagement(conn, host, engagement_id, updated, revision + 1)
+        conn.commit()
+        return out
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.close()
 
 
 def save_knowledge_note(tags: list, note: str, source: str = "manual", engagement_id: str = "") -> bool:
@@ -1234,7 +1414,9 @@ def list_knowledge_notes(limit: int = 500, engagement_id: str | None = None) -> 
     return out
 
 
-def is_chain_already_detected(url: str, signature: str) -> bool:
+def is_chain_already_detected(url: str, signature: str, *, engagement_id: str = "") -> bool:
+    if engagement_id:
+        signature = json.dumps([_engagement_partition(engagement_id), signature])
     host = host_of(url)
     conn = _connect()
     try:
@@ -1247,7 +1429,9 @@ def is_chain_already_detected(url: str, signature: str) -> bool:
         conn.close()
 
 
-def mark_chain_detected(url: str, signature: str) -> None:
+def mark_chain_detected(url: str, signature: str, *, engagement_id: str = "") -> None:
+    if engagement_id:
+        signature = json.dumps([_engagement_partition(engagement_id), signature])
     host = host_of(url)
     conn = _connect()
     try:
@@ -1563,26 +1747,33 @@ def persist_ledger_event(event: dict) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO ledger_events "
             "(event_id, event_type, finding_ref, case_ref, summary, data_json, "
-            "provenance_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "provenance_json, engagement_id, captured_principal_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (event.get("event_id", ""), event.get("event_type", ""),
              event.get("finding_ref", ""), event.get("case_ref", ""),
              event.get("summary", ""), json.dumps(event.get("data", {}) or {}),
-             json.dumps(event.get("provenance", {}) or {}), event.get("created_at", time.time())))
+             json.dumps(event.get("provenance", {}) or {}), _CURRENT_ENGAGEMENT.get(),
+             _CURRENT_CAPTURED_PRINCIPAL.get(), event.get("created_at", time.time())))
         conn.commit()
     finally:
         conn.close()
 
 
-def ledger_events_for(finding_ref: str) -> list[dict]:
+def ledger_events_for(finding_ref: str, *, engagement_id: str | None = None,
+                      captured_principal: str | None = None) -> list[dict]:
     """All persisted ledger events for one finding, oldest first, as plain
     dicts shaped like LedgerEvent.to_dict() (ready for
     harness.evidence_ledger.ledger_from_store to replay)."""
     conn = _connect()
     try:
+        ownership = " AND engagement_id = ?" if engagement_id is not None else ""
+        params = (finding_ref, _engagement_partition(engagement_id)) if engagement_id is not None else (finding_ref,)
+        if captured_principal is not None:
+            ownership += " AND captured_principal_id = ?"
+            params += (captured_principal,)
         rows = conn.execute(
             "SELECT event_id, event_type, finding_ref, case_ref, summary, data_json, "
             "provenance_json, created_at FROM ledger_events WHERE finding_ref = ? "
-            "ORDER BY created_at ASC", (finding_ref,)).fetchall()
+            + ownership + " ORDER BY created_at ASC", params).fetchall()
     finally:
         conn.close()
     out = []
@@ -1595,7 +1786,8 @@ def ledger_events_for(finding_ref: str) -> list[dict]:
     return out
 
 
-def ledger_events_for_many(finding_refs: "list[str]") -> "dict[str, list[dict]]":
+def ledger_events_for_many(finding_refs: "list[str]", *, engagement_id: str | None = None,
+                           captured_principal: str | None = None) -> "dict[str, list[dict]]":
     """Batched form of ledger_events_for (RA-4): every persisted ledger event
     for MANY findings in ONE query/connection, instead of one fresh
     connection+query per finding_ref. Grouped by finding_ref; each ref's own
@@ -1616,10 +1808,15 @@ def ledger_events_for_many(finding_refs: "list[str]") -> "dict[str, list[dict]]"
     conn = _connect()
     try:
         placeholders = ",".join("?" for _ in refs)
+        ownership = " AND engagement_id = ?" if engagement_id is not None else ""
+        params = refs + [_engagement_partition(engagement_id)] if engagement_id is not None else refs
+        if captured_principal is not None:
+            ownership += " AND captured_principal_id = ?"
+            params = params + [captured_principal]
         rows = conn.execute(
             "SELECT event_id, event_type, finding_ref, case_ref, summary, data_json, "
             "provenance_json, created_at FROM ledger_events WHERE finding_ref IN "
-            f"({placeholders}) ORDER BY created_at ASC", refs).fetchall()
+            f"({placeholders})" + ownership + " ORDER BY created_at ASC", params).fetchall()
     finally:
         conn.close()
     out: "dict[str, list[dict]]" = {}
@@ -1685,8 +1882,12 @@ def _begin_immediate() -> sqlite3.Connection:
     already held, so the caller owns one explicit BEGIN IMMEDIATE .. COMMIT
     transaction and pysqlite never injects an implicit one of its own."""
     conn = _connect()
-    conn.isolation_level = None
-    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -2286,6 +2487,8 @@ def wipe_engagement(host: str) -> dict:
         # (i) engagement_state.
         cur = conn.execute("DELETE FROM engagement_state WHERE host = ?", (host,))
         counts["engagement_state"] = cur.rowcount
+        cur = conn.execute("DELETE FROM scoped_engagement_state WHERE host = ?", (host,))
+        counts["scoped_engagement_state"] = cur.rowcount
 
         conn.commit()
         return counts

@@ -5,7 +5,7 @@ import httpx
 
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import get_default_gate, reset_default_gate
-from harness.run_context import RunContext, ScopePolicy
+from harness.run_context import ExecutionOutcome, RunContext, ScopePolicy
 from harness.test_run_context import _Fixture
 from harness.validators.sqlmap import (
     SqlmapValidator,
@@ -174,6 +174,70 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await ctx.aclose()
             fixture.close()
+
+    async def test_run_context_does_not_redecode_already_decoded_gzip_body(self):
+        ctx = RunContext.create(
+            allowed_hosts=["x.test"], max_requests=2,
+            gate_config={"active_enabled": True})
+        transport = AsyncMock()
+        transport.execute = AsyncMock(side_effect=[
+            ExecutionOutcome(
+                outcome="ok", status=200, body="x" * 1000,
+                headers={"Content-Encoding": "gzip", "Content-Length": "29"}),
+            ExecutionOutcome(
+                outcome="ok", status=200, body="x" * 10,
+                headers={"Content-Encoding": "gzip", "Content-Length": "23"}),
+        ])
+        ctx.executor = lambda: transport
+        validator = SqlmapValidator(binary="sqlmap", run_context=ctx)
+        exchange = HttpExchange(
+            url="https://x.test/filter?category=Pets", method="GET",
+            response_status=200)
+        try:
+            result = await validator._boolean_probe_fallback(
+                _finding(), exchange)
+            self.assertEqual(result.status, "confirmed")
+            self.assertTrue(result.confirmed)
+        finally:
+            await ctx.aclose()
+
+    async def test_login_bypass_refreshes_csrf_token_in_session(self):
+        # A CSRF-protected login form: the captured token is stale, so without an
+        # in-session refresh both probes would be rejected identically and hide
+        # the injection. With the refresh, the tautology logs in (302) and the
+        # contradiction is rejected (401) -> a confirmed differential.
+        from urllib.parse import parse_qsl
+
+        async def fake_execute(req, capability=None, session_ref=None):
+            if req.method == "GET":  # form page hands out a fresh token
+                return ExecutionOutcome(outcome="ok", status=200,
+                                        body='<form><input name="csrf" value="FRESH"></form>', headers={})
+            params = dict(parse_qsl(req.body or "", keep_blank_values=True))
+            if params.get("csrf") != "FRESH":       # stale/absent token -> rejected
+                return ExecutionOutcome(outcome="ok", status=400, body="Invalid CSRF token", headers={})
+            user = params.get("username", "")
+            if "'1'='1'" in user:                    # tautology -> authenticated
+                return ExecutionOutcome(outcome="ok", status=302, body="", headers={"location": "/my-account"})
+            if "'1'='2'" in user:                    # contradiction -> rejected
+                return ExecutionOutcome(outcome="ok", status=401, body="Invalid credentials", headers={})
+            return ExecutionOutcome(outcome="ok", status=200, body="Invalid credentials", headers={})
+
+        ctx = RunContext.create(allowed_hosts=["lab.test"], max_requests=50,
+                                gate_config={"active_enabled": True, "allow_mutating_replay": True})
+        transport = AsyncMock()
+        transport.execute = AsyncMock(side_effect=fake_execute)
+        ctx.executor = lambda: transport
+        v = SqlmapValidator(binary="sqlmap", run_context=ctx)
+        exchange = HttpExchange(
+            url="http://lab.test/login", method="POST",
+            request_headers={"Content-Type": "application/x-www-form-urlencoded"},
+            request_body="csrf=STALE&username=wiener&password=peter", response_status=200)
+        try:
+            result = await v._boolean_probe_fallback(_finding(), exchange)
+            self.assertEqual(result.status, "confirmed")
+            self.assertTrue(result.confirmed)
+        finally:
+            await ctx.aclose()
 
     async def test_no_mutable_parameter_returns_none_without_any_network_call(self):
         v = self._validator()
@@ -371,6 +435,42 @@ class SqlmapValidatorFallsBackWhenBinaryMissingTests(unittest.IsolatedAsyncioTes
         self.assertEqual(result.status, "error")
         self.assertIn("sqlmap executable not found", result.summary)
 
+    async def test_get_query_boolean_preflight_confirms_without_launching_sqlmap(self):
+        v = SqlmapValidator(binary="sqlmap")
+        exchange = HttpExchange(
+            url="https://x.test/filter?category=Pets", method="GET",
+            response_status=200, response_body="baseline")
+        large = httpx.Response(
+            200, content=b"x" * 600,
+            request=httpx.Request("GET", exchange.url))
+        small = httpx.Response(
+            200, content=b"y" * 10,
+            request=httpx.Request("GET", exchange.url))
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock,
+                   side_effect=[large, small]), \
+             patch("harness.validators.sqlmap.subprocess.run") as sqlmap_run:
+            result = await v.validate(_finding(), exchange)
+        self.assertTrue(result.confirmed)
+        self.assertEqual(result.status, "confirmed")
+        self.assertIn("Bounded boolean preflight", result.summary)
+        sqlmap_run.assert_not_called()
+
+    async def test_quick_only_inconclusive_get_does_not_launch_sqlmap(self):
+        v = SqlmapValidator(binary="sqlmap", quick_only=True)
+        exchange = HttpExchange(
+            url="https://x.test/product?productId=18", method="GET",
+            response_status=200, response_body="baseline")
+        same = httpx.Response(
+            200, content=b"same",
+            request=httpx.Request("GET", exchange.url))
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock,
+                   side_effect=[same, same]), \
+             patch("harness.validators.sqlmap.subprocess.run") as sqlmap_run:
+            result = await v.validate(_finding(), exchange)
+        self.assertEqual(result.status, "not_confirmed")
+        self.assertFalse(result.confirmed)
+        sqlmap_run.assert_not_called()
+
 
 class AuthRequestDetectionTests(unittest.TestCase):
     def test_credential_body_field_is_auth(self):
@@ -454,8 +554,10 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         v = SqlmapValidator(binary="sqlmap")
         url = "https://x.test/api/products?id=1"
         exchange = HttpExchange(url=url, method="GET", response_status=200)
+        same = httpx.Response(200, content=b"same", request=httpx.Request("GET", url))
         with patch("harness.validators.sqlmap.subprocess.run",
-                   return_value=_FakeProc(returncode=1, stdout="not vulnerable")):
+                   return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
+             patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=same):
             result = await v.validate(_finding(), exchange)
         self.assertNotIn("--ignore-code", result.command)
 

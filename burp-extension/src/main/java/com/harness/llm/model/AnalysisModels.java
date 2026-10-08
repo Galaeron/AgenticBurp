@@ -57,6 +57,9 @@ public class AnalysisModels {
         public String verification_state;  // "candidate" | "verified"
         public String oracle_capsule_id;   // nullable/"" -- ProofCapsule.capsule_id()
         public String oracle_reason;       // nullable/"" -- human-readable oracle verdict reason
+        public String evidence_maturity;   // server-derived; unknown/older servers fail to unverified
+        public String triage_priority;     // next action, independent of severity/confidence
+        public String impact_severity;
     }
 
     public static class AgentReport {

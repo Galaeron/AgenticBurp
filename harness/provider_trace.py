@@ -82,55 +82,47 @@ async def traced_call(
     and any other exception propagates after the reservation is refunded."""
     est = int(estimate) if estimate is not None else max(1, round(budget.ledger.average_tokens(kind)))
     provider_name = _provider_name(provider)
+    from harness.security import sanitize_for_inference, safe_error_summary
+    system_prompt, user_prompt = sanitize_for_inference(system_prompt, user_prompt)
 
-    admitted, reason = budget.reserve(est)
-    if not admitted:
-        return TracedOutcome(ok=False, outcome="budget_blocked", reason=reason)
-
-    settled = False
     attempt = 0
-    result: OllamaResult | None = None
-    last_exc: BaseException | None = None
-    start = clock()
-    try:
-        while True:
-            try:
-                result = await provider.chat_json(
-                    model, system_prompt, user_prompt, temperature=temperature, **kw)
-                break
-            except retry_on as exc:  # noqa: B012 -- deliberate bounded retry
-                last_exc = exc
-                if attempt >= max_retries:
-                    result = None
-                    break
-                attempt += 1
+    from harness.passive_inference import settle_call
+    import asyncio
+    while True:
+        admitted, reason = budget.reserve(est)
+        if not admitted:
+            return TracedOutcome(ok=False, outcome="budget_blocked", reason=reason, retries=attempt)
+        start = clock()
+        try:
+            result = await provider.chat_json(
+                model, system_prompt, user_prompt, temperature=temperature, **kw)
+        except BaseException as exc:
+            latency_ms = (clock() - start) * 1000.0
+            receipt = dict(getattr(exc, "inference_usage", None) or {})
+            receipt.update(outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                           retries=attempt)
+            record = settle_call(budget, kind, model, est, receipt,
+                                 provider=provider_name, elapsed_ms=latency_ms)
+            record.prompt_version, record.case_ref, record.run_id = prompt_version, case_ref, run_id
+            if not isinstance(exc, retry_on):
+                raise
+            if attempt >= max_retries:
+                return TracedOutcome(ok=False, outcome="error", error=safe_error_summary(exc), record=record,
+                                     retries=attempt, latency_ms=latency_ms, exception=exc)
+            attempt += 1
+            continue
         latency_ms = (clock() - start) * 1000.0
-
-        if result is not None:
-            is_streamed = bool(getattr(result, "streamed", False)) if streamed is None else bool(streamed)
-            record = budget.commit(
-                kind, model, int(result.prompt_tokens), int(result.completion_tokens),
-                reserved=est, provider=provider_name, prompt_version=prompt_version,
-                latency_ms=latency_ms, retries=attempt, outcome="ok",
-                streamed=is_streamed, case_ref=case_ref, run_id=run_id)
-            settled = True
-            return TracedOutcome(ok=True, outcome="ok", result=result, record=record,
-                                 retries=attempt, latency_ms=latency_ms)
-
-        # Retries exhausted on a retry_on exception: refund the reservation but
-        # still account the failed model path as a zero-usage error trace.
-        budget.release(est)
-        record = budget.record(
-            kind, model, 0, 0, provider=provider_name, prompt_version=prompt_version,
-            latency_ms=latency_ms, retries=attempt, outcome="error",
-            case_ref=case_ref, run_id=run_id)
-        settled = True
-        return TracedOutcome(ok=False, outcome="error", error=str(last_exc), record=record,
-                             retries=attempt, latency_ms=latency_ms, exception=last_exc)
-    finally:
-        if not settled:
-            # A non-retryable exception is propagating out; don't leak the reservation.
-            budget.release(est)
+        measurement = getattr(result, "measurement", None)
+        receipt = dict(measurement) if isinstance(measurement, dict) else {
+            "prompt_tokens": result.prompt_tokens, "completion_tokens": result.completion_tokens,
+            "completed": True, "usable": True, "outcome": "ok"}
+        receipt["retries"] = attempt
+        record = settle_call(budget, kind, model, est, receipt,
+                             provider=provider_name, elapsed_ms=latency_ms)
+        record.prompt_version, record.case_ref, record.run_id = prompt_version, case_ref, run_id
+        record.streamed = bool(getattr(result, "streamed", False)) if streamed is None else bool(streamed)
+        return TracedOutcome(ok=True, outcome="ok", result=result, record=record,
+                             retries=attempt, latency_ms=latency_ms)
 
 
 class TracingProvider:

@@ -47,7 +47,7 @@ class ChatJsonMeteredTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.prompt_tokens, 742)
         self.assertEqual(result.completion_tokens, 88)
 
-    async def test_missing_usage_fields_falls_back_to_zero_not_error(self):
+    async def test_missing_usage_fields_remain_unknown_not_error(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={
                 "message": {"content": json.dumps({"ok": True})},
@@ -56,8 +56,8 @@ class ChatJsonMeteredTests(unittest.IsolatedAsyncioTestCase):
             })
         client = _make_client(self, handler)
         result = await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
-        self.assertEqual(result.prompt_tokens, 0)
-        self.assertEqual(result.completion_tokens, 0)
+        self.assertIsNone(result.prompt_tokens)
+        self.assertIsNone(result.completion_tokens)
         self.assertEqual(result.data, {"ok": True})
 
     async def test_chat_json_unmetered_still_returns_plain_dict(self):

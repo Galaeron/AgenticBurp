@@ -1,89 +1,53 @@
-# Current state — 2026-10-01
+# Current state
 
-## Checkout
-- Branch: `reconciliation-backlog`
-- HEAD: `0de16331` (LB-5 cross-site PoC primitive, 4 cleanly-separable files). Earlier real
-  commits: `6d5a2082` (LB-1), `f952b107` (LB-2). LB-NOTE/LB-3/LB-4 fixes + the LB-2/LB-5
-  fixture/integration/validator wiring land in the preserved tracked-WIP (no isolated commit).
-- Working tree is a large, deliberately-uncommitted WIP pile (the 2026-10-01
-  live-loop legs, the benchmark harness, the `objective_completion`/IDOR work,
-  etc.). Branch convention: each loop iteration commits only the new standalone
-  files for its item and preserves the WIP pile. Preserve these edits.
-- `harness/config.yaml` remains at safe defaults; live overrides stay in-memory /
-  git-ignored `config.local.yaml`.
+AgenticVibe is a **working research prototype**: a Burp Suite copilot that uses
+local LLMs to review captured HTTP traffic and deterministic validators to
+confirm or refute the findings. See [README.md](README.md) for what it is and
+[docs/USER_MANUAL.md](docs/USER_MANUAL.md) for how to run it safely.
 
-## Active queue — 2026-10-01 live-loop build batch (LB-*)
-Order: **LB-1 → LB-3 → LB-2 → LB-4 → LB-5 → LB-6**, before older queue work.
-LB-7 is OWNER/LIVE (skip).
-- **LB-1 — DONE (`6d5a2082`, VERIFIED).** Shared in-session source-form replay
-  primitive (`harness/validators/source_form.py`): one `fetch_source_form(...)`
-  helper + `SourceForm` dataclass + shared `CSRF_FIELD_RE`. The four source-form
-  legs (stored_xss, auth_sequence, file_upload, client_trust) are refactored onto
-  it with NO behavior change (per-validator form-selection kept as separate caller
-  closures; auth_sequence vs client_trust CSRF rules deliberately NOT flattened).
-  Committed artifact = helper + `harness/test_source_form.py` (7 tests); the
-  validator refactor wiring rides in the uncommitted legs pile.
-- **LB-NOTE — DONE (VERIFIED, in-worktree).** Cleared the two pre-existing `full`
-  failures: (A) `_ssti_readback_urls` normalizes the by-design dict/object union in
-  `orchestrator_chain.py` so the SSTI-readback loop no longer crashes on role_crawl's
-  `model_dump()` dicts (+ `test_ssti_readback_urls.py`, non-GET negative control both
-  shapes); (B) added the `client_trust` Python-only entry to the execution-plane matrix.
-  `full` now green. Fixes land in tracked-WIP (no isolated commit, per branch convention).
-- **LB-3 — DONE (VERIFIED, in-worktree).** `_authenticate` bounded 3-attempt login retry +
-  `_auth_info` degraded/fail-loud marker; 7 new tests; lands in untracked runner WIP (doc-close).
-- **LB-2 — DONE (`f952b107`, VERIFIED).** Driver-based capture of JS/XHR-built request shapes:
-  `browser_driver.capture_requests` records real fetch/XHR requests (method/URL/content-type/body)
-  through the existing browser policy; `driver_capture.discover()` emits them as role_crawl-shaped
-  `HttpExchange` dicts so legs fire on JS-built shapes. New `driver_capture` flag OFF + registered
-  in the passive force-off list / SafeDefaultGuard. 6 cleanly-separable files committed;
-  the /xxe fixture + capture→confirm integration test (XXE via in-process loopback collaborator,
-  offline) + passive negative control ride the legs WIP. multipart/file-upload half deferred.
-- **LB-4 — DONE (VERIFIED, in-worktree).** Two shape-preconditions in
-  `shape_precondition_legs` route the 2fa-bypass + client-trust legs from captured traffic
-  (reusing each validator's own predicate); `_confirm` gained a client_trust branch + 2fa/mfa
-  match. Dispatch-only, confirm-gated, behavior-neutral for existing classes (reviewer over-match
-  check). 6 new precondition assertions + the existing leg confirm/control cases. `full` green.
-  Lands in orchestrator WIP → doc-close.
-- **LB-5 — DONE (`0de16331`, VERIFIED).** Cross-site CSRF PoC primitive, default-OFF:
-  `browser_driver.cross_site_submit` + a pure fail-closed policy that allows only the attacker
-  GET (fulfilled locally at a synthetic `*.localhost` site), one declared victim POST, and a
-  GET-only readback; the browser cookie jar (its SameSite attr) is the sole credential channel,
-  so SameSite/Origin/bearer are genuine browser-enforced controls. `evaluate_browser_request` and
-  the static LIVE seed untouched; csrf promotion stays run-derived + flag-gated. 4 cleanly-separable
-  files committed; csrf_validator wiring + /csrf-poc fixture + csrf LegCase ride the WIP pile.
-  Review flagged a co-resident UNGATED non-browser CSRF method-bypass branch in csrf_validator WIP
-  (unsound: manual cookie + non-independent readback) — filed **LB-CSRF-REPLAY** to gate/fix before
-  the pile is committed.
-- **Next: LB-6** — runner objective-completion wiring (benchmark oracle only; the typed wiring +
-  fixture is LOOP, turning it on against a live lab is OWNER/LIVE). Then LB-FLAKE / LB-CSRF-REPLAY.
+## What is verified
 
-## Verification (this checkout)
-- **`full` (LB-5 run) fully GREEN:** unittest `Ran 3094 tests … OK`; pytest-native 38 passed;
-  testing 272 OK; integrity 42 OK; exit 0. (LB-FLAKE timestamp flake did not recur; still filed.)
-- LB-5 surface: `test_cross_site_submit` 16 OK; `test_browser_interception_gate` 13 OK
-  (evaluate_browser_request intact); `test_leg_live_verification` 47 OK (1 cross-site positive +
-  4 controls ran); SafeDefaultGuard green. Earlier LB-1..LB-4 surfaces remain green.
-- No offline tier establishes current model accuracy or blind-target recall.
+- **It installs and runs.** `python -m harness.server` starts the FastAPI
+  server on `127.0.0.1:8787`; the Burp extension (Java/Montoya) compiles and its
+  Java unit tests pass.
+- **The parts behave as designed.** ~2,400 Python tests and ~230 Java tests pass
+  (`python -m harness.suite full`). These are component/behaviour tests —
+  e.g. a validator flags a planted vuln in a fixture, a gate caps a finding.
+- **Safe-by-default posture.** Out of the box the harness does passive review
+  only: active validators, autonomous discovery, the oracle and the cloud seams
+  are all OFF; `allowed_hosts` is unset. See the USER MANUAL to enable active
+  testing on a scoped host.
 
-## Web-objective benchmark
-- Contract: `testing/web-objective-benchmark/`; runner: `testing/run_web_objective_smoke.py`;
-  scorer: `testing/web_objective_benchmark.py`.
-- Durable per-case evidence under `reviews/2026-09-29/`..`2026-09-30/web-objective-smoke/`;
-  ledger `reviews/2026-09-29/web-objective-smoke/LOOP_LEDGER.md` (the LB-* source).
-- Owner goal: safe detection + non-destructive proof. Do not run destructive objectives.
+## What is NOT verified (read before trusting results)
 
-## Confirmed live capabilities (historical/reported unless re-run this session)
-- SQLi hidden-data/login-bypass, reflected + stored XSS, path traversal, simple
-  command injection, SSRF, XXE, IDOR read, CSRF method bypass, unrestricted upload,
-  JWT unverified signature + RS256/HMAC algorithm confusion (0.90), NoSQL auth bypass,
-  Freemarker SSTI arithmetic (0.95), custom-exploit SSTI (0.95, non-destructive).
+- **Real-model accuracy on unseen targets.** The component tests do not measure
+  how often the LLM agents catch real bugs on an unfamiliar app, or the
+  false-positive rate. The detection scorer (`testing/score.py`) is reproducible
+  but needs a local model and a corpus you build yourself (see the USER MANUAL),
+  and the corpora it was developed against are **tuning corpora, not blind** —
+  their answer keys ship in the repo. Treat headline detection claims as
+  unproven until you run it against a target it was never tuned on
+  (WebGoat/DVWA/a PortSwigger lab — runbook in the USER MANUAL).
+- **LLM-agent detection from traffic.** The confirmation/validator layer *is*
+  live-verified against an owned loopback fixture with paired secure controls
+  (`harness/test_leg_live_verification.py`, broad class coverage); what is not
+  measured is whether the agents flag the issue from real traffic in the first
+  place. (The `coverage_manifest.py` ledger reports most classes as
+  `gap_unimplemented`, but that means "not registered in the ledger," not "no
+  test" — see docs/LIMITATIONS.md.)
 
-## Open work / pointers
-- continue LB-6; then the filed offline notes LB-FLAKE (timestamp flake) and
-  LB-CSRF-REPLAY (gate/fix the unsound co-resident method-bypass before the pile is committed).
-- Older still-open: SC-6 (wheel imports outside checkout), SC-9 (tool broker),
-  SC-10/SC-14 (ToolAdapter / install-doctor-serve) — after the LB batch.
-- OWNER/LIVE (skip in loop): LB-7 (single-packet race dispatch), P0-3, P1-5, P2-2,
-  efficacy/ablation runs, any real-model/blind-recall claim.
-- Handoff: `docs/DETERMINISTIC_FIRST_IMPLEMENTATION_CHECKLIST.md`. Preserve
-  `test_pipeline_gate.py` and its defect-injection controls.
+See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for the full, honest list of
+known issues, gaps and roadmap (Burp integration, an in-flight scope-handling
+refactor, performance, data handling, architecture debt).
+
+## In-flight / known rough edges
+
+- **Scope handling is mid-refactor.** The main analysis path and the crawler now
+  fail *closed* on an empty scope in active mode, but `scope_lock`/`safety_gate`
+  and several validators' own inline checks are still being migrated to the same
+  contract; some unit tests that construct an active gate without a scope are red
+  in the working tree because of this migration. Do not rely on a single
+  entry-point check — set `server.allowed_hosts` explicitly for any active run.
+- Historical reviews and plans under `archive/` and `reviews/` describe the
+  revisions they were written for, not current capability. Code is authoritative
+  for behaviour; `docs/` is the current documentation.

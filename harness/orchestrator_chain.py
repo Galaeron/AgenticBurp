@@ -22,11 +22,90 @@ from harness.run_context import transport_for, ExecutionOutcome
 # FR-6: need the module too, for `_CREDENTIAL_HEADERS` -- aliased for the same
 # shadowing reason as above (several methods below have a `run_context` parameter).
 from harness import run_context as _run_context_mod
+from harness import objective_completion as _objective_completion_mod
+from harness.objective_profiles import ObjectiveTask
 
 
 # FR-6 (F10) sentinel appended to a header value to make it a genuinely invalid
 # credential control -- see `_invalidated_headers` below.
 _FR6_INVALID_SENTINEL = "_fr6_invalid"
+
+
+import re as _re
+
+# Foreign object identifiers to try in a single-principal IDOR read (usernames of
+# OTHER people mentioned in public content, numeric ids seen in links). Purely a
+# seed list: the IDOR read validator's three-way differential rejects any id that
+# is not a real, distinct, unauthorised object, so a stray candidate is harmless.
+_ID_QUERY_KEYS = {"id", "user", "user_id", "userid", "uid", "account", "account_id",
+                  "customer", "customer_id", "profile", "pid", "oid", "owner"}
+_AUTHOR_MENTION = _re.compile(
+    r'(?:author|username|posted by|created by|by)["\'\s:>]{1,4}([A-Za-z][A-Za-z0-9_.\-]{2,30})',
+    _re.IGNORECASE)
+
+
+def _harvest_object_ids(captured, own_ids) -> list[str]:
+    """Mine candidate foreign object ids from the run's own observed traffic:
+    values of id-like query params seen in links, and other people's usernames
+    mentioned in public content. Excludes the current principal(s)' own ids and is
+    bounded. This is observed data, never a guessed wordlist."""
+    from urllib.parse import urlsplit, parse_qsl
+    own = {str(x).lower() for x in (own_ids or set())}
+    seen: list[str] = []
+
+    def _add(v: str):
+        v = (v or "").strip()
+        if (v and v.lower() not in own and v not in seen
+                and 1 <= len(v) <= 32 and v.lower() not in ("anonymous", "user", "admin", "me")):
+            seen.append(v)
+
+    for cap in (captured or []):
+        try:
+            ex = cap if hasattr(cap, "url") else None
+            url = (ex.url if ex is not None else (cap.get("url") if isinstance(cap, dict) else "")) or ""
+            body = (ex.response_body if ex is not None
+                    else (cap.get("response_body") if isinstance(cap, dict) else "")) or ""
+        except Exception:
+            continue
+        for k, val in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+            if k.lower() in _ID_QUERY_KEYS:
+                _add(val)
+        for m in _AUTHOR_MENTION.finditer(body or ""):
+            _add(m.group(1))
+        if len(seen) >= 8:
+            break
+    return seen[:8]
+
+
+def _ssti_readback_urls(captured) -> list[str]:
+    """Candidate SSTI readback pages: same-origin GET urls already observed in
+    this engagement with a 2xx response, excluding destructive-looking paths.
+
+    `captured` (normally `_all_captured`) is a UNION of two shapes by design:
+    `HttpExchange` objects (feature_workflow's own captures) and the dict form
+    role_crawl's discovery captures use (`HttpExchange(...).model_dump()`,
+    required by test_role_crawl.py's dict-indexed assertions on
+    RoleCrawlResult.captured). `_harvest_object_ids` above already tolerates
+    both; this normalizes each item the same way before reading any field, so
+    a dict element no longer crashes here. A malformed item is skipped, not
+    fatal -- it just never becomes a readback candidate."""
+    urls: list[str] = []
+    for cap in (captured or []):
+        try:
+            cap_ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
+        except Exception:
+            continue
+        if (cap_ex.method or "GET").upper() != "GET":
+            continue
+        _parts = urlsplit(cap_ex.url or "")
+        _path_low = (_parts.path or "/").lower()
+        if any(token in _path_low for token in
+               ("logout", "signout", "delete", "remove", "destroy", "reset")):
+            continue
+        if cap_ex.response_status is not None and not (200 <= cap_ex.response_status < 300):
+            continue
+        urls.append(cap_ex.url)
+    return urls
 
 
 def _invalidated_headers(headers: dict) -> dict:
@@ -406,7 +485,15 @@ class ChainMixin:
 
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
-                                     max_chain_rounds: int = 1, run_context=None) -> dict:
+                                     discovery_max_endpoints: int = 150,
+                                     discovery_max_pages: int = 40,
+                                     active_discovery: bool = True,
+                                     max_chain_rounds: int = 1, run_context=None,
+                                     stop_on_confirm: bool = False,
+                                     objective_class: str | None = None,
+                                     objective_task: "ObjectiveTask | None" = None,
+                                     objective_provider=None,
+                                     seed_exchanges=None) -> dict:
         """Milestone A+B, end to end: build the app model (active discovery ->
         per-role access matrix -> prioritised worklist), then drive the ITERATIVE
         agent top-down over that worklist -- each high-value node gets a bounded
@@ -424,7 +511,29 @@ class ChainMixin:
         from harness import role_crawl
         state, rc = await engagement_builder.build_engagement(
             base_url, roles, allowed_hosts=self.allowed_hosts,
+            crawl_max_pages=discovery_max_pages,
+            max_endpoints=discovery_max_endpoints,
+            active_discovery=active_discovery,
             discovery_max_probes=discovery_max_probes, run_context=run_context)
+
+        # Operator/capture supplied shapes (for example the runner's successful
+        # login setup exchange) are first-class evidence. They do not trigger new
+        # traffic here; they only prevent session-setup forms from disappearing at
+        # the discovery boundary before deterministic validators can inspect them.
+        for _seed in list(seed_exchanges or []):
+            try:
+                from harness import engagement as _engagement
+                _seed_ex = _seed if isinstance(_seed, HttpExchange) else HttpExchange(**_seed)
+                rc.captured.append(_seed_ex)
+                _seed_ep = state._ep(_seed_ex.method, _engagement.normalize_path(_seed_ex.url))
+                # A login boundary is publicly reachable; the submitted values may
+                # authenticate, but the route itself belongs to the anonymous role.
+                # Use a real role name so worklist seeding can bind the template.
+                _seed_ep.access.setdefault("anonymous", _seed_ex.response_status)
+                if "anonymous" not in _seed_ep.reachable_roles:
+                    _seed_ep.reachable_roles.append("anonymous")
+            except Exception:
+                pass
 
         # R30: operational failures in the additive phases below are caught so one
         # broken phase can't sink the run -- but they must not vanish silently. Each
@@ -433,12 +542,16 @@ class ChainMixin:
         _errors: list[dict] = []
         workflow_results: list[dict] = []
 
-        # Phase 0.1: promote every substantive 2xx encountered during discovery
-        # into full content-level review before prioritising/iterating. A body
-        # that is correctly access-scoped but itself leaks otherwise never
-        # becomes an analyzable exchange -- see review_captured_exchanges.
-        await review_captured_exchanges(
-            self, state, getattr(rc, "captured", None), run_context=run_context)
+        # Preserve real request shapes before any worklist leg runs. Full model
+        # review is deliberately deferred until after the bounded deterministic
+        # precondition sweep below; otherwise a handful of discovery captures can
+        # consume the wall-clock budget before a three-request validator runs.
+        for _cap in list(getattr(rc, "captured", None) or []):
+            try:
+                _ex = _cap if isinstance(_cap, HttpExchange) else HttpExchange(**_cap)
+                state.record_template(_ex.url, _ex.method, _ex)
+            except Exception:
+                pass
 
         # Emit findings for sensitive files discovered during active probing
         # (/.env, /backup/, etc.). These are confirmed by their mere existence
@@ -468,12 +581,11 @@ class ChainMixin:
                     base_url, roles, allowed_hosts=self.allowed_hosts,
                     submit_forms=_get_gate().config.allow_mutating_replay,
                     seed_paths=discovered_paths, run_context=run_context)
-                # make the workflow surface visible to prioritisation + coverage,
-                # then run the same content-level review as discovery captures.
+                # Make workflow routes and their real request shapes visible to
+                # prioritisation. Content-level model review remains deferred.
                 for ex in feature_caps:
                     state._ep(ex.method, _eng.normalize_path(ex.url))
-                await review_captured_exchanges(
-                    self, state, feature_caps, run_context=run_context)
+                    state.record_template(ex.url, ex.method, ex)
             except Exception as e:  # feature crawl is additive -- never sink the run
                 log.warning("investigate_engagement: feature crawl failed: %s", e)
                 _errors.append({"phase": "feature_crawl", "error": f"{type(e).__name__}: {e}"})
@@ -486,13 +598,14 @@ class ChainMixin:
             _all_captured.extend(feature_caps)  # noqa: F821 -- set in the feature_crawl block above
         except NameError:
             pass
-        try:
-            await universal_header_audit(self, state, _all_captured)
-        except Exception as e:
-            log.warning("investigate_engagement: universal header audit failed: %s", e)
-            _errors.append({"phase": "universal_header_audit", "error": f"{type(e).__name__}: {e}"})
-            from harness import telemetry
-            telemetry.record_swallowed_exception("universal_header_audit", e)
+        if not (stop_on_confirm and objective_class):
+            try:
+                await universal_header_audit(self, state, _all_captured)
+            except Exception as e:
+                log.warning("investigate_engagement: universal header audit failed: %s", e)
+                _errors.append({"phase": "universal_header_audit", "error": f"{type(e).__name__}: {e}"})
+                from harness import telemetry
+                telemetry.record_swallowed_exception("universal_header_audit", e)
 
         async def _probe(exchange, hypothesis, specialty, sb):
             return await self.run_active_probe(exchange, hypothesis, specialty, step_budget=sb)
@@ -505,6 +618,7 @@ class ChainMixin:
         from harness import identity_headers
         from harness import access_control_gate
         from harness.validators.cross_identity_validator import CrossIdentityValidator
+        from harness.validators.idor_read_validator import IdorReadValidator
         from harness.validators.browser_xss_validator import BrowserXssValidator
         from harness.validators.jwt_forge_validator import JwtForgeValidator
         from harness.validators.ssrf_validator import SsrfValidator
@@ -521,6 +635,13 @@ class ChainMixin:
         from harness.validators.reset_token_validator import ResetTokenValidator
         from harness.validators.dom_xss_validator import DomXssValidator
         from harness.validators.toctou_validator import ToctouValidator
+        from harness.validators.csrf_validator import CsrfValidator
+        from harness.validators.nosql_validator import NosqlValidator
+        from harness.validators.race_condition_validator import RaceConditionValidator
+        from harness.validators.sqlmap import SqlmapValidator
+        from harness.validators.client_trust_validator import ClientTrustValidator
+        from harness.validators.base import ValidationResult
+        from harness import missing_auth_probe
         from harness.models import Finding
         host = urlsplit(base_url).hostname or ""
         if run_context is not None:
@@ -546,18 +667,41 @@ class ChainMixin:
             timeout=float(_xid_cfg.get("timeout", 10.0)),
             max_identities=int(_xid_cfg.get("max_identities", 3)),
             run_context=run_context)
+        # Single-principal IDOR read-differential: swap the object id (no second
+        # account needed). Seed it with foreign ids observed elsewhere in the run
+        # (other users mentioned in public content, ids seen in links) so a
+        # username-keyed IDOR is reachable, not just numeric neighbours. Bad
+        # candidates are harmless -- the three-way differential rejects them.
+        _idor_cfg = (self.config.get("validators", {}) or {}).get("idor_read", {}) or {}
+        _idor_read = IdorReadValidator(
+            allowed_hosts=self.allowed_hosts,
+            # Observed ids (mined from content) plus any target object ids the
+            # operator declared for this engagement (e.g. a known victim account,
+            # like a tester who was told which record to reach).
+            candidate_ids=(list(_idor_cfg.get("candidate_ids", []) or [])
+                           + _harvest_object_ids(_all_captured, {r.principal_id() for r in roles})))
         _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts)
         _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts,
                                  run_context=run_context)
         _ssrf = SsrfValidator(allowed_hosts=self.allowed_hosts)
         _xxe = XxeValidator(allowed_hosts=self.allowed_hosts)
-        _cmdi = CommandInjectionValidator(allowed_hosts=self.allowed_hosts)
-        _ssti = SstiValidator(allowed_hosts=self.allowed_hosts)
-        _path = PathTraversalValidator(allowed_hosts=self.allowed_hosts)
+        _cmdi = CommandInjectionValidator(allowed_hosts=self.allowed_hosts,
+                                          run_context=run_context)
+        # Stored SSTI often writes a preference/editor value and evaluates it on
+        # a separate public render.  Supply only GET pages already observed in
+        # this engagement; the validator keeps the set bounded and same-origin.
+        _ssti_readbacks = _ssti_readback_urls(_all_captured)
+        _ssti_readbacks.sort(key=lambda u: ("/post" not in urlsplit(u).path.lower(), u))
+        _ssti = SstiValidator(allowed_hosts=self.allowed_hosts,
+                              run_context=run_context,
+                              readback_urls=_ssti_readbacks)
+        _path = PathTraversalValidator(allowed_hosts=self.allowed_hosts,
+                                       run_context=run_context)
         _redir = OpenRedirectValidator(allowed_hosts=self.allowed_hosts)
         _seq = SequenceValidator(allowed_hosts=self.allowed_hosts)
         _deser = DeserializationOobValidator(allowed_hosts=self.allowed_hosts)
         _auth = AuthSequenceValidator(allowed_hosts=self.allowed_hosts)
+        _ct = ClientTrustValidator(allowed_hosts=self.allowed_hosts)
         _sxss = StoredXssValidator(allowed_hosts=self.allowed_hosts)
         _rate = RateLimitValidator(allowed_hosts=self.allowed_hosts,
                                    run_context=run_context)
@@ -565,6 +709,29 @@ class ChainMixin:
         _domxss = DomXssValidator(allowed_hosts=self.allowed_hosts)
         _toctou = ToctouValidator(allowed_hosts=self.allowed_hosts,
                                   run_context=run_context)
+        _csrf = CsrfValidator(allowed_hosts=self.allowed_hosts,
+                              run_context=run_context)
+        _nosql = NosqlValidator(allowed_hosts=self.allowed_hosts,
+                                run_context=run_context)
+        _race_cfg = ((self.config.get("validators", {}) or {}).get("race_condition", {}) or {})
+        _race = RaceConditionValidator(
+            timeout=float(_race_cfg.get("timeout", 15.0)),
+            burst_size=int(_race_cfg.get("burst_size", 12)),
+            run_context=run_context,
+            target_email=_race_cfg.get("target_email"),
+            mailbox_url=_race_cfg.get("mailbox_url"),
+            email_race_rounds=int(_race_cfg.get("email_race_rounds", 6)))
+        _sql_cfg = ((self.config.get("validators", {}) or {}).get("sqlmap", {}) or {})
+        _sqlmap = SqlmapValidator(
+            binary=_sql_cfg.get("binary", "sqlmap"),
+            timeout_seconds=int(_sql_cfg.get("timeout_seconds", 90)),
+            level=int(_sql_cfg.get("level", 1)),
+            risk=int(_sql_cfg.get("risk", 1)),
+            container_image=_sql_cfg.get("container_image"),
+            run_context=run_context,
+            allowed_hosts=self.allowed_hosts,
+            quick_only=bool(stop_on_confirm and objective_class == "sqli"),
+        )
 
         # Memoisation cache: avoid re-running the same validator on the same
         # endpoint during one investigate_engagement() call. Keyed by
@@ -699,7 +866,35 @@ class ChainMixin:
             A confirmed finding is upgraded in place; anything else is left untouched."""
             vc = (finding.get("vulnerability_class") or "")
             low = vc.lower()
-            if access_control_gate._is_access_control_class(vc):
+            if low in ("auth_bypass", "missing_authentication", "missing authentication"):
+                # Anonymous access to a privileged-looking route is confirmed by
+                # replaying the captured read with every credential stripped.
+                # This is not an IDOR/BFLA comparison and needs no second user.
+                try:
+                    parts = urlsplit(exchange.url)
+                    path = parts.path or "/"
+                    if parts.query:
+                        path += "?" + parts.query
+                    outcome = await missing_auth_probe.probe(
+                        base_url, ((exchange.method or "GET").upper(), path),
+                        allowed_hosts=self.allowed_hosts,
+                        baseline_headers=exchange.request_headers,
+                        send_garbage_token=False,
+                        expected_protected=True,
+                        run_context=run_context)
+                    if outcome.finding is not None:
+                        proof = outcome.finding
+                        await _apply(
+                            finding,
+                            ValidationResult(
+                                validator="missing_auth_probe", status="confirmed",
+                                finding_class="missing_authentication",
+                                confidence=proof.confidence, confirmed=True,
+                                summary=proof.summary, evidence=proof.evidence),
+                            "missing-auth", 0.85, exchange)
+                except Exception:
+                    return
+            elif access_control_gate._is_access_control_class(vc):
                 # populate the candidate baseline: the probe role's own response.
                 if exchange.response_status is None and scope_discovery.is_host_allowed(exchange.url, self.allowed_hosts):
                     # W-16: baseline read through the single TargetTransport (this run's
@@ -722,6 +917,11 @@ class ChainMixin:
                             await _owned.aclose()
                 try:
                     await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9, exchange)
+                    # Single-principal fallback: if no second identity confirmed a
+                    # cross-identity breach, try the object-id read differential
+                    # (own vs foreign vs absent) as the captured principal.
+                    if not finding.get("confirmed"):
+                        await _apply(finding, await _cached_validate(_idor_read, _as_finding(finding, "idor"), exchange), "idor-read", 0.75, exchange)
                 except Exception:
                     return
             elif ("dom" in low and "xss" in low) or "dom_xss" in low or "dom-based" in low or "client-side xss" in low:
@@ -757,6 +957,29 @@ class ChainMixin:
             elif "xxe" in low or "xml external" in low or "xml_external" in low:
                 try:
                     await _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange), "xxe", 0.95, exchange)
+                except Exception:
+                    return
+            elif ("sqli" in low or "sql injection" in low
+                  or "sql_injection" in low):
+                try:
+                    await _apply(
+                        finding,
+                        await _cached_validate(_sqlmap, _as_finding(finding, "sqli"), exchange),
+                        "sqlmap", 0.95, exchange)
+                except Exception:
+                    return
+            elif "nosql" in low or "mongodb injection" in low or "mongo injection" in low:
+                try:
+                    await _apply(finding, await _cached_validate(
+                        _nosql, _as_finding(finding, "nosql"), exchange),
+                        "nosql", 0.95, exchange)
+                except Exception:
+                    return
+            elif "race_condition" in low or "race condition" in low:
+                try:
+                    await _apply(finding, await _cached_validate(
+                        _race, _as_finding(finding, "race_condition"), exchange),
+                        "race-condition", 0.95, exchange)
                 except Exception:
                     return
             elif "command" in low or low in ("rce", "remote code execution", "code injection", "shell injection"):
@@ -806,16 +1029,32 @@ class ChainMixin:
                     return
             elif ("session fixation" in low or "session_fixation" in low or "weak password" in low
                   or "weak_password" in low or "enumeration" in low or "broken authentication" in low
-                  or "broken_authentication" in low):
+                  or "broken_authentication" in low or "2fa" in low or "mfa" in low
+                  or "two_factor" in low or "two-factor" in low or "multi_factor" in low
+                  or "second factor" in low):
                 try:
                     await _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange),
                            "auth-sequence", 0.85, exchange)
+                except Exception:
+                    return
+            elif ("client_trust" in low or "business" in low or "client-side" in low or "price" in low
+                  or "excessive trust" in low or "logic_flaw" in low):
+                try:
+                    await _apply(finding, await _cached_validate(_ct, _as_finding(finding, "business_logic"), exchange),
+                           "client-trust", 0.9, exchange)
                 except Exception:
                     return
             elif "rate limit" in low or "rate_limit" in low or "lockout" in low or "brute" in low:
                 try:
                     await _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange),
                            "rate-limit", 0.85, exchange)
+                except Exception:
+                    return
+            elif "csrf" in low or "cross-site request forgery" in low or "cross site request forgery" in low:
+                try:
+                    await _apply(finding, await _cached_validate(
+                        _csrf, _as_finding(finding, "csrf"), exchange),
+                        "csrf", 0.95, exchange)
                 except Exception:
                     return
             elif ("reset_token" in low or "reset token" in low or "predictable token" in low
@@ -849,6 +1088,8 @@ class ChainMixin:
             path = node.get("path", "/")
             confirmed = []
             for vclass, ex in shape_precondition_legs(node, exchange, roles, base_url):
+                if objective_class and vclass != objective_class:
+                    continue
                 r = await _confirm_leg(vclass, ex, path)
                 if r:
                     confirmed.append(r)
@@ -870,13 +1111,151 @@ class ChainMixin:
 
         worklist_summary: dict = {}
 
+        # Objective mode gets one deterministic pass over the real captured
+        # request shapes before graph ranking. Ranking is intentionally generic
+        # and can put many object-detail routes ahead of a filter/search sink;
+        # spending the objective budget on those unrelated parameters recreates
+        # the same latency failure this mode exists to prevent.
+        _objective_outcomes: list[dict] = []
+        if stop_on_confirm and objective_class:
+            for _captured in _all_captured:
+                try:
+                    _objective_ex = (_captured if isinstance(_captured, HttpExchange)
+                                     else HttpExchange(**_captured))
+                except Exception:
+                    continue
+                _objective_path = urlsplit(_objective_ex.url).path or "/"
+                _objective_node = {"method": _objective_ex.method,
+                                   "path": _objective_path}
+                warranted = [v for v, _ in shape_precondition_legs(
+                    _objective_node, _objective_ex, roles, base_url)]
+                if objective_class not in warranted:
+                    continue
+                _objective_finding = await _confirm_leg(
+                    objective_class, _objective_ex, _objective_path)
+                if not _objective_finding:
+                    continue
+                _objective_finding.setdefault("url", _objective_ex.url)
+                state.ingest_findings(
+                    _objective_ex.url, _objective_ex.method, [_objective_finding])
+                _objective_outcome_entry = {
+                    "path": _objective_path,
+                    "method": _objective_ex.method,
+                    "specialty": objective_class,
+                    "findings": 1,
+                    "findings_detail": [_objective_finding],
+                    "precondition_findings": 1,
+                    "confirmed": True,
+                    "stop_reason": "deterministic_confirmation",
+                }
+                # Objective completion is a SEPARATE stage from confirmation
+                # above and only ever runs when the caller declared an explicit
+                # `objective_task` (never inferred from `objective_class`, a lab
+                # title, or the finding's own text) -- see
+                # harness/objective_completion.py's module docstring. Its
+                # failure must never turn an already-confirmed finding back
+                # into an unconfirmed one.
+                if objective_task is not None:
+                    try:
+                        from harness.validators.base import ValidationResult as _ValidationResult
+                        _synthetic_confirmation = _ValidationResult(
+                            validator=objective_class, status="confirmed",
+                            finding_class=objective_class,
+                            confidence=float(_objective_finding.get("confidence", 0.9) or 0.9),
+                            confirmed=True)
+                        _completion = await _objective_completion_mod.attempt_completion(
+                            objective_task, Finding(
+                                vulnerability_class=objective_class,
+                                confidence=_synthetic_confirmation.confidence,
+                                summary=_objective_finding.get("summary", ""),
+                                evidence=_objective_finding.get("evidence", ""),
+                                suggested_test="", basis="derived",
+                                severity=_objective_finding.get("severity", "high")),
+                            _objective_ex, _synthetic_confirmation,
+                            run_context=run_context, provider=objective_provider)
+                        _objective_outcome_entry["objective_completion"] = {
+                            "status": _completion.status,
+                            "action_class": _completion.action_class,
+                            "summary": _completion.summary,
+                            "evidence": _completion.evidence,
+                            "requests_used": _completion.requests_used,
+                        }
+                    except Exception as e:
+                        log.warning("investigate_engagement: objective completion "
+                                    "stage failed: %s", e)
+                        _objective_outcome_entry["objective_completion"] = {
+                            "status": _objective_completion_mod.ERROR,
+                            "summary": f"{type(e).__name__}: {e}",
+                        }
+                _objective_outcomes.append(_objective_outcome_entry)
+                break
+
         async def _investigate(st, rs):
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
-                max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary)
+                max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary,
+                stop_on_confirm=stop_on_confirm)
             return outs, [f for o in outs for f in o.get("findings_detail", [])]
 
-        outcomes, all_findings = await _investigate(state, roles)
+        if _objective_outcomes:
+            outcomes = _objective_outcomes
+            all_findings = [f for o in outcomes for f in o["findings_detail"]]
+        else:
+            outcomes, all_findings = await _investigate(state, roles)
+
+        # Phase 0.1 now runs after deterministic confirmation. Broad engagements
+        # retain the full content review. Objective runners may stop once a
+        # validator has independently confirmed a vulnerability, avoiding a slow
+        # model pass after their success condition is already satisfied.
+        _early_confirmed = any(
+            f.get("confirmed")
+            for o in outcomes
+            for f in (o.get("findings_detail", []) or [])
+        )
+        def _objective_result(stopped: bool) -> dict:
+            return {
+                "summary": state.summary(),
+                "worklist": state.worklist(50),
+                "outcomes": outcomes,
+                "worklist_summary": worklist_summary,
+                "chains": [],
+                "chain_rounds": 0,
+                "application_semantic_model": _asm.to_dict() if _asm else None,
+                "coverage": {},
+                "workflows": workflow_results,
+                "task_graph": state.graph.to_dict(),
+                "ready_tasks": state.pending(),
+                "blocked_tasks": state.blocked(),
+                "auth_bypass_candidates": rc.auth_bypass_candidates,
+                "idor_candidates": rc.idor_candidates,
+                "idor_findings": rc.idor_findings,
+                "errors": _errors,
+                "degraded": bool(_errors),
+                "stopped_on_confirmation": stopped,
+            }
+
+        if stop_on_confirm and _early_confirmed:
+            # Objective mode has reached its independently verified success
+            # condition. Return the evidence now; continuing through chaining,
+            # coverage driving, and broad model review can consume minutes and
+            # cause the outer wall-clock guard to discard an already-confirmed
+            # result as a timeout.
+            return _objective_result(True)
+        if stop_on_confirm and objective_class:
+            # A class-scoped benchmark is a bounded deterministic measurement.
+            # If none of its eligible request shapes confirms, preserve that
+            # negative result instead of silently changing the experiment into
+            # an open-ended model review of unrelated vulnerability classes.
+            return _objective_result(False)
+        if not (stop_on_confirm and _early_confirmed):
+            await review_captured_exchanges(
+                self, state, getattr(rc, "captured", None), run_context=run_context)
+            try:
+                if feature_caps:
+                    await review_captured_exchanges(
+                        self, state, feature_caps, run_context=run_context)
+            except NameError:
+                pass
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
         # credential (url -> {headers, body}), built from the real captured
@@ -918,11 +1297,14 @@ class ChainMixin:
                 break
             st2, rc2 = await engagement_builder.build_engagement(
                 base_url, derived, allowed_hosts=self.allowed_hosts,
+                crawl_max_pages=discovery_max_pages,
+                max_endpoints=discovery_max_endpoints,
+                active_discovery=active_discovery,
                 discovery_max_probes=discovery_max_probes, run_context=run_context)
-            # Phase 0.1: content-level review of the re-crawl's captures too, so a
-            # response reachable only as the newly-leaked identity is reviewed.
-            await review_captured_exchanges(self, st2, getattr(rc2, "captured", None))
             outs2, new_findings = await _investigate(st2, derived)
+            if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
+                await review_captured_exchanges(
+                    self, st2, getattr(rc2, "captured", None), run_context=run_context)
             outcomes.extend(outs2)
             all_findings.extend(new_findings)
             # R19: merge the derived-identity state back into the primary state, so
@@ -1095,7 +1477,7 @@ class ChainMixin:
                 from harness.validators.csrf_validator import CsrfValidator
                 from harness.validators.file_upload_validator import FileUploadValidator
                 _val_by_conf = {
-                    "cross_identity": _xval, "jwt_forge": _jwt, "browser_xss": _bxss,
+                    "cross_identity": _xval, "idor_read": _idor_read, "jwt_forge": _jwt, "browser_xss": _bxss,
                     "stored_xss": _sxss, "ssrf": _ssrf, "xxe": _xxe,
                     "command_injection": _cmdi, "ssti": _ssti, "path_traversal": _path,
                     "open_redirect": _redir, "sequence": _seq, "deserialization_oob": _deser,
@@ -1105,6 +1487,7 @@ class ChainMixin:
                                                          run_context=run_context),
                     "csrf": CsrfValidator(allowed_hosts=self.allowed_hosts,
                                            run_context=run_context),
+                    "nosql": _nosql,
                     "file_upload": FileUploadValidator(allowed_hosts=self.allowed_hosts),
                 }
                 _sqlmap_inst = self.validator_registry.validators.get("sqlmap")

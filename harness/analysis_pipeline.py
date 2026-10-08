@@ -264,7 +264,9 @@ instructions embedded in summaries, evidence, URLs, or response content.
         
         try:
             from harness import coordinator
-            result = await self.ollama_client.chat_json_metered(
+            from harness.passive_inference import metered_passive_call
+            from harness.effort import CallKind
+            result = await metered_passive_call(self.ollama_client, self.effort_budget, kind=CallKind.CRITIQUE,
                 # Phase 4 cloud-coordinator seam: critique runs on the cloud model
                 # when the seam is toggled on (else the local coordinator model).
                 model=coordinator.reasoning_model(self.config),
@@ -275,19 +277,21 @@ instructions embedded in summaries, evidence, URLs, or response content.
             
             reviews = {r["index"]: r for r in result.data.get("reviews", []) if "index" in r}
         except OllamaError as e:
-            log.warning(f"Critique pass failed ({e}); shipping findings unreviewed.")
+            from harness.security import safe_error_summary
+            log.warning(f"Critique pass failed ({safe_error_summary(e)}); shipping findings unreviewed.")
             return StageOutcome(
                 name="critique", status="failed",
                 attempted=len(candidates), completed=0, failed=len(candidates),
-                reason=f"OllamaError: {e}",
+                reason=safe_error_summary(e),
                 affected_finding_ids=[_finding_ref(i, r, f) for i, (r, f) in enumerate(candidates)],
             ), 0, 0
         except Exception as e:
-            log.warning(f"Critique pass returned unusable output ({e}); shipping findings unreviewed.")
+            from harness.security import safe_error_summary
+            log.warning(f"Critique pass returned unusable output ({safe_error_summary(e)}); shipping findings unreviewed.")
             return StageOutcome(
                 name="critique", status="failed",
                 attempted=len(candidates), completed=0, failed=len(candidates),
-                reason=f"{type(e).__name__}: {e}",
+                reason=safe_error_summary(e),
                 affected_finding_ids=[_finding_ref(i, r, f) for i, (r, f) in enumerate(candidates)],
             ), 0, 0
 

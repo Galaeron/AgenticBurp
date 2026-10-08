@@ -39,8 +39,10 @@ plus the assembly. Behavior is unchanged -- the methods moved verbatim and every
   and the model/agent/effort management surface.
 """
 from __future__ import annotations
+import uuid
 
 from harness import config_schema
+from harness import run_inference
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (re-export shared namespace)
 from harness.orchestrator_detect import DetectMixin
 from harness.orchestrator_confirm import ConfirmMixin
@@ -51,7 +53,6 @@ from harness.orchestrator_report import ReportMixin
 class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
     """
     Main orchestrator for security testing.
-    
     This class coordinates all aspects of analyzing HTTP exchanges,
     including agent dispatching, finding collection, validation, and
     result delivery.
@@ -63,6 +64,24 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
     - FastPathSelector: Provides deterministic pre-LLM agent routing
     """
     
+    @property
+    def effort_budget(self):
+        view = run_inference.current(self)
+        return view.budget if view is not None else self._aggregate_effort_budget
+
+    @effort_budget.setter
+    def effort_budget(self, value):
+        self._aggregate_effort_budget = value
+
+    @property
+    def analysis_pipeline(self):
+        view = run_inference.current(self)
+        return view.pipeline if view is not None else self._analysis_pipeline_template
+
+    @analysis_pipeline.setter
+    def analysis_pipeline(self, value):
+        self._analysis_pipeline_template = value
+
     def __init__(self, config: dict, *, explicit_keys: set[str] | None = None):
         """
         Initialize the orchestrator.
@@ -192,6 +211,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             log.warning("Unknown effort_budget.mode %r; defaulting to soft.", mode_str)
             budget_mode = BudgetMode.SOFT
         self.effort_budget = EffortBudget(mode=budget_mode, total_tokens=effort_cfg.get("total_tokens"))
+        self._inference_owner_id = uuid.uuid4().hex
         
         # Initialize agent manager (uses plugin system for discovery)
         self.agent_manager = AgentManager(config, self.ollama)

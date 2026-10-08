@@ -1,5 +1,20 @@
 # Architecture & OWASP Security Review
 
+> **Historical, founding review — dated 2026-08-30, never updated since.**
+> Numbers below are a snapshot of that day (e.g. "15 validators", "one squashed
+> commit", "506 tests"): the registry now registers 35 validators, the repo has
+> a full dated commit history, and the suite is thousands of tests across
+> unittest/pytest/evaluation tiers — see [CURRENT_STATE.md](CURRENT_STATE.md)
+> and [docs/TESTING.md](docs/TESTING.md) for the current counts and how to
+> reproduce them. Several headline problems here were subsequently addressed
+> (an evidence ledger, a scored precision/recall harness, a full leg-
+> verification pass, CI, package layout) — check [IMPROVEMENT_BACKLOG.md](IMPROVEMENT_BACKLOG.md)
+> and [ORACLE_RETIREMENTS.md](ORACLE_RETIREMENTS.md) before assuming any item
+> below is still open. Kept at this path, unedited below this banner, because
+> `harness/scope_discovery.py`'s module docstring cross-references it by
+> numbered item (`REVIEW.md's #3/#8`); renumbering or moving it would break
+> that pointer.
+>
 > Senior review of the Burp LLM Harness project, written to be handed directly
 > to an implementing agent. Every claim below was checked against the actual
 > code, config, tests, and repo state — not inferred from docs. File references

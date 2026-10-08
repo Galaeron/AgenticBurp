@@ -113,6 +113,18 @@ class AgentManager:
             try:
                 self.agents[name] = self._create_agent(agent_class, acfg)
                 log.info("Initialized agent: %s (model: %s)", name, self.agents[name].model)
+                # Surface the shadowing trap: a per-agent `model` override set to
+                # the SAME value as agent_defaults.model is redundant AND a trap --
+                # it silently will NOT follow a later change to the default, so an
+                # operator who "switches the model" leaves these agents behind on
+                # the old one. Warn so the pin is visible (see config.yaml note).
+                default_model = (self.config.get("agent_defaults") or {}).get("model")
+                if isinstance(acfg, dict) and acfg.get("model") and acfg.get("model") == default_model:
+                    log.warning(
+                        "Agent %s pins model %r, identical to agent_defaults.model -- a "
+                        "redundant override that will NOT follow a change to the default. "
+                        "Remove the per-agent `model` unless it is meant to differ.",
+                        name, acfg.get("model"))
             except Exception as e:
                 log.error(f"Failed to initialize agent {name}: {e}")
                 raise
@@ -301,7 +313,8 @@ class AgentManager:
         return result
     
     
-    def run_agent(self, name: str, exchange, max_body_chars: int = 6000, prior_context: str = "") -> AgentReport:
+    def run_agent(self, name: str, exchange, max_body_chars: int = 6000,
+                  prior_context: str = "", effort_budget=None) -> AgentReport:
         """
         Run a specific agent on an exchange.
         
@@ -325,9 +338,6 @@ class AgentManager:
                 raw_error=f"Agent {name} not found"
             )
         
-        # Get effort budget if available
-        effort_budget = getattr(self, '_effort_budget', None)
-        
         # Run the agent
         import asyncio
         if asyncio.iscoroutinefunction(agent.run):
@@ -341,7 +351,8 @@ class AgentManager:
             # Agent.run is sync (shouldn't happen with current BaseAgent)
             return agent.run(exchange, max_body_chars, prior_context, effort_budget)
     
-    async def run_agent_async(self, name: str, exchange, max_body_chars: int = 6000, prior_context: str = "") -> AgentReport:
+    async def run_agent_async(self, name: str, exchange, max_body_chars: int = 6000,
+                              prior_context: str = "", effort_budget=None) -> AgentReport:
         """
         Async version of run_agent.
         
@@ -364,9 +375,6 @@ class AgentManager:
                 findings=[],
                 raw_error=f"Agent {name} not found"
             )
-        
-        # Get effort budget if available
-        effort_budget = getattr(self, '_effort_budget', None)
         
         # Run the agent
         return await agent.run(exchange, max_body_chars, prior_context, effort_budget)
@@ -397,13 +405,13 @@ class AgentManager:
         """
         if self.routing_mode == "families":
             return await self._run_multiple_agents_families(
-                agent_names, exchange, max_body_chars, prior_context)
+                agent_names, exchange, max_body_chars, prior_context, effort_budget)
         return await self._run_multiple_agents_default(
-            agent_names, exchange, max_body_chars, prior_context)
+            agent_names, exchange, max_body_chars, prior_context, effort_budget)
 
     async def _run_multiple_agents_default(self, agent_names: list[str], exchange,
                                            max_body_chars: int = 6000,
-                                           prior_context: str = "") -> list:
+                                           prior_context: str = "", effort_budget=None) -> list:
         """Unchanged pre-AR-1 behavior: one model call per dispatched agent,
         bounded by `concurrency.max_parallel_agents` in config (see __init__)
         so a large dispatch doesn't fire every agent's inference request at
@@ -414,10 +422,14 @@ class AgentManager:
         tasks = []
 
         async def _run_bounded(name: str):
+            # Preserve standalone overrides with the legacy four-argument API.
+            args = (name, exchange, max_body_chars, prior_context)
+            if effort_budget is not None:
+                args += (effort_budget,)
             if self._agent_semaphore is not None:
                 async with self._agent_semaphore:
-                    return await self.run_agent_async(name, exchange, max_body_chars, prior_context)
-            return await self.run_agent_async(name, exchange, max_body_chars, prior_context)
+                    return await self.run_agent_async(*args)
+            return await self.run_agent_async(*args)
 
         for name in agent_names:
             if name in self.agents:
@@ -447,7 +459,7 @@ class AgentManager:
 
     async def _run_multiple_agents_families(self, agent_names: list[str], exchange,
                                             max_body_chars: int = 6000,
-                                            prior_context: str = "") -> list:
+                                            prior_context: str = "", effort_budget=None) -> list:
         """AR-1 families path: group `agent_names` (already filtered to
         agents this manager actually has initialized) into
         `agent_families.DEFAULT_FAMILIES` families -- only members present in
@@ -472,17 +484,19 @@ class AgentManager:
 
         async def _run_family_bounded(family_name: str, members: list[str]):
             runner = FamilyRunner(family_name, [self.agents[m] for m in members])
-            effort_budget = getattr(self, '_effort_budget', None)
             if self._agent_semaphore is not None:
                 async with self._agent_semaphore:
                     return await runner.run(exchange, max_body_chars, prior_context, effort_budget)
             return await runner.run(exchange, max_body_chars, prior_context, effort_budget)
 
         async def _run_solo_bounded(name: str):
+            args = (name, exchange, max_body_chars, prior_context)
+            if effort_budget is not None:
+                args += (effort_budget,)
             if self._agent_semaphore is not None:
                 async with self._agent_semaphore:
-                    return await self.run_agent_async(name, exchange, max_body_chars, prior_context)
-            return await self.run_agent_async(name, exchange, max_body_chars, prior_context)
+                    return await self.run_agent_async(*args)
+            return await self.run_agent_async(*args)
 
         for family_name, members in families.items():
             tasks.append(asyncio.create_task(_run_family_bounded(family_name, members)))

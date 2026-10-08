@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Any
 from pathlib import Path
+from contextlib import contextmanager
 
 import sqlite3
 from threading import Lock
@@ -228,7 +229,7 @@ class ExchangeCache:
     
     def _init_db(self) -> None:
         """Initialize the SQLite database and tables."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cache_entries (
                     exchange_hash TEXT PRIMARY KEY,
@@ -287,6 +288,16 @@ class ExchangeCache:
         )
         conn.row_factory = sqlite3.Row
         return conn
+
+    @contextmanager
+    def _connection(self):
+        """Own one connection while preserving SQLite commit/rollback semantics."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
     
     # Headers that are pure transport/tracing noise: they change on every
     # single request/response regardless of whether the exchange is
@@ -380,7 +391,7 @@ class ExchangeCache:
         
         with self._lock:
             try:
-                with self._get_connection() as conn:
+                with self._connection() as conn:
                     row = conn.execute(
                         "SELECT * FROM cache_entries WHERE exchange_hash = ?",
                         (exchange_hash,)
@@ -464,7 +475,7 @@ class ExchangeCache:
         
         with self._lock:
             try:
-                with self._get_connection() as conn:
+                with self._connection() as conn:
                     # Evict old entries if at capacity
                     self._evict_if_needed(conn)
                     
@@ -509,6 +520,7 @@ class ExchangeCache:
         current_prompt_versions: dict[str, str],
         config_fingerprint: str,
         bypass: bool = False,
+        namespace: str = "",
     ) -> Optional["HypothesisCacheEntry"]:
         """Look up a hypothesis-cache entry for this exchange. Returns None on
         a miss/expiry/staleness, exactly like get() above, but the returned
@@ -520,11 +532,11 @@ class ExchangeCache:
                 self._hyp_stats.bypasses += 1
             return None
 
-        exchange_hash = self.compute_exchange_hash(exchange, namespace="")
+        exchange_hash = self.compute_exchange_hash(exchange, namespace=namespace)
 
         with self._lock:
             try:
-                with self._get_connection() as conn:
+                with self._connection() as conn:
                     row = conn.execute(
                         "SELECT * FROM hypothesis_cache_entries WHERE exchange_hash = ?",
                         (exchange_hash,)
@@ -595,6 +607,7 @@ class ExchangeCache:
         model: str,
         prompt_versions: dict[str, str],
         config_fingerprint: str,
+        namespace: str = "",
     ) -> None:
         """Store the pre-proof, run-independent half of an analysis.
 
@@ -618,7 +631,7 @@ class ExchangeCache:
                     )
                     return
 
-        exchange_hash = self.compute_exchange_hash(exchange, namespace="")
+        exchange_hash = self.compute_exchange_hash(exchange, namespace=namespace)
         payload = {
             "reports": [r.model_dump() for r in reports],
             "dispatch": list(dispatch),
@@ -630,7 +643,7 @@ class ExchangeCache:
 
         with self._lock:
             try:
-                with self._get_connection() as conn:
+                with self._connection() as conn:
                     self._evict_hypothesis_if_needed(conn)
                     conn.execute(
                         """
@@ -717,7 +730,7 @@ class ExchangeCache:
     def _save_stats_to_db(self) -> None:
         """Save statistics to the database."""
         try:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 for field in ['hits', 'misses', 'bypasses', 'evictions']:
                     conn.execute(
                         "UPDATE cache_stats SET value = ? WHERE key = ?",
@@ -738,7 +751,7 @@ class ExchangeCache:
         """Clear all cached entries."""
         with self._lock:
             try:
-                with self._get_connection() as conn:
+                with self._connection() as conn:
                     count = conn.execute(
                         "SELECT COUNT(*) as cnt FROM cache_entries"
                     ).fetchone()["cnt"]
@@ -760,7 +773,7 @@ class ExchangeCache:
         """Get current cache statistics."""
         with self._lock:
             try:
-                with self._get_connection() as conn:
+                with self._connection() as conn:
                     self._load_stats(conn)
             except Exception:
                 pass
@@ -778,7 +791,7 @@ class ExchangeCache:
     def exchange_size(self) -> int:
         """Number of entries in the exchange cache."""
         try:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 return conn.execute(
                     "SELECT COUNT(*) as cnt FROM cache_entries"
                 ).fetchone()["cnt"]
@@ -789,7 +802,7 @@ class ExchangeCache:
     def hypothesis_size(self) -> int:
         """Number of entries in the hypothesis cache."""
         try:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 return conn.execute(
                     "SELECT COUNT(*) as cnt FROM hypothesis_cache_entries"
                 ).fetchone()["cnt"]

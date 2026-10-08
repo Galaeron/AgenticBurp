@@ -5,12 +5,13 @@ import os
 import secrets
 import yaml
 from harness import store
+from harness import security
 from harness import active_verification
 from harness import surface_prioritizer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -21,6 +22,7 @@ import harness.identity as identity_mod
 from harness.orchestrator import Orchestrator
 
 logging.basicConfig(level=logging.INFO)
+security.install_privacy_log_filters()
 log = logging.getLogger("harness.server")
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -106,7 +108,54 @@ def _live_validators_gate_config() -> dict:
     """
     live = dict(config.get("validators", {}) or {})
     live["active_enabled"] = orchestrator.validator_registry.active_enabled
+    from harness.target_request_policy import TargetRequestPolicy
+    live['target_policy'] = TargetRequestPolicy.from_config(orchestrator.config)
     return live
+
+
+def _require_target_fetch(url: str, *, bulk: bool = False) -> None:
+    """Admission for API operations that fetch rather than analyze supplied data."""
+    from harness.target_request_policy import TargetRequestPolicy
+    policy = TargetRequestPolicy.from_config(orchestrator.config)
+    reason = policy.denial_reason(url)
+    if not reason and bulk and policy.excluded_path_prefixes:
+        # Legacy raw crawl/browser adapters cannot enforce exclusions per hop.
+        # Reject the entire operation rather than promising partial containment.
+        reason = 'target operation blocked: this adapter cannot enforce endpoint exclusions per hop'
+    if reason:
+        raise HTTPException(status_code=403, detail=reason)
+
+
+def _require_active_crawl(url: str) -> None:
+    """Admission for the crawl endpoints, which send ACTIVE outbound traffic.
+
+    Two safety preconditions, each returning a clear 403 (never a silent empty
+    result):
+      1. An explicit scope that covers `url`. Empty server.allowed_hosts is
+         fail-CLOSED for active fetching (W-17 active_mode) -- a default-config
+         crawl must not reach an arbitrary host.
+      2. Active mode armed (validators.active_enabled, live value including the
+         POST /settings toggle). Crawling is active traffic, so it respects the
+         same master switch as the active validators.
+    """
+    from harness.scope_lock import host_in_scope, out_of_scope_reason
+    allowed = orchestrator.allowed_hosts
+    if not host_in_scope(url, allowed, active_mode=True):
+        if not allowed:
+            raise HTTPException(
+                status_code=403,
+                detail="crawl refused: no server.allowed_hosts configured. Crawling "
+                       "sends active traffic, so it fails closed without an explicit "
+                       "scope. Set server.allowed_hosts (e.g. in config.local.yaml) to "
+                       "the target host, then retry.")
+        raise HTTPException(status_code=403, detail=f"crawl refused: {out_of_scope_reason(url, allowed)}")
+    if not orchestrator.validator_registry.active_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="crawl refused: active operations are disabled. Crawling sends live "
+                   "requests to the target, so it requires validators.active_enabled "
+                   "(set it in config.local.yaml, or arm active mode via POST /settings "
+                   "/ the Burp 'Active testing' toggle), on top of a configured scope.")
 
 
 def _is_loopback(host: str) -> bool:
@@ -115,13 +164,9 @@ def _is_loopback(host: str) -> bool:
 
 _BEARER_TOKEN = config.get("server", {}).get("auth_token") or os.environ.get("HARNESS_BEARER_TOKEN")
 _SERVER_HOST = config.get("server", {}).get("host", "127.0.0.1")
-# FR-8 (F12 offline half): ships false -- see the config.yaml comment on
-# server.require_read_auth for why. Read as a plain module global (not
-# wrapped in a function) so a test can flip it directly via
-# `server._READ_AUTH_ENABLED = True`/`False` without a config reload;
-# _require_read_auth below re-reads this name from the module each call
-# (never captures it in a closure/default arg) so that monkeypatch works.
-_READ_AUTH_ENABLED = bool(config.get("server", {}).get("require_read_auth", False))
+# Compatibility name for legacy diagnostics/tests. Sensitive reads always
+# authenticate; server.require_read_auth=false no longer disables the policy.
+_READ_AUTH_ENABLED = True
 # P3-1 (partial): ships false -- see the config.yaml comment on
 # server.enable_wipe_endpoint for why. Same pattern as _READ_AUTH_ENABLED
 # above: a plain module global (not wrapped in a function) so a test can
@@ -193,10 +238,8 @@ def _require_auth(authorization: str | None) -> None:
 #      included), since GET is exactly the "simple request" class the
 #      primary control above does not cover.
 #
-# RB-1b (separate, OWNER/JDK item, out of this change's scope) is the Burp
-# extension reading this token from the lockfile and sending it. Until that
-# lands, the packaged extension will not authenticate its mutating calls --
-# expected and accepted, per the backlog item.
+# The extension accepts an explicitly supplied token (or environment bearer).
+# /pairing/check proves authentication separately from public liveness.
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 # Where the ephemeral token is published for a local operator/extension to
@@ -205,40 +248,29 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 TOKEN_LOCKFILE_PATH = Path(__file__).parent / ".harness_token.lock"
 
 
-def _write_token_lockfile(token: str) -> None:
-    """Best-effort: publish the ephemeral token to TOKEN_LOCKFILE_PATH with
-    owner-only (0600) permissions where the OS supports it. A failure to
-    write or chmod the file must never crash startup -- the token still
-    works for any caller that already has it (e.g. this same process's
-    tests); an operator who needs the file can always regenerate it by
-    restarting. NOTE (Windows caveat): os.chmod on Windows does not map onto
-    POSIX owner/group/other permission bits -- it can only toggle the
-    read-only attribute, not actually restrict the file to the current
-    user's account. On Windows this call is therefore a no-op with respect
-    to the "0600, other local accounts cannot read it" guarantee POSIX gets;
-    the real security boundary on any platform is still the token itself
-    (an attacker who can already read arbitrary files on the host has far
-    worse problems than this lockfile).
+def _write_token_lockfile(token: str) -> bool:
+    """Publish privately or report failure; no credential bytes in diagnostics.
+
+    Windows uses a protected explicit user DACL before writing, POSIX uses 0600.
+    Failure leaves the prior file unchanged; it may be stale, so do not report
+    successful publication. Startup retains the generated in-memory token.
     """
     try:
-        TOKEN_LOCKFILE_PATH.write_text(token, encoding="utf-8")
+        security.write_private_credential_file(TOKEN_LOCKFILE_PATH, token)
     except OSError as e:
-        log.warning("RB-1: could not write ephemeral token lockfile %s: %s", TOKEN_LOCKFILE_PATH, e)
-        return
-    try:
-        os.chmod(TOKEN_LOCKFILE_PATH, 0o600)
-    except OSError as e:
-        # Expected/benign on Windows (see docstring above) and on any
-        # filesystem that doesn't support POSIX permission bits.
-        log.debug("RB-1: chmod 0600 on token lockfile not applied (%s): %s", TOKEN_LOCKFILE_PATH, e)
+        log.warning("Could not privately publish ephemeral pairing token (%s); "
+                    "prior lockfile may be stale. Configure an explicit bearer token to pair.", type(e).__name__)
+        return False
+    return True
 
 
 _EPHEMERAL_TOKEN: str | None = None
 if not _BEARER_TOKEN:
     _EPHEMERAL_TOKEN = secrets.token_urlsafe(32)
-    _write_token_lockfile(_EPHEMERAL_TOKEN)
-    log.info("RB-1: no operator server.auth_token/HARNESS_BEARER_TOKEN configured -- generated an "
-             "ephemeral bearer token for state-changing routes and wrote it to %s", TOKEN_LOCKFILE_PATH)
+    _token_published = _write_token_lockfile(_EPHEMERAL_TOKEN)
+    if _token_published:
+        log.info("Generated an ephemeral bearer token for authenticated routes and privately published it to %s",
+                 TOKEN_LOCKFILE_PATH)
 
 
 def _mutation_token() -> str | None:
@@ -252,40 +284,15 @@ def _mutation_token() -> str | None:
 
 
 def _require_read_auth(authorization: str | None) -> None:
-    """FR-8 (F12 offline half): opt-in gate for sensitive GET reads
-    (/report, /telemetry, /test-plans/{plan_id}, GET /settings,
-    GET /findings/{finding_ref}/evidence, GET /engagement/{host},
-    GET /engagement/{host}/investigate/{job_id}, GET /identities,
-    GET /hosts/{host}/sessions, GET /findings/suppressions,
-    GET /issues/{host}/merges, GET /knowledge, GET /activity,
-    GET /engagement/{host}/investigate) -- routes that expose captured client
-    traffic, discovered secrets, reconstructed evidence/reproduction recipes,
-    identities/sessions, tester-authored knowledge notes, the live activity
-    feed, investigation job listings (base URL / error / manifest path) and
-    diagnostics, which _require_auth's
-    loopback bypass otherwise leaves open to any local process/user with
-    no token at all. Deliberately a SEPARATE function from
-    _require_auth (which stays exactly as it was: unchanged, still gates
-    only on the configured _BEARER_TOKEN, still bypassed on loopback with no
-    configured token) -- this one is opt-in via server.require_read_auth
-    (ships false) and, when armed, requires the SAME effective token already
-    required on mutations (_mutation_token(): the configured token if set,
-    else the RB-1 ephemeral one), not just a configured operator token. That
-    lets an operator arm this on the default no-token-configured loopback
-    deploy and still have it mean something (today's ephemeral mutation
-    token), rather than requiring them to additionally set server.auth_token.
+    """Require the effective credential for sensitive reads, including loopback.
 
-    Reads the _READ_AUTH_ENABLED module global fresh on every call (never
-    caches it in a default arg or closure) so a test can flip
-    `server._READ_AUTH_ENABLED` directly without reloading the module or
-    re-reading config.yaml. /health calls neither this nor _require_auth and
-    must stay that way -- it is the one route pairing/liveness needs open
-    unconditionally.
+    Legacy require_read_auth=false and the compatibility module flag cannot
+    disable this policy. Public health/schema documentation remain readable;
+    pairing requires the effective token independently. See docs/PRIVACY.md.
     """
-    if not _READ_AUTH_ENABLED:
-        return
-    expected = f"Bearer {_mutation_token()}"
-    if not authorization or not secrets.compare_digest(authorization, expected):
+    token = _mutation_token()
+    if not token or not authorization or not secrets.compare_digest(
+            authorization, f"Bearer {token}"):
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
 
@@ -329,18 +336,88 @@ async def _csrf_defense_middleware(request, call_next):
             if not authorization or not secrets.compare_digest(authorization, f"Bearer {expected}"):
                 return JSONResponse(status_code=401, content={"detail": "missing or invalid bearer token"})
 
+    # Central route coverage also protects newly added diagnostic/sensitive
+    # GET routes; public liveness and API schema documentation are explicit.
+    if request.method in {"GET", "HEAD"} and request.url.path not in {
+            "/health", "/pairing/check", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}:
+        try:
+            _require_read_auth(request.headers.get("authorization"))
+        except HTTPException:
+            return JSONResponse(status_code=401, content={"detail": "missing or invalid bearer token"})
+
     return await call_next(request)
 
 
 @app.get("/health")
 async def health():
+    """Liveness AND readiness. `status` is "ok" only when the LLM backend is
+    actually usable: previously this returned "ok" without ever contacting
+    Ollama, so a server with no `ollama serve` / no pulled model still looked
+    healthy and every analysis silently fell back to deterministic-only output
+    ("it ran and found almost nothing"). Now it probes Ollama and reports
+    "degraded" when it is unreachable or a configured LOCAL model is not pulled,
+    with `ollama` carrying the detail. Cloud model tags (…-cloud) are not pulled
+    locally and are excluded from the missing-model check."""
     from harness import coordinator
+    probe = await orchestrator.ollama.health_check()
+    present = set(probe.get("models") or [])
+
+    def _is_present(model: str) -> bool:
+        if model in present:
+            return True
+        base = model.split(":")[0]
+        return any(tag == model or tag.split(":")[0] == base for tag in present)
+
+    configured = {orchestrator.coordinator_model}
+    configured.update(a.model for a in orchestrator.agent_manager.agents.values())
+    crit = (config.get("critique") or {}).get("model")
+    if crit:
+        configured.add(crit)
+    local_models = sorted(m for m in configured if m and not m.endswith("-cloud"))
+    missing = [m for m in local_models if not _is_present(m)]
+
+    reachable = bool(probe.get("reachable"))
+    status = "ok" if (reachable and not missing) else "degraded"
+    ollama_detail = {
+        "base_url": orchestrator.ollama.base_url,
+        "reachable": reachable,
+        "models_present": sorted(present),
+        "configured_local_models": local_models,
+        "missing_models": missing,
+    }
+    if not reachable:
+        ollama_detail["error"] = probe.get("error")
+        ollama_detail["hint"] = "start Ollama (`ollama serve`) and confirm ollama.base_url in config.yaml"
+    elif missing:
+        ollama_detail["hint"] = ("pull the configured model(s), e.g. "
+                                 + "; ".join(f"`ollama pull {m}`" for m in missing))
     return {
-        "status": "ok",
+        "status": status,
         "coordinator_model": orchestrator.coordinator_model,
         "agents": list(orchestrator.agent_manager.get_enabled_agents()),
+        # Per-agent model, so an operator can VERIFY which model each agent
+        # actually runs (a per-agent override can silently shadow the default --
+        # see the config.yaml agents note) instead of assuming they all moved
+        # when agent_defaults.model changed.
+        "agent_models": {name: a.model
+                         for name, a in sorted(orchestrator.agent_manager.agents.items())},
+        "ollama": ollama_detail,
         "coordinator_fail_opens": coordinator.fail_open_stats(),
     }
+
+
+@app.get("/pairing/check")
+async def pairing_check(authorization: str | None = Header(default=None)):
+    """Authenticate a configured client without inference or state changes.
+
+    No credential is returned. Unlike /health, this always requires the
+    effective mutation token, including the ephemeral loopback credential.
+    """
+    expected = _mutation_token()
+    if not expected or not authorization or not secrets.compare_digest(
+            authorization, f"Bearer {expected}"):
+        raise HTTPException(status_code=401, detail="pairing credential missing or stale; reconnect")
+    return {"status": "authenticated"}
 
 
 @app.get("/telemetry")
@@ -364,7 +441,9 @@ async def telemetry(run_id: str | None = None, authorization: str | None = Heade
 
 
 @app.get("/report")
-async def report(url: str, authorization: str | None = Header(default=None)):
+async def report(url: str, authorization: str | None = Header(default=None),
+                 engagement_id: str = Query(default="", max_length=128),
+                 captured_principal_id: str | None = Query(default=None, max_length=128)):
     """
     Analyst-facing Markdown writeup of everything found for `url`'s host
     so far -- report_generator.py, wired here for the first time. The
@@ -385,12 +464,18 @@ async def report(url: str, authorization: str | None = Header(default=None)):
     markdown = await __import__("asyncio").to_thread(
         report_generator.generate_report_for_host, url, orchestrator.effort_budget.ledger,
         config=config,
+        engagement_id=engagement_id,
+        captured_principal=captured_principal_id,
     )
+    if not engagement_id:
+        markdown = "> Legacy host-only records. Current passive analysis requires its returned engagement_id.\n\n" + markdown
     return PlainTextResponse(markdown, media_type="text/markdown")
 
 
 @app.get("/report/sarif")
-async def report_sarif(url: str, authorization: str | None = Header(default=None)):
+async def report_sarif(url: str, authorization: str | None = Header(default=None),
+                       engagement_id: str = Query(default="", max_length=128),
+                       captured_principal_id: str | None = Query(default=None, max_length=128)):
     """
     RA-3: the SAME findings /report renders as Markdown, as a SARIF 2.1.0
     JSON document (sarif_adapter.py) instead -- so findings are portable
@@ -424,9 +509,12 @@ async def report_sarif(url: str, authorization: str | None = Header(default=None
     _require_read_auth(authorization)
     from harness import report_generator, sarif_adapter
     from harness import evidence_ledger
-    exports = await asyncio.to_thread(report_generator.export_issues_for_host, url, config=config)
+    exports = await asyncio.to_thread(report_generator.export_issues_for_host, url, config=config,
+                                      engagement_id=engagement_id, captured_principal=captured_principal_id)
     source_revision = evidence_ledger.Provenance.capture().code_version
     doc = sarif_adapter.export_issues_to_sarif(exports, source_revision=source_revision)
+    doc["runs"][0]["properties"]["engagement_id"] = engagement_id
+    doc["runs"][0]["properties"]["state_partition"] = "explicit-engagement" if engagement_id else "legacy-host-only"
     return JSONResponse(doc)
 
 
@@ -477,10 +565,12 @@ async def validation_result(submission: ValidationSubmission, authorization: str
 async def analyze(req: AnalysisRequest, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
     try:
-        return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery)
+        partition = {"engagement_id": req.engagement_id} if req.engagement_id else {}
+        return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery,
+                                          **partition)
     except Exception as e:
-        log.exception("Unhandled error during analysis")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        log.error("Unhandled error during analysis: %s", security.safe_error_summary(e))
+        return JSONResponse(status_code=500, content={"error": security.safe_error_summary(e)})
 
 
 @app.post("/estimate")
@@ -517,8 +607,9 @@ async def prioritize(req: PrioritizeRequest, authorization: str | None = Header(
     cfg = config.get("surface_prioritization", {})
     if not cfg.get("enabled", True):
         raise HTTPException(status_code=403, detail="surface_prioritization is disabled in config.yaml")
+    engagement_partition = req.engagement_id or f"prioritize:{_uuid.uuid4().hex}"
     if not req.items:
-        return PrioritizeResponse(results=[])
+        return PrioritizeResponse(results=[], engagement_id=engagement_partition)
 
     chunk_size = max(1, cfg.get("max_items_per_call", 40))
     chunks = [req.items[i:i + chunk_size] for i in range(0, len(req.items), chunk_size)]
@@ -536,9 +627,10 @@ async def prioritize(req: PrioritizeRequest, authorization: str | None = Header(
         by_host.setdefault(store.host_of(r.url), []).append(
             {"method": r.method, "url": r.url, "ai_priority": r.ai_priority, "ai_score": r.ai_score})
     for host, items in by_host.items():
-        await asyncio.to_thread(_update_engagement, host, lambda st, it=items: st.ingest_prioritization(it))
+        await asyncio.to_thread(_update_engagement, host, lambda st, it=items: st.ingest_prioritization(it),
+                                engagement_id=engagement_partition)
 
-    return PrioritizeResponse(results=results)
+    return PrioritizeResponse(results=results, engagement_id=engagement_partition)
 
 
 from pydantic import BaseModel as _BaseModel
@@ -562,6 +654,8 @@ async def crawl_endpoint(req: CrawlRequest, authorization: str | None = Header(d
     max_pages/max_depth. Drives the Burp "Crawl" button; returns the discovered
     endpoints for the site map / attack-surface tab."""
     _require_auth(authorization)
+    _require_target_fetch(req.base_url, bulk=True)
+    _require_active_crawl(req.base_url)
     from harness import crawler
     result = await crawler.crawl(
         req.base_url,
@@ -675,6 +769,8 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
     flow. Scope-gated to server.allowed_hosts, throttled, bounded by
     max_endpoints. Credentials arrive per call and are never persisted."""
     _require_auth(authorization)
+    _require_target_fetch(req.base_url, bulk=True)
+    _require_active_crawl(req.base_url)
     from harness import role_crawl
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
                                     headers=r.get("headers") or {})
@@ -701,7 +797,7 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
             # a store hiccup must never sink the (already-completed) crawl result.
             log.warning("crawl-roles: identity registration failed: %s", e)
             out["registered_identities"] = []
-            out["identity_registration_error"] = str(e)
+            out["identity_registration_error"] = security.safe_error_summary(e)
 
     def _ingest(st):
         st.ingest_role_crawl(out)
@@ -725,6 +821,7 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
     GET), or set `discover` to crawl base_url first. Returns per-endpoint
     outcomes plus the missing_authentication findings."""
     _require_auth(authorization)
+    _require_target_fetch(req.base_url, bulk=bool(req.discover))
     from harness import missing_auth_probe
     from harness.js_endpoint_extractor import CallShape
 
@@ -803,6 +900,7 @@ async def active_probe(req: ActiveProbeRequest, authorization: str | None = Head
     transcript + findings and the integration outcome (held findings, validation
     plans, detected chains, and forward pivot hints)."""
     _require_auth(authorization)
+    _require_target_fetch(req.exchange.url, bulk=True)
     if not orchestrator.iterative_agent_enabled:
         raise HTTPException(status_code=403, detail="iterative_agent is disabled in config.yaml")
     try:
@@ -811,8 +909,8 @@ async def active_probe(req: ActiveProbeRequest, authorization: str | None = Head
             model=req.model or "", step_budget=req.step_budget or None,
         )
     except Exception as e:
-        log.exception("Unhandled error during active probe")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        log.error("Unhandled error during active probe: %s", security.safe_error_summary(e))
+        return JSONResponse(status_code=500, content={"error": security.safe_error_summary(e)})
 
 
 class RetryAgentsRequest(_BaseModel):
@@ -838,10 +936,10 @@ async def retry_agents(req: RetryAgentsRequest, authorization: str | None = Head
             granted_tokens=req.granted_tokens,
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=security.safe_error_summary(e))
     except Exception as e:
-        log.exception("Unhandled error during retry-agents")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        log.error("Unhandled error during retry-agents: %s", security.safe_error_summary(e))
+        return JSONResponse(status_code=500, content={"error": security.safe_error_summary(e)})
 
 
 class PlanAllocationRequest(_BaseModel):
@@ -887,9 +985,11 @@ async def get_settings(authorization: str | None = Header(default=None)):
     _require_auth(authorization)
     _require_read_auth(authorization)
     from harness import global_throttle
+    from harness.target_request_policy import TargetRequestPolicy
     from harness import llm_provider as _llm_provider
     p = orchestrator.retry_budget_policy
     return {
+        'target_policy': TargetRequestPolicy.from_config(orchestrator.config).status(),
         "throttle": global_throttle.throttle.stats(),
         "retry_budget": {
             "max_retries": p.max_retries, "max_agents": p.max_agents,
@@ -996,7 +1096,7 @@ async def select_model(req: SelectModelRequest, authorization: str | None = Head
         if req.agent_model:
             result["agents"] = orchestrator.set_agents_model(req.agent_model, req.agent or None)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=security.safe_error_summary(e))
     if not result:
         raise HTTPException(status_code=400, detail="nothing to set: provide coordinator and/or agent_model")
     return result
@@ -1083,21 +1183,24 @@ async def tools_recommend(req: ToolRecommendRequest, authorization: str | None =
     return {"recommendations": [r.to_dict() for r in recs]}
 
 
-def _update_engagement(host: str, apply_fn) -> None:
-    """Load the host's engagement snapshot, apply an ingest function, save it.
+def _update_engagement(host: str, apply_fn, *, engagement_id: str = "") -> dict | None:
+    """Atomically apply an ingest function in the requested host partition.
     Defensive: engagement is a convenience layer over the primary result, so a
     store hiccup here must never fail the endpoint that called it."""
     from harness import engagement
     try:
-        st = engagement.EngagementState.from_dict(store.load_engagement(host) or {"host": host})
-        apply_fn(st)
-        store.save_engagement(host, st.to_dict())
+        def mutate(snapshot):
+            st = engagement.EngagementState.from_dict(snapshot)
+            apply_fn(st)
+            return st.to_dict()
+        return store.mutate_engagement(host, mutate, engagement_id=engagement_id)
     except Exception as e:
         log.warning("engagement update failed for %s: %s", host, e)
 
 
 @app.get("/engagement/{host}")
-async def engagement_view(host: str, limit: int = 25, authorization: str | None = Header(default=None)):
+async def engagement_view(host: str, limit: int = 25, authorization: str | None = Header(default=None),
+                          engagement_id: str = Query(default="", max_length=128)):
     """The fused, per-host worklist (engagement.py): every known endpoint ranked
     by a transparent combination of PathScorer tier, LLM rating, the role-access
     matrix, and findings so far -- the one picture the discrete capabilities feed.
@@ -1105,11 +1208,13 @@ async def engagement_view(host: str, limit: int = 25, authorization: str | None 
     _require_auth(authorization)
     _require_read_auth(authorization)
     from harness import engagement
-    snap = await __import__("asyncio").to_thread(store.load_engagement, host)
+    snap = await __import__("asyncio").to_thread(store.load_engagement, host, engagement_id=engagement_id)
+    partition_meta = {"engagement_id": engagement_id,
+                      "state_partition": "explicit-engagement" if engagement_id else "legacy-host-only"}
     if not snap:
-        return {"host": host, "endpoint_count": 0, "worklist": [], "summary": {"host": host, "endpoint_count": 0}}
+        return {**partition_meta, "host": host, "endpoint_count": 0, "worklist": [], "summary": {"host": host, "endpoint_count": 0}}
     st = engagement.EngagementState.from_dict(snap)
-    return {"host": host, "worklist": st.worklist(limit=max(1, min(limit, 200))),
+    return {**partition_meta, "host": host, "worklist": st.worklist(limit=max(1, min(limit, 200))),
             "ready_tasks": st.pending(), "blocked_tasks": st.blocked(), "summary": st.summary()}
 
 
@@ -1132,6 +1237,7 @@ async def engagement_run(host: str, req: RunEngagementRequest, authorization: st
     _require_auth(authorization)
     max_targets = max(1, min(req.max_targets, 50))
     if req.execute:
+        _require_target_fetch(req.base_url or '', bulk=True)
         if not req.base_url:
             raise HTTPException(status_code=400, detail="execute requires base_url")
         return await orchestrator.run_engagement(
@@ -1157,6 +1263,7 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
     worklist. This is the closed loop the tester drives -- run it as a newly
     obtained identity and the new surface it can reach re-enters the ranking."""
     _require_auth(authorization)
+    _require_target_fetch(req.base_url, bulk=True)
     from harness import role_crawl, engagement
     roles = [role_crawl.RoleSession(role=str(r.get("role", "user")), headers=r.get("headers") or {})
              for r in req.roles]
@@ -1188,6 +1295,7 @@ import time as _time
 import harness.run_manifest as _run_manifest
 
 _INVESTIGATE_JOBS: dict[str, dict] = {}
+_JOB_OWNER = _uuid.uuid4().hex
 
 # P1-8: bounded admission + terminal-job retention. _INVESTIGATE_JOBS
 # accumulated without bound before this (every job dict, including its Task
@@ -1200,7 +1308,24 @@ _MAX_RUNNING_JOBS = 4            # admission cap on concurrent running/cancellin
 _JOB_RETENTION_SECONDS = 900.0   # how long a terminal job's result stays readable/pollable
 _MAX_RETAINED_TERMINAL_JOBS = 50 # cap on retained terminal jobs; oldest-finished evicted first
 _RUNNING_STATUSES = {"running", "cancelling"}
-_TERMINAL_STATUSES = {"done", "error", "cancelled"}
+_TERMINAL_STATUSES = {"done", "error", "cancelled", "interrupted"}
+
+
+def _job_store():
+    from harness.job_status import JobStatusStore
+    return JobStatusStore(Path(store._DB_PATH).with_name('harness_jobs.db'), _JOB_OWNER,
+                          retention=_JOB_RETENTION_SECONDS,
+                          max_terminal=_MAX_RETAINED_TERMINAL_JOBS,
+                          max_running=_MAX_RUNNING_JOBS)
+
+
+def _save_job_status(job):
+    try:
+        _job_store().update(job)
+        job['persistence_error'] = None
+    except Exception as exc:
+        job['persistence_error'] = 'durable job status unavailable; polling after restart may be incomplete'
+        log.warning('job status persistence failed (%s)', type(exc).__name__)
 
 
 def _evict_expired_jobs(now: float | None = None) -> None:
@@ -1228,12 +1353,25 @@ def _evict_expired_jobs(now: float | None = None) -> None:
         terminal_ids.sort(key=lambda jid: _INVESTIGATE_JOBS[jid].get("finished_at") or 0)
         for job_id in terminal_ids[:excess]:
             del _INVESTIGATE_JOBS[job_id]
+    try:
+        journal = _job_store()
+        journal.recover_interrupted(now=now)
+        journal.prune(now=now)
+    except Exception:
+        raise HTTPException(status_code=503, detail='durable job status unavailable') from None
 
 
-def _job_public(job: dict) -> dict:
+def _job_public(job: dict, *, include_result: bool = False) -> dict:
     """The JSON-safe view of a job (never leaks the asyncio Task)."""
-    return {k: job.get(k) for k in ("job_id", "host", "base_url", "status",
-                                    "started_at", "finished_at", "error", "manifest_path")}
+    from harness.job_status import JobStatusStore
+    snapshot = JobStatusStore.public_snapshot(job)
+    out = {k: snapshot.get(k) for k in ("job_id", "host", "base_url", "status",
+                                    "started_at", "finished_at", "error", "manifest_path",
+                                    "recovered", "result_available")}
+    out['persistence_error'] = job.get('persistence_error')
+    if include_result and snapshot['status'] == 'done':
+        out['result'] = snapshot['result']
+    return out
 
 
 class InvestigateRequest(_BaseModel):
@@ -1251,6 +1389,7 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     a job_id to poll. The job is cancellable. This is the single API entry to
     investigate_engagement (R18)."""
     _require_auth(authorization)
+    _require_target_fetch(req.base_url, bulk=True)
     if not req.base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
     from harness import role_crawl
@@ -1320,10 +1459,25 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
         gate_config=_live_validators_gate_config(),
         max_requests=runs_cfg.get("max_requests"), config=config,
         timeout=float(runs_cfg.get("request_timeout_seconds", 15.0)))
-    manifest = _run_manifest.RunManifest.start(
-        run_id=job_id, target_identifier=host, config=config,
-        cache_namespace=run_context.cache_namespace, output_dir=runs_cfg.get("output_dir"),
-        model_versions={"coordinator": orchestrator.coordinator_model,
+    output_dir = Path(runs_cfg.get('output_dir') or Path(__file__).parent / 'run-output')
+    job: dict = {"job_id": job_id, "host": host, "base_url": req.base_url,
+                 "status": "running", "task": None, "result": None, "error": None,
+                 "started_at": _time.time(), "finished_at": None,
+                 "manifest_path": str(output_dir / f'{job_id}.json'), "run_context": run_context}
+    try:
+        _, admitted = _job_store().create(job)
+        if not admitted:
+            raise ValueError('duplicate job identity')
+    except Exception:
+        await run_context.aclose()
+        raise HTTPException(status_code=503, detail='durable job admission unavailable',
+                            headers={'Retry-After': '5'}) from None
+
+    try:
+        manifest = _run_manifest.RunManifest.start(
+            run_id=job_id, target_identifier=host, config=security.sanitize_data(config),
+            cache_namespace=run_context.cache_namespace, output_dir=runs_cfg.get("output_dir"),
+            model_versions={"coordinator": orchestrator.coordinator_model,
                         "agents": sorted({getattr(a, "model", "")
                                           for a in orchestrator.agent_manager.agents.values()
                                           if getattr(a, "model", "")}),
@@ -1333,10 +1487,25 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                         # provider object, so this never touches an API key.
                         "coordinator_provider": (config.get("coordinator") or {}).get("provider", "ollama"),
                         "critique_provider": (config.get("critique") or {}).get("provider", "ollama")})
-    job: dict = {"job_id": job_id, "host": host, "base_url": req.base_url,
-                 "status": "running", "task": None, "result": None, "error": None,
-                 "started_at": _time.time(), "finished_at": None,
-                 "manifest_path": str(manifest.path), "run_context": run_context}
+    except Exception:
+        job.update(status='error', finished_at=_time.time(),
+                   error='job manifest initialization failed; no work was scheduled')
+        _save_job_status(job)
+        await run_context.aclose()
+        raise HTTPException(status_code=503, detail='job manifest initialization unavailable',
+                            headers={'Retry-After': '5'}) from None
+
+    def _finish_manifest(status, *, result=None, error=None):
+        try:
+            manifest.finish(status, result=security.sanitize_data(result), error=error)
+        except Exception as exc:
+            # Artifact persistence loss is not an unhandled async task failure.
+            # Keep cancellation visible, but never advertise a completed durable
+            # record when its terminal manifest could not be written.
+            if job['status'] == 'done':
+                job['status'] = 'error'
+            job['error'] = 'manifest persistence failed; execution record is incomplete'
+            log.warning('job manifest persistence failed (%s)', type(exc).__name__)
 
     async def _run():
         try:
@@ -1351,16 +1520,16 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
             job["result"].setdefault("request_count", run_context.budget.used)
             job["status"] = "done"
-            manifest.finish("done", result=job["result"])
+            _finish_manifest("done", result=job["result"])
         except asyncio.CancelledError:
             job["status"] = "cancelled"
-            manifest.finish("cancelled")
+            _finish_manifest("cancelled")
             raise
         except Exception as e:  # a failed job must report, never crash the server
             job["status"] = "error"
-            job["error"] = f"{type(e).__name__}: {e}"
-            manifest.finish("error", error=job["error"])
-            log.warning("investigate job %s failed: %s", job_id, e)
+            job["error"] = security.safe_error_summary(e)
+            _finish_manifest("error", error=job["error"])
+            log.warning("investigate job %s failed (%s)", job_id, type(e).__name__)
         finally:
             job["finished_at"] = _time.time()
             # P1-8: the job just reached a terminal state -- release the
@@ -1373,8 +1542,21 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             # exceeded.
             job["task"] = None
             job["run_context"] = None
+            job['result_available'] = job.get('result') is not None
+            _save_job_status(job)
+
+    def _ensure_cancelled(task):
+        # Cancellation before the coroutine's first step never enters its
+        # try/finally. Preserve terminal polling in that scheduling window too.
+        if task.cancelled() and job['status'] in _RUNNING_STATUSES:
+            job.update(status='cancelled', finished_at=_time.time(), task=None, run_context=None)
+            try:
+                _finish_manifest('cancelled')
+            finally:
+                _save_job_status(job)
 
     job["task"] = asyncio.create_task(_run())
+    job['task'].add_done_callback(_ensure_cancelled)
     _INVESTIGATE_JOBS[job_id] = job
     return _job_public(job)
 
@@ -1385,7 +1567,9 @@ async def engagement_investigate_list(host: str, authorization: str | None = Hea
     _require_auth(authorization)
     _require_read_auth(authorization)
     _evict_expired_jobs()
-    jobs = [j for j in _INVESTIGATE_JOBS.values() if j["host"] == host]
+    durable = {j['job_id']: j for j in _job_store().list(host)}
+    durable.update({jid: j for jid, j in _INVESTIGATE_JOBS.items() if j['host'] == host})
+    jobs = list(durable.values())
     jobs.sort(key=lambda j: j.get("started_at") or 0, reverse=True)
     return {"host": host, "jobs": [_job_public(j) for j in jobs]}
 
@@ -1397,17 +1581,14 @@ async def engagement_investigate_status(host: str, job_id: str,
     _require_auth(authorization)
     _require_read_auth(authorization)
     _evict_expired_jobs()
-    job = _INVESTIGATE_JOBS.get(job_id)
+    job = _INVESTIGATE_JOBS.get(job_id) or _job_store().get(job_id)
     if not job or job["host"] != host:
         # P1-8: an evicted/expired job_id lands here too (its dict was
         # dropped by _evict_expired_jobs), same as a job_id that never
         # existed -- see _evict_expired_jobs's docstring for why this is a
         # single documented 404 rather than a distinct "410 Gone".
         raise HTTPException(status_code=404, detail="unknown job")
-    out = _job_public(job)
-    if job["status"] == "done":
-        out["result"] = job["result"]
-    return out
+    return _job_public(job, include_result=True)
 
 
 @app.post("/engagement/{host}/investigate/{job_id}/cancel")
@@ -1416,10 +1597,12 @@ async def engagement_investigate_cancel(host: str, job_id: str,
     """Request cancellation of a running job (asyncio task cancellation)."""
     _require_auth(authorization)
     _evict_expired_jobs()
-    job = _INVESTIGATE_JOBS.get(job_id)
+    job = _INVESTIGATE_JOBS.get(job_id) or _job_store().get(job_id)
     if not job or job["host"] != host:
         raise HTTPException(status_code=404, detail="unknown job")
     task = job.get("task")
+    if task is None and job['status'] in _RUNNING_STATUSES:
+        raise HTTPException(status_code=409, detail='job belongs to another live process; cancellation was not sent')
     if task is not None and not task.done():
         context = job.get("run_context")
         if context is not None:
@@ -1427,6 +1610,7 @@ async def engagement_investigate_cancel(host: str, job_id: str,
         task.cancel()
         if job["status"] == "running":
             job["status"] = "cancelling"
+        _save_job_status(job)
     return _job_public(job)
 
 
@@ -1567,7 +1751,9 @@ async def list_suppressions(authorization: str | None = Header(default=None)):
 
 
 @app.get("/findings/{finding_ref}/evidence")
-async def finding_evidence(finding_ref: str, authorization: str | None = Header(default=None)):
+async def finding_evidence(finding_ref: str, authorization: str | None = Header(default=None),
+                          engagement_id: str = Query(default="", max_length=128),
+                          captured_principal_id: str | None = Query(default=None, max_length=128)):
     """P0-1: the EvidenceLedger's audit-grade reconstruction of one finding --
     why it was tested, what was sent, what came back, why it was concluded
     (vulnerable or not), and what was never tested -- plus the minimal recipe
@@ -1578,9 +1764,11 @@ async def finding_evidence(finding_ref: str, authorization: str | None = Header(
     _require_read_auth(authorization)
     from harness import evidence_ledger
     reconstruction = await __import__("asyncio").to_thread(
-        evidence_ledger.reconstruct_persisted, finding_ref)
+        evidence_ledger.reconstruct_persisted, finding_ref, engagement_id=engagement_id,
+        captured_principal=captured_principal_id)
     recipe = await __import__("asyncio").to_thread(
-        evidence_ledger.reproduction_recipe_persisted, finding_ref)
+        evidence_ledger.reproduction_recipe_persisted, finding_ref, engagement_id=engagement_id,
+        captured_principal=captured_principal_id)
     if not reconstruction.get("event_count"):
         raise HTTPException(status_code=404, detail="no evidence-ledger events for this finding_ref")
     return {"reconstruction": reconstruction, "reproduction_recipe": recipe}
@@ -1605,7 +1793,7 @@ async def merge_issues(host: str, req: MergeIssuesRequest,
         await __import__("asyncio").to_thread(
             store.record_issue_merge, host, req.source_id, req.target_id)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=security.safe_error_summary(e))
     return {"host": host, "source_id": req.source_id, "target_id": req.target_id, "merged": True}
 
 

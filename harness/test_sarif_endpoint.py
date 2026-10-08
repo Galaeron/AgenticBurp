@@ -59,11 +59,10 @@ class SarifReportEndpointTests(unittest.TestCase):
         importlib.reload(server_module)
         self.server = server_module
         from fastapi.testclient import TestClient
-        # No default Authorization header (unlike SuppressionEndpointTests)
-        # -- this endpoint is GET-only, unaffected by the RB-1 CSRF gate,
-        # and the auth-control tests below need to toggle the header
-        # per-request.
-        self.client = TestClient(server_module.app, base_url="http://localhost")
+        # R03: use the paired token for normal export callers. Auth controls
+        # remove the header explicitly to retain their rejection checks.
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers=self._auth_header())
 
     def tearDown(self):
         store._DB_PATH = self._original_db_path
@@ -109,18 +108,20 @@ class SarifReportEndpointTests(unittest.TestCase):
 
     def test_requires_token_when_read_auth_enabled(self):
         self.server._READ_AUTH_ENABLED = True
+        self.client.headers.pop("Authorization", None)
         resp = self.client.get("/report/sarif", params={"url": "https://example.com/x"})
         self.assertEqual(resp.status_code, 401)
         resp = self.client.get("/report/sarif", params={"url": "https://example.com/x"},
                                headers=self._auth_header())
         self.assertEqual(resp.status_code, 200)
 
-    def test_reachable_without_token_when_read_auth_disabled_by_default(self):
-        self.assertFalse(self.server._READ_AUTH_ENABLED,
-                         "server.require_read_auth must default to false")
+    def test_legacy_false_flag_cannot_disable_sensitive_read_auth(self):
+        self.server._READ_AUTH_ENABLED = False
+        self.client.headers.pop("Authorization", None)
         resp = self.client.get("/report/sarif", params={"url": "https://example.com/x"})
-        self.assertNotEqual(resp.status_code, 401)
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(self.client.get("/report/sarif", params={"url": "https://example.com/x"},
+                                        headers=self._auth_header()).status_code, 200)
 
     # --- /report's own Markdown contract is untouched ----------------------
 

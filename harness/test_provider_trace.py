@@ -177,7 +177,9 @@ class FailureAndStreamingTests(unittest.TestCase):
         self.assertEqual(len(budget.ledger.records), 1)  # failed path still traced
         rec = budget.ledger.records[0]
         self.assertEqual(rec.outcome, "error")
-        self.assertEqual(rec.total_tokens, 0)            # no usage on a failure
+        self.assertIsNone(rec.total_tokens)              # transport usage is unknown
+        self.assertEqual(budget.spent, 0)                # no invented measured usage
+        self.assertFalse(rec.completed)
         self.assertEqual(budget.spent, 0)
         self.assertEqual(budget._reserved, 0)            # reservation refunded
 
@@ -189,7 +191,9 @@ class FailureAndStreamingTests(unittest.TestCase):
                                estimate=100, max_retries=2))
         self.assertTrue(out.ok)
         self.assertEqual(out.retries, 1)
-        self.assertEqual(budget.ledger.records[0].retries, 1)
+        self.assertEqual(len(budget.ledger.records), 2)
+        self.assertEqual([r.outcome for r in budget.ledger.records], ["error", "ok"])
+        self.assertEqual(budget.ledger.records[-1].retries, 1)
         self.assertEqual(budget.spent, 100)
 
     def test_retries_exhausted_reports_error(self):
@@ -201,6 +205,7 @@ class FailureAndStreamingTests(unittest.TestCase):
         self.assertEqual(out.outcome, "error")
         self.assertEqual(out.retries, 2)
         self.assertEqual(provider.calls, 3)              # 1 + 2 retries
+        self.assertEqual(len(budget.ledger.records), 3)   # every attempt remains visible
         self.assertEqual(budget.ledger.records[0].outcome, "error")
 
     def test_streaming_call_is_flagged_and_usage_accounted(self):

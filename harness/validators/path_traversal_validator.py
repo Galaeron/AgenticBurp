@@ -105,9 +105,11 @@ class PathTraversalValidator(Validator):
                        "lfi", "local file inclusion", "file inclusion"}
     active = True
 
-    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0):
+    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
+                 run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        self.run_context = run_context
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         return (super().applies(finding, exchange) and bool(param_targets(exchange))) \
@@ -136,24 +138,43 @@ class PathTraversalValidator(Validator):
             return self._skip("no file/path-shaped parameter or path segment to inject a traversal into")
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
+        session_ref = None
+        request_headers = headers
+        if self.run_context is not None:
+            from .transport import bind_session
+            session_ref, request_headers = bind_session(self.run_context, headers)
         for loc, param in targets:
             for prefix in _PREFIXES:
                 for target, marker in _TARGETS.items():
                     url, body = self._mutated(exchange, loc, param, prefix + target)
                     try:
-                        await global_throttle.acquire()
-                        async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
-                                                    follow_redirects=False, verify=False) as client:
-                            resp = await client.request(method, url, headers=headers or None,
-                                                        content=body or None)
+                        if self.run_context is not None:
+                            from harness.run_context import TypedRequest
+                            outcome = await self.run_context.executor().execute(
+                                TypedRequest(method, url, headers=request_headers,
+                                             body=body or None),
+                                capability=self.name, session_ref=session_ref,
+                                case_ref=finding.finding_id or "", max_redirects=0)
+                            if not outcome.executed:
+                                return self._skip(
+                                    f"path-traversal replay declined: {outcome.outcome}")
+                            if not outcome.ok:
+                                continue
+                            text = outcome.body or ""
+                        else:
+                            await global_throttle.acquire()
+                            async with GatedAsyncClient(get_default_gate(), self.name,
+                                                        timeout=self.timeout,
+                                                        follow_redirects=False,
+                                                        verify=False) as client:
+                                resp = await client.request(
+                                    method, url, headers=headers or None,
+                                    content=body or None)
+                            text = resp.text
                     except SafetyGateBlocked:
                         return self._skip("mutating path-traversal replay not authorized "
                                           "(set validators.allow_mutating_replay)")
                     except httpx.HTTPError:
-                        continue
-                    try:
-                        text = resp.text
-                    except Exception:
                         continue
                     if marker.search(text):
                         where = "path segment" if loc == _PATHSEG else f"{loc} parameter {param!r}"

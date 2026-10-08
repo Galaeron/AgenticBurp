@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import os
+import re
 import tempfile
 import subprocess
 from pathlib import Path
@@ -67,6 +68,38 @@ def _mutate_form_param(body: str, param: str, payload: str) -> str | None:
     if not any(k == param for k, _ in pairs):
         return None
     return urlencode([(k, payload if k == param else v) for k, v in pairs])
+
+
+# Field names that carry an anti-CSRF / anti-forgery token. Such a token is
+# session-bound and often single-use, so a captured value is stale on replay --
+# a login-bypass probe must fetch a FRESH one in-session before each attempt.
+_CSRF_FIELD_TOKENS = ("csrf", "xsrf", "authenticity", "antiforgery", "anti-forgery",
+                      "_token", "__requestverificationtoken", "nonce")
+
+
+def _csrf_field_name(body: str, content_type: str) -> str | None:
+    """The form field holding an anti-CSRF token, if the urlencoded body has one."""
+    if not body or _looks_like_json(body, content_type):
+        return None
+    for key, _ in parse_qsl(body, keep_blank_values=True):
+        low = key.lower()
+        if any(tok in low for tok in _CSRF_FIELD_TOKENS):
+            return key
+    return None
+
+
+def _extract_token(html: str, field: str) -> str | None:
+    """Read a fresh token value for `field` from a form page's HTML."""
+    from harness.feature_workflow import extract_forms
+    for form in extract_forms(html or "", ""):
+        for fld in form.fields:
+            if fld.name == field and fld.value:
+                return fld.value
+    m = re.search(rf'name=["\']{re.escape(field)}["\'][^>]*value=["\']([^"\']+)', html or "")
+    if m:
+        return m.group(1)
+    m = re.search(rf'value=["\']([^"\']+)["\'][^>]*name=["\']{re.escape(field)}["\']', html or "")
+    return m.group(1) if m else None
 
 
 def _query_top_level_params(url: str) -> list[str]:
@@ -218,7 +251,8 @@ class SqlmapValidator(Validator):
 
     def __init__(self, binary: str = "sqlmap", timeout_seconds: int = 90,
                  level: int = 1, risk: int = 1, container_image: str | None = None,
-                 run_context=None, allowed_hosts: list[str] | None = None):
+                 run_context=None, allowed_hosts: list[str] | None = None,
+                 quick_only: bool = False):
         self.binary = binary
         self.timeout_seconds = timeout_seconds
         self.level = max(1, min(level, 2))
@@ -236,6 +270,7 @@ class SqlmapValidator(Validator):
         # the container reaches the same service the host means by localhost.
         self.container_image = container_image
         self.run_context = run_context
+        self.quick_only = bool(quick_only)
 
     @staticmethod
     def _raw_request(exchange: HttpExchange) -> str:
@@ -310,6 +345,23 @@ class SqlmapValidator(Validator):
                     summary=f"Blocked by safety gate: {gate_decision.reason} "
                             f"(sqlmap would fuzz a {exchange.method.upper()} endpoint, sending many "
                             f"requests to what may be a real mutating action)",
+                )
+
+        # A two-request boolean differential is both cheaper and more tightly
+        # bounded than launching sqlmap. Run it first for parameterized GETs;
+        # if it proves injection, avoid the heavier tool entirely. If it is
+        # inconclusive, retain the existing sqlmap path for broader techniques.
+        # This also keeps external authorized targets testable when a container
+        # runtime's network policy cannot route directly to that hostname.
+        if exchange.method.upper() == "GET":
+            quick = await self._boolean_probe_fallback(finding, exchange)
+            if quick is not None and quick.confirmed:
+                quick.summary = "Bounded boolean preflight confirmed SQL injection: " + quick.summary
+                return quick
+            if self.quick_only:
+                return quick or ValidationResult(
+                    self.name, "not_confirmed", finding.vulnerability_class,
+                    summary="bounded boolean preflight found no injectable parameter",
                 )
 
         with tempfile.TemporaryDirectory(prefix="harness-sqlmap-") as td:
@@ -413,13 +465,19 @@ class SqlmapValidator(Validator):
                 "--sql-shell", "--file-write", "--file-dest", "--file-read",
                 "--reg-read", "--reg-add", "--reg-del", "--privesc",
             )
+            # NOTE: these are `if ... raise`, NOT `assert`. A safety invariant must
+            # never be a Python assert -- `python -O` strips assert statements, which
+            # would silently remove the only guard stopping a --dump/--os-shell from
+            # reaching the target. RuntimeError always runs regardless of -O.
             for denied in _DENIED_SQLMAP_FLAGS:
-                assert denied not in cmd, (
-                    f"Refusing to run sqlmap: denied flag {denied!r} present in constructed "
-                    f"command. This is a hard-coded safety invariant, not a config option."
-                )
-            assert self.risk <= 2, f"Refusing to run sqlmap: risk={self.risk} exceeds the hard ceiling of 2."
-            assert self.level <= 2, f"Refusing to run sqlmap: level={self.level} exceeds the hard ceiling of 2."
+                if denied in cmd:
+                    raise RuntimeError(
+                        f"Refusing to run sqlmap: denied flag {denied!r} present in constructed "
+                        f"command. This is a hard-coded safety invariant, not a config option.")
+            if self.risk > 2:
+                raise RuntimeError(f"Refusing to run sqlmap: risk={self.risk} exceeds the hard ceiling of 2.")
+            if self.level > 2:
+                raise RuntimeError(f"Refusing to run sqlmap: level={self.level} exceeds the hard ceiling of 2.")
 
             # Container mode: wrap the (already safety-checked) sqlmap args in a
             # `docker run --rm` and rewrite the -u target to host.docker.internal.
@@ -670,15 +728,44 @@ class SqlmapValidator(Validator):
 
                     async def routed(url, probe_body):
                         session_ref, request_headers = bind_session(self.run_context, headers)
+                        # CSRF/anti-forgery tokens are session-bound and often
+                        # single-use: the captured value is stale, so both probes
+                        # would fail identically and hide a real login injection.
+                        # Fetch a FRESH token in the SAME session (session_ref
+                        # keeps the cookie) and substitute it before sending.
+                        csrf = _csrf_field_name(probe_body or "", inferred_ct or content_type)
+                        if csrf and location == "body" and body_kind == "form":
+                            try:
+                                page = await self.run_context.executor().execute(
+                                    TypedRequest("GET", exchange.url, headers=request_headers),
+                                    capability="sqlmap_boolean_probe", session_ref=session_ref)
+                                tok = _extract_token(page.body or "", csrf) if page.ok else None
+                            except Exception:
+                                tok = None
+                            if tok:
+                                fresh = _mutate_form_param(probe_body, csrf, tok)
+                                if fresh is not None:
+                                    probe_body = fresh
                         outcome = await self.run_context.executor().execute(
                             TypedRequest(exchange.method.upper(), url,
                                          headers=request_headers, body=probe_body or None),
                             capability="sqlmap_boolean_probe", session_ref=session_ref)
                         if not outcome.ok:
                             raise httpx.TransportError(outcome.error or outcome.outcome)
+                        # RunContext exposes decoded text. Reattaching the
+                        # origin's wire-level gzip/content-length headers to
+                        # those decoded bytes makes httpx decompress them a
+                        # second time ("incorrect header check") and turns a
+                        # valid comparison into a silent probe error.
+                        decoded_headers = {
+                            k: v for k, v in (outcome.headers or {}).items()
+                            if k.lower() not in (
+                                "content-encoding", "content-length",
+                                "transfer-encoding")
+                        }
                         return httpx.Response(
                             outcome.status or 0, content=(outcome.body or "").encode(),
-                            headers=outcome.headers,
+                            headers=decoded_headers,
                             request=httpx.Request(exchange.method.upper(), url))
 
                     resp_a = await routed(target_a, body_a)

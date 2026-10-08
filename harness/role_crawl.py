@@ -48,6 +48,12 @@ def _template_ids(path: str) -> str:
     return _NUM_SEG.sub("/{id}", path)
 
 
+def _split_discovered_endpoint(endpoint: str) -> tuple[str, str]:
+    """Return the normalized sitemap path and its observed query template."""
+    parts = urlsplit(endpoint)
+    return _template_ids(parts.path or "/"), parts.query
+
+
 # Probe only these declared write methods, in stable order. DELETE needs a
 # purpose-built confirmation flow and is excluded from speculative crawl.
 _NON_GET_PREFERENCE = ("POST", "PUT", "PATCH")
@@ -75,6 +81,16 @@ _GENERIC_JSON_BODY = '{"name": "probe", "value": "probe"}'
 # exercises no input-handling code at all.
 _QUERY_KEYWORDS = ("search", "query", "find", "filter")
 
+# Synthetic credential submissions can invalidate an already-authenticated
+# session (or rotate its CSRF state) before the crawl reaches the protected
+# forms we actually need to inspect. Authentication is setup owned by the
+# caller; role crawl must observe login forms, but must not submit invented
+# credentials to them.
+_SESSION_SETUP_PATH = re.compile(
+    r"(?:^|[-_/])(login|log-in|signin|sign-in|authenticate)(?:[-_/]|$)",
+    re.IGNORECASE,
+)
+
 
 def _synthesize_body(method: str, path: str) -> tuple[str, str]:
     """Guess a minimal JSON body for a POST/PUT/PATCH endpoint with no
@@ -94,6 +110,8 @@ def _synthesize_query(path: str) -> str:
     low = path.lower()
     if "?" in path:
         return ""
+    if "filter" in low:
+        return "category=test"
     if any(k in low for k in _QUERY_KEYWORDS):
         return "q=test"
     return ""
@@ -387,6 +405,10 @@ class RoleCrawlResult:
     # response content, so identical bodies across roles collapse to one.
     captured: list = field(default_factory=list)
     sensitive_file_hits: list = field(default_factory=list)
+    # Destructive-looking operations (delete/remove/reset/... paths, or forms with
+    # such actions) that were deliberately NOT probed, so a run can show it never
+    # attempted a state-destroying request. Mirrors CrawlResult.suppressed_navigation.
+    suppressed_navigation: set = field(default_factory=set)
     errors: list = field(default_factory=list)
     # P1.3: per-(owner,requester) results of the ACTIVE cross-role object probe
     # (probe_cross_role_matrix) -- dicts from CrossRoleOutcome.to_dict(). Leaked
@@ -405,6 +427,7 @@ class RoleCrawlResult:
             "idor_candidates": self.idor_candidates,
             "idor_findings": self.idor_findings,
             "captured": self.captured,
+            "suppressed_navigation": sorted(self.suppressed_navigation),
             "errors": self.errors,
             "cross_role_outcomes": self.cross_role_outcomes,
         }
@@ -489,10 +512,17 @@ async def crawl_roles(
 
     # 1. Discover the surface, per role (authenticated pages/JS may reveal more).
     discovered: set[str] = set()
+    observed_queries: dict[str, str] = {}
     # path -> real accepted HTTP verbs, from active discovery's Allow-header
     # introspection. A path with no entry here came from the passive JS/HTML
     # crawl only, which carries no method signal -- default GET for those.
     path_methods: dict[str, set[str]] = {}
+    # Passive HTML forms supply both the accepted method and the real parameter
+    # schema. Tokens and hidden identifiers are commonly session-bound, so keep
+    # the concrete template per role rather than reusing the first role's form
+    # for every principal. GET fields become a query string at replay time;
+    # only write methods carry a request body.
+    form_templates: dict[tuple[str, str, int], tuple[str, str, str]] = {}
     for role_index, r in enumerate(roles):
         try:
             cr = await crawler.crawl(base_url, headers=r.norm_headers(),
@@ -500,7 +530,24 @@ async def crawl_roles(
                                      run_context=run_context,
                                      session_ref=(session_refs[role_index]
                                                   if session_refs is not None else None))
-            discovered |= cr.endpoints
+            for endpoint in sorted(cr.endpoints):
+                discovered_path, observed_query = _split_discovered_endpoint(endpoint)
+                discovered.add(discovered_path)
+                if observed_query:
+                    observed_queries.setdefault(discovered_path, observed_query)
+            for form in getattr(cr, "forms", []):
+                parts = urlsplit(form.action)
+                form_path = _template_ids(parts.path or "/")
+                form_method = (form.method or "GET").upper()
+                discovered.add(form_path)
+                path_methods.setdefault(form_path, set()).add(form_method)
+                if parts.query:
+                    observed_queries.setdefault(form_path, parts.query)
+                form_templates.setdefault(
+                    (form_path, form_method, role_index),
+                    (form.body(), form.enctype or "application/x-www-form-urlencoded", parts.query),
+                )
+            result.suppressed_navigation |= getattr(cr, "suppressed_navigation", set()) or set()
             result.errors.extend(f"[{r.role}] {e}" for e in cr.errors)
         except Exception as e:  # a bad role's crawl must not sink the whole run
             result.errors.append(f"[{r.role}] crawl failed: {e.__class__.__name__}")
@@ -554,8 +601,21 @@ async def crawl_roles(
         except Exception as e:
             result.errors.append(f"[discovery] failed: {e.__class__.__name__}")
 
-    operations = [(path, method) for path in sorted(discovered)
-                  for method in _resolve_probe_methods(path_methods.get(path))]
+    # Defense in depth (matches the crawler's link/form suppression): never send
+    # a state-changing method to a destructive-looking path (delete/remove/reset/
+    # ...), even if active discovery surfaced it. Detection reaches the vulnerable
+    # surface via safe reads; it never needs to execute the destructive action.
+    _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+    operations = []
+    for path in sorted(discovered):
+        for method in _resolve_probe_methods(path_methods.get(path)):
+            if method.upper() in _MUTATING and crawler._DESTRUCTIVE_NAVIGATION.search(path):
+                result.suppressed_navigation.add(f"{method} {path}")
+                continue
+            if method.upper() in _MUTATING and _SESSION_SETUP_PATH.search(path):
+                result.suppressed_navigation.add(f"{method} {path}")
+                continue
+            operations.append((path, method))
     if len(operations) > max_endpoints:
         result.errors.append(f"surface truncated to {max_endpoints} of {len(operations)} "
                              "endpoint operations for probing")
@@ -568,15 +628,28 @@ async def crawl_roles(
         # probed with GET returns a uniform wrong-method error to every role
         # and is misread as unreachable/dead, never exercising the endpoint's
         # actual logic. No method info (passive JS/HTML crawl only) -> GET.
-        req_body, req_ctype = _synthesize_body(probe_method, path)
-        query = _synthesize_query(path) if probe_method == "GET" else ""
-        url = map_._build_url(base_url, path, id_fill)
-        if query:
-            url = f"{url}?{query}"
-        if not map_._host_allowed(url, allowed_hosts):
-            continue
         access = EndpointAccess(method=probe_method, path=path)
         for role_index, r in enumerate(roles):
+            form_template = form_templates.get((path, probe_method, role_index))
+            if form_template:
+                form_body, form_ctype, form_query = form_template
+                if probe_method == "GET":
+                    # HTML GET form controls are URL query parameters. Sending
+                    # them as a body loses the replay shape downstream.
+                    req_body, req_ctype = "", ""
+                    query = "&".join(q for q in (form_query, form_body) if q)
+                else:
+                    req_body, req_ctype = form_body, form_ctype
+                    query = form_query
+            else:
+                req_body, req_ctype = _synthesize_body(probe_method, path)
+                query = ((observed_queries.get(path) or _synthesize_query(path))
+                         if probe_method == "GET" else "")
+            url = map_._build_url(base_url, path, id_fill)
+            if query:
+                url = f"{url}?{query}"
+            if not map_._host_allowed(url, allowed_hosts):
+                continue
             status, body, resp_headers = await _probe(
                 probe_method, url, r.norm_headers(), timeout, run_context=run_context,
                 session_ref=session_refs[role_index] if session_refs is not None else None,

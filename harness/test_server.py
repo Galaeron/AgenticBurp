@@ -60,15 +60,55 @@ class SuppressionEndpointTests(unittest.TestCase):
         results = store.all_host_findings(url, include_suppressed=True)
         return results[0]["fingerprint"]
 
+    def _orchestrator(self):
+        import harness.server as server_module
+        return server_module.orchestrator
+
+    def _stub_ollama_health(self, *, reachable, models):
+        async def _probe(timeout=3.0):
+            return {"reachable": reachable, "models": list(models),
+                    "error": None if reachable else "stubbed unreachable"}
+
+        self._orchestrator().ollama.health_check = _probe
+
     def test_health_exposes_fail_open_telemetry(self):
         # Phase 1.4: /health surfaces the coordinator fail-open counters so the
-        # historically-silent "firing all agents" state is observable.
+        # historically-silent "firing all agents" state is observable. Stub the
+        # Ollama probe reachable (with every configured local model present) so
+        # the readiness check below is deterministic in CI, where no Ollama runs.
+        orch = self._orchestrator()
+        configured = {orch.coordinator_model}
+        configured.update(a.model for a in orch.agent_manager.agents.values())
+        self._stub_ollama_health(reachable=True,
+                                 models=[m for m in configured if m and not m.endswith("-cloud")])
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["status"], "ok")
         self.assertIn("coordinator_fail_opens", body)
         self.assertIn("count", body["coordinator_fail_opens"])
+        self.assertIn("ollama", body)
+        self.assertTrue(body["ollama"]["reachable"])
+        self.assertEqual(body["ollama"]["missing_models"], [])
+
+    def test_health_degraded_when_ollama_unreachable(self):
+        # The whole point of the readiness probe: a server with no reachable
+        # model backend must NOT report "ok" (the old behavior that made
+        # "ollama isn't running" look healthy).
+        self._stub_ollama_health(reachable=False, models=[])
+        body = self.client.get("/health").json()
+        self.assertEqual(body["status"], "degraded")
+        self.assertFalse(body["ollama"]["reachable"])
+        self.assertIn("hint", body["ollama"])
+
+    def test_health_degraded_when_model_missing(self):
+        # Reachable backend but the configured model isn't pulled -> degraded,
+        # with the missing model named.
+        self._stub_ollama_health(reachable=True, models=["some-other-model:1b"])
+        body = self.client.get("/health").json()
+        self.assertEqual(body["status"], "degraded")
+        self.assertTrue(body["ollama"]["reachable"])
+        self.assertTrue(body["ollama"]["missing_models"])
 
     def test_settings_exposes_cloud_reasoning_seam(self):
         resp = self.client.get("/settings")
@@ -1067,22 +1107,10 @@ class InvestigateJobAdmissionAndRetentionTests(unittest.TestCase):
 
 
 class ReadAuthTests(unittest.TestCase):
-    """FR-8 (F12 offline half): server.require_read_auth is an opt-in gate on
-    sensitive GET reads (/report, /telemetry, /test-plans/{plan_id}, GET
-    /settings, and -- RA-2 -- GET /findings/{finding_ref}/evidence, GET
-    /engagement/{host}, GET /engagement/{host}/investigate/{job_id}, GET
-    /identities, GET /hosts/{host}/sessions, GET /findings/suppressions, GET
-    /issues/{host}/merges) that closes the gap _require_auth's loopback
-    bypass otherwise leaves open -- another local process/user with no
-    token at all could read findings/evidence/identities/sessions/
-    diagnostics, since _require_auth only checks a CONFIGURED operator
-    token and the RB-1 CSRF middleware only guards mutating methods. Ships
-    FALSE (see config.yaml's server.require_read_auth comment) so the
-    default deploy and the Burp extension's existing token-less reads are
-    byte-for-byte unchanged; these tests flip
-    `harness.server._READ_AUTH_ENABLED` directly (never config.yaml) --
-    _require_read_auth's own docstring says it re-reads that module global
-    fresh on every call for exactly this purpose.
+    """R03: sensitive reads require pairing even with legacy false flags.
+
+    Keep both denied and authorized route controls; liveness remains public.
+    This class uses disposable storage and does not initiate target traffic.
     """
 
     def setUp(self):
@@ -1225,62 +1253,48 @@ class ReadAuthTests(unittest.TestCase):
                 self.assertEqual(
                     self.client.get(path, headers=self._auth_header()).status_code, 200)
 
-    def test_r06_reads_unauthenticated_when_disabled(self):
-        # Load-bearing negative control: with the shipped default
-        # (require_read_auth: false) these reads stay reachable with no token,
-        # so the default deploy is byte-identical.
-        self.assertFalse(self.server._READ_AUTH_ENABLED,
-                         "test env must reflect the shipped false default")
+    def test_r06_reads_reject_legacy_disabled_flag(self):
+        self.server._READ_AUTH_ENABLED = False
         for path in ("/knowledge", "/activity", "/engagement/shop.test/investigate"):
             with self.subTest(path=path):
-                self.assertEqual(self.client.get(path).status_code, 200)
+                self.assertEqual(self.client.get(path).status_code, 401)
+                self.assertEqual(self.client.get(path, headers=self._auth_header()).status_code, 200)
 
     # --- NEGATIVE CONTROL: disabled (the shipped default) ------------------
 
-    def test_telemetry_and_report_unauthenticated_when_disabled(self):
-        # Proves the default (require_read_auth: false, i.e. _READ_AUTH_ENABLED
-        # is False after a fresh module reload with no config.local.yaml
-        # override) leaves these reads exactly as before FR-8 -- the Burp
-        # extension's existing token-less reads keep working.
-        self.assertFalse(self.server._READ_AUTH_ENABLED,
-                         "test env must reflect the shipped false default")
+    def test_telemetry_and_report_reject_legacy_disabled_flag(self):
+        self.server._READ_AUTH_ENABLED = False
         resp = self.client.get("/telemetry")
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 401)
         resp = self.client.get("/report", params={"url": "http://localhost/x"})
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(self.client.get("/telemetry", headers=self._auth_header()).status_code, 200)
+        self.assertEqual(self.client.get("/report", params={"url": "http://localhost/x"},
+                                        headers=self._auth_header()).status_code, 200)
 
-    def test_test_plan_and_settings_unauthenticated_when_disabled(self):
-        self.assertFalse(self.server._READ_AUTH_ENABLED)
+    def test_test_plan_and_settings_reject_legacy_disabled_flag(self):
+        self.server._READ_AUTH_ENABLED = False
         resp = self.client.get("/test-plans/unknown-plan-id")
-        self.assertEqual(resp.status_code, 404)  # not 401 -- no auth gate at all
+        self.assertEqual(resp.status_code, 401)
         resp = self.client.get("/settings")
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(self.client.get("/test-plans/unknown-plan-id", headers=self._auth_header()).status_code, 404)
+        self.assertEqual(self.client.get("/settings", headers=self._auth_header()).status_code, 200)
 
-    def test_ra2_endpoints_unauthenticated_when_disabled(self):
-        # Load-bearing negative control (RA-2): with the shipped default
-        # (require_read_auth: false), every newly-gated read must remain
-        # exactly as reachable with no token as it was before this change --
-        # the default deploy stays byte-identical.
-        self.assertFalse(self.server._READ_AUTH_ENABLED,
-                         "test env must reflect the shipped false default")
+    def test_ra2_endpoints_reject_legacy_disabled_flag(self):
+        self.server._READ_AUTH_ENABLED = False
         finding_ref = "ra2-test-finding-ref-disabled"
         evidence_ledger.emit(evidence_ledger.EventType.OBSERVATION, finding_ref,
                              "seeded for RA-2 disabled-flag negative control")
 
-        resp = self.client.get("/engagement/shop.test")
-        self.assertEqual(resp.status_code, 200)
-        resp = self.client.get("/engagement/shop.test/investigate/unknown-job-id")
-        self.assertEqual(resp.status_code, 404)  # not 401 -- no auth gate at all
-        resp = self.client.get("/identities")
-        self.assertEqual(resp.status_code, 200)
-        resp = self.client.get("/hosts/shop.test/sessions")
-        self.assertEqual(resp.status_code, 200)
-        resp = self.client.get("/findings/suppressions")
-        self.assertEqual(resp.status_code, 200)
-        resp = self.client.get("/issues/shop.test/merges")
-        self.assertEqual(resp.status_code, 200)
-        resp = self.client.get(f"/findings/{finding_ref}/evidence")
-        self.assertEqual(resp.status_code, 200)
+        for path, authorized_status in (("/engagement/shop.test", 200),
+                ("/engagement/shop.test/investigate/unknown-job-id", 404),
+                ("/identities", 200), ("/hosts/shop.test/sessions", 200),
+                ("/findings/suppressions", 200), ("/issues/shop.test/merges", 200),
+                (f"/findings/{finding_ref}/evidence", 200)):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
+                self.assertEqual(self.client.get(path, headers=self._auth_header()).status_code, authorized_status)
 
 
 class HostHeaderDefenseTests(unittest.TestCase):
@@ -1320,7 +1334,8 @@ class HostHeaderDefenseTests(unittest.TestCase):
         # GET endpoints are the simple-cross-origin ones a visited page can hit;
         # the defense must cover them, not just the JSON POSTs.
         client = self.TestClient(self.server_module.app, base_url="http://evil.example")
-        resp = client.get("/report", params={"url": "http://localhost/x"})
+        resp = client.get("/report", params={"url": "http://localhost/x"},
+                          headers={"Authorization": f"Bearer {self.server_module._mutation_token()}"})
         self.assertEqual(resp.status_code, 400)
 
 

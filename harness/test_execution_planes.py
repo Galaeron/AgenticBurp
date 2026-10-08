@@ -231,6 +231,22 @@ class KnownDualPlaneCapabilitiesArePythonAuthoritativeTests(unittest.TestCase):
             self.assertIn(canonical, dual)
 
 
+class ClientTrustIsPythonOnlyTests(unittest.TestCase):
+    """LB-NOTE-B explicit control: `client_trust` is registered in
+    ValidatorRegistry (harness/validators/registry.py) with no Java case
+    label implementing it (ClientTrustValidator is pure Python/httpx, no
+    browser automation) -- it belongs in the Python-only plane, not the dual
+    plane. This pins that down beyond the generic no-drift assertion above."""
+
+    def test_client_trust_is_python_only_and_python_authoritative(self):
+        self.assertIn("client_trust", CAPABILITY_MATRIX)
+        cap = CAPABILITY_MATRIX["client_trust"]
+        self.assertTrue(cap.python_present, "client_trust should be python_present")
+        self.assertFalse(cap.java_present, "client_trust has no Java case label")
+        self.assertEqual("python", execution_planes.authoritative_plane("client_trust"))
+        self.assertNotIn("client_trust", execution_planes.dual_plane_capabilities())
+
+
 class MatrixConstructionNegativeControlTests(unittest.TestCase):
     """Negative control: CapabilityOwnership itself refuses the invalid
     shapes the exclusivity/coverage tests above are supposed to catch, so a

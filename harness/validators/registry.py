@@ -29,7 +29,9 @@ from .auth_sequence_validator import AuthSequenceValidator
 from .stored_xss_validator import StoredXssValidator
 from .verb_tamper_validator import VerbTamperValidator
 from .csrf_validator import CsrfValidator
+from .nosql_validator import NosqlValidator
 from .file_upload_validator import FileUploadValidator
+from .client_trust_validator import ClientTrustValidator
 from .rate_limit_validator import RateLimitValidator
 from .reset_token_validator import ResetTokenValidator
 from .dom_xss_validator import DomXssValidator
@@ -164,6 +166,9 @@ class ValidatorRegistry:
             self.validators["race_condition"] = RaceConditionValidator(
                 timeout=float(race_cfg.get("timeout", 15.0)),
                 burst_size=int(race_cfg.get("burst_size", 12)),
+                target_email=race_cfg.get("target_email"),
+                mailbox_url=race_cfg.get("mailbox_url"),
+                email_race_rounds=int(race_cfg.get("email_race_rounds", 6)),
             )
 
         # Insecure Deserialization validator (passive local inspection, not active)
@@ -200,6 +205,13 @@ class ValidatorRegistry:
         if ssti_cfg.get("enabled", True):
             self.validators["ssti"] = SstiValidator(
                 allowed_hosts=_allowed, timeout=float(ssti_cfg.get("timeout", 10.0)))
+        # IDOR read leg -- single-principal object-id read differential (own vs
+        # foreign vs absent). Read-only (GET); never a mutating/destructive replay.
+        idor_cfg = cfg.get("idor_read", {})
+        if idor_cfg.get("enabled", True):
+            from .idor_read_validator import IdorReadValidator
+            self.validators["idor_read"] = IdorReadValidator(
+                allowed_hosts=_allowed, timeout=float(idor_cfg.get("timeout", 10.0)))
         # Path-traversal leg -- reads a canonical system file via a traversal payload. Active.
         pt_cfg = cfg.get("path_traversal", {})
         if pt_cfg.get("enabled", True):
@@ -252,12 +264,25 @@ class ValidatorRegistry:
         if csrf_cfg.get("enabled", True):
             self.validators["csrf"] = CsrfValidator(
                 allowed_hosts=_allowed, timeout=float(csrf_cfg.get("timeout", 10.0)))
+        # NoSQL login-operator differential -- fresh anti-CSRF token per attempt,
+        # negative regex control, and independent administrator-page readback.
+        nosql_cfg = cfg.get("nosql", {})
+        if nosql_cfg.get("enabled", True):
+            self.validators["nosql"] = NosqlValidator(
+                allowed_hosts=_allowed, timeout=float(nosql_cfg.get("timeout", 10.0)))
         # File-upload extension bypass -- uploads a benign .html file and checks
         # if it is stored and retrievable. Active; the upload is mutating.
         fu_cfg = cfg.get("file_upload", {})
         if fu_cfg.get("enabled", True):
             self.validators["file_upload"] = FileUploadValidator(
                 allowed_hosts=_allowed, timeout=float(fu_cfg.get("timeout", 15.0)))
+        # Excessive trust in client-side controls -- tampers a server-owned value
+        # field (price/amount/total) and confirms the server reflects it back on an
+        # independent read. Active; the tamper write is gated by allow_mutating_replay.
+        ct_cfg = cfg.get("client_trust", {})
+        if ct_cfg.get("enabled", True):
+            self.validators["client_trust"] = ClientTrustValidator(
+                allowed_hosts=_allowed, timeout=float(ct_cfg.get("timeout", 10.0)))
         # Rate-limit / lockout absence -- replays the captured auth request N times
         # (safe subset: unchanged, valid creds) via authorize_burst and confirms no
         # 429/lockout after min_attempts. Active; gated by max_burst_size + mutating.

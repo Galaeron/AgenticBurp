@@ -246,7 +246,11 @@ class ConfirmMixin:
                 return pr.proof_id, case.case_id
             log.warning("failed to persist coverage proof for %s: %s", result.validator, reason)
         except Exception as e:  # proof bookkeeping must never break coverage
-            log.debug("coverage proof bookkeeping failed: %s", e)
+            # Surfaced at WARNING, not debug: a confirmed finding whose proof
+            # record silently fails to persist is exactly the "confirmation
+            # without a proof record" integrity gap the project already tracks,
+            # and a debug line is invisible on the default log level.
+            log.warning("coverage proof bookkeeping failed (proof record NOT persisted): %s", e)
         return "", ""
 
     async def _persist_confirmation_proof(

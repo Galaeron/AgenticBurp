@@ -17,6 +17,16 @@
 # here (see CLAUDE.md/AGENTS.md config hazard).
 operating_profile: "none"
 
+# TargetTransport verifies HTTPS certificates and hostnames by default for both
+# session and anonymous clients. Add a local proxy CA through an absolute PEM
+# path in config.local.yaml. Fixture bypasses are explicit loopback origins only;
+# no global verify:false option is supported. See docs/HTTPS_TRUST_POLICY.md.
+transport:
+  tls:
+    ca_bundle: null
+    fixture_insecure_origins: []
+    fixture_insecure_reason: null
+
 ollama:
   base_url: "http://localhost:11434"
   # Raised from 120s: three separate real PixelMart runs this session
@@ -96,8 +106,9 @@ coordinator:
   # to a deterministic UNION FLOOR beneath it (the coordinator can only add
   # agents to that floor, never remove them). The cloud model was A/B-validated
   # at 4.0 agents/exchange (31% tighter than fast_path's 5.8) for zero lost
-  # detections in the labeled run -- but re-run testing/test-target/
-  # ab_routing_recall.py before trusting it as primary on a fresh state.
+  # detections in the labeled run -- but re-measure A/B routing recall on your
+  # own corpus (see testing/README.md) before trusting it as primary on a fresh
+  # state. (An earlier ad-hoc ab_routing_recall.py helper is not committed.)
   cloud_primary: false
   cloud_model: "gemma4:31b-cloud"
   # Cloud-coordinator REASONING seam (Phase 4). DEFAULT OFF, and a stricter,
@@ -326,48 +337,37 @@ agent_defaults:
 # Smaller/faster models are fine for narrow, well-scoped classification
 # tasks -- only override upward (e.g. back to the coordinator's model or
 # stronger) for agents where you've found the default underperforming.
+#
+# IMPORTANT: do NOT add a per-agent `model:` that merely repeats
+# agent_defaults.model. Such a pin is a silent trap -- it does NOT follow a
+# later change to agent_defaults.model, so "switching the model" would leave
+# that agent behind on the old one. These agents therefore set only `enabled`
+# and inherit the default model; the harness logs each agent's resolved model
+# at startup, warns when an override shadows the default, and exposes the full
+# agent->model map at GET /health so you can verify what actually runs. Add a
+# `model:` here ONLY when it must genuinely differ from the default.
 agents:
   sqli:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   xss:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   idor:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   ssrf:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   auth:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   # Added: rising per 2021-2025 bug bounty/CVE data (see README).
   business_logic:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   misconfig:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   ai_llm:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   rate_limit:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   supply_chain:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
 
 # Deterministic lookup against GitHub's public Security Advisory
 # Database, used to resolve component candidates the supply_chain agent

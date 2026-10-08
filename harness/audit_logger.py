@@ -491,8 +491,8 @@ class AuditLogger:
         self,
         model: str,
         response: str,
-        prompt_tokens: int,
-        completion_tokens: int,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
         session_id: Optional[str] = None,
         request_id: Optional[str] = None,
         user_id: Optional[str] = None,
@@ -510,7 +510,10 @@ class AuditLogger:
                 'response_length': len(response),
                 'prompt_tokens': prompt_tokens,
                 'completion_tokens': completion_tokens,
-                'total_tokens': prompt_tokens + completion_tokens,
+                  'total_tokens': (prompt_tokens + completion_tokens
+                                   if prompt_tokens is not None and completion_tokens is not None else None),
+                  'known_tokens': (prompt_tokens or 0) + (completion_tokens or 0),
+                  'usage_complete': prompt_tokens is not None and completion_tokens is not None,
             },
             context={
                 'response_hash': hashlib.sha256(response.encode()).hexdigest()[:16],
@@ -741,7 +744,7 @@ def log_llm_prompt(model: str, system_prompt: str, user_prompt: str, **kwargs) -
     return get_audit_logger().log_llm_prompt(model, system_prompt, user_prompt, **kwargs)
 
 
-def log_llm_response(model: str, response: str, prompt_tokens: int, completion_tokens: int, **kwargs) -> str:
+def log_llm_response(model: str, response: str, prompt_tokens: int | None, completion_tokens: int | None, **kwargs) -> str:
     """Log an LLM response using the default logger."""
     return get_audit_logger().log_llm_response(model, response, prompt_tokens, completion_tokens, **kwargs)
 

@@ -346,6 +346,9 @@ _GATE_ROUTED_EXCEPTIONS = {
     # matches the mutating-method-literal check below, not the exchange.method
     # one, and is verified gate-routed there.
     "reset_token_validator.py",
+    # client_trust replays the captured write method with a tampered value field
+    # (price/amount) through GatedAsyncClient, self-gated on allow_mutating_replay.
+    "client_trust_validator.py",
 }
 
 
@@ -403,6 +406,15 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             # `if (exchange.method or "GET").upper() != "GET": return skipped`, and
             # the live send (_probe) hardcodes client.get(). Never sent.
             "jwt_forge_validator.py",
+            # idor_read is GET-only: its exchange.method references are two defensive
+            # `!= "GET": return skipped` guards plus two evidence f-strings; the only
+            # live send hardcodes client.request("GET", ...). The captured method is
+            # never sent.
+            "idor_read_validator.py",
+            # nosql's only exchange.method reference is a defensive `!= "POST": skip`
+            # guard; its live sends go through the gate-routed RunContext transport
+            # (transport.send) with the form's own/ hardcoded method, never exchange.method.
+            "nosql_validator.py",
         }
 
         violations = []
@@ -495,6 +507,9 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
                      "path_traversal_validator.py", "open_redirect_validator.py",
                      "sequence_validator.py", "deserialization_oob_validator.py",
                      "auth_sequence_validator.py", "stored_xss_validator.py",
+                     # client_trust replays the captured write with a tampered value
+                     # field through the gate; verify it too routes through it.
+                     "client_trust_validator.py",
                      # reset_token hardcodes method="POST" (mutating-literal
                      # check), so verify it too routes through the gate.
                      "reset_token_validator.py"):
@@ -518,12 +533,22 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
                         max(0, line_no - 5):line_no][0] and "cmd +=" in line:
                     self.fail(f"sqlmap.py line {line_no} adds denied flag {flag} to cmd: {line.strip()}")
 
-    def test_sqlmap_has_hard_ceiling_assertions(self):
+    def test_sqlmap_hard_ceiling_is_not_a_strippable_assert(self):
+        # The risk/level ceilings and the denied-flag guard are SAFETY invariants,
+        # so they must be `if ... raise`, never `assert` -- `python -O` strips
+        # assert statements, which would silently remove the guard. Enforce both
+        # the presence of the runtime guard AND the absence of the assert form.
         import pathlib
         here = pathlib.Path(__file__).parent
         sqlmap_src = (here / "validators" / "sqlmap.py").read_text()
-        self.assertIn("assert self.risk <= 2", sqlmap_src)
-        self.assertIn("assert self.level <= 2", sqlmap_src)
+        self.assertIn("if self.risk > 2:", sqlmap_src)
+        self.assertIn("if self.level > 2:", sqlmap_src)
+        self.assertNotIn("assert self.risk", sqlmap_src,
+                         "sqlmap risk ceiling must not be an assert (stripped under python -O)")
+        self.assertNotIn("assert self.level", sqlmap_src,
+                         "sqlmap level ceiling must not be an assert (stripped under python -O)")
+        self.assertNotIn("assert denied not in cmd", sqlmap_src,
+                         "sqlmap denied-flag guard must not be an assert (stripped under python -O)")
 
 
 class PerFindingMutationCeilingTests(unittest.TestCase):

@@ -108,6 +108,12 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(wl[0]["path"], "/rest/admin/config")
         self.assertTrue(any("privileged" in r for r in wl[0]["reasons"]))
 
+    def test_hyphenated_administrator_route_is_privileged(self):
+        self.assertTrue(engagement._looks_privileged("/administrator-panel"))
+
+    def test_privileged_keyword_inside_unrelated_word_is_not_privileged(self):
+        self.assertFalse(engagement._looks_privileged("/administratorship"))
+
     def test_confirmed_finding_outranks_bare_endpoint(self):
         st = EngagementState(host="shop.test")
         st.ingest_endpoints(["/api/plain"])
@@ -274,7 +280,9 @@ class StoreAndEndpointTests(unittest.TestCase):
             {"method": "GET", "path": "/rest/admin", "by_role": {"anonymous": 200},
              "reachable_roles": ["anonymous"], "object_scoped": False}]})
         self.store.save_engagement("shop.test", st.to_dict())
-        resp = client.get("/engagement/shop.test")
+        self.assertEqual(client.get("/engagement/shop.test").status_code, 401)
+        resp = client.get("/engagement/shop.test", headers={
+            "Authorization": f"Bearer {server_module._mutation_token()}"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertTrue(body["worklist"])

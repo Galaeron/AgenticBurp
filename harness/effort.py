@@ -50,8 +50,8 @@ _DEFAULT_TOKEN_ESTIMATE: dict[CallKind, int] = {
 class CallRecord:
     kind: CallKind
     model: str
-    prompt_tokens: int
-    completion_tokens: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
     # SC-13: unified trace metadata for every model path. All default to neutral
     # values, so the 4-positional CallRecord(kind, model, pt, ct) construction and
     # every existing 4-arg record()/commit() call are unchanged; a plain
@@ -64,10 +64,24 @@ class CallRecord:
     streamed: bool = False
     case_ref: str = ""
     run_id: str = ""
+    attempted: bool = True
+    completed: bool = True
+    usable: bool = True
+    queue_ms: float | None = None
+    connection_ms: float | None = None
+    generation_ms: float | None = None
+    wall_ms: float | None = None
 
     @property
-    def total_tokens(self) -> int:
+    def total_tokens(self) -> int | None:
+        if self.prompt_tokens is None or self.completion_tokens is None:
+            return None
         return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def known_tokens(self) -> int:
+        """Known consumption lower bound; missing counts remain unknown."""
+        return (self.prompt_tokens or 0) + (self.completion_tokens or 0)
 
     def to_dict(self) -> dict:
         """One flat trace row for the run-ledger / audit surfaces (SC-13)."""
@@ -81,6 +95,13 @@ class CallRecord:
             "latency_ms": self.latency_ms, "retries": self.retries,
             "outcome": self.outcome, "streamed": self.streamed,
             "case_ref": self.case_ref, "run_id": self.run_id,
+            "attempted": self.attempted, "completed": self.completed, "usable": self.usable,
+            "usage_known": self.total_tokens is not None,
+            "known_tokens": self.known_tokens,
+            "queue_ms": self.queue_ms, "connection_ms": self.connection_ms,
+            "generation_ms": self.generation_ms, "wall_ms": self.wall_ms,
+            "missing_timings": [key for key in ("queue_ms", "connection_ms", "generation_ms", "wall_ms")
+                                if getattr(self, key) is None],
         }
 
 
@@ -90,6 +111,7 @@ class CallRecord:
 _TRACE_FIELDS = frozenset({
     "provider", "prompt_version", "latency_ms", "retries", "outcome",
     "streamed", "case_ref", "run_id",
+    "attempted", "completed", "usable", "queue_ms", "connection_ms", "generation_ms", "wall_ms",
 })
 
 
@@ -131,23 +153,27 @@ class EffortLedger:
 
     @property
     def total_tokens(self) -> int:
-        return sum(r.total_tokens for r in self.records)
+        return sum(r.known_tokens for r in self.records)
+
+    @property
+    def usage_complete(self) -> bool:
+        return all(r.total_tokens is not None for r in self.records)
 
     def average_tokens(self, kind: CallKind) -> float:
         """Real observed average for `kind` if any calls of that kind have
         happened yet, else the labeled-as-unmeasured prior."""
-        matching = [r.total_tokens for r in self.records if r.kind == kind]
+        matching = [r.total_tokens for r in self.records if r.kind == kind and r.total_tokens is not None]
         if matching:
             return sum(matching) / len(matching)
         return float(_DEFAULT_TOKEN_ESTIMATE[kind])
 
     def has_real_data_for(self, kind: CallKind) -> bool:
-        return any(r.kind == kind for r in self.records)
+        return any(r.kind == kind and r.total_tokens is not None for r in self.records)
 
     def breakdown(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for r in self.records:
-            out[r.kind.value] = out.get(r.kind.value, 0) + r.total_tokens
+            out[r.kind.value] = out.get(r.kind.value, 0) + r.known_tokens
         return out
 
 
@@ -180,6 +206,9 @@ class EffortBudget:
     # released. Only touched by reserve()/commit()/release(); a caller
     # using only allow()/record() never moves this off 0.
     _reserved: int = field(default=0, repr=False, compare=False)
+    # Completed calls with missing provider counts consume admission capacity
+    # conservatively. This is an estimate debit, NEVER measured token usage.
+    _unmeasured_admission: int = field(default=0, repr=False, compare=False)
     # SC-8: serializes reserve()/commit()/release()/record() so concurrent
     # dispatch cannot race the check-then-increment in reserve() past the
     # budget. Not used by allow(), which stays a pure, lock-free check.
@@ -196,12 +225,12 @@ class EffortBudget:
     def remaining(self) -> int | None:
         if self.total_tokens is None:
             return None
-        return max(0, self.total_tokens - self.spent)
+        return max(0, self.total_tokens - self.spent - self._unmeasured_admission)
 
     def exhausted(self) -> bool:
         """Token-only, deliberately -- duration is folded into `allow()`
         separately so this stays a pure token predicate."""
-        return self.total_tokens is not None and self.spent >= self.total_tokens
+        return self.total_tokens is not None and self.spent + self._unmeasured_admission >= self.total_tokens
 
     def _deadline_passed(self) -> bool:
         if self.max_duration_s is None or self._deadline is None:
@@ -229,7 +258,7 @@ class EffortBudget:
         if not token_exhausted and not duration_passed:
             return True, ""
         if token_exhausted:
-            limit_desc = f"({self.spent}/{self.total_tokens} tokens)"
+            limit_desc = f"({self.spent} known tokens + {self._unmeasured_admission} unmeasured admission/{self.total_tokens})"
         else:
             limit_desc = f"(duration limit {self.max_duration_s}s reached)"
         if self.mode == BudgetMode.HARD:
@@ -272,13 +301,13 @@ class EffortBudget:
             # 100 cannot admit reserve(60) twice (120).
             requested = max(0, estimated_tokens)
             token_full = self.total_tokens is not None and (
-                (self.spent + self._reserved) >= self.total_tokens
-                or (self.spent + self._reserved + requested) > self.total_tokens)
+                (self.spent + self._unmeasured_admission + self._reserved) >= self.total_tokens
+                or (self.spent + self._unmeasured_admission + self._reserved + requested) > self.total_tokens)
             if not duration_passed and not token_full:
                 self._reserved += max(0, estimated_tokens)
                 return True, ""
             if token_full:
-                limit_desc = f"({self.spent + self._reserved}/{self.total_tokens} tokens)"
+                limit_desc = f"({self.spent} known + {self._reserved} pending + {self._unmeasured_admission} unmeasured admission/{self.total_tokens})"
             else:
                 limit_desc = f"(duration limit {self.max_duration_s}s reached)"
             if self.mode == BudgetMode.HARD:
@@ -308,7 +337,10 @@ class EffortBudget:
         """
         with self._lock:
             self._reserved = max(0, self._reserved - max(0, reserved))
-            return self.ledger.record(kind, model, prompt_tokens, completion_tokens, **meta)
+            record = self.ledger.record(kind, model, prompt_tokens, completion_tokens, **meta)
+            if record.completed and record.total_tokens is None:
+                self._unmeasured_admission += max(0, reserved - record.known_tokens)
+            return record
 
     def release(self, reserved: int) -> None:
         """SC-8: full refund of a reservation for a call that failed or
@@ -316,6 +348,20 @@ class EffortBudget:
         write, unlike commit()."""
         with self._lock:
             self._reserved = max(0, self._reserved - max(0, reserved))
+
+    def accounting(self) -> dict:
+        """Sanitized export; token totals are lower bounds when usage is unknown."""
+        with self._lock:
+            records = self.ledger.records
+            return {"known_tokens": self.spent, "usage_complete": self.ledger.usage_complete,
+                    "pending_admission_tokens": self._reserved,
+                    "unmeasured_admission_tokens": self._unmeasured_admission,
+                    "remaining_admission_tokens": self.remaining,
+                    "attempted_calls": sum(r.attempted for r in records),
+                    "completed_calls": sum(r.completed for r in records),
+                    "usable_calls": sum(r.usable for r in records),
+                    "error_calls": sum(r.outcome == "error" for r in records),
+                    "cancelled_calls": sum(r.outcome == "cancelled" for r in records)}
 
 
 @dataclass
@@ -381,7 +427,7 @@ def estimate_for_urls(
         "urls_unscored": len(urls) - n_scored,
         "urls_high_risk": n_high,
         "estimated_total_tokens": int(grand_total),
-        "calibrated_from_real_calls": bool(ledger.records),
+        "calibrated_from_real_calls": any(r.total_tokens is not None for r in ledger.records),
         "breakdown": {
             "routing": int(routing_total),
             "agent_dispatch": int(agent_total),

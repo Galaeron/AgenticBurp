@@ -24,6 +24,7 @@ import os
 from typing import Protocol
 
 from harness.ollama_client import OllamaClient, OllamaError, OllamaResult
+from harness import security
 
 log = logging.getLogger("harness.llm_provider")
 
@@ -60,6 +61,7 @@ class OllamaProvider:
         self, model: str, system_prompt: str, user_prompt: str,
         temperature: float = 0.1, **kw,
     ) -> OllamaResult:
+        system_prompt, user_prompt = security.sanitize_for_inference(system_prompt, user_prompt)
         return await self._client.chat_json_metered(
             model, system_prompt, user_prompt, temperature=temperature)
 
@@ -92,13 +94,13 @@ def provider_diagnostics(role_config: dict) -> dict:
     to render a status panel even when a key is missing or misconfigured)."""
     provider_name = str((role_config or {}).get("provider", "ollama") or "ollama").lower()
     env_var = _API_KEY_ENV_VAR.get(provider_name, "")
-    return {
+    return security.sanitize_data({
         "provider": provider_name,
         "model": (role_config or {}).get("model", ""),
         "remote": provider_name != "ollama",
         "api_key_env_var": env_var,
         "api_key_present": bool(env_var and os.environ.get(env_var)),
-    }
+    })
 
 
 def build_provider(role_config: dict, *, ollama_client: OllamaClient) -> Provider:

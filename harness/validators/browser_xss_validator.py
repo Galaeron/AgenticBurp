@@ -36,6 +36,11 @@ def _payloads(nonce: str) -> list[str]:
     runs, surfaces `nonce` in a console message, dialog, or page error."""
     js = f"console.log('{nonce}')"
     return [
+        # Lead with a dialog payload. A dialog is the strongest browser-visible
+        # execution proof and is also the completion oracle used by common XSS
+        # benchmark labs; console-only execution can prove the sink internally
+        # while leaving that independent oracle unsatisfied.
+        f"<script>alert('{nonce}')</script>",
         f"<script>{js}</script>",
         f"\"><script>{js}</script>",
         f"\"><img src=x onerror={js}>",

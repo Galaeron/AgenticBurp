@@ -140,6 +140,23 @@ def _reset(path: str):
     return _do
 
 
+def _cross_site_poc_enabled() -> bool:
+    """Fail-safe config read for the csrf LegCase's `available` gate (LB-5),
+    mirroring how the command_injection case below gates on
+    `shutil.which("curl")`: the self-test only attempts the real cross-site
+    browser PoC when the operator has explicitly turned harness/config.yaml's
+    `cross_site_poc.enabled` on (default OFF everywhere it ships). ANY
+    failure to read config (missing file, bad YAML, import error) is treated
+    as "not enabled", never as "enabled" -- same fail-safe-by-construction
+    rule as every other `available` gate in this module."""
+    try:
+        from harness.server import load_config
+        cfg, _ = load_config()
+        return bool((cfg.get("cross_site_poc", {}) or {}).get("enabled", False))
+    except Exception:
+        return False
+
+
 def _default_cases() -> list[LegCase]:
     """The self-test's built-in leg roster -- one case per class the owned
     loopback fixture has a matched vulnerable/safe pair for. Deliberately a
@@ -157,6 +174,8 @@ def _default_cases() -> list[LegCase]:
     from harness.validators.auth_sequence_validator import AuthSequenceValidator
     from harness.validators.stored_xss_validator import StoredXssValidator
     from harness.validators.jwt_forge_validator import JwtForgeValidator
+    from harness.validators.csrf_validator import CsrfValidator
+    from harness import browser_driver
 
     def _get(base_url, path):
         return HttpExchange(url=f"{base_url}{path}", method="GET",
@@ -182,6 +201,24 @@ def _default_cases() -> list[LegCase]:
         seed = base64.b64encode(pickle.dumps({"user": "alice"})).decode()
         return HttpExchange(url=f"{base_url}{path}", method="GET",
                             request_headers={"Cookie": f"session={seed}"}, request_body="")
+
+    def _csrf_poc_exchange(base_url, path):
+        # Form-urlencoded body (never JSON): a real cross-site <form> can
+        # only auto-submit application/x-www-form-urlencoded (or multipart)
+        # content, which is exactly the shape _cross_site_form_fields expects.
+        # The Origin header mirrors what a REAL capture of a legitimate
+        # same-origin submission would show -- letting the plain token-strip
+        # replay branch (which simply forwards whatever Origin the capture
+        # had) reach 2xx so execution falls through to the NEW cross-site-PoC
+        # branch, where the REAL browser's own (unforgeable) cross-origin
+        # Origin header is what the fixture's Origin-enforced control
+        # actually exercises and rejects.
+        return HttpExchange(
+            url=f"{base_url}{path}", method="POST",
+            request_headers={"Content-Type": "application/x-www-form-urlencoded",
+                             "Cookie": "csrf_sid=leg-self-test-seed-session",
+                             "Origin": base_url},
+            request_body="note=seed")
 
     def _jwt_get(base_url, path):
         import base64, json
@@ -247,6 +284,27 @@ def _default_cases() -> list[LegCase]:
         LegCase("jwt", "jwt",
                 lambda: JwtForgeValidator(allowed_hosts=["127.0.0.1"]),
                 lambda b: _jwt_get(b, "/jwt/kid"), lambda b: _jwt_get(b, "/jwt/kid-safe")),
+
+        # LB-5: cross-site browser PoC for CSRF -- gated on BOTH Playwright
+        # being installed AND the operator explicitly opting into
+        # config.yaml's `cross_site_poc.enabled` (default OFF). Unlike every
+        # other case above, an unset flag means this case is simply never
+        # attempted this run (fail-safe: "csrf" stays provisional, exactly as
+        # today, with the flag off). TP = no declared defense (ambient
+        # cookie rides along); NEG = the Origin/Referer-enforced control
+        # (ambient cookie still present, but a real browser's own Origin
+        # header on the cross-site POST is what the fixture rejects) -- the
+        # SameSite=Strict/Lax and bearer-only controls are exercised directly
+        # against the mechanism/validator in
+        # harness/test_leg_live_verification.py, not via this TP/NEG pairing.
+        LegCase("csrf", "csrf",
+                lambda: CsrfValidator(
+                    allowed_hosts=["127.0.0.1"], cross_site_poc_enabled=True,
+                    cross_site_readback_url=lambda u: u.replace("/transfer", "/state")),
+                lambda b: _csrf_poc_exchange(b, "/csrf-poc/transfer"),
+                lambda b: _csrf_poc_exchange(b, "/csrf-poc/transfer-origin"),
+                setup=_reset("/csrf-poc/reset"),
+                available=lambda: browser_driver.playwright_available() and _cross_site_poc_enabled()),
     ]
 
 

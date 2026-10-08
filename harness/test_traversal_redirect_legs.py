@@ -6,8 +6,11 @@ import unittest
 from urllib.parse import urlsplit, parse_qsl
 from unittest.mock import patch
 
+import httpx
+
 from harness.models import Finding, HttpExchange
 from harness.categories import canonicalize
+from harness.run_context import RunContext
 from harness.validators.path_traversal_validator import PathTraversalValidator
 from harness.validators.open_redirect_validator import OpenRedirectValidator, _SENTINEL_HOST
 
@@ -101,6 +104,55 @@ class PathTraversalTests(_GateActive):
                           request_body="", response_status=200, response_body="x")
         # applies even with an unrelated finding class, purely on the file-ish segment
         self.assertTrue(PathTraversalValidator(allowed_hosts=["t.test"]).applies(_f("misconfig"), ex))
+
+    def test_run_context_owns_confirmation_send_and_budget(self):
+        sent = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(str(request.url))
+            return httpx.Response(
+                200, text="root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:")
+
+        async def run():
+            ctx = RunContext.create(allowed_hosts=["t.test"], max_requests=2)
+            ctx._default_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler), follow_redirects=False)
+            try:
+                result = await PathTraversalValidator(
+                    allowed_hosts=["t.test"], run_context=ctx
+                ).validate(_f("path traversal"), self._exchange())
+                return result, ctx.budget.used
+            finally:
+                await ctx.aclose()
+
+        result, used = asyncio.run(run())
+        self.assertEqual(result.status, "confirmed")
+        self.assertEqual(used, 1)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("etc%2Fpasswd", sent[0])
+
+    def test_run_context_budget_exhaustion_sends_nothing(self):
+        sent = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(str(request.url))
+            return httpx.Response(200, text="root:x:0:0:root:/root:/bin/bash")
+
+        async def run():
+            ctx = RunContext.create(allowed_hosts=["t.test"], max_requests=0)
+            ctx._default_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler), follow_redirects=False)
+            try:
+                return await PathTraversalValidator(
+                    allowed_hosts=["t.test"], run_context=ctx
+                ).validate(_f("path traversal"), self._exchange())
+            finally:
+                await ctx.aclose()
+
+        result = asyncio.run(run())
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("budget_exhausted", result.summary)
+        self.assertEqual(sent, [])
 
 
 class OpenRedirectTests(_GateActive):
