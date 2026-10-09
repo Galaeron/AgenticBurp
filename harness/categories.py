@@ -224,6 +224,51 @@ def canonicalize(raw: str | None) -> str | None:
     return _SYNONYMS.get(normalized)
 
 
+# Distinctive, unambiguous class tokens an LLM commonly embeds in a specific
+# finding TITLE instead of writing the bare class -- "Missing CSRF Token",
+# "JWT None Algorithm", "Reflected XSS in search". These are a LAST-RESORT
+# routing aid for Validator.applies ONLY (review pt 6): canonicalize() itself
+# stays strict and still returns None for them, so the coverage ledger and
+# capability planning -- which must not guess -- are unchanged. Deliberately
+# excludes ambiguous words that collide with ordinary English or with other
+# classes (auth, key, token, access, none, redirect); every entry here is a
+# security term with essentially no benign whole-word use in a finding title.
+_DISTINCTIVE_TOKENS: dict[str, str] = {
+    "csrf": "csrf", "xsrf": "csrf",
+    "sqli": "sqli",
+    "ssrf": "ssrf",
+    "xxe": "xxe",
+    "ssti": "ssti",
+    "idor": "idor", "bola": "idor",
+    "nosql": "nosql",
+    "lfi": "path_traversal", "rfi": "path_traversal",
+    "jwt": "jwt",
+    "xss": "xss",
+    "rce": "command_injection",
+    "cors": "cors",
+    "clickjacking": "csp",
+}
+
+_DISTINCTIVE_RE = re.compile(
+    r"\b(" + "|".join(sorted(_DISTINCTIVE_TOKENS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def distinctive_token(raw: str | None) -> str | None:
+    """Canonical category implied by a distinctive, unambiguous class token
+    appearing as a whole word in `raw`, or None.
+
+    Routing aid for validator dispatch only -- NOT used by canonicalize(). If
+    `raw` contains two DIFFERENT distinctive tokens, returns None rather than
+    guess which class the finding is 'really' about.
+    """
+    if not raw:
+        return None
+    hits = {_DISTINCTIVE_TOKENS[m.group(1).lower()] for m in _DISTINCTIVE_RE.finditer(raw)}
+    return next(iter(hits)) if len(hits) == 1 else None
+
+
 def all_known_phrases() -> dict[str, str]:
     """
     Public accessor for the full exact-match phrase table: every

@@ -760,9 +760,11 @@ class TestEarlyTermination(unittest.TestCase):
             self.create_report("sqli", 0.95, "critical"),
             self.create_report("xss", 0.8, "medium"),
         ]
-        
-        result = should_terminate_early(reports, ["idor", "ssrf"], config)
-        
+
+        # remaining excludes the protected core classes (sqli/xss/idor) so the
+        # confidence/severity gate -- not the review-pt-3 guard -- is exercised.
+        result = should_terminate_early(reports, ["ssrf", "misconfig"], config)
+
         self.assertTrue(result[0])
         self.assertIn("critical", result[1])
     
@@ -779,9 +781,9 @@ class TestEarlyTermination(unittest.TestCase):
             self.create_report("sqli", 0.7, "high"),
             self.create_report("xss", 0.8, "medium"),
         ]
-        
-        result = should_terminate_early(reports, ["idor", "ssrf"], config)
-        
+
+        result = should_terminate_early(reports, ["ssrf", "auth"], config)
+
         self.assertFalse(result[0])
     
     def test_no_early_termination_on_low_severity(self):
@@ -797,9 +799,9 @@ class TestEarlyTermination(unittest.TestCase):
             self.create_report("sqli", 0.95, "medium"),
             self.create_report("xss", 0.9, "low"),
         ]
-        
-        result = should_terminate_early(reports, ["idor", "ssrf"], config)
-        
+
+        result = should_terminate_early(reports, ["ssrf", "auth"], config)
+
         self.assertFalse(result[0])
     
     def test_early_termination_disabled(self):
@@ -847,7 +849,9 @@ class TestEarlyTermination(unittest.TestCase):
             self.create_report("business_logic", 0.5, "medium"),
             self.create_report("cors", 0.95, "high"),
         ]
-        result = should_terminate_early(reports, ["csp", "idor", "misconfig", "nosql", "rate_limit", "sqli", "xss"], config)
+        # remaining excludes the protected core classes so this test exercises
+        # the severity DEFAULT ({"critical"}), not the review-pt-3 guard.
+        result = should_terminate_early(reports, ["csp", "misconfig", "nosql", "rate_limit"], config)
         self.assertFalse(result[0], f"must not terminate on a 'high' severity finding by default, got: {result}")
 
     def test_default_config_still_terminates_on_critical(self):
@@ -858,7 +862,35 @@ class TestEarlyTermination(unittest.TestCase):
             self.create_report("business_logic", 0.5, "medium"),
             self.create_report("sqli", 0.95, "critical"),
         ]
-        result = should_terminate_early(reports, ["idor", "xss"], config)
+        result = should_terminate_early(reports, ["ssrf", "misconfig"], config)
+        self.assertTrue(result[0])
+
+    def test_pt3_guard_no_termination_while_core_classes_pending(self):
+        """Review pt 3: a confident, critical -- but UNCONFIRMED -- finding must
+        NOT cancel the core injection / access-control checks (sqli/xss/idor)
+        while they are still queued. Agents dispatch alphabetically so these
+        sort last; the old behavior let a first-batch anomaly/business_logic
+        claim starve them entirely."""
+        config = EarlyTerminationConfig(enabled=True, min_confidence=0.9, max_agents_before_check=3)
+        reports = [
+            self.create_report("anomaly", 0.95, "critical"),
+            self.create_report("business_logic", 0.92, "critical"),
+            self.create_report("cors", 0.95, "high"),
+        ]
+        for pending in (["sqli"], ["xss"], ["idor"], ["misconfig", "sqli", "xss"]):
+            result = should_terminate_early(reports, pending, config)
+            self.assertFalse(result[0], f"must not terminate while {pending} pending, got: {result}")
+
+    def test_pt3_guard_terminates_once_core_classes_have_run(self):
+        """The guard only protects PENDING core classes: once none of
+        sqli/xss/idor remain, a genuinely critical finding still terminates."""
+        config = EarlyTerminationConfig(enabled=True, min_confidence=0.9, max_agents_before_check=3)
+        reports = [
+            self.create_report("anomaly", 0.6, "medium"),
+            self.create_report("business_logic", 0.5, "medium"),
+            self.create_report("sqli", 0.95, "critical"),
+        ]
+        result = should_terminate_early(reports, ["ssrf", "misconfig"], config)
         self.assertTrue(result[0])
 
 
@@ -931,7 +963,9 @@ class TestFastPathSelector(unittest.TestCase):
                 )
             ],
         )
-        self.selector.check_early_termination([report], ["xss", "idor"])
+        # remaining excludes the protected core classes so the tracking path
+        # (not the review-pt-3 guard) is what's exercised here.
+        self.selector.check_early_termination([report], ["ssrf", "auth"])
         stats = self.selector.get_stats()
         self.assertEqual(stats['early_terminations'], 1)
     def test_reset_stats(self):

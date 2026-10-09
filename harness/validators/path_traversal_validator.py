@@ -29,6 +29,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl
 import httpx
 
 from harness import global_throttle
+from harness.categories import canonicalize
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
@@ -58,6 +59,18 @@ _TARGETS = {
 }
 _MAX_PARAMS = 6
 _PATHSEG = "pathseg"
+
+# Review pt 7: the shape-decoupled fallback (probe any file/path-shaped request
+# even when the LLM labelled it something else -- like the ssrf/xxe legs) is
+# intentional coverage for unlabelled/mislabelled findings. But it should NOT
+# fire for a finding whose class is DEFINITIONALLY a response-header/transport
+# concern with no relationship to reading a file off disk: a CSP, CORS or TLS
+# finding that merely happens to sit on a file-serving URL is not a
+# path-traversal hypothesis, and sending traversal probes off the back of it is
+# just unrequested active traffic. Narrow, explicit, and canonical so it never
+# suppresses a genuinely file-read-adjacent class (misconfig, info_disclosure,
+# recon, anomaly, etc. still get the shape-decoupled probe).
+_NOT_FILE_READ_CLASSES = {"csp", "cors", "crypto"}
 
 
 def _file_shaped(exchange: HttpExchange) -> list[tuple[str, str]]:
@@ -112,8 +125,15 @@ class PathTraversalValidator(Validator):
         self.run_context = run_context
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
-        return (super().applies(finding, exchange) and bool(param_targets(exchange))) \
-            or bool(_file_shaped(exchange)) or _fileish_segment(exchange.url)
+        # A finding explicitly labelled this class (or a traversal synonym)
+        # routes whenever there is any injectable parameter -- unchanged.
+        if super().applies(finding, exchange) and bool(param_targets(exchange)):
+            return True
+        # Shape-decoupled fallback, suppressed for header/transport-only classes
+        # that are never a file read (review pt 7).
+        if canonicalize(finding.vulnerability_class) in _NOT_FILE_READ_CLASSES:
+            return False
+        return bool(_file_shaped(exchange)) or _fileish_segment(exchange.url)
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "path_traversal", summary=why)

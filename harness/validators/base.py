@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from harness.models import Finding, HttpExchange, TestPlan
-from harness.categories import canonicalize
+from harness.categories import canonicalize, distinctive_token
 
 
 @dataclass
@@ -44,7 +44,27 @@ class Validator(ABC):
         # still works during the transition.
         raw = finding.vulnerability_class.lower()
         category = canonicalize(finding.vulnerability_class)
-        return raw in self.finding_classes or (category is not None and category in self.finding_classes)
+        fcs = self.finding_classes
+        if raw in fcs or (category is not None and category in fcs):
+            return True
+        # Review pt 6 -- synonym/canonical spelling mismatch: a validator may
+        # declare a SYNONYM in finding_classes (e.g. verbose_error lists
+        # "information_disclosure") while the agent writes the CANONICAL class
+        # ("info_disclosure"), or vice-versa. Compare on canonical identity so
+        # the two spellings of the same class never silently fail to route.
+        canon_fcs = {canonicalize(fc) or fc for fc in fcs}
+        if category is not None and category in canon_fcs:
+            return True
+        # Review pt 6 -- embedded-title token: the model often writes a
+        # specific finding TITLE that embeds an unambiguous class token
+        # ("Missing CSRF Token", "JWT None Algorithm") which canonicalize()
+        # deliberately leaves unmapped. Route on that token only when it maps
+        # to one of THIS validator's own classes -- never a global guess.
+        if category is None:
+            tok = distinctive_token(raw)
+            if tok is not None and tok in canon_fcs:
+                return True
+        return False
 
     @abstractmethod
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
