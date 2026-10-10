@@ -1,0 +1,56 @@
+# ============================================================================
+# DECISIVE-RUN CONFIG TEMPLATE -- crAPI (Phase 1.2)
+# ============================================================================
+# This is an OVERLAY, applied on top of harness/config.yaml exactly the way
+# config.local.yaml is layered -- it is NOT the server default and is NEVER
+# loaded automatically. It is ARMED on purpose (active mode + mutating replay)
+# and is meant for ONE thing: the explicitly-authorised crAPI decisive run.
+#
+# DO NOT copy these values into harness/config.yaml or harness/config.local.yaml.
+# config.yaml stays at safe defaults (active_enabled: false,
+# allow_mutating_replay: false, allowed_hosts: []); this file is the only place
+# the decisive-run knobs live, and it takes effect solely when an operator
+# points the eval run at it for an engagement they are authorised to test.
+#
+# Load + validate it with testing/run_provenance.py:load_decisive_config(),
+# which refuses the scope placeholder below and records the config hash with the
+# results (Phase 1.2 "done when": the run's config is loaded from the template
+# and its hash is recorded).
+# ============================================================================
+
+server:
+  # EXACT target scope -- host only, no port (the gate is exact-host-only, W-17;
+  # scope_lock rejects host:port entries). REPLACE the placeholder with the real
+  # crAPI host before the run; load_decisive_config() refuses this sentinel so a
+  # forgotten scope fails loudly instead of running against nothing.
+  allowed_hosts:
+    - "SET-EXACT-CRAPI-HOST"
+
+validators:
+  # Armed: the whole point of the decisive run. active_enabled authorises the
+  # live validators; allow_mutating_replay authorises the mutating legs (BOLA/
+  # BFLA/mass-assignment writes, the race burst). Both gated by scope above.
+  active_enabled: true
+  allow_mutating_replay: true
+  # Burst ceiling >= 5 so the rate-limit and TOCTOU-race legs have headroom
+  # (rate-limit needs >= its min_attempts; the race needs >= 2).
+  max_burst_size: 5
+
+ollama:
+  # Fixed run seed -- a reproducibility CONTROL, not a guarantee of identical
+  # output across hardware or Ollama/model versions. This is the value that
+  # actually reaches options.seed for EVERY model call (coordinator, agents,
+  # critique, allocation) because they share one OllamaClient. Any fixed integer
+  # works; 1337 is this template's pinned value. (A seed of 0 is also valid and
+  # is honoured -- the plumbing gates on `is not None`, not truthiness.)
+  seed: 1337
+
+coordinator:
+  # Deterministic routing: temperature 0 + the same run seed.
+  temperature: 0
+  seed: 1337
+
+agent_defaults:
+  # Deterministic agents: temperature 0. Agents inherit the run seed from the
+  # shared OllamaClient above, so no per-agent seed is needed here.
+  temperature: 0
