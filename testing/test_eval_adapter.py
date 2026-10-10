@@ -357,6 +357,20 @@ class DroppedFindingNegativeControlTests(unittest.TestCase):
             stored = store.all_host_findings(_HOST)
             self.assertEqual(len(stored), 2, stored)
 
+            # The chain detector saw idor+sqli on this host and recorded a
+            # speculative chain hypothesis. It must NOT count toward the host
+            # finding set above (that would make the eval score a rule-derived
+            # relationship as if it were an independently-detected finding),
+            # but it must still be retrievable -- the report surfaces it and a
+            # dropped-chain regression must be detectable here too.
+            with_chains = store.all_host_findings(_HOST, include_chains=True)
+            self.assertEqual(len(with_chains), 3, with_chains)
+            self.assertTrue(
+                any(f["vulnerability_class"].startswith("potential-attack-chain:")
+                    for f in with_chains),
+                "chain hypothesis was not recorded as a host finding at all",
+            )
+
             truncated = stored[:1]  # synthetic drop: one persisted finding withheld
             with self.assertRaises(EvalAdapterError):
                 build_eval_artifact(

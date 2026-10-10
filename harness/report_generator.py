@@ -715,9 +715,10 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     opt-in never loses recall.
     """
     from harness import store
-    findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal)
+    findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal,
+                                       include_chains=True)
     all_including_suppressed = store.all_host_findings(url, include_suppressed=True, engagement_id=engagement_id,
-                                                     captured_principal=captured_principal)
+                                                     captured_principal=captured_principal, include_chains=True)
     suppressed_count = len(all_including_suppressed) - len(findings)
     host = store.host_of(url)
     reporting = (config or {}).get("reporting") or {}
@@ -800,7 +801,8 @@ def export_issues_for_host(url: str, *, config: dict | None = None, engagement_i
     existing caller (export_issues_for_host(url), no config kwarg) is
     byte-for-byte unaffected."""
     from harness import store
-    findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal)
+    findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal,
+                                       include_chains=True)
     reporting = (config or {}).get("reporting") or {}
     if reporting:
         findings = [f for f in findings if not _demoted_by_reporting_gates(f, reporting)]

@@ -1029,6 +1029,7 @@ def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int 
             """SELECT url, vulnerability_class, severity, confidence, summary
                FROM findings WHERE host = ? AND engagement_id = ?
                AND (? IS NULL OR captured_principal_id = ?) AND url != COALESCE(?, '')
+               AND vulnerability_class NOT LIKE 'potential-attack-chain:%'
                ORDER BY created_at DESC LIMIT ?""",
             (host, _engagement_partition(engagement_id), captured_principal, captured_principal, exclude_url, limit),
         ).fetchall()
@@ -1061,10 +1062,21 @@ def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int 
 
 
 def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_id: str = "",
-                      captured_principal: str | None = None) -> list[dict]:
+                      captured_principal: str | None = None,
+                      include_chains: bool = False) -> list[dict]:
     """
     Full (not summarized) finding records for a host, for chain detection
     and report generation.
+
+    `include_chains`: speculative attack-chain hypotheses
+    (vulnerability_class "potential-attack-chain:*") are rule-derived
+    *relationships* between findings, not independently-detected host
+    findings. They must not inflate the per-host finding count the eval
+    scores, nor be fed back into agent prompts as "prior findings" (both
+    read this function), so they are EXCLUDED by default. The report
+    passes include_chains=True to surface them in their own section --
+    they are still persisted and recorded, just kept out of the
+    host-finding set every other consumer sees.
 
     `include_suppressed`: if False (the default), findings whose
     fingerprint has been suppressed (see `suppress_finding`) are left out
@@ -1130,6 +1142,9 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
     ]
     if not include_suppressed:
         results = [r for r in results if not r["suppressed"]]
+    if not include_chains:
+        results = [r for r in results
+                   if not r["vulnerability_class"].startswith("potential-attack-chain:")]
     return results
 
 
