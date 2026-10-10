@@ -93,6 +93,9 @@ class CrossIdentityValidatorTest(unittest.TestCase):
         self.assertNotEqual(getattr(r, "control_outcome", ""), "control_held")
         self.assertLess(r.confidence, 0.8)
         self.assertNotIn("correctly restricted", (r.summary or "").lower())
+        # evidence reports the ACTUAL rejected count, never a blanket "all rejected"
+        # (some probes can come back neither rejected nor confirmed).
+        self.assertNotIn("all rejected", (r.evidence or "").lower())
 
     def test_skips_without_identities(self):
         v = _StubbedValidator(lambda h: (200, "x"), allowed_hosts=["localhost"])

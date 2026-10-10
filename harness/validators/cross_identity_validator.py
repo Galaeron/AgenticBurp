@@ -370,8 +370,8 @@ class CrossIdentityValidator(Validator):
                         f"identity/identities were denied, but {errored} probe(s) errored and could not "
                         f"be evaluated -- 'every non-privileged identity was denied' cannot be asserted.",
                 evidence=f"{considered} non-privileged identity/identities tested against {exchange.url} "
-                         f"(all denied); {errored} errored (last: {last_error}). An errored probe is an "
-                         f"unknown, not a denial, so this is NOT reported as a held control.",
+                         f"({rejects} denied); {errored} errored (last: {last_error}). An errored probe is "
+                         f"an unknown, not a denial, so this is NOT reported as a held control.",
                 control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
@@ -506,9 +506,9 @@ class CrossIdentityValidator(Validator):
                 summary=f"Cross-identity access-control test INCONCLUSIVE: {rejects} identity/identities "
                         f"were denied, but {errored} probe(s) errored and could not be evaluated -- "
                         f"'every other identity was denied' cannot be asserted.",
-                evidence=f"{considered} identity/identities evaluated against {exchange.url} (all rejected); "
-                         f"{errored} errored (last: {last_error}). An errored probe is an unknown, not a "
-                         f"denial, so this is NOT reported as a restricted/held control.",
+                evidence=f"{considered} identity/identities evaluated against {exchange.url} "
+                         f"({rejects} rejected); {errored} errored (last: {last_error}). An errored probe "
+                         f"is an unknown, not a denial, so this is NOT reported as a restricted/held control.",
                 control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
