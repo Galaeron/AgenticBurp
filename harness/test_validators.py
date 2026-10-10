@@ -111,6 +111,37 @@ class ValidatorTests(unittest.TestCase):
         with self.assertNoLogs("harness.validators.registry", level="WARNING"):
             reg.set_active_enabled(True)
 
+    def test_no_accounts_for_host_warns_on_access_control_finding(self):
+        # Second crAPI failure mode: active armed + an IDOR candidate on a host
+        # with NO registered identities -> the cross-user validator can't arm and
+        # the check silently skips. Warn once per host (replay armed here so the
+        # set_active_enabled mutating-replay warning doesn't fire).
+        from harness import identity_headers
+        identity_headers.clear()
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": True}})
+        reg.set_active_enabled(True)
+        with self.assertLogs("harness.validators.registry", level="WARNING") as cm:
+            matched = reg.for_finding(self._idor_finding(), self.exchange)
+        self.assertNotIn("cross_identity", [v.name for v in matched])  # could not arm
+        self.assertIn("no identities", "\n".join(cm.output).lower())
+        # deduped: a second access-control finding on the same host warns no more
+        with self.assertNoLogs("harness.validators.registry", level="WARNING"):
+            reg.for_finding(self._idor_finding(), self.exchange)
+        identity_headers.clear()
+
+    def test_no_accounts_warning_suppressed_when_identities_registered(self):
+        from harness import identity_headers
+        identity_headers.clear()
+        identity_headers.set_identity("example.test", "other", {"Authorization": "Bearer o"})
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": True}})
+        reg.set_active_enabled(True)
+        with self.assertNoLogs("harness.validators.registry", level="WARNING"):
+            matched = reg.for_finding(self._idor_finding(), self.exchange)
+        self.assertIn("cross_identity", [v.name for v in matched])  # auto-armed instead
+        identity_headers.clear()
+
     def test_sqlmap_confirmation_promotes_only_on_explicit_tool_result(self):
         validator = SqlmapValidator()
         with patch("subprocess.run", return_value=FakeProc()):

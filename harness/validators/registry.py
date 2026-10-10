@@ -434,11 +434,33 @@ class ValidatorRegistry:
             from harness import identity_headers
             from urllib.parse import urlsplit
             host = urlsplit(exchange.url).hostname or ""
+            xid = self._auto_cross_identity()
             if identity_headers.has_identities(host):
-                xid = self._auto_cross_identity()
                 if xid.applies(finding, exchange):
                     matched.append(xid)
+            elif xid.applies(finding, exchange):
+                # Second crAPI failure mode: active mode is armed and this IS an
+                # access-control (IDOR/BFLA) candidate, but no identities are
+                # registered for the host, so the cross-user validator cannot
+                # arm and the cross-user check is silently skipped -- a run can
+                # report "nothing found" for access control without ever testing
+                # it. Warn once per host (the mutating-replay switch is warned
+                # separately in set_active_enabled / config_schema).
+                self._warn_no_accounts(host)
         return matched
+
+    def _warn_no_accounts(self, host: str) -> None:
+        seen = self.__dict__.setdefault("_no_account_hosts_warned", set())
+        if host in seen:
+            return
+        seen.add(host)
+        log.warning(
+            "active mode is armed and an access-control (IDOR/BFLA) candidate was "
+            "raised for %r, but NO identities are registered for that host -- the "
+            "cross-user validator cannot run, so cross-user access-control checks "
+            "are silently skipped. Register another identity's session via "
+            "POST /identities/session-headers (Autorize-style) to exercise them.",
+            host)
 
     def bind_run_context(self, validators, run_context):
         """Return invocation-bound copies without changing for_finding's public seam."""
