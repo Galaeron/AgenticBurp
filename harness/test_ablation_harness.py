@@ -47,11 +47,12 @@ from harness.ablation_harness import RunMetrics, Variant, run_ablation
 
 _HARNESS_DIR = Path(__file__).resolve().parent
 
-# A bare hostname entry in server.allowed_hosts matches itself AND every
-# subdomain (scope_discovery.is_host_allowed) -- so per-test unique
-# subdomains keep each test's findings out of the others' prior_findings_
-# summary/store reads within the class-scoped temp DB, the same rationale
-# test_smoke_detection.py documents for its own host parametrization.
+# Per-test unique subdomains keep each test's findings out of the others'
+# prior_findings_summary/store reads within the class-scoped temp DB (the same
+# rationale test_smoke_detection.py documents for its own host parametrization).
+# NOTE: scope is exact-host-only now (docs/SCOPE_POLICY.md, W-17) -- a bare root
+# entry does NOT match these subdomains, so each analyze()-calling test scopes
+# its config to the exact hosts it targets via _config_scoped(), not this root.
 _ROOT_HOST = "ablation-harness-test.local"
 
 
@@ -176,6 +177,20 @@ def _build(key: str, base_config: dict):
     orch = ah.build_variant_orchestrator(_variant(key), base_config)
     ah.install_stub_model(orch, _StubOllama())
     return orch
+
+
+def _config_scoped(*hosts: str) -> dict:
+    """_base_config() scoped to the EXACT fixture hosts a test analyzes.
+
+    The scope policy is exact-host-only (docs/SCOPE_POLICY.md, W-17): a bare
+    root entry no longer matches its subdomains, so each per-variant unique host
+    the test targets must be listed explicitly or orchestrator_detect refuses it
+    as out of scope. Declaring them per-test keeps this from going stale as
+    hosts are added -- there is no central host list to maintain.
+    """
+    cfg = _base_config()
+    cfg["server"]["allowed_hosts"] = list(hosts)
+    return cfg
 
 
 class _TempStoreCase(unittest.IsolatedAsyncioTestCase):
@@ -372,14 +387,14 @@ class VariantConfigOverrideTests(unittest.TestCase):
 class VariantDispatchTests(_TempStoreCase):
 
     async def test_variant_b_dispatches_exactly_one_agent(self):
-        orch = _build("B", _base_config())
+        orch = _build("B", _config_scoped(f"var-b.{_ROOT_HOST}"))
         exchange = ah._exchange_from_dict(_sqli_exchange(f"var-b.{_ROOT_HOST}"))
         resp = await orch.analyze(exchange, **ah.variant_analyze_kwargs("B"))
         self.assertEqual(resp.dispatched_agents, [ah.DEFAULT_SINGLE_AGENT])
         self.assertEqual(len(resp.dispatched_agents), 1)
 
     async def test_variant_b_forces_whichever_single_agent_is_named(self):
-        orch = _build("B", _base_config())
+        orch = _build("B", _config_scoped(f"var-b2.{_ROOT_HOST}"))
         exchange = ah._exchange_from_dict(_sqli_exchange(f"var-b2.{_ROOT_HOST}"))
         resp = await orch.analyze(
             exchange, **ah.variant_analyze_kwargs("B", single_agent="xss"))
@@ -387,14 +402,14 @@ class VariantDispatchTests(_TempStoreCase):
         self.assertEqual(len(resp.dispatched_agents), 1)
 
     async def test_variant_c_dispatches_zero_agents_on_a_strong_signal_exchange(self):
-        orch = _build("C", _base_config())
+        orch = _build("C", _config_scoped(f"var-c.{_ROOT_HOST}"))
         exchange = ah._exchange_from_dict(_sqli_exchange(f"var-c.{_ROOT_HOST}"))
         resp = await orch.analyze(exchange, **ah.variant_analyze_kwargs("C"))
         self.assertEqual(resp.dispatched_agents, [])
         self.assertEqual(len(resp.dispatched_agents), 0)
 
     async def test_variant_c_dispatches_zero_agents_on_a_signal_free_exchange(self):
-        orch = _build("C", _base_config())
+        orch = _build("C", _config_scoped(f"var-c-b.{_ROOT_HOST}"))
         exchange = ah._exchange_from_dict(_benign_exchange(f"var-c-b.{_ROOT_HOST}"))
         resp = await orch.analyze(exchange)
         self.assertEqual(resp.dispatched_agents, [])
@@ -405,7 +420,7 @@ class VariantDispatchTests(_TempStoreCase):
         `if force_agents:`, so it falls through to NORMAL routing instead of
         forcing an empty dispatch -- on variant A's unmodified config (agents
         still enabled), that normal routing dispatches >=1 agent, not 0."""
-        orch = _build("A", _base_config())
+        orch = _build("A", _config_scoped(f"force-empty.{_ROOT_HOST}"))
         exchange = ah._exchange_from_dict(_benign_exchange(f"force-empty.{_ROOT_HOST}"))
         resp = await orch.analyze(exchange, force_agents=[])
         self.assertGreaterEqual(len(resp.dispatched_agents), 1)
@@ -415,7 +430,7 @@ class VariantDispatchTests(_TempStoreCase):
         the unmodified baseline variant, dispatches >=1 agent -- so variant
         C's zero is the override actually taking effect, not an inert
         exchange that would have dispatched nothing under any variant."""
-        orch = _build("A", _base_config())
+        orch = _build("A", _config_scoped(f"var-a.{_ROOT_HOST}"))
         exchange = ah._exchange_from_dict(_sqli_exchange(f"var-a.{_ROOT_HOST}"))
         resp = await orch.analyze(exchange)
         self.assertGreaterEqual(len(resp.dispatched_agents), 1)
@@ -428,7 +443,7 @@ class VariantDispatchTests(_TempStoreCase):
 class VariantCritiqueTests(_TempStoreCase):
 
     async def test_variant_d_disables_critique_versus_variant_a_baseline(self):
-        base = _base_config()
+        base = _config_scoped(f"var-crit-a.{_ROOT_HOST}", f"var-crit-d.{_ROOT_HOST}")
 
         orch_a = _build("A", base)
         resp_a = await orch_a.analyze(
@@ -456,7 +471,7 @@ class VariantCritiqueTests(_TempStoreCase):
 class MetricsTableTests(_TempStoreCase):
 
     async def test_run_variant_async_emits_schema_fields_on_run_metrics(self):
-        orch = _build("A", _base_config())
+        orch = _build("A", _config_scoped(f"metrics-a.{_ROOT_HOST}", f"metrics-b.{_ROOT_HOST}"))
         exchanges = [
             _sqli_exchange(f"metrics-a.{_ROOT_HOST}"),
             _benign_exchange(f"metrics-b.{_ROOT_HOST}"),
@@ -473,7 +488,7 @@ class MetricsTableTests(_TempStoreCase):
         """P3: all six variants selectable through `run_ablation`, each
         producing a schema-complete row, rendered as one table -- the
         completed scaffold's own runner and table, not a parallel module."""
-        base = _base_config()
+        base = _config_scoped(*[f"table-{v.key.lower()}.{_ROOT_HOST}" for v in ah.VARIANTS])
         runner_inner = ah.orchestrator_variant_runner(model_stub_factory=_StubOllama)
 
         def variant_runner(variant: Variant, config: dict, corpus_arg):
