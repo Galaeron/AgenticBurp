@@ -354,14 +354,22 @@ class RealTransportWorkflowTests(unittest.TestCase):
              "prerequisites":["create"],"cleanup":True}
           ]}
         try:
-            if variant:
-                wf = __import__("harness.workflow_engine",
-                                fromlist=["workflow_from_dict"]).workflow_from_dict(declaration)
-                result = asyncio.run(execute_misuse_variant(
-                    wf, variant, ctx, initial_values={"id":"1"}))
-            else:
-                result = asyncio.run(engagement_builder.execute_declared_workflows([declaration], ctx))[0]
-            asyncio.run(ctx.aclose())
+            async def _drive():
+                # Open, use, and close ctx's httpx clients on ONE event loop.
+                # Closing them on a second asyncio.run() loop raises "Event loop
+                # is closed" on the Windows proactor loop, because the connections
+                # were opened on the (now-closed) first loop (see c4435fce).
+                try:
+                    if variant:
+                        wf = __import__("harness.workflow_engine",
+                                        fromlist=["workflow_from_dict"]).workflow_from_dict(declaration)
+                        return await execute_misuse_variant(
+                            wf, variant, ctx, initial_values={"id": "1"})
+                    return (await engagement_builder.execute_declared_workflows(
+                        [declaration], ctx))[0]
+                finally:
+                    await ctx.aclose()
+            result = asyncio.run(_drive())
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=2)
         return result, state
