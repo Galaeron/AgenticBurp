@@ -92,6 +92,25 @@ class ValidatorTests(unittest.TestCase):
         self.assertIn("cross_identity", s["registered"])
         self.assertEqual(s["registered"], sorted(s["registered"]))
 
+    def test_arming_active_without_mutating_replay_warns(self):
+        # Second-switch visibility: arming active mode while allow_mutating_replay
+        # is OFF silently disables every mutating-proof validator. The operator
+        # must be warned up front, not left to infer it from per-send logs.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": False}})
+        with self.assertLogs("harness.validators.registry", level="WARNING") as cm:
+            reg.set_active_enabled(True)
+        joined = "\n".join(cm.output)
+        self.assertIn("allow_mutating_replay", joined)
+        self.assertIn("BLOCKED", joined)
+
+    def test_arming_active_with_mutating_replay_does_not_warn(self):
+        # Negative control: with replay armed too, there is nothing to warn about.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": True}})
+        with self.assertNoLogs("harness.validators.registry", level="WARNING"):
+            reg.set_active_enabled(True)
+
     def test_sqlmap_confirmation_promotes_only_on_explicit_tool_result(self):
         validator = SqlmapValidator()
         with patch("subprocess.run", return_value=FakeProc()):

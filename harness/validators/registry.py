@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from .base import Validator
 from .sqlmap import SqlmapValidator
 from .cors_validator import CorsValidator
@@ -38,6 +39,8 @@ from .dom_xss_validator import DomXssValidator
 from .toctou_validator import ToctouValidator
 from .verbose_error_validator import VerboseErrorValidator
 from harness.safety_gate import get_default_gate, reset_default_gate
+
+log = logging.getLogger(__name__)
 
 
 class ValidatorRegistry:
@@ -364,6 +367,25 @@ class ValidatorRegistry:
         In-memory only; never written back to config. Does NOT persist across a
         server restart -- deliberately, like the identities it authorizes."""
         self.active_enabled = bool(enabled)
+        # Second-switch visibility: active_enabled ALONE does not exercise the
+        # validators whose proof requires a mutating request -- those are gated by
+        # the SEPARATE validators.allow_mutating_replay flag (frozen from startup
+        # config) and skip silently without it. Arming active mode while that flag
+        # is off is the "turned it on and nothing happened" trap: the run looks
+        # complete while e.g. stored XSS, CSRF, file upload, the auth/sequence
+        # flows and the command-injection/SSTI/XXE/deserialization OOB sends were
+        # all blocked at the gate. Warn up front, when the gate is armed, rather
+        # than leaving the operator to infer it from per-send BLOCKED logs.
+        if enabled and not get_default_gate().config.allow_mutating_replay:
+            log.warning(
+                "active mode armed (validators.active_enabled=on) but "
+                "validators.allow_mutating_replay is OFF -- every validator whose "
+                "proof needs a mutating replay (e.g. stored_xss, csrf, file_upload, "
+                "auth_sequence, sequence, verb_tamper, command_injection, ssti, xxe, "
+                "deserialization_oob) will be BLOCKED by the safety gate and skip. "
+                "The run can report 'nothing found' for those classes without having "
+                "tested them. Set validators.allow_mutating_replay to exercise them; "
+                "each blocked send is also logged individually by the gate.")
 
     def set_cross_identity_enabled(self, enabled: bool) -> None:
         """Arm/disarm the cross-identity validator at run time. Arming lazily
