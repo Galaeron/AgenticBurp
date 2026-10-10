@@ -9,6 +9,7 @@ from harness.ollama_client import (
     OllamaInvalidJSONError,
     _repair_json_escapes,
     _loads_lenient,
+    _chat_options,
 )
 
 
@@ -30,6 +31,79 @@ def _make_client(testcase: unittest.TestCase, handler) -> OllamaClient:
     # during discovery can run under the wrong module boundary.
     testcase.addCleanup(setattr, mod.httpx, "AsyncClient", _REAL_ASYNC_CLIENT)
     return client
+
+
+def _seed_capture_client(testcase, captured, *, seed=None) -> OllamaClient:
+    """Like _make_client, but constructs the client with a run-level `seed` and
+    records every outgoing request payload into `captured` so a test can assert
+    exactly what reached Ollama's options."""
+    client = OllamaClient(base_url="http://fake-ollama:11434", seed=seed)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "message": {"content": json.dumps({"ok": True})}, "done": True})
+
+    class PatchedAsyncClient(_REAL_ASYNC_CLIENT):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    import harness.ollama_client as mod
+    mod.httpx.AsyncClient = PatchedAsyncClient
+    testcase.addCleanup(setattr, mod.httpx, "AsyncClient", _REAL_ASYNC_CLIENT)
+    return client
+
+
+class ChatOptionsSeedTests(unittest.TestCase):
+    """Phase 1.2: the options builder keeps a seed of 0 (reproducibility control)
+    and omits the key entirely when no seed is configured."""
+
+    def test_seed_zero_is_kept_not_dropped(self):
+        self.assertEqual(_chat_options(0.0, None, 0), {"temperature": 0.0, "seed": 0})
+
+    def test_positive_seed_included(self):
+        self.assertEqual(_chat_options(0.2, None, 7), {"temperature": 0.2, "seed": 7})
+
+    def test_none_seed_omits_key(self):
+        opts = _chat_options(0.2, None, None)
+        self.assertNotIn("seed", opts)
+        self.assertEqual(opts, {"temperature": 0.2})
+
+    def test_seed_and_num_ctx_are_independent(self):
+        self.assertEqual(_chat_options(0.0, 4096, 0),
+                         {"temperature": 0.0, "num_ctx": 4096, "seed": 0})
+
+
+class SeedOnTheWireTests(unittest.IsolatedAsyncioTestCase):
+    """Caller-level proof: the configured seed actually reaches the outgoing
+    /api/chat request body -- including seed=0."""
+
+    async def test_client_seed_zero_reaches_outgoing_options(self):
+        captured = []
+        client = _seed_capture_client(self, captured, seed=0)
+        await client.chat_json(model="m", system_prompt="s", user_prompt="u", temperature=0.0)
+        self.assertEqual(captured[0]["options"]["seed"], 0,
+                         "a configured seed of 0 must reach options.seed on the wire")
+
+    async def test_no_seed_means_no_seed_key_on_the_wire(self):
+        captured = []
+        client = _seed_capture_client(self, captured)  # seed=None
+        await client.chat_json(model="m", system_prompt="s", user_prompt="u")
+        self.assertNotIn("seed", captured[0]["options"])
+
+    async def test_per_call_seed_overrides_client_default_including_zero(self):
+        captured = []
+        client = _seed_capture_client(self, captured, seed=7)
+        await client.chat_json(model="m", system_prompt="s", user_prompt="u", seed=0)
+        self.assertEqual(captured[0]["options"]["seed"], 0,
+                         "a per-call seed=0 must override the client default, not be dropped")
+
+    async def test_metered_path_also_carries_the_client_seed(self):
+        captured = []
+        client = _seed_capture_client(self, captured, seed=123)
+        await client.chat_json_metered(model="m", system_prompt="s", user_prompt="u")
+        self.assertEqual(captured[0]["options"]["seed"], 123)
 
 
 class ChatJsonMeteredTests(unittest.IsolatedAsyncioTestCase):

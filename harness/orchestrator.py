@@ -120,6 +120,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             base_url=config["ollama"]["base_url"],
             timeout_seconds=config["ollama"].get("timeout_seconds", 120),
             num_ctx=config["ollama"].get("num_ctx"),  # opt-in; None => unchanged
+            seed=config["ollama"].get("seed"),  # run-level reproducibility seed; None => omit
         )
         
         # Configuration
