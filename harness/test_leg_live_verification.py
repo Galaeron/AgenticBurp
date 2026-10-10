@@ -53,6 +53,33 @@ def _finding(vc):
                    summary=f"{vc} hypothesis", evidence="", suggested_test="", basis="derived")
 
 
+class _RequestCounter:
+    """WSGI middleware that counts every request the fixture actually serves.
+
+    Rule 4 (a test must prove it exercised something): a leg that claims a
+    verdict without a request having reached the fixture would be vacuous
+    evidence -- exactly the silent-hollowing failure mode a scope/auth change
+    could reintroduce. Each positive/negative-control leg asserts this counter
+    advanced during validate(); the one passive-discovery leg (meant to send
+    nothing) asserts it did not.
+
+    This also supplies the exact-PORT evidence the gate scope cannot express:
+    the fixture binds exactly one ephemeral port, so a counted request is proof
+    the leg reached THIS fixture on THAT exact port. The production gate scope is
+    deliberately exact-host-only and port-agnostic -- scope_lock.parse_scope_entry
+    rejects any port-bearing entry (W-17), so '127.0.0.1:<port>' cannot be
+    configured there without exercising a non-production parse path.
+    """
+
+    def __init__(self, app):
+        self._app = app
+        self.count = 0
+
+    def __call__(self, environ, start_response):
+        self.count += 1  # incremented in the werkzeug serving thread; read after
+        return self._app(environ, start_response)  # the validate() call settles
+
+
 class LiveLegVerificationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -60,7 +87,8 @@ class LiveLegVerificationTest(unittest.TestCase):
         logging.getLogger("werkzeug").setLevel(logging.ERROR)  # quiet per-request logs
         global_throttle.configure(0)
         app = _load_make_app()()
-        cls._server = make_server("127.0.0.1", 0, app, threaded=True)
+        cls._counter = _RequestCounter(app)  # Rule 4: prove each leg reached the fixture
+        cls._server = make_server("127.0.0.1", 0, cls._counter, threaded=True)
         cls._port = cls._server.server_address[1]
         cls._thread = threading.Thread(target=cls._server.serve_forever, daemon=True)
         cls._thread.start()
@@ -90,14 +118,38 @@ class LiveLegVerificationTest(unittest.TestCase):
         cls._thread.join(timeout=5.0)
         safety_gate.reset_default_gate()
 
-    def _run(self, validator, path):
+    @classmethod
+    def _sent_count(cls):
+        return cls._counter.count
+
+    def _check_sent(self, before, expect_sent, res):
+        """Rule 4: a leg's verdict is only real evidence if it sent traffic the
+        fixture actually served. Assert the exact direction every time."""
+        sent = self._sent_count() - before
+        if expect_sent:
+            self.assertGreater(
+                sent, 0,
+                f"leg reported {getattr(res, 'status', '?')!r} without any request "
+                f"reaching the fixture -- the live evidence would be vacuous")
+        else:
+            self.assertEqual(
+                sent, 0,
+                f"a send-nothing leg unexpectedly issued {sent} request(s) to the fixture")
+
+    def _run(self, validator, path, *, expect_sent=True):
         ex = HttpExchange(url=f"{self._base}{path}", method="GET",
                           request_headers={}, request_body="")
         fc = next(iter(validator.finding_classes))
-        return asyncio.run(validator.validate(_finding(fc), ex))
+        before = self._sent_count()
+        res = asyncio.run(validator.validate(_finding(fc), ex))
+        self._check_sent(before, expect_sent, res)
+        return res
 
-    def _run_ex(self, validator, exchange, fc):
-        return asyncio.run(validator.validate(_finding(fc), exchange))
+    def _run_ex(self, validator, exchange, fc, *, expect_sent=True):
+        before = self._sent_count()
+        res = asyncio.run(validator.validate(_finding(fc), exchange))
+        self._check_sent(before, expect_sent, res)
+        return res
 
     def _reset_profiles(self):
         urllib.request.urlopen(urllib.request.Request(
@@ -529,7 +581,10 @@ class LiveLegVerificationTest(unittest.TestCase):
         # discovery (no pre-labelled XXE hypothesis) would hand the leg.
         self.assertFalse(v.applies(_finding("business_logic"), passive_exchange),
                          "xxe leg incorrectly treated a passively-synthesized JSON body as XML-shaped")
-        res = self._run_ex(v, passive_exchange, "xxe")
+        # The ONLY send-nothing leg: applies() is False, so validate() must skip
+        # WITHOUT touching the fixture. Assert exactly zero requests (not merely
+        # "not confirmed") -- this is the negative half of the Rule 4 guard.
+        res = self._run_ex(v, passive_exchange, "xxe", expect_sent=False)
         self.assertNotEqual(res.status, "confirmed",
                             "a passive-only synthesized capture must NOT confirm the js-built XXE "
                             "endpoint -- that is exactly the gap driver-capture closes")
