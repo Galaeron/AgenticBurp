@@ -65,7 +65,10 @@ class ActivityEndpointTests(unittest.TestCase):
         activity_feed.feed.clear()
         self.af = activity_feed
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app, base_url="http://localhost")
+        # /activity is a sensitive-read endpoint requiring the effective bearer
+        # token even over loopback; attach it like the other server tests.
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
 
     def test_endpoint_snapshot_and_since(self):
         self.af.publish("dispatch", "hello", detail={"agents": ["sqli"]})

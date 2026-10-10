@@ -203,6 +203,7 @@ async def investigate_worklist(
     *,
     confirm_fn=None,
     precondition_fn=None,
+    stop_on_confirm: bool = False,
     max_nodes: int = 8,
     max_precondition_legs: int = 24,
     step_budget: int = 16,
@@ -321,10 +322,14 @@ async def investigate_worklist(
                     f.setdefault("url", exchange.url)
                 node_findings.extend(precond_findings)
 
-        # 2. The iterative agent probe (unchanged) -- only when a specialty
-        #    derived and the agent budget remains.
+        precondition_confirmed = any(f.get("confirmed") for f in precond_findings)
+
+        # 2. The iterative agent probe -- only when a specialty derived and the
+        #    agent budget remains. Objective-style runs can stop after a
+        #    deterministic confirmation instead of spending their remaining
+        #    wall-clock budget on a model pass that cannot improve that verdict.
         agent_stop = None
-        if do_agent:
+        if do_agent and not (stop_on_confirm and precondition_confirmed):
             specialty, hypothesis = derived
             investigated += 1
             try:
@@ -368,6 +373,8 @@ async def investigate_worklist(
             "confirmed": any(f.get("confirmed") for f in node_findings),
             "stop_reason": agent_stop,
         })
+        if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
+            break
 
     log.info("investigate_worklist: %s -- investigated %d nodes, %d proactive legs attempted, "
              "%d node(s) skipped (of %d eligible)",

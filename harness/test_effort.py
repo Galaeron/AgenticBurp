@@ -1,3 +1,4 @@
+import threading
 import unittest
 from harness.effort import (
     BudgetMode, CallKind, EffortLedger, EffortBudget,
@@ -66,6 +67,213 @@ class EffortBudgetTests(unittest.TestCase):
         budget.record(CallKind.ROUTING, "m", 500, 400)
         self.assertTrue(budget.exhausted())
         self.assertEqual(budget.remaining, 0)
+
+
+class _FakeClock:
+    """Deterministic, test-controlled stand-in for time.monotonic --
+    starts at 0 and only advances when the test tells it to. No real
+    sleeps anywhere in these tests."""
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class EffortBudgetDurationTests(unittest.TestCase):
+    def test_hard_mode_blocks_past_deadline_and_ignores_confirmation(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=10, clock=clock)
+        budget.record(CallKind.AGENT_DISPATCH, "m", 10, 10)  # deadline set at t=0 -> 10
+        clock.advance(11)
+        allowed, reason = budget.allow()
+        self.assertFalse(allowed)
+        self.assertIn("duration limit", reason)
+        budget.confirm_overspend()  # must NOT unblock hard mode
+        allowed2, _ = budget.allow()
+        self.assertFalse(allowed2, "hard mode duration limit must not be talked past by confirm_overspend")
+
+    def test_soft_mode_blocks_past_deadline_until_confirmed_then_allows(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.SOFT, max_duration_s=10, clock=clock)
+        budget.record(CallKind.AGENT_DISPATCH, "m", 10, 10)
+        clock.advance(11)
+        allowed, reason = budget.allow()
+        self.assertFalse(allowed)
+        self.assertIn("soft mode", reason)
+        self.assertIn("duration limit", reason)
+        budget.confirm_overspend()
+        allowed2, reason2 = budget.allow()
+        self.assertTrue(allowed2)
+        self.assertIn("operator confirmation", reason2)
+
+    def test_no_duration_limit_is_behaviorally_identical_to_today(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=None, clock=clock)
+        budget.record(CallKind.AGENT_DISPATCH, "m", 10, 10)
+        clock.advance(10_000_000)  # arbitrarily far past any plausible deadline
+        allowed, reason = budget.allow()
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "")
+
+    def test_allow_true_before_deadline_reached(self):
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=10, clock=clock)
+        budget.record(CallKind.AGENT_DISPATCH, "m", 10, 10)  # deadline at t=10
+        clock.advance(5)  # still before the deadline
+        allowed, reason = budget.allow()
+        self.assertEqual((allowed, reason), (True, ""))
+
+    def test_deadline_set_at_construction_not_first_spend(self):
+        """
+        SC-8 contract inversion, not a weakening: the test this replaces
+        (test_deadline_set_on_first_spend_not_construction) asserted the
+        PRE-SC-8 contract -- that the deadline armed only on the first
+        record(), so an idle budget with max_duration_s set could never
+        expire from time alone before any work was dispatched. SC-8
+        deliberately inverts that: __post_init__ now sets the deadline at
+        construction, so a budget is live (and can expire) from the
+        moment it exists. This is harder-not-looser (a stalled/idle
+        dispatcher can no longer sit past its wall-clock budget
+        unnoticed), so the old assertion (allowed, reason) == (True, "")
+        with no record() call is now REQUIRED to fail once time passes
+        the deadline -- which is what this test checks.
+        """
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=10, clock=clock)
+        clock.advance(11)  # past the deadline set at construction (t=0 -> 10)
+        # record() never called -- construction alone must be enough to arm it.
+        allowed, reason = budget.allow()
+        self.assertFalse(allowed)
+        self.assertIn("duration limit", reason)
+
+    def test_reserve_blocks_past_construction_deadline(self):
+        """reserve() must observe the same construction-time deadline as
+        allow() -- an idle, never-recorded budget still blocks a
+        reservation once real time passes it."""
+        clock = _FakeClock()
+        budget = EffortBudget(mode=BudgetMode.HARD, max_duration_s=10, clock=clock)
+        clock.advance(11)
+        ok, reason = budget.reserve(1)
+        self.assertFalse(ok)
+        self.assertIn("duration limit", reason)
+
+
+class EffortBudgetReservationTests(unittest.TestCase):
+    """SC-8: atomic reservation primitive (reserve/commit/release) on top
+    of EffortBudget. allow()/record() are untouched by this class's
+    subject matter and are exercised elsewhere; these tests only cover
+    the additive reserve/commit/release surface."""
+
+    def test_concurrent_reservations_are_serialized_and_exact(self):
+        """
+        Deterministic via a barrier, not timing: all 10 threads call
+        reserve(1) at effectively the same instant against a
+        total_tokens=3 HARD budget. Without a lock serializing
+        check-then-increment, multiple threads could all observe
+        spent(0) + _reserved(0) < 3 and all succeed, jointly overshooting
+        the budget -- the exact race SC-8 closes. With the lock,
+        reservation k is admitted only while spent(0) + _reserved(k-1) < 3
+        (k = 1, 2, 3), so exactly 3 of the 10 succeed, deterministically,
+        every run.
+        """
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=3)
+        barrier = threading.Barrier(10)
+        results: list[bool] = []
+        results_lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait()
+            ok, _ = budget.reserve(1)
+            with results_lock:
+                results.append(ok)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sum(1 for ok in results if ok), 3)
+        self.assertEqual(budget._reserved, 3)
+
+    def test_reserve_commit_matches_bare_record_of_actuals(self):
+        """A reserve() -> commit() pair must leave the ledger identical to
+        a bare record() of the actuals, and must return _reserved to 0."""
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        ok, _ = budget.reserve(600)
+        self.assertTrue(ok)
+        budget.commit(CallKind.AGENT_DISPATCH, "m", 100, 100, reserved=600)
+        self.assertEqual(budget.spent, 200)
+        self.assertEqual(budget._reserved, 0)
+        self.assertEqual(budget.remaining, 1000 - 200)
+
+        twin = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        twin.record(CallKind.AGENT_DISPATCH, "m", 100, 100)
+        self.assertEqual(budget.allow(), twin.allow())
+        self.assertEqual(budget.spent, twin.spent)
+
+    def test_reserve_rejects_estimate_larger_than_total_capacity(self):
+        """R4: admission must include the REQUESTED amount, not just
+        committed+in-flight spend -- a HARD budget of 1000 must reject a
+        single reserve(1600) outright instead of admitting it and ending up
+        120% over cap. (Previously accepted -- this is the exact
+        counterexample the R4 review named.)"""
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        ok, reason = budget.reserve(1600)
+        self.assertFalse(ok)
+        self.assertEqual(budget._reserved, 0)
+        self.assertTrue(reason)
+
+    def test_reserve_rejects_second_reservation_that_would_overshoot(self):
+        """R4: two reserve(600) calls against a 1000 HARD budget must not
+        both succeed -- 600 + 600 = 1200 > 1000. The first is legitimate;
+        the second must be refused rather than pushing total admitted
+        reservations past the hard cap."""
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        ok1, _ = budget.reserve(600)
+        self.assertTrue(ok1)
+        ok2, reason2 = budget.reserve(600)
+        self.assertFalse(ok2)
+        self.assertEqual(budget._reserved, 600)
+        self.assertTrue(reason2)
+
+    def test_reserve_admission_uses_actual_requested_amount_unequal_sizes(self):
+        """R4 (acceptance: the unequal-size case): admission is judged on each
+        call's ACTUAL requested amount, not a fixed step. Against a 1000 HARD
+        budget, reserve(700) is admitted; a differently-sized reserve(400) is
+        refused because 700+400=1100 > 1000, leaving _reserved at 700. A
+        reserve(300) that lands EXACTLY on the ceiling (700+300=1000) is still
+        admitted -- the check rejects only strictly-over, so the inclusive cap
+        is reachable -- after which the budget is full and reserve(1) is
+        refused."""
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        ok1, _ = budget.reserve(700)
+        self.assertTrue(ok1)
+        ok2, reason2 = budget.reserve(400)          # 700+400 = 1100 > 1000 -> refused
+        self.assertFalse(ok2)
+        self.assertEqual(budget._reserved, 700)
+        self.assertTrue(reason2)
+        ok3, _ = budget.reserve(300)                # 700+300 = 1000, exactly at cap -> admitted
+        self.assertTrue(ok3)
+        self.assertEqual(budget._reserved, 1000)
+        ok4, reason4 = budget.reserve(1)            # now full -> refused
+        self.assertFalse(ok4)
+        self.assertEqual(budget._reserved, 1000)
+        self.assertTrue(reason4)
+
+    def test_reserve_then_release_leaves_no_trace(self):
+        """release() is a full refund for a failed/aborted call -- no
+        ledger write, and _reserved returns to 0."""
+        budget = EffortBudget(mode=BudgetMode.HARD, total_tokens=1000)
+        ok, _ = budget.reserve(500)
+        self.assertTrue(ok)
+        budget.release(500)
+        self.assertEqual(budget.spent, 0)
+        self.assertEqual(budget._reserved, 0)
 
 
 class EstimateForUrlsTests(unittest.TestCase):

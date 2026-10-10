@@ -1,6 +1,9 @@
 from __future__ import annotations
+import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 
 class BudgetMode(str, Enum):
@@ -47,12 +50,76 @@ _DEFAULT_TOKEN_ESTIMATE: dict[CallKind, int] = {
 class CallRecord:
     kind: CallKind
     model: str
-    prompt_tokens: int
-    completion_tokens: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    # SC-13: unified trace metadata for every model path. All default to neutral
+    # values, so the 4-positional CallRecord(kind, model, pt, ct) construction and
+    # every existing 4-arg record()/commit() call are unchanged; a plain
+    # token-only record still round-trips exactly as before.
+    provider: str = ""
+    prompt_version: str = ""
+    latency_ms: float = 0.0
+    retries: int = 0
+    outcome: str = "ok"  # "ok" | "error"
+    streamed: bool = False
+    case_ref: str = ""
+    run_id: str = ""
+    attempted: bool = True
+    completed: bool = True
+    usable: bool = True
+    queue_ms: float | None = None
+    connection_ms: float | None = None
+    generation_ms: float | None = None
+    wall_ms: float | None = None
 
     @property
-    def total_tokens(self) -> int:
+    def total_tokens(self) -> int | None:
+        if self.prompt_tokens is None or self.completion_tokens is None:
+            return None
         return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def known_tokens(self) -> int:
+        """Known consumption lower bound; missing counts remain unknown."""
+        return (self.prompt_tokens or 0) + (self.completion_tokens or 0)
+
+    def to_dict(self) -> dict:
+        """One flat trace row for the run-ledger / audit surfaces (SC-13)."""
+        return {
+            "kind": self.kind.value if isinstance(self.kind, CallKind) else str(self.kind),
+            "model": self.model, "provider": self.provider,
+            "prompt_version": self.prompt_version,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "latency_ms": self.latency_ms, "retries": self.retries,
+            "outcome": self.outcome, "streamed": self.streamed,
+            "case_ref": self.case_ref, "run_id": self.run_id,
+            "attempted": self.attempted, "completed": self.completed, "usable": self.usable,
+            "usage_known": self.total_tokens is not None,
+            "known_tokens": self.known_tokens,
+            "queue_ms": self.queue_ms, "connection_ms": self.connection_ms,
+            "generation_ms": self.generation_ms, "wall_ms": self.wall_ms,
+            "missing_timings": [key for key in ("queue_ms", "connection_ms", "generation_ms", "wall_ms")
+                                if getattr(self, key) is None],
+        }
+
+
+# SC-13: the additive trace fields record()/commit() may forward to CallRecord.
+# A key outside this set is a caller bug, so it is rejected (fail closed) rather
+# than silently dropped.
+_TRACE_FIELDS = frozenset({
+    "provider", "prompt_version", "latency_ms", "retries", "outcome",
+    "streamed", "case_ref", "run_id",
+    "attempted", "completed", "usable", "queue_ms", "connection_ms", "generation_ms", "wall_ms",
+})
+
+
+def _trace_meta(meta: dict) -> dict:
+    extra = set(meta) - _TRACE_FIELDS
+    if extra:
+        raise TypeError(f"unknown trace field(s): {sorted(extra)}")
+    return meta
 
 
 @dataclass
@@ -69,28 +136,44 @@ class EffortLedger:
     """
     records: list[CallRecord] = field(default_factory=list)
 
-    def record(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int) -> None:
-        self.records.append(CallRecord(kind, model, prompt_tokens, completion_tokens))
+    def record(self, kind: CallKind, model: str, prompt_tokens: int,
+               completion_tokens: int, **meta) -> CallRecord:
+        """Append one call. Extra keyword args (SC-13 trace fields: provider,
+        prompt_version, latency_ms, retries, outcome, streamed, case_ref,
+        run_id) enrich the row; none is required, so a bare 4-arg call is
+        unchanged. Returns the appended record so a tracer can read it back
+        without racing the list under concurrency."""
+        rec = CallRecord(kind, model, prompt_tokens, completion_tokens, **_trace_meta(meta))
+        self.records.append(rec)
+        return rec
+
+    def trace(self) -> list[dict]:
+        """The full run trace as flat rows (SC-13), oldest first."""
+        return [r.to_dict() for r in self.records]
 
     @property
     def total_tokens(self) -> int:
-        return sum(r.total_tokens for r in self.records)
+        return sum(r.known_tokens for r in self.records)
+
+    @property
+    def usage_complete(self) -> bool:
+        return all(r.total_tokens is not None for r in self.records)
 
     def average_tokens(self, kind: CallKind) -> float:
         """Real observed average for `kind` if any calls of that kind have
         happened yet, else the labeled-as-unmeasured prior."""
-        matching = [r.total_tokens for r in self.records if r.kind == kind]
+        matching = [r.total_tokens for r in self.records if r.kind == kind and r.total_tokens is not None]
         if matching:
             return sum(matching) / len(matching)
         return float(_DEFAULT_TOKEN_ESTIMATE[kind])
 
     def has_real_data_for(self, kind: CallKind) -> bool:
-        return any(r.kind == kind for r in self.records)
+        return any(r.kind == kind and r.total_tokens is not None for r in self.records)
 
     def breakdown(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for r in self.records:
-            out[r.kind.value] = out.get(r.kind.value, 0) + r.total_tokens
+            out[r.kind.value] = out.get(r.kind.value, 0) + r.known_tokens
         return out
 
 
@@ -98,12 +181,41 @@ class EffortLedger:
 class EffortBudget:
     """
     Gates further spend. `total_tokens=None` means "track but never
-    block" (still useful for visibility even with no cap set).
+    block" (still useful for visibility even with no cap set), and
+    `max_duration_s=None` is the same no-op default for wall-clock: with
+    both left unset this class behaves exactly as it did before the
+    duration dimension was added.
     """
     mode: BudgetMode
     total_tokens: int | None = None
+    max_duration_s: int | None = None
     ledger: EffortLedger = field(default_factory=EffortLedger)
+    # Injectable monotonic-clock seam so tests can drive elapsed time
+    # deterministically (a fake incrementing counter) instead of relying
+    # on real sleeps. Defaults to the real clock in production.
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
     _overspend_confirmed: bool = field(default=False, repr=False)
+    # SC-8: the deadline is now set at construction (see __post_init__),
+    # not on first record() -- a budget with max_duration_s set is live
+    # from the moment it exists, not from the moment work starts. This is
+    # a deliberate tightening (harder, not looser): an idle budget can now
+    # expire from time alone, closing the gap where dispatch could stall
+    # indefinitely before the wall-clock limit ever engaged.
+    _deadline: float | None = field(default=None, repr=False)
+    # SC-8: in-flight reservations from reserve(), not yet committed or
+    # released. Only touched by reserve()/commit()/release(); a caller
+    # using only allow()/record() never moves this off 0.
+    _reserved: int = field(default=0, repr=False, compare=False)
+    # Completed calls with missing provider counts consume admission capacity
+    # conservatively. This is an estimate debit, NEVER measured token usage.
+    _unmeasured_admission: int = field(default=0, repr=False, compare=False)
+    # SC-8: serializes reserve()/commit()/release()/record() so concurrent
+    # dispatch cannot race the check-then-increment in reserve() past the
+    # budget. Not used by allow(), which stays a pure, lock-free check.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._deadline = self.clock() + self.max_duration_s if self.max_duration_s is not None else None
 
     @property
     def spent(self) -> int:
@@ -113,10 +225,17 @@ class EffortBudget:
     def remaining(self) -> int | None:
         if self.total_tokens is None:
             return None
-        return max(0, self.total_tokens - self.spent)
+        return max(0, self.total_tokens - self.spent - self._unmeasured_admission)
 
     def exhausted(self) -> bool:
-        return self.total_tokens is not None and self.spent >= self.total_tokens
+        """Token-only, deliberately -- duration is folded into `allow()`
+        separately so this stays a pure token predicate."""
+        return self.total_tokens is not None and self.spent + self._unmeasured_admission >= self.total_tokens
+
+    def _deadline_passed(self) -> bool:
+        if self.max_duration_s is None or self._deadline is None:
+            return False
+        return self.clock() >= self._deadline
 
     def allow(self) -> tuple[bool, str]:
         """
@@ -126,28 +245,123 @@ class EffortBudget:
         allowed=True but over budget under operator confirmation, so a
         caller can log/display it either way rather than silently
         proceeding.
+
+        Folds in both token exhaustion (`exhausted()`) and the duration
+        deadline (`_deadline_passed()`), reusing the same SOFT/HARD
+        semantics for both: HARD stops dispatch outright and cannot be
+        talked past; SOFT blocks until `confirm_overspend()` is called,
+        after which it allows further spend regardless of which limit
+        (token or duration) triggered it.
         """
-        if not self.exhausted():
+        token_exhausted = self.exhausted()
+        duration_passed = self._deadline_passed()
+        if not token_exhausted and not duration_passed:
             return True, ""
+        if token_exhausted:
+            limit_desc = f"({self.spent} known tokens + {self._unmeasured_admission} unmeasured admission/{self.total_tokens})"
+        else:
+            limit_desc = f"(duration limit {self.max_duration_s}s reached)"
         if self.mode == BudgetMode.HARD:
             return False, (
-                f"effort budget exhausted ({self.spent}/{self.total_tokens} tokens) in hard mode -- "
+                f"effort budget exhausted {limit_desc} in hard mode -- "
                 f"dispatch stopped. Raise the budget or switch to soft mode to continue."
             )
         if self._overspend_confirmed:
-            return True, f"over budget ({self.spent}/{self.total_tokens} tokens) -- continuing on operator confirmation"
+            return True, f"over budget {limit_desc} -- continuing on operator confirmation"
         return False, (
-            f"effort budget exhausted ({self.spent}/{self.total_tokens} tokens) in soft mode -- "
+            f"effort budget exhausted {limit_desc} in soft mode -- "
             f"awaiting operator confirmation to continue past it (see confirm_overspend)"
         )
 
     def confirm_overspend(self) -> None:
         """Soft mode only, in practice -- hard mode's `allow()` never
-        checks this flag, by design: hard mode cannot be talked past."""
+        checks this flag, by design: hard mode cannot be talked past.
+        Applies to either limit (token or duration)."""
         self._overspend_confirmed = True
 
-    def record(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int) -> None:
-        self.ledger.record(kind, model, prompt_tokens, completion_tokens)
+    def record(self, kind: CallKind, model: str, prompt_tokens: int,
+               completion_tokens: int, **meta) -> CallRecord:
+        with self._lock:
+            return self.ledger.record(kind, model, prompt_tokens, completion_tokens, **meta)
+
+    def reserve(self, estimated_tokens: int) -> tuple[bool, str]:
+        """
+        SC-8: atomic pre-dispatch reservation for concurrent callers.
+        Mirrors allow()'s SOFT/HARD/deadline semantics, but checks
+        COMMITTED + IN-FLIGHT spend (self.spent + self._reserved) instead
+        of committed spend alone, so N concurrent dispatchers cannot all
+        pass a check that only looked at yesterday's ledger and jointly
+        overshoot the budget. Must be paired with commit() (normal
+        completion) or release() (aborted/failed call) so the reservation
+        doesn't leak.
+        """
+        with self._lock:
+            duration_passed = self._deadline_passed()
+            # R4: admission includes the REQUESTED amount, so a hard budget of
+            # 100 cannot admit reserve(60) twice (120).
+            requested = max(0, estimated_tokens)
+            token_full = self.total_tokens is not None and (
+                (self.spent + self._unmeasured_admission + self._reserved) >= self.total_tokens
+                or (self.spent + self._unmeasured_admission + self._reserved + requested) > self.total_tokens)
+            if not duration_passed and not token_full:
+                self._reserved += max(0, estimated_tokens)
+                return True, ""
+            if token_full:
+                limit_desc = f"({self.spent} known + {self._reserved} pending + {self._unmeasured_admission} unmeasured admission/{self.total_tokens})"
+            else:
+                limit_desc = f"(duration limit {self.max_duration_s}s reached)"
+            if self.mode == BudgetMode.HARD:
+                return False, (
+                    f"effort budget exhausted {limit_desc} in hard mode -- "
+                    f"dispatch stopped. Raise the budget or switch to soft mode to continue."
+                )
+            if self._overspend_confirmed:
+                self._reserved += max(0, estimated_tokens)
+                return True, f"over budget {limit_desc} -- continuing on operator confirmation"
+            return False, (
+                f"effort budget exhausted {limit_desc} in soft mode -- "
+                f"awaiting operator confirmation to continue past it (see confirm_overspend)"
+            )
+
+    def commit(self, kind: CallKind, model: str, prompt_tokens: int, completion_tokens: int,
+               reserved: int = 0, **meta) -> CallRecord:
+        """
+        SC-8: settle a reserve() with the real usage once a call
+        completes. Releases the estimate that reserve() held and records
+        the actual usage in one atomic step, so `spent` ends identical to
+        a bare record() of those actuals. Calls self.ledger.record
+        directly, NOT self.record -- self._lock is a plain (non-reentrant)
+        threading.Lock, so re-entering it via self.record here would
+        deadlock. SC-13 trace fields (provider, latency_ms, ...) pass
+        through as **meta; returns the appended record.
+        """
+        with self._lock:
+            self._reserved = max(0, self._reserved - max(0, reserved))
+            record = self.ledger.record(kind, model, prompt_tokens, completion_tokens, **meta)
+            if record.completed and record.total_tokens is None:
+                self._unmeasured_admission += max(0, reserved - record.known_tokens)
+            return record
+
+    def release(self, reserved: int) -> None:
+        """SC-8: full refund of a reservation for a call that failed or
+        was aborted before producing any usage to record -- no ledger
+        write, unlike commit()."""
+        with self._lock:
+            self._reserved = max(0, self._reserved - max(0, reserved))
+
+    def accounting(self) -> dict:
+        """Sanitized export; token totals are lower bounds when usage is unknown."""
+        with self._lock:
+            records = self.ledger.records
+            return {"known_tokens": self.spent, "usage_complete": self.ledger.usage_complete,
+                    "pending_admission_tokens": self._reserved,
+                    "unmeasured_admission_tokens": self._unmeasured_admission,
+                    "remaining_admission_tokens": self.remaining,
+                    "attempted_calls": sum(r.attempted for r in records),
+                    "completed_calls": sum(r.completed for r in records),
+                    "usable_calls": sum(r.usable for r in records),
+                    "error_calls": sum(r.outcome == "error" for r in records),
+                    "cancelled_calls": sum(r.outcome == "cancelled" for r in records)}
 
 
 @dataclass
@@ -213,7 +427,7 @@ def estimate_for_urls(
         "urls_unscored": len(urls) - n_scored,
         "urls_high_risk": n_high,
         "estimated_total_tokens": int(grand_total),
-        "calibrated_from_real_calls": bool(ledger.records),
+        "calibrated_from_real_calls": any(r.total_tokens is not None for r in ledger.records),
         "breakdown": {
             "routing": int(routing_total),
             "agent_dispatch": int(agent_total),

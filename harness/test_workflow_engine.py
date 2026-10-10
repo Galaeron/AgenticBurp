@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from harness.workflow_engine import (
     Assertion, Extractor, ExtractorKind, StepStatus, Workflow, WorkflowResult,
     WorkflowStep, bind_template, execute_misuse_variant, execute_workflow,
-    extract_all, json_pointer, misuse_variants, MisuseVariant,
+    extract_all, json_pointer, misuse_variants, MisuseVariant, workflow_from_dict,
 )
 
 
@@ -204,6 +204,96 @@ class ExecutionTests(unittest.TestCase):
         self.assertTrue(switched.complete)
 
 
+class UnknownAssertionKindFailsClosedTests(unittest.TestCase):
+    """SC-4: an unrecognized assertion kind must be rejected at load time and
+    must fail closed (never PASSED) if one somehow reaches execution."""
+
+    def test_unknown_kind_rejected_at_load_time_by_real_loader(self):
+        declaration = {"id": "malformed", "version": 1, "steps": [
+            {"id": "step1", "method": "GET", "url_template": "http://t.test/x",
+             "session_ref": "alice",
+             "assertions": [{"kind": "misspelled_status", "expected": 200}]},
+        ]}
+        with self.assertRaises(ValueError):
+            workflow_from_dict(declaration)
+
+    def test_unknown_kind_rejected_end_to_end_via_execute_declared_workflows(self):
+        from harness import engagement_builder
+        declaration = {"id": "malformed", "version": 1, "steps": [
+            {"id": "step1", "method": "GET", "url_template": "http://t.test/x",
+             "session_ref": "alice",
+             "assertions": [{"kind": "misspelled_status", "expected": 200}]},
+        ]}
+        ctx = _Context([_out(200)])
+        with self.assertRaises(ValueError):
+            asyncio.run(engagement_builder.execute_declared_workflows([declaration], ctx))
+
+    def test_status_assertion_missing_expected_rejected_at_load_time(self):
+        declaration = {"id": "missing-expected", "version": 1, "steps": [
+            {"id": "step1", "method": "GET", "url_template": "http://t.test/x",
+             "session_ref": "alice", "assertions": [{"kind": "status"}]},
+        ]}
+        with self.assertRaises(ValueError):
+            workflow_from_dict(declaration)
+
+    def test_json_pointer_assertion_missing_expression_rejected_at_load_time(self):
+        declaration = {"id": "missing-expression", "version": 1, "steps": [
+            {"id": "step1", "method": "GET", "url_template": "http://t.test/x",
+             "session_ref": "alice", "assertions": [{"kind": "json_pointer", "expected": "ok"}]},
+        ]}
+        with self.assertRaises(ValueError):
+            workflow_from_dict(declaration)
+
+    def test_unknown_kind_fails_closed_at_runtime_not_passed(self):
+        step = WorkflowStep("read", "GET", "http://t.test/x", "alice",
+                            assertions=(Assertion(kind="misspelled_status", expected=403),))
+        wf = Workflow("w", (step,))
+        ctx = _Context([_out(200)])
+        result = asyncio.run(execute_workflow(wf, ctx))
+        sr = result.steps[0]
+        self.assertEqual(sr.status, StepStatus.FAILED)
+        self.assertIn("unknown assertion kind", sr.reason)
+        self.assertNotEqual(sr.status, StepStatus.PASSED)
+
+    def test_status_assertion_non_integer_expected_rejected_at_load_time(self):
+        declaration = {"id": "bad-status-expected", "version": 1, "steps": [
+            {"id": "step1", "method": "GET", "url_template": "http://t.test/x",
+             "session_ref": "alice", "assertions": [{"kind": "status", "expected": "abc"}]},
+        ]}
+        with self.assertRaises(ValueError):
+            workflow_from_dict(declaration)
+
+    def test_status_assertion_integer_expected_loads_fine(self):
+        declaration = {"id": "good-status-expected", "version": 1, "steps": [
+            {"id": "step1", "method": "GET", "url_template": "http://t.test/x",
+             "session_ref": "alice", "assertions": [{"kind": "status", "expected": 200}]},
+        ]}
+        wf = workflow_from_dict(declaration)
+        loaded = wf.steps[0].assertions[0]
+        self.assertEqual(loaded.kind, "status")
+        self.assertEqual(loaded.expected, 200)
+
+    def test_status_assertion_malformed_operand_fails_closed_at_runtime_not_passed(self):
+        step = WorkflowStep("read", "GET", "http://t.test/x", "alice",
+                            assertions=(Assertion("status", expected="abc"),))
+        wf = Workflow("w", (step,))
+        ctx = _Context([_out(200)])
+        result = asyncio.run(execute_workflow(wf, ctx))
+        sr = result.steps[0]
+        self.assertEqual(sr.status, StepStatus.FAILED)
+        self.assertNotEqual(sr.status, StepStatus.PASSED)
+        self.assertIn("malformed status assertion operand", sr.reason)
+
+    def test_valid_assertions_still_execute_and_pass(self):
+        step = WorkflowStep("read", "GET", "http://t.test/x", "alice",
+                            assertions=(Assertion("status", expected=200),
+                                        Assertion("json_pointer", expression="/ok", expected="true")))
+        wf = Workflow("w2", (step,))
+        ctx = _Context([_out(200, '{"ok":"true"}')])
+        result = asyncio.run(execute_workflow(wf, ctx))
+        self.assertEqual(result.steps[0].status, StepStatus.PASSED)
+
+
 class RealTransportWorkflowTests(unittest.TestCase):
     """Readable create->approve->verify fixture; transport and executor are real."""
 
@@ -264,14 +354,22 @@ class RealTransportWorkflowTests(unittest.TestCase):
              "prerequisites":["create"],"cleanup":True}
           ]}
         try:
-            if variant:
-                wf = __import__("harness.workflow_engine",
-                                fromlist=["workflow_from_dict"]).workflow_from_dict(declaration)
-                result = asyncio.run(execute_misuse_variant(
-                    wf, variant, ctx, initial_values={"id":"1"}))
-            else:
-                result = asyncio.run(engagement_builder.execute_declared_workflows([declaration], ctx))[0]
-            asyncio.run(ctx.aclose())
+            async def _drive():
+                # Open, use, and close ctx's httpx clients on ONE event loop.
+                # Closing them on a second asyncio.run() loop raises "Event loop
+                # is closed" on the Windows proactor loop, because the connections
+                # were opened on the (now-closed) first loop (see c4435fce).
+                try:
+                    if variant:
+                        wf = __import__("harness.workflow_engine",
+                                        fromlist=["workflow_from_dict"]).workflow_from_dict(declaration)
+                        return await execute_misuse_variant(
+                            wf, variant, ctx, initial_values={"id": "1"})
+                    return (await engagement_builder.execute_declared_workflows(
+                        [declaration], ctx))[0]
+                finally:
+                    await ctx.aclose()
+            result = asyncio.run(_drive())
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=2)
         return result, state

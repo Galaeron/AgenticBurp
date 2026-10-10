@@ -29,25 +29,38 @@ CLI:  python detection_fixture.py build            # pre-warm the default set
       python detection_fixture.py build --samples 2 # run each pair twice, flag flaky ones
       python detection_fixture.py stats             # show what's cached
 """
-import asyncio, json, os, sys, argparse
+import asyncio, json, os, sys, argparse, tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 HARNESS_DIR = PROJECT_ROOT / "harness"
+HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Cross-platform scratch DB paths. Previously hardcoded to C:\tmp\... (Windows
+# only), which broke this benchmark on macOS/Linux. Default to the OS temp dir;
+# override with DETBENCH_STATE_DB / DETBENCH_CACHE_DB if you want them elsewhere.
+_TMP = Path(tempfile.gettempdir())
 from harness import store
-store._DB_PATH = r"C:\tmp\detbench_state.db"
+store._DB_PATH = os.environ.get("DETBENCH_STATE_DB", str(_TMP / "detbench_state.db"))
 from harness import cache
-cache.init_cache(db_path=r"C:\tmp\detbench_cache.db")
+cache.init_cache(db_path=os.environ.get("DETBENCH_CACHE_DB", str(_TMP / "detbench_cache.db")))
 
 import yaml
 from harness import fast_path
 from harness.orchestrator import Orchestrator
 from harness.models import HttpExchange
 
-EXCHANGES_PATH = r"C:\tmp\pixelmart_exchanges.json"
-FIXTURE_DIR = Path(__file__).resolve().parent / "fixture"
+# Labeled corpus of captured PixelMart exchanges. Regenerate on any machine with
+#   cd testing/test-target && python app.py        # in one shell
+#   python capture_exchanges.py                     # in another
+# which writes this same repo-relative path. Override with DETBENCH_EXCHANGES.
+# This is a TUNING corpus (the harness was developed against it, and its
+# ANSWER_KEY.md ships alongside) -- not a blind/held-out target; see
+# testing/README.md. Captures are git-ignored (they carry fixture session
+# tokens), so this file is produced locally, never committed.
+EXCHANGES_PATH = os.environ.get("DETBENCH_EXCHANGES", str(HERE / "corpus" / "pixelmart_exchanges.json"))
+FIXTURE_DIR = HERE / "fixture"
 FIXTURE_DIR.mkdir(exist_ok=True)
 CACHE_PATH = FIXTURE_DIR / "detection_fixture.json"
 MAX_BODY = 6000
@@ -62,6 +75,13 @@ cfg.setdefault("autonomous_discovery", {})["enabled"] = False
 orch = Orchestrator(cfg)
 AVAIL = set(orch.agent_manager.get_enabled_agents())
 
+if not os.path.exists(EXCHANGES_PATH):
+    raise SystemExit(
+        f"corpus not found: {EXCHANGES_PATH}\n"
+        "Generate it first (cross-platform, no hardcoded paths):\n"
+        "  cd testing/test-target && python app.py      # shell 1: run PixelMart\n"
+        "  python capture_exchanges.py                   # shell 2: capture -> corpus/\n"
+        "or point DETBENCH_EXCHANGES at an existing capture.")
 _raw = json.load(open(EXCHANGES_PATH))
 EXCHANGES_BY_LABEL = {e["label"].split(":")[0].strip(): e for e in _raw
                       if e["label"][:2] in ("TP", "TN")}

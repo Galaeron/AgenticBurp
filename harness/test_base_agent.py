@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock
 
@@ -79,6 +80,81 @@ class RedactHeadersTests(unittest.TestCase):
         self.assertEqual(out["Authorization"], security.REDACTED_PLACEHOLDER)
 
 
+class SecretValueRedactionTests(unittest.TestCase):
+    """PR-9 / R09: schema-aware secret-NAME redaction for URLs and bodies
+    (harness.security.redact_secrets_in_url / redact_secrets_in_body),
+    unit-tested directly against the security module before exercising
+    the full _user_prompt pipeline below."""
+
+    # --- URL query params ---
+
+    def test_url_query_secret_param_redacted(self):
+        out = security.redact_secrets_in_url("https://a.test/login?token=CANARY-TOK-1")
+        self.assertNotIn("CANARY-TOK-1", out)
+        self.assertIn("token=", out)  # param NAME still visible
+
+    def test_url_query_injection_payload_survives_verbatim(self):
+        url = "https://a.test/search?q=1' OR '1'='1&token=CANARY-TOK-2"
+        out = security.redact_secrets_in_url(url)
+        self.assertIn("q=1' OR '1'='1", out)  # byte-for-byte, not re-encoded
+        self.assertNotIn("CANARY-TOK-2", out)
+
+    def test_url_with_no_secret_param_returned_unchanged(self):
+        url = "https://a.test/search?q=hello+world&page=2"
+        self.assertEqual(security.redact_secrets_in_url(url), url)
+
+    def test_url_without_query_returned_unchanged(self):
+        url = "https://a.test/path/only"
+        self.assertEqual(security.redact_secrets_in_url(url), url)
+
+    # --- JSON bodies ---
+
+    def test_json_body_top_level_password_redacted(self):
+        body = '{"username": "bob", "password": "CANARY-PW-1"}'
+        out = security.redact_secrets_in_body(body)
+        self.assertNotIn("CANARY-PW-1", out)
+        self.assertIn('"password"', out)  # key name still visible
+        self.assertIn('"bob"', out)  # non-secret sibling field preserved
+
+    def test_json_body_nested_dict_secret_redacted(self):
+        body = '{"user": "bob", "creds": {"api_key": "CANARY-NESTED-1"}}'
+        out = security.redact_secrets_in_body(body)
+        self.assertNotIn("CANARY-NESTED-1", out)
+        self.assertIn('"api_key"', out)
+        self.assertIn('"bob"', out)
+
+    def test_json_body_no_secret_returned_byte_identical(self):
+        """When nothing needs redacting, the ORIGINAL string comes back
+        unchanged -- not a re-serialized json.dumps() -- so formatting a
+        test or detector depends on is never disturbed for the common
+        (no-secret) case."""
+        body = '{"user_id": 42, "email": "user@example.test", "role": "member"}'
+        self.assertEqual(security.redact_secrets_in_body(body), body)
+
+    def test_json_body_injection_payload_in_sibling_field_survives(self):
+        body = '{"search": "<script>alert(1)</script>", "password": "CANARY-PW-2"}'
+        out = security.redact_secrets_in_body(body)
+        self.assertIn("<script>alert(1)</script>", out)
+        self.assertNotIn("CANARY-PW-2", out)
+
+    # --- non-JSON bodies (conservative key=value / key: value fallback) ---
+
+    def test_form_encoded_body_secret_field_redacted(self):
+        body = "username=bob&password=CANARY-PW-3"
+        out = security.redact_secrets_in_body(body)
+        self.assertNotIn("CANARY-PW-3", out)
+        self.assertIn("username=bob", out)
+        self.assertIn("password=", out)
+
+    def test_plain_text_body_without_secret_shape_unchanged(self):
+        body = "just some plain text with a ' OR 1=1 -- payload in it"
+        self.assertEqual(security.redact_secrets_in_body(body), body)
+
+    def test_none_and_non_string_body_passthrough(self):
+        self.assertIsNone(security.redact_secrets_in_body(None))
+        self.assertEqual(security.redact_secrets_in_body(123), 123)
+
+
 class DummyAgent(BaseAgent):
     name = "dummy"
     @property
@@ -115,6 +191,81 @@ class UserPromptRedactionTests(unittest.TestCase):
         body = ("x" * 1000) + "Traceback (most recent call last): boom"
         self.assertIn("Traceback", _high_signal_slice(body, start=500))
         self.assertEqual(_high_signal_slice("nothing interesting here", start=0), "")
+
+
+class SecretInUrlAndBodyPromptTests(unittest.TestCase):
+    """PR-9 / R09: header redaction alone left a JSON password, a query
+    token and a nested password dict reaching _user_prompt raw. These
+    are full-pipeline (canary-absence / detection-preservation /
+    structure-preservation) tests over the wired-in
+    security.redact_secrets_in_url / redact_secrets_in_body calls."""
+
+    def test_canary_secrets_absent_from_prompt_header_url_body_nested(self):
+        agent = DummyAgent(ollama=None, model="m")
+        exchange = HttpExchange(
+            url="https://a.test/login?token=CANARY-URL-TOKEN-a1b2c3",
+            method="POST",
+            request_headers={"Authorization": "Bearer CANARY-HEADER-d4e5f6"},
+            response_headers={},
+            request_body=json.dumps({
+                "username": "alice",
+                "password": "CANARY-BODY-PASSWORD-g7h8i9",
+                "creds": {"api_key": "CANARY-NESTED-APIKEY-j0k1l2"},
+            }),
+        )
+        prompt = agent._user_prompt(exchange, max_body_chars=2000)
+        # (a) header, (b) URL query param, (c) JSON body field, (d) nested body dict
+        self.assertNotIn("CANARY-HEADER-d4e5f6", prompt)
+        self.assertNotIn("CANARY-URL-TOKEN-a1b2c3", prompt)
+        self.assertNotIn("CANARY-BODY-PASSWORD-g7h8i9", prompt)
+        self.assertNotIn("CANARY-NESTED-APIKEY-j0k1l2", prompt)
+        # redaction is not blanket deletion -- names stay visible
+        self.assertIn("Authorization", prompt)
+        self.assertIn("token=", prompt)
+        self.assertIn('"password"', prompt)
+        self.assertIn('"api_key"', prompt)
+
+    def test_detection_preservation_injection_payload_survives_alongside_redacted_secret(self):
+        """Mandatory negative control: an injection payload in a
+        NON-secret param must still reach the model verbatim (the
+        detector must not be blinded), while a sibling secret value in
+        the SAME request is redacted."""
+        agent = DummyAgent(ollama=None, model="m")
+        exchange = HttpExchange(
+            url="https://a.test/search?q=1' OR '1'='1&token=CANARY-DETECT-TOK-99",
+            method="GET",
+            request_headers={}, response_headers={},
+            request_body=json.dumps({
+                "search": "<script>alert(document.cookie)</script>",
+                "password": "CANARY-DETECT-PW-77",
+            }),
+        )
+        prompt = agent._user_prompt(exchange, max_body_chars=2000)
+        # injection payloads: present verbatim, byte-for-byte
+        self.assertIn("q=1' OR '1'='1", prompt)
+        self.assertIn("<script>alert(document.cookie)</script>", prompt)
+        # sibling secrets in the SAME request: redacted
+        self.assertNotIn("CANARY-DETECT-TOK-99", prompt)
+        self.assertNotIn("CANARY-DETECT-PW-77", prompt)
+
+    def test_structure_preservation_non_secret_fields_and_key_names_survive(self):
+        """Negative control: a task-relevant non-secret field (username,
+        product id) is preserved in the prompt, and the secret field's
+        NAME stays visible -- only its value is replaced."""
+        agent = DummyAgent(ollama=None, model="m")
+        exchange = HttpExchange(
+            url="https://a.test/api/products/4471?session=CANARY-STRUCT-SESSION-1",
+            method="GET",
+            request_headers={}, response_headers={},
+            request_body=json.dumps({"username": "alice_doe", "product_id": 4471, "password": "CANARY-STRUCT-PW"}),
+        )
+        prompt = agent._user_prompt(exchange, max_body_chars=2000)
+        self.assertIn("alice_doe", prompt)
+        self.assertIn("4471", prompt)
+        self.assertIn('"password"', prompt)
+        self.assertNotIn("CANARY-STRUCT-PW", prompt)
+        self.assertNotIn("CANARY-STRUCT-SESSION-1", prompt)
+        self.assertIn("session=", prompt)
 
 
 class PromptVersionTests(unittest.TestCase):

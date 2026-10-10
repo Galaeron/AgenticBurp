@@ -310,11 +310,19 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
                    new_callable=AsyncMock, return_value=[fake]) as execute, \
              patch("httpx.AsyncClient.get", new_callable=AsyncMock,
                    side_effect=_responder(False)):
-            result = asyncio.run(orch.investigate_engagement(
-                BASE_URL, ROLES, max_nodes=0, max_chain_rounds=0, run_context=ctx))
+            async def _drive():
+                # Open, use, and close the RunContext's httpx clients on ONE event
+                # loop. Closing them on a second asyncio.run() loop raises
+                # "Event loop is closed" on the Windows proactor loop, because the
+                # connections were opened on the (now-closed) first loop.
+                try:
+                    return await orch.investigate_engagement(
+                        BASE_URL, ROLES, max_nodes=0, max_chain_rounds=0, run_context=ctx)
+                finally:
+                    await ctx.aclose()
+            result = asyncio.run(_drive())
         self.assertEqual(result["workflows"][0]["workflow_id"], "wf")
         self.assertIs(execute.await_args.args[1], ctx)
-        asyncio.run(ctx.aclose())
 
 
 class CoverageProofCoordinatesTest(unittest.TestCase):

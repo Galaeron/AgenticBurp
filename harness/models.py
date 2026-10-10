@@ -1,6 +1,6 @@
 from __future__ import annotations
-from typing import Optional
-from pydantic import BaseModel, Field
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, computed_field
 
 
 class HttpExchange(BaseModel):
@@ -14,6 +14,11 @@ class HttpExchange(BaseModel):
     response_body: str = ""
     # Free-text notes the analyst typed in Burp before sending, if any.
     analyst_note: str = ""
+    # Trusted transport identifier set by the capture driver (eval harness /
+    # Burp extension), NOT agent-authored JSON. Additive/optional for
+    # back-compat: empty for older callers, which fall back to a content
+    # hash of the exchange (see cache.ExchangeCache.compute_exchange_hash).
+    capture_id: str = ""
 
 
 class ComponentCandidate(BaseModel):
@@ -110,6 +115,23 @@ class Finding(BaseModel):
     oracle_capsule_id: str = ""
     oracle_reason: str = ""
 
+    @computed_field
+    @property
+    def evidence_maturity(self) -> str:
+        from harness.confirmation_gate import finding_triage
+        return finding_triage(self)["evidence_maturity"]
+
+    @computed_field
+    @property
+    def triage_priority(self) -> str:
+        from harness.confirmation_gate import finding_triage
+        return finding_triage(self)["triage_priority"]
+
+    @computed_field
+    @property
+    def impact_severity(self) -> str:
+        return self.original_severity or self.severity
+
 
 # R02: fields this harness's own deterministic pipeline owns -- the
 # orchestrator's confirmation/proof linkage (orchestrator_confirm.py), its
@@ -122,6 +144,7 @@ class Finding(BaseModel):
 # first -- see harness/agents/base_agent.py, harness/iterative_agent.py,
 # harness/orchestrator_detect.py's _attempt_rediscovery.
 AGENT_AUTHORITY_FIELDS = frozenset({
+    "evidence_maturity", "triage_priority", "impact_severity",
     "confirmed", "proof_id", "case_id", "review_verdict", "review_note",
     "original_confidence", "original_severity", "original_vulnerability_class",
     "shape_inconsistent", "confirmed_by_leg",
@@ -159,6 +182,8 @@ class AgentReport(BaseModel):
 
 class AnalysisRequest(BaseModel):
     exchange: HttpExchange
+    # Explicit snapshot partition. Omitted calls use their fresh run identity.
+    engagement_id: str = Field(default="", max_length=128)
     # If empty, the coordinator picks agents itself. If set, caller forces
     # a specific subset (e.g. user right-clicked "Test for SQLi only").
     force_agents: list[str] = Field(default_factory=list)
@@ -237,9 +262,64 @@ class ValidationReport(BaseModel):
     confirmed: bool = False
     summary: str = ""
     evidence: str = ""
+    # FR-5 (F09): case-identity coordinates for this validation attempt, so a
+    # controlled negative can be bound to the SAME case (parameter) it actually
+    # tested rather than just its class. Optional/default-empty for backward
+    # compatibility -- every pre-existing constructor call and serialized form
+    # stays valid; an empty `parameter` is treated as a class-level (not
+    # parameter-scoped) negative by confirmation_gate.apply_confirmation_suppression.
+    url: str = ""
+    method: str = ""
+    parameter: str = ""
+    # SC-3: the principal (identity) this validation attempt ran under, so a
+    # controlled negative recorded under one principal cannot refute a finding
+    # discovered under a DIFFERENT principal of the same class/parameter.
+    # Optional/default-empty for backward compatibility.
+    principal_id: str = ""
+    # R2/RA-7: carried from ValidationResult.control_outcome. "inconclusive"
+    # marks a not_confirmed that is NOT a genuine executed negative control
+    # (e.g. cross-identity reached-but-unproven); the suppression gate must not
+    # treat it as a refutation. Empty = legacy validator (not_confirmed is a
+    # negative); "control_held" = genuine held control.
+    control_outcome: str = ""
+
+
+class StageOutcome(BaseModel):
+    """Typed health outcome for one pipeline stage (e.g. the critique pass).
+
+    R08/PR-7: before this existed, AnalysisPipeline._critique() returned a bare
+    (0, 0) tuple on THREE different situations -- critique disabled by config,
+    a genuinely healthy pass that reviewed 0 candidates (none met the
+    confidence threshold), and a FAILED pass where the model call raised
+    (OllamaError or any other Exception), so every candidate finding shipped
+    UNREVIEWED. All three looked identical to a caller, and a circuit breaker
+    that had not tripped was not enough to tell them apart (a single transient
+    error is invisible to the breaker's threshold). `status` makes the three
+    cases distinguishable; `attempted`/`completed`/`failed` and
+    `affected_finding_ids` say exactly what happened and to which findings,
+    instead of a silent, indistinguishable 0.
+
+    `status`:
+      - "completed": the stage ran to completion (including legitimately
+        having nothing to do, e.g. 0 candidates above threshold).
+      - "failed": the stage raised/errored; its output (if any) was shipped
+        anyway, unreviewed -- see `affected_finding_ids`.
+      - "skipped": the stage was bypassed for a reason other than config
+        (e.g. an earlier stage's result made it moot).
+      - "disabled": the stage is turned off in config.
+    """
+    name: str
+    status: Literal["completed", "failed", "skipped", "disabled"]
+    attempted: int = 0
+    completed: int = 0
+    failed: int = 0
+    reason: Optional[str] = None
+    affected_finding_ids: list[str] = Field(default_factory=list)
 
 
 class AnalysisResponse(BaseModel):
+    engagement_id: str = ""
+    captured_principal_id: str = ""
     coordinator_model: str
     dispatched_agents: list[str]
     agent_reports: list[AgentReport]
@@ -257,6 +337,9 @@ class AnalysisResponse(BaseModel):
     # this one call) -- see effort.EffortBudget. budget_remaining is None
     # when no cap is configured (tracked but never blocking).
     effort_spent_tokens: int = 0
+    # Compatibility scalar above is a known lower bound when False; None means
+    # an older/uninstrumented response supplied no completeness declaration.
+    effort_usage_complete: bool | None = None
     effort_budget_remaining: Optional[int] = None
     effort_budget_warning: str = ""
     # Tools the harness recommends the tester reach for to confirm/exploit these
@@ -272,12 +355,44 @@ class AnalysisResponse(BaseModel):
     # reason string as a structured flag on the response itself, not just in
     # `telemetry`'s process-wide counters or the logs.
     coordinator_fallback: bool = False
+    # B2-1: True when the shared ollama circuit breaker (harness.circuit_breaker
+    # .get_ollama_circuit_breaker("ollama")) was OPEN during this analysis --
+    # agent/critique calls short-circuited without hitting the model, so this
+    # result is degraded/false-negative-shaped rather than a clean miss.
+    # Observability only: does not change breaker trip/reset behavior.
+    agents_circuit_open: bool = False
     # Astra T01: case-bound structured proof records for this analysis, one per
     # validator attempt (evidence.ProofRecord.to_dict()). This is the API/report
     # surface for structured, verdict-honest evidence -- distinct from the
     # free-text validation_reports compatibility view above. Empty when no
     # validator ran.
     proof_records: list[dict] = Field(default_factory=list)
+    # R08/PR-7: the typed per-stage health record(s) for this analysis (currently
+    # just critique -- one StageOutcome per run_full_analysis call this exchange
+    # made, e.g. one for the first dispatch batch and one for the early-termination
+    # remainder). See StageOutcome above for what distinguishes "completed with 0
+    # reviewed", "disabled" and "failed". Additive/default-empty: a caller that
+    # predates this field simply sees an empty list, exactly as before.
+    stage_outcomes: list[StageOutcome] = Field(default_factory=list)
+    # R08/PR-7: True when this result is degraded -- some stage FAILED (see
+    # stage_outcomes) and shipped its input unreviewed, OR the shared ollama
+    # circuit breaker was open (agents_circuit_open, B2-1). Deliberately reuses
+    # agents_circuit_open rather than duplicating its semantics: `degraded` is
+    # the single OR of every known health signal, so a reader only has to check
+    # one field to know "was this run's output fully trustworthy". Findings are
+    # NEVER dropped because of degradation -- they still ship, just flagged.
+    # Default False so a healthy run (the overwhelming common case) is
+    # byte-for-byte unchanged from before this field existed.
+    degraded: bool = False
+    # Top-level, structured mirror of every dispatched agent's raw_error ("<agent>:
+    # <error>"). Previously an agent failure (e.g. the model backend being down)
+    # was recorded ONLY in the per-agent raw_error buried inside agent_reports, so
+    # a run where every LLM agent failed still returned a normal-looking 200 with
+    # a few deterministic hits. This surfaces the failures where a caller/UI can
+    # see them without walking agent_reports; empty on a clean run. When EVERY
+    # dispatched agent errored (the model-unavailable case), `degraded` is also
+    # True and the summary leads with an explicit warning.
+    agent_errors: list[str] = Field(default_factory=list)
 
 
 class UrlEstimateItem(BaseModel):
@@ -306,6 +421,7 @@ class PrioritizeRequestItem(BaseModel):
 
 
 class PrioritizeRequest(BaseModel):
+    engagement_id: str = Field(default="", max_length=128)
     items: list[PrioritizeRequestItem]
 
 
@@ -318,6 +434,7 @@ class PrioritizeResultItem(BaseModel):
 
 
 class PrioritizeResponse(BaseModel):
+    engagement_id: str = ""
     results: list[PrioritizeResultItem]
 
 
@@ -328,6 +445,12 @@ class EffortStatus(BaseModel):
     remaining_tokens: Optional[int] = None
     exhausted: bool = False
     breakdown: dict[str, int] = Field(default_factory=dict)
+    # spent_tokens/breakdown are known lower bounds when any count is missing.
+    usage_complete: bool = True
+    tokens_lower_bound: bool = False
+    pending_admission_tokens: int = 0
+    unmeasured_admission_tokens: int = 0
+    call_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class IdentityCreateRequest(BaseModel):

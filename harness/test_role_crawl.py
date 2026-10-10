@@ -1,7 +1,7 @@
 """Tests for role-aware crawl -> access matrix (mocked network)."""
 import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from harness import global_throttle
 from harness import role_crawl
@@ -103,6 +103,39 @@ class RoleCrawlTests(unittest.TestCase):
         self.assertFalse(any(c["class"] == "missing_authentication" for c in r.auth_bypass_candidates))
         self.assertEqual(r.endpoints[0].reachable_roles, ["admin"])
 
+    def test_destructive_form_action_never_probed(self):
+        # Defense in depth: a POST to a destructive-looking path (e.g. an
+        # /account/delete form surfaced past the crawler's own guard) must never
+        # be probed -- detection must not attempt a state-destroying request.
+        from harness.crawler import CrawlResult
+        from harness.feature_workflow import FormAction, FormField
+
+        async def fake(base_url, headers=None, allowed_hosts=None, max_pages=40,
+                       max_depth=2, timeout=15.0, **kwargs):
+            r = CrawlResult(base_url=base_url)
+            r.endpoints = {"/product"}
+            r.forms = [FormAction(method="POST", action="http://shop.test/account/delete",
+                                  fields=[FormField(name="confirm", type="hidden", value="1")])]
+            return r
+
+        roles = [RoleSession("anonymous", {})]
+        with patch("harness.crawler.crawl", fake), \
+             patch("httpx.AsyncClient.request", _fake_probe({})):
+            r = asyncio.run(role_crawl.crawl_roles(
+                "http://shop.test/", roles, allowed_hosts=["shop.test"], active_discovery=False))
+        probed = {(e.method, e.path) for e in r.endpoints}
+        self.assertNotIn(("POST", "/account/delete"), probed)
+        self.assertIn(("GET", "/product"), probed)  # benign surface still probed
+        self.assertTrue(any("/account/delete" in s for s in r.suppressed_navigation))
+
+    def test_observed_anchor_query_becomes_capture_template(self):
+        roles = [RoleSession("anonymous", {})]
+        matrix = {"/filter": lambda auth: (200, "pets")}
+        r = self._run(["/filter?category=Pets"], matrix, roles)
+        self.assertEqual(r.endpoints[0].path, "/filter")
+        self.assertEqual(r.captured[0]["url"],
+                         "http://shop.test/filter?category=Pets")
+
     def test_idor_candidate_for_object_scoped(self):
         roles = [RoleSession("user", {"Authorization": "Bearer u"}),
                  RoleSession("admin", {"Authorization": "Bearer a"})]
@@ -147,6 +180,116 @@ class RoleCrawlTests(unittest.TestCase):
                 allowed_hosts=["shop.test"], run_context=ctx))
         self.assertEqual(r.endpoints, [])
         self.assertIn("explicit session reference", r.errors[0])
+
+    def test_observed_form_drives_exact_post_template(self):
+        from harness.crawler import CrawlResult
+        from harness.feature_workflow import FormAction, FormField
+        cr = CrawlResult(base_url="http://shop.test/")
+        cr.forms.append(FormAction(
+            method="POST", action="http://shop.test/product/stock",
+            fields=[FormField("productId", "hidden", "1"),
+                    FormField("storeId", "hidden", "1")]))
+        calls = []
+
+        async def fake_probe(method, url, headers, timeout, **kwargs):
+            calls.append((method, url, kwargs.get("body"), kwargs.get("content_type")))
+            return 200, "17", {"content-type": "text/plain"}
+
+        async def scenario():
+            with patch("harness.crawler.crawl", return_value=cr), \
+                 patch("harness.role_crawl._probe", fake_probe):
+                return await role_crawl.crawl_roles(
+                    "http://shop.test/", [RoleSession("anonymous", {})],
+                    allowed_hosts=["shop.test"])
+
+        result = asyncio.run(scenario())
+        self.assertEqual(calls, [("POST", "http://shop.test/product/stock",
+                                  "productId=1&storeId=1",
+                                  "application/x-www-form-urlencoded")])
+        self.assertEqual(result.captured[0]["request_body"], "productId=1&storeId=1")
+        self.assertEqual(result.captured[0]["method"], "POST")
+
+    def test_observed_get_form_drives_query_template_without_request_body(self):
+        from harness.crawler import CrawlResult
+        from harness.feature_workflow import FormAction, FormField
+        cr = CrawlResult(base_url="http://shop.test/")
+        cr.forms.append(FormAction(
+            method="GET", action="http://shop.test/search?category=all",
+            fields=[FormField("search", "text", "")]))
+        calls = []
+
+        async def fake_probe(method, url, headers, timeout, **kwargs):
+            calls.append((method, url, kwargs.get("body"), kwargs.get("content_type")))
+            return 200, "results", {"content-type": "text/html"}
+
+        async def scenario():
+            with patch("harness.crawler.crawl", return_value=cr), \
+                 patch("harness.role_crawl._probe", fake_probe):
+                return await role_crawl.crawl_roles(
+                    "http://shop.test/", [RoleSession("anonymous", {})],
+                    allowed_hosts=["shop.test"])
+
+        result = asyncio.run(scenario())
+        self.assertEqual(calls, [("GET",
+                                  "http://shop.test/search?category=all&search=harness-workflow-probe",
+                                  "", "")])
+        self.assertEqual(result.captured[0]["request_body"], "")
+        self.assertIn("search=harness-workflow-probe", result.captured[0]["url"])
+
+    def test_form_templates_are_bound_to_the_role_that_observed_them(self):
+        from harness.crawler import CrawlResult
+        from harness.feature_workflow import FormAction, FormField
+
+        async def fake_crawl(base_url, headers=None, **kwargs):
+            cr = CrawlResult(base_url=base_url)
+            token = (headers or {}).get("X-Role-Token")
+            if token:
+                cr.forms.append(FormAction(
+                    method="POST", action="http://shop.test/account/email",
+                    fields=[FormField("email", "email", "probe@example.com"),
+                            FormField("csrf", "hidden", token)]))
+            return cr
+
+        calls = []
+
+        async def fake_probe(method, url, headers, timeout, **kwargs):
+            calls.append((headers.get("X-Role-Token"), kwargs.get("body")))
+            return 200, "ok", {"content-type": "text/html"}
+
+        roles = [RoleSession("anonymous", {}),
+                 RoleSession("alice", {"X-Role-Token": "alice-csrf"}),
+                 RoleSession("bob", {"X-Role-Token": "bob-csrf"})]
+        async def scenario():
+            with patch("harness.crawler.crawl", fake_crawl), \
+                 patch("harness.role_crawl._probe", fake_probe):
+                return await role_crawl.crawl_roles(
+                    "http://shop.test/", roles, allowed_hosts=["shop.test"])
+
+        asyncio.run(scenario())
+        self.assertEqual(calls[0][0], None)
+        self.assertNotIn("csrf=alice-csrf", calls[0][1])
+        self.assertIn("csrf=alice-csrf", calls[1][1])
+        self.assertIn("csrf=bob-csrf", calls[2][1])
+
+    def test_login_form_is_observed_but_not_submitted(self):
+        from harness.crawler import CrawlResult
+        from harness.feature_workflow import FormAction, FormField
+        cr = CrawlResult(base_url="http://shop.test/")
+        cr.forms.append(FormAction(
+            method="POST", action="http://shop.test/login",
+            fields=[FormField("username"), FormField("password", "password")]))
+
+        async def scenario():
+            with patch("harness.crawler.crawl", return_value=cr), \
+                 patch("harness.role_crawl._probe", new_callable=AsyncMock) as probe:
+                result = await role_crawl.crawl_roles(
+                    "http://shop.test/", [RoleSession("user", {"Cookie": "s=1"})],
+                    allowed_hosts=["shop.test"])
+                return result, probe
+
+        result, probe = asyncio.run(scenario())
+        probe.assert_not_awaited()
+        self.assertIn("POST /login", result.suppressed_navigation)
 
     def test_access_matrix_replay_uses_run_context_real_transport(self):
         fixture = _Fixture()
@@ -255,8 +398,21 @@ class RoleCrawlEndpointTests(unittest.TestCase):
         import harness.server as server_module
         self.server_module = server_module
         server_module.orchestrator.allowed_hosts = ["shop.test"]
+        # /crawl-roles sends ACTIVE outbound traffic, so _require_active_crawl
+        # requires active mode armed (validators.active_enabled) on top of the
+        # scope above -- otherwise every call 403s "active operations are
+        # disabled" (and bodies lack the normal keys). Arm it for these endpoint
+        # tests; restore the prior value in tearDown so nothing leaks.
+        self._prev_active = server_module.orchestrator.validator_registry.active_enabled
+        server_module.orchestrator.validator_registry.set_active_enabled(True)
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app, base_url="http://localhost")
+        # RB-1: state-changing routes require the bearer token even from
+        # loopback; attach the (ephemeral, in this test env) token.
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
+
+    def tearDown(self):
+        self.server_module.orchestrator.validator_registry.set_active_enabled(self._prev_active)
 
     def test_endpoint_runs(self):
         with patch("harness.crawler.crawl", _fake_crawl(["/api/report"])), \
@@ -342,8 +498,15 @@ class ProbeSynthesisHelperTests(unittest.TestCase):
 
     def test_synthesize_query_only_for_search_like_paths(self):
         self.assertEqual(role_crawl._synthesize_query("/api/tickets/search"), "q=test")
+        self.assertEqual(role_crawl._synthesize_query("/filter"), "category=test")
         self.assertEqual(role_crawl._synthesize_query("/api/tickets"), "")
         self.assertEqual(role_crawl._synthesize_query("/api/tickets/search?q=1"), "")
+
+    def test_split_discovered_endpoint_preserves_observed_query(self):
+        path, query = role_crawl._split_discovered_endpoint(
+            "/filter?category=Pets")
+        self.assertEqual(path, "/filter")
+        self.assertEqual(query, "category=Pets")
 
 
 class ActiveDiscoveryMethodPropagationTests(unittest.TestCase):

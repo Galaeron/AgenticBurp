@@ -45,7 +45,7 @@ _TIER_W = {"critical": 1.0, "high": 0.75, "medium": 0.5, "low": 0.25, "info": 0.
 _PRIVILEGED = re.compile(
     r"/(admin|administrator|manage|management|config|configuration|settings|internal|debug|"
     r"actuator|console|dashboard|billing|payment|invoice|account|users?|profile|report|export|"
-    r"backup|token|secret|key|password|role|permission|privilege)(s)?(/|$)",
+    r"backup|token|secret|key|password|role|permission|privilege)(s)?(?:[-_/]|$)",
     re.IGNORECASE,
 )
 
@@ -127,6 +127,13 @@ class SurfaceEndpoint:
     # instead of fabricating an empty body, a stripped query, and id=1. None until
     # a capture is recorded (record_template); replay falls back to fabrication.
     template: dict | None = None
+    # P2-1: business-impact contribution from the Application Semantic Model,
+    # set by EngagementState.apply_semantic_model (default-off business-context
+    # pass). None until an ASM is applied -- and while None, fused_score() adds
+    # NOTHING for it, so a run without the ASM ranks byte-for-byte as before (the
+    # negative control). Never a confirmation; only re-ranking.
+    business_score: float | None = None
+    business_reasons: list = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -263,6 +270,18 @@ class SurfaceEndpoint:
             score += 0.2
             reasons.append("input-bearing route (body/query/object-id) -- concrete probe available")
 
+        # P2-1: business impact from the Application Semantic Model (a
+        # value-bearing checkout/payment/role endpoint outranks a generic static
+        # page). Additive and STRICTLY OPT-IN: None (no ASM applied) adds nothing,
+        # so the ranking is unchanged without the business-context pass. Placed
+        # with the other additive signals -- BEFORE the validated/malformed/dead
+        # multipliers below -- so a proven, dead, or malformed endpoint is still
+        # demoted regardless of its business score (business context never
+        # resurrects a dead route or a confirmation).
+        if self.business_score:
+            score += float(self.business_score)
+            reasons.extend(self.business_reasons or ["business impact (ASM)"])
+
         # Already validated -> mostly done; keep a little so it stays visible.
         if self.status == "validated":
             score *= 0.3
@@ -297,6 +316,10 @@ class SurfaceEndpoint:
             # proved dead or malformed.
             "dead_endpoint": self.is_repeat_5xx_artifact(),
             "malformed_or_encoded": self.is_malformed_or_encoded(),
+            # P2-1: surfaced only when an ASM was applied (None otherwise), so a
+            # dict consumer / the report can see WHY an endpoint was re-ranked.
+            "business_score": self.business_score,
+            "business_reasons": self.business_reasons,
         }
 
     @classmethod
@@ -307,6 +330,8 @@ class SurfaceEndpoint:
             access=d.get("access", {}) or {}, reachable_roles=d.get("reachable_roles", []) or [],
             object_scoped=bool(d.get("object_scoped", False)), findings=d.get("findings", []) or [],
             status=d.get("status", "discovered"), template=d.get("template"),
+            business_score=d.get("business_score"),
+            business_reasons=d.get("business_reasons", []) or [],
         )
 
 
@@ -660,6 +685,52 @@ class EngagementState:
         self.graph.add("verify", spec["target"], reason=spec["reason"],
                        needs=spec["needs"], source=url)
         return True
+
+    def apply_semantic_model(self, asm, *, ledger=None) -> int:
+        """P2-1: fold an Application Semantic Model into the surface + graph.
+
+        Two effects, both additive and reversible, NEITHER a confirmation:
+          1. RE-RANK: stamp each endpoint's `business_score`/`business_reasons`
+             from `asm.business_impact_for(method, path)`, so the fused worklist
+             lifts value-bearing endpoints (checkout/payment/role/id) above
+             generic ones. Endpoints the ASM says nothing about get score 0 --
+             their ranking is unchanged.
+          2. PROPOSE: record each ranked chaining hypothesis as a BLOCKED
+             `chain-hypothesis` task (needs operator review). It is a PROPOSAL
+             surfaced to the tester / the chain proposer -- never auto-run, never
+             marked confirmed, and it selects no URL for a validator.
+
+        `asm` is duck-typed (anything with `business_impact_for` +
+        `chaining_hypotheses`), so this never hard-imports the ASM module.
+        Returns the number of endpoints that received a positive business score.
+        Sends nothing."""
+        if asm is None:
+            return 0
+        scored = 0
+        for ep in self.endpoints.values():
+            try:
+                score, reasons = asm.business_impact_for(ep.method, ep.path)
+            except Exception:
+                continue
+            ep.business_score = score
+            ep.business_reasons = list(reasons)
+            if score > 0:
+                scored += 1
+        for hyp in getattr(asm, "chaining_hypotheses", []) or []:
+            try:
+                self.graph.add(
+                    "chain-hypothesis", getattr(hyp, "id", "") or "hypothesis",
+                    reason=(getattr(hyp, "rationale", "") or
+                            f"{getattr(hyp, 'source', '?')} -> {getattr(hyp, 'target', '?')}"),
+                    needs="operator review (proposed chain -- not confirmed)",
+                    source=",".join(getattr(hyp, "endpoints", []) or [])[:200],
+                    meta={"auto_runnable": False,
+                          "rank": getattr(hyp, "rank", 0.0),
+                          "classes": list(getattr(hyp, "classes", []) or []),
+                          "proposed_only": True})
+            except Exception:
+                continue
+        return scored
 
     # --- the fused output ---
 

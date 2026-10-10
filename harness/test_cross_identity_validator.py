@@ -68,6 +68,34 @@ class CrossIdentityValidatorTest(unittest.TestCase):
         r = asyncio.run(v.validate(_finding(), _exchange()))
         self.assertEqual(r.status, "not_confirmed")
         self.assertFalse(r.confirmed)
+        self.assertEqual(getattr(r, "control_outcome", ""), "control_held")  # clean denial => control held
+
+    def test_errored_probe_is_inconclusive_not_restricted(self):
+        # REGRESSION (review 2026-10): one identity's probe ERRORS (network/scope
+        # failure); the other identity and anon are cleanly denied. An errored
+        # probe is an UNKNOWN, not a denial -- so the leg must report INCONCLUSIVE,
+        # never "access correctly restricted" (control_held, 0.8). The latter is
+        # treated as a refutation downstream and would turn a transient error into
+        # a confident clean bill of health against a real IDOR lead.
+        identity_headers.set_identity("localhost", "bob", {"Authorization": "Bearer bob"})
+        identity_headers.set_identity("localhost", "carol", {"Authorization": "Bearer carol"})
+
+        def responder(headers):
+            if headers.get("Authorization") == "Bearer bob":
+                raise RuntimeError("connection reset by peer")   # errored probe -> unknown
+            return (403, "Forbidden")                            # carol + anon denied
+
+        v = _StubbedValidator(responder, allowed_hosts=["localhost"])
+        r = asyncio.run(v.validate(_finding(), _exchange()))
+        self.assertEqual(r.status, "not_confirmed")
+        self.assertFalse(r.confirmed)
+        self.assertEqual(getattr(r, "control_outcome", ""), "inconclusive")
+        self.assertNotEqual(getattr(r, "control_outcome", ""), "control_held")
+        self.assertLess(r.confidence, 0.8)
+        self.assertNotIn("correctly restricted", (r.summary or "").lower())
+        # evidence reports the ACTUAL rejected count, never a blanket "all rejected"
+        # (some probes can come back neither rejected nor confirmed).
+        self.assertNotIn("all rejected", (r.evidence or "").lower())
 
     def test_skips_without_identities(self):
         v = _StubbedValidator(lambda h: (200, "x"), allowed_hosts=["localhost"])
@@ -246,6 +274,28 @@ class CrossIdentityValidatorTest(unittest.TestCase):
         r = asyncio.run(v.validate(_finding("broken_access_control"), ex))
         self.assertEqual(r.status, "not_confirmed")
         self.assertFalse(r.confirmed)
+        self.assertEqual(getattr(r, "control_outcome", ""), "control_held")
+
+    def test_bfla_errored_probe_is_inconclusive_not_control_held(self):
+        # REGRESSION (review 2026-10): same partial-failure bug on the BFLA path.
+        # One non-privileged probe errors, the other is denied -> INCONCLUSIVE,
+        # never "authorization holds" (control_held, 0.8).
+        identity_headers.set_identity("localhost", "carol", {"Authorization": "Bearer carol"}, role="user")
+        identity_headers.set_identity("localhost", "dave", {"Authorization": "Bearer dave"}, role="user")
+
+        def responder(headers):
+            if headers.get("Authorization") == "Bearer carol":
+                raise RuntimeError("connection reset by peer")   # errored probe -> unknown
+            return (403, "Forbidden")                            # dave + anon denied
+
+        v = _StubbedValidator(responder, allowed_hosts=["localhost"])
+        ex = _exchange(url="http://localhost/api/admin/users", body="")
+        r = asyncio.run(v.validate(_finding("broken_access_control"), ex))
+        self.assertEqual(r.status, "not_confirmed")
+        self.assertFalse(r.confirmed)
+        self.assertEqual(getattr(r, "control_outcome", ""), "inconclusive")
+        self.assertLess(r.confidence, 0.8)
+        self.assertNotIn("authorization holds", (r.summary or "").lower())
 
     def test_bfla_skips_when_only_admin_identity(self):
         # an admin reaching an admin function is expected -> can't prove a bypass.

@@ -177,8 +177,10 @@ class RateLimitValidatorTests(unittest.TestCase):
 
     def _gate(self, burst):
         reset_default_gate()
+        # Seed scope so the burst clears the fail-closed gate (3c622c3) instead of
+        # being refused out-of-scope before the rate-limit leg runs.
         get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
-                          "max_burst_size": burst})
+                          "max_burst_size": burst, "allowed_hosts": ["target.test"]})
 
     def test_skip_on_get(self):
         self._gate(20)
@@ -247,8 +249,10 @@ class RateLimitValidatorTests(unittest.TestCase):
 
     def test_blocked_when_mutating_replay_off(self):
         reset_default_gate()
+        # In scope, so the skip is attributable to allow_mutating_replay=False
+        # (the property under test) and not to an out-of-scope refusal.
         get_default_gate({"active_enabled": True, "allow_mutating_replay": False,
-                          "max_burst_size": 20})
+                          "max_burst_size": 20, "allowed_hosts": ["target.test"]})
         v = RateLimitValidator(allowed_hosts=["target.test"], min_attempts=5)
         r = asyncio.run(v.validate(_finding("rate_limit"), _ex()))
         self.assertEqual(r.status, "skipped")

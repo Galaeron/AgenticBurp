@@ -73,17 +73,33 @@ class TestPromptValidator(unittest.TestCase):
         with self.assertRaises(LengthValidationError):
             self.validator.validate_user_prompt(many_lines)
     
-    def test_too_many_newlines(self):
-        """Prompt with too many consecutive newlines should raise ValidationError."""
-        too_many_newlines = "line1\n\n\n\nline2"
-        with self.assertRaises(ValidationError):
-            self.validator.validate_user_prompt(too_many_newlines)
-    
-    def test_too_many_spaces(self):
-        """Prompt with too many consecutive spaces should raise ValidationError."""
+    def test_excessive_newlines_are_collapsed_not_rejected(self):
+        """Review pt 4: excessive consecutive newlines (a blank-line run in a
+        captured template/body) must NOT drop the exchange. They are collapsed
+        to the configured ceiling and the prompt still passes."""
+        # config.max_consecutive_newlines == 3
+        too_many_newlines = "line1" + "\n" * 8 + "line2"
+        result = self.validator.validate_user_prompt(too_many_newlines)
+        self.assertEqual(result, "line1" + "\n" * 3 + "line2")
+        self.assertNotIn("\n" * 4, result)
+        self.assertEqual(self.validator.get_stats()["whitespace_collapsed"], 1)
+
+    def test_excessive_spaces_are_collapsed_not_rejected(self):
+        """Review pt 4: a long run of spaces (deeply-indented captured HTML)
+        must NOT drop the exchange. It is collapsed to the ceiling and passes."""
+        # config.max_consecutive_spaces == 20
         too_many_spaces = "word" + " " * 50 + "word"
-        with self.assertRaises(ValidationError):
-            self.validator.validate_user_prompt(too_many_spaces)
+        result = self.validator.validate_user_prompt(too_many_spaces)
+        self.assertEqual(result, "word" + " " * 20 + "word")
+        self.assertNotIn(" " * 21, result)
+
+    def test_indented_html_body_is_not_dropped(self):
+        """Review pt 4 (the exact live failure): a deeply-indented HTML body
+        reaches the model instead of failing validation."""
+        body = "<html>\n<body>\n" + " " * 52 + "<span>x</span>\n</body>\n</html>"
+        result = self.validator.validate_user_prompt(body)
+        self.assertIn("<span>x</span>", result)
+        self.assertNotIn(" " * 21, result)
     
     def test_blocked_pattern(self):
         """With hard-blocking opted in, a blocked pattern raises PatternValidationError."""

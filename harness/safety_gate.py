@@ -46,10 +46,11 @@ import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from harness.target_request_policy import TargetRequestPolicy
 
 log = logging.getLogger("harness.safety_gate")
 
-# Methods that are safe by default: no expected server-side state change.
+# Nominally safe HTTP methods; method classification is not a side-effect claim.
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
 # Methods this gate treats as mutating and therefore gated.
@@ -120,6 +121,7 @@ class SafetyGateConfig:
     # listed -- central defense-in-depth so a validator that forgets its own scope
     # check, or follows an off-scope redirect, is still stopped at the transport.
     allowed_hosts: frozenset = field(default_factory=frozenset)
+    target_policy: TargetRequestPolicy = field(default_factory=TargetRequestPolicy)
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "SafetyGateConfig":
@@ -128,13 +130,15 @@ class SafetyGateConfig:
         # bool(value) (bool("false") is True). See parse_validators_flags's
         # docstring for the exact defect this closes.
         from harness.config_schema import parse_validators_flags
+        from harness.scope_lock import configured_entries
         flags = parse_validators_flags(cfg)
         return cls(
             active_enabled=flags["active_enabled"],
             allow_mutating_replay=flags["allow_mutating_replay"],
             max_burst_size=int(cfg.get("max_burst_size", 1)),
             max_mutating_requests_per_finding=int(cfg.get("max_mutating_requests_per_finding", 1)),
-            allowed_hosts=frozenset(str(h).lower() for h in (cfg.get("allowed_hosts") or [])),
+            allowed_hosts=configured_entries(cfg.get("allowed_hosts")),
+            target_policy=cfg.get('target_policy') or TargetRequestPolicy(),
         )
 
 
@@ -246,9 +250,11 @@ class SafetyGate:
         # Safety item #12: scope lock is checked FIRST -- an off-scope host is
         # refused regardless of method, before hard-deny/mutating classification,
         # so no probe (read-only or mutating) can be sent to a host outside the
-        # engagement scope. Empty allowed_hosts = unset = no restriction.
+        # engagement scope. Empty active scope fails closed; standalone passive
+        # compatibility is retained, independently of malformed URL rejection.
         from harness import scope_lock
-        if not scope_lock.host_in_scope(url, self.config.allowed_hosts):
+        if not scope_lock.host_in_scope(url, self.config.allowed_hosts,
+                                       active_mode=self.config.active_enabled):
             decision = AuthorizationDecision(
                 allowed=False, tier=ActionRiskTier.OUT_OF_SCOPE,
                 reason="Refused by scope lock: " + scope_lock.out_of_scope_reason(url, self.config.allowed_hosts),
@@ -256,6 +262,12 @@ class SafetyGate:
             self._log(validator_name, method, url, decision)
             return decision
 
+        restriction = self.config.target_policy.denial_reason(url)
+        if restriction:
+            decision = AuthorizationDecision(allowed=False, tier=ActionRiskTier.HARD_DENIED,
+                                             reason=restriction)
+            self._log(validator_name, method, url, decision)
+            return decision
         tier = self.classify(method, body=body, url=url)
 
         if tier == ActionRiskTier.HARD_DENIED:
@@ -266,7 +278,8 @@ class SafetyGate:
                        "allowed regardless of configuration.",
             )
         elif tier == ActionRiskTier.SAFE:
-            decision = AuthorizationDecision(allowed=True, tier=tier, reason="Safe method, no gating required.")
+            decision = AuthorizationDecision(allowed=True, tier=tier,
+                                             reason="Nominally safe method allowed under scope and endpoint policy; side effects are not established.")
         else:  # MUTATING
             if not self.config.active_enabled:
                 decision = AuthorizationDecision(

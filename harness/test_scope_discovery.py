@@ -34,8 +34,10 @@ class IsHostAllowedTests(unittest.TestCase):
     def test_non_matching_host_rejected(self):
         self.assertFalse(scope_discovery.is_host_allowed("https://evil.invalid/x", ["target.invalid"]))
 
-    def test_subdomain_of_allowed_host_allowed(self):
-        self.assertTrue(scope_discovery.is_host_allowed("https://api.target.invalid/x", ["target.invalid"]))
+    def test_subdomain_requires_explicit_exact_host(self):
+        self.assertFalse(scope_discovery.is_host_allowed("https://api.target.invalid/x", ["target.invalid"]))
+        self.assertFalse(scope_discovery.is_host_allowed("https://api.target.invalid/x", ["*.target.invalid"]))
+        self.assertTrue(scope_discovery.is_host_allowed("https://api.target.invalid/x", ["api.target.invalid"]))
 
     # --- W-17: fail closed in active mode when no scope is configured ---
     def test_empty_allowed_hosts_fails_open_in_passive_mode(self):
@@ -59,27 +61,26 @@ class IsHostAllowedTests(unittest.TestCase):
         self.assertTrue(scope_discovery.is_host_allowed("http://localhost:5002/x", ["localhost"]))
         self.assertTrue(scope_discovery.is_host_allowed("http://localhost:11434/x", ["localhost"]))
 
-    def test_host_port_entry_matches_only_that_port(self):
-        self.assertTrue(scope_discovery.is_host_allowed("http://localhost:5002/x", ["localhost:5002"]))
+    def test_host_port_entry_is_denied_in_shared_intersection(self):
+        self.assertFalse(scope_discovery.is_host_allowed("http://localhost:5002/x", ["localhost:5002"]))
         # A scope pinned to :5002 must NOT authorize Ollama on :11434 or the
         # harness itself on :8787 -- the "localhost authorizes all local
         # services" gap W-17 closes.
         self.assertFalse(scope_discovery.is_host_allowed("http://localhost:11434/x", ["localhost:5002"]))
         self.assertFalse(scope_discovery.is_host_allowed("http://localhost:8787/x", ["localhost:5002"]))
 
-    def test_host_port_entry_matches_scheme_default_port(self):
-        # https://target with no explicit port == :443, so a :443 entry matches.
-        self.assertTrue(scope_discovery.is_host_allowed("https://target.invalid/x", ["target.invalid:443"]))
+    def test_host_port_entry_default_port_is_still_denied(self):
+        self.assertFalse(scope_discovery.is_host_allowed("https://target.invalid/x", ["target.invalid:443"]))
         self.assertFalse(scope_discovery.is_host_allowed("https://target.invalid/x", ["target.invalid:8443"]))
 
     # --- W-17: scheme precision ---
-    def test_scheme_qualified_entry_matches_only_that_scheme(self):
-        self.assertTrue(scope_discovery.is_host_allowed("https://target.invalid/x", ["https://target.invalid"]))
+    def test_scheme_qualified_entry_is_denied_in_shared_intersection(self):
+        self.assertFalse(scope_discovery.is_host_allowed("https://target.invalid/x", ["https://target.invalid"]))
         self.assertFalse(scope_discovery.is_host_allowed("http://target.invalid/x", ["https://target.invalid"]))
 
     # --- W-17: CIDR / IP matching ---
-    def test_cidr_entry_matches_ip_in_range(self):
-        self.assertTrue(scope_discovery.is_host_allowed("http://10.0.0.7:8080/x", ["10.0.0.0/24"]))
+    def test_cidr_entry_is_denied_in_shared_intersection(self):
+        self.assertFalse(scope_discovery.is_host_allowed("http://10.0.0.7:8080/x", ["10.0.0.0/24"]))
         self.assertFalse(scope_discovery.is_host_allowed("http://10.0.1.7:8080/x", ["10.0.0.0/24"]))
 
     def test_bare_ip_entry_matches_exactly(self):

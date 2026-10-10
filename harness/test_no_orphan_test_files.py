@@ -74,15 +74,21 @@ class NoOrphanTestFilesTest(unittest.TestCase):
             self.assertTrue(discovery_issues((ROOT / rel).read_text(encoding='utf-8')),
                             f'{rel} no longer needs pytest selection')
 
-    def test_ci_uses_canonical_selections_in_both_tiers(self):
+    def test_ci_full_tier_uses_canonical_selections(self):
+        # Rule 2: one `full` tier runs on every push/PR (the former fast-smoke /
+        # full-nightly split is gone). It must reference the canonical
+        # harness.suite selections (native + evaluation) rather than a
+        # hand-maintained copy of the module lists, and run the whole unittest
+        # discover plus the coverage gate.
         import yaml
         jobs = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'))['jobs']
-        for name in ('fast', 'nightly'):
-            scripts = [step.get('run', '').strip() for step in jobs[name]['steps']]
-            self.assertIn('python -m harness.suite native', scripts, name)
-            self.assertIn('python -m harness.suite evaluation', scripts, name)
-        self.assertIn('python -m harness.suite smoke', [s.get('run', '').strip() for s in jobs['fast']['steps']])
-        self.assertTrue(any('unittest discover -t . -s harness' in s.get('run', '') for s in jobs['nightly']['steps']))
+        scripts = [step.get('run', '').strip() for step in jobs['full']['steps']]
+        self.assertIn('python -m harness.suite native', scripts)
+        self.assertIn('python -m harness.suite evaluation', scripts)
+        self.assertTrue(any('unittest discover -t . -s harness' in s for s in scripts),
+                        'full tier must run the whole unittest discover')
+        self.assertTrue(any('coverage_manifest --check' in s for s in scripts),
+                        'full tier must run the coverage gate')
 
     def test_full_includes_unittest_native_and_evaluation(self):
         full = commands('full')

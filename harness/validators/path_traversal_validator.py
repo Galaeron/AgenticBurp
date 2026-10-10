@@ -29,8 +29,9 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl
 import httpx
 
 from harness import global_throttle
+from harness.categories import canonicalize
 from harness.models import Finding, HttpExchange
-from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked, ActionRiskTier
 from .base import Validator, ValidationResult
 from .injection_targets import param_targets, mutate, replay_headers
 
@@ -58,6 +59,18 @@ _TARGETS = {
 }
 _MAX_PARAMS = 6
 _PATHSEG = "pathseg"
+
+# Review pt 7: the shape-decoupled fallback (probe any file/path-shaped request
+# even when the LLM labelled it something else -- like the ssrf/xxe legs) is
+# intentional coverage for unlabelled/mislabelled findings. But it should NOT
+# fire for a finding whose class is DEFINITIONALLY a response-header/transport
+# concern with no relationship to reading a file off disk: a CSP, CORS or TLS
+# finding that merely happens to sit on a file-serving URL is not a
+# path-traversal hypothesis, and sending traversal probes off the back of it is
+# just unrequested active traffic. Narrow, explicit, and canonical so it never
+# suppresses a genuinely file-read-adjacent class (misconfig, info_disclosure,
+# recon, anomaly, etc. still get the shape-decoupled probe).
+_NOT_FILE_READ_CLASSES = {"csp", "cors", "crypto"}
 
 
 def _file_shaped(exchange: HttpExchange) -> list[tuple[str, str]]:
@@ -105,13 +118,22 @@ class PathTraversalValidator(Validator):
                        "lfi", "local file inclusion", "file inclusion"}
     active = True
 
-    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0):
+    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
+                 run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        self.run_context = run_context
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
-        return (super().applies(finding, exchange) and bool(param_targets(exchange))) \
-            or bool(_file_shaped(exchange)) or _fileish_segment(exchange.url)
+        # A finding explicitly labelled this class (or a traversal synonym)
+        # routes whenever there is any injectable parameter -- unchanged.
+        if super().applies(finding, exchange) and bool(param_targets(exchange)):
+            return True
+        # Shape-decoupled fallback, suppressed for header/transport-only classes
+        # that are never a file read (review pt 7).
+        if canonicalize(finding.vulnerability_class) in _NOT_FILE_READ_CLASSES:
+            return False
+        return bool(_file_shaped(exchange)) or _fileish_segment(exchange.url)
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "path_traversal", summary=why)
@@ -136,24 +158,51 @@ class PathTraversalValidator(Validator):
             return self._skip("no file/path-shaped parameter or path segment to inject a traversal into")
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
+        session_ref = None
+        request_headers = headers
+        if self.run_context is not None:
+            from .transport import bind_session
+            session_ref, request_headers = bind_session(self.run_context, headers)
         for loc, param in targets:
             for prefix in _PREFIXES:
                 for target, marker in _TARGETS.items():
                     url, body = self._mutated(exchange, loc, param, prefix + target)
                     try:
-                        await global_throttle.acquire()
-                        async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
-                                                    follow_redirects=False, verify=False) as client:
-                            resp = await client.request(method, url, headers=headers or None,
-                                                        content=body or None)
-                    except SafetyGateBlocked:
+                        if self.run_context is not None:
+                            from harness.run_context import TypedRequest
+                            outcome = await self.run_context.executor().execute(
+                                TypedRequest(method, url, headers=request_headers,
+                                             body=body or None),
+                                capability=self.name, session_ref=session_ref,
+                                case_ref=finding.finding_id or "", max_redirects=0)
+                            if not outcome.executed:
+                                return self._skip(
+                                    f"path-traversal replay declined: {outcome.outcome}")
+                            if not outcome.ok:
+                                continue
+                            text = outcome.body or ""
+                        else:
+                            await global_throttle.acquire()
+                            async with GatedAsyncClient(get_default_gate(), self.name,
+                                                        timeout=self.timeout,
+                                                        follow_redirects=False,
+                                                        verify=False) as client:
+                                resp = await client.request(
+                                    method, url, headers=headers or None,
+                                    content=body or None)
+                            text = resp.text
+                    except SafetyGateBlocked as blocked:
+                        # One probe URL the gate refuses must not abort the whole leg
+                        # and be mislabelled a mutating-replay denial. A traversal
+                        # payload can produce a URL the scope lock cannot validate
+                        # (e.g. backslash path segments), which fails closed as
+                        # out-of-scope: skip that payload and try the rest. A genuine
+                        # mutating-replay denial still terminates -- nothing more can send.
+                        if blocked.decision.tier == ActionRiskTier.OUT_OF_SCOPE:
+                            continue
                         return self._skip("mutating path-traversal replay not authorized "
                                           "(set validators.allow_mutating_replay)")
                     except httpx.HTTPError:
-                        continue
-                    try:
-                        text = resp.text
-                    except Exception:
                         continue
                     if marker.search(text):
                         where = "path segment" if loc == _PATHSEG else f"{loc} parameter {param!r}"

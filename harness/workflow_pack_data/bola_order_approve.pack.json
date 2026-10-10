@@ -1,0 +1,56 @@
+{
+  "pack_id": "bola-order-approve",
+  "schema_version": 1,
+  "engine_min": 1,
+  "engine_max": 1,
+  "taxonomy": "A01:Broken-Access-Control",
+  "required_capabilities": ["workflow"],
+  "impact": {"severity": "high", "scope": "cross-principal", "cwe": "CWE-639"},
+  "fingerprint": {
+    "method": "GET",
+    "url_template": "http://shop.test/health",
+    "session_ref": "probe",
+    "assertions": [{"kind": "body_contains", "expected": "shop-api"}]
+  },
+  "proof_contract": {
+    "proof_step": "escalate",
+    "proven_status": "passed",
+    "refuted_statuses": ["failed", "blocked"]
+  },
+  "negative_fixture": {
+    "description": "A patched build denies a non-manager principal's approve with HTTP 403, so the proof step FAILS and the pack is refuted.",
+    "expected_state": "refuted"
+  },
+  "cleanup_contract": {"required_steps": ["cleanup"]},
+  "workflow": {
+    "id": "bola-order-approve",
+    "version": 1,
+    "invariant": "only a manager principal may approve an order",
+    "steps": [
+      {
+        "id": "create",
+        "method": "POST",
+        "url_template": "http://shop.test/orders",
+        "session_ref": "user",
+        "body_template": "{\"item\": \"widget\"}",
+        "extractors": [{"name": "id", "kind": "json_pointer", "expression": "/id"}]
+      },
+      {
+        "id": "escalate",
+        "method": "POST",
+        "url_template": "http://shop.test/orders/{{id}}/approve",
+        "session_ref": "user",
+        "prerequisites": ["create"],
+        "assertions": [{"kind": "status", "expected": 200}]
+      },
+      {
+        "id": "cleanup",
+        "method": "DELETE",
+        "url_template": "http://shop.test/orders/{{id}}",
+        "session_ref": "user",
+        "prerequisites": ["create"],
+        "cleanup": true
+      }
+    ]
+  }
+}

@@ -17,6 +17,16 @@
 # here (see CLAUDE.md/AGENTS.md config hazard).
 operating_profile: "none"
 
+# TargetTransport verifies HTTPS certificates and hostnames by default for both
+# session and anonymous clients. Add a local proxy CA through an absolute PEM
+# path in config.local.yaml. Fixture bypasses are explicit loopback origins only;
+# no global verify:false option is supported. See docs/HTTPS_TRUST_POLICY.md.
+transport:
+  tls:
+    ca_bundle: null
+    fixture_insecure_origins: []
+    fixture_insecure_reason: null
+
 ollama:
   base_url: "http://localhost:11434"
   # Raised from 120s: three separate real PixelMart runs this session
@@ -96,8 +106,9 @@ coordinator:
   # to a deterministic UNION FLOOR beneath it (the coordinator can only add
   # agents to that floor, never remove them). The cloud model was A/B-validated
   # at 4.0 agents/exchange (31% tighter than fast_path's 5.8) for zero lost
-  # detections in the labeled run -- but re-run testing/test-target/
-  # ab_routing_recall.py before trusting it as primary on a fresh state.
+  # detections in the labeled run -- but re-measure A/B routing recall on your
+  # own corpus (see testing/README.md) before trusting it as primary on a fresh
+  # state. (An earlier ad-hoc ab_routing_recall.py helper is not committed.)
   cloud_primary: false
   cloud_model: "gemma4:31b-cloud"
   # Cloud-coordinator REASONING seam (Phase 4). DEFAULT OFF, and a stricter,
@@ -108,6 +119,29 @@ coordinator:
   # needs OFF-HOST, so enable it only where that data egress is acceptable. Flip
   # at runtime via POST /settings {"coordinator": {"cloud_reasoning": true}}.
   cloud_reasoning: false
+  # AR-1 (P2-2 collapse candidate, ablation variant G): agent-call FAN-OUT
+  # mode. Does not touch agent SELECTION (_choose_agents/dispatch) -- only
+  # how many model calls the dispatched agent set produces. "agents"
+  # (default, shipped) is today's behavior: one model call per dispatched
+  # agent, unchanged. "families" collapses dispatched agents into per-family
+  # composed calls, one call per routed family, via
+  # harness/agent_families.py's DEFAULT_FAMILIES grouping:
+  #   injection        -- sqli, nosql, command_injection, ssti, xss, xxe
+  #   access_control    -- idor, auth, csrf, oauth, jwt, race_condition
+  #   server_side       -- ssrf, deserialization, http_request_smuggling,
+  #                        web_cache_poisoning, open_redirect, websocket
+  #   config_headers    -- cors, csp, header_injection, misconfig,
+  #                        info_disclosure, crypto
+  #   api_logic         -- api_security, graphql, business_logic,
+  #                        business_logic_enhanced, rate_limit, ai_security
+  #   recon_supply      -- recon, subdomain_takeover, supply_chain, anomaly,
+  #                        ai_llm, file_upload
+  # A dispatched agent outside every family still runs its own solo call
+  # (never dropped). NOT a safety flag (fewer model calls, no live traffic,
+  # no wider scope) -- do not add to SafeDefaultGuardTests.SAFE_CHECKS.
+  # Whether "families" retains recall vs. "agents" is an owner-reported
+  # ablation (P2-2 / VARIANTS "G"), not claimed by this default.
+  routing_mode: "agents"
 
 # Adaptive re-spin loop (SESSION_HANDOVER.md §7). DEFAULT OFF, and further
 # a no-op unless coordinator.cloud_primary above is also on -- the loop is
@@ -177,6 +211,42 @@ browser_xss:
   # needed on the host in CDP mode.
   cdp_endpoint: ""
 
+# Driver-based request capture -- LB-2 (harness/driver_capture.py). Loads a
+# page in the SAME Playwright engine browser_xss uses and records the actual
+# requests the page's own JS issues (fetch/XHR -- method, URL, content-type,
+# body, headers), so a form that builds an XML or multipart body in JS at
+# submit time is captured with its real shape instead of a guessed/synthesized
+# one. Captures land in RoleCrawlResult.captured, feeding the SAME
+# confirmation legs passive discovery feeds (xxe, file_upload, ...).
+# SAFE DEFAULT: off in the committed config -- this drives a real browser to
+# load a page and is active-traffic-shaped (same class of knob as
+# autonomous_discovery.enabled / oracle.enabled above); a live local run
+# enables it via config.local.yaml, never by a committed flip.
+driver_capture:
+  enabled: false
+  wait_ms: 1500        # settle time after load, for async JS-issued requests
+  max_captured: 50      # cap on XHR/fetch exchanges captured per page visit
+
+# Cross-site browser PoC for CSRF confirmation -- LB-5 (harness/browser_driver.py
+# PlaywrightDriver.cross_site_submit + harness/validators/csrf_validator.py).
+# Loads a synthesized attacker-origin auto-submit form in a real browser that
+# POSTs cross-site to the captured victim endpoint carrying the victim's AMBIENT
+# session cookie, then independently re-reads (GET-only) the authenticated victim
+# state to verify it changed -- the only way to prove a CSRF is a real browser-
+# deliverable attack rather than an HTTP replay that proves nothing about
+# ambient-credential delivery (see csrf_validator.py's RETIRED note). Stays
+# SILENT when the app defends (SameSite=Strict/Lax, Origin/Referer-enforced,
+# bearer-only/non-ambient auth) -- the browser's OWN SameSite/cookie-jar logic
+# decides delivery; this never attaches credentials itself.
+# SAFE DEFAULT: off in the committed config -- same class of knob as
+# driver_capture.enabled above (drives a real browser, sends live cross-site
+# traffic). A live local run enables it via config.local.yaml, never by a
+# committed flip. With this off, csrf stays a 0.4 OBSERVATION and is never
+# promoted into any live-verified set (promotion is run-derived only, gated on
+# this flag -- see leg_self_test.py's csrf LegCase).
+cross_site_poc:
+  enabled: false
+
 # Per-vulnerability resource governance -- F5 (resource_governor.py). The
 # ceiling for testing ONE vulnerability: how many retries (re-dispatches of the
 # same class), how many distinct agent runs, and a hard per-vulnerability token
@@ -226,6 +296,21 @@ engagement:
   coverage_drive_legs: false
   coverage_leg_budget: 80
 
+# P2-1: business-context planning agent. When on, investigate_engagement runs
+# ONE application-context pass that builds an Application Semantic Model (apparent
+# roles + privilege order, business objects, ordered value-bearing workflows,
+# client-trusted value flows like price/quantity/role/is_admin/id, sensitive
+# sinks, and RANKED chaining hypotheses) and uses it to RE-RANK the worklist by
+# business impact and PROPOSE (never confirm) multi-step chains. DEFAULT OFF: with
+# it off, the loop behaves exactly as today. The pass itself sends NO traffic and
+# confirms NOTHING -- every resulting probe stays gated by validators.active_enabled
+# / allow_mutating_replay / scope / budget. Its input is anonymized structure-only
+# (method / path template / parameter NAMES / roles) by default; raw off-host
+# egress additionally requires coordinator.cloud_reasoning, like the other cloud
+# flags. Enable in the git-ignored config.local.yaml, never here.
+business_context:
+  enabled: false
+
 retry_budget:
   max_retries: 2              # extra re-dispatches after the first pass (0 = one pass)
   max_agents: 3              # distinct agent runs per vulnerability, retries included
@@ -252,48 +337,37 @@ agent_defaults:
 # Smaller/faster models are fine for narrow, well-scoped classification
 # tasks -- only override upward (e.g. back to the coordinator's model or
 # stronger) for agents where you've found the default underperforming.
+#
+# IMPORTANT: do NOT add a per-agent `model:` that merely repeats
+# agent_defaults.model. Such a pin is a silent trap -- it does NOT follow a
+# later change to agent_defaults.model, so "switching the model" would leave
+# that agent behind on the old one. These agents therefore set only `enabled`
+# and inherit the default model; the harness logs each agent's resolved model
+# at startup, warns when an override shadows the default, and exposes the full
+# agent->model map at GET /health so you can verify what actually runs. Add a
+# `model:` here ONLY when it must genuinely differ from the default.
 agents:
   sqli:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   xss:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   idor:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   ssrf:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   auth:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   # Added: rising per 2021-2025 bug bounty/CVE data (see README).
   business_logic:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   misconfig:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   ai_llm:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   rate_limit:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
   supply_chain:
     enabled: true
-    model: "qwen3:8b"
-    temperature: 0.1
 
 # Deterministic lookup against GitHub's public Security Advisory
 # Database, used to resolve component candidates the supply_chain agent
@@ -394,6 +468,29 @@ server:
   # Cap on request/response body bytes sent into prompts, to keep local
   # context windows sane. Bodies are truncated, not dropped, with a marker.
   max_body_chars: 6000
+  # FR-8 (F12 offline half): when true, sensitive GET reads (/report,
+  # /telemetry, /test-plans/{plan_id}, GET /settings) require the same
+  # effective bearer token already required on mutations (server.auth_token/
+  # HARNESS_BEARER_TOKEN if configured, else the ephemeral RB-1 token).
+  # /health stays open either way, for pairing/liveness.
+  #
+  # SAFE DEFAULT: false. Shipping true here would break the Burp extension's
+  # existing unauthenticated reads until its Java side is updated to send the
+  # token on GETs too (that's the OWNER half of F12, not done yet) -- so the
+  # default deploy stays byte-for-byte unchanged. An operator who wants this
+  # hardening today can flip it via the git-ignored config.local.yaml overlay.
+  require_read_auth: false
+  # P3-1 (partial): when true, DELETE /engagement/{host}/evidence permanently
+  # deletes every row this store persisted for that host (via the already-
+  # landed store.wipe_engagement) -- a destructive, irreversible action. The
+  # route is already gated by the same auth as every other mutating route
+  # (the CSRF middleware's mutation token, plus _require_auth); this flag is
+  # an ADDITIONAL opt-in on top of that, not a replacement for it.
+  #
+  # SAFE DEFAULT: false. Ships disabled so no deploy can wipe stored evidence
+  # by default. An operator who wants a deliberate, explicit wipe capability
+  # can flip it via the git-ignored config.local.yaml overlay.
+  enable_wipe_endpoint: false
 
 # Validator/tool layer. Agents propose hypotheses; validators independently
 # test them. Active validators are OFF by default and never accept a
@@ -419,6 +516,14 @@ validators:
   # exchange used. SAFE DEFAULT: off here; a live local run turns it on via
   # config.local.yaml (like active_enabled above), never by a committed flip.
   allow_mutating_replay: false
+  # ER-4: reproduction-replay determinism gate. When on, an active leg
+  # confirming ssrf/ssti/command_injection re-runs its confirming request ONCE
+  # via the same validate() path and keeps confirmed=True only if both runs
+  # agree; on disagreement it downgrades to the existing provisional/unproven
+  # path instead of surfacing a possibly-flaky one-shot confirmation. SAFE
+  # DEFAULT: off here -- ships byte-for-byte unchanged (one validate() call,
+  # no extra traffic). A live/local run turns it on via config.local.yaml.
+  confirm_replay: false
   # Ceiling on how many times the race-condition validator repeats a
   # mutating request concurrently. This can only lower the effective
   # limit below safety_gate.py's own hard ceiling (20) -- it cannot raise
@@ -563,6 +668,33 @@ reporting:
   # unaffected; enable in the measurement overlay (config.local.yaml or the
   # runner's explicit config dict) for blind/no-oracle evaluation.
   quarantine_unverified_leads: false
+  # B2-5: gate UNCONFIRMED, low-confidence (< generic_confidence_floor)
+  # findings in a narrow, named set of generic vulnerability classes
+  # (Security misconfiguration, Broken Access Control (Workflow Bypass), SQL
+  # injection -- the scorecard's dominant FP driver, see
+  # confirmation_gate.is_low_confidence_generic_guess) into the same `leads`
+  # bucket as quarantine_unverified_leads, instead of the main findings list.
+  # Never routes a confirmed/oracle-verified finding, nor one at/above the
+  # floor, regardless of class (hard recall guard). SHIPPED OFF so a
+  # fully-confirmed run, and any run that doesn't opt in, is byte-for-byte
+  # unaffected; enable in the measurement overlay (config.local.yaml or the
+  # runner's explicit config dict) for blind/no-oracle evaluation.
+  gate_low_confidence_generic: false
+  generic_confidence_floor: 0.5
+  # 2026-09-25 FR-4 (supersedes BM-1): for ONLY the two catch-all classes
+  # (misconfig, info_disclosure -- see confirmation_gate.DEFAULT_CATCHALL_CLASSES),
+  # require a confirming leg (confirmed OR oracle_verified) before the
+  # finding is surfaced, rather than trusting its self-reported confidence --
+  # an offline re-score found confidence is the wrong lever for these two
+  # classes specifically (most sit at confidence >= 0.5 already). Demoted
+  # findings are routed to the same `leads` bucket as gate_low_confidence_generic,
+  # not deleted. Deliberately narrow: sqli/xss/idor/path_traversal/jwt/csrf/etc.
+  # are NEVER affected by this flag -- a global leg requirement was measured
+  # to collapse recall to 0.05. SHIPPED OFF so a fully-confirmed run, and any
+  # run that doesn't opt in, is byte-for-byte unaffected; enable in the
+  # measurement overlay (config.local.yaml or the runner's explicit config
+  # dict) for blind/no-oracle evaluation.
+  gate_uncorroborated_catchall: false
 
 # Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
 # off. When enabled, a CONFIRMED finding's host-agnostic structural shape
@@ -574,3 +706,27 @@ reporting:
 pattern_memory:
   enabled: false
   # path: "harness/pattern_memory.jsonl"  # default; override to relocate the log
+
+# P3-1 (partial): retention/expiry for the SQLite evidence-blob store
+# (harness/store.py evidence_blobs table). SAFE DEFAULT: 0 = keep captured
+# evidence forever (current/default behavior); set >0 to purge evidence
+# blobs older than N days. Config-gated only -- nothing calls
+# apply_retention_from_config() automatically yet; wiring it to a
+# scheduler/endpoint is a later slice.
+store:
+  evidence_retention_days: 0
+
+# Per-run knobs (harness/run_context.py RunContext.create reads
+# runs.cache_namespace; unset here, so cache_namespace defaults to "").
+runs:
+  # FR-7 (F11): run-INDEPENDENT reuse of the pre-proof half of an analysis
+  # (model-inference-derived reports, never proof/case/oracle fields --
+  # see cache.HypothesisCacheEntry/get_hypothesis/put_hypothesis) across
+  # DIFFERENT runs' cache_namespaces on identical traffic. The existing
+  # run-namespaced full-response cache (ExchangeCache.get/put) is untouched
+  # and remains the only cache active while this is off. SAFE DEFAULT:
+  # false -- ships off; a hit still always falls through to
+  # _validate_findings so proof/case identifiers are freshly minted for
+  # THIS run, never replayed from a prior one.
+  hypothesis_cache:
+    enabled: false

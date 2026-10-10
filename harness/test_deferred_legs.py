@@ -5,10 +5,15 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 from harness.models import Finding, HttpExchange
 from harness.validators.verb_tamper_validator import VerbTamperValidator
-from harness.validators.csrf_validator import CsrfValidator, _has_csrf_token, _session_cookie_samesite
+from harness.validators.csrf_validator import (CsrfValidator, _has_csrf_token,
+                                                _method_bypass_url, _readback_matches,
+                                                _session_cookie_samesite)
 from harness.validators.file_upload_validator import FileUploadValidator
+from harness.validators.nosql_validator import (NosqlValidator, _administrator_readback,
+                                                _credential_names)
 from harness.run_context import RunContext, ScopePolicy
 from harness.test_run_context import _Fixture
+from types import SimpleNamespace
 
 
 def _exchange(url="http://target.test/api/admin", method="GET", status=403,
@@ -24,6 +29,46 @@ def _exchange(url="http://target.test/api/admin", method="GET", status=403,
 def _finding(vuln_class="misconfig"):
     return Finding(vulnerability_class=vuln_class, severity="medium", confidence=0.7,
                    summary="test", evidence="test", suggested_test="test", basis="derived")
+
+
+class NosqlValidatorTests(unittest.IsolatedAsyncioTestCase):
+    def test_credential_shape_and_readback_helpers(self):
+        self.assertEqual(_credential_names("csrf=x&username=u&password=p"),
+                         ("username", "password"))
+        self.assertTrue(_administrator_readback(
+            "https://t/my-account?id=administrator", ""))
+        self.assertFalse(_administrator_readback("https://t/login", "Invalid username"))
+
+    async def test_control_held_administrator_bypass_confirms(self):
+        validator = NosqlValidator(allowed_hosts=["t"], run_context=object())
+        validator._attempt = AsyncMock(side_effect=[
+            SimpleNamespace(ok=True, status=200, final_url="https://t/login",
+                            body="Invalid username or password"),
+            SimpleNamespace(ok=True, status=200,
+                            final_url="https://t/my-account?id=administrator",
+                            body="Your username is: administrator"),
+        ])
+        result = await validator.validate(
+            _finding("nosql"), _exchange(
+                url="https://t/login", method="POST", status=200,
+                request_headers={"Content-Type": "application/x-www-form-urlencoded"},
+                request_body="csrf=x&username=u&password=p"))
+        self.assertTrue(result.confirmed)
+        self.assertEqual(result.status, "confirmed")
+
+    async def test_negative_control_reaching_admin_rejects_confirmation(self):
+        validator = NosqlValidator(allowed_hosts=["t"], run_context=object())
+        validator._attempt = AsyncMock(return_value=SimpleNamespace(
+            ok=True, status=200,
+            final_url="https://t/my-account?id=administrator",
+            body="Your username is: administrator"))
+        result = await validator.validate(
+            _finding("nosql"), _exchange(
+                url="https://t/login", method="POST", status=200,
+                request_headers={"Content-Type": "application/x-www-form-urlencoded"},
+                request_body="username=u&password=p"))
+        self.assertFalse(result.confirmed)
+        self.assertEqual(result.status, "not_confirmed")
 
 
 # ---- VerbTamperValidator ----
@@ -151,6 +196,19 @@ class CsrfHelperTests(unittest.TestCase):
         ex = _exchange(response_headers={"Set-Cookie": "theme=dark; Path=/"})
         self.assertIsNone(_session_cookie_samesite(ex))
 
+    def test_method_bypass_drops_only_token_field(self):
+        ex = _exchange(url="http://target.test/change?view=account", method="POST",
+                       request_body="email=probe%40example.com&csrf=secret")
+        url, submitted = _method_bypass_url(ex)
+        self.assertIn("email=probe%40example.com", url)
+        self.assertNotIn("csrf", url)
+        self.assertEqual(submitted, [("email", "probe@example.com")])
+
+    def test_readback_needs_distinct_submitted_value(self):
+        self.assertTrue(_readback_matches("email: probe@example.com",
+                                          [("email", "probe@example.com")]))
+        self.assertFalse(_readback_matches("ordinary page 1", [("id", "1")]))
+
 
 class CsrfValidatorTests(unittest.TestCase):
     def setUp(self):
@@ -167,6 +225,27 @@ class CsrfValidatorTests(unittest.TestCase):
         r = asyncio.run(self.v.validate(_finding("csrf"), ex))
         self.assertEqual(r.status, "not_confirmed")
         self.assertIn("SameSite", r.summary)
+
+    @patch("harness.validators.csrf_validator.GatedAsyncClient")
+    @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
+    def test_method_dependent_token_validation_requires_readback(self, _throttle, mock_client_cls):
+        ex = _exchange(
+            url="http://target.test/change-email", method="POST", status=200,
+            request_headers={"Cookie": "session=victim", "Content-Type": "application/x-www-form-urlencoded"},
+            request_body="email=probe%40example.com&csrf=secret")
+        confirmed = MagicMock(status_code=200, text="Account email: probe@example.com")
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=confirmed)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock()
+        mock_client_cls.return_value = client
+        result = asyncio.run(self.v.validate(_finding("csrf"), ex))
+        self.assertTrue(result.confirmed)
+        self.assertEqual(result.status, "confirmed")
+
+        client.get.return_value = MagicMock(status_code=200, text="Account unchanged")
+        result = asyncio.run(self.v.validate(_finding("csrf"), ex))
+        self.assertFalse(result.confirmed)
 
     @patch("harness.validators.csrf_validator.GatedAsyncClient")
     @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
@@ -361,7 +440,9 @@ class RealWrapperFileUploadTests(unittest.TestCase):
     def setUp(self):
         from harness import safety_gate
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed scope so the upload POST clears the fail-closed gate (3c622c3).
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": ["target.test"]})
         self.v = FileUploadValidator(allowed_hosts=["target.test"])
 
     def tearDown(self):
@@ -416,7 +497,10 @@ class RealWrapperFileUploadTests(unittest.TestCase):
         import httpx
         from harness import safety_gate
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": False})
+        # In scope, so the skip is attributable to allow_mutating_replay=False (the
+        # property under test) rather than to an out-of-scope refusal.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": False,
+                                      "allowed_hosts": ["target.test"]})
 
         def handler(request):  # should never be reached
             return httpx.Response(200, json={"url": "/uploads/x.html"})

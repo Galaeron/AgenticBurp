@@ -79,7 +79,10 @@ class TestSafetyGateClassification(unittest.TestCase):
 
 class TestHardDenyPatterns(unittest.TestCase):
     def setUp(self):
-        self.gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True, max_burst_size=99))
+        # Scope is seeded explicitly (this class tests hard-deny, not scope; the
+        # fail-closed empty-scope behaviour is covered by TestScopeLockGating).
+        self.gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
+                                                max_burst_size=99, allowed_hosts={"example.com"}))
 
     def test_drop_table_in_body_is_hard_denied(self):
         tier = self.gate.classify("GET", body="'; DROP TABLE users; --")
@@ -170,13 +173,15 @@ class TestMutatingMethodGating(unittest.TestCase):
         # This is the core new protection: active_enabled alone is NOT
         # enough to authorize a mutating replay -- a second, separate
         # flag is required.
-        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=False))
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=False,
+                                           allowed_hosts={"x.example"}))
         decision = gate.authorize(validator_name="t", method="DELETE", url="https://x.example/")
         self.assertFalse(decision.allowed)
         self.assertIn("allow_mutating_replay", decision.reason)
 
     def test_mutating_allowed_when_both_flags_on(self):
-        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
+                                           allowed_hosts={"x.example"}))
         decision = gate.authorize(validator_name="t", method="POST", url="https://x.example/")
         self.assertTrue(decision.allowed)
 
@@ -186,11 +191,48 @@ class TestMutatingMethodGating(unittest.TestCase):
         self.assertTrue(decision.allowed)
 
 
+class TestScopeLockGating(unittest.TestCase):
+    """The fail-closed scope lock itself (safety item #12). The method/burst/
+    ceiling tests above seed a host explicitly so they can reach the logic they
+    test; these keep the scope BEHAVIOUR covered, so seeding scope elsewhere can
+    never let the lock silently regress into a no-op."""
+
+    def test_empty_scope_in_active_mode_refuses(self):
+        # The exact condition the other tests must seed around: active mode with
+        # no declared scope fails closed, before any method/ceiling logic runs.
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        decision = gate.authorize(validator_name="t", method="POST", url="https://x.example/")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.tier, ActionRiskTier.OUT_OF_SCOPE)
+
+    def test_in_scope_host_is_allowed(self):
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
+                                           allowed_hosts={"x.example"}))
+        self.assertTrue(gate.authorize(validator_name="t", method="POST",
+                                       url="https://x.example/").allowed)
+
+    def test_a_different_host_is_still_refused_with_a_scope_set(self):
+        # Proves scope seeding authorizes ONLY the seeded host, not everything --
+        # so a seeded test can't accidentally disable scope matching.
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
+                                           allowed_hosts={"x.example"}))
+        decision = gate.authorize(validator_name="t", method="POST", url="https://evil.example/")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.tier, ActionRiskTier.OUT_OF_SCOPE)
+
+    def test_empty_scope_in_passive_mode_is_allowed_backcompat(self):
+        # active_enabled=False keeps standalone/passive compatibility: no scope
+        # required when not in active mode (the fail-closed rule is active-only).
+        gate = SafetyGate(SafetyGateConfig(active_enabled=False))
+        self.assertTrue(gate.authorize(validator_name="t", method="GET",
+                                       url="https://anything.example/").allowed)
+
+
 class TestBurstCeilings(unittest.TestCase):
     def test_burst_capped_by_hard_ceiling_regardless_of_config(self):
         # Config asks for far more than the hard ceiling allows.
         gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
-                                            max_burst_size=999999))
+                                            max_burst_size=999999, allowed_hosts={"x.example"}))
         decision = gate.authorize_burst(validator_name="race", method="POST", url="https://x.example/",
                                          requested_burst_size=999999)
         self.assertTrue(decision.allowed)
@@ -199,7 +241,7 @@ class TestBurstCeilings(unittest.TestCase):
 
     def test_burst_capped_by_config_when_stricter_than_hard_ceiling(self):
         gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
-                                            max_burst_size=3))
+                                            max_burst_size=3, allowed_hosts={"x.example"}))
         decision = gate.authorize_burst(validator_name="race", method="POST", url="https://x.example/",
                                          requested_burst_size=12)
         self.assertTrue(decision.allowed)
@@ -207,7 +249,7 @@ class TestBurstCeilings(unittest.TestCase):
 
     def test_burst_capped_by_validators_own_request_when_smallest(self):
         gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
-                                            max_burst_size=50))
+                                            max_burst_size=50, allowed_hosts={"x.example"}))
         decision = gate.authorize_burst(validator_name="race", method="POST", url="https://x.example/",
                                          requested_burst_size=5)
         self.assertTrue(decision.allowed)
@@ -215,21 +257,22 @@ class TestBurstCeilings(unittest.TestCase):
 
     def test_burst_denied_entirely_if_mutating_replay_off(self):
         gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=False,
-                                            max_burst_size=50))
+                                            max_burst_size=50, allowed_hosts={"x.example"}))
         decision = gate.authorize_burst(validator_name="race", method="POST", url="https://x.example/",
                                          requested_burst_size=12)
         self.assertFalse(decision.allowed)
 
     def test_hard_deny_pattern_blocks_burst_too(self):
         gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
-                                            max_burst_size=50))
+                                            max_burst_size=50, allowed_hosts={"x.example"}))
         decision = gate.authorize_burst(validator_name="race", method="POST", url="https://x.example/",
                                          requested_burst_size=12, body="DROP TABLE orders")
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.tier, ActionRiskTier.HARD_DENIED)
 
     def test_zero_or_negative_burst_size_disables_burst(self):
-        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True, max_burst_size=0))
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True, max_burst_size=0,
+                                           allowed_hosts={"x.example"}))
         decision = gate.authorize_burst(validator_name="race", method="POST", url="https://x.example/",
                                          requested_burst_size=12)
         self.assertFalse(decision.allowed)
@@ -271,7 +314,8 @@ class TestGatedAsyncClient(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(gate.audit_log[0].allowed)
 
     async def test_hard_denied_body_raises_even_with_everything_else_on(self):
-        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
+                                           allowed_hosts={"example.com"}))
         async with GatedAsyncClient(gate, "test_validator") as client:
             with self.assertRaises(SafetyGateBlocked) as ctx:
                 await client.request("POST", "https://example.com/x", content="DROP TABLE users")
@@ -346,6 +390,9 @@ _GATE_ROUTED_EXCEPTIONS = {
     # matches the mutating-method-literal check below, not the exchange.method
     # one, and is verified gate-routed there.
     "reset_token_validator.py",
+    # client_trust replays the captured write method with a tampered value field
+    # (price/amount) through GatedAsyncClient, self-gated on allow_mutating_replay.
+    "client_trust_validator.py",
 }
 
 
@@ -403,6 +450,15 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             # `if (exchange.method or "GET").upper() != "GET": return skipped`, and
             # the live send (_probe) hardcodes client.get(). Never sent.
             "jwt_forge_validator.py",
+            # idor_read is GET-only: its exchange.method references are two defensive
+            # `!= "GET": return skipped` guards plus two evidence f-strings; the only
+            # live send hardcodes client.request("GET", ...). The captured method is
+            # never sent.
+            "idor_read_validator.py",
+            # nosql's only exchange.method reference is a defensive `!= "POST": skip`
+            # guard; its live sends go through the gate-routed RunContext transport
+            # (transport.send) with the form's own/ hardcoded method, never exchange.method.
+            "nosql_validator.py",
         }
 
         violations = []
@@ -495,6 +551,9 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
                      "path_traversal_validator.py", "open_redirect_validator.py",
                      "sequence_validator.py", "deserialization_oob_validator.py",
                      "auth_sequence_validator.py", "stored_xss_validator.py",
+                     # client_trust replays the captured write with a tampered value
+                     # field through the gate; verify it too routes through it.
+                     "client_trust_validator.py",
                      # reset_token hardcodes method="POST" (mutating-literal
                      # check), so verify it too routes through the gate.
                      "reset_token_validator.py"):
@@ -518,12 +577,22 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
                         max(0, line_no - 5):line_no][0] and "cmd +=" in line:
                     self.fail(f"sqlmap.py line {line_no} adds denied flag {flag} to cmd: {line.strip()}")
 
-    def test_sqlmap_has_hard_ceiling_assertions(self):
+    def test_sqlmap_hard_ceiling_is_not_a_strippable_assert(self):
+        # The risk/level ceilings and the denied-flag guard are SAFETY invariants,
+        # so they must be `if ... raise`, never `assert` -- `python -O` strips
+        # assert statements, which would silently remove the guard. Enforce both
+        # the presence of the runtime guard AND the absence of the assert form.
         import pathlib
         here = pathlib.Path(__file__).parent
         sqlmap_src = (here / "validators" / "sqlmap.py").read_text()
-        self.assertIn("assert self.risk <= 2", sqlmap_src)
-        self.assertIn("assert self.level <= 2", sqlmap_src)
+        self.assertIn("if self.risk > 2:", sqlmap_src)
+        self.assertIn("if self.level > 2:", sqlmap_src)
+        self.assertNotIn("assert self.risk", sqlmap_src,
+                         "sqlmap risk ceiling must not be an assert (stripped under python -O)")
+        self.assertNotIn("assert self.level", sqlmap_src,
+                         "sqlmap level ceiling must not be an assert (stripped under python -O)")
+        self.assertNotIn("assert denied not in cmd", sqlmap_src,
+                         "sqlmap denied-flag guard must not be an assert (stripped under python -O)")
 
 
 class PerFindingMutationCeilingTests(unittest.TestCase):
@@ -534,7 +603,8 @@ class PerFindingMutationCeilingTests(unittest.TestCase):
     def _gate(self, ceiling=1):
         return SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
                                            max_burst_size=99,
-                                           max_mutating_requests_per_finding=ceiling))
+                                           max_mutating_requests_per_finding=ceiling,
+                                           allowed_hosts={"x.example", "x"}))
 
     def test_third_post_denied_with_ceiling_of_one(self):
         gate = self._gate(ceiling=1)
@@ -620,7 +690,8 @@ class TestAmbientGateScope(unittest.TestCase):
 
         # 2. "create an active run afterward" -- an invocation installs its OWN
         # gate as ambient for its lifetime.
-        active_gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        active_gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
+                                                  allowed_hosts={"127.0.0.1"}))
         with gate_scope(active_gate):
             # SQLMap's exact fallback expression (self.run_context is None):
             # `get_default_gate()`, then .authorize(POST ...).
@@ -635,7 +706,8 @@ class TestAmbientGateScope(unittest.TestCase):
             self.assertIs(get_default_gate(), active_gate)
 
     def test_a_safe_run_afterward_is_not_contaminated_by_the_earlier_active_one(self):
-        active_gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        active_gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
+                                                  allowed_hosts={"x"}))
         with gate_scope(active_gate):
             self.assertTrue(get_default_gate().authorize(
                 validator_name="sqlmap", method="POST", url="http://x/login").allowed)

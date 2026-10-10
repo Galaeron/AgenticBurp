@@ -2,11 +2,23 @@
 Phase 0: capture real HTTP exchanges from a live PixelMart instance,
 covering every endpoint in ANSWER_KEY.md. Saved as JSON so later phases
 don't need the app running.
+
+Cross-platform: the capture is written to a repo-relative path
+(testing/test-target/corpus/pixelmart_exchanges.json), not a hardcoded
+C:\\tmp / /tmp location, so it works on any OS and detection_fixture.py reads
+the same default. Override the target with PIXELMART_BASE and the output with
+DETBENCH_EXCHANGES.
 """
 import json
+import os
+from pathlib import Path
+
 import requests
 
-BASE = "http://127.0.0.1:5001"
+BASE = os.environ.get("PIXELMART_BASE", "http://127.0.0.1:5001")
+OUT_PATH = Path(os.environ.get(
+    "DETBENCH_EXCHANGES",
+    str(Path(__file__).resolve().parent / "corpus" / "pixelmart_exchanges.json")))
 exchanges = []
 
 
@@ -123,9 +135,10 @@ capture("POST", "/api/account/change-email", headers=AUTH_ALICE, json_body={"ema
 capture("GET", "/api/health",
         label="TN6: health check, no sensitive data")
 
-with open("/tmp/pixelmart_exchanges.json", "w") as f:
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+with open(OUT_PATH, "w") as f:
     json.dump(exchanges, f, indent=2)
 
-print(f"Captured {len(exchanges)} exchanges -> /tmp/pixelmart_exchanges.json")
+print(f"Captured {len(exchanges)} exchanges -> {OUT_PATH}")
 for e in exchanges:
     print(f"  [{e['response_status']}] {e['method']:5s} {e['url'][:70]:70s} -- {e['label']}")

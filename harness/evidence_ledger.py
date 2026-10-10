@@ -36,6 +36,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from harness.source_identity import SourceSnapshot, process_source_snapshot
 
 EVIDENCE_SCHEMA_VERSION = "1.0"
 
@@ -48,6 +49,8 @@ class EventType(str, Enum):
     EXECUTION = "execution"                            # the actual send: request/response/tool io
     VALIDATION_DECISION = "validation_decision"        # confirmed / refuted / inconclusive
     FINDING_REVISION = "finding_revision"              # a lifecycle/severity change to the finding
+    RUN_SUMMARY = "run_summary"                        # ER-2: one canonical per-run trace summary
+    PERSISTENCE_FAILURE = "persistence_failure"
 
 
 # Canonical order for reconstructing a chain when timestamps tie.
@@ -75,10 +78,12 @@ class Provenance:
     model: str = ""
     prompt_version: str = ""
     evidence_schema_version: str = EVIDENCE_SCHEMA_VERSION
+    source_identity: dict = field(default_factory=dict)
 
     @classmethod
     def capture(cls, *, config: dict | None = None, model: str = "",
-                prompt_version: str = "", config_fingerprint: str = "") -> "Provenance":
+                prompt_version: str = "", config_fingerprint: str = "",
+                source_snapshot: SourceSnapshot | None = None) -> "Provenance":
         fp = config_fingerprint
         if not fp and config is not None:
             try:
@@ -87,7 +92,8 @@ class Provenance:
             except Exception:
                 fp = ""
         return cls(code_version=_code_version(), config_fingerprint=fp,
-                   model=model, prompt_version=prompt_version)
+                   model=model, prompt_version=prompt_version,
+                   source_identity=(source_snapshot or process_source_snapshot()).to_dict())
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -118,6 +124,236 @@ class LedgerEvent:
         return d
 
 
+def _nonempty(s) -> bool:
+    return bool((s or "").strip()) if isinstance(s, str) else bool(s)
+
+
+def _resolved_blob_hash(executions: list, field: str, *, resolver=None) -> str | None:
+    """The first hash under `field` (``request_blob``/``response_blob``) on any
+    EXECUTION event that actually STORAGE-RESOLVES (harness.store.
+    evidence_blob_resolves): present in the blob store AND its bytes still
+    hash to that value. Returns None if no such hash resolves -- whether
+    because no hash was ever recorded, or because the one recorded is
+    missing/corrupted. Imported lazily (like the rest of this module's store
+    access) to avoid a hard import-time dependency on store.py.
+
+    `resolver`: optional ``hash -> bool`` override for the default
+    ``store.evidence_blob_resolves`` lookup (RA-4 batched-report perf). A
+    caller reconstructing many findings in one report can pass a memoizing
+    resolver so the SAME hash is only ever checked once across the whole
+    batch, instead of once per finding that happens to reference it. Omitted
+    (the default, and what every existing caller gets) preserves the exact
+    prior behavior: one fresh `store.evidence_blob_resolves` call per hash."""
+    if resolver is None:
+        try:
+            from harness import store
+        except Exception:
+            return None
+        resolver = store.evidence_blob_resolves
+    for e in executions:
+        h = e.data.get(field)
+        if _nonempty(h):
+            try:
+                if resolver(h):
+                    return h
+            except Exception:
+                pass
+    return None
+
+
+def _resolvable_execution(executions: list, *, resolver=None) -> "LedgerEvent | None":
+    """The first EXECUTION event whose OWN ``request_blob`` AND ``response_blob``
+    BOTH storage-resolve (see ``_blob_resolves`` / ``store.evidence_blob_resolves``)
+    -- i.e. a SINGLE execution that alone supports replay.
+
+    This is the R01 fix for the cross-execution "blob pooling" over-claim:
+    ``_resolved_blob_hash`` resolves ``request_blob``/``response_blob``
+    INDEPENDENTLY across ALL executions, so a request-only execution A plus an
+    unrelated response-only execution B could together satisfy
+    ``request_blob_hash and response_blob_hash`` despite no single send being
+    replayable -- an assurance no single execution actually supports. This
+    helper requires the pair to resolve off the SAME execution's own data.
+
+    Returns the resolving execution event itself (not just a bool) so a
+    caller that wants the actual hashes can read them straight off it, or
+    None if no execution's own pair resolves.
+
+    `resolver`: same optional ``hash -> bool`` override as `_resolved_blob_hash`
+    / `_blob_resolves` (RA-4 batched-report memoization); omitted resolves via
+    a fresh `harness.store.evidence_blob_resolves()` call per hash checked."""
+    if resolver is None:
+        try:
+            from harness import store
+        except Exception:
+            return None
+        resolver = store.evidence_blob_resolves
+    for e in executions:
+        req_h = e.data.get("request_blob")
+        resp_h = e.data.get("response_blob")
+        if not (_nonempty(req_h) and _nonempty(resp_h)):
+            continue
+        try:
+            if resolver(req_h) and resolver(resp_h):
+                return e
+        except Exception:
+            pass
+    return None
+
+
+def _blob_resolves(h) -> bool:
+    """True iff a single hash `h` is present and storage-resolves (harness.
+    store.evidence_blob_resolves). Same semantics/try-except-swallow pattern
+    as `_resolved_blob_hash` above, but checked against ONE specific hash
+    (e.g. one EXECUTION step's own request_blob/response_blob) rather than
+    "the first resolving hash across every EXECUTION" -- reproduction_recipe
+    needs PER-STEP replayability, not the pooled-across-executions check
+    `_assess_completeness` uses for its own resolvable flag. Imported lazily
+    to avoid a hard import-time dependency on store.py; any store error
+    (including no store available) is treated as unresolved."""
+    if not _nonempty(h):
+        return False
+    try:
+        from harness import store
+    except Exception:
+        return False
+    try:
+        return bool(store.evidence_blob_resolves(h))
+    except Exception:
+        return False
+
+
+_REHYDRATION_NOTE = (
+    "stored request/response blobs are REDACTED (secrets/session/credentials "
+    "stripped before hashing, per run_context.TargetTransport._artifact) -- "
+    "authenticated replay needs session/credential/input rehydration; the "
+    "blob alone is not a literal replay.")
+
+
+def _assess_completeness(by_type: "dict[EventType, list[LedgerEvent]]", *, resolver=None,
+                         persistence_degraded=False) -> dict:
+    """Honest reproducibility assessment for a finding (P0-6 / R10; FR-2 / F03).
+
+    `complete` (elsewhere) only says a verdict was reached. That is NOT the same
+    as a tester being able to reproduce the finding. FR-2 tightens this further:
+    a nonempty `request`/`response` STRING (e.g. a bare URL, or ``HTTP 200``) is
+    a human-readable reference, not reproducible evidence -- it proves nothing
+    was hashed or stored, only that someone wrote a label. `resolvable` now
+    requires a REAL, content-addressed, hash-verified blob for BOTH the request
+    and the response (see run_context.TargetTransport._artifact, which stores
+    them, already redacted, only at the successful-send call site). A blob hash
+    that was recorded but no longer resolves (deleted/corrupted) is reported
+    exactly like one that was never recorded -- resolvability is storage-backed,
+    never a nonempty-string illusion. Computed only from the events on hand, so
+    a durable record whose EXECUTION event failed to persist reconstructs as NOT
+    resolvable (never a silent ``complete`` durable record for un-persisted
+    evidence).
+
+    R01: `resolvable` requires the request+response pair to resolve off ONE
+    SINGLE execution's own data (`_resolvable_execution`), never a request
+    blob resolving on execution A pooled with a response blob resolving on a
+    DIFFERENT execution B -- that pooled check (still used below for the
+    `has_request_blob`/`has_response_blob` diagnostic fields, which answer
+    "does a resolving blob of this kind exist anywhere for this finding", not
+    "is this finding replayable") was an over-claim no single execution
+    actually supported. A resolvable finding also carries `rehydration_required`
+    -- stored blobs are redacted, so a resolvable recipe is not a literal
+    replay without session/credential/input rehydration.
+    """
+    executions = by_type.get(EventType.EXECUTION, [])
+    observations = by_type.get(EventType.OBSERVATION, []) + by_type.get(EventType.HYPOTHESIS, [])
+
+    has_conclusion = bool(by_type.get(EventType.VALIDATION_DECISION)
+                          or by_type.get(EventType.FINDING_REVISION))
+    has_execution = bool(executions)
+    has_request = any(_nonempty(e.data.get("request")) for e in executions)
+    has_response = any(_nonempty(e.data.get("response")) for e in executions)
+    has_captured_observation = any(_nonempty(e.summary) for e in observations)
+
+    has_request_blob_ref = any(_nonempty(e.data.get("request_blob")) for e in executions)
+    has_response_blob_ref = any(_nonempty(e.data.get("response_blob")) for e in executions)
+    # Pooled (across-all-executions) resolution: kept ONLY for the diagnostic
+    # has_request_blob/has_response_blob fields below ("does a resolving blob
+    # of this kind exist anywhere for this finding") and the per-field
+    # `missing` messages -- never for `resolvable` itself (see R01 above).
+    request_blob_hash = _resolved_blob_hash(executions, "request_blob", resolver=resolver)
+    response_blob_hash = _resolved_blob_hash(executions, "response_blob", resolver=resolver)
+    evidence_blob_degraded = any(e.data.get("evidence_blob_degraded") for e in executions)
+
+    missing: list[str] = []
+    persistence_degraded = bool(persistence_degraded
+        or by_type.get(EventType.PERSISTENCE_FAILURE)
+        or any(e.data.get("ledger_persistence_degraded")
+               for events in by_type.values() for e in events))
+    if persistence_degraded:
+        missing.append("ledger persistence failed; durable evidence is incomplete")
+    if not has_conclusion:
+        missing.append("no verdict (validation decision / finding revision) recorded")
+    if has_execution:
+        if not has_request:
+            missing.append("execution recorded but the request reference is empty")
+        if not has_response:
+            missing.append("execution recorded but the response capture is empty")
+        # FR-2/R01: an independently re-runnable step needs a STORED,
+        # HASH-VERIFIED blob for both the request and the response -- the
+        # legacy `request`/`response` strings above are display-only
+        # references and are never, by themselves, sufficient -- AND that
+        # pair must resolve off ONE SINGLE execution's own data, never a
+        # request blob from execution A pooled with a response blob from a
+        # different execution B (no single send supports that "resolvable").
+        resolvable_exec = _resolvable_execution(executions, resolver=resolver)
+        resolvable = resolvable_exec is not None
+        if not resolvable:
+            if not has_request_blob_ref and not has_response_blob_ref:
+                missing.append(
+                    "request/response recorded only as a reference (e.g. 'HTTP 200'), "
+                    "not a stored hash-verified artifact")
+            else:
+                if has_request_blob_ref and not request_blob_hash:
+                    missing.append("referenced request blob is missing or failed hash verification")
+                elif not has_request_blob_ref:
+                    missing.append("no request blob recorded -- reference only")
+                if has_response_blob_ref and not response_blob_hash:
+                    missing.append("referenced response blob is missing or failed hash verification")
+                elif not has_response_blob_ref:
+                    missing.append("no response blob recorded -- reference only")
+                if request_blob_hash and response_blob_hash:
+                    # Both fields resolve SOMEWHERE, but never on the SAME
+                    # execution -- the R01 split-pair case.
+                    missing.append(
+                        "request and response blobs each resolve, but never both on the "
+                        "SAME execution -- no single send is independently replayable")
+            if evidence_blob_degraded:
+                missing.append(
+                    "evidence blob store failed durably at capture time; the request/response "
+                    "were not archived (evidence health degraded)")
+    else:
+        if not has_captured_observation:
+            missing.append("no execution and no captured observation to reproduce from")
+        # No active send was recorded: nothing independently re-runnable exists in
+        # the ledger (a passive finding's evidence is the original captured
+        # exchange, re-read, not a step this ledger can replay).
+        resolvable = False
+
+    return {
+        "resolvable": resolvable and not persistence_degraded,
+        "persistence_degraded": persistence_degraded,
+        "has_conclusion": has_conclusion,
+        "has_execution": has_execution,
+        "has_request": has_request,
+        "has_response": has_response,
+        "has_captured_observation": has_captured_observation,
+        "has_request_blob": bool(request_blob_hash),
+        "has_response_blob": bool(response_blob_hash),
+        "evidence_blob_degraded": evidence_blob_degraded,
+        # C: a resolvable finding's stored blobs are still REDACTED (secrets/
+        # session stripped at capture, run_context.TargetTransport._artifact)
+        # -- declare that a resolvable recipe is not itself a literal replay.
+        "rehydration_required": resolvable and not persistence_degraded,
+        "rehydration_note": _REHYDRATION_NOTE if resolvable and not persistence_degraded else None,
+        "missing": missing,
+    }
+
+
 class AppendOnlyViolation(Exception):
     """Raised on any attempt to re-append or otherwise mutate a ledger event."""
 
@@ -142,6 +378,7 @@ class EvidenceLedger:
         self._events: list[LedgerEvent] = []
         self._ids: set[str] = set()
         self.max_events = max_events
+        self._persistence_degraded = False
 
     def append(self, event: LedgerEvent) -> LedgerEvent:
         if event.event_id in self._ids:
@@ -167,8 +404,15 @@ class EvidenceLedger:
             [e for e in self._events if e.finding_ref == finding_ref],
             key=lambda e: (e.created_at, _ORDER.get(e.event_type, 99)))
 
-    def reconstruct(self, finding_ref: str) -> dict:
-        """Answer the five audit questions for one finding from its events alone."""
+    def reconstruct(self, finding_ref: str, *, resolver=None) -> dict:
+        """Answer the five audit questions for one finding from its events alone.
+
+        `resolver`: optional override threaded straight through to
+        _assess_completeness's blob-hash resolution (RA-4 batched-report
+        memoization) -- see _resolved_blob_hash's docstring. Omitted (the
+        default, and what every existing caller gets) resolves each blob
+        hash via a fresh harness.store.evidence_blob_resolves() call, exactly
+        as before this parameter existed."""
         evs = self.events_for(finding_ref)
         by_type: dict[EventType, list[LedgerEvent]] = {}
         for e in evs:
@@ -178,6 +422,8 @@ class EvidenceLedger:
             return [e.summary for e in by_type.get(t, [])]
 
         executions = by_type.get(EventType.EXECUTION, [])
+        completeness = _assess_completeness(by_type, resolver=resolver,
+                                            persistence_degraded=self._persistence_degraded)
         return {
             "finding_ref": finding_ref,
             "why_tested": summaries(EventType.OBSERVATION) + summaries(EventType.HYPOTHESIS),
@@ -190,24 +436,95 @@ class EvidenceLedger:
             "what_was_never_tested": [e.data["not_tested"] for e in evs if e.data.get("not_tested")],
             "event_count": len(evs),
             "provenance": evs[0].provenance.to_dict() if evs else {},
+            # A verdict is still separately reported as has_conclusion. A
+            # known durable-write loss must not advertise complete evidence.
             "complete": bool(by_type.get(EventType.VALIDATION_DECISION)
-                             or by_type.get(EventType.FINDING_REVISION)),
+                             or by_type.get(EventType.FINDING_REVISION))
+                        and not completeness["persistence_degraded"],
+            "completeness": completeness,
         }
 
     def reproduction_recipe(self, finding_ref: str) -> dict:
-        """The minimal, provenance-stamped recipe to reproduce a finding."""
+        """The minimal, provenance-stamped recipe to reproduce a finding.
+
+        RA-1: the old shape only ever surfaced `request`/`expected` -- the
+        human-readable reference strings -- and `expected` is never even set
+        by the live EXECUTION producer (run_context.TargetTransport._artifact).
+        That let a recipe claim to be a "reproducible finding" while pointing
+        at none of the actual replayable evidence, even when `completeness.
+        resolvable` (see _assess_completeness) was True beside it. Each
+        EXECUTION step now also surfaces `method` and the request/response
+        blob HASHES -- but only when they storage-resolve (_blob_resolves,
+        same check `_resolved_blob_hash` uses, applied per-step rather than
+        pooled across executions) -- plus a `replayable` flag so a caller
+        never has to re-derive resolvability itself. The legacy `request`/
+        `expected` keys are kept for back-compat; nothing existing is removed.
+
+        R01: top-level `resolvable` (and each step's `replayable`) requires
+        the request+response pair to resolve off ONE SINGLE execution's own
+        data (`_resolvable_execution` -- the exact same per-execution-pair
+        check `_assess_completeness` now uses), never a request blob
+        resolving on execution A pooled with a response blob resolving on a
+        DIFFERENT execution B. A resolvable step/recipe also carries
+        `rehydration_required` -- stored blobs are redacted, so resolvable
+        is not itself a literal replay.
+        """
         evs = self.events_for(finding_ref)
         executions = [e for e in evs if e.event_type == EventType.EXECUTION]
         prov = evs[0].provenance if evs else Provenance()
+
+        steps = []
+        for e in executions:
+            request_blob = e.data.get("request_blob")
+            response_blob = e.data.get("response_blob")
+            request_resolves = _blob_resolves(request_blob)
+            response_resolves = _blob_resolves(response_blob)
+            replayable = request_resolves and response_resolves
+            step = {
+                "request": e.data.get("request", ""),
+                "expected": e.data.get("expected", ""),
+                "method": e.data.get("method"),
+                "response": e.data.get("response", ""),
+                "status": e.data.get("response", ""),
+                "request_blob": request_blob if request_resolves else None,
+                "response_blob": response_blob if response_resolves else None,
+                "replayable": replayable,
+            }
+            if replayable:
+                step["rehydration_required"] = True
+                step["rehydration_note"] = _REHYDRATION_NOTE
+            else:
+                step["note"] = "reference-only, not replayable"
+            steps.append(step)
+
+        # Top-level `resolvable`: reuse `_resolvable_execution` -- the EXACT
+        # same per-execution-pair helper `_assess_completeness` now calls to
+        # compute `completeness.resolvable` -- over the SAME `executions`
+        # list. This (not the old pooled `_resolved_blob_hash` check) is what
+        # GUARANTEES this recipe's resolvability never drifts from
+        # `reconstruct(...)["completeness"]["resolvable"]` for the same
+        # finding, and it now agrees with the per-step `replayable` flags
+        # above too (both require one execution's own pair to resolve).
+        degraded = self.reconstruct(finding_ref)["completeness"]["persistence_degraded"]
+        resolvable = _resolvable_execution(executions) is not None and not degraded
+        if degraded:
+            for step in steps:
+                step["replayable"] = False
+                step.pop("rehydration_required", None)
+                step.pop("rehydration_note", None)
+                step["note"] = "ledger persistence failed; durable evidence is incomplete"
+
         return {
             "finding_ref": finding_ref,
             "code_version": prov.code_version,
             "config_fingerprint": prov.config_fingerprint,
             "evidence_schema_version": prov.evidence_schema_version,
-            "steps": [
-                {"request": e.data.get("request", ""), "expected": e.data.get("expected", "")}
-                for e in executions
-            ],
+            "source_identity": prov.source_identity,
+            "persistence_degraded": degraded,
+            "resolvable": resolvable,
+            "rehydration_required": resolvable,
+            "rehydration_note": _REHYDRATION_NOTE if resolvable else None,
+            "steps": steps,
         }
 
     def to_dicts(self) -> list[dict]:
@@ -222,9 +539,8 @@ class EvidenceLedger:
 # emits onto, plus a persistence bridge to store.py so the stream survives a
 # process restart and the findings API / report can reconstruct a finding
 # without needing the in-memory singleton. INSTRUMENTATION ONLY: emit()
-# never raises into and never returns anything a caller branches on -- a
-# store failure is swallowed (logged) so a persistence hiccup can never
-# affect a finding's verdict, severity, or the send it is recording.
+# store failure is recorded as degraded evidence and a sanitized warning;
+# the finding's verdict/severity and any producer decision remain unchanged.
 # ---------------------------------------------------------------------------
 
 import logging as _logging
@@ -232,6 +548,18 @@ import logging as _logging
 _log = _logging.getLogger("harness.evidence_ledger")
 
 _DEFAULT_LEDGER = EvidenceLedger(max_events=DEFAULT_MAX_EVENTS)
+_PERSISTENCE_FAILURES = 0
+
+
+def evidence_write_status() -> dict:
+    """Sticky bounded process status; no finding identifiers or exception text.
+
+    A total storage outage cannot durably record its own failure. This status
+    survives ledger eviction/reset, but requires external monitoring to survive
+    process loss when even the failure marker could not be stored.
+    """
+    return {"persistence_degraded": bool(_PERSISTENCE_FAILURES),
+            "failure_count": _PERSISTENCE_FAILURES, "lifetime": "process"}
 
 
 def get_default_ledger() -> EvidenceLedger:
@@ -263,37 +591,51 @@ def emit(event_type, finding_ref: str, summary: str, *, data: dict | None = None
     confirmation, the suppression gate) calls through; it is read/record-only
     and never influences the caller's own decision.
     """
+    global _PERSISTENCE_FAILURES
     if not finding_ref:
         return None
     led = ledger if ledger is not None else _DEFAULT_LEDGER
-    ev = led.record(event_type, finding_ref, summary, data=data,
-                    provenance=provenance, case_ref=case_ref)
+    payload = dict(data or {})
+    if _PERSISTENCE_FAILURES:
+        payload["ledger_persistence_degraded"] = True
+    ev = led.record(event_type, finding_ref, summary, data=payload,
+                    provenance=provenance or Provenance.capture(), case_ref=case_ref)
     try:
         from harness import store
         store.persist_ledger_event(ev.to_dict())
-    except Exception as e:  # persistence is best-effort; never break the live pipeline
-        _log.debug("failed to persist ledger event %s for %s: %s", event_type, finding_ref, e)
+    except Exception as e:  # never change a passive verdict on a storage failure
+        _PERSISTENCE_FAILURES += 1
+        _log.warning("evidence persistence failed (%s); durable evidence incomplete", type(e).__name__)
+        led._persistence_degraded = True
+        # Each lost event needs its own best-effort durable marker. A marker
+        # attached only to the first failed finding cannot protect another
+        # finding after process loss clears the process-wide status. The
+        # existing FIFO cap bounds memory even during a sustained outage.
+        marker = led.record(EventType.PERSISTENCE_FAILURE, finding_ref,
+                            "Durable evidence incomplete: ledger write failed",
+                            data={"failure_type": type(e).__name__}, provenance=ev.provenance)
+        try:
+            store.persist_ledger_event(marker.to_dict())
+        except Exception:
+            pass
     return ev
 
 
-def ledger_from_store(finding_ref: str) -> EvidenceLedger:
-    """Replay this finding's persisted events (store.py) into a fresh ledger.
+def _ledger_from_rows(finding_ref: str, rows: "list[dict]") -> EvidenceLedger:
+    """Replay already-fetched persisted-event rows (each shaped like one of
+    store.ledger_events_for's row dicts) into a fresh, unbounded ledger for
+    one finding_ref. The shared per-row construction ledger_from_store (one
+    ref, one query) and reconstruct_persisted_many (RA-4: many refs, one
+    batched query) both build on -- so there is exactly one place that turns
+    a persisted row back into a LedgerEvent.
 
-    Lets the findings API / report reconstruct a finding independent of the
-    in-memory singleton (e.g. after a restart, or from a different process),
-    while reconstruct()/reproduction_recipe() themselves stay pure functions
-    of whatever events a ledger holds."""
-    # Unbounded replay: the durable read path must never evict a finding's own
-    # persisted events, even in the pathological case of a single finding with
-    # more than DEFAULT_MAX_EVENTS records. The cap is only a memory guard on
-    # the long-lived in-memory singleton, not on a fresh per-finding replay.
+    Unbounded (max_events=0): the durable read path must never evict a
+    finding's own persisted events, even in the pathological case of a
+    single finding with more than DEFAULT_MAX_EVENTS records. The cap is
+    only a memory guard on the long-lived in-memory singleton, not on a
+    fresh per-finding replay."""
     led = EvidenceLedger(max_events=0)
-    try:
-        from harness import store
-        rows = store.ledger_events_for(finding_ref)
-    except Exception as e:
-        _log.debug("failed to load persisted ledger events for %s: %s", finding_ref, e)
-        return led
+    led._persistence_degraded = bool(_PERSISTENCE_FAILURES)
     for row in rows:
         try:
             prov = Provenance(**row.get("provenance", {}))
@@ -310,11 +652,111 @@ def ledger_from_store(finding_ref: str) -> EvidenceLedger:
     return led
 
 
-def reconstruct_persisted(finding_ref: str) -> dict:
+def ledger_from_store(finding_ref: str, *, engagement_id: str | None = None,
+                       captured_principal: str | None = None) -> EvidenceLedger:
+    """Replay this finding's persisted events (store.py) into a fresh ledger.
+
+    Lets the findings API / report reconstruct a finding independent of the
+    in-memory singleton (e.g. after a restart, or from a different process),
+    while reconstruct()/reproduction_recipe() themselves stay pure functions
+    of whatever events a ledger holds."""
+    try:
+        from harness import store
+        ownership = {"engagement_id": engagement_id} if engagement_id is not None else {}
+        if captured_principal is not None:
+            ownership["captured_principal"] = captured_principal
+        rows = store.ledger_events_for(finding_ref, **ownership)
+    except Exception as e:
+        _log.debug("failed to load persisted ledger events for %s: %s", finding_ref, e)
+        return EvidenceLedger(max_events=0)
+    return _ledger_from_rows(finding_ref, rows)
+
+
+def reconstruct_persisted(finding_ref: str, *, engagement_id: str | None = None,
+                           captured_principal: str | None = None) -> dict:
     """reconstruct(), reading from the durable store instead of memory."""
-    return ledger_from_store(finding_ref).reconstruct(finding_ref)
+    return ledger_from_store(finding_ref, engagement_id=engagement_id,
+                             captured_principal=captured_principal).reconstruct(finding_ref)
 
 
-def reproduction_recipe_persisted(finding_ref: str) -> dict:
+def reconstruct_persisted_many(finding_refs: "list[str]", *, engagement_id: str | None = None,
+                               captured_principal: str | None = None) -> "dict[str, dict]":
+    """Batched form of reconstruct_persisted (RA-4 perf fix).
+
+    The report generator used to call reconstruct_persisted(ref) once PER
+    FINDING. Each of those calls did its own ledger_events_for(ref) fresh
+    connection+query, plus one MORE fresh connection per blob field
+    (evidence_blob_resolves) on every EXECUTION event it found -- an
+    N findings x E events-per-finding pile of serial SQLite connections for
+    one report. This does ONE batched events fetch for every ref
+    (store.ledger_events_for_many), builds each ref's EvidenceLedger from its
+    own slice of that single fetch (never re-querying per ref), and resolves
+    each blob hash AT MOST ONCE across the whole batch via a shared
+    {hash: bool} memo -- so a report over many findings still does a small,
+    bounded number of store reads, not one per finding times its event count.
+
+    Returns a dict keyed by finding_ref. Every ref passed in (after dropping
+    empty/duplicate entries) is present in the result -- including a ref with
+    zero persisted events, which reconstructs to the same all-defaults dict
+    reconstruct_persisted would give it -- and each value is IDENTICAL, field
+    for field, to what reconstruct_persisted(ref) returns today. This
+    function only changes HOW MANY TIMES the store is read, never what is
+    computed; reconstruct_persisted itself is untouched and still what
+    server.py's per-finding endpoint calls."""
+    refs = [r for r in dict.fromkeys(finding_refs) if r]
+    if not refs:
+        return {}
+    try:
+        from harness import store
+    except Exception:
+        return {}
+    try:
+        ownership = {"engagement_id": engagement_id} if engagement_id is not None else {}
+        if captured_principal is not None:
+            ownership["captured_principal"] = captured_principal
+        events_by_ref = store.ledger_events_for_many(refs, **ownership)
+    except Exception as e:
+        _log.debug("failed to batch-load persisted ledger events for %d ref(s): %s", len(refs), e)
+        return {}
+
+    blob_cache: "dict[str, bool]" = {}
+    # One shared connection for EVERY blob-hash resolution in this batch,
+    # instead of evidence_blob_resolves' own default of a fresh _connect()
+    # per call -- this is what keeps the connection count bounded even when
+    # every finding's execution carries its OWN distinct request/response
+    # hashes (so the {hash: bool} memo above alone wouldn't help): the memo
+    # avoids re-resolving the SAME hash twice, this shared connection avoids
+    # a new connection for each DIFFERENT hash. Best-effort: if opening it
+    # fails, fall back to evidence_blob_resolves' own per-call connection
+    # (correct, just not batched) rather than losing resolvability entirely.
+    try:
+        shared_conn = store._connect()
+    except Exception:
+        shared_conn = None
+
+    def _memoized_resolver(h: str) -> bool:
+        cached = blob_cache.get(h)
+        if cached is None:
+            try:
+                cached = bool(store.evidence_blob_resolves(h, conn=shared_conn))
+            except Exception:
+                cached = False
+            blob_cache[h] = cached
+        return cached
+
+    try:
+        out: "dict[str, dict]" = {}
+        for ref in refs:
+            led = _ledger_from_rows(ref, events_by_ref.get(ref, []))
+            out[ref] = led.reconstruct(ref, resolver=_memoized_resolver)
+        return out
+    finally:
+        if shared_conn is not None:
+            shared_conn.close()
+
+
+def reproduction_recipe_persisted(finding_ref: str, *, engagement_id: str | None = None,
+                                  captured_principal: str | None = None) -> dict:
     """reproduction_recipe(), reading from the durable store instead of memory."""
-    return ledger_from_store(finding_ref).reproduction_recipe(finding_ref)
+    return ledger_from_store(finding_ref, engagement_id=engagement_id,
+                             captured_principal=captured_principal).reproduction_recipe(finding_ref)

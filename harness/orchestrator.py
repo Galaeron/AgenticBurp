@@ -39,8 +39,10 @@ plus the assembly. Behavior is unchanged -- the methods moved verbatim and every
   and the model/agent/effort management surface.
 """
 from __future__ import annotations
+import uuid
 
 from harness import config_schema
+from harness import run_inference
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (re-export shared namespace)
 from harness.orchestrator_detect import DetectMixin
 from harness.orchestrator_confirm import ConfirmMixin
@@ -51,7 +53,6 @@ from harness.orchestrator_report import ReportMixin
 class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
     """
     Main orchestrator for security testing.
-    
     This class coordinates all aspects of analyzing HTTP exchanges,
     including agent dispatching, finding collection, validation, and
     result delivery.
@@ -63,6 +64,24 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
     - FastPathSelector: Provides deterministic pre-LLM agent routing
     """
     
+    @property
+    def effort_budget(self):
+        view = run_inference.current(self)
+        return view.budget if view is not None else self._aggregate_effort_budget
+
+    @effort_budget.setter
+    def effort_budget(self, value):
+        self._aggregate_effort_budget = value
+
+    @property
+    def analysis_pipeline(self):
+        view = run_inference.current(self)
+        return view.pipeline if view is not None else self._analysis_pipeline_template
+
+    @analysis_pipeline.setter
+    def analysis_pipeline(self, value):
+        self._analysis_pipeline_template = value
+
     def __init__(self, config: dict, *, explicit_keys: set[str] | None = None):
         """
         Initialize the orchestrator.
@@ -100,6 +119,8 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         self.ollama = OllamaClient(
             base_url=config["ollama"]["base_url"],
             timeout_seconds=config["ollama"].get("timeout_seconds", 120),
+            num_ctx=config["ollama"].get("num_ctx"),  # opt-in; None => unchanged
+            seed=config["ollama"].get("seed"),  # run-level reproducibility seed; None => omit
         )
         
         # Configuration
@@ -116,6 +137,13 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         _conc = config.get("concurrency", {}) or {}
         self.max_concurrent_validations = max(1, int(_conc.get("max_concurrent_validations", 6)))
         self.early_termination_batch_size = max(1, int(_conc.get("early_termination_batch_size", 3)))
+
+        # ER-4: reproduction-replay determinism gate. DEFAULT OFF -- when a
+        # scoped active leg (ssrf/ssti/command_injection) confirms, replaying
+        # its confirming request once and requiring both runs to agree guards
+        # against a flaky one-shot confirmation inflating precision. Off ships
+        # byte-for-byte unchanged (see orchestrator_confirm._maybe_replay).
+        self.confirm_replay = bool((config.get("validators") or {}).get("confirm_replay", False))
 
         # Initialize GitHub Advisories client
         gha_cfg = config.get("github_advisories", {})
@@ -184,6 +212,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             log.warning("Unknown effort_budget.mode %r; defaulting to soft.", mode_str)
             budget_mode = BudgetMode.SOFT
         self.effort_budget = EffortBudget(mode=budget_mode, total_tokens=effort_cfg.get("total_tokens"))
+        self._inference_owner_id = uuid.uuid4().hex
         
         # Initialize agent manager (uses plugin system for discovery)
         self.agent_manager = AgentManager(config, self.ollama)
@@ -300,5 +329,19 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # (finer fan-out = more leg traffic); bounded per cell by coverage_case_budget.
         self.engagement_coverage_case_drive = self.engagement_policy.engagement_coverage_case_drive
         self.coverage_case_budget = self.engagement_policy.coverage_case_budget
+        # P2-1: business-context planning agent (BusinessContextAgent). DEFAULT
+        # OFF. When on, investigate_engagement runs ONE application-context pass
+        # that builds an Application Semantic Model (roles/objects/workflows/
+        # value-flows/sinks + ranked chaining HYPOTHESES) and uses it to RE-RANK
+        # the worklist by business impact and PROPOSE (never confirm) chains. It
+        # is NOT in engagement_policy because it is not an active-traffic toggle:
+        # the pass sends NO requests itself, and every resulting send stays gated
+        # by validators.active_enabled / allow_mutating_replay / scope / budget,
+        # exactly as without it. Raw off-host egress additionally needs
+        # coordinator.cloud_reasoning (read by the agent), same as the other
+        # cloud flags. New top-level config block; default-off is guarded by
+        # SafeDefaultGuardTests and forced off under the passive-only profile.
+        self.business_context_enabled = bool(
+            (config.get("business_context", {}) or {}).get("enabled", False))
 
         log.info(f"Orchestrator initialized with {len(self.agent_manager.get_enabled_agents())} agents")

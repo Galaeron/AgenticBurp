@@ -145,7 +145,10 @@ class DriverEndpointTests(unittest.TestCase):
         import harness.server as server_module
         self.server_module = server_module
         from fastapi.testclient import TestClient
-        self.client = TestClient(server_module.app, base_url="http://localhost")
+        # RB-1: state-changing routes require the bearer token even from
+        # loopback; attach the (ephemeral, in this test env) token.
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
 
     def tearDown(self):
         store._DB_PATH = self.orig
@@ -162,7 +165,10 @@ class DriverEndpointTests(unittest.TestCase):
 
     def test_execute_requires_base_url(self):
         resp = self.client.post("/engagement/shop.test/run", json={"execute": True})
-        self.assertEqual(resp.status_code, 400)
+        # execute=True with no base_url has no parseable crawl target, so the
+        # fail-closed active-crawl precondition refuses it with 403 before any
+        # field-level 400 -- scope/active preconditions are checked first (W-17).
+        self.assertEqual(resp.status_code, 403)
 
 
 if __name__ == "__main__":

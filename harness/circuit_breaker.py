@@ -17,6 +17,7 @@ States:
 """
 from __future__ import annotations
 import asyncio
+import contextvars
 import logging
 import time
 from typing import Optional, Callable, Any
@@ -417,3 +418,235 @@ def get_ollama_circuit_breaker(name: str = "ollama", config: CircuitBreakerConfi
     if name not in registry._breakers:
         registry._breakers[name] = OllamaCircuitBreaker(name, config)
     return registry._breakers[name]
+
+
+# =============================================================================
+# Per-run isolation + loud-fail seam (B2-2, LOOP half)
+# =============================================================================
+#
+# The shared "ollama" breaker above is a DELIBERATE process-wide singleton
+# (see get_ollama_circuit_breaker's docstring): a short-lived OllamaClient
+# still needs to accumulate failures across call sites within one run. But
+# in a multi-run process (e.g. an eval/ablation driver that loops over many
+# targets in one interpreter) that singleton has two failure modes:
+#
+#   1. Silent poisoning: run 1's cascade trips the breaker OPEN; run 2 starts
+#      with an already-OPEN breaker and every one of its detections silently
+#      fails-open/degrades with no indication the *breaker*, not run 2's own
+#      traffic, is why.
+#   2. Silent starvation: a run that ends with the breaker OPEN just emits
+#      zeros/degraded results -- nothing raises, nothing flags the run as
+#      unreliable.
+#
+# Everything below is NEW, ADDITIVE, and OFF/opt-in: it is never called from
+# any committed run path, so importing this module and using
+# get_ollama_circuit_breaker() as today is byte-for-byte unchanged unless a
+# caller explicitly invokes one of these. No trip/reset thresholds or logic
+# are touched -- this only adds scoping/observability around the existing
+# reset()/state primitives.
+
+
+class CircuitStarvationError(RuntimeError):
+    """Raised by raise_if_ollama_starved() when the shared "ollama" circuit
+    breaker is OPEN -- i.e. a run ended (or is running) starved of a working
+    model backend. Distinct exception type so callers can catch/report it
+    specifically instead of it being swallowed as a generic RuntimeError."""
+    pass
+
+
+def _set_state(
+    breaker: "CircuitBreaker",
+    state: CircuitState,
+    consecutive_failures: int,
+    consecutive_successes: int,
+    half_open_requests: int,
+) -> None:
+    """Directly set a breaker's state fields, bypassing the lock and the
+    asyncio.run()-based sync reset()/force_open() wrappers.
+
+    reset()/force_open() are meant for sync call sites with no event loop
+    already running -- calling asyncio.run() from inside a running loop
+    (e.g. an async run-driver using these seams from inside `async def`
+    code) raises. The state mutation itself is the same handful of
+    attribute assignments _reset_async()/_force_open_async() perform under
+    their lock; scoped_ollama_breaker/reset_ollama_circuit_breaker own the
+    breaker for the duration of their call, so the lock isn't needed here
+    any more than it already isn't needed by direct attribute reads like
+    `.is_open` elsewhere in this module.
+    """
+    breaker._state = state
+    breaker._consecutive_failures = consecutive_failures
+    breaker._consecutive_successes = consecutive_successes
+    breaker._half_open_requests = half_open_requests
+    breaker._last_state_change = time.time()
+
+
+def reset_ollama_circuit_breaker(name: str = "ollama") -> "OllamaCircuitBreaker":
+    """Explicitly reset the shared Ollama circuit breaker to a fresh, CLOSED
+    state and return it.
+
+    This is the opt-in per-run isolation primitive: an eval/engagement
+    driver that loops over multiple runs in one process can call this at the
+    start of each run so a prior run's OPEN trip cannot silently poison the
+    next one. Safe to call from sync or async call sites (see _set_state).
+
+    This is never called automatically by any committed code path; a caller
+    must invoke it explicitly.
+    """
+    breaker = get_ollama_circuit_breaker(name)
+    _set_state(breaker, CircuitState.CLOSED, 0, 0, 0)
+    return breaker
+
+
+class scoped_ollama_breaker:
+    """Context manager that gives the wrapped block a fresh, isolated
+    "ollama" circuit breaker and restores the breaker's prior state on exit.
+
+    Usage (opt-in -- a runner must choose to wrap a run with this):
+
+        with scoped_ollama_breaker():
+            # this run starts with a CLOSED breaker regardless of what a
+            # prior run left behind, and any tripping that happens here is
+            # rolled back on exit so it can't leak into the next block.
+            await orchestrator.analyze(...)
+
+    Implementation note: the shared "ollama" breaker is a process-wide
+    singleton by design (see get_ollama_circuit_breaker's docstring), so
+    "isolation" here means snapshot-and-restore around the registry's one
+    instance, not swapping in a second instance -- callers elsewhere in the
+    process (e.g. a concurrently running critique pass) still observe the
+    same object identity throughout, matching today's sharing semantics.
+    Only the *state* (open/closed, failure counts) is scoped to the `with`
+    block.
+    """
+
+    def __init__(self, name: str = "ollama"):
+        self.name = name
+        self._breaker: Optional["OllamaCircuitBreaker"] = None
+        self._saved_state: Optional[CircuitState] = None
+        self._saved_consecutive_failures = 0
+        self._saved_consecutive_successes = 0
+        self._saved_half_open_requests = 0
+
+    def __enter__(self) -> "OllamaCircuitBreaker":
+        breaker = get_ollama_circuit_breaker(self.name)
+        self._breaker = breaker
+        # Snapshot so __exit__ can restore rather than merely reset-to-closed,
+        # in case this scope is nested inside a caller that relies on the
+        # breaker's pre-existing state once the scope ends.
+        self._saved_state = breaker.state
+        self._saved_consecutive_failures = breaker._consecutive_failures
+        self._saved_consecutive_successes = breaker._consecutive_successes
+        self._saved_half_open_requests = breaker._half_open_requests
+        # Set directly (not via the sync reset()/force_open() wrappers,
+        # which call asyncio.run() and would raise if this context manager
+        # is entered from inside an already-running event loop, e.g. a
+        # caller inside async run code). This mirrors what
+        # CircuitBreaker._reset_async() does, minus the lock, since this
+        # scope owns the breaker for its duration.
+        _set_state(breaker, CircuitState.CLOSED, 0, 0, 0)
+        return breaker
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        breaker = self._breaker
+        if breaker is None:
+            return
+        # Restore the pre-scope snapshot rather than leaving whatever state
+        # this run's traffic produced, so a subsequent unscoped caller sees
+        # the same breaker state it would have if this scope never ran.
+        _set_state(
+            breaker,
+            self._saved_state,
+            self._saved_consecutive_failures,
+            self._saved_consecutive_successes,
+            self._saved_half_open_requests,
+        )
+
+
+def raise_if_ollama_starved(context: str = "", name: str = "ollama") -> None:
+    """Loud-fail assertion helper: raise CircuitStarvationError if the shared
+    "ollama" circuit breaker is currently OPEN, otherwise no-op.
+
+    Intended for a runner to call at the end of a run (or periodically
+    during one) to turn a silent starvation cascade -- a run that quietly
+    emits degraded/zero results because the model backend has been
+    unavailable -- into a loud, attributable failure. Never called
+    automatically; a caller must invoke it explicitly.
+
+    Args:
+        context: optional free-text describing what was starved (e.g. a run
+            id or target name), included in the raised error for
+            attribution.
+        name: circuit breaker name to check (default "ollama").
+
+    Raises:
+        CircuitStarvationError: if the breaker is OPEN.
+    """
+    breaker = current_ollama_breaker(name)
+    if breaker.is_open:
+        suffix = f" ({context})" if context else ""
+        raise CircuitStarvationError(
+            f"Ollama circuit breaker '{name}' is OPEN{suffix} -- this run is "
+            f"starved of a working model backend. Results from this run are "
+            f"unreliable (silent fail-open/degraded), not a clean signal."
+        )
+
+
+# =============================================================================
+# Run-scoped ambient breaker (AR-2, LOOP half)
+# =============================================================================
+#
+# scoped_ollama_breaker (above) snapshot-and-restores the ONE shared registry
+# instance's *state* around a `with` block -- it cannot isolate two runs that
+# are genuinely CONCURRENT in the same process, because both runs would still
+# be mutating the same object at the same time. AR-2 fixes that by mirroring
+# safety_gate.py's ambient-ContextVar pattern (_gate_ctx / push_gate /
+# pop_gate / get_default_gate): a run that wants isolation constructs its OWN
+# OllamaCircuitBreaker instance (the existing class, no new registry) and
+# pushes it onto a ContextVar for the dynamic extent of its `async with`
+# block. Because a ContextVar is task-local, two concurrent asyncio Tasks
+# each see only their own pushed breaker.
+#
+# OFF by default: when no RunContext has pushed a per-run breaker (server
+# default, scripts, the ~70 existing tests that construct a RunContext but
+# never `async with` it), current_ollama_breaker() returns EXACTLY what
+# get_ollama_circuit_breaker(name) returns today -- same object identity,
+# same shared state. Nothing here changes behavior unless a caller opts in.
+_ollama_breaker_ctx: "contextvars.ContextVar[OllamaCircuitBreaker | None]" = (
+    contextvars.ContextVar("harness_ollama_breaker_ambient", default=None)
+)
+
+
+def push_ollama_breaker(breaker: "OllamaCircuitBreaker") -> "OllamaCircuitBreaker | None":
+    """Make `breaker` the ambient per-run Ollama circuit breaker for
+    `current_ollama_breaker()` calls made anywhere in the dynamic extent of
+    the current invocation, until `pop_ollama_breaker` is called with the
+    returned handle. Mirrors safety_gate.push_gate exactly, including the
+    plain get()/set() (not Token) rationale: a RunContext may be pushed in
+    one asyncio Task and popped in another (e.g. a background job Task), and
+    `Token.reset()` raises across that boundary while plain get/set does
+    not."""
+    previous = _ollama_breaker_ctx.get()
+    _ollama_breaker_ctx.set(breaker)
+    return previous
+
+
+def pop_ollama_breaker(previous: "OllamaCircuitBreaker | None") -> None:
+    """Undo a `push_ollama_breaker`, restoring whatever breaker (or none)
+    was ambient before it."""
+    _ollama_breaker_ctx.set(previous)
+
+
+def current_ollama_breaker(name: str = "ollama") -> "OllamaCircuitBreaker":
+    """Return the breaker that should govern the CURRENT invocation.
+
+    Prefers the ambient per-run breaker pushed by an enclosing RunContext
+    (task-local via ContextVar, so concurrent runs cannot see each other's
+    breaker). Falls back to the process-wide shared singleton
+    (`get_ollama_circuit_breaker(name)`) when no run has pushed one --
+    identical object identity to today's behavior, so every existing call
+    site with no RunContext in play is byte-for-byte unchanged."""
+    ambient = _ollama_breaker_ctx.get()
+    if ambient is not None:
+        return ambient
+    return get_ollama_circuit_breaker(name)

@@ -37,6 +37,15 @@ dev = ["pytest==9.1.1"]
 # The import package is `harness` (distribution name stays burp-llm-harness).
 # Picks up harness + harness.agents/validators/testing_fixtures via their __init__.py.
 include = ["harness*"]
+namespaces = false
+
+[tool.setuptools]
+# Only explicitly declared non-code resources belong in an installed package.
+# Never collect local configuration, token files or runtime database artifacts.
+include-package-data = false
+
+[tool.setuptools.package-data]
+harness = ["config.yaml", "workflow_pack_data/*.pack.json"]
 
 [tool.pytest.ini_options]
 # Most tests use unittest; three pytest-native modules need a separate runner.

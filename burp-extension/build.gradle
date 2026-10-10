@@ -75,6 +75,11 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
+// Source literals are UTF-8 on every supported host, including Windows/JDK 17.
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
 test {
     useJUnitPlatform()
 }

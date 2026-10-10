@@ -64,10 +64,15 @@ class MassAssignmentSliceTest(EvidenceCase):
         self.addCleanup(lambda: global_throttle.configure(prev_rate, prev_burst))
         global_throttle.configure(0)
 
-        # Same for the process-wide safety gate.
+        # Same for the process-wide safety gate. Seed the loopback fixture host
+        # in scope, as ValidatorRegistry does from server.allowed_hosts in
+        # production: the gate fails closed on an empty active scope (commit
+        # 3c622c3), so without this the send to 127.0.0.1 is refused with
+        # SafetyGateBlocked before the SequenceValidator can exercise the fixture.
         self.addCleanup(safety_gate.reset_default_gate)
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": [HOST]})
 
     def _fixture(self, mode):
         fx = MassAssignmentFixture(mode)

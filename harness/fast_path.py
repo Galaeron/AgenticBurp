@@ -763,6 +763,20 @@ class EarlyTerminationConfig:
         self.max_agents_before_check = max_agents_before_check
 
 
+# Review pt 3: core high-impact classes that must never be cancelled by an
+# early-termination decision while they are still pending. At the detection
+# stage every finding is UNCONFIRMED model output, and these classes are both
+# high-impact and routinely independent of whatever fired first (a confident
+# CORS/misconfig claim says nothing about whether the same request is also
+# SQL-injectable or exposes another user's object). Agents are dispatched
+# alphabetically, so sqli/xss sort last and are exactly the ones a first-batch
+# claim from `anomaly`/`business_logic` used to starve. If any of these are
+# still queued, keep going regardless of how confident/severe the early finding
+# looks -- "model guesses, code proves" means a guess must not silently cancel
+# the checks that would prove (or refute) the highest-impact classes.
+_NEVER_SKIP_WHILE_PENDING = {"sqli", "xss", "idor"}
+
+
 def should_terminate_early(
     reports_so_far: list['AgentReport'],
     remaining_agents: list[str],
@@ -770,28 +784,33 @@ def should_terminate_early(
 ) -> tuple[bool, str]:
     """
     Determine if analysis should terminate early.
-    
+
     This checks if we've already found high-confidence, high-severity findings
     that make further analysis unnecessary.
-    
+
     Returns:
         tuple of (should_terminate, reason)
     """
     if not config.enabled:
         return False, ""
-    
+
     if len(reports_so_far) < config.max_agents_before_check:
         return False, ""
-    
+
+    # Never short-circuit past the core injection / access-control checks on an
+    # unconfirmed finding (review pt 3).
+    if _NEVER_SKIP_WHILE_PENDING & set(remaining_agents):
+        return False, ""
+
     # Check all findings from completed reports
     for report in reports_so_far:
         for finding in report.findings:
-            if (finding.confidence >= config.min_confidence and 
+            if (finding.confidence >= config.min_confidence and
                 finding.severity in config.min_severity):
                 return True, (f"Early termination: {finding.severity} severity "
                             f"finding with {finding.confidence:.1f} confidence "
                             f"({finding.vulnerability_class}) detected early")
-    
+
     return False, ""
 
 

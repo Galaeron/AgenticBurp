@@ -4,12 +4,17 @@ Tests for the audit logger module.
 import unittest
 import tempfile
 import os
+import shutil
 import json
+import logging
+import logging.handlers
 from harness.audit_logger import (
     AuditLogger,
     AuditEvent,
     AuditEventType,
     AuditLogLevel,
+    AuditStorageUnavailable,
+    _default_audit_log_path,
     get_audit_logger,
     set_default_audit_logger,
     log_audit_event,
@@ -304,7 +309,77 @@ class TestAuditLogger(unittest.TestCase):
             self.assertNotIn("abc123", content)
             self.assertNotIn("token123", content)
             self.assertIn("[REDACTED]", content)
-    
+
+    def test_nested_dict_secret_redacted_R09(self):
+        """PR-9 / R09: _sanitize_data only sanitized TOP-LEVEL keys, so a
+        credential nested inside another dict (e.g. {"creds": {"password":
+        "x"}}) survived into the persisted audit event. It must now be
+        redacted at any depth."""
+        self.logger.log(
+            event_type=AuditEventType.API_REQUEST,
+            data={
+                'endpoint': '/login',
+                'creds': {'api_key': 'CANARY-AUDIT-NESTED-9f3a1b'},
+            },
+        )
+
+        with open(self.log_file, 'r') as f:
+            content = f.read()
+            self.assertNotIn("CANARY-AUDIT-NESTED-9f3a1b", content)
+            self.assertIn('"api_key": "[REDACTED]"', content)
+            # non-secret sibling data at every depth is preserved
+            self.assertIn("/login", content)
+            self.assertIn('"creds"', content)
+
+    def test_nested_list_of_dicts_secret_redacted_R09(self):
+        """Recursion must also apply to dicts nested inside a LIST, not
+        only inside another dict."""
+        self.logger.log(
+            event_type=AuditEventType.API_REQUEST,
+            data={
+                'requests': [
+                    {'url': 'https://a.test/x', 'password': 'CANARY-AUDIT-LIST-77aa'},
+                    {'url': 'https://a.test/y', 'note': 'benign'},
+                ],
+            },
+        )
+
+        with open(self.log_file, 'r') as f:
+            content = f.read()
+            self.assertNotIn("CANARY-AUDIT-LIST-77aa", content)
+            self.assertIn("https://a.test/x", content)
+            self.assertIn("https://a.test/y", content)
+            self.assertIn("benign", content)
+
+    def test_deeply_nested_secret_redacted_R09(self):
+        """Multiple levels of nesting (dict-in-dict-in-dict) are all
+        covered, not just one level down."""
+        self.logger.log(
+            event_type=AuditEventType.API_REQUEST,
+            data={'a': {'b': {'c': {'token': 'CANARY-AUDIT-DEEP-42'}}}},
+        )
+        with open(self.log_file, 'r') as f:
+            content = f.read()
+            self.assertNotIn("CANARY-AUDIT-DEEP-42", content)
+
+    def test_non_secret_nested_field_and_key_name_preserved_R09(self):
+        """Structure-preservation negative control: a task-relevant
+        non-secret nested field is preserved verbatim, and the secret
+        field's NAME stays visible in the sanitized output -- redaction
+        replaces only the value, never the whole record."""
+        self.logger.log(
+            event_type=AuditEventType.API_REQUEST,
+            data={
+                'user': {'username': 'alice_doe', 'product_id': 4471, 'password': 'CANARY-AUDIT-STRUCT'},
+            },
+        )
+        with open(self.log_file, 'r') as f:
+            content = f.read()
+            self.assertIn("alice_doe", content)
+            self.assertIn("4471", content)
+            self.assertIn('"password": "[REDACTED]"', content)
+            self.assertNotIn("CANARY-AUDIT-STRUCT", content)
+
     def test_stats_tracking(self):
         """Statistics should be tracked."""
         self.logger.log(
@@ -339,6 +414,119 @@ class TestAuditLogger(unittest.TestCase):
         
         stats = self.logger.get_stats()
         self.assertEqual(stats['total_events'], 0)
+
+
+class TestAuditLoggerUnwritableStorage(unittest.TestCase):
+    """Construction must never raise merely because audit storage is unwritable.
+
+    Covers both guarded failure points: os.makedirs (directory creation) and
+    the RotatingFileHandler open (the file itself), which are distinct calls
+    that can each fail independently.
+    """
+
+    def setUp(self):
+        self.tmp_root = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_root, ignore_errors=True)
+
+    def test_unwritable_directory_degrades_without_exception(self):
+        """(a) A log_file whose DIRECTORY cannot be created/written degrades
+        to enable_file=False, with no exception raised."""
+        # blocker is a FILE, so a directory cannot be created underneath it -
+        # forces os.makedirs(log_dir, exist_ok=True) to fail.
+        blocker = os.path.join(self.tmp_root, "blocker_file")
+        with open(blocker, "w") as f:
+            f.write("not a directory")
+        log_dir = os.path.join(blocker, "nested")
+        log_file = os.path.join(log_dir, "audit.log")
+
+        logger = AuditLogger(name="test_unwritable_dir", log_file=log_file, enable_file=True)
+
+        self.assertFalse(logger.enable_file)
+        self.assertFalse(any(
+            isinstance(h, logging.handlers.RotatingFileHandler) for h in logger._logger.handlers
+        ))
+        # Construction must not have raised, and logging afterwards is still safe.
+        logger.log(event_type=AuditEventType.LLM_PROMPT, level=AuditLogLevel.INFO)
+
+    def test_unwritable_existing_file_degrades_without_exception(self):
+        """(b) A log_file path that already exists but cannot be opened as a
+        file (here: it exists as a directory) degrades to enable_file=False,
+        with no exception raised. This exercises the RotatingFileHandler
+        open guard specifically (its parent directory already exists, so
+        os.makedirs succeeds trivially; only the file open fails)."""
+        log_file = os.path.join(self.tmp_root, "audit.log")
+        os.makedirs(log_file)  # log_file path exists, but as a directory, not a file
+
+        logger = AuditLogger(name="test_unwritable_file", log_file=log_file, enable_file=True)
+
+        self.assertFalse(logger.enable_file)
+        self.assertFalse(any(
+            isinstance(h, logging.handlers.RotatingFileHandler) for h in logger._logger.handlers
+        ))
+        logger.log(event_type=AuditEventType.LLM_PROMPT, level=AuditLogLevel.INFO)
+
+    def test_require_file_raises_on_unwritable_path(self):
+        """require_file=True opts into failing loudly instead of degrading."""
+        log_file = os.path.join(self.tmp_root, "audit.log")
+        os.makedirs(log_file)
+
+        with self.assertRaises(AuditStorageUnavailable):
+            AuditLogger(
+                name="test_require_file",
+                log_file=log_file,
+                enable_file=True,
+                require_file=True,
+            )
+
+    def test_writable_path_negative_control(self):
+        """NEGATIVE CONTROL: a writable tmp path still attaches the file
+        handler (enable_file stays True) and an emitted record actually
+        lands in the file."""
+        log_file = os.path.join(self.tmp_root, "writable_subdir", "audit.log")
+
+        logger = AuditLogger(name="test_writable", log_file=log_file, enable_file=True)
+
+        self.assertTrue(logger.enable_file)
+        self.assertTrue(any(
+            isinstance(h, logging.handlers.RotatingFileHandler) for h in logger._logger.handlers
+        ))
+
+        event_id = logger.log(event_type=AuditEventType.LLM_PROMPT, level=AuditLogLevel.INFO)
+
+        self.assertTrue(os.path.exists(log_file))
+        with open(log_file, "r") as f:
+            content = f.read()
+        self.assertIn(event_id, content)
+
+
+class TestDefaultAuditLogPath(unittest.TestCase):
+    """The default audit log path must be a per-user location, never /var/log."""
+
+    def test_default_path_is_not_var_log(self):
+        path = _default_audit_log_path("agentic_burp_test")
+        self.assertNotIn("var/log", path.replace("\\", "/"))
+
+    def test_default_path_is_platform_appropriate(self):
+        path = _default_audit_log_path("agentic_burp_test")
+        normalized = path.replace("\\", "/")
+        self.assertTrue(normalized.endswith("agentic_burp_test/audit.log"))
+
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+        else:
+            xdg = os.environ.get("XDG_STATE_HOME") or os.environ.get("XDG_DATA_HOME")
+            base = xdg or os.path.join(os.path.expanduser("~"), ".local", "state")
+        self.assertTrue(path.startswith(base))
+
+    def test_constructing_without_log_file_uses_default(self):
+        """Constructing without an explicit log_file uses the per-user
+        default (the constructor arg / setter still override it)."""
+        logger = AuditLogger(name="agentic_burp_default_test", enable_file=False)
+        normalized = logger.log_file.replace("\\", "/")
+        self.assertNotIn("var/log", normalized)
+        self.assertIn("agentic_burp_default_test/audit.log", normalized)
 
 
 class TestGlobalAuditLogger(unittest.TestCase):

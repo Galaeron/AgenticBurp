@@ -36,6 +36,11 @@ def _payloads(nonce: str) -> list[str]:
     runs, surfaces `nonce` in a console message, dialog, or page error."""
     js = f"console.log('{nonce}')"
     return [
+        # Lead with a dialog payload. A dialog is the strongest browser-visible
+        # execution proof and is also the completion oracle used by common XSS
+        # benchmark labs; console-only execution can prove the sink internally
+        # while leaving that independent oracle unsatisfied.
+        f"<script>alert('{nonce}')</script>",
         f"<script>{js}</script>",
         f"\"><script>{js}</script>",
         f"\"><img src=x onerror={js}>",
@@ -52,7 +57,7 @@ class BrowserXssValidator(Validator):
 
     def __init__(self, *, timeout: float = 15.0, allowed_hosts: list[str] | None = None,
                  wait_ms: int = 1200, max_visits: int = 8, driver=None,
-                 cdp_endpoint: str | None = None):
+                 cdp_endpoint: str | None = None, run_context=None):
         self.timeout = timeout
         self.allowed_hosts = allowed_hosts or []
         self.wait_ms = wait_ms
@@ -64,6 +69,16 @@ class BrowserXssValidator(Validator):
         # An injected driver (tests / a custom engine) wins; otherwise the best
         # available real driver is resolved lazily at validate() time.
         self._driver = driver
+        # R7: optional RunContext, bound per-dispatch by
+        # ValidatorRegistry.bind_run_context (same seam every other active
+        # validator uses -- see orchestrator_confirm.py's for_finding/
+        # bind_run_context call). When present, its scope/gate/budget/cancel
+        # are threaded into the browser's own request interception (SC-7), so
+        # a redirect or subresource the payload triggers mid-visit is policed
+        # by the SAME capability policy as every other outbound send in this
+        # run, instead of falling back to the driver's same-origin-only
+        # default with no gate/budget coverage at all.
+        self.run_context = run_context
 
     def _host_allowed(self, url: str) -> bool:
         if not self.allowed_hosts:
@@ -115,13 +130,20 @@ class BrowserXssValidator(Validator):
         nonce = "HARNESSXSS" + secrets.token_hex(8)
         urls = self._candidate_urls(exchange, nonce)
         errors: list[str] = []
+        # R7: forwarded only when a RunContext is actually bound -- omitted
+        # entirely otherwise, so a standalone/no-context caller (and every
+        # fake driver in the test suite, which doesn't accept these kwargs)
+        # sees byte-identical behavior to before this wiring existed.
+        rc = self.run_context
+        visit_kw = (dict(scope=rc.scope, gate=rc.gate, budget=rc.budget, cancel=rc.cancel)
+                    if rc is not None else {})
         for url in urls:
             await global_throttle.acquire()
             try:
                 # R25: drive the browser AS the captured identity (auth headers +
                 # cookies), so an AUTHENTICATED reflected-XSS sink is reachable.
                 obs = await driver.visit(url, wait_ms=self.wait_ms,
-                                         headers=exchange.request_headers)
+                                         headers=exchange.request_headers, **visit_kw)
             except Exception as e:  # a driver blowing up must not kill the whole pass
                 errors.append(f"{url[:120]}: {e.__class__.__name__}")
                 continue

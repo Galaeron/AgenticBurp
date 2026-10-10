@@ -506,6 +506,48 @@ class TestCacheOperations(unittest.TestCase):
         self.cache.clear()
         self.assertEqual(self.cache.size(), 0)
 
+    def test_clear_and_size_span_the_hypothesis_cache_table(self):
+        """R5 (FR-7 lifecycle): clear() and size() must span BOTH the exchange
+        cache and the hypothesis cache. Pre-R5, clear() only issued DELETE FROM
+        cache_entries and size() only counted that table, so an operator's
+        /cache/clear left a cached hypothesis behind and size() under-reported.
+        Write one entry into each table, prove both are present and the
+        hypothesis is retrievable, clear(), then prove BOTH tables miss and all
+        three size accessors read 0."""
+        ex_full = HttpExchange(url="https://example.com/full", method="GET",
+                               request_body="", response_status=200, response_body="ok")
+        response = AnalysisResponse(coordinator_model="test-model",
+                                    dispatched_agents=[], agent_reports=[], summary="t")
+        self.cache.put(ex_full, response, "test-model", {})
+
+        ex_hyp = HttpExchange(url="https://example.com/hyp", method="GET",
+                              request_body="", response_status=200, response_body="ok")
+        self.cache.put_hypothesis(ex_hyp, dispatch=[], reason="", reports=[],
+                                  stage_outcomes=[], findings_reviewed=0,
+                                  findings_rejected=0, model="test-model",
+                                  prompt_versions={}, config_fingerprint="fp")
+
+        # Both tables populated; size() spans both; the hypothesis is retrievable.
+        self.assertEqual(self.cache.exchange_size(), 1)
+        self.assertEqual(self.cache.hypothesis_size(), 1)
+        self.assertEqual(self.cache.size(), 2)
+        self.assertIsNotNone(
+            self.cache.get_hypothesis(ex_hyp, "test-model", {}, "fp"),
+            "the hypothesis entry was not retrievable before clear() -- fixture broken",
+        )
+
+        self.cache.clear()
+
+        # NEGATIVE CONTROL: after a full clear, BOTH tables miss and every size
+        # accessor reads 0. Pre-R5 the hypothesis read still HIT and size()==1.
+        self.assertIsNone(self.cache.get(ex_full, "test-model", {}),
+                          "exchange cache still hit after clear()")
+        self.assertIsNone(self.cache.get_hypothesis(ex_hyp, "test-model", {}, "fp"),
+                          "R5: hypothesis cache still hit after clear()")
+        self.assertEqual(self.cache.exchange_size(), 0)
+        self.assertEqual(self.cache.hypothesis_size(), 0)
+        self.assertEqual(self.cache.size(), 0)
+
 
 class TestCacheStats(unittest.TestCase):
     """Test cache statistics tracking."""

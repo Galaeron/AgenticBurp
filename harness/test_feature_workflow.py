@@ -58,6 +58,64 @@ class ExtractionTests(unittest.TestCase):
         self.assertIn("csrf=tok123", body)
         self.assertIn("cc=probe%40example.com", body)
 
+    def test_first_named_submit_button_is_the_deterministic_submitter(self):
+        html = """<form method="post" action="/template">
+          <textarea name="template"></textarea>
+          <button type="submit" name="template-action" value="preview">Preview</button>
+          <button type="submit" name="template-action" value="save">Save</button>
+        </form>"""
+        form = fw.extract_forms(html, "http://t.test/product?productId=1")[0]
+        self.assertIn("template-action=preview", form.body())
+        self.assertNotIn("template-action=save", form.body())
+
+    def test_select_option_value_captured_for_url_bearing_control(self):
+        # Regression: an SSRF-style stock-check form whose only field is a
+        # <select> of URL <option>s. Discovery must replay the real URL value,
+        # not a synthesized marker that the server rejects with 400 (which would
+        # drop the endpoint's replay template and starve the SSRF validator).
+        html = """<form id="stockCheckForm" action="/product/stock" method="POST">
+            <select name="stockApi">
+              <option value="http://stock.weliketoshop.net:8080/product/stock/check?productId=1&storeId=1">London</option>
+              <option value="http://stock.weliketoshop.net:8080/product/stock/check?productId=1&storeId=2">Paris</option>
+            </select>
+            <button type="submit">Check stock</button>
+          </form>"""
+        forms = fw.extract_forms(html, "http://t.test/product?productId=1")
+        self.assertEqual(len(forms), 1)
+        f = forms[0]
+        self.assertEqual(f.method, "POST")
+        self.assertEqual(f.action, "http://t.test/product/stock")
+        stock = next(fld for fld in f.fields if fld.name == "stockApi")
+        # First option's real URL is captured verbatim, not a marker default.
+        self.assertEqual(
+            stock.value,
+            "http://stock.weliketoshop.net:8080/product/stock/check?productId=1&storeId=1")
+        body = f.body()
+        self.assertIn("stockApi=http", body)
+        self.assertNotIn(fw._MARKER, body)
+
+    def test_select_prefers_selected_option(self):
+        html = """<form action="/f" method="post"><select name="s">
+            <option value="a">A</option>
+            <option value="b" selected>B</option>
+          </select></form>"""
+        f = fw.extract_forms(html, "http://t.test/")[0]
+        self.assertEqual(next(x for x in f.fields if x.name == "s").value, "b")
+
+    def test_option_text_used_when_no_value_attribute(self):
+        html = """<form action="/f" method="post"><select name="s">
+            <option>Alpha</option><option>Beta</option>
+          </select></form>"""
+        f = fw.extract_forms(html, "http://t.test/")[0]
+        self.assertEqual(next(x for x in f.fields if x.name == "s").value, "Alpha")
+
+    def test_empty_select_falls_back_to_marker(self):
+        # Negative control: a select with no options must not crash and still
+        # yields a benign default rather than an empty/None value.
+        html = '<form action="/f" method="post"><select name="s"></select></form>'
+        f = fw.extract_forms(html, "http://t.test/")[0]
+        self.assertIn("s=" + fw._MARKER, f.body())
+
     def test_extract_links_skips_non_navigable(self):
         html = ('<a href="/dashboard">d</a><a href="#top">t</a>'
                 '<a href="javascript:void(0)">j</a><a href="/tickets/1">one</a>')
@@ -124,7 +182,28 @@ class CrawlTests(unittest.TestCase):
         post = [e for e in res.captured if e.method == "POST"]
         self.assertTrue(post, "no workflow submit captured")
         self.assertEqual(post[0].request_headers.get("Cookie"), "session=alice-token")
+        self.assertEqual(post[0].request_headers.get("Content-Type"),
+                         "application/x-www-form-urlencoded")
         self.assertIn("subject=", post[0].request_body)
+
+    def test_multipart_form_without_file_is_submitted_as_urlencoded(self):
+        app = _FakeApp({
+            ("GET", "/"): _Resp(200, """<html><body>
+                <form method="post" action="/post/comment" enctype="multipart/form-data">
+                  <input type="hidden" name="csrf" value="tok">
+                  <input type="hidden" name="postId" value="1">
+                  <textarea name="comment"></textarea>
+                </form></body></html>"""),
+            ("POST", "/post/comment"): _Resp(302, "", {"location": "/post?postId=1"}),
+            ("GET", "/post?postId=1"): _Resp(200, "comment saved"),
+        })
+        res = asyncio.run(fw.crawl_features(
+            "http://t.test", "user", {}, fetch_fn=app.fetch,
+            allowed_hosts=["t.test"], max_steps=10, max_depth=2))
+        post = next(e for e in res.captured if e.method == "POST")
+        self.assertEqual(post.request_headers["Content-Type"],
+                         "application/x-www-form-urlencoded")
+        self.assertIn("comment=harness-workflow-probe-body", post.request_body)
 
     def test_stays_in_scope(self):
         app = self._ticket_app()
@@ -142,6 +221,28 @@ class CrawlTests(unittest.TestCase):
             submit_forms=False))
         methods = {m for m, _, _, _ in app.calls}
         self.assertEqual(methods, {"GET"})
+        self.assertEqual(res.forms_submitted, 0)
+
+    def test_preserves_session_by_skipping_logout_and_destructive_forms(self):
+        app = _FakeApp({
+            ("GET", "/"): _Resp(200, """<html><body>
+                <a href="/logout">Log out</a>
+                <a href="/editor">Editor</a>
+                <form method="post" action="/admin/delete-user">
+                  <input name="username" value="carlos">
+                </form>
+              </body></html>"""),
+            ("GET", "/editor"): _Resp(200, "<html>privileged editor</html>"),
+            ("GET", "/logout"): _Resp(200, "logged out"),
+            ("POST", "/admin/delete-user"): _Resp(200, "deleted"),
+        })
+        res = asyncio.run(fw.crawl_features(
+            "http://t.test", "user", {"Cookie": "session=alice"},
+            fetch_fn=app.fetch, allowed_hosts=["t.test"], max_steps=10))
+        methods_paths = {(m, p) for m, p, _, _ in app.calls}
+        self.assertIn(("GET", "/editor"), methods_paths)
+        self.assertNotIn(("GET", "/logout"), methods_paths)
+        self.assertNotIn(("POST", "/admin/delete-user"), methods_paths)
         self.assertEqual(res.forms_submitted, 0)
 
     def test_bounded_by_max_steps(self):

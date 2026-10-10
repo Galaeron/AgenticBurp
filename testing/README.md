@@ -41,3 +41,33 @@ answer key and the exploit-payload capture script sitting right in it),
 and don't send the `run-*-results/` folders inside `blind-test-kit/`
 either (they'd leak a prior run's discovered endpoints to a fresh
 tester, undercutting their own exploration).
+
+## `blind-target-2/` — a second, independently-built blind target
+
+Same rules as `test-target/`: **never open, read, or grep `app.py` or
+`ANSWER_KEY.md`** in here — see `blind-target-2/README.md`. A helpdesk-style
+app used for the strict/exact-class benchmark runs (see below), captured and
+scored the same way as the other blind runs.
+
+## `labels/` + `score.py`/`pool_strict_runs.py`/`reconcile_benchmark.py` — multi-target strict scoring
+
+A ground-truth manifest per target (`labels/*.labels.json` — currently
+`pixelmart`, `dvwa`, `juiceshop`, `webgoat`, `blindtarget2`), loaded and
+validated by `labels/manifest.py`. Unlike `score.py`'s coarse OWASP-category
+grading, a manifest records the **exact** vulnerability class per exchange
+plus per-class negative controls, and leaves a label `inconclusive` (never a
+silent secure/negative) where the permitted public sources
+(`score.py`'s `_LABEL_CATEGORY`, `test-target/bench.py`'s `KEYWORDS`, the
+corpus's own self-describing labels) don't pin one down. This is the ground
+truth for the strict-scoring path (`BP-1a`) — see
+[docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md](../docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md)
+for the implementation path and current status, and `reviews/*/benchmark/`
+for dated run outputs. DVWA/Juice Shop/WebGoat are the standard public
+vulnerable apps (no answer-key secrecy concern); run your own instance of
+each — none is bundled or auto-started by this repo.
+
+For fast agent/routing/gating iteration specifically on `test-target/`
+(PixelMart) without re-running the full ~2h LLM pass every time, see the
+caching methodology in [test-target/detection_fixture.py](test-target/detection_fixture.py)'s
+module docstring (keyed by agent+model+prompt hash) and
+[test-target/README.md](test-target/README.md).

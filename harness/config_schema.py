@@ -35,6 +35,12 @@ _log = logging.getLogger("harness.config_schema")
 
 _SECRET_KEYS = {"auth_token", "bearer_token", "api_key", "cloud_api_key", "token", "password"}
 _VALID_FAIL_OPEN_MODES = {"all", "curated"}
+# AR-1 (LOOP half): agent-family routing mode. "agents" (default, shipped) is
+# today's per-agent fan-out. "families" collapses dispatched agents into
+# per-family composed calls (harness/agent_families.py) -- NOT a safety flag
+# (it only reduces model-call count; sends no live traffic, widens no
+# scope), so it is intentionally NOT added to SafeDefaultGuardTests.SAFE_CHECKS.
+_VALID_ROUTING_MODES = {"agents", "families"}
 
 
 @dataclass
@@ -97,6 +103,7 @@ class _CoordinatorSection(BaseModel):
     cloud_reasoning: bool = False
     cloud_model: str | None = None
     fail_open_mode: str = "all"
+    routing_mode: str = "agents"
 
 
 class ConfigModel(BaseModel):
@@ -134,6 +141,23 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
             "is false: mutating replay can never run, and the combination signals a "
             "misconfigured active run (enable active_enabled or clear allow_mutating_replay)."
         )
+    # The dangerous OTHER direction: active armed from the config FILE at startup
+    # (how the crAPI eval was configured) but mutating replay off. This is a VALID
+    # read-only-active config, so it's a warning not an error -- but silently every
+    # validator whose proof needs a mutating replay is blocked by the gate and
+    # skips, so a run can report "nothing found" for those classes without testing
+    # them. (ValidatorRegistry.set_active_enabled warns the runtime POST /settings
+    # path; this covers the startup-config path the same way.)
+    if v.active_enabled and not v.allow_mutating_replay:
+        warnings.append(
+            "validators.active_enabled is true but validators.allow_mutating_replay "
+            "is false: active mode is armed, but every validator whose proof needs a "
+            "mutating replay (e.g. stored_xss, csrf, file_upload, auth_sequence, "
+            "sequence, verb_tamper, command_injection, ssti, xxe, deserialization_oob) "
+            "will be blocked by the safety gate and skip -- the run can report "
+            "'nothing found' for those classes without having tested them. Set "
+            "validators.allow_mutating_replay to exercise them."
+        )
     if c.cloud_reasoning and not c.cloud_model:
         errors.append(
             "coordinator.cloud_reasoning is true but coordinator.cloud_model is unset: "
@@ -143,6 +167,11 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
         errors.append(
             f"coordinator.fail_open_mode {c.fail_open_mode!r} is not one of "
             f"{sorted(_VALID_FAIL_OPEN_MODES)}."
+        )
+    if c.routing_mode not in _VALID_ROUTING_MODES:
+        errors.append(
+            f"coordinator.routing_mode {c.routing_mode!r} is not one of "
+            f"{sorted(_VALID_ROUTING_MODES)}."
         )
 
     # --- range constraints ---
@@ -257,6 +286,14 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     "engagement.coverage_drive_legs",
     "coordinator.cloud_primary",
     "coordinator.cloud_reasoning",
+    # P2-1: the business-context planning pass re-ranks the worklist and proposes
+    # chains; passive-only ("just analyze captured traffic") forces it off too.
+    "business_context.enabled",
+    # LB-2: driver-based request capture drives a real browser against the
+    # target to observe JS-issued requests -- active target traffic, same as
+    # autonomous_discovery.enabled above; passive-only forces it off too.
+    "driver_capture.enabled",
+    "iterative_agent.enabled",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

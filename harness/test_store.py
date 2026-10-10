@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -87,6 +88,178 @@ class TestFindingsPersistenceRoundTrip(unittest.TestCase):
         self.assertEqual(len(results), 2)
         classes = {r["vulnerability_class"] for r in results}
         self.assertEqual(classes, {"xss", "idor"})
+
+
+class TestExchangeProvenanceAR3(unittest.TestCase):
+    """AR-3 (LOOP half): findings carry the exact id of the exchange that
+    produced them (exchange_id), additively, instead of only the
+    (method, url) coordinates the findings table already had. Covers the
+    round-trip, re-observation-after-dedup, and back-compat/no-op cases the
+    Opus scoper's acceptance criteria call for."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "test_ar3_state.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def test_capture_id_round_trips_through_all_host_findings(self):
+        # POSITIVE (round-trip): a finding persisted from a known synthetic
+        # exchange with an explicit capture_id reads back carrying that
+        # exact exchange id, not just its (method, url).
+        exchange = HttpExchange(
+            url="https://example.com/api/orders/1", method="GET",
+            request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+            capture_id="exch-known-42",
+        )
+        finding = Finding(
+            vulnerability_class="idor", confidence=0.7, summary="s",
+            evidence="e", suggested_test="t", basis="derived",
+        )
+        store.persist_findings(exchange, "idor_agent", [finding])
+        results = store.all_host_findings(exchange.url)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["exchange_id"], "exch-known-42")
+        # run_id is additive too; absent any bound telemetry run, it is ''.
+        self.assertEqual(results[0]["run_id"], "")
+
+    def test_no_capture_id_falls_back_to_content_hash_and_reads_back(self):
+        # NEGATIVE (legacy/back-compat, no explicit capture_id): a finding
+        # persisted from an exchange with NO capture_id set still reads back
+        # fine, and gets a non-empty exchange_id -- the stable content hash
+        # fallback (cache.ExchangeCache.compute_exchange_hash), not ''.
+        exchange = HttpExchange(
+            url="https://example.com/api/orders/2", method="GET",
+            request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+        )
+        self.assertEqual(exchange.capture_id, "")
+        finding = Finding(
+            vulnerability_class="idor", confidence=0.6, summary="s",
+            evidence="e", suggested_test="t", basis="derived",
+        )
+        store.persist_findings(exchange, "idor_agent", [finding])
+        results = store.all_host_findings(exchange.url)
+        self.assertEqual(len(results), 1)
+        self.assertNotEqual(results[0]["exchange_id"], "")
+
+        from harness import cache as cache_mod
+        expected = cache_mod.ExchangeCache.compute_exchange_hash(exchange)[:16]
+        self.assertEqual(results[0]["exchange_id"], expected)
+
+    def test_deduped_finding_records_second_observation_row(self):
+        # POSITIVE (re-observation): two exchanges sharing the SAME (host,
+        # method, endpoint, vulnerability_class) -- so they fingerprint
+        # identically and collapse into ONE findings row (INSERT OR IGNORE,
+        # unchanged dedup) -- still each get their own row in
+        # finding_observations, keyed by their own exchange_id.
+        url = "https://example.com/api/tickets/9"
+        exchange_a = HttpExchange(
+            url=url, method="GET", request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+            capture_id="exch-a",
+        )
+        exchange_b = HttpExchange(
+            url=url, method="GET", request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+            capture_id="exch-b",
+        )
+        finding = Finding(
+            vulnerability_class="idor", confidence=0.65, summary="s",
+            evidence="e", suggested_test="t", basis="derived",
+        )
+        store.persist_findings(exchange_a, "idor_agent", [finding])
+        store.persist_findings(exchange_b, "idor_agent", [finding])
+
+        results = store.all_host_findings(url)
+        # Dedup unchanged: one findings row, keeping the first-seen exchange_id.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["exchange_id"], "exch-a")
+
+        fp = results[0]["fingerprint"]
+        observed = store.finding_observations([fp])
+        self.assertIn(fp, observed)
+        self.assertCountEqual(observed[fp], ["exch-a", "exch-b"])
+
+    def test_pre_ar3_db_migrates_without_error(self):
+        # NEGATIVE (migration/back-compat): a DB created by a build that
+        # predates AR-3 -- findings table with no exchange_id/run_id columns,
+        # no finding_observations table at all -- must migrate cleanly the
+        # next time it is opened, with no destructive rewrite of existing
+        # rows (they simply default to '').
+        import sqlite3
+        conn = sqlite3.connect(store._DB_PATH)
+        try:
+            # Exact pre-AR-3 schema: every column store.py's findings table has
+            # had for a while, EXCEPT exchange_id/run_id (the two this item
+            # adds) -- so the only thing the migration guard has to do here is
+            # add those two, not paper over unrelated pre-existing gaps.
+            conn.executescript("""
+                CREATE TABLE findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    vulnerability_class TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    summary TEXT NOT NULL,
+                    basis TEXT NOT NULL,
+                    evidence TEXT NOT NULL DEFAULT '',
+                    suggested_test TEXT NOT NULL DEFAULT '',
+                    owasp_category TEXT,
+                    review_verdict TEXT,
+                    confirmed INTEGER NOT NULL DEFAULT 0,
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    prompt_version TEXT NOT NULL DEFAULT '',
+                    finding_id TEXT NOT NULL DEFAULT '',
+                    case_id TEXT NOT NULL DEFAULT '',
+                    proof_id TEXT NOT NULL DEFAULT '',
+                    oracle_verified INTEGER NOT NULL DEFAULT 0,
+                    verification_state TEXT NOT NULL DEFAULT 'candidate',
+                    oracle_capsule_id TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
+                );
+                INSERT INTO findings (host, url, method, agent, vulnerability_class,
+                                       severity, confidence, summary, basis, fingerprint, created_at)
+                VALUES ('example.com', 'https://example.com/legacy', 'GET', 'legacy_agent',
+                        'xss', 'medium', 0.5, 'pre-AR-3 row', 'derived', 'legacy-fp-1', 0.0);
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Opening it through the normal path must not raise, must add the
+        # new columns/table, and the pre-existing row must remain readable
+        # with the new columns defaulting to ''.
+        conn = store._connect()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)")}
+            self.assertIn("exchange_id", cols)
+            self.assertIn("run_id", cols)
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn("finding_observations", tables)
+            row = conn.execute(
+                "SELECT exchange_id, run_id, summary FROM findings WHERE url = ?",
+                ("https://example.com/legacy",),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row[0], "")
+        self.assertEqual(row[1], "")
+        self.assertEqual(row[2], "pre-AR-3 row")
+
+        results = store.all_host_findings("https://example.com/legacy")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["exchange_id"], "")
+        self.assertEqual(results[0]["run_id"], "")
 
 
 class TestFindingSuppression(unittest.TestCase):
@@ -397,6 +570,390 @@ class TestConnectConcurrentMigrationIsIdempotent(unittest.TestCase):
         finally:
             conn.close()
         self.assertTrue({"tenant", "permissions_json", "trust"}.issubset(ident_cols))
+
+
+class EvidenceBlobStoreTests(unittest.TestCase):
+    """FR-2 (F03): the content-addressed blob store P0-6 resolvability now depends
+    on. Callers (run_context._artifact) are responsible for redacting bytes before
+    calling put_evidence_blob -- this store only proves the put/get/verify contract:
+    round-trip by hash, and honest False for a hash that was never stored or whose
+    bytes no longer match it (corruption), never a silent/guessed answer."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "evidence_blobs_t.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def test_put_get_round_trip_by_content_hash(self):
+        data = b'{"method":"GET","url":"http://a.test/x","headers":{},"body":null}'
+        h = store.put_evidence_blob(data)
+        self.assertEqual(len(h), 64)  # sha256 hex digest
+        import hashlib
+        self.assertEqual(h, hashlib.sha256(data).hexdigest())
+        self.assertEqual(store.get_evidence_blob(h), data)
+        self.assertTrue(store.evidence_blob_resolves(h))
+
+    def test_put_is_idempotent_for_identical_bytes(self):
+        data = b"identical evidence bytes"
+        h1 = store.put_evidence_blob(data)
+        h2 = store.put_evidence_blob(data)
+        self.assertEqual(h1, h2)
+        self.assertEqual(store.get_evidence_blob(h1), data)
+
+    def test_absent_hash_does_not_resolve(self):
+        # A hash that was never written at all -- honest False, not an exception.
+        self.assertIsNone(store.get_evidence_blob("0" * 64))
+        self.assertFalse(store.evidence_blob_resolves("0" * 64))
+
+    def test_empty_hash_does_not_resolve(self):
+        self.assertIsNone(store.get_evidence_blob(""))
+        self.assertFalse(store.evidence_blob_resolves(""))
+
+    def test_corrupted_blob_fails_hash_verification(self):
+        # NEGATIVE control: a row is present under the hash, but its bytes were
+        # tampered with (e.g. partial write, disk corruption) -- evidence_blob_
+        # resolves must recompute the hash and say False, not just check presence.
+        h = store.put_evidence_blob(b"original bytes")
+        conn = store._connect()
+        try:
+            conn.execute("UPDATE evidence_blobs SET data = ? WHERE sha256 = ?",
+                         (b"tampered bytes", h))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNotNone(store.get_evidence_blob(h))  # a row is still there...
+        self.assertFalse(store.evidence_blob_resolves(h))  # ...but it does not verify
+
+
+class EvidenceRetentionPolicyTests(unittest.TestCase):
+    """P3-1 (partial): retention/expiry for evidence_blobs, config-gated OFF by
+    default. Purging is safe -- evidence_blob_resolves() already reports a
+    deleted blob as unresolved -- but must never fire when retention is
+    disabled (the shipped default), so both a positive purge and a negative
+    (default/OFF) control are required here."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "evidence_retention_t.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def _make_old_and_new_blobs(self, now):
+        old_hash = store.put_evidence_blob(b"stale evidence, 40 days old")
+        new_hash = store.put_evidence_blob(b"fresh evidence, just captured")
+        old_cutoff = now - 40 * 86400.0
+        conn = store._connect()
+        try:
+            conn.execute(
+                "UPDATE evidence_blobs SET created_at = ? WHERE sha256 = ?",
+                (old_cutoff, old_hash))
+            conn.commit()
+        finally:
+            conn.close()
+        return old_hash, new_hash
+
+    def test_apply_retention_policy_purges_only_blobs_older_than_threshold(self):
+        # POSITIVE: a 30-day retention policy purges a 40-day-old blob but
+        # leaves a freshly-written one alone.
+        now = time.time()
+        old_hash, new_hash = self._make_old_and_new_blobs(now)
+        deleted = store.apply_retention_policy(30, now=now)
+        self.assertEqual(deleted, 1)
+        self.assertFalse(store.evidence_blob_resolves(old_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+    def test_retention_disabled_by_default_is_a_no_op(self):
+        # NEGATIVE control: retention OFF (0, the shipped default) must not
+        # delete anything -- byte-identical to today's keep-forever behavior.
+        now = time.time()
+        old_hash, new_hash = self._make_old_and_new_blobs(now)
+        self.assertEqual(store.apply_retention_policy(0, now=now), 0)
+        self.assertEqual(store.apply_retention_from_config({}, now=now), 0)
+        self.assertTrue(store.evidence_blob_resolves(old_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+    def test_purge_evidence_blobs_older_than_rejects_non_positive_max_age(self):
+        now = time.time()
+        old_hash, new_hash = self._make_old_and_new_blobs(now)
+        self.assertEqual(store.purge_evidence_blobs_older_than(0, now=now), 0)
+        self.assertEqual(store.purge_evidence_blobs_older_than(-100, now=now), 0)
+        self.assertTrue(store.evidence_blob_resolves(old_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+    def test_apply_retention_from_config_reads_store_evidence_retention_days(self):
+        # Config->mechanism consumer: a 30-day config value purges the old
+        # blob; an empty config (no `store` section) leaves everything alone.
+        now = time.time()
+        old_hash, new_hash = self._make_old_and_new_blobs(now)
+        deleted = store.apply_retention_from_config(
+            {"store": {"evidence_retention_days": 30}}, now=now)
+        self.assertEqual(deleted, 1)
+        self.assertFalse(store.evidence_blob_resolves(old_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+        # A second, disabled config on fresh blobs must not touch anything.
+        another_hash = store.put_evidence_blob(b"yet more fresh evidence")
+        self.assertEqual(store.apply_retention_from_config({}, now=now), 0)
+        self.assertTrue(store.evidence_blob_resolves(another_hash))
+        self.assertTrue(store.evidence_blob_resolves(new_hash))
+
+
+class WipeEngagementTests(unittest.TestCase):
+    """P3-1 (partial): the explicit "wipe engagement" action -- host-scoped
+    deletion of a host's persisted evidence. The load-bearing property under
+    test is the evidence_blobs guard: evidence_blobs is content-addressed
+    (sha256(bytes) is the primary key), so identical bytes referenced by two
+    different hosts is ONE shared row that must survive wiping either host
+    alone -- a blanket delete of every hash the target host's ledger
+    mentions would be wrong. See store.wipe_engagement's own docstring/
+    module comment for the full table-by-table rationale."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_db_path = store._DB_PATH
+        store._DB_PATH = Path(self._tmpdir.name) / "wipe_engagement_t.db"
+
+    def tearDown(self):
+        store._DB_PATH = self._original_db_path
+        self._tmpdir.cleanup()
+
+    def _seed_host(self, host: str, url: str, *, case_id: str, finding_id: str,
+                    proof_id: str, req_bytes: bytes, resp_bytes: bytes) -> dict:
+        """Seed one host with a finding (carrying case_id/finding_id/
+        proof_id), a ledger_event referencing a request/response blob pair
+        under that finding's case_id, a proof_records row, a finding_
+        observations row (automatic, via persist_findings), and an
+        engagement_state row. Returns the finding's fingerprint plus the
+        blob hashes, for assertions."""
+        exchange = HttpExchange(
+            url=url, method="GET", request_headers={}, request_body="",
+            response_status=200, response_headers={}, response_body="",
+        )
+        finding = Finding(
+            vulnerability_class="sqli", confidence=0.9, summary=f"finding for {host}",
+            evidence="e", suggested_test="t", basis="derived",
+            case_id=case_id, finding_id=finding_id, proof_id=proof_id,
+        )
+        store.persist_findings(exchange, "test_agent", [finding])
+        results = store.all_host_findings(url)
+        self.assertEqual(len(results), 1)
+        fingerprint = results[0]["fingerprint"]
+
+        req_hash = store.put_evidence_blob(req_bytes)
+        resp_hash = store.put_evidence_blob(resp_bytes)
+        store.persist_ledger_event({
+            "event_id": f"evt-{case_id}",
+            "event_type": "execution",
+            "finding_ref": case_id,
+            "case_ref": case_id,
+            "summary": f"GET {url}",
+            "data": {"request_blob": req_hash, "response_blob": resp_hash},
+            "provenance": {},
+            "created_at": time.time(),
+        })
+
+        conn = store._connect()
+        try:
+            conn.execute(
+                "INSERT INTO proof_records (proof_id, run_id, case_id, finding_ref, "
+                "verdict, created_at) VALUES (?, '', ?, ?, 'confirmed', ?)",
+                (proof_id, case_id, finding_id, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        store.save_engagement(host, {"host": host, "note": "seeded"})
+
+        return {"fingerprint": fingerprint, "req_hash": req_hash, "resp_hash": resp_hash}
+
+    def _seed_plan_and_validation(self, url: str, *, plan_id: str,
+                                  source_hash: str, capability: str = "sqlmap") -> str:
+        """Seed a test_plan (host derived from `url`) plus a validation_runs
+        row under it, via the production persist path. confirmed=False so the
+        confirmation-capability allowlist is not consulted -- the point is only
+        to insert a validation_runs row tied to the plan. Returns plan_id."""
+        plan = TestPlan(
+            id=plan_id, capability=capability, finding_class="sqli", category="A03",
+            source_exchange_url=url, execution_plane="burp",
+            source_exchange_hash=source_hash,
+        )
+        store.persist_retry_plan(plan)
+        ok, msg = store.persist_validation_submission(ValidationSubmission(
+            plan_id=plan_id, status="not_confirmed", confirmed=False,
+            executor=f"burp:{capability}", source_exchange_hash=source_hash,
+        ))
+        self.assertTrue(ok, msg)
+        return plan_id
+
+    def _validation_run_count(self, plan_id: str) -> int:
+        conn = store._connect()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM validation_runs WHERE plan_id = ?", (plan_id,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_wipe_cascades_into_validation_runs_and_spares_other_hosts(self):
+        # P3-1 orphan cascade (defect-injection): wiping a host must ALSO
+        # remove the validation_runs rows hanging off that host's test_plans.
+        # validation_runs has no host column, no ON DELETE CASCADE, and
+        # _connect() leaves PRAGMA foreign_keys off, so without the explicit
+        # subquery delete these rows orphan. Pre-fix, counts["validation_runs"]
+        # KeyErrors and the A row survives -- so this test is red before green.
+        a_plan = self._seed_plan_and_validation(
+            "https://a.example.com/vuln", plan_id="plan-A", source_hash="hash-A")
+        b_plan = self._seed_plan_and_validation(
+            "https://b.example.com/vuln", plan_id="plan-B", source_hash="hash-B")
+        self.assertEqual(self._validation_run_count(a_plan), 1)
+        self.assertEqual(self._validation_run_count(b_plan), 1)
+
+        counts = store.wipe_engagement("a.example.com")
+
+        # POSITIVE: A's validation_runs row is gone (query validation_runs
+        # directly -- a JOIN reader would return nothing anyway once A's
+        # test_plans are deleted, which would NOT prove the orphan is cleaned).
+        self.assertEqual(self._validation_run_count(a_plan), 0)
+        # NEGATIVE CONTROL: B's validation_runs row is untouched.
+        self.assertEqual(self._validation_run_count(b_plan), 1)
+        # The wipe reports the deletion (KeyError / 0 before the fix).
+        self.assertGreaterEqual(counts["validation_runs"], 1)
+
+    def test_wipe_deletes_target_hosts_own_evidence(self):
+        # POSITIVE: everything seeded for host A disappears after wiping A.
+        seeded = self._seed_host(
+            "a.example.com", "https://a.example.com/api/x",
+            case_id="case-A-1", finding_id="finding-A-1", proof_id="proof-A-1",
+            req_bytes=b"A-only request bytes", resp_bytes=b"A-only response bytes",
+        )
+        self.assertTrue(store.evidence_blob_resolves(seeded["req_hash"]))
+        self.assertTrue(store.evidence_blob_resolves(seeded["resp_hash"]))
+
+        counts = store.wipe_engagement("a.example.com")
+
+        self.assertEqual(store.all_host_findings("https://a.example.com/api/x", include_suppressed=True), [])
+        self.assertEqual(store.ledger_events_for("case-A-1"), [])
+        self.assertFalse(store.evidence_blob_resolves(seeded["req_hash"]))
+        self.assertFalse(store.evidence_blob_resolves(seeded["resp_hash"]))
+        conn = store._connect()
+        try:
+            proof_rows = conn.execute(
+                "SELECT 1 FROM proof_records WHERE case_id = ?", ("case-A-1",)).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(proof_rows, [])
+        self.assertEqual(store.finding_observations([seeded["fingerprint"]]), {})
+        self.assertIsNone(store.load_engagement("a.example.com"))
+
+        # The returned dict reports non-zero counts for every table this
+        # seed actually populated.
+        for table in ("findings", "ledger_events", "evidence_blobs",
+                      "proof_records", "finding_observations", "scoped_engagement_state"):
+            self.assertGreater(counts[table], 0, f"expected {table} to report rows deleted")
+
+    def test_other_host_survives_untouched(self):
+        # NEGATIVE CONTROL #1: host B's own findings/ledger/blobs are
+        # completely unaffected by wiping A.
+        self._seed_host(
+            "a.example.com", "https://a.example.com/api/x",
+            case_id="case-A-1", finding_id="finding-A-1", proof_id="proof-A-1",
+            req_bytes=b"A-only request bytes", resp_bytes=b"A-only response bytes",
+        )
+        seeded_b = self._seed_host(
+            "b.example.com", "https://b.example.com/api/y",
+            case_id="case-B-1", finding_id="finding-B-1", proof_id="proof-B-1",
+            req_bytes=b"B-only request bytes", resp_bytes=b"B-only response bytes",
+        )
+
+        store.wipe_engagement("a.example.com")
+
+        self.assertEqual(len(store.all_host_findings("https://b.example.com/api/y")), 1)
+        self.assertTrue(store.evidence_blob_resolves(seeded_b["req_hash"]))
+        self.assertTrue(store.evidence_blob_resolves(seeded_b["resp_hash"]))
+        self.assertEqual(len(store.ledger_events_for("case-B-1")), 1)
+
+    def test_blob_shared_by_both_hosts_survives_wiping_one(self):
+        # NEGATIVE CONTROL #2 (LOAD-BEARING): a blob whose IDENTICAL bytes
+        # are referenced by BOTH A and B survives wipe_engagement("A") --
+        # proving the `candidate - other_referenced` guard, not a blanket
+        # delete keyed on "every hash A's ledger mentions".
+        shared_bytes = b"identical evidence bytes shared by A and B"
+        shared_hash = store.put_evidence_blob(shared_bytes)
+
+        # Host A references the shared blob (as its request_blob) plus an
+        # A-only response blob.
+        exchange_a = HttpExchange(
+            url="https://a.example.com/api/shared", method="GET",
+            request_headers={}, request_body="", response_status=200,
+            response_headers={}, response_body="",
+        )
+        finding_a = Finding(
+            vulnerability_class="sqli", confidence=0.9, summary="finding A",
+            evidence="e", suggested_test="t", basis="derived",
+            case_id="case-A-shared", finding_id="finding-A-shared", proof_id="proof-A-shared",
+        )
+        store.persist_findings(exchange_a, "test_agent", [finding_a])
+        a_only_hash = store.put_evidence_blob(b"A-only distinct bytes")
+        store.persist_ledger_event({
+            "event_id": "evt-a-shared", "event_type": "execution",
+            "finding_ref": "case-A-shared", "case_ref": "case-A-shared",
+            "summary": "GET shared", "data": {"request_blob": shared_hash,
+                                                "response_blob": a_only_hash},
+            "provenance": {}, "created_at": time.time(),
+        })
+
+        # Host B independently produced the exact same bytes (e.g. the same
+        # canned error page) and also references the shared blob.
+        exchange_b = HttpExchange(
+            url="https://b.example.com/api/shared", method="GET",
+            request_headers={}, request_body="", response_status=200,
+            response_headers={}, response_body="",
+        )
+        finding_b = Finding(
+            vulnerability_class="sqli", confidence=0.9, summary="finding B",
+            evidence="e", suggested_test="t", basis="derived",
+            case_id="case-B-shared", finding_id="finding-B-shared", proof_id="proof-B-shared",
+        )
+        store.persist_findings(exchange_b, "test_agent", [finding_b])
+        store.persist_ledger_event({
+            "event_id": "evt-b-shared", "event_type": "execution",
+            "finding_ref": "case-B-shared", "case_ref": "case-B-shared",
+            "summary": "GET shared", "data": {"request_blob": shared_hash},
+            "provenance": {}, "created_at": time.time(),
+        })
+
+        self.assertTrue(store.evidence_blob_resolves(shared_hash))
+        self.assertTrue(store.evidence_blob_resolves(a_only_hash))
+
+        store.wipe_engagement("a.example.com")
+
+        # The shared blob survives (B still references it); the A-only one is gone.
+        self.assertTrue(store.evidence_blob_resolves(shared_hash))
+        self.assertFalse(store.evidence_blob_resolves(a_only_hash))
+        # And B's own finding is untouched.
+        self.assertEqual(len(store.all_host_findings("https://b.example.com/api/shared")), 1)
+
+    def test_unknown_host_is_a_clean_no_op(self):
+        # EMPTY/NO-OP: an unseeded host returns all-zero counts and deletes
+        # nothing, including for a host with real data present elsewhere.
+        self._seed_host(
+            "a.example.com", "https://a.example.com/api/x",
+            case_id="case-A-1", finding_id="finding-A-1", proof_id="proof-A-1",
+            req_bytes=b"A-only request bytes", resp_bytes=b"A-only response bytes",
+        )
+        counts = store.wipe_engagement("nonexistent.host")
+        self.assertTrue(counts)
+        self.assertTrue(all(v == 0 for v in counts.values()), counts)
+        # And host A's own data is untouched by the no-op.
+        self.assertEqual(len(store.all_host_findings("https://a.example.com/api/x")), 1)
 
 
 if __name__ == "__main__":

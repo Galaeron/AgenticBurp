@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from .base import Validator
 from .sqlmap import SqlmapValidator
 from .cors_validator import CorsValidator
@@ -29,13 +30,17 @@ from .auth_sequence_validator import AuthSequenceValidator
 from .stored_xss_validator import StoredXssValidator
 from .verb_tamper_validator import VerbTamperValidator
 from .csrf_validator import CsrfValidator
+from .nosql_validator import NosqlValidator
 from .file_upload_validator import FileUploadValidator
+from .client_trust_validator import ClientTrustValidator
 from .rate_limit_validator import RateLimitValidator
 from .reset_token_validator import ResetTokenValidator
 from .dom_xss_validator import DomXssValidator
 from .toctou_validator import ToctouValidator
 from .verbose_error_validator import VerboseErrorValidator
 from harness.safety_gate import get_default_gate, reset_default_gate
+
+log = logging.getLogger(__name__)
 
 
 class ValidatorRegistry:
@@ -164,6 +169,9 @@ class ValidatorRegistry:
             self.validators["race_condition"] = RaceConditionValidator(
                 timeout=float(race_cfg.get("timeout", 15.0)),
                 burst_size=int(race_cfg.get("burst_size", 12)),
+                target_email=race_cfg.get("target_email"),
+                mailbox_url=race_cfg.get("mailbox_url"),
+                email_race_rounds=int(race_cfg.get("email_race_rounds", 6)),
             )
 
         # Insecure Deserialization validator (passive local inspection, not active)
@@ -200,6 +208,13 @@ class ValidatorRegistry:
         if ssti_cfg.get("enabled", True):
             self.validators["ssti"] = SstiValidator(
                 allowed_hosts=_allowed, timeout=float(ssti_cfg.get("timeout", 10.0)))
+        # IDOR read leg -- single-principal object-id read differential (own vs
+        # foreign vs absent). Read-only (GET); never a mutating/destructive replay.
+        idor_cfg = cfg.get("idor_read", {})
+        if idor_cfg.get("enabled", True):
+            from .idor_read_validator import IdorReadValidator
+            self.validators["idor_read"] = IdorReadValidator(
+                allowed_hosts=_allowed, timeout=float(idor_cfg.get("timeout", 10.0)))
         # Path-traversal leg -- reads a canonical system file via a traversal payload. Active.
         pt_cfg = cfg.get("path_traversal", {})
         if pt_cfg.get("enabled", True):
@@ -252,12 +267,25 @@ class ValidatorRegistry:
         if csrf_cfg.get("enabled", True):
             self.validators["csrf"] = CsrfValidator(
                 allowed_hosts=_allowed, timeout=float(csrf_cfg.get("timeout", 10.0)))
+        # NoSQL login-operator differential -- fresh anti-CSRF token per attempt,
+        # negative regex control, and independent administrator-page readback.
+        nosql_cfg = cfg.get("nosql", {})
+        if nosql_cfg.get("enabled", True):
+            self.validators["nosql"] = NosqlValidator(
+                allowed_hosts=_allowed, timeout=float(nosql_cfg.get("timeout", 10.0)))
         # File-upload extension bypass -- uploads a benign .html file and checks
         # if it is stored and retrievable. Active; the upload is mutating.
         fu_cfg = cfg.get("file_upload", {})
         if fu_cfg.get("enabled", True):
             self.validators["file_upload"] = FileUploadValidator(
                 allowed_hosts=_allowed, timeout=float(fu_cfg.get("timeout", 15.0)))
+        # Excessive trust in client-side controls -- tampers a server-owned value
+        # field (price/amount/total) and confirms the server reflects it back on an
+        # independent read. Active; the tamper write is gated by allow_mutating_replay.
+        ct_cfg = cfg.get("client_trust", {})
+        if ct_cfg.get("enabled", True):
+            self.validators["client_trust"] = ClientTrustValidator(
+                allowed_hosts=_allowed, timeout=float(ct_cfg.get("timeout", 10.0)))
         # Rate-limit / lockout absence -- replays the captured auth request N times
         # (safe subset: unchanged, valid creds) via authorize_burst and confirms no
         # 429/lockout after min_attempts. Active; gated by max_burst_size + mutating.
@@ -339,6 +367,25 @@ class ValidatorRegistry:
         In-memory only; never written back to config. Does NOT persist across a
         server restart -- deliberately, like the identities it authorizes."""
         self.active_enabled = bool(enabled)
+        # Second-switch visibility: active_enabled ALONE does not exercise the
+        # validators whose proof requires a mutating request -- those are gated by
+        # the SEPARATE validators.allow_mutating_replay flag (frozen from startup
+        # config) and skip silently without it. Arming active mode while that flag
+        # is off is the "turned it on and nothing happened" trap: the run looks
+        # complete while e.g. stored XSS, CSRF, file upload, the auth/sequence
+        # flows and the command-injection/SSTI/XXE/deserialization OOB sends were
+        # all blocked at the gate. Warn up front, when the gate is armed, rather
+        # than leaving the operator to infer it from per-send BLOCKED logs.
+        if enabled and not get_default_gate().config.allow_mutating_replay:
+            log.warning(
+                "active mode armed (validators.active_enabled=on) but "
+                "validators.allow_mutating_replay is OFF -- every validator whose "
+                "proof needs a mutating replay (e.g. stored_xss, csrf, file_upload, "
+                "auth_sequence, sequence, verb_tamper, command_injection, ssti, xxe, "
+                "deserialization_oob) will be BLOCKED by the safety gate and skip. "
+                "The run can report 'nothing found' for those classes without having "
+                "tested them. Set validators.allow_mutating_replay to exercise them; "
+                "each blocked send is also logged individually by the gate.")
 
     def set_cross_identity_enabled(self, enabled: bool) -> None:
         """Arm/disarm the cross-identity validator at run time. Arming lazily
@@ -387,11 +434,33 @@ class ValidatorRegistry:
             from harness import identity_headers
             from urllib.parse import urlsplit
             host = urlsplit(exchange.url).hostname or ""
+            xid = self._auto_cross_identity()
             if identity_headers.has_identities(host):
-                xid = self._auto_cross_identity()
                 if xid.applies(finding, exchange):
                     matched.append(xid)
+            elif xid.applies(finding, exchange):
+                # Second crAPI failure mode: active mode is armed and this IS an
+                # access-control (IDOR/BFLA) candidate, but no identities are
+                # registered for the host, so the cross-user validator cannot
+                # arm and the cross-user check is silently skipped -- a run can
+                # report "nothing found" for access control without ever testing
+                # it. Warn once per host (the mutating-replay switch is warned
+                # separately in set_active_enabled / config_schema).
+                self._warn_no_accounts(host)
         return matched
+
+    def _warn_no_accounts(self, host: str) -> None:
+        seen = self.__dict__.setdefault("_no_account_hosts_warned", set())
+        if host in seen:
+            return
+        seen.add(host)
+        log.warning(
+            "active mode is armed and an access-control (IDOR/BFLA) candidate was "
+            "raised for %r, but NO identities are registered for that host -- the "
+            "cross-user validator cannot run, so cross-user access-control checks "
+            "are silently skipped. Register another identity's session via "
+            "POST /identities/session-headers (Autorize-style) to exercise them.",
+            host)
 
     def bind_run_context(self, validators, run_context):
         """Return invocation-bound copies without changing for_finding's public seam."""

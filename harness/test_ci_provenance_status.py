@@ -77,12 +77,13 @@ class TestScoredStatusJobWiring(unittest.TestCase):
         """P1.6 must not silently drop the test_no_orphan_test_files.py
         tripwire while editing this workflow. It is a plain test_*.py file
         picked up by unittest discover -- confirm the file (and its
-        discoverable test class) still exist, and that the nightly tier
-        still runs full discovery (which is what actually executes it)."""
+        discoverable test class) still exist, and that the `full` tier still
+        runs full discovery (which is what actually executes it) on every
+        push/PR (Rule 2)."""
         orphan_test = Path(__file__).resolve().parent / "test_no_orphan_test_files.py"
         self.assertTrue(orphan_test.exists())
-        nightly_steps = self.jobs["nightly"]["steps"]
-        discover_cmds = [s.get("run", "") for s in nightly_steps]
+        full_steps = self.jobs["full"]["steps"]
+        discover_cmds = [s.get("run", "") for s in full_steps]
         self.assertTrue(any("unittest discover" in cmd for cmd in discover_cmds))
 
 

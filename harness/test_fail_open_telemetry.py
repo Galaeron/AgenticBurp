@@ -28,13 +28,13 @@ _AVAILABLE = ["sqli", "xss", "idor"]
 
 class _EmptyRoutingStub:
     """Returns a well-formed but empty dispatch -- the 'no valid targets' path."""
-    async def chat_json_metered(self, model, system_prompt, user_prompt, temperature=0.1):
+    async def chat_json_metered(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         return OllamaResult(data={"dispatch": [], "reason": ""}, prompt_tokens=1, completion_tokens=1)
 
 
 class _RaisingRoutingStub:
     """Raises -- the 'coordinator error' path."""
-    async def chat_json_metered(self, model, system_prompt, user_prompt, temperature=0.1):
+    async def chat_json_metered(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         raise RuntimeError("boom")
 
 
