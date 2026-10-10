@@ -339,20 +339,26 @@ class XxeTests(_GateAllowsMutating):
                 r.text = "ok"
             return r
         v = XxeValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=False))
-        with patch("httpx.AsyncClient.request", reading_app):
+        responder = CountingResponder(reading_app)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("xxe"), self._stock_xml_exchange()))
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
         self.assertIn("in-band", r.summary)
         # The file contents must NOT be dumped into the finding.
         self.assertNotIn("daemon:x:1:1:", r.evidence)
+        self.assertGreaterEqual(responder.count, 1, responder.why())  # the in-band read was actually sent
 
     def test_inband_no_reflection_and_no_oob_is_not_confirmed(self):
         # Entities disabled: no passwd signature reflected and no OOB hit.
         v = XxeValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=False))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("xxe"), self._stock_xml_exchange()))
         self.assertEqual(r.status, "not_confirmed")
+        # Non-vacuous: "not_confirmed" must mean the probe was sent and saw
+        # nothing, NOT that a mis-seeded scope sent nothing at all.
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
 
 if __name__ == "__main__":

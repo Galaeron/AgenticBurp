@@ -110,11 +110,12 @@ class CommandInjectionTests(_GateAllowsMutating):
         v = CommandInjectionValidator(
             allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=False),
             run_context=ctx)
-        with patch("httpx.AsyncClient.request") as send:
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("command injection"), self._exchange()))
         self.assertEqual(r.status, "skipped")
         self.assertEqual(ctx.budget.used, 0)
-        send.assert_not_called()
+        self.assertEqual(responder.count, 0, responder.why())  # zero budget => nothing reaches the wire
 
 
 def _ssti_responder(evaluate: bool):
@@ -189,10 +190,12 @@ class SstiTests(_GateAllowsMutating):
             async with ctx:
                 return await v.validate(_f("ssti"), ex)
 
-        with patch("httpx.AsyncClient.request", request):
+        responder = CountingResponder(request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(run())
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
+        self.assertGreaterEqual(responder.count, 1, responder.why())  # POST + same-origin readback were sent
 
     def test_confirms_stored_expression_on_separate_discovered_render_and_restores(self):
         from urllib.parse import parse_qs
@@ -228,11 +231,13 @@ class SstiTests(_GateAllowsMutating):
             async with ctx:
                 return await v.validate(_f("ssti"), ex)
 
-        with patch("httpx.AsyncClient.request", request):
+        responder = CountingResponder(request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(run())
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
         self.assertEqual(stored["display"], "user.name")
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_stored_readback_requires_product_absent_from_baseline(self):
         class Resp:
@@ -257,9 +262,13 @@ class SstiTests(_GateAllowsMutating):
             async with ctx:
                 return await v.validate(_f("ssti"), ex)
 
-        with patch("httpx.AsyncClient.request", request):
+        responder = CountingResponder(request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(run())
         self.assertEqual(r.status, "not_confirmed")
+        # Non-vacuous: the probe + readback were sent; not_confirmed is a real
+        # negative (the product was already in the baseline), not a no-send.
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_skips_without_params(self):
         ex = HttpExchange(url="http://t.test/x", method="GET", request_headers={},
@@ -272,11 +281,12 @@ class SstiTests(_GateAllowsMutating):
             allowed_hosts=["t.test"], max_requests=0,
             gate_config={"active_enabled": True, "allow_mutating_replay": True})
         v = SstiValidator(allowed_hosts=["t.test"], run_context=ctx)
-        with patch("httpx.AsyncClient.request") as send:
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssti"), self._exchange()))
         self.assertEqual(r.status, "skipped")
         self.assertEqual(ctx.budget.used, 0)
-        send.assert_not_called()
+        self.assertEqual(responder.count, 0, responder.why())  # zero budget => nothing reaches the wire
 
 
 if __name__ == "__main__":
