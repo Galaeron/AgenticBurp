@@ -19,8 +19,6 @@ result/log artifacts and `harness/config.yaml`.
 """
 from __future__ import annotations
 
-import copy
-import json
 import sys
 import unittest
 from pathlib import Path
@@ -329,6 +327,41 @@ def _synthetic_pixelmart_artifact(*, corrupt_wall: bool = False) -> dict:
     }
 
 
+def _synthetic_blind_style_artifact() -> dict:
+    """A minimal but structurally valid blind-eval ("runs"/"variance") artifact
+    whose stored aggregates reduce exactly to its own per-run rows, so
+    reconcile_blind_style accepts it. The negative controls tamper one stored
+    value and must then be rejected. Built in-test rather than read from a
+    721 KB committed run artifact -- the real file was only convenient input,
+    and skip-if-absent would let these pass in CI by never running (the same
+    vacuous-pass we are fixing elsewhere)."""
+    def _run(n_findings, elapsed, hit_id):
+        return {
+            "n_findings_total": float(n_findings),
+            "timing": {"total_elapsed_seconds": float(elapsed)},
+            "surfaced_finding_ids": [hit_id],
+            "results": [
+                {"ground_truth": "confirmed_vuln", "findings": [{"finding_id": hit_id}]},
+                {"ground_truth": "confirmed_vuln", "findings": []},
+                {"ground_truth": "control", "findings": []},
+            ],
+        }
+    runs = [_run(5, 100.0, "h0"), _run(7, 200.0, "h1")]
+    return {
+        "runs": runs,
+        "variance": {
+            # values/mean/pvariance recomputed directly from runs[] above
+            "n_findings_total": {"values": [5.0, 7.0], "mean": 6.0, "variance": 1.0},
+            "total_elapsed_seconds": {"values": [100.0, 200.0], "mean": 150.0, "variance": 2500.0},
+        },
+        "_bench_meta": {
+            "n_confirmed_vuln": 2,              # 2 confirmed_vuln results per run
+            "recall_any_finding": {"mean": 0.5},      # one of two hit each run
+            "recall_surfaced_only": {"mean": 0.5},
+        },
+    }
+
+
 class NegativeControlTests(unittest.TestCase):
     """Feeds the reconciliation functions synthetic artifacts whose stored
     summary DISAGREES with their own per-run rows. If these checks were
@@ -346,31 +379,33 @@ class NegativeControlTests(unittest.TestCase):
             rb.reconcile_pixelmart(data)
         self.assertIn("self-consistency failure", str(ctx.exception))
 
+    def test_blind_style_self_consistent_synthetic_artifact_passes(self):
+        # Positive control: the untampered synthetic artifact reduces to its own
+        # runs[], so reconcile_blind_style must accept it (proves the negative
+        # controls below discriminate, not just reject everything).
+        result = rb.reconcile_blind_style(_synthetic_blind_style_artifact(), "blindtarget2")
+        self.assertEqual(result["recall_any_finding"]["mean"], 0.5)
+        self.assertEqual(result["n_confirmed_vuln"], 2)
+
     def test_blind_style_corrupted_variance_values_is_rejected(self):
-        data = json.loads(
-            (rb.BENCHMARK_DIR / "blindtarget2_default_3x.json").read_text(encoding="utf-8"))
-        corrupted = copy.deepcopy(data)
-        # Tamper with one stored per-run value in the pre-aggregated
-        # 'variance' block so it silently disagrees with the SAME metric's
-        # real per-run value still sitting in runs[0] -- exactly the kind of
-        # drift a real reconciliation bug would need to catch.
+        corrupted = _synthetic_blind_style_artifact()
+        # Tamper with one stored per-run value in the pre-aggregated 'variance'
+        # block so it silently disagrees with the SAME metric's real per-run
+        # value still sitting in runs[0] -- the drift a real reconciliation bug
+        # would need to catch.
         corrupted["variance"]["n_findings_total"]["values"][0] = 999999.0
         with self.assertRaises(rb.ReconciliationError) as ctx:
             rb.reconcile_blind_style(corrupted, "blindtarget2")
         self.assertIn("disagrees", str(ctx.exception))
 
     def test_blind_style_corrupted_summary_mean_is_rejected(self):
-        data = json.loads(
-            (rb.BENCHMARK_DIR / "blindtarget2_default_3x.json").read_text(encoding="utf-8"))
-        corrupted = copy.deepcopy(data)
+        corrupted = _synthetic_blind_style_artifact()
         corrupted["variance"]["total_elapsed_seconds"]["mean"] = 1.0
         with self.assertRaises(rb.ReconciliationError):
             rb.reconcile_blind_style(corrupted, "blindtarget2")
 
     def test_blind_style_corrupted_bench_meta_recall_is_rejected(self):
-        data = json.loads(
-            (rb.BENCHMARK_DIR / "dvwa_default_3x.json").read_text(encoding="utf-8"))
-        corrupted = copy.deepcopy(data)
+        corrupted = _synthetic_blind_style_artifact()
         corrupted["_bench_meta"]["recall_any_finding"]["mean"] = 0.0
         with self.assertRaises(rb.ReconciliationError):
             rb.reconcile_blind_style(corrupted, "dvwa")
