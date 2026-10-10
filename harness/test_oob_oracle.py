@@ -82,7 +82,11 @@ class OobOracleTest(unittest.TestCase):
         else:
             raise RuntimeError("leg-verification fixture did not come up")
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed the gate SCOPE too: the scope lock (3c622c3) fails closed on an
+        # empty active scope, so without the fixture host the SSRF probe is
+        # refused and the oracle never reaches VERIFIED.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": ["127.0.0.1"]})
 
     @classmethod
     def tearDownClass(cls):

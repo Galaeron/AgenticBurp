@@ -43,6 +43,10 @@ def _gate(active_enabled: bool = False, allow_mutating_replay: bool = False) -> 
     return SafetyGate(SafetyGateConfig.from_dict({
         "active_enabled": active_enabled,
         "allow_mutating_replay": allow_mutating_replay,
+        # Scope to the origin these browser requests target; the scope lock fails
+        # closed on an empty active scope (3c622c3), which would deny the active
+        # same-origin mutation this gate is meant to allow.
+        "allowed_hosts": ["app.example"],
     }))
 
 

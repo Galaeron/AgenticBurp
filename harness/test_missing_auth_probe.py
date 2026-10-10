@@ -144,7 +144,8 @@ class MissingAuthProbeTests(unittest.TestCase):
         self.assertIn("safety gate", o.note)
 
     def test_mutating_method_probed_when_gate_allows(self):
-        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True))
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
+                                           allowed_hosts={"t.test"}))
         m = {("POST", "http://t.test/api/x"): {"unauth": (200, '{"created": true, "id": 7}')}}
         o = self._probe(m, ("POST", "/api/x"), include_mutating=True, gate=gate)
         self.assertEqual(o.classification, "missing_auth")
