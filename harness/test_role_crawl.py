@@ -398,11 +398,21 @@ class RoleCrawlEndpointTests(unittest.TestCase):
         import harness.server as server_module
         self.server_module = server_module
         server_module.orchestrator.allowed_hosts = ["shop.test"]
+        # /crawl-roles sends ACTIVE outbound traffic, so _require_active_crawl
+        # requires active mode armed (validators.active_enabled) on top of the
+        # scope above -- otherwise every call 403s "active operations are
+        # disabled" (and bodies lack the normal keys). Arm it for these endpoint
+        # tests; restore the prior value in tearDown so nothing leaks.
+        self._prev_active = server_module.orchestrator.validator_registry.active_enabled
+        server_module.orchestrator.validator_registry.set_active_enabled(True)
         from fastapi.testclient import TestClient
         # RB-1: state-changing routes require the bearer token even from
         # loopback; attach the (ephemeral, in this test env) token.
         self.client = TestClient(server_module.app, base_url="http://localhost",
                                  headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
+
+    def tearDown(self):
+        self.server_module.orchestrator.validator_registry.set_active_enabled(self._prev_active)
 
     def test_endpoint_runs(self):
         with patch("harness.crawler.crawl", _fake_crawl(["/api/report"])), \
