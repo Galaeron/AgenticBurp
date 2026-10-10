@@ -76,7 +76,13 @@ class LiveLegVerificationTest(unittest.TestCase):
         else:
             raise RuntimeError("leg-verification fixture did not come up")
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed the gate's SCOPE too, not just the mode flags: the scope lock
+        # (3c622c3) fails closed on an empty active scope, so without the
+        # fixture host here every mutating leg is refused at authorize() and
+        # skips ("not authorized") before it can confirm. The per-validator
+        # allowed_hosts is a separate check and does not arm the gate.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": ["127.0.0.1"]})
 
     @classmethod
     def tearDownClass(cls):
