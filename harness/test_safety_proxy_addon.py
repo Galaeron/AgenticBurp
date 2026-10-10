@@ -45,6 +45,10 @@ def _addon_with_config(active_enabled=False, allow_mutating_replay=False,
         allow_mutating_replay=allow_mutating_replay,
         max_burst_size=max_burst_size,
         max_mutating_requests_per_finding=max_burst_size,
+        # Scope the gate to the fixture host these flows target. The scope lock
+        # fails closed on an empty active scope (3c622c3), so without this every
+        # active-mode flow is refused before method/burst/ceiling logic runs.
+        allowed_hosts={"target.test"},
     ))
     addon._combined_tracker = CombinedBurstTracker()
     return addon
