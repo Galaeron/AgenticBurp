@@ -165,7 +165,10 @@ class DriverEndpointTests(unittest.TestCase):
 
     def test_execute_requires_base_url(self):
         resp = self.client.post("/engagement/shop.test/run", json={"execute": True})
-        self.assertEqual(resp.status_code, 400)
+        # execute=True with no base_url has no parseable crawl target, so the
+        # fail-closed active-crawl precondition refuses it with 403 before any
+        # field-level 400 -- scope/active preconditions are checked first (W-17).
+        self.assertEqual(resp.status_code, 403)
 
 
 if __name__ == "__main__":
