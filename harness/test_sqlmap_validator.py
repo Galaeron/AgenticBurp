@@ -413,7 +413,10 @@ class SqlmapValidatorFallsBackWhenBinaryMissingTests(unittest.IsolatedAsyncioTes
 
     def setUp(self):
         reset_default_gate()
-        get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed the fixture host so the boolean-probe fallback clears the fail-closed
+        # gate (3c622c3) instead of being refused out-of-scope before it runs.
+        get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                          "allowed_hosts": ["localhost"]})
 
     def tearDown(self):
         reset_default_gate()
@@ -507,7 +510,10 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         reset_default_gate()
-        get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed the fixture host so the boolean-probe fallback clears the fail-closed
+        # gate (3c622c3) instead of being refused out-of-scope before it runs.
+        get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                          "allowed_hosts": ["localhost"]})
 
     def tearDown(self):
         reset_default_gate()

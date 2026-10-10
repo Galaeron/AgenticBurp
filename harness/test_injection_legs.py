@@ -12,6 +12,7 @@ from harness.validators.command_injection_validator import CommandInjectionValid
 from harness.validators.ssti_validator import SstiValidator, _PRODUCT, _EXPR
 from harness.validators.injection_targets import param_targets
 from harness.run_context import RunContext
+from harness.testing_fixtures.sent_probe import CountingResponder, seed_gate_scope
 
 
 def _f(vc):
@@ -36,9 +37,10 @@ async def _noop_request(self, method, url, content=None, headers=None, **kw):
 
 class _GateAllowsMutating(unittest.TestCase):
     def setUp(self):
-        from harness import safety_gate
-        safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed the fixture host in scope: the gate fails closed on an empty active
+        # scope (3c622c3), so without this every send below is refused before the
+        # leg runs and the test "passes" having sent nothing.
+        seed_gate_scope(["t.test"])
 
     def tearDown(self):
         from harness import safety_gate
@@ -64,16 +66,25 @@ class CommandInjectionTests(_GateAllowsMutating):
 
     def test_confirms_on_callback(self):
         v = CommandInjectionValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=True))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("command injection"), self._exchange()))
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
+        # The payload-carrying request must actually have cleared the gate -- a
+        # confirmed verdict off zero sends would be a vacuous pass. (_FakeCollab is
+        # the OOB listener, not the send, so we count the real request here.)
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_not_confirmed_without_callback(self):
         v = CommandInjectionValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=False))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("command injection"), self._exchange()))
         self.assertEqual(r.status, "not_confirmed")
+        # Negative control still sends: not_confirmed must mean "sent, no callback",
+        # not "never sent" (the exact vacuous pass this guards).
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_skips_without_params(self):
         ex = HttpExchange(url="http://t.test/api/x", method="GET", request_headers={},
@@ -83,9 +94,14 @@ class CommandInjectionTests(_GateAllowsMutating):
 
     def test_out_of_scope_host_skipped(self):
         v = CommandInjectionValidator(allowed_hosts=["only.test"], collaborator=_FakeCollab(hit=True))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("command injection"), self._exchange()))
         self.assertEqual(r.status, "skipped")
+        # The sent-counter sits BELOW the scope decision: an out-of-scope host
+        # reaches the responder zero times, so a seeded scope can never make this
+        # pass vacuously.
+        self.assertEqual(responder.count, 0, responder.why())
 
     def test_run_context_zero_budget_prevents_network_send(self):
         ctx = RunContext.create(
@@ -121,17 +137,21 @@ class SstiTests(_GateAllowsMutating):
 
     def test_confirms_on_evaluated_expression(self):
         v = SstiValidator(allowed_hosts=["t.test"])
-        with patch("httpx.AsyncClient.request", _ssti_responder(evaluate=True)):
+        responder = CountingResponder(_ssti_responder(evaluate=True))
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssti"), self._exchange()))
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_not_confirmed_on_literal_reflection(self):
         # Reflected but NOT evaluated (e.g. reflected-XSS sink) must not confirm SSTI.
         v = SstiValidator(allowed_hosts=["t.test"])
-        with patch("httpx.AsyncClient.request", _ssti_responder(evaluate=False)):
+        responder = CountingResponder(_ssti_responder(evaluate=False))
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssti"), self._exchange()))
         self.assertEqual(r.status, "not_confirmed")
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_run_context_follows_same_origin_redirect_to_rendered_result(self):
         """A stored template editor commonly redirects after POST.  The proof is

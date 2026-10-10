@@ -14,6 +14,7 @@ from harness.validators.jwt_forge_validator import (JwtForgeValidator, _JWT_RE, 
                                             _forge_keep_sig, _rsa_jwks_to_pem)
 from harness.validators.ssrf_validator import SsrfValidator
 from harness.validators.xxe_validator import XxeValidator
+from harness.testing_fixtures.sent_probe import CountingResponder
 
 
 def _f(vc):
@@ -48,7 +49,13 @@ class CollaboratorTests(unittest.TestCase):
 
 class _StubJwt(JwtForgeValidator):
     """Replaces the network probe with a canned responder keyed on the token's
-    alg / signature, so the confirm logic is tested without a server."""
+    alg / signature, so the confirm logic is tested without a server.
+
+    NOTE (review 2026-10): this overrides `_probe` -- the method that performs the
+    send -- so the safety gate is NEVER consulted on this path. These tests are a
+    pure test of the confirmation LOGIC and are deliberately excluded from the
+    sent-count condition. End-to-end JWT proof over the gated transport (with a
+    real server-side request count) lives in test_leg_live_verification."""
     def __init__(self, responder, **kw):
         super().__init__(**kw)
         self._responder = responder
@@ -158,7 +165,10 @@ class _GateAllowsMutating(unittest.TestCase):
     def setUp(self):
         from harness import safety_gate
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed scope: the gate fails closed on an empty active scope (3c622c3), so
+        # without this the mutating ssrf/xxe POST is refused before the leg runs.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": ["t.test"]})
 
     def tearDown(self):
         from harness import safety_gate
@@ -173,16 +183,20 @@ class SsrfTests(_GateAllowsMutating):
 
     def test_confirms_on_callback(self):
         v = SsrfValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=True))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssrf"), self._exchange()))
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_not_confirmed_without_callback(self):
         v = SsrfValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=False))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssrf"), self._exchange()))
         self.assertEqual(r.status, "not_confirmed")
+        self.assertGreaterEqual(responder.count, 1, responder.why())  # probed; no OOB hit
 
     def test_skips_without_url_param(self):
         ex = HttpExchange(url="http://t.test/api/x", method="GET", request_headers={},
@@ -210,9 +224,11 @@ class SsrfTests(_GateAllowsMutating):
         v = SsrfValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=True))
         ex = self._stock_form_exchange()
         self.assertTrue(v.applies(_f("ssrf"), ex))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssrf"), ex))
         self.assertEqual(r.status, "confirmed")
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_inband_differential_confirms_without_collaborator(self):
         # A server that actually FETCHES the URL: the reachable loopback port
@@ -228,11 +244,13 @@ class SsrfTests(_GateAllowsMutating):
                 r.text = "<html><body>Internal service dashboard: 42 widgets</body></html>"
             return r
         v = SsrfValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=False))
-        with patch("httpx.AsyncClient.request", fetching_app):
+        responder = CountingResponder(fetching_app)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssrf"), self._stock_form_exchange()))
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
         self.assertIn("in-band", r.summary)
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_inband_echo_only_app_is_not_confirmed(self):
         # Negative control: the app only REFLECTS the submitted URL (no fetch).
@@ -245,9 +263,11 @@ class SsrfTests(_GateAllowsMutating):
             r.text = f"No stock information for URL {url} body {content}"
             return r
         v = SsrfValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=False))
-        with patch("httpx.AsyncClient.request", echo_app):
+        responder = CountingResponder(echo_app)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssrf"), self._stock_form_exchange()))
         self.assertEqual(r.status, "not_confirmed")
+        self.assertGreaterEqual(responder.count, 1, responder.why())  # fetched; only reflected
 
     def test_form_body_non_url_value_still_skipped(self):
         # Negative control: a urlencoded body whose value is NOT a URL and whose
@@ -267,15 +287,19 @@ class XxeTests(_GateAllowsMutating):
 
     def test_confirms_on_callback(self):
         v = XxeValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=True))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("xxe"), self._exchange()))
         self.assertEqual(r.status, "confirmed")
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_not_confirmed_without_callback(self):
         v = XxeValidator(allowed_hosts=["t.test"], collaborator=_FakeCollab(hit=False))
-        with patch("httpx.AsyncClient.request", _noop_request):
+        responder = CountingResponder(_noop_request)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("xxe"), self._exchange()))
         self.assertEqual(r.status, "not_confirmed")
+        self.assertGreaterEqual(responder.count, 1, responder.why())  # probed; no OOB hit
 
     def test_skips_non_xml_endpoint(self):
         ex = HttpExchange(url="http://t.test/api/x", method="POST",

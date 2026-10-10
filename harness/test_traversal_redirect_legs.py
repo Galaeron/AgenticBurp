@@ -13,6 +13,7 @@ from harness.categories import canonicalize
 from harness.run_context import RunContext
 from harness.validators.path_traversal_validator import PathTraversalValidator
 from harness.validators.open_redirect_validator import OpenRedirectValidator, _SENTINEL_HOST
+from harness.testing_fixtures.sent_probe import CountingResponder
 
 
 def _f(vc):
@@ -31,7 +32,10 @@ class _GateActive(unittest.TestCase):
     def setUp(self):
         from harness import safety_gate
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed scope: the gate fails closed on an empty active scope (3c622c3),
+        # so without this the leg's send is refused before it can run.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": ["t.test"]})
 
     def tearDown(self):
         from harness import safety_gate
@@ -61,18 +65,22 @@ class PathTraversalTests(_GateActive):
                 return _Resp("root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:")
             return _Resp("not found", status=404)
         v = PathTraversalValidator(allowed_hosts=["t.test"])
-        with patch("httpx.AsyncClient.request", _req):
+        responder = CountingResponder(_req)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("path traversal"), self._exchange()))
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_not_confirmed_when_traversal_blocked(self):
         async def _req(self, method, url, content=None, headers=None, **kw):
             return _Resp("Access denied", status=403)  # a hardened endpoint
         v = PathTraversalValidator(allowed_hosts=["t.test"])
-        with patch("httpx.AsyncClient.request", _req):
+        responder = CountingResponder(_req)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("path traversal"), self._exchange()))
         self.assertEqual(r.status, "not_confirmed")
+        self.assertGreaterEqual(responder.count, 1, responder.why())  # the probe was sent, just blocked
 
     def test_skips_without_file_param(self):
         ex = HttpExchange(url="http://t.test/api/status?verbose=1", method="GET",
@@ -94,10 +102,12 @@ class PathTraversalTests(_GateActive):
                 return _Resp("root:x:0:0:root:/root:/bin/bash")
             return _Resp("not found", status=404)
         v = PathTraversalValidator(allowed_hosts=["t.test"])
-        with patch("httpx.AsyncClient.request", _req):
+        responder = CountingResponder(_req)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("path traversal"), ex))
         self.assertEqual(r.status, "confirmed")
         self.assertIn("path segment", r.summary)
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_fileish_segment_makes_it_applicable(self):
         ex = HttpExchange(url="http://t.test/uploads/1", method="GET", request_headers={},
@@ -167,18 +177,22 @@ class OpenRedirectTests(_GateActive):
                 return _Resp(status=302, headers={"location": nxt})
             return _Resp(status=302, headers={"location": "/dashboard"})
         v = OpenRedirectValidator(allowed_hosts=["t.test"])
-        with patch("httpx.AsyncClient.request", _req):
+        responder = CountingResponder(_req)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("open redirect"), self._exchange()))
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
+        self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_not_confirmed_when_redirect_stays_onorigin(self):
         async def _req(self, method, url, content=None, headers=None, **kw):
             return _Resp(status=302, headers={"location": "/dashboard"})  # ignores the param
         v = OpenRedirectValidator(allowed_hosts=["t.test"])
-        with patch("httpx.AsyncClient.request", _req):
+        responder = CountingResponder(_req)
+        with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("open redirect"), self._exchange()))
         self.assertEqual(r.status, "not_confirmed")
+        self.assertGreaterEqual(responder.count, 1, responder.why())  # probed; target ignored it
 
     def test_skips_without_redirect_param(self):
         ex = HttpExchange(url="http://t.test/api/items?q=shoes", method="GET",

@@ -82,8 +82,11 @@ class _StateFixture:
 class ToctouTests(unittest.TestCase):
     def setUp(self):
         reset_default_gate()
+        # Seed scope: the gate fails closed on an empty active scope (3c622c3),
+        # so without this the mutating burst below is refused before the race leg
+        # runs and the test asserts against a bare out-of-scope skip.
         get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
-                          "max_burst_size": 12})
+                          "max_burst_size": 12, "allowed_hosts": ["target.test"]})
 
     def tearDown(self):
         reset_default_gate()
@@ -147,7 +150,8 @@ class ToctouTests(unittest.TestCase):
 
     def test_skip_when_burst_ceiling_below_two(self):
         reset_default_gate()
-        get_default_gate({"active_enabled": True, "allow_mutating_replay": True, "max_burst_size": 1})
+        get_default_gate({"active_enabled": True, "allow_mutating_replay": True, "max_burst_size": 1,
+                          "allowed_hosts": ["target.test"]})
         v = ToctouValidator(allowed_hosts=["target.test"])
         # baseline read must return JSON with a non-privileged authority field
         with patch.object(v, "_get_json", new=AsyncMock(return_value=(200, {"role": "user"}))):

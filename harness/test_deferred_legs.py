@@ -440,7 +440,9 @@ class RealWrapperFileUploadTests(unittest.TestCase):
     def setUp(self):
         from harness import safety_gate
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed scope so the upload POST clears the fail-closed gate (3c622c3).
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": ["target.test"]})
         self.v = FileUploadValidator(allowed_hosts=["target.test"])
 
     def tearDown(self):
@@ -495,7 +497,10 @@ class RealWrapperFileUploadTests(unittest.TestCase):
         import httpx
         from harness import safety_gate
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": False})
+        # In scope, so the skip is attributable to allow_mutating_replay=False (the
+        # property under test) rather than to an out-of-scope refusal.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": False,
+                                      "allowed_hosts": ["target.test"]})
 
         def handler(request):  # should never be reached
             return httpx.Response(200, json={"url": "/uploads/x.html"})
