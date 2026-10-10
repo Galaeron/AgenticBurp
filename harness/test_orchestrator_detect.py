@@ -54,7 +54,7 @@ class _RoutingStubOllama:
     def __init__(self, *, fail_routing: bool):
         self._fail_routing = fail_routing
 
-    async def chat_json_metered(self, model, system_prompt, user_prompt, temperature=0.1):
+    async def chat_json_metered(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         if _COORDINATOR_ANCHOR in system_prompt:
             if self._fail_routing:
                 raise RuntimeError("simulated coordinator routing failure")
@@ -65,8 +65,8 @@ class _RoutingStubOllama:
         return OllamaResult(data={"findings": [], "components": []},
                             prompt_tokens=1, completion_tokens=1)
 
-    async def chat_json(self, model, system_prompt, user_prompt, temperature=0.1):
-        result = await self.chat_json_metered(model, system_prompt, user_prompt, temperature)
+    async def chat_json(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
+        result = await self.chat_json_metered(model, system_prompt, user_prompt, temperature, seed=seed)
         return result.data
 
 
