@@ -305,13 +305,17 @@ class CrossIdentityValidator(Validator):
 
         considered = 0
         rejects = 0
+        errored = 0
+        last_error = None
         reached_unproven = None
         for ident in idents[:self.max_identities]:
             if _PRIVILEGED_ROLE.search(ident.get("role", "") or ""):
                 continue  # an admin reaching an admin function is expected, not a bypass
             try:
                 attempt = await self._probe_identity(exchange.url, ident)
-            except Exception:
+            except Exception as e:
+                errored += 1       # an errored probe is an UNKNOWN, not a denial
+                last_error = e
                 continue
             considered += 1
             if self._reached(attempt):
@@ -334,6 +338,10 @@ class CrossIdentityValidator(Validator):
             else:
                 rejects += 1
         if considered == 0:
+            if errored:
+                return self._skip(fc, f"could not test a function-level bypass: every non-privileged probe "
+                                      f"errored ({errored}; last: {last_error}) -- an errored probe is an "
+                                      f"unknown, never evidence that the control held")
             return self._skip(fc, "only privileged-role identities are configured -- cannot test a "
                                   "function-level bypass (an admin reaching an admin function is expected). "
                                   "Supply a lower-privilege identity's session to test BFLA")
@@ -347,6 +355,23 @@ class CrossIdentityValidator(Validator):
                         f"An admin namespace is a lead, not proof -- delegated/read-only access may be legitimate.",
                 evidence=f"Supply an admin session for a privileged-data comparison, or verify the returned "
                          f"content is genuinely admin-only, before treating this as a confirmed BFLA.",
+                control_outcome="inconclusive")
+        if errored:
+            # An errored probe is an UNKNOWN, not a denial. Without this guard it
+            # silently drops out of `considered`, so a single remaining denial
+            # satisfies rejects==considered and the leg reports "authorization
+            # holds" at 0.8 with control_outcome="control_held" -- which the
+            # downgrade block in orchestrator_confirm treats as a refutation,
+            # turning a network/scope failure into a confident clean bill of
+            # health against a real BFLA lead. Report inconclusive, never held.
+            return ValidationResult(
+                validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.0, confirmed=False,
+                summary=f"Function-level authorization test INCONCLUSIVE: {rejects} non-privileged "
+                        f"identity/identities were denied, but {errored} probe(s) errored and could not "
+                        f"be evaluated -- 'every non-privileged identity was denied' cannot be asserted.",
+                evidence=f"{considered} non-privileged identity/identities tested against {exchange.url} "
+                         f"(all denied); {errored} errored (last: {last_error}). An errored probe is an "
+                         f"unknown, not a denial, so this is NOT reported as a held control.",
                 control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
@@ -415,10 +440,14 @@ class CrossIdentityValidator(Validator):
         considered = 0
         rejects = 0
         authorized = 0
+        errored = 0
+        last_error = None
         for ident in idents_distinct[:self.max_identities]:
             try:
                 attempt = await self._probe_identity(exchange.url, ident)
-            except Exception:
+            except Exception as e:
+                errored += 1       # an errored probe is an UNKNOWN, not a denial
+                last_error = e
                 continue
             considered += 1
             ev = identity_compare.evaluate(
@@ -450,6 +479,9 @@ class CrossIdentityValidator(Validator):
                 rejects += 1
 
         if considered == 0:
+            if errored:
+                return self._skip(fc, f"no configured identity probe completed: every probe errored "
+                                      f"({errored}; last: {last_error}) -- cannot test access control")
             return self._skip(fc, "no configured identity probe could be sent")
         if authorized:
             return ValidationResult(
@@ -460,6 +492,23 @@ class CrossIdentityValidator(Validator):
                         f"all {considered} configured principals were still evaluated.",
                 evidence=f"OwnershipLedger authorized {authorized} of {considered} tested "
                          f"principal(s) for {self._object_ref(exchange.url)!r}.",
+                control_outcome="inconclusive")
+        if errored:
+            # An errored probe is an UNKNOWN, not a denial. Without this guard it
+            # silently drops out of `considered`, so a single remaining denial
+            # satisfies rejects==considered and the leg reports "access correctly
+            # restricted" at 0.8 with control_outcome="control_held" -- which the
+            # downgrade block in orchestrator_confirm treats as a refutation,
+            # turning a network/scope failure into a confident clean bill of
+            # health against a real IDOR/BOLA lead. Report inconclusive, never held.
+            return ValidationResult(
+                validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.0, confirmed=False,
+                summary=f"Cross-identity access-control test INCONCLUSIVE: {rejects} identity/identities "
+                        f"were denied, but {errored} probe(s) errored and could not be evaluated -- "
+                        f"'every other identity was denied' cannot be asserted.",
+                evidence=f"{considered} identity/identities evaluated against {exchange.url} (all rejected); "
+                         f"{errored} errored (last: {last_error}). An errored probe is an unknown, not a "
+                         f"denial, so this is NOT reported as a restricted/held control.",
                 control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
