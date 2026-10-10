@@ -457,6 +457,18 @@ def second_order_candidates(host_findings: list[dict]) -> list[dict]:
     return out
 
 
+# A chain is only as trustworthy as its weakest input, so it inherits that
+# input's basis rather than claiming a clean "derived" rule match: a chain built
+# from an `assumed`/`recalled` finding is itself assumed/recalled, not derived
+# (review 2026-10). Rank: lower = less certain.
+_BASIS_RANK = {"assumed": 0, "recalled": 0, "derived": 1, "observed": 2, "confirmed": 3}
+
+
+def _weakest_basis(*findings: dict) -> str:
+    bases = [(f.get("basis") or "derived").strip().lower() for f in findings]
+    return min(bases, key=lambda b: _BASIS_RANK.get(b, 1)) if bases else "derived"
+
+
 def detect(host_findings: list[dict]) -> list[Finding]:
     """
     host_findings: dicts as returned by store.all_host_findings() --
@@ -502,7 +514,9 @@ def detect(host_findings: list[dict]) -> list[Finding]:
             suggested_test="Test these together explicitly, in the order implied by the chain -- "
                             "individually-valid findings don't automatically compose, this is a "
                             "hypothesis to verify, not a confirmed exploit path.",
-            basis="derived",
+            # Inherit the weakest input's basis: a chain off an `assumed` IDOR is
+            # `assumed`, not a clean `derived` rule match (review 2026-10).
+            basis=_weakest_basis(a, b),
         ))
     return results
 
