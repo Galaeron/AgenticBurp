@@ -267,7 +267,7 @@ class PrioritizeEndpointTests(unittest.TestCase):
             mock_mod.prioritize = AsyncMock()
             response = self.client.post("/prioritize", json={"items": []})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"results": []})
+        self.assertEqual(response.json()["results"], [])  # response also carries an additive engagement_id
         mock_mod.prioritize.assert_not_called()
 
     def test_items_are_chunked_by_max_items_per_call(self):
@@ -758,7 +758,10 @@ class InvestigateJobEndpointTests(unittest.TestCase):
 
     def test_empty_base_url_rejected(self):
         resp = self.client.post("/engagement/shop.test/investigate", json={"base_url": ""})
-        self.assertEqual(resp.status_code, 400)
+        # An empty base_url has no parseable host, so the fail-closed crawl-scope
+        # precondition (_require_active_crawl) refuses it with 403 before any
+        # field-level 400 -- scope is checked first by design (W-17).
+        self.assertEqual(resp.status_code, 403)
 
     def test_unauthorized_destination_rejected_before_job_creation(self):
         # P1-7 NEGATIVE: "evil.test" is never added to orchestrator.allowed_hosts
@@ -1025,6 +1028,10 @@ class InvestigateJobAdmissionAndRetentionTests(unittest.TestCase):
         # simulate the retention window having elapsed
         self.server._INVESTIGATE_JOBS[job_id]["finished_at"] = (
             self.server._time.time() - self.server._JOB_RETENTION_SECONDS - 1)
+        # The status read falls back to the durable job store, so the aged
+        # finished_at must be persisted there too for prune/eviction to drop it;
+        # the in-memory dict is no longer the only source of truth.
+        self.server._save_job_status(self.server._INVESTIGATE_JOBS[job_id])
 
         resp = self.client.get(f"/engagement/shop.test/investigate/{job_id}")
         # P1-8: documented response for an evicted/expired id is the same
