@@ -31,7 +31,7 @@ import httpx
 from harness import global_throttle
 from harness.categories import canonicalize
 from harness.models import Finding, HttpExchange
-from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
+from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked, ActionRiskTier
 from .base import Validator, ValidationResult
 from .injection_targets import param_targets, mutate, replay_headers
 
@@ -191,7 +191,15 @@ class PathTraversalValidator(Validator):
                                     method, url, headers=headers or None,
                                     content=body or None)
                             text = resp.text
-                    except SafetyGateBlocked:
+                    except SafetyGateBlocked as blocked:
+                        # One probe URL the gate refuses must not abort the whole leg
+                        # and be mislabelled a mutating-replay denial. A traversal
+                        # payload can produce a URL the scope lock cannot validate
+                        # (e.g. backslash path segments), which fails closed as
+                        # out-of-scope: skip that payload and try the rest. A genuine
+                        # mutating-replay denial still terminates -- nothing more can send.
+                        if blocked.decision.tier == ActionRiskTier.OUT_OF_SCOPE:
+                            continue
                         return self._skip("mutating path-traversal replay not authorized "
                                           "(set validators.allow_mutating_replay)")
                     except httpx.HTTPError:
