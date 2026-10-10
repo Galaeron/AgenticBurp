@@ -141,6 +141,23 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
             "is false: mutating replay can never run, and the combination signals a "
             "misconfigured active run (enable active_enabled or clear allow_mutating_replay)."
         )
+    # The dangerous OTHER direction: active armed from the config FILE at startup
+    # (how the crAPI eval was configured) but mutating replay off. This is a VALID
+    # read-only-active config, so it's a warning not an error -- but silently every
+    # validator whose proof needs a mutating replay is blocked by the gate and
+    # skips, so a run can report "nothing found" for those classes without testing
+    # them. (ValidatorRegistry.set_active_enabled warns the runtime POST /settings
+    # path; this covers the startup-config path the same way.)
+    if v.active_enabled and not v.allow_mutating_replay:
+        warnings.append(
+            "validators.active_enabled is true but validators.allow_mutating_replay "
+            "is false: active mode is armed, but every validator whose proof needs a "
+            "mutating replay (e.g. stored_xss, csrf, file_upload, auth_sequence, "
+            "sequence, verb_tamper, command_injection, ssti, xxe, deserialization_oob) "
+            "will be blocked by the safety gate and skip -- the run can report "
+            "'nothing found' for those classes without having tested them. Set "
+            "validators.allow_mutating_replay to exercise them."
+        )
     if c.cloud_reasoning and not c.cloud_model:
         errors.append(
             "coordinator.cloud_reasoning is true but coordinator.cloud_model is unset: "
