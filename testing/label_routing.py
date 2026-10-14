@@ -2,18 +2,18 @@
 
 The miss being measured: the model emits a vulnerability_class in free-form
 wording ("MASS ASSIGNMENT / EXCESSIVE DATA BINDING", "Broken Access Control"),
-while validators route by canonical class. A label that canonicalizes to nothing
-any validator declares reaches NO validator and the finding is silently dropped
--- not for want of a validator, but for want of matching vocabulary. That is the
-loss Phase 2.2 (constrain the label set + route by agent) sets out to remove.
+while validators route by canonical class. This measures compatibility with
+declared class vocabulary, not observed production dispatch or discarded
+findings. Unsupported classes and descriptive observations may also miss.
 
 ``routes_to_validator(label)`` uses the harness's OWN routing: the base
 ``Validator.applies`` class gate (canonicalize + raw + distinctive_token against
 each registered validator's finding_classes), bypassing subclass shape checks so
 this is a pure LABEL/vocabulary question, plus the access-control markers the
-cross-identity validator auto-arms on. It therefore tracks the real routing: when
-Phase 2.2 changes the vocabulary / routing, this predicate and the miss rate move
-with it, which is what makes the committed baseline a regression ratchet.
+cross-identity validator auto-arms on. Shape, scope, active-mode and identity
+requirements must be checked separately through the production caller. A future
+agent-aware route needs its own caller-level coverage; this predicate does not
+automatically measure that additional dispatch path.
 """
 from __future__ import annotations
 

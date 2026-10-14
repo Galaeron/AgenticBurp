@@ -90,6 +90,8 @@ def load_config() -> tuple[dict, set[str]]:
 
 config, _explicit_config_keys = load_config()
 orchestrator = Orchestrator(config, explicit_keys=_explicit_config_keys)
+from harness.source_identity import capture_source_snapshot
+_startup_source = capture_source_snapshot()
 app = FastAPI(title="Burp LLM Harness", version="0.1.0")
 
 
@@ -346,6 +348,13 @@ async def _csrf_defense_middleware(request, call_next):
             return JSONResponse(status_code=401, content={"detail": "missing or invalid bearer token"})
 
     return await call_next(request)
+
+
+@app.get("/run-provenance")
+async def run_provenance(authorization: str | None = Header(default=None)):
+    _require_read_auth(authorization)
+    from harness.runtime_provenance import describe
+    return describe(config, orchestrator, _startup_source)
 
 
 @app.get("/health")

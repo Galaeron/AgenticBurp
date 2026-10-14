@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+import asyncio
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -76,7 +78,7 @@ class DryRunCrossUserDispatchTest(unittest.TestCase):
             identity_headers.set_identity(h, "victimB", {"Authorization": "Bearer B"})
 
     def test_corpus_is_object_scoped(self):
-        self.assertGreaterEqual(len(self.exchanges), 1, "no object-scoped corpus")
+        self.assertEqual(len(self.exchanges), 14, "captured dispatch corpus was reduced")
         for rec in self.exchanges:
             self.assertTrue(has_object_identifier(rec["url"]) or is_admin_namespaced(rec["url"]),
                             f"corpus entry is not object-scoped/function-level: {rec['url']}")
@@ -102,11 +104,60 @@ class DryRunCrossUserDispatchTest(unittest.TestCase):
         # none registered, cross_identity cannot arm AND the no-accounts warning
         # fires -- exactly the silent-skip Phase 1.1 closes.
         reg = _armed_registry()
-        rec = self.exchanges[0]
         with self.assertLogs("harness.validators.registry", level="WARNING") as cm:
-            names = [v.name for v in reg.for_finding(_finding(), _exchange(rec))]
-        self.assertNotIn("cross_identity", names)
+            for rec in self.exchanges:
+                names = [v.name for v in reg.for_finding(_finding(), _exchange(rec))]
+                self.assertNotIn("cross_identity", names, rec["url"])
         self.assertIn("no identities", "\n".join(cm.output).lower())
+
+    def test_production_confirmation_caller_reaches_validator_with_controls(self):
+        """Real confirmation caller + registry; replace execution/persistence only.
+
+        This is a dispatch test, not a live vulnerability-verdict test. Removing
+        the caller's dispatch, accounts, scope, or active mode must prevent the
+        expected calls. No HTTP is sent and no proof is written to the store.
+        """
+        from harness.orchestrator_confirm import ConfirmMixin
+        from harness.models import AgentReport
+        from harness.run_context import RunContext
+        from harness.validators.base import ValidationResult
+        from harness.validators.cross_identity_validator import CrossIdentityValidator
+
+        async def exercise(registered, active, scoped):
+            for host in self.hosts:
+                identity_headers.clear(host)
+            if registered:
+                self._register_two()
+            caller = ConfirmMixin()
+            caller.config = {"validators": {"active_enabled": active}}
+            caller.allowed_hosts = list(self.hosts) if scoped else ["outside.invalid"]
+            caller.validator_registry = _armed_registry()
+            caller.validator_registry.set_active_enabled(active)
+            # Keep the real automatic cross-identity admission path, excluding
+            # unrelated validators from this narrowly scoped caller regression.
+            caller.validator_registry.validators = {}
+            observed = AsyncMock(return_value=ValidationResult(
+                validator="cross_identity", status="not_confirmed", finding_class="idor"))
+            context = RunContext.create(allowed_hosts=caller.allowed_hosts, config=caller.config)
+            try:
+                with patch.object(CrossIdentityValidator, "validate", observed), \
+                     patch.object(CrossIdentityValidator, "plan", return_value=None), \
+                     patch.object(caller, "_persist_confirmation_proof", return_value=(True, {"proof_id": "inert"}, "")), \
+                     patch("harness.evidence_ledger.emit"):
+                    for rec in self.exchanges:
+                        report = AgentReport(agent="idor", model="synthetic", findings=[_finding()])
+                        validations, _ = await caller._validate_findings(_exchange(rec), [report], run_context=context)
+                        self.assertEqual([v.status for v in validations],
+                                         ["not_confirmed"] if registered and active and scoped else [])
+                return observed.await_count
+            finally:
+                await context.aclose()
+
+        for registered, active, scoped, expected in (
+                (True, True, True, 14), (False, True, True, 0),
+                (True, False, True, 0), (True, True, False, 0)):
+            with self.subTest(registered=registered, active=active, scoped=scoped):
+                self.assertEqual(asyncio.run(exercise(registered, active, scoped)), expected)
 
 
 if __name__ == "__main__":

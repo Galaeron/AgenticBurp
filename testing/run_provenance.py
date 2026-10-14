@@ -8,8 +8,8 @@ guarantee of identical output across hardware or Ollama/model versions; the
 stamp records them so a result can be reproduced and audited, not so anyone can
 claim bit-identical reruns.
 
-The external eval scripts call ``run_provenance(...)`` once the config is loaded
-and the model known, and write the returned dict into each result file. The
+The HTTP evaluation driver uses remote_run_provenance to call this assembler
+with server-reported effective configuration and startup source identity. The
 git/Ollama lookups are split into small helpers (``current_harness_commit``,
 ``ollama_model_digest``, ``ollama_runtime_version``) that degrade to "unknown"
 rather than crash the run, and are injectable so the assembler stays hermetic

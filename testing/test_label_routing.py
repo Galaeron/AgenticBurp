@@ -66,6 +66,9 @@ class LabelRoutingBaselineTests(unittest.TestCase):
         self.assertGreater(self.fx["baseline_distinct_miss_rate"], 0.0)
         self.assertLess(self.fx["baseline_distinct_miss_rate"], 1.0)
 
+    def test_previously_routable_labels_cannot_regress_in_exchange_for_improvements(self):
+        self.assertFalse(set(self.summary["missing_labels"]) - set(self.fx["baseline_missing_labels"]))
+
 
 class RoutingPredicateTests(unittest.TestCase):
     def test_canonical_classes_route(self):
@@ -78,12 +81,12 @@ class RoutingPredicateTests(unittest.TestCase):
     def test_unknown_vocabulary_misses(self):
         self.assertFalse(lr.routes_to_validator("Totally Made Up Nonsense Class XYZ"))
 
-    def test_wording_variant_of_a_routable_vuln_can_still_miss(self):
+    def test_historical_wording_gap_is_recorded_without_requiring_it_to_persist(self):
         # The crux the baseline captures: the SAME vulnerability wins or loses on
         # wording. "Mass Assignment" routes; the ALL-CAPS slashed title does not --
         # the exact free-text-label loss Phase 2.2 is meant to remove.
         self.assertTrue(lr.routes_to_validator("Mass Assignment"))
-        self.assertFalse(lr.routes_to_validator("MASS ASSIGNMENT / EXCESSIVE DATA BINDING"))
+        self.assertIn("MASS ASSIGNMENT / EXCESSIVE DATA BINDING", _load()["baseline_missing_labels"])
 
 
 if __name__ == "__main__":
