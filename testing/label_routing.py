@@ -57,6 +57,55 @@ def routes_to_validator(label: str) -> bool:
     return any(Validator.applies(v, finding, _DUMMY_EXCHANGE) for v in _validators())
 
 
+def routes_by_agent(agent: str) -> bool:
+    """True if a finding's PRODUCING AGENT maps to a validator.
+
+    AgentReport.agent is set programmatically by each specialist agent (never by
+    model output) and matches categories.CANONICAL_CATEGORIES, so it is the
+    reliable routing signal the free-text label is not. An agent routes exactly
+    when its canonical category reaches a validator -- the same predicate as the
+    label, applied to the agent name. Detection/recon agents with no confirming
+    validator (anomaly, ai_security, chain_detector, ...) correctly do NOT route:
+    their findings are observations, not confirmable hypotheses.
+    """
+    return routes_to_validator(agent)
+
+
+def classify_findings(pairs) -> dict:
+    """Agent-aware routing study over (agent, label) finding pairs.
+
+    Compares three strategies on the SAME real findings:
+      - label only   -- today's dispatch keys off vulnerability_class,
+      - agent only    -- route by the reliable producing agent,
+      - combined      -- label OR agent (what Phase 2.2 implements: fall back to
+                         the agent when the model's wording does not route).
+    Returns occurrence-weighted miss rates for each, plus the residual agents
+    whose findings still reach nothing under the combined route. This is a
+    vocabulary/target study, NOT a measurement of production dispatch (see the
+    module docstring) -- a caller-level test must establish production separately.
+    """
+    from collections import Counter
+    pairs = [(a or "", l or "") for a, l in pairs]
+    n = len(pairs)
+    label_route = {l: routes_to_validator(l) for _, l in pairs}
+    agent_route = {a: routes_by_agent(a) for a, _ in pairs}
+    label_miss = sum(1 for _, l in pairs if not label_route[l])
+    agent_miss = sum(1 for a, _ in pairs if not agent_route[a])
+    combined_miss = sum(1 for a, l in pairs if not (label_route[l] or agent_route[a]))
+    residual = Counter(a for a, l in pairs if not (label_route[l] or agent_route[a]))
+
+    def rate(m):
+        return round(m / n, 4) if n else 0.0
+
+    return {
+        "total_findings": n,
+        "label_miss": label_miss, "label_miss_rate": rate(label_miss),
+        "agent_miss": agent_miss, "agent_miss_rate": rate(agent_miss),
+        "combined_miss": combined_miss, "combined_miss_rate": rate(combined_miss),
+        "residual_unrouted_agents": dict(residual.most_common()),
+    }
+
+
 def classify(labels) -> dict:
     """Routing summary over a label frequency map {label: count}.
 
