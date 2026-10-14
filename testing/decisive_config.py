@@ -77,6 +77,19 @@ def assert_decisive_settings(cfg: dict) -> None:
     seed = (cfg.get("ollama") or {}).get("seed")
     if not _is_int(seed):
         raise DecisiveConfigError(f"ollama.seed must be a fixed integer; got {seed!r}")
-    temp = (cfg.get("coordinator") or {}).get("temperature")
-    if temp != 0:  # 0 == 0.0 in Python, so an int or float zero both pass
-        raise DecisiveConfigError(f"coordinator.temperature must be 0; got {temp!r}")
+    for role in ("coordinator", "agent_defaults", "critique"):
+        settings = cfg.get(role) or {}
+        temp = settings.get("temperature")
+        if isinstance(temp, bool) or not isinstance(temp, (int, float)) or temp != 0:
+            raise DecisiveConfigError(f"{role}.temperature must be 0; got {temp!r}")
+        override = settings.get("seed")
+        if override is not None and (not _is_int(override) or override != seed):
+            raise DecisiveConfigError(f"{role}.seed must match ollama.seed or be omitted")
+        if settings.get("provider", "ollama") != "ollama":
+            raise DecisiveConfigError(f"{role}.provider must be ollama for this fixed-seed run")
+    for name, settings in (cfg.get("agents") or {}).items():
+        if settings.get("enabled", True) is False:
+            continue
+        temp = settings.get("temperature", 0)
+        if isinstance(temp, bool) or not isinstance(temp, (int, float)) or temp != 0:
+            raise DecisiveConfigError(f"agents.{name}.temperature must be 0")

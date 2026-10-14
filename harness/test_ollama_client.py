@@ -86,6 +86,15 @@ class SeedOnTheWireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0]["options"]["seed"], 0,
                          "a configured seed of 0 must reach options.seed on the wire")
 
+    async def test_production_provider_preserves_override_and_client_default(self):
+        from harness.llm_provider import build_provider
+        captured = []
+        client = _seed_capture_client(self, captured, seed=7)
+        provider = build_provider({}, ollama_client=client)
+        await provider.chat_json_metered("m", "s", "u", temperature=0, seed=0)
+        await provider.chat_json_metered("m", "s", "u", temperature=0, seed=None)
+        self.assertEqual([p["options"]["seed"] for p in captured], [0, 7])
+
     async def test_no_seed_means_no_seed_key_on_the_wire(self):
         captured = []
         client = _seed_capture_client(self, captured)  # seed=None

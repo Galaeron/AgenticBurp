@@ -62,8 +62,11 @@ class OllamaProvider:
         temperature: float = 0.1, **kw,
     ) -> OllamaResult:
         system_prompt, user_prompt = security.sanitize_for_inference(system_prompt, user_prompt)
+        options = {}
+        if kw.get("seed") is not None:
+            options["seed"] = kw["seed"]
         return await self._client.chat_json_metered(
-            model, system_prompt, user_prompt, temperature=temperature)
+            model, system_prompt, user_prompt, temperature=temperature, **options)
 
     # Back-compat alias: every existing caller (coordinator.py's three call
     # sites, critique) calls `.chat_json_metered(...)` on what used to be a

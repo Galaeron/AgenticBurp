@@ -6,13 +6,14 @@
 # loaded automatically. It is ARMED on purpose (active mode + mutating replay)
 # and is meant for ONE thing: the explicitly-authorised crAPI decisive run.
 #
-# DO NOT copy these values into harness/config.yaml or harness/config.local.yaml.
+# DO NOT copy these values into harness/config.yaml.
 # config.yaml stays at safe defaults (active_enabled: false,
-# allow_mutating_replay: false, allowed_hosts: []); this file is the only place
-# the decisive-run knobs live, and it takes effect solely when an operator
-# points the eval run at it for an engagement they are authorised to test.
+# allow_mutating_replay: false, allowed_hosts: []). For an authorized run, the
+# owner may merge the filled overlay into ignored config.local.yaml and restart
+# their owned server. The driver verifies the running settings against this
+# file; passing --decisive-config does not itself change server settings.
 #
-# Load + validate it with testing/run_provenance.py:load_decisive_config(),
+# Load + validate it with testing/decisive_config.py:load_decisive_config(),
 # which refuses the scope placeholder below and records the config hash with the
 # results (Phase 1.2 "done when": the run's config is loaded from the template
 # and its hash is recorded).
@@ -53,4 +54,7 @@ coordinator:
 agent_defaults:
   # Deterministic agents: temperature 0. Agents inherit the run seed from the
   # shared OllamaClient above, so no per-agent seed is needed here.
+  temperature: 0
+
+critique:
   temperature: 0

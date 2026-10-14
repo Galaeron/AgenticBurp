@@ -22,6 +22,7 @@ def _valid_cfg():
         "ollama": {"seed": 1337},
         "coordinator": {"temperature": 0, "seed": 1337},
         "agent_defaults": {"temperature": 0},
+        "critique": {"temperature": 0},
     }
 
 
@@ -71,7 +72,31 @@ class AssertDecisiveSettingsTests(unittest.TestCase):
     def test_seed_zero_is_accepted(self):
         cfg = _valid_cfg()
         cfg["ollama"]["seed"] = 0  # a valid, fixed seed -- must NOT read as "unset"
+        cfg["coordinator"]["seed"] = 0
         dc.assert_decisive_settings(cfg)
+
+    def test_every_model_role_requires_zero_temperature(self):
+        for role in ("coordinator", "agent_defaults", "critique"):
+            for temperature in (0.1, False, "0", None):
+                with self.subTest(role=role, temperature=temperature):
+                    cfg = _valid_cfg()
+                    cfg[role]["temperature"] = temperature
+                    with self.assertRaises(dc.DecisiveConfigError):
+                        dc.assert_decisive_settings(cfg)
+
+    def test_agent_override_cannot_bypass_zero_temperature(self):
+        cfg = _valid_cfg()
+        cfg["agents"] = {"idor": {"temperature": 0.9}}
+        with self.assertRaises(dc.DecisiveConfigError):
+            dc.assert_decisive_settings(cfg)
+
+    def test_mismatched_seed_and_non_ollama_provider_rejected(self):
+        for key, value in (("seed", 99), ("seed", False), ("provider", "anthropic")):
+            with self.subTest(key=key, value=value):
+                cfg = _valid_cfg()
+                cfg["coordinator"][key] = value
+                with self.assertRaises(dc.DecisiveConfigError):
+                    dc.assert_decisive_settings(cfg)
 
     def test_active_mode_off_rejected(self):
         cfg = _valid_cfg(); cfg["validators"]["active_enabled"] = False
