@@ -20,7 +20,7 @@ def discovery_issues(source: str, *, pytest_native: bool = False) -> list[str]:
     issues = []
     classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
     # Explicit imported bases used by this repository, not substring matching.
-    bases = {'TestCase', 'IsolatedAsyncioTestCase', 'EvidenceCase'}
+    bases = {'TestCase', 'IsolatedAsyncioTestCase', 'EvidenceCase', 'PairingCallerTests'}
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and node.module == 'unittest':
             bases.update(n.asname or n.name for n in node.names if n.name in bases)
@@ -57,6 +57,11 @@ def discovery_issues(source: str, *, pytest_native: bool = False) -> list[str]:
 
 
 class NoOrphanTestFilesTest(unittest.TestCase):
+    def test_imported_pairing_base_is_recognized_without_accepting_arbitrary_bases(self):
+        source = 'from harness.test_pairing_contract import PairingCallerTests\nclass T(PairingCallerTests):\n def test_x(self): pass\n'
+        self.assertEqual(discovery_issues(source), [])
+        self.assertTrue(discovery_issues(source.replace('PairingCallerTests', 'ArbitraryBase')))
+
     def test_every_definition_has_a_runner(self):
         errors = []
         for path in sorted((ROOT / 'harness').glob('test_*.py')):

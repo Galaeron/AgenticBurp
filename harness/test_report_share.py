@@ -29,7 +29,7 @@ def _finding(*, vc="sqli", url="http://shop.test/orders", method="POST",
         "confirmed": confirmed, "oracle_verified": oracle_verified,
         "verification_state": verification_state, "case_id": case_id, "proof_id": proof_id,
         "severity": severity, "confidence": confidence, "evidence": evidence,
-        "summary": summary or evidence, "finding_id": finding_id,
+        "summary": summary or evidence, "finding_id": finding_id, "fingerprint": finding_id,
         "parameter_name": parameter_name, "parameter_location": parameter_location,
         "basis": basis,
     }
@@ -69,6 +69,7 @@ class FormatParityTests(unittest.TestCase):
         gate_cfg = {"reporting": {"gate_low_confidence_generic": True,
                                   "generic_confidence_floor": 0.9}}
         with patch("harness.store.all_host_findings", return_value=[solid, lead]), \
+                patch("harness.store.finding_observation_history", return_value={}), \
                 patch("harness.store.proofs_for_case", return_value=[]), \
                 patch("harness.store.all_issue_merges", return_value={}), \
                 patch("harness.store.host_of", return_value="shop.test"):

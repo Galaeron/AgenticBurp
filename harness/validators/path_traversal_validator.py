@@ -70,7 +70,7 @@ _PATHSEG = "pathseg"
 # just unrequested active traffic. Narrow, explicit, and canonical so it never
 # suppresses a genuinely file-read-adjacent class (misconfig, info_disclosure,
 # recon, anomaly, etc. still get the shape-decoupled probe).
-_NOT_FILE_READ_CLASSES = {"csp", "cors", "crypto"}
+_NOT_FILE_READ_CLASSES = {"csp", "cors", "crypto", "sqli", "idor", "business_logic"}
 
 
 def _file_shaped(exchange: HttpExchange) -> list[tuple[str, str]]:

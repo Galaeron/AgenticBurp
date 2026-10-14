@@ -55,7 +55,7 @@ class _InertStubOllama:
     so tokens_total on the summary is deterministic and traceable to real
     recorded calls, not routing fallback or detection noise."""
 
-    async def chat_json_metered(self, model, system_prompt, user_prompt, temperature=0.1):
+    async def chat_json_metered(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         if "coordinator in a security-testing harness" in system_prompt:
             return OllamaResult(
                 data={"dispatch": ["misconfig"], "reason": "plausible config surface"},
@@ -64,7 +64,7 @@ class _InertStubOllama:
         return OllamaResult(data={"findings": [], "components": []},
                             prompt_tokens=5, completion_tokens=5)
 
-    async def chat_json(self, model, system_prompt, user_prompt, temperature=0.1):
+    async def chat_json(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         result = await self.chat_json_metered(model, system_prompt, user_prompt, temperature)
         return result.data
 

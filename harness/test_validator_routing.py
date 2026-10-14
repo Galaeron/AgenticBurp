@@ -108,6 +108,17 @@ class TestPathTraversalShapeGate(unittest.TestCase):
             ex = HttpExchange(url="http://t/uploads/123", method="GET")
             self.assertTrue(self.pt.applies(_finding(cls), ex), cls)
 
+    def test_strong_distinct_classes_do_not_trigger_on_fileish_url(self):
+        # Pt 7 (second pass): a confident, distinct class (sqli/idor/business-
+        # logic) on a file-serving URL is a different finding, not a mislabelled
+        # traversal -- it must not spawn traversal probes. Spaced + canonical +
+        # synonym spellings all suppressed (the gate keys on canonical identity).
+        for cls in ("sqli", "SQL Injection", "idor", "IDOR", "BOLA",
+                    "business_logic", "business logic"):
+            ex = HttpExchange(url="http://t/download?file=x.pdf", method="GET")
+            self.assertFalse(self.pt.applies(_finding(cls), ex),
+                             f"{cls} should not spawn traversal probes")
+
     def test_explicit_traversal_finding_with_param_still_applies(self):
         ex = HttpExchange(url="http://t/item?id=5", method="GET")
         self.assertTrue(self.pt.applies(_finding("path_traversal"), ex))
