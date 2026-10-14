@@ -1,53 +1,48 @@
-# Current state
+# Current state — 2026-10-14
 
-AgenticVibe is a **working research prototype**: a Burp Suite copilot that uses
-local LLMs to review captured HTTP traffic and deterministic validators to
-confirm or refute the findings. See [README.md](README.md) for what it is and
-[docs/USER_MANUAL.md](docs/USER_MANUAL.md) for how to run it safely.
+## Checkout
+- Branch `reconciliation-backlog`; candidate `5aedf787`, base `474ad511`.
+- Focused fixes: `ba7a649e` (seed/config), `4d713696` (provenance/caller gate),
+  `4374e060` (regression fixtures and traversal applicability), `5aedf787`
+  (report fixture independent of uncommitted store API).
+- Earlier tracked edits and untracked tests/artifacts remain in the main checkout;
+  they are not all included in these commits. Safe `harness/config.yaml` is unchanged.
+- The attached `verify-decisive-fixes` worktree isolates the committed candidate.
 
-## What is verified
+## Fresh verification
+- Main checkout full: 3398 harness tests, 38 pytest, 364 evaluation, 42 integrity,
+  all pass; coverage manifest passes. Smoke: 93 pass. No skipped-test proof claimed.
+- Isolated focused seed/config/provenance/dispatch/precondition controls: 136 pass.
+- Isolated full: 3103 harness, 38 pytest, 284 evaluation and 42 integrity pass;
+  17 optional historical-artifact evaluation tests skipped, coverage passes, exit 0.
+  The first isolated run exposed a test-fixture dependency, corrected in `5aedf787`.
+- Final isolated smoke: 93 pass, coverage check passes, exit 0.
+- Actual Java test + shadowJar with JDK17/Gradle8.7: isolated candidate 229 tests;
+  main checkout 252 tests; both pass without failures/errors/skips.
+- Evidence and commands: docs/DECISIVE_FIX_VERIFICATION.md and
+  .test-work/consolidation-20261014/. Earlier results below are historical/reported.
 
-- **It installs and runs.** `python -m harness.server` starts the FastAPI
-  server on `127.0.0.1:8787`; the Burp extension (Java/Montoya) compiles and its
-  Java unit tests pass.
-- **The parts behave as designed.** ~2,400 Python tests and ~230 Java tests pass
-  (`python -m harness.suite full`). These are component/behaviour tests —
-  e.g. a validator flags a planted vuln in a fixture, a gate caps a finding.
-- **Safe-by-default posture.** Out of the box the harness does passive review
-  only: active validators, autonomous discovery, the oracle and the cloud seams
-  are all OFF; `allowed_hosts` is unset. See the USER MANUAL to enable active
-  testing on a scoped host.
+## Remaining work
+- Live crAPI identity-B confirmation and secure control remain unverified. Docker's
+  Linux engine is unavailable; crAPI localhost:8888 and harness 127.0.0.1:8787
+  were unreachable. Ollama's port accepts TCP; model readiness was not established.
+- Restart an owned server with the filled decisive overlay and registered test
+  identities before using the updated external evaluation launcher. See
+  docs/DECISIVE_RUN_PROVENANCE.md. Model digest/runtime version remain unavailable.
+- Phase 2.2 vocabulary/agent routing remains open. Committed candidate misses
+  63/122 labels (51.64%) and 374/978 occurrences (38.24%); normalization WIP in
+  the main checkout yields 60/122 (49.18%) and 272/978 (27.81%). These measure
+  class vocabulary compatibility, not production dispatch, accuracy or recall.
+- Earlier remediation's intact installed-package/security review (R15/R19), final
+  Burp walkthrough (R20), practical study (R25), measurement-led optimization
+  (R21), and final release adjudication (R28) remain open; no new release claim.
+- Historical remediation detail (local WIP): docs/RECONCILED_REMEDIATION_REGISTER.json,
+  docs/RECONCILED_REMEDIATION_LOOP.md and docs/REMEDIATION_RELEASE_GATES.md.
 
-## What is NOT verified (read before trusting results)
-
-- **Real-model accuracy on unseen targets.** The component tests do not measure
-  how often the LLM agents catch real bugs on an unfamiliar app, or the
-  false-positive rate. The detection scorer (`testing/score.py`) is reproducible
-  but needs a local model and a corpus you build yourself (see the USER MANUAL),
-  and the corpora it was developed against are **tuning corpora, not blind** —
-  their answer keys ship in the repo. Treat headline detection claims as
-  unproven until you run it against a target it was never tuned on
-  (WebGoat/DVWA/a PortSwigger lab — runbook in the USER MANUAL).
-- **LLM-agent detection from traffic.** The confirmation/validator layer *is*
-  live-verified against an owned loopback fixture with paired secure controls
-  (`harness/test_leg_live_verification.py`, broad class coverage); what is not
-  measured is whether the agents flag the issue from real traffic in the first
-  place. (The `coverage_manifest.py` ledger reports most classes as
-  `gap_unimplemented`, but that means "not registered in the ledger," not "no
-  test" — see docs/LIMITATIONS.md.)
-
-See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for the full, honest list of
-known issues, gaps and roadmap (Burp integration, an in-flight scope-handling
-refactor, performance, data handling, architecture debt).
-
-## In-flight / known rough edges
-
-- **Scope handling is mid-refactor.** The main analysis path and the crawler now
-  fail *closed* on an empty scope in active mode, but `scope_lock`/`safety_gate`
-  and several validators' own inline checks are still being migrated to the same
-  contract; some unit tests that construct an active gate without a scope are red
-  in the working tree because of this migration. Do not rely on a single
-  entry-point check — set `server.allowed_hosts` explicitly for any active run.
-- Historical reviews and plans under `archive/` and `reviews/` describe the
-  revisions they were written for, not current capability. Code is authoritative
-  for behaviour; `docs/` is the current documentation.
+## Working rules
+- Follow AGENTS.md; never read answer keys or blind implementations.
+- Preserve existing edits/artifacts. Active settings belong only in ignored local
+  overrides; restart only owned services after Python changes.
+- Python: .venv-rationalisation/Scripts/python.exe (3.12.14).
+- Run smoke/full/orchestrator-precondition from the repository root after changes.
+- Green offline tests and a JAR build do not establish live model quality or recall.
