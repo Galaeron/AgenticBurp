@@ -787,6 +787,28 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
     return produced
 
 
+def per_run_gate_config(config: dict | None, registry=None) -> dict:
+    """Gate POLICY for a freshly-created per-run RunContext on the standalone
+    analysis path.
+
+    RunContext.create() builds a fresh SafetyGate per run (per-run budget
+    isolation), but its policy flags -- active_enabled / allow_mutating_replay /
+    max_burst_size -- must still match the server the operator configured.
+    Without this, the per-run gate defaults both safety flags to False and
+    BLOCKS a mutating send that validators using the process-global gate are
+    allowed to make (the reproduced "blocked: active_enabled off" on a POST
+    SQL-injection in a run configured active=true). active_enabled additionally
+    reflects the live runtime toggle (ValidatorRegistry.set_active_enabled),
+    which arms the registry without rewriting `config`. Returns the
+    `validators:` subconfig with active_enabled overridden by the registry's
+    live value when a registry is supplied.
+    """
+    cfg = dict((config or {}).get("validators", {}) or {})
+    if registry is not None:
+        cfg["active_enabled"] = getattr(registry, "active_enabled", cfg.get("active_enabled", False))
+    return cfg
+
+
 # Re-export EVERY top-level name so `from orchestrator_helpers import *` gives the
 # full namespace (star-import honours __all__, so underscore names come through too).
 __all__ = [_n for _n in list(globals()) if not _n.startswith("__")]

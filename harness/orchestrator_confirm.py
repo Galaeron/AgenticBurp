@@ -401,9 +401,17 @@ class ConfirmMixin:
         metas: list = []  # (original finding, validator, exact case, routed finding) parallel to jobs
         if run_context is None:
             from harness.run_context import RunContext
+            # Fallback create for direct callers that pass no context (the real
+            # analyze() path builds and seeds the context itself). Carry the
+            # operator's active/mutating policy into the per-run gate so a
+            # validator authorizing a mutating send through run_context.gate is
+            # not blocked by a flag-less default gate when active mode is on
+            # (see per_run_gate_config / orchestrator_detect.analyze).
+            _cfg = getattr(self, "config", {}) or {}
             run_context = RunContext.create(
                 allowed_hosts=getattr(self, "allowed_hosts", []),
-                config=getattr(self, "config", {}))
+                config=_cfg,
+                gate_config=per_run_gate_config(_cfg, getattr(self, "validator_registry", None)))
         _run_id = run_context.run_id
         _template_id = evidence._short(
             (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
