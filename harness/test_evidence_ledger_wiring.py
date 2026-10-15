@@ -87,7 +87,7 @@ class _NoopRegistry:
     def __init__(self, validator):
         self._validator = validator
 
-    def for_finding(self, finding, exchange):
+    def for_finding(self, finding, exchange, agent=None):
         if finding.vulnerability_class == "idor":
             return [self._validator]
         return []

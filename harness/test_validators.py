@@ -142,6 +142,56 @@ class ValidatorTests(unittest.TestCase):
         self.assertIn("cross_identity", [v.name for v in matched])  # auto-armed instead
         identity_headers.clear()
 
+    # --- Phase 2.2 route-by-agent (producing-agent fallback) ------------------
+    def _mislabelled_sqli(self) -> Finding:
+        # "sql_injection" is a real captured spelling that does NOT route by label
+        # (it is in the 2.1 baseline's missing set); the sqli agent is reliable.
+        return Finding(vulnerability_class="sql_injection", confidence=0.8,
+                       severity="high", summary="injection on id", evidence="id param",
+                       suggested_test="probe id", basis="derived")
+
+    def test_route_by_agent_recovers_a_mislabelled_finding(self):
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": True}})
+        f = self._mislabelled_sqli()
+        label_only = {v.name for v in reg.for_finding(f, self.exchange)}
+        self.assertNotIn("sqlmap", label_only, "mis-worded label unexpectedly routed")
+        with_agent = {v.name for v in reg.for_finding(f, self.exchange, agent="sqli")}
+        self.assertIn("sqlmap", with_agent,
+                      "the reliable producing agent did not recover the mislabelled finding")
+
+    def test_agent_fallback_is_opt_in_no_agent_is_label_only(self):
+        # Negative control: with no agent context the behaviour is exactly the old
+        # label-only routing, so existing callers are unchanged.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": True}})
+        f = self._mislabelled_sqli()
+        self.assertEqual({v.name for v in reg.for_finding(f, self.exchange)},
+                         {v.name for v in reg.for_finding(f, self.exchange, agent=None)})
+
+    def test_route_by_agent_does_not_defeat_shape_gating(self):
+        # Negative control: the agent recovers the CLASS, not the shape. A
+        # file_upload agent on a plain GET must NOT pull in the file-upload
+        # validator -- confirmation still needs the right request shape.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": True}})
+        names = {v.name for v in reg.for_finding(self._mislabelled_sqli(), self.exchange,
+                                                 agent="file_upload")}
+        self.assertNotIn("file_upload", names)
+
+    def test_route_by_agent_arms_cross_identity_via_the_agent(self):
+        from harness import identity_headers
+        identity_headers.clear()
+        identity_headers.set_identity("example.test", "other", {"Authorization": "Bearer o"})
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": True}})
+        reg.set_active_enabled(True)
+        # A finding whose LABEL is not access-control, produced by the idor agent.
+        f = self._mislabelled_sqli()
+        label_only = {v.name for v in reg.for_finding(f, self.exchange)}
+        self.assertNotIn("cross_identity", label_only)  # label alone does not arm it
+        with_agent = {v.name for v in reg.for_finding(f, self.exchange, agent="idor")}
+        self.assertIn("cross_identity", with_agent,
+                      "the idor agent did not arm the cross-user check via route-by-agent")
+        identity_headers.clear()
+
     def test_sqlmap_confirmation_promotes_only_on_explicit_tool_result(self):
         validator = SqlmapValidator()
         with patch("subprocess.run", return_value=FakeProc()):

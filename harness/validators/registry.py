@@ -417,11 +417,28 @@ class ValidatorRegistry:
             self._auto_xid = self._build_cross_identity()
         return self._auto_xid
 
-    def for_finding(self, finding, exchange):
+    def for_finding(self, finding, exchange, agent=None):
         if not self.enabled:
             return []
-        matched = [v for v in self.validators.values()
-                   if v.applies(finding, exchange) and (not v.active or self.active_enabled)]
+        # Phase 2.2 route-by-agent: the producing agent (AgentReport.agent) is set
+        # programmatically by each specialist agent and matches
+        # categories.CANONICAL_CATEGORIES, so it is reliable where the model's
+        # free-text vulnerability_class is not. Route on BOTH signals -- a
+        # validator applies if it matches the finding as labelled OR as if its
+        # class were the agent's category -- so a correct hypothesis reaches its
+        # validator even when the model mis-worded the label. Confirmation is
+        # unchanged: the validator still has to prove it, so this lifts recall
+        # without manufacturing confirmations. agent=None keeps the legacy
+        # label-only behaviour for callers with no agent context.
+        candidates = [finding]
+        if agent:
+            candidates.append(finding.model_copy(update={"vulnerability_class": agent}))
+
+        def _applies(v) -> bool:
+            return (not v.active or self.active_enabled) and any(
+                v.applies(c, exchange) for c in candidates)
+
+        matched = [v for v in self.validators.values() if _applies(v)]
         # W-12: within an active, scoped engagement, auto-arm cross-identity for
         # applicable object-scoped requests when registered identities exist for
         # the host -- no separate cross_identity.enabled opt-in required.
@@ -435,10 +452,11 @@ class ValidatorRegistry:
             from urllib.parse import urlsplit
             host = urlsplit(exchange.url).hostname or ""
             xid = self._auto_cross_identity()
+            applies_xid = any(xid.applies(c, exchange) for c in candidates)
             if identity_headers.has_identities(host):
-                if xid.applies(finding, exchange):
+                if applies_xid:
                     matched.append(xid)
-            elif xid.applies(finding, exchange):
+            elif applies_xid:
                 # Second crAPI failure mode: active mode is armed and this IS an
                 # access-control (IDOR/BFLA) candidate, but no identities are
                 # registered for the host, so the cross-user validator cannot

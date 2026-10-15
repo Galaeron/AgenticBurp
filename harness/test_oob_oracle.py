@@ -56,7 +56,7 @@ class FakeSsrfOnlyRegistry:
     def __init__(self, validator):
         self._validator = validator
 
-    def for_finding(self, finding, exchange):
+    def for_finding(self, finding, exchange, agent=None):
         return [self._validator]
 
 

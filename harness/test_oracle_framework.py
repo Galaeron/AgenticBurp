@@ -253,7 +253,7 @@ class FakeRegistry:
     def __init__(self, validators):
         self._validators = validators
 
-    def for_finding(self, finding, exchange):
+    def for_finding(self, finding, exchange, agent=None):
         return list(self._validators)
 
 
@@ -366,7 +366,7 @@ class TestOracleForPassiveOnly(unittest.TestCase):
         passive_v.finding_classes = {"ssrf"}
 
         class BothRegistry:
-            def for_finding(self, finding, exchange):
+            def for_finding(self, finding, exchange, agent=None):
                 return [active_v, passive_v]  # active first
 
         reg = OracleRegistry(BothRegistry(), n_required=1)

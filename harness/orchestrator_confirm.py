@@ -427,7 +427,8 @@ class ConfirmMixin:
         for report_index, report in enumerate(reports):
             for finding_index, finding in enumerate(report.findings):
                 case = _case_for(finding, report, report_index, finding_index)
-                validators = self.validator_registry.for_finding(finding, exchange)
+                validators = self.validator_registry.for_finding(
+                    finding, exchange, agent=report.agent)
                 bind_context = getattr(self.validator_registry, "bind_run_context", None)
                 if bind_context is not None:
                     validators = bind_context(validators, run_context)

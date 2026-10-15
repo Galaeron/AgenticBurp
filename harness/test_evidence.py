@@ -243,13 +243,13 @@ class _FakeRegistry:
     def __init__(self, mapping):
         self._mapping = mapping
 
-    def for_finding(self, finding, exchange):
+    def for_finding(self, finding, exchange, agent=None):
         v = self._mapping.get(finding.vulnerability_class)
         return [v] if v else []
 
 
 class _PerFindingRegistry:
-    def for_finding(self, finding, exchange):
+    def for_finding(self, finding, exchange, agent=None):
         if finding.summary == "confirmed-case":
             return [_FakeValidator("sqlmap", "confirmed", True)]
         return [_FakeValidator("sqlmap", "skipped", False)]
