@@ -55,7 +55,7 @@ class ConfirmMixin:
         self._leg_self_test_cache = markers
         return markers
 
-    async def _oracle_gate(self, finding, exchange) -> None:
+    async def _oracle_gate(self, finding, exchange, *, routing_finding=None) -> None:
         """P0.1-WIRE: run the deterministic verification oracle over a just-
         confirmed finding, behind config `oracle.enabled` (default false).
 
@@ -81,12 +81,13 @@ class ConfirmMixin:
         registry = oracle_framework.OracleRegistry(
             self.validator_registry, n_required=n_required)
 
+        oracle_finding = routing_finding if routing_finding is not None else finding
         if enabled:
-            capsule = await registry.verify(finding, exchange)
+            capsule = await registry.verify(oracle_finding, exchange)
         else:
             # safe_passive_default: passive-only oracle, zero new requests
-            oracle = registry.oracle_for(finding, exchange, passive_only=True)
-            capsule = await oracle.run(finding, exchange) if oracle is not None else None
+            oracle = registry.oracle_for(oracle_finding, exchange, passive_only=True)
+            capsule = await oracle.run(oracle_finding, exchange) if oracle is not None else None
 
         oracle_framework.stamp_finding(finding, capsule)
 
@@ -397,7 +398,7 @@ class ConfirmMixin:
             return [], []
         jobs = []
         plans: list = []
-        metas: list = []  # (finding, validator, exact case) parallel to jobs
+        metas: list = []  # (original finding, validator, exact case, routed finding) parallel to jobs
         if run_context is None:
             from harness.run_context import RunContext
             run_context = RunContext.create(
@@ -454,9 +455,23 @@ class ConfirmMixin:
                     except Exception:
                         pass
                 for validator in validators:
-                    jobs.append(self._maybe_replay(validator, finding, exchange))
-                    plans.append(validator.plan(finding, exchange))
-                    metas.append((finding, validator, case))
+                    # Applicability must survive validators' plan/validate rechecks.
+                    # Prefer the original label per validator; route only a private
+                    # copy, retaining the original evidence and case coordinates.
+                    routed = finding
+                    applies = getattr(validator, "applies", None)
+                    if report.agent and applies is not None and not applies(finding, exchange):
+                        candidate = finding.model_copy(
+                            deep=True, update={"vulnerability_class": report.agent})
+                        if not applies(candidate, exchange):
+                            continue
+                        routed = candidate
+                    jobs.append(self._maybe_replay(validator, routed, exchange))
+                    plan = validator.plan(routed, exchange)
+                    if plan is not None and routed is not finding:
+                        plan = plan.model_copy(update={"finding_class": finding.vulnerability_class})
+                    plans.append(plan)
+                    metas.append((finding, validator, case, routed))
         if not jobs:
             return [], []
         # R29: bound this phase's concurrency instead of firing every
@@ -471,7 +486,7 @@ class ConfirmMixin:
         output: list[ValidationReport] = []
         proofs: list[dict] = []
         for result, plan, meta in zip(results, plans, metas):
-            finding, validator, case = meta
+            finding, validator, case, routed = meta
             if isinstance(result, Exception):
                 log.warning("validator failed: %s", result)
                 # W-11: count the crashed leg so a run where a validator throws on
@@ -509,6 +524,10 @@ class ConfirmMixin:
                         url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
                         parameter=getattr(finding, "parameter_name", "")))
                 continue
+            # Results may come from a cache; never mutate the shared value.
+            if routed is not finding:
+                from dataclasses import replace
+                result = replace(result, finding_class=finding.vulnerability_class)
             output.append(ValidationReport(
                 validator=result.validator,
                 status=result.status,
@@ -578,7 +597,10 @@ class ConfirmMixin:
                         finding.confirmed_by_leg = result.validator
                         # P0.1-WIRE: oracle gate runs (or no-ops, per config)
                         # at the exact moment a finding is first confirmed.
-                        await self._oracle_gate(finding, exchange)
+                        if routed is finding:
+                            await self._oracle_gate(finding, exchange)
+                        else:
+                            await self._oracle_gate(finding, exchange, routing_finding=routed)
                 else:
                     log.warning("failed to persist proof for %s: %s", result.validator, reason)
                     output[-1] = ValidationReport(
@@ -636,7 +658,7 @@ class ConfirmMixin:
         # (getattr for safety against older/foreign ValidationResult
         # instances that predate the field).
         for result, meta in zip(results, metas):
-            finding, validator, _case = meta
+            finding, validator, _case, _routed = meta
             if (not isinstance(result, Exception)
                     and result.validator == "cross_identity"
                     and result.status == "not_confirmed"
