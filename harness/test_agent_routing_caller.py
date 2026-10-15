@@ -149,6 +149,61 @@ class RoutingIdentityTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await context.aclose()
 
+    async def test_fallback_validator_mismatched_class_does_not_confirm(self):
+        # REPORT_2026-10-15_decisive_reproducibility.md: a validator reached
+        # ONLY via the agent-fallback (its own declared classes matched
+        # nothing on the finding directly) must never be allowed to confirm
+        # the finding by returning confirmed=True for some OTHER, hardcoded
+        # claim unrelated to what it was actually asked about -- as
+        # auth_sequence did (it ran a username-enumeration check and
+        # confirmed an unrelated cleartext_transmission finding with it).
+        # This is the general backstop: a SYNTHETIC validator standing in for
+        # ANY future validator with the same bug (returns a class that does
+        # not match what it was handed) must never confirm.
+        from harness.validators.base import ValidationResult
+        class MismatchedValidator:
+            active = False
+            run_context = None
+            version = "test"
+            name = "mismatched"
+            def applies(self, finding, exchange):
+                return finding.vulnerability_class == "auth"
+            def plan(self, finding, exchange):
+                return None
+            async def validate(self, finding, exchange):
+                await asyncio.sleep(0)
+                # Hands back a confirmed result for a DIFFERENT, hardcoded
+                # claim ("username_enumeration") regardless of what it was
+                # asked about ("auth", the bare agent-fallback sentinel) --
+                # exactly auth_sequence's pre-fix shape.
+                return ValidationResult(self.name, "confirmed", "username_enumeration",
+                                        confirmed=True, confidence=0.9,
+                                        summary="unrelated enum proof")
+        config = {"validators": {"enabled": True}}
+        caller = ConfirmMixin()
+        caller.config, caller.allowed_hosts = config, ["routing.invalid"]
+        caller.validator_registry = ValidatorRegistry(config)
+        caller.validator_registry.validators = {"mismatched": MismatchedValidator()}
+        finding = Finding(vulnerability_class="cleartext_transmission", confidence=0.6, severity="medium",
+                          summary="hypothesis", evidence="original evidence", suggested_test="test",
+                          basis="derived", finding_id="original-id")
+        report = AgentReport(agent="auth", model="synthetic", findings=[finding])
+        exchange = HttpExchange(url="https://routing.invalid/items", method="GET")
+        context = RunContext.create(allowed_hosts=caller.allowed_hosts, config=config)
+        proof = AsyncMock(return_value=(True, {"proof_id": "proof"}, ""))
+        try:
+            with patch.object(caller, "_persist_confirmation_proof", proof), \
+                 patch.object(caller, "_oracle_gate", AsyncMock()), \
+                 patch("harness.store.persist_validation_submission", return_value=(True, "")):
+                validations, _ = await caller._validate_findings(exchange, [report], run_context=context)
+            self.assertFalse(finding.confirmed)
+            self.assertEqual(len(validations), 1)
+            self.assertFalse(validations[0].confirmed)
+            self.assertEqual(validations[0].status, "skipped")
+            self.assertEqual(validations[0].finding_class, "cleartext_transmission")
+        finally:
+            await context.aclose()
+
     async def test_oracle_uses_routed_category_and_stamps_original_passively(self):
         caller = ConfirmMixin()
         caller.config = {}

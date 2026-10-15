@@ -139,10 +139,26 @@ class AuthSequenceValidator(Validator):
 
     def _which_checks(self, vc: str, exchange: HttpExchange) -> list[str]:
         """Return the ordered list of sub-checks to run. For a specific class
-        (e.g. "username_enumeration"), returns just that one. For generic
-        "broken_authentication", returns ALL applicable checks so we don't miss
-        a confirmable finding just because the LLM used a vague label."""
-        low = (vc or "").lower()
+        (e.g. "username_enumeration"), returns just that one. For a genuine
+        generic label containing "authentication" (e.g. "broken_authentication",
+        "Broken Authentication"), returns ALL applicable checks so we don't
+        miss a confirmable finding just because the LLM used a vague label.
+
+        Any OTHER unrecognized class returns NO checks. This matters because
+        registry.ValidatorRegistry.for_finding / orchestrator_confirm.
+        _validate_findings route a finding here not just by its own class but
+        also, as a fallback, by substituting the bare PRODUCING-AGENT name
+        ("auth") as a stand-in vulnerability_class when the finding's real
+        class matches no validator directly. That fallback is reachable for
+        ANY auth-family finding, including ones (e.g. cleartext_transmission)
+        this validator has no check for at all. "auth" does not contain
+        "authentication", so it correctly falls through to no-checks here
+        instead of running an unrelated check and mislabelling its result as
+        evidence for that unrelated claim -- the reproduced false-confirmation
+        bug in REPORT_2026-10-15_decisive_reproducibility.md (6/30 findings
+        per run carried a confirmed username-enumeration result that was
+        evidence for a completely different claim)."""
+        low = (vc or "").strip().lower()
         if "fixation" in low:
             return ["fixation"]
         if "weak" in low or "password polic" in low:
@@ -151,7 +167,8 @@ class AuthSequenceValidator(Validator):
             return ["enum"]
         if "2fa" in low or "mfa" in low or "two" in low or "multi" in low or "second factor" in low:
             return ["mfa"]
-        # Generic "broken authentication" — run all applicable checks.
+        if "authentication" not in low:
+            return []
         path = urlsplit(exchange.url).path.lower()
         fields, _ = _parse_body(exchange)
         checks = []
@@ -174,6 +191,10 @@ class AuthSequenceValidator(Validator):
         if not get_default_gate().config.allow_mutating_replay:
             return self._skip("auth-mechanism probes send POSTs; need validators.allow_mutating_replay")
         checks = self._which_checks(finding.vulnerability_class, exchange)
+        if not checks:
+            return self._skip(
+                "no auth_sequence check applies to this finding's class",
+                finding.vulnerability_class or "broken_authentication")
         last_result = None
         try:
             for check in checks:

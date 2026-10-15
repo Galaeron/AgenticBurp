@@ -535,7 +535,43 @@ class ConfirmMixin:
             # Results may come from a cache; never mutate the shared value.
             if routed is not finding:
                 from dataclasses import replace
-                result = replace(result, finding_class=finding.vulnerability_class)
+                # `routed` was only reached via the agent-fallback (its own
+                # declared classes matched nothing on `finding` directly --
+                # see ValidatorRegistry.for_finding): `routed.vulnerability_class`
+                # is the bare PRODUCING-AGENT name (e.g. "auth", "sqli"), a
+                # routing token, not a claim. A well-behaved validator echoes
+                # whatever class it was handed back in `result.finding_class`
+                # (sqlmap, cross_identity, crypto, ... all do), so this is a
+                # no-op for them. But a validator that instead returns some
+                # OTHER hardcoded class naming a specific sub-check it ran
+                # (auth_sequence's session_fixation/weak_password/
+                # username_enumeration/2fa_bypass) can fire a check wholly
+                # unrelated to `finding`'s real claim and still report
+                # confirmed=True -- which must never be stamped onto a
+                # finding it was never actually about. Reproduced bug:
+                # REPORT_2026-10-15_decisive_reproducibility.md (a confirmed
+                # username-enumeration result validating an unrelated
+                # cleartext_transmission finding, 6/30 per run, 3/3 runs).
+                # This check is the general backstop; auth_sequence's own
+                # dispatch is additionally hardened (see
+                # AuthSequenceValidator._which_checks) so it declines to run
+                # an unrelated check at all, rather than running it and
+                # relying on this catch after the fact.
+                tested_class = (result.finding_class or "").strip().lower()
+                fallback_label = (routed.vulnerability_class or "").strip().lower()
+                if result.confirmed and tested_class != fallback_label:
+                    result = replace(
+                        result, confirmed=False, status="skipped",
+                        finding_class=finding.vulnerability_class,
+                        summary=(
+                            f"{result.validator} confirmed {result.finding_class!r} via the "
+                            f"agent-fallback route (producing agent {routed.vulnerability_class!r}), "
+                            f"which does not match this finding's own class "
+                            f"{finding.vulnerability_class!r} -- not treated as confirmation of "
+                            f"this finding."),
+                    )
+                else:
+                    result = replace(result, finding_class=finding.vulnerability_class)
             output.append(ValidationReport(
                 validator=result.validator,
                 status=result.status,

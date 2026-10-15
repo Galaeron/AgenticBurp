@@ -298,6 +298,51 @@ class AuthSequenceRoutingTests(unittest.TestCase):
                                         body='{"username":"a","password":"b"}'))
         self.assertEqual(checks, ["weak"])
 
+    def test_unrelated_class_runs_no_checks(self):
+        # REPORT_2026-10-15_decisive_reproducibility.md: a cleartext_transmission
+        # finding has no auth_sequence check at all. It must not fall into the
+        # generic "run everything" battery just because it doesn't match any
+        # specific keyword -- that previously let an unrelated confirmed enum
+        # result get stamped onto a finding that was never about enumeration.
+        from harness.validators.auth_sequence_validator import AuthSequenceValidator
+        v = AuthSequenceValidator(allowed_hosts=["target.test"])
+        checks = v._which_checks("cleartext_transmission_of_sensitive_data",
+                                   _ex(url="http://target.test/api/login",
+                                        body='{"username":"a","password":"b"}'))
+        self.assertEqual(checks, [])
+
+    def test_bare_agent_name_fallback_runs_no_checks(self):
+        # registry.ValidatorRegistry.for_finding / orchestrator_confirm.
+        # _validate_findings substitute the bare producing-agent name ("auth")
+        # as vulnerability_class when routing a finding here only because its
+        # producing agent is "auth", not because its own class matched. That
+        # substitution carries no information about which (if any) specific
+        # check actually applies to the finding's real claim, so it must not
+        # trigger the generic battery either.
+        from harness.validators.auth_sequence_validator import AuthSequenceValidator
+        v = AuthSequenceValidator(allowed_hosts=["target.test"])
+        checks = v._which_checks("auth",
+                                   _ex(url="http://target.test/api/login",
+                                        body='{"username":"a","password":"b"}'))
+        self.assertEqual(checks, [])
+
+    def test_validate_declines_unrelated_class_instead_of_confirming(self):
+        # End-to-end: validate() must not return a confirmed result (evidence
+        # for a check it never ran that is relevant) for a class it has no
+        # check for, even on an exchange where the enum check WOULD confirm
+        # if it were (wrongly) run generically.
+        import asyncio
+        from harness.validators.auth_sequence_validator import AuthSequenceValidator
+        reset_default_gate()
+        get_default_gate({"allow_mutating_replay": True})
+        v = AuthSequenceValidator(allowed_hosts=["target.test"])
+        finding = _finding("cleartext_transmission_of_sensitive_data")
+        ex = _ex(url="http://target.test/api/login",
+                  body='{"username":"a","password":"b"}')
+        res = asyncio.run(v.validate(finding, ex))
+        self.assertFalse(res.confirmed)
+        self.assertNotEqual(res.status, "confirmed")
+
 
 if __name__ == "__main__":
     unittest.main()
