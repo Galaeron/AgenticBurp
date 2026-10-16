@@ -1328,7 +1328,7 @@ class ChainMixin:
             import json as _json
             import harness.chaining as _chaining
             import harness.second_order as _so
-            from harness.safety_gate import GatedAsyncClient as _GAC, get_default_gate as _gg2
+            from harness.safety_gate import get_default_gate as _gg2
             if _gg2().config.allow_mutating_replay:
                 _MARK_FIELDS = ("q", "name", "value", "comment", "data", "note", "subject", "title")
                 # R13: plant AS an authenticated attacker/owner (never anonymously),
@@ -1338,49 +1338,58 @@ class ChainMixin:
                 _plant_send_headers = dict(_plant_headers)
                 _plant_send_headers.setdefault("Content-Type", "application/json")
 
-                async def _plant(a_url, marker):
+                async def _plant(a_url, marker, case_ref=""):
                     await global_throttle.acquire()
                     body = _json.dumps({f: marker for f in _MARK_FIELDS})
+                    # ARCH-2: the plant travels the owning run's ONE TargetTransport
+                    # (scope + gate + request budget + evidence, under the run's TLS
+                    # trust), exactly like the read below -- never a separate
+                    # verify=False client that bypassed central accounting and trust.
                     try:
-                        async with _GAC(_gg2(), "second_order", timeout=10.0,
-                                        follow_redirects=False, verify=False) as c:
-                            resp = await c.request("POST", a_url, headers=_plant_send_headers,
-                                                   content=body)
-                        # R13: a failed write is surfaced, not silently swallowed --
-                        # the confirmation must not proceed as if the value was stored.
-                        if not (200 <= resp.status_code < 400):
-                            log.debug("second_order plant to %s returned %s", a_url, resp.status_code)
-                            return False
-                        return True
+                        out = await _so.send_through_run(
+                            run_context, "POST", a_url, allowed_hosts=self.allowed_hosts,
+                            config=self.config, capability="second_order_plant",
+                            headers=_plant_send_headers, body=body, case_ref=case_ref)
                     except Exception as e:
                         log.debug("second_order plant to %s failed: %s", a_url, e)
                         return False
+                    # R13: a failed write is surfaced, not silently swallowed -- the
+                    # confirmation must not proceed as if the value was stored. A
+                    # blocked/budget/scope/cancelled outcome (out.ok False) or a non-2xx/3xx
+                    # status is NOT a successful plant.
+                    if not (out.ok and out.status is not None and 200 <= out.status < 400):
+                        log.debug("second_order plant to %s returned %s/%s", a_url,
+                                  out.outcome, out.status)
+                        return False
+                    return True
 
-                async def _read(b_url, headers=None):
+                async def _read(b_url, headers=None, case_ref=""):
                     await global_throttle.acquire()
                     # default the read identity to the PLANTER (so the SQLi differential
                     # reads its own stored value back); a cross-identity read passes the
                     # other identity explicitly.
                     hdrs = _plant_headers if headers is None else headers
                     hdrs = {k: v for k, v in (hdrs or {}).items() if (k or "").lower() != "content-type"}
-                    # W-16: second-order read through the single TargetTransport (this run's
-                    # when present, else standalone). send_creds forwards the read identity's
-                    # credentials; max_redirects=0 == follow_redirects=False.
-                    _tt, _owned = transport_for(run_context, allowed_hosts=self.allowed_hosts,
-                                                config=self.config)
+                    # W-16/ARCH-2: second-order read through the single TargetTransport
+                    # (this run's when present, else standalone), sharing the plant's
+                    # case_ref so per-case accounting cannot be sidestepped.
                     try:
-                        out = await _tt.send_creds("GET", b_url, capability="second_order_read",
-                                                   headers=hdrs, max_redirects=0)
+                        out = await _so.send_through_run(
+                            run_context, "GET", b_url, allowed_hosts=self.allowed_hosts,
+                            config=self.config, capability="second_order_read",
+                            headers=hdrs, case_ref=case_ref)
                         return (out.body or "") if out.ok else ""
                     except Exception:
                         return ""
-                    finally:
-                        if _owned is not None:
-                            await _owned.aclose()
 
                 async def _confirm_sqli(a_url, b_url):
+                    # ARCH-2: one stable case ref ties the plant and the trigger-read
+                    # of THIS pair together, so per-case budget/evidence cannot be
+                    # bypassed by omitting the case identity on either leg.
+                    cr = f"second_order_sqli:{a_url}=>{b_url}"
                     return await _so.confirm_second_order_sqli(
-                        plant=lambda m: _plant(a_url, m), trigger=lambda: _read(b_url))
+                        plant=lambda m: _plant(a_url, m, case_ref=cr),
+                        trigger=lambda: _read(b_url, case_ref=cr))
 
                 async def _confirm_idor(a_url, b_url):
                     if not _other_headers:
@@ -1390,9 +1399,10 @@ class ChainMixin:
                             confirmed=False,
                             reason="no distinct second identity configured for a cross-identity "
                                    "second-order IDOR read (would be a self-comparison)")
+                    cr = f"second_order_idor:{a_url}=>{b_url}"
                     return await _so.confirm_second_order_idor(
-                        plant=lambda m: _plant(a_url, m),
-                        read_as_other=lambda: _read(b_url, _other_headers))
+                        plant=lambda m: _plant(a_url, m, case_ref=cr),
+                        read_as_other=lambda: _read(b_url, _other_headers, case_ref=cr))
 
                 _cands = _chaining.second_order_candidates(all_findings)
                 _confirmed_so = await _so.auto_confirm_candidates(
