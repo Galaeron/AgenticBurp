@@ -608,7 +608,10 @@ class ChainMixin:
                 telemetry.record_swallowed_exception("universal_header_audit", e)
 
         async def _probe(exchange, hypothesis, specialty, sb):
-            return await self.run_active_probe(exchange, hypothesis, specialty, step_budget=sb)
+            # ARCH-1: forward THIS engagement's run_context so the iterative
+            # probe's sends spend the run's budget/transport, not a throwaway one.
+            return await self.run_active_probe(exchange, hypothesis, specialty,
+                                               step_budget=sb, run_context=run_context)
 
         # Cross-identity confirmation for the investigation path: register the
         # roles as replay identities and confirm access-control findings the

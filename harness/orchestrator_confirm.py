@@ -100,6 +100,7 @@ class ConfirmMixin:
         model: str = "",
         step_budget: int | None = None,
         on_step=None,
+        run_context=None,
     ) -> dict:
         """Drive the iterative agent (F4) against one captured exchange, then
         integrate its result through F2 (pivot_memory): hold the findings as
@@ -118,13 +119,35 @@ class ConfirmMixin:
         from harness.iterative_agent import IterativeAgent
         from harness import pivot_memory
         from harness import activity_feed
+        from harness.run_context import standalone_context
+        from harness.safety_gate import get_default_gate
 
         # Phase 4 cloud-coordinator seam: the iterative agent's reasoning runs on
         # the cloud model when the seam is toggled on (else local).
         chosen_model = model or self.reasoning_model()
+        effective_budget = step_budget or self.iterative_agent_max_steps
+        # ARCH-1: the probe must spend the OWNING run's budget and travel its ONE
+        # TargetTransport. Inside an engagement, run_context is the engagement's
+        # (passed by investigate_engagement), and the agent borrows it. A
+        # standalone probe (e.g. the /active-probe endpoint, which passes no
+        # run_context) owns ONE properly-configured context for the WHOLE probe,
+        # with an explicit request ceiling, closed in the finally below -- never
+        # a throwaway per-send client that escaped all accounting (the ARCH-1
+        # defect). The ceiling defaults to a generous multiple of the step budget
+        # (each step issues at most one send) and is overridable via
+        # config iterative_agent.max_requests.
+        owned_ctx = None
+        probe_ctx = run_context
+        if probe_ctx is None:
+            _ia_cfg = (self.config or {}).get("iterative_agent", {}) or {}
+            _cfg_max = _ia_cfg.get("max_requests")
+            ceiling = int(_cfg_max) if _cfg_max else effective_budget * 2 + 10
+            owned_ctx = standalone_context(self.allowed_hosts, config=self.config,
+                                           gate=get_default_gate(), max_requests=ceiling)
+            probe_ctx = owned_ctx
         agent = IterativeAgent(
             self.ollama, chosen_model, self.allowed_hosts,
-            max_steps=self.iterative_agent_max_steps,
+            max_steps=self.iterative_agent_max_steps, run_context=probe_ctx,
         )
 
         # Publish each step to the live feed (V1), and still call any caller-
@@ -140,14 +163,21 @@ class ConfirmMixin:
             if on_step is not None:
                 on_step(step)
 
-        result = await agent.run(
-            exchange, hypothesis, specialty,
-            step_budget=step_budget or self.iterative_agent_max_steps,
-            effort_budget=self.effort_budget,
-            on_step=_feed_step,
-        )
-        outcome = await pivot_memory.integrate(result, exchange, model=chosen_model)
-        return {"iterative_result": result.to_dict(), "integration": outcome.to_dict()}
+        try:
+            result = await agent.run(
+                exchange, hypothesis, specialty,
+                step_budget=effective_budget,
+                effort_budget=self.effort_budget,
+                on_step=_feed_step,
+            )
+            outcome = await pivot_memory.integrate(result, exchange, model=chosen_model)
+            return {"iterative_result": result.to_dict(), "integration": outcome.to_dict()}
+        finally:
+            # ARCH-1: close ONLY a context this call owns (the standalone probe).
+            # A context borrowed from an engagement is never closed here -- its
+            # lifetime belongs to investigate_engagement.
+            if owned_ctx is not None:
+                await owned_ctx.aclose()
 
     async def run_retry_agents(
         self,

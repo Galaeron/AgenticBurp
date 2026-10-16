@@ -167,12 +167,21 @@ Rules:
 
 class IterativeAgent:
     def __init__(self, ollama, model: str, allowed_hosts: list[str], *, temperature: float = 0.2,
-                 max_steps: int = 250):
+                 max_steps: int = 250, run_context=None):
         self.ollama = ollama
         self.model = model
         self.allowed_hosts = allowed_hosts or []
         self.temperature = temperature
         self.max_steps = max_steps
+        # ARCH-1: the OWNING run's context when this probe runs inside an
+        # engagement (threaded engagement -> run_active_probe -> here), else a
+        # single standalone context the caller built for the whole probe. When
+        # set, every send in _execute goes through THIS run's one TargetTransport,
+        # so the probe draws on the run's request budget, cancel token, TLS and
+        # evidence context instead of escaping into a throwaway per-send client
+        # that no parent accounting ever covered. The agent BORROWS the context;
+        # ownership (and aclose) stays with the caller (see run_active_probe).
+        self._run_context = run_context
         # P2.6: idempotency guard, scoped to THIS active-probe session -- one
         # IterativeAgent is constructed fresh per run_active_probe() call
         # (orchestrator_confirm.py), so this set's lifetime is exactly "this
@@ -263,7 +272,12 @@ class IterativeAgent:
             return None, "skipped: identical request already sent this active-probe session"
         self._sent_signatures.add(sig)
 
-        _tt, _ctx = transport_for(None, allowed_hosts=self.allowed_hosts, gate=self.gate)
+        # ARCH-1: route through the OWNING run's transport when present (owned
+        # context is None, so the finally never closes a borrowed run); only a
+        # directly-constructed agent with no run_context falls back to a
+        # per-send standalone context (owned, closed below), preserving the old
+        # behaviour for callers that build an IterativeAgent on their own.
+        _tt, _ctx = transport_for(self._run_context, allowed_hosts=self.allowed_hosts, gate=self.gate)
         try:
             await global_throttle.acquire()
             out = await _tt.send_creds(method, url, capability="iterative_agent",
