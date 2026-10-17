@@ -14,9 +14,12 @@ retrieval path works at all; the other-principal and other-engagement cases are
 the negative controls (cross-principal exclusion is a privacy decision, X02).
 
 The standalone same-principal cases are X02. On 1715022a findings from a
-standalone call are persisted with captured_principal_id='' (store.persist_findings)
+standalone call were persisted with captured_principal_id='' (store.persist_findings)
 but read back filtered by the real principal (orchestrator_detect ->
-store.prior_findings_summary), so the prior context is always empty.
+store.prior_findings_summary), so the prior context was always empty. Standalone
+calls share the host partition (owner decision 2026-10-17); retrieval stays
+limited to the same principal, the same partition and a different URL. Fault
+injection: persisting '' again must make the same-principal assertions fail.
 """
 import asyncio
 import json
@@ -25,6 +28,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from harness import cache, store
 from harness.circuit_breaker import get_ollama_circuit_breaker
@@ -158,6 +162,27 @@ class StandalonePriorContextTests(_IsolatedStateCase):
     """Standalone /analyze (no engagement_id) -- the only path the committed
     Burp client uses."""
 
+    def assert_sees_prior_finding(self, joined: str) -> None:
+        self.assertTrue(_PRIOR_BLOCK in joined,
+                        "standalone analyze gave the same principal no prior-findings block")
+        self.assertTrue(_FINDING_SUMMARY in joined, "A's finding missing from C's prompt")
+
+    def test_standalone_finding_not_visible_to_explicit_engagement(self):
+        # Negative control: the shared host partition is not another engagement's.
+        a = _exchange("/api/v1/orders/101", "fixture-alice-token", _MARK_A)
+        c = _exchange("/api/v1/orders/202", "fixture-alice-token", _MARK_C)
+        joined = self._second_prompts(a, c, engagement_second="eng-other")
+        self.assertFalse(_FINDING_SUMMARY in joined,
+                         "a standalone finding leaked into an explicit engagement's prompt")
+
+    def test_same_url_is_still_excluded(self):
+        # Negative control: prior context covers OTHER endpoints of the host.
+        a = _exchange("/api/v1/orders/101", "fixture-alice-token", _MARK_A)
+        again = _exchange("/api/v1/orders/101", "fixture-alice-token", _MARK_C)
+        joined = self._second_prompts(a, again)
+        self.assertFalse(_FINDING_SUMMARY in joined,
+                         "the same URL's own finding was fed back as prior context")
+
     def test_standalone_other_principal_does_not_see_prior_finding(self):
         # Negative control: an X02 fix must keep cross-principal exclusion.
         a = _exchange("/api/v1/orders/101", "fixture-alice-token", _MARK_A)
@@ -169,19 +194,42 @@ class StandalonePriorContextTests(_IsolatedStateCase):
         # X02 (probe case 2).
         a = _exchange("/api/v1/orders/101", "fixture-alice-token", _MARK_A)
         c = _exchange("/api/v1/orders/202", "fixture-alice-token", _MARK_C)
-        joined = self._second_prompts(a, c)
-        self.assertTrue(_PRIOR_BLOCK in joined,
-                        "standalone analyze gave the same principal no prior-findings block")
-        self.assertTrue(_FINDING_SUMMARY in joined, "A's finding missing from C's prompt")
+        self.assert_sees_prior_finding(self._second_prompts(a, c))
 
     def test_standalone_anonymous_sees_prior_finding(self):
         # X02 (probe case 5): the anonymous principal is one principal too.
         a = _exchange("/api/v1/orders/101", None, _MARK_A)
         c = _exchange("/api/v1/orders/202", None, _MARK_C)
-        joined = self._second_prompts(a, c)
-        self.assertTrue(_PRIOR_BLOCK in joined,
-                        "standalone anonymous analyze gave no prior-findings block")
-        self.assertTrue(_FINDING_SUMMARY in joined, "A's finding missing from C's prompt")
+        self.assert_sees_prior_finding(self._second_prompts(a, c))
+
+    def test_standalone_finding_row_records_the_principal(self):
+        a = _exchange("/api/v1/orders/101", "fixture-alice-token", _MARK_A)
+        asyncio.run(_build(_RecordingModel()).analyze(a, force_agents=["idor"], bypass_cache=True))
+        rows = [r for r in store.all_host_findings(a.url, captured_principal=store.captured_principal_id(a))
+                if r["agent"] == "idor"]
+        self.assertEqual(len(rows), 1, "the standalone finding is not readable by its principal")
+        self.assertIn(_FINDING_SUMMARY, rows[0]["summary"])
+        self.assertTrue(rows[0]["captured_principal_id"].startswith("captured:"))
+
+
+class StandalonePriorContextFaultInjectionTests(_IsolatedStateCase):
+    """CROSS_REQUEST_ACCEPTANCE_SPEC.md section 5: persisting standalone findings
+    with captured_principal_id='' again must make the X02 assertions fail."""
+
+    def test_persisting_blank_principal_again_fails_x02(self):
+        original = store.persist_findings
+
+        def persist_blank(*args, **kwargs):
+            with patch("harness.store.captured_principal_id", lambda exchange: ""):
+                return original(*args, **kwargs)
+
+        checker = StandalonePriorContextTests("test_standalone_same_principal_sees_prior_finding")
+        a = _exchange("/api/v1/orders/101", "fixture-alice-token", _MARK_A)
+        c = _exchange("/api/v1/orders/202", "fixture-alice-token", _MARK_C)
+        with patch("harness.store.persist_findings", persist_blank):
+            joined = self._second_prompts(a, c)
+        with self.assertRaises(AssertionError, msg="fault injection is inert"):
+            checker.assert_sees_prior_finding(joined)
 
 
 if __name__ == "__main__":
