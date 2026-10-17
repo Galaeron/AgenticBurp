@@ -93,11 +93,13 @@ class _PromptSpyModel:
 
     def _canned(self, user_prompt: str) -> dict:
         self.prompts.append(user_prompt)
+        # Match the exchange's own "URL:" line, not any mention: since X02 the
+        # prior-findings block legitimately names earlier URLs on the host.
         for (method, url), payload in self._by_pair.items():
-            if f"METHOD: {method}" in user_prompt and url in user_prompt:
+            if f"METHOD: {method}" in user_prompt and f"URL: {url}\n" in user_prompt:
                 return payload
         for url, payload in self._by_url.items():
-            if url in user_prompt:
+            if f"URL: {url}\n" in user_prompt:
                 return payload
         return {"findings": [], "components": []}
 

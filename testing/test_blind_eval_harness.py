@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import json
+import re
 import shutil
 import tempfile
 import unittest
@@ -49,6 +50,8 @@ from unittest import mock
 _TESTING_DIR = Path(__file__).resolve().parent
 _ROOT = _TESTING_DIR.parent
 _RUNNER_PATH = _ROOT / "testing" / "blind-target-2" / "run_blind_eval.py"
+# store.captured_principal_id label: per-store HMAC, so it differs across fresh stores.
+_CAPTURED_LABEL = re.compile(r"captured:[0-9a-f]{64}")
 
 
 def _load_runner_module():
@@ -784,7 +787,18 @@ class ExchangeProvenanceAttributionAR3Tests(unittest.TestCase):
         self.assertEqual(sc1["surfaced_finding_ids"], sc2["surfaced_finding_ids"])
         self.assertEqual(sc1["n_controls_issue_level"], sc2["n_controls_issue_level"])
         self.assertEqual(sc1["controls_clean_issue_level"], sc2["controls_clean_issue_level"])
-        self.assertEqual(sc1["markdown_reports"], sc2["markdown_reports"])
+        # Standalone findings carry a captured auth context (X02), a per-store
+        # pseudonym keyed by that state DB's principal-hmac-v1 secret, so two
+        # fresh stores label the same capture differently. Everything else in
+        # the report must still be byte-identical.
+        def _normalized(reports):
+            return {host: _CAPTURED_LABEL.sub("captured:<per-store>", text)
+                    for host, text in reports.items()}
+
+        self.assertEqual(
+            [len(_CAPTURED_LABEL.findall(t)) for t in sc1["markdown_reports"].values()],
+            [len(_CAPTURED_LABEL.findall(t)) for t in sc2["markdown_reports"].values()])
+        self.assertEqual(_normalized(sc1["markdown_reports"]), _normalized(sc2["markdown_reports"]))
 
 
 class ScorecardShapeTests(unittest.TestCase):
