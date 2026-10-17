@@ -7,6 +7,13 @@ re-reading the whole review.
 
 ## How the loop should use this file
 
+**2026-10-17 canonical owners:** each of the 31 unchecked and 4 partial headings below has
+one canonical owner, either a ticket (I01–I17 in
+[the remaining-implementation plan](docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md)) or an
+explicit deferral. The owner table is in
+[the I01 candidate manifest](docs/I01_CANDIDATE_MANIFEST_2026-10-17.md). A `[x]` here closes only
+the acceptance scope that entry names; it is not a caller, live or release claim.
+
 **2026-09-24 benchmark follow-up:** The BP-0 through BP-7 implementation
 path is in [Benchmark precision implementation path](docs/BENCHMARK_PRECISION_IMPLEMENTATION_PATH.md).
 Start with provenance-tracked seed labels, then BP-1a strict scoring and BP-1b
@@ -3919,6 +3926,15 @@ firing autonomously end-to-end "during real engagements".
   capture additions, config.yaml OFF flag, config_schema + test_config_schema registration);
   fixture + integration test ride the legs WIP per branch convention. The blind-target recall
   claim remains OWNER/LIVE (out of scope); the multipart/file-upload half was deferred (XXE proven).
+- **Reconciled 2026-10-17 (I01):** `[x]` covers the capture component only. When it was checked
+  it had no default caller. The engagement-caller integration is now committed as `ba080691` (the
+  I01 candidate; `docs/SPA_DISCOVERY_FIXES.md`): page-load fetch/XHR capture flows into the
+  `build_engagement` worklist under the owning RunContext. Original
+  acceptance is still NOT fully met. XML capture→XXE confirmation is proven at component/fixture
+  level only (`test_leg_live_verification`), not through the engagement caller. Multipart/file-upload
+  remains deferred, and there is no interaction-driven SPA workflow. **Open → I06** (declared
+  interactions) **and I07** (XML/multipart request shape). See
+  `docs/I01_CANDIDATE_MANIFEST_2026-10-17.md`.
 - **Domain:** Discovery · **Effort:** L · **Depends on:** none · **Mode:** LOOP for the
   capture plumbing + fixture; a real blind-target recall claim is OWNER/LIVE
 - **Evidence:** `feature_workflow` / the passive HTML parser emit only urlencoded bodies.
@@ -4178,3 +4194,83 @@ firing autonomously end-to-end "during real engagements".
   default-OFF flag is on; the branch (if kept) confirms only on an independent readback + fresh
   sentinel and a reflecting-endpoint negative control stays `not_confirmed`; caller-level test;
   `full` green. **Source:** 2026-10-05 LB-5 review.
+
+## Deterministic-check deferrals — 2026-10-15 (Part A split-outs)
+
+Three deterministic checks were explicitly held OUT of the 2026-10-15 "Part A"
+deterministic-checks block and filed here as separate questions (user note: "the
+POST-capable SQL injection check, JWT detection and the SSRF validator ... they're
+separate questions"). Each validator already EXISTS and is dispatched in
+`harness/orchestrator_chain.py::_confirm`; these items are about coverage /
+triggering / live soundness, not missing code. They map to
+`docs/DETERMINISTIC_FIRST_IMPLEMENTATION_CHECKLIST.md` Batch 5.
+
+### [ ] DET-SQLI-POST — Confirm POST/body-shaped SQLi reaches the SQLi confirmation leg
+- **Domain:** Deterministic-first coverage · **Effort:** S-M · **Depends on:** none ·
+  **Mode:** LOOP (offline shape/caller test); the full sqlmap path stays OWNER/LIVE (Docker image, no host install).
+- **Evidence (VERIFIED):** `SqlmapValidator` (`harness/validators/sqlmap.py`) already
+  mutates JSON and urlencoded body params (`_json_top_level_params`/`_mutate_json_param:38-59`,
+  `_form_top_level_params`/`_mutate_form_param:62-80`), so the validator itself is POST-capable.
+  The open question is the DISPATCH/shape gate: the SQLi precondition commentary in
+  `harness/orchestrator_helpers.py` frames SQLi around "reflected input or a query-shaped
+  parameter" (`:95-96`); the `_confirm` sqli branch is `orchestrator_chain.py:962-968`.
+- **Problem:** if the shape precondition only recognizes query-string params, a body-only SQLi
+  (common in JSON APIs like crAPI) is never handed to the validator even though the validator
+  could test it — a silent recall gap that the engagement run would never surface as "attempted".
+- **Recommendation:** add a caller-level test proving a POST/JSON body with a candidate param
+  reaches `SqlmapValidator` with the body param targeted, plus a negative control (no injectable
+  param → no validator send); extend the precondition if the gap is real.
+- **Acceptance criteria:** body-shaped SQLi positive reaches the validator at the caller; negative
+  control sends nothing; `full` green. **Source:** 2026-10-15 Part A deferral.
+- **Reconciled 2026-10-17 (I01):** the "Problem" above is stale at HEAD `64e09ed6`. Two paths now
+  schedule the `sqli` leg, plus command-injection, SSTI and XSS, without a model label:
+  `orchestrator_helpers.shape_precondition_legs` (graph path) and `shape_precondition_findings`
+  (analyze path). Both fire whenever `injection_targets.param_targets` finds a query parameter OR a
+  JSON/form body parameter. Still unproven: that a body-only captured request reaches `SqlmapValidator`
+  through the real `_confirm` caller with the BODY parameter targeted, together with the empty-body
+  negative control. **Canonical owner → I09.**
+
+### [ ] DET-JWT-DETECT — Trigger the JWT forge leg deterministically from a JWT-bearing request
+- **Domain:** Deterministic-first coverage · **Effort:** S-M · **Depends on:** none ·
+  **Mode:** LOOP (offline shape/caller test) + OWNER/LIVE confirm.
+- **Evidence (VERIFIED):** the confirmation leg is sound-by-design — `JwtForgeValidator`
+  (`harness/validators/jwt_forge_validator.py`) mints `alg:none` and HS-with-public-key forgeries
+  plus claim escalation and compares against a garbage-signature control; it is wired in
+  `orchestrator_chain.py::_confirm` (`:684`) and dispatched (`:947-949`) on label text containing
+  "jwt"/"algorithm confusion"/"weak_token". DETECTION is the question: dispatch keys off the model
+  LABEL, which this project's own discipline treats as variance-prone.
+- **Problem:** a JWT in the request is a deterministic signal; relying on an LLM label to fire the
+  forge leg risks missing a real JWT-weakness and makes recall depend on label variance.
+- **Recommendation:** add a deterministic shape precondition that queues the forge leg whenever the
+  request carries a JWT (`Authorization: Bearer <jwt>` or a jwt-shaped cookie), independent of model
+  labelling; caller-level positive + a non-JWT negative control.
+- **Acceptance criteria:** a JWT-bearing exchange schedules the forge leg with no model label; a
+  non-JWT control schedules nothing; `full` green. **Source:** 2026-10-15 Part A deferral.
+- **Reconciled 2026-10-17 (I01):** partly stale. At HEAD `64e09ed6`, `shape_precondition_legs`
+  already schedules the `jwt` forge leg with no model label in one case: a GET node where
+  `_jwt_identity` finds a reachable supplied role whose header values carry a JWT-shaped token.
+  That covers both `Authorization` and `Cookie`. Uncovered cases are non-GET methods, analyze()'s
+  single captured-exchange path (`shape_precondition_findings` has no jwt leg), and a JWT that
+  appears only in the captured request rather than in a supplied role. Re-scope to those cases only.
+  **Canonical owner → I09.**
+
+### [ ] DET-SSRF — Resolve SSRF collaborator reachability for live confirmation
+- **Domain:** Deterministic-first validator soundness · **Effort:** M · **Depends on:** an
+  in-process collaborator reachable from the target · **Mode:** OWNER/LIVE (needs `active_enabled` +
+  a reachable callback).
+- **Evidence (VERIFIED):** `SsrfValidator` (`harness/validators/ssrf_validator.py`) swaps a
+  URL-shaped param (`url/uri/target/callback/webhook/...`, `:30`) for a unique in-process
+  collaborator URL and confirms on a callback (`confirmed=0.95`, `:183`), gated by
+  `validators.active_enabled`; wired at `orchestrator_chain.py:686`, dispatched `:952-954`.
+- **Problem:** OOB SSRF confirmation depends on the target reaching the collaborator. On an
+  egress-filtered or docker-networked lab (crAPI runs in Docker), the callback may never arrive,
+  yielding inconclusive/false-negative for a real SSRF — and the collaborator's host-visible
+  address is not necessarily reachable from inside the container network.
+- **Recommendation:** determine the collaborator address reachable from the crAPI docker network
+  (`host.docker.internal` / bridge IP), document it, and add a bounded in-band/timing fallback where
+  a sound oracle allows; keep default-OFF and scope-gated.
+- **Acceptance criteria:** a known crAPI SSRF sink confirms via callback with the documented
+  address (or a documented reason it cannot, plus a sound fallback); negative control stays
+  unconfirmed; caller-level test; `full` green. **Source:** 2026-10-15 Part A deferral.
+- **Reconciled 2026-10-17 (I01):** live acceptance only. **Canonical owner → I13.** Establish
+  collaborator reachability independently; a missing callback alone does not refute SSRF.
