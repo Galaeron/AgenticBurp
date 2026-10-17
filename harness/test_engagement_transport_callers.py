@@ -236,7 +236,7 @@ class _EngagementCallerBase(unittest.TestCase):
 
     def _run(self, target: _Target, *, max_requests, endpoints=(), captured=(), mutating=False,
              run_hosts=("127.0.0.1",), run_mutating=None, cancel_before=False, model=None,
-             wrap_probe=None, extra_patches=(), browser=False):
+             wrap_probe=None, extra_patches=(), browser=False, roles=None):
         """One investigate_engagement against `target`, entered as the server does.
         Real Chromium legs run only when `browser` is set (they dominate runtime).
         Returns (result, run_context, model)."""
@@ -259,7 +259,7 @@ class _EngagementCallerBase(unittest.TestCase):
             try:
                 async with rc:
                     return await orch.investigate_engagement(
-                        target.base, _ROLES, max_nodes=2, step_budget=2,
+                        target.base, roles or _ROLES, max_nodes=2, step_budget=2,
                         max_chain_rounds=0, run_context=rc)
             finally:
                 await rc.aclose()
