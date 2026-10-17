@@ -15,7 +15,7 @@ import logging
 import re
 import secrets
 from typing import Callable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 
@@ -63,21 +63,6 @@ def _session_cookie_samesite(exchange: HttpExchange) -> str | None:
                 return m.group(1)
             return None
     return None
-
-
-def _method_bypass_url(exchange: HttpExchange) -> tuple[str, list[tuple[str, str]]]:
-    """Turn a token-bearing form write into a top-level-navigation GET shape.
-
-    Returns the URL and the non-token form fields retained in the query. Empty
-    means this is not a browser-simple method-bypass candidate.
-    """
-    parts = urlsplit(exchange.url or "")
-    pairs = parse_qsl(exchange.request_body or "", keep_blank_values=True)
-    retained = [(k, v) for k, v in pairs if not _CSRF_TOKEN_NAMES.search(k or "")]
-    if not retained or len(retained) == len(pairs):
-        return "", []
-    query = urlencode(parse_qsl(parts.query, keep_blank_values=True) + retained)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, "")), retained
 
 
 def _readback_matches(body: str, submitted: list[tuple[str, str]]) -> bool:
@@ -257,62 +242,16 @@ class CsrfValidator(Validator):
             return self._skip("endpoint does not accept a state-changing method")
 
         samesite = _session_cookie_samesite(exchange)
-
-        # Token validation that disappears when POST is changed to GET is a
-        # distinct, browser-deliverable CSRF case. A top-level cross-site GET can
-        # carry SameSite=Lax cookies; require Cookie ambient credentials, reject
-        # bearer-only shapes, and confirm only when the followed response reads
-        # back a non-token value submitted by the probe.
-        bypass_url, submitted = _method_bypass_url(exchange)
         headers_lower = {str(k).lower(): str(v)
                          for k, v in (exchange.request_headers or {}).items()}
-        if bypass_url and "cookie" in headers_lower and "authorization" not in headers_lower:
-            if samesite and samesite.lower() == "strict":
-                return ValidationResult(
-                    self.name, "not_confirmed", "csrf", confidence=0.0, confirmed=False,
-                    summary="Session cookie has SameSite=Strict, blocking cross-site navigation credentials.")
-            method_headers = replay_headers(exchange)
-            method_headers = {k: v for k, v in (method_headers or {}).items()
-                              if (k or "").lower() not in
-                              ("content-type", "content-length", "origin", "referer")
-                              and not _CSRF_TOKEN_NAMES.search(k or "")}
-            try:
-                if self.run_context is not None:
-                    from harness.run_context import TypedRequest
-                    from .transport import bind_session
-                    session_ref, request_headers = bind_session(self.run_context, method_headers)
-                    outcome = await self.run_context.executor().execute(
-                        TypedRequest("GET", bypass_url, headers=request_headers),
-                        capability=self.name, session_ref=session_ref)
-                    if not outcome.executed:
-                        return self._skip(f"CSRF method-bypass probe declined: {outcome.outcome}")
-                    if outcome.outcome == "error":
-                        return ValidationResult(self.name, "error", "csrf",
-                                                summary=f"HTTP error during method-bypass probe: {outcome.error}")
-                    status_code, response_body = outcome.status or 0, outcome.body or ""
-                else:
-                    await global_throttle.acquire()
-                    async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
-                                                follow_redirects=True, verify=False) as client:
-                        resp = await client.get(bypass_url, headers=method_headers or None)
-                    status_code, response_body = resp.status_code, resp.text or ""
-            except SafetyGateBlocked:
-                return self._skip("CSRF method-bypass probe not authorized")
-            except httpx.HTTPError as e:
-                return ValidationResult(self.name, "error", "csrf",
-                                        summary=f"HTTP error during method-bypass probe: {e}")
-            if 200 <= status_code < 300 and _readback_matches(response_body, submitted):
-                names = ", ".join(k for k, _ in submitted)
-                return ValidationResult(
-                    self.name, "confirmed", "csrf", confidence=0.95, confirmed=True,
-                    summary=("Token-bearing form accepted as a tokenless GET and the resulting "
-                             "authenticated page independently read back the submitted value."),
-                    evidence=(f"GET {bypass_url} without the CSRF field returned {status_code}; "
-                              f"readback matched submitted field(s): {names}."))
-            return ValidationResult(
-                self.name, "not_confirmed", "csrf", confidence=0.0, confirmed=False,
-                summary=(f"Tokenless GET method-bypass returned {status_code}, but no submitted "
-                         "value was independently read back."))
+
+        # RETIRED (I04 / LB-CSRF-REPLAY, 2026-10-17): a tokenless GET replay of the
+        # write, confirmed when that SAME response contained a submitted value. The
+        # harness attached the session cookie itself, the "readback" was not
+        # independent, and a server that merely echoes its query string confirmed
+        # at 0.95 -- even with mutating replay off, since the write travelled as a
+        # GET. CSRF confirmation now comes only from the cross-site browser PoC
+        # below (ambient cookie, fresh sentinel, independent GET readback).
 
         if samesite and samesite.lower() in ("strict", "lax"):
             return ValidationResult(

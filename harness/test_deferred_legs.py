@@ -6,8 +6,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from harness.models import Finding, HttpExchange
 from harness.validators.verb_tamper_validator import VerbTamperValidator
 from harness.validators.csrf_validator import (CsrfValidator, _has_csrf_token,
-                                                _method_bypass_url, _readback_matches,
-                                                _session_cookie_samesite)
+                                                _readback_matches, _session_cookie_samesite)
 from harness.validators.file_upload_validator import FileUploadValidator
 from harness.validators.nosql_validator import (NosqlValidator, _administrator_readback,
                                                 _credential_names)
@@ -196,13 +195,11 @@ class CsrfHelperTests(unittest.TestCase):
         ex = _exchange(response_headers={"Set-Cookie": "theme=dark; Path=/"})
         self.assertIsNone(_session_cookie_samesite(ex))
 
-    def test_method_bypass_drops_only_token_field(self):
-        ex = _exchange(url="http://target.test/change?view=account", method="POST",
-                       request_body="email=probe%40example.com&csrf=secret")
-        url, submitted = _method_bypass_url(ex)
-        self.assertIn("email=probe%40example.com", url)
-        self.assertNotIn("csrf", url)
-        self.assertEqual(submitted, [("email", "probe@example.com")])
+    def test_tokenless_get_method_bypass_is_retired(self):
+        # I04 / LB-CSRF-REPLAY: the same-response "readback" confirmation was
+        # unsound (see harness/test_csrf_reflection_control.py).
+        from harness.validators import csrf_validator
+        self.assertFalse(hasattr(csrf_validator, "_method_bypass_url"))
 
     def test_readback_needs_distinct_submitted_value(self):
         self.assertTrue(_readback_matches("email: probe@example.com",
@@ -228,24 +225,25 @@ class CsrfValidatorTests(unittest.TestCase):
 
     @patch("harness.validators.csrf_validator.GatedAsyncClient")
     @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
-    def test_method_dependent_token_validation_requires_readback(self, _throttle, mock_client_cls):
+    def test_method_dependent_token_shape_never_confirms_from_its_own_response(self, _throttle, mock_client_cls):
+        # I04 / LB-CSRF-REPLAY: this shape used to be replayed as a tokenless GET
+        # and confirmed when that same response echoed the submitted value. With
+        # the cross-site PoC off, it is at most the retired 0.4 observation.
         ex = _exchange(
             url="http://target.test/change-email", method="POST", status=200,
             request_headers={"Cookie": "session=victim", "Content-Type": "application/x-www-form-urlencoded"},
             request_body="email=probe%40example.com&csrf=secret")
-        confirmed = MagicMock(status_code=200, text="Account email: probe@example.com")
+        echoed = MagicMock(status_code=200, text="Account email: probe@example.com")
         client = AsyncMock()
-        client.get = AsyncMock(return_value=confirmed)
+        client.get = AsyncMock(return_value=echoed)
+        client.request = AsyncMock(return_value=echoed)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock()
         mock_client_cls.return_value = client
         result = asyncio.run(self.v.validate(_finding("csrf"), ex))
-        self.assertTrue(result.confirmed)
-        self.assertEqual(result.status, "confirmed")
-
-        client.get.return_value = MagicMock(status_code=200, text="Account unchanged")
-        result = asyncio.run(self.v.validate(_finding("csrf"), ex))
         self.assertFalse(result.confirmed)
+        self.assertLessEqual(result.confidence, 0.4)
+        client.get.assert_not_called()   # the write is never re-sent as a GET
 
     @patch("harness.validators.csrf_validator.GatedAsyncClient")
     @patch("harness.global_throttle.acquire", new_callable=AsyncMock)
