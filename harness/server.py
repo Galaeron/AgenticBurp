@@ -724,13 +724,16 @@ class RoleCrawlRequest(_BaseModel):
 
 
 def _register_role_identities(roles) -> list[dict]:
-    """Register an Identity per distinct role (idempotent by name), so a role
+    """Register an Identity per distinct principal (idempotent by name), so a role
     crawl's reachable identities feed the existing identity/cross-identity-compare
-    system. Never stores credentials -- only the label + role."""
+    system. Named by the access-matrix principal key (X03), which is the role
+    label for a sole principal of that role. Never stores credentials -- only
+    the label + role."""
+    from harness.role_crawl import principal_keys
     existing = {i["name"] for i in store.list_identities()}
     registered: list[dict] = []
-    for r in roles:
-        name = f"rolecrawl:{r.role}"
+    for key, r in zip(principal_keys(roles), roles):
+        name = f"rolecrawl:{key}"
         if name in existing:
             continue
         existing.add(name)
@@ -810,8 +813,8 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
 
     def _ingest(st):
         st.ingest_role_crawl(out)
-        for r in roles:
-            st.ingest_identity(f"rolecrawl:{r.role}", r.role, source="seed")
+        for key, r in zip(role_crawl.principal_keys(roles), roles):
+            st.ingest_identity(f"rolecrawl:{key}", r.role, source="seed")
         for ri in registered:
             st.ingest_identity(ri["name"], ri["role"], source="seed")
     await __import__("asyncio").to_thread(_update_engagement, store.host_of(req.base_url), _ingest)

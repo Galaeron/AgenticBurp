@@ -250,7 +250,12 @@ async def investigate_worklist(
     budget with eligible work still on the table.
 
     Returns a per-node outcome list; findings are folded back into `state`."""
-    role_headers = {r.role: dict(r.headers or {}) for r in roles}
+    # X03: reachable_roles holds access-matrix principal keys, so credentials
+    # are looked up by principal and trust by that principal's role.
+    from harness.role_crawl import principal_keys
+    keys = principal_keys(roles)
+    role_headers = {key: dict(r.headers or {}) for key, r in zip(keys, roles)}
+    key_roles = {key: r.role for key, r in zip(keys, roles)}
     outcomes: list[dict] = []
     investigated = 0
     precondition_run = 0
@@ -287,9 +292,13 @@ async def investigate_worklist(
             continue  # no agent hypothesis AND no shape-driven leg to run -- skip
 
         reach = node.get("reachable_roles", []) or []
+        access_roles = node.get("access_roles") or {}
         # probe from the lowest-trust identity that can reach it (strongest proof).
-        probe_role = min(reach, key=_trust) if reach else (roles[0].role if roles else "anonymous")
-        headers = role_headers.get(probe_role, {})
+        probe_role = (min(reach, key=lambda k: _trust(access_roles.get(k) or key_roles.get(k) or k))
+                      if reach else (keys[0] if roles else "anonymous"))
+        headers = role_headers.get(probe_role)
+        if headers is None:  # a state whose matrix still names a role label
+            headers = next((dict(r.headers or {}) for r in roles if r.role == probe_role), {})
         parent_id = _parent_template_object_id(state, node)
         exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
 

@@ -230,15 +230,51 @@ class RoleSession:
             provisional=provisional, label=self.name or self.role or "")
 
 
+def principal_keys(roles) -> list[str]:
+    """The access-matrix column key for each session, aligned with `roles` (X03).
+
+    The matrix is keyed by PRINCIPAL, not by role label: alice and bob, both
+    role "user", are two columns, so the same-object comparison can fire for a
+    user-to-user BOLA. A session's key is its explicit `name`; else its role
+    label while that label names exactly one supplied principal (the historical
+    key, so distinct labels are unchanged); else `principal_id()` (role plus a
+    credential hash). Sessions with the same name are one principal (credential
+    renewal) and share a key. Role stays an attribute for trust decisions."""
+    roles = list(roles or [])
+
+    def _pid(r) -> str:
+        p = getattr(r, "principal_id", None)
+        return str(p()) if callable(p) else (getattr(r, "role", None) or "anonymous")
+
+    pids = [_pid(r) for r in roles]
+    labels = [getattr(r, "role", None) or "anonymous" for r in roles]
+    principals_by_label: dict[str, set] = {}
+    for label, pid in zip(labels, pids):
+        principals_by_label.setdefault(label, set()).add(pid)
+    keys = [str(getattr(r, "name", None) or (label if len(principals_by_label[label]) == 1 else pid))
+            for r, label, pid in zip(roles, labels, pids)]
+    # A name equal to another principal's role label must not merge the two:
+    # the unnamed session falls back to its own principal id.
+    principals_by_key: dict[str, set] = {}
+    for key, pid in zip(keys, pids):
+        principals_by_key.setdefault(key, set()).add(pid)
+    return [pid if len(principals_by_key[key]) > 1 and not getattr(r, "name", None) else key
+            for r, key, pid in zip(roles, keys, pids)]
+
+
 @dataclass
 class EndpointAccess:
     method: str
     path: str                 # normalized (may contain {id})
-    by_role: dict = field(default_factory=dict)   # role -> status (int) or None on error
-    reachable_roles: list = field(default_factory=list)  # roles that got substantive 2xx
-    # role -> {"len": int, "hash": str|None} for the SAME probed object id, so
-    # the same object's response can be compared ACROSS identities (BOLA test).
+    # Matrix columns are principal keys (principal_keys), not role labels; the
+    # field names are kept for API/snapshot compatibility.
+    by_role: dict = field(default_factory=dict)   # principal key -> status (int) or None on error
+    reachable_roles: list = field(default_factory=list)  # principal keys that got substantive 2xx
+    # principal key -> {"len": int, "hash": str|None} for the SAME probed object
+    # id, so the same object's response can be compared ACROSS identities (BOLA).
     fingerprints: dict = field(default_factory=dict)
+    # principal key -> role label: the attribute trust decisions read.
+    principal_roles: dict = field(default_factory=dict)
 
     @property
     def object_scoped(self) -> bool:
@@ -247,16 +283,17 @@ class EndpointAccess:
     def to_dict(self) -> dict:
         return {"method": self.method, "path": self.path, "by_role": self.by_role,
                 "reachable_roles": self.reachable_roles, "object_scoped": self.object_scoped,
-                "fingerprints": self.fingerprints}
+                "fingerprints": self.fingerprints, "principal_roles": self.principal_roles}
 
 
 @dataclass
 class CrossRoleOutcome:
-    """Result of one ACTIVE cross-role object probe: role `requester_role`
+    """Result of one ACTIVE cross-role object probe: principal `requester_role`
     replaying its own credentials against an object id known to be OWNED by
-    `owner_role` (a specific, real id -- not the shared templated id_fill
-    `_compare_identities` uses). This is the direct test broken object-level
-    authorization turns on: does B's session get A's actual data."""
+    principal `owner_role` (a specific, real id -- not the shared templated
+    id_fill `_compare_identities` uses). This is the direct test broken
+    object-level authorization turns on: does B's session get A's actual data.
+    Both fields hold matrix principal keys (principal_keys)."""
     method: str
     path: str
     owner_role: str
@@ -302,7 +339,7 @@ async def probe_cross_role_objects(
     roles: list[RoleSession],
     method: str,
     path: str,
-    owned_object_ids: dict,        # owner role -> the real object id that role owns
+    owned_object_ids: dict,        # owner principal key -> the real object id it owns
     *,
     allowed_hosts: list[str] | None = None,
     timeout: float = 15.0,
@@ -311,7 +348,9 @@ async def probe_cross_role_objects(
 ) -> list[CrossRoleOutcome]:
     """ACTIVELY probe every (owner, requester) pair, owner != requester, for one
     object-scoped endpoint: build the URL from the OWNER's real object id, send
-    it with the REQUESTER's own credentials, and classify the result.
+    it with the REQUESTER's own credentials, and classify the result. Owners
+    and requesters are principals (principal_keys), so two same-role users are
+    probed against each other.
 
       - "leaked": the requester got a substantive 2xx for another role's object
         -- broken object-level authorization (BOLA/IDOR), carries a Finding.
@@ -322,7 +361,7 @@ async def probe_cross_role_objects(
 
     `session_refs`, when supplied, must align 1:1 with `roles` (same contract
     as `crawl_roles`)."""
-    role_by_name = {r.role: (i, r) for i, r in enumerate(roles)}
+    role_by_name = {key: (i, r) for i, (key, r) in enumerate(zip(principal_keys(roles), roles))}
     outcomes: list[CrossRoleOutcome] = []
     for owner_role, obj_id in owned_object_ids.items():
         if not obj_id or owner_role not in role_by_name:
@@ -354,7 +393,7 @@ async def probe_cross_role_objects(
 async def probe_cross_role_matrix(
     result: RoleCrawlResult,
     roles: list[RoleSession],
-    owned_object_ids: dict,        # role -> {normalized path: object id owned by that role}
+    owned_object_ids: dict,        # principal key -> {normalized path: object id it owns}
     *,
     allowed_hosts: list[str] | None = None,
     timeout: float = 15.0,
@@ -363,7 +402,7 @@ async def probe_cross_role_matrix(
 ) -> None:
     """Wire `probe_cross_role_objects` across every object-scoped endpoint
     already in the crawl matrix (`result.endpoints`) for which at least two
-    roles have a declared owned object id -- "auto-test cross-role access on
+    principals have a declared owned object id -- "auto-test cross-role access on
     every crawl-matrix endpoint" once ownership is known. Mutates `result` in
     place: appends to `result.cross_role_outcomes` and folds `leaked`
     outcomes into `result.idor_findings` (the same sink `_compare_identities`
@@ -496,14 +535,18 @@ async def crawl_roles(
     (api_surface_discovery) -- essential on a headless API where the JS crawler
     finds nothing. The engagement builder turns active discovery on.
 
-    `owned_object_ids` (P1.3, optional): {role -> {normalized_path: object_id}}
-    -- when the caller knows which real object id each role owns (e.g. "alice
-    created ticket 101"), every object-scoped matrix endpoint with >=2 declared
-    owners is AUTOMATICALLY cross-role probed (probe_cross_role_matrix): each
-    other role's own credentials are replayed against that owner's real object
-    id. Omitted/empty -> unchanged behaviour (matches the shared id_fill lens
-    `_compare_identities` already runs)."""
+    The matrix is keyed by principal (principal_keys), with each column's role
+    kept in EndpointAccess.principal_roles for trust decisions (X03).
+
+    `owned_object_ids` (P1.3, optional): {principal key -> {normalized_path:
+    object_id}} -- when the caller knows which real object id each principal
+    owns (e.g. "alice created ticket 101"), every object-scoped matrix endpoint
+    with >=2 declared owners is AUTOMATICALLY cross-role probed
+    (probe_cross_role_matrix): each other principal's own credentials are
+    replayed against that owner's real object id. Omitted/empty -> unchanged
+    behaviour (matches the shared id_fill lens `_compare_identities` already runs)."""
     result = RoleCrawlResult(base_url=base_url, roles=[r.role for r in roles])
+    keys = principal_keys(roles)
     if not roles:
         result.errors.append("no roles supplied")
         return result
@@ -659,10 +702,17 @@ async def crawl_roles(
                 probe_method, url, r.norm_headers(), timeout, run_context=run_context,
                 session_ref=session_refs[role_index] if session_refs is not None else None,
                 body=req_body, content_type=req_ctype)
-            access.by_role[r.role] = status
+            # One column per principal. A principal supplied under several
+            # credentials (renewal) keeps its first substantive response.
+            key = keys[role_index]
+            access.principal_roles[key] = r.role
+            already_reached = key in access.reachable_roles
+            if not already_reached:
+                access.by_role[key] = status
             substantive = map_._substantive(status, body)
+            if substantive and not already_reached:
+                access.reachable_roles.append(key)
             if substantive:
-                access.reachable_roles.append(r.role)
                 # Phase 0.1: retain the substantive 2xx as an analyzable exchange
                 # so full content-level review reaches it, AND (R05) so the
                 # request body/query the harness actually used to reach it
@@ -687,8 +737,8 @@ async def crawl_roles(
                     ).model_dump())
             # Record a body fingerprint for object-scoped endpoints so the SAME
             # object's response can be compared across identities below.
-            if access.object_scoped:
-                access.fingerprints[r.role] = {
+            if access.object_scoped and not already_reached:
+                access.fingerprints[key] = {
                     "len": len((body or "").strip()),
                     "hash": _body_fp(body) if substantive else None,
                 }
@@ -719,18 +769,19 @@ def _compare_identities(result: RoleCrawlResult, roles: list[RoleSession], id_fi
     scoping the object per-identity -- either it's a shared/public object or it's
     a broken object-level authorization (BOLA/IDOR). That distinction needs a
     human (is object {id} meant to be private?), so this ships as an unconfirmed,
-    moderate-confidence finding, not a confirmation."""
-    authed = {r.role for r in roles if _trust(r.role) > 0}
+    moderate-confidence finding, not a confirmation. Identities are principals
+    (principal_keys), so two same-role users are compared (X03)."""
+    authed = {key for key, r in zip(principal_keys(roles), roles) if _trust(r.role) > 0}
     for e in result.endpoints:
         if not e.object_scoped:
             continue
         by_hash: dict[str, list[str]] = {}
-        for role in e.reachable_roles:
-            if role not in authed:
+        for key in e.reachable_roles:
+            if key not in authed:
                 continue
-            h = e.fingerprints.get(role, {}).get("hash")
+            h = e.fingerprints.get(key, {}).get("hash")
             if h:
-                by_hash.setdefault(h, []).append(role)
+                by_hash.setdefault(h, []).append(key)
         for _hash, sharing in by_hash.items():
             distinct = sorted(set(sharing))
             if len(distinct) < 2:
@@ -758,7 +809,14 @@ def _compare_identities(result: RoleCrawlResult, roles: list[RoleSession], id_fi
 
 
 def _derive_candidates(result: RoleCrawlResult, roles: list[RoleSession]) -> None:
-    anon_roles = {r.role for r in roles if _trust(r.role) == 0}
+    # Matrix columns are principal keys; trust is read from each principal's role.
+    keys = principal_keys(roles)
+    key_roles = {key: r.role for key, r in zip(keys, roles)}
+
+    def trust(key: str) -> int:
+        return _trust(key_roles.get(key, key))
+
+    anon_roles = {key for key in keys if trust(key) == 0}
     for e in result.endpoints:
         reachable = set(e.reachable_roles)
         if not reachable:
@@ -777,9 +835,9 @@ def _derive_candidates(result: RoleCrawlResult, roles: list[RoleSession]) -> Non
             # Function-level authz gap: a lower-trust role reaches something a
             # strictly higher-trust role in this run does NOT -- the privilege
             # direction is inverted from what RBAC would produce.
-            reached_trust = min(_trust(x) for x in reachable)
-            higher_absent = sorted(r.role for r in roles
-                                   if r.role not in reachable and _trust(r.role) > reached_trust)
+            reached_trust = min(trust(x) for x in reachable)
+            higher_absent = sorted({key for key in keys
+                                    if key not in reachable and trust(key) > reached_trust})
             if higher_absent and reached_trust > 0:
                 result.auth_bypass_candidates.append({
                     "path": e.path, "method": e.method, "reached_by": sorted(reachable),
@@ -792,7 +850,7 @@ def _derive_candidates(result: RoleCrawlResult, roles: list[RoleSession]) -> Non
 
         # IDOR/BOLA: an object-scoped endpoint reachable by >=1 authenticated
         # identity -- the target for a same-object cross-identity comparison.
-        authed_reach = sorted(x for x in reachable if _trust(x) > 0)
+        authed_reach = sorted(x for x in reachable if trust(x) > 0)
         if e.object_scoped and authed_reach:
             result.idor_candidates.append({
                 "path": e.path, "method": e.method, "reached_by": authed_reach,

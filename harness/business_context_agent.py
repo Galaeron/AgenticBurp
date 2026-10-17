@@ -247,7 +247,12 @@ class BusinessContextAgent:
             path = _acc(ep, "path", "/")
             template = _acc(ep, "template", None)
             names = _template_param_names(template)
-            _merge(method, path, names, _acc(ep, "object_scoped", False), _acc(ep, "reachable_roles", []))
+            # The semantic model reasons about ROLES; the access matrix is keyed
+            # by principal (X03), so project each reaching principal to its role.
+            access_roles = _acc(ep, "access_roles", None) or {}
+            reach = list(dict.fromkeys(access_roles.get(r) or r
+                                       for r in (_acc(ep, "reachable_roles", []) or [])))
+            _merge(method, path, names, _acc(ep, "object_scoped", False), reach)
 
         # Captured exchanges: run each through feature_projection so ONLY names/
         # shape survive (values/ids/bodies are dropped there), then fold the

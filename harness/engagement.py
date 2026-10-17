@@ -117,8 +117,8 @@ class SurfaceEndpoint:
     path_tier: str | None = None      # PathScorer tier (from Burp)
     llm_priority: str | None = None   # surface_prioritizer ai_priority
     llm_score: float | None = None    # surface_prioritizer ai_score 0..1
-    access: dict = field(default_factory=dict)          # role -> status
-    reachable_roles: list = field(default_factory=list)  # substantive 2xx
+    access: dict = field(default_factory=dict)          # principal key -> status
+    reachable_roles: list = field(default_factory=list)  # principal keys with substantive 2xx
     object_scoped: bool = False
     findings: list = field(default_factory=list)         # [{class, severity, confidence, confirmed}]
     status: str = "discovered"        # discovered | analyzed | validated
@@ -134,10 +134,16 @@ class SurfaceEndpoint:
     # negative control). Never a confirmation; only re-ranking.
     business_score: float | None = None
     business_reasons: list = field(default_factory=list)
+    # X03: access-matrix columns are principals (role_crawl.principal_keys);
+    # this maps each column to its role label, the attribute trust reads.
+    access_roles: dict = field(default_factory=dict)
 
     @property
     def key(self) -> str:
         return f"{self.method.upper()} {self.path}"
+
+    def role_of(self, principal: str) -> str:
+        return self.access_roles.get(principal) or principal
 
     def is_malformed_or_encoded(self) -> bool:
         """A discovery artifact (residual percent-encoding), not a distinct
@@ -251,11 +257,13 @@ class SurfaceEndpoint:
             reasons.append(f"path tier {self.path_tier}")
 
         # Access-matrix anomalies -- the highest-signal cross-source insight.
-        low_trust_reaches = any(r.lower() in ("anonymous", "user") for r in self.reachable_roles)
+        low_trust_reaches = any(self.role_of(r).lower() in ("anonymous", "user")
+                                for r in self.reachable_roles)
         if low_trust_reaches and _looks_privileged(self.path):
             score += 0.7
             reasons.append("low-trust role reaches a privileged-looking path (authz gap)")
-        if self.object_scoped and any(r.lower() not in ("anonymous",) for r in self.reachable_roles):
+        if self.object_scoped and any(self.role_of(r).lower() not in ("anonymous",)
+                                      for r in self.reachable_roles):
             score += 0.3
             reasons.append("object-scoped endpoint reachable by an identity (IDOR candidate)")
         if _looks_privileged(self.path) and not self.findings and not self.reachable_roles:
@@ -306,6 +314,7 @@ class SurfaceEndpoint:
             "method": self.method, "path": self.path, "status": self.status,
             "path_tier": self.path_tier, "llm_priority": self.llm_priority, "llm_score": self.llm_score,
             "access": self.access, "reachable_roles": self.reachable_roles,
+            "access_roles": self.access_roles,
             "object_scoped": self.object_scoped, "findings": self.findings,
             "template": self.template,
             "score": s, "reasons": reasons,
@@ -332,6 +341,7 @@ class SurfaceEndpoint:
             status=d.get("status", "discovered"), template=d.get("template"),
             business_score=d.get("business_score"),
             business_reasons=d.get("business_reasons", []) or [],
+            access_roles=d.get("access_roles", {}) or {},
         )
 
 
@@ -530,6 +540,8 @@ class EngagementState:
             for r in ep.reachable_roles or []:
                 if r not in mine.reachable_roles:
                     mine.reachable_roles.append(r)
+            for principal, role in (ep.access_roles or {}).items():
+                mine.access_roles.setdefault(principal, role)
             if ep.template and not mine.template:
                 mine.template = ep.template
             # a proven endpoint status propagates upward, never downward
@@ -548,6 +560,7 @@ class EngagementState:
             ep = self._ep(e.get("method", "GET"), normalize_path(e.get("path", "/")))
             ep.access = e.get("by_role", {}) or {}
             ep.reachable_roles = e.get("reachable_roles", []) or []
+            ep.access_roles = e.get("principal_roles", {}) or {}
             ep.object_scoped = bool(e.get("object_scoped", False))
             n += 1
         for f in result.get("idor_findings", []) or []:
