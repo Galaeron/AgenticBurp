@@ -272,5 +272,137 @@ class EngagementBuilderPrincipalTests(unittest.TestCase):
                       "worklist probed the object as no authenticated principal")
 
 
+
+class _RecordedLeg:
+    status = "not_confirmed"
+    summary = ""
+    confidence = None
+    evidence = ""
+    validator = "stub"
+
+
+class CoverageIdentityByPrincipalTests(unittest.TestCase):
+    """Coverage reachability follows the principal's matrix column (X03 review):
+    a principal NAMED "user" reaching an endpoint must not make another principal
+    whose ROLE is "user" count as reaching it."""
+
+    def setUp(self):
+        global_throttle.configure(0)
+
+    def _drive(self, roles, *, denied):
+        from harness import coverage_tracker
+        state, _ = _build(roles, denied=denied)
+        driven = []
+
+        async def run_leg(identity, method, path, check):
+            driven.append((identity, method, path))
+            return _RecordedLeg()
+
+        asyncio.run(coverage_tracker.build_coverage_driven(state, roles, run_leg, budget=500))
+        return state, driven
+
+    def test_denied_principal_gets_no_legs_when_a_principal_is_named_like_its_role(self):
+        roles = [_anon(),
+                 RoleSession("user", {"Authorization": "Bearer usr"}, name="user"),
+                 RoleSession("user", {"Authorization": "Bearer bob"}, name="bob")]
+        state, driven = self._drive(roles, denied=("bob",))
+        ep = state.endpoints[f"GET {_ORDERS}"]
+        self.assertEqual(ep.reachable_roles, ["user"], "precondition: only the principal 'user' reached")
+        self.assertEqual(ep.access.get("bob"), 403)
+        bob_legs = [d for d in driven if d[0] == "bob" and d[2] == _ORDERS]
+        self.assertEqual(bob_legs, [], f"{len(bob_legs)} leg(s) scheduled as the denied principal bob")
+        self.assertTrue([d for d in driven if d[0] == "user" and d[2] == _ORDERS],
+                        "the reaching principal 'user' got no legs (control)")
+
+    def test_jwt_leg_identity_follows_the_principal_column(self):
+        from harness.orchestrator_helpers import _jwt_identity
+        jwt = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln"
+        # bob first: a role-label fallback would pick bob for the column "user".
+        roles = [RoleSession("user", {"Authorization": jwt + "b"}, name="bob"),
+                 RoleSession("user", {"Authorization": jwt + "u"}, name="user")]
+        self.assertEqual(_jwt_identity({"reachable_roles": ["bob"]}, roles).name, "bob")
+        self.assertEqual(_jwt_identity({"reachable_roles": ["user"]}, roles).name, "user")
+
+    def test_legacy_role_keyed_matrix_still_matches_by_role(self):
+        # A matrix whose columns are role labels (built before X03, or a stub)
+        # names none of this run's principal columns: fall back to the role.
+        from harness import coverage_tracker
+        from harness.engagement import EngagementState
+        st = EngagementState(host="shop.test")
+        ep = st._ep("GET", _ORDERS)
+        ep.reachable_roles = ["user"]
+        ep.object_scoped = True
+        roles = [RoleSession("user", {"Authorization": "Bearer A"}, name="alice"),
+                 RoleSession("user", {"Authorization": "Bearer B"}, name="bob")]
+        driven = []
+
+        async def run_leg(identity, method, path, check):
+            driven.append(identity)
+            return _RecordedLeg()
+
+        asyncio.run(coverage_tracker.build_coverage_driven(st, roles, run_leg, budget=500))
+        self.assertIn("alice", driven)
+        self.assertIn("bob", driven)
+
+
+class RoleCrawlApiKeepsPrincipalNamesTests(unittest.TestCase):
+    """The API role inputs carry the principal name through to the matrix (X03
+    review): renewed credentials of one named principal stay one column."""
+
+    _RENEWED = [{"role": "anonymous", "headers": {}},
+                {"role": "user", "name": "alice", "headers": {"Authorization": "Bearer alice-old"}},
+                {"role": "user", "name": "alice", "headers": {"Authorization": "Bearer alice-new"}}]
+
+    def setUp(self):
+        global_throttle.configure(0)
+        import harness.server as server_module
+        from fastapi.testclient import TestClient
+        self.server_module = server_module
+        self._prev_hosts = server_module.orchestrator.allowed_hosts
+        server_module.orchestrator.allowed_hosts = _HOSTS
+        self._prev_active = server_module.orchestrator.validator_registry.active_enabled
+        server_module.orchestrator.validator_registry.set_active_enabled(True)
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
+
+    def tearDown(self):
+        self.server_module.orchestrator.validator_registry.set_active_enabled(self._prev_active)
+        self.server_module.orchestrator.allowed_hosts = self._prev_hosts
+
+    def _post(self, path, roles, **extra):
+        sent: list = []
+        with patch("harness.crawler.crawl", _fake_crawl()), \
+             patch("harness.role_crawl._probe", _fake_probe(sent)), \
+             patch("harness.server._update_engagement", lambda host, fn: None), \
+             patch("harness.store.load_engagement", lambda host: None):
+            resp = self.client.post(path, json={"base_url": _BASE, "roles": roles, **extra})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp.json()
+
+    @staticmethod
+    def _orders_row(crawl):
+        return next(e for e in crawl["endpoints"] if e["path"] == _ORDERS)
+
+    def test_crawl_roles_keeps_a_renewed_principal_as_one_column(self):
+        body = self._post("/crawl-roles", self._RENEWED, register_identities=False)
+        row = self._orders_row(body)
+        self.assertEqual(sorted(row["by_role"]), ["alice", "anonymous"])
+        self.assertEqual(row["principal_roles"]["alice"], "user")
+        self.assertEqual(body["idor_findings"], [],
+                         "one principal's two credentials were compared as two identities")
+
+    def test_crawl_roles_keeps_named_same_role_principals_distinct(self):
+        roles = [{"role": "anonymous", "headers": {}},
+                 {"role": "user", "name": "alice", "headers": {"Authorization": "Bearer alice"}},
+                 {"role": "user", "name": "bob", "headers": {"Authorization": "Bearer bob"}}]
+        body = self._post("/crawl-roles", roles, register_identities=False)
+        self.assertEqual(sorted(self._orders_row(body)["by_role"]), ["alice", "anonymous", "bob"])
+        self.assertEqual(len(body["idor_findings"]), 1)
+
+    def test_engagement_advance_keeps_a_renewed_principal_as_one_column(self):
+        body = self._post("/engagement/shop.test/advance", self._RENEWED)
+        self.assertEqual(sorted(self._orders_row(body["crawl"])["by_role"]), ["alice", "anonymous"])
+
+
 if __name__ == "__main__":
     unittest.main()
