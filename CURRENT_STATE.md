@@ -1,62 +1,63 @@
-# Current state — 2026-10-17
+# Current state — 2026-10-17 (evening)
 
 ## Checkout
-- Branch `reconciliation-backlog`; base `474ad511`. Pushed tip `64e09ed6` (ARCH-3
-  hardening) is the head of [Galaeron/AgenticBurp#1](https://github.com/Galaeron/AgenticBurp/pull/1).
-- There are two local commits on top, NOT pushed: `ba080691` (SPA/catch-all discovery
-  fixes = the I01 candidate) and the I01 docs commit after it (HEAD).
-- Other uncommitted work (W1 cache trust, W2 passive ownership/export, W3 health
-  contract, W4 label routing, docs) is left in place and dispositioned, not reverted.
-- Safe `harness/config.yaml` is unchanged. The checkout has 13 git worktrees; several
-  belong to other agents.
-- Earlier discovery-fix evidence (2026-10-16 full run on the mixed tree, mutation log):
-  `.test-work/discovery-fixes-*.log`. Historical context: docs/PROJECT_HANDOVER_2026-10-15.md.
+- Branch `reconciliation-backlog`; base `474ad511`; head of
+  [Galaeron/AgenticBurp#1](https://github.com/Galaeron/AgenticBurp/pull/1) after today's push.
+  Auto-fix is on for PR #1.
+- Today's commits (oldest first): `ba080691` discovery fixes (I01 candidate), `1715022a`
+  I01 docs, `1be5ed04` 16 regression modules, `2a883761` I03 transport, `fe9b8f3` I04 CSRF,
+  `9adfa8a` I11, `d5802ec` I09 caller tests, `b9bcd18` gate: two writes for the
+  second-order pair, `a9b71f6` CSRF manual-check guidance, `6d10816` docs, `5506ee4` CI fix
+  (two W2-dependent tests untracked again; Python 3.14-valid TLS fixtures; short-path
+  compare), then a docs commit.
+- The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
+  as evidence only.
+- Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
+  trust, W2 passive ownership/export, W3 health, W4 label routing, docs and untracked tests.
+- Safe `harness/config.yaml` is unchanged. Another session's worktree
+  `.claude/worktrees/objective-shannon-457fc8` exists; do not touch it.
+- Implementation manual: docs/I01_I17_IMPLEMENTATION_GUIDE_2026-10-17.md (track
+  implemented / caller-verified / live-validated / released separately).
 
-## I01 candidate = commit `ba080691`
-- `64e09ed6` + `.test-work/i01-candidate-overlay.patch` (12 files: discovery, crawler,
-  role crawl, engagement builder, chain wiring, browser driver, tests, SPA doc; only the
-  investigate hunks of `server.py`). The commit's diff from `64e09ed6` is byte-identical
-  to the patch.
-- Manifest, file dispositions, reproduce steps and canonical owner table:
-  docs/I01_CANDIDATE_MANIFEST_2026-10-17.md.
-- Isolated detached worktree, `.venv-rationalisation` Python 3.12.14, safe defaults:
-  precondition 74 OK; smoke 93 OK + coverage gate; full exit 0 (3164 harness, 0 skips;
-  38 pytest; 308 evaluation with 17 skips for absent local benchmark artifacts; 42
-  integrity; 36 requirement-evidence gaps). Logs: `.test-work/i01-candidate-*.log`.
-- The older 3459/371 counts came from the mixed tree, including untracked tests; they
-  describe no committed or committable state.
-- PR #1 CI at `64e09ed6` (base only, clean checkout): full Python suite + coverage gate,
-  Java build + tests and provenance all pass; GPU/nightly scored tiers skipped.
+## What changed today (offline; owned loopback fixtures only)
+- I03: engagement legs now all spend the owning run (budget, scope, cancellation, TLS);
+  the browser honours run cancellation. The second-order SQLi pair gets 2 writes per case
+  (`DEFAULT_MUTATING_CEILING_BY_CHECK`). See docs/ARCH_RECONCILIATION_TRACKING.md.
+- I04: the unsound CSRF confirmation is retired. On real targets CSRF is manual-check only
+  (LB-5 PoC is self-test only). Unconfirmed cookie-auth candidates show as low-severity
+  "NEEDS MANUAL CHECK" items whose next step holds copy-ready steps and a test form.
+- I09: caller evidence for label-free body-SQLi and cookie-JWT dispatch; DET-JWT-SCOPE filed.
+- I11: LB-FLAKE closed; audit-log file leak fixed; 36 gaps classified in
+  docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md.
+- Handoffs: `.test-work/{i03-transport,i04-csrf,i09-dispatch,i11-hygiene}-20261017-1731/HANDOFF.md`.
 
-## Reconciled trackers (I01)
-- docs/ARCH_RECONCILIATION_TRACKING.md: ARCH-1/2 tests are helper-level, so caller
-  verification is open (I03). The false-confirmation test mocks persistence and the
-  oracle, so storage/export is open (I02). Records the `64e09ed6` hardening.
-- IMPROVEMENT_BACKLOG.md: LB-2 is component-only (rest → I06/I07). DET-SQLI-POST and
-  DET-JWT-DETECT have stale diagnoses and are re-scoped to I09. DET-SSRF → I13. A pointer
-  to the owner table sits at the top of the backlog.
-- W4 (`validators/base.py` spaced-label routing) has no ticket; I09 now owns it.
-- 18 untracked test modules pass against the candidate alone. That is regression coverage
-  missing from Git, which CI never runs. Another 10 pass only with the W1–W3 WIP. The manifest
-  lists both groups.
-- W2 changes the default `/analyze` partition to `analyze:<uuid>`, reversing the
-  2026-10-09 operator-visibility choice. This needs an owner decision before commit.
+## Verification
+- Verify in the in-repo worktree `.test-work/wt-verify`. Windows Defender deletes
+  `file_upload_agent.py` / `FileUploadLogic.java` from worktrees under %TEMP%. Block the
+  venv's editable-install leak (it imports modules missing from a worktree from the main
+  checkout) with an untracked `sitecustomize.py` there plus `PYTHONPATH=<worktree>`.
+- CI runs Python 3.14. Last verified state (`5506ee4`): on both system Python 3.14.7 and venv
+  3.12.14, smoke 93 OK and full exit 0 (3325 harness, 38 pytest, 312 evaluation with 17
+  artifact-absence skips, 42 integrity). Logs: `.test-work/cifix-*.log`. The coverage gate still
+  reports 36 gaps.
+
+## Owner decisions (2026-10-17)
+- `/analyze` grouping: one shared pile per site by default; `engagement_id` = optional named
+  pile. The W2 `analyze:<uuid>` server hunk is rejected (do not commit it). A Burp field for the
+  named pile is I16 work.
 
 ## Open work and evidence boundaries
-- Ordered list: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Next: I02/I03/I04 and I11.
-- Assessment: reviews/2026-10-17-project-assessment/ASSESSMENT.md.
-- The live Part B crAPI experiment has not been run. Historical negative crAPI results
-  still govern efficacy, and offline tests do not establish recall.
-- Browser capture covers page-load traffic only: no login or click-through.
-  Catch-all fingerprinting is conservative and can suppress or miss routes.
-- Priority-5 release work and live Burp validation remain open. The Java CI pass covers
-  committed Java only, not the W2/W3 Java edits.
-- Remediation register and release gates: docs/RECONCILED_REMEDIATION_REGISTER.json and
-  docs/REMEDIATION_RELEASE_GATES.md (both untracked; W2 docs).
+- Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I02, I03, I04, I09, I11.
+  I02 batch B (default history) is fixed. Next: I02 batches A/C, I05 (plain-client validators,
+  process containment), I11
+  socket trace and evidence wiring; I04 storage/export label check with I02.
+- The live Part B crAPI experiment has not been run. Historical negative crAPI results still
+  govern efficacy, and offline tests do not establish recall.
+- Browser capture covers page-load traffic only; catch-all filtering is conservative.
+- Priority-5 release, live Burp validation and the W2/W3 Java edits remain unverified.
 
 ## Working rules
-- Follow AGENTS.md; never read answer keys or blind target implementations.
-- Preserve prior edits and artifacts; live toggles belong in ignored local config.
-- Verify from an isolated worktree, never from this mixed working copy.
-- Run smoke/full/precondition after code changes. No offline tier establishes current
-  model accuracy, blind recall or production readiness.
+- Follow AGENTS.md and the implementation guide; never read answer keys, blind labels or
+  blind-target implementations.
+- Preserve prior edits; live toggles belong in ignored local config; never `git add -A`.
+- Verify in an isolated worktree inside the repo; record exact source identity.

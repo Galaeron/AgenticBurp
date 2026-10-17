@@ -275,6 +275,10 @@ def is_cancelled(cancel) -> bool:
         return cancel.is_set()
     if callable(cancel):
         return bool(cancel())
+    # I03: run_context.CancelToken (what validators and engagement discovery
+    # pass) is neither an Event nor callable; it used to read as never cancelled.
+    if hasattr(cancel, "cancelled"):
+        return bool(cancel.cancelled)
     return False
 
 

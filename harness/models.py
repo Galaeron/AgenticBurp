@@ -114,6 +114,9 @@ class Finding(BaseModel):
     verification_state: str = "candidate"
     oracle_capsule_id: str = ""
     oracle_reason: str = ""
+    # I04: harness-owned guidance for a candidate that needs a manual check
+    # (copy-ready steps). Not confirmation; agents can never set it.
+    manual_verification: str = ""
 
     @computed_field
     @property
@@ -149,6 +152,7 @@ AGENT_AUTHORITY_FIELDS = frozenset({
     "original_confidence", "original_severity", "original_vulnerability_class",
     "shape_inconsistent", "confirmed_by_leg",
     "oracle_verified", "verification_state", "oracle_capsule_id", "oracle_reason",
+    "manual_verification",
 })
 
 
@@ -282,6 +286,8 @@ class ValidationReport(BaseModel):
     # treat it as a refutation. Empty = legacy validator (not_confirmed is a
     # negative); "control_held" = genuine held control.
     control_outcome: str = ""
+    # I04: manual-check guidance carried from ValidationResult (empty if none).
+    manual_verification: str = ""
 
 
 class StageOutcome(BaseModel):

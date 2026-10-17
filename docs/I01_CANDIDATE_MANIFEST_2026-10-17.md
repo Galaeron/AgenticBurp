@@ -91,12 +91,12 @@ The groups are uncommitted work that each needs its own reviewed, focused commit
 | **W4 label routing** | `validators/base.py` (`_snake_label`: spaced agent labels such as "Verbose Error" reach snake_case validator classes); `test_validator_routing.py`. **No backlog ticket tracks this work.** | I09 |
 | **Docs** | `README.md`, `docs/README.md`, `docs/TESTING.md`, `docs/USER_MANUAL.md` point to the untracked remediation-loop docs; commit them together. `COMPETITIVE_LANDSCAPE.md` points to the untracked 2026-10-09 comparison. `CURRENT_STATE.md` is the handover. `IMPROVEMENT_BACKLOG.md` holds the pre-existing DET deferrals and observed-ID note plus these I01 notes. `docs/ARCH_RECONCILIATION_TRACKING.md` holds the I01 test-boundary split. | I01 |
 
-**Design decision embedded in W2:** the `server.py` analyze hunk replaces the
-host-only partition with `analyze:<uuid>` when no `engagement_id` is supplied. Each
-standalone `/analyze` call then lands in its own partition, and Burp must reuse the
-returned `engagement_id` to share a report. This reverses the 2026-10-09 resolution toward
-operator visibility (`engagement_id or ""`). It needs an explicit owner decision before W2 is
-committed.
+**W2 grouping — owner decision 2026-10-17:** keep ONE shared pile per site by default (the
+host-wide partition, today's behaviour). An explicit `engagement_id` is an optional named pile
+for separation. The uncommitted W2 `server.py` hunk that defaulted `/analyze` to a fresh
+`analyze:<uuid>` partition is therefore REJECTED: exclude it when W2 is split into commits.
+Within a pile, the captured principal still isolates history (I02 batch B). A Burp field to
+set the optional named pile belongs to I16.
 
 ### Untracked files
 
@@ -145,8 +145,13 @@ mapping given in the plan.
   DET-SQLI-POST, DET-JWT-DETECT).
 - The candidate is committed as `ba080691` and not pushed; this document follows in its own
   docs commit.
-- Not done: the 18 untracked tests of committed code are still not in Git. W1–W4 still
-  need their own reviewed commits, and W2 needs the partition decision first. Untracked
+- 16 of the 18 tests of committed code were committed in `1be5ed04`. CI (Python 3.14, clean
+  checkout) then showed that `test_data_lifecycle_callers` and `test_unverified_priority_consistency`
+  import the uncommitted `test_pairing_contract`. They are untracked again, so 14 remain committed.
+  `test_captured_shapes_passive` and `test_data_maintenance` also stay with W2. Local runs had
+  missed this because the venv's editable install resolves modules missing from a worktree from
+  the main checkout. Leak-free runs now block that finder (see CURRENT_STATE).
+- Not done: W1–W4 still need their own reviewed commits, and W2 needs the partition decision first. Untracked
   tests were classified by running each module on its own:
   `.test-work/i01-untracked-tests-vs-candidate.log` and
   `.test-work/i01-wip-dependent-tests-mixed-tree.log`. The 36 coverage-evidence gaps are not

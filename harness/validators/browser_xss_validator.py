@@ -134,7 +134,9 @@ class BrowserXssValidator(Validator):
         # entirely otherwise, so a standalone/no-context caller (and every
         # fake driver in the test suite, which doesn't accept these kwargs)
         # sees byte-identical behavior to before this wiring existed.
-        rc = self.run_context
+        # I03: fall back to the enclosing run when this instance was not bound.
+        from harness.run_context import current_run_context
+        rc = self.run_context or current_run_context()
         visit_kw = (dict(scope=rc.scope, gate=rc.gate, budget=rc.budget, cancel=rc.cancel)
                     if rc is not None else {})
         for url in urls:

@@ -24,6 +24,9 @@ class ValidationResult:
     # trailing + defaulted so all existing positional/keyword construction
     # of ValidationResult stays valid.
     control_outcome: str = ""
+    # I04: operator guidance when a check cannot confirm automatically but the
+    # shape stays worth a human look (e.g. CSRF). Never confirmation authority.
+    manual_verification: str = ""
 
 
 class Validator(ABC):

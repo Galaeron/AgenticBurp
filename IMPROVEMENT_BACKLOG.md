@@ -4151,7 +4151,7 @@ firing autonomously end-to-end "during real engagements".
   for A, a negative control that the guard does not swallow a real non-GET method); `full`'s unittest
   stage drops those failures; no `config.yaml` change. **Source:** 2026-10-01 LB-1 review.
 
-### [ ] LB-FLAKE — Freeze the clock in the blind-eval report-equivalence test
+### [x] LB-FLAKE — Freeze the clock in the blind-eval report-equivalence test
 - **Domain:** Test hygiene (flake) · **Effort:** S · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED):** `testing/test_blind_eval_harness.py::ExchangeProvenanceAttributionAR3Tests`
   `test_no_duplicates_corpus_scoring_unchanged_from_pair_based_path` compares two generated report
@@ -4167,8 +4167,12 @@ firing autonomously end-to-end "during real engagements".
   and passes deterministically across a minute boundary; a control proves a genuine content
   difference still fails the assertion; `full`'s testing stage is green on repeat runs.
 - **Source:** 2026-10-03 LB-2 full run.
+- **Closed 2026-10-17 (I11):** the flaky test passes a fixed `generated_at` (committed), and
+  `testing/test_remediation_report_clock.py` adds the controls: the injected clock stays equal
+  across a minute boundary, the default clock still changes, and a real content difference
+  stays visible with a fixed clock. All four pass against committed code.
 
-### [ ] LB-CSRF-REPLAY — Review/gate the ungated non-browser "method-dependent CSRF token bypass"
+### [x] LB-CSRF-REPLAY — Review/gate the ungated non-browser "method-dependent CSRF token bypass"
 - **Domain:** Validator soundness · **Effort:** S-M · **Depends on:** none · **Mode:** LOOP (offline)
 - **Evidence (VERIFIED, surfaced by the LB-5 review):** `harness/validators/csrf_validator.py`
   (uncommitted WIP, NOT part of LB-5's committed artifact) carries a second, UNGATED, non-browser
@@ -4194,6 +4198,17 @@ firing autonomously end-to-end "during real engagements".
   default-OFF flag is on; the branch (if kept) confirms only on an independent readback + fresh
   sentinel and a reflecting-endpoint negative control stays `not_confirmed`; caller-level test;
   `full` green. **Source:** 2026-10-05 LB-5 review.
+- **Closed 2026-10-17 (I04):** reproduced first. With the victim cookie registered as a run
+  session, a loopback target that only echoes its query string got CSRF `confirmed` at 0.95,
+  even with mutating replay off, because the write was replayed as a GET. The branch and
+  `_method_bypass_url` are retired. Flag-off behaviour is back to the 0.4 observation. The LB-5
+  browser PoC is the only remaining confirm path, but production callers do not enable it
+  (only the leg self-test does), so on real targets CSRF is manual-verification only. Owner
+  follow-up: unconfirmed cookie-authenticated CSRF candidates are reported as low-severity
+  "NEEDS MANUAL CHECK" items whose next step holds copy-ready steps and a click-to-submit test
+  form (tokens omitted, secrets replaced). Controls:
+  `harness/test_csrf_reflection_control.py` (reflection never confirms; with mutation off,
+  nothing is sent). `test_deferred_legs` was updated; the LB-5 PoC tests still pass.
 
 ## Deterministic-check deferrals — 2026-10-15 (Part A split-outs)
 
@@ -4205,7 +4220,7 @@ separate questions"). Each validator already EXISTS and is dispatched in
 triggering / live soundness, not missing code. They map to
 `docs/DETERMINISTIC_FIRST_IMPLEMENTATION_CHECKLIST.md` Batch 5.
 
-### [ ] DET-SQLI-POST — Confirm POST/body-shaped SQLi reaches the SQLi confirmation leg
+### [x] DET-SQLI-POST — Confirm POST/body-shaped SQLi reaches the SQLi confirmation leg
 - **Domain:** Deterministic-first coverage · **Effort:** S-M · **Depends on:** none ·
   **Mode:** LOOP (offline shape/caller test); the full sqlmap path stays OWNER/LIVE (Docker image, no host install).
 - **Evidence (VERIFIED):** `SqlmapValidator` (`harness/validators/sqlmap.py`) already
@@ -4229,8 +4244,14 @@ triggering / live soundness, not missing code. They map to
   JSON/form body parameter. Still unproven: that a body-only captured request reaches `SqlmapValidator`
   through the real `_confirm` caller with the BODY parameter targeted, together with the empty-body
   negative control. **Canonical owner → I09.**
+- **Closed 2026-10-17 (I09):** `harness/test_det_shape_dispatch_callers.py` drives
+  `investigate_engagement` with a captured body-only JSON POST and a silent model. sqlmap is
+  invoked with `--data` equal to the captured body and no query rewrite; an empty-body capture
+  dispatches nothing. Two label-free routes exist (graph precondition and analyze-path
+  precondition), and removing both makes the positive case fail. This proves dispatch and
+  targeting, not sqlmap efficacy (I13).
 
-### [ ] DET-JWT-DETECT — Trigger the JWT forge leg deterministically from a JWT-bearing request
+### [x] DET-JWT-DETECT — Trigger the JWT forge leg deterministically from a JWT-bearing request
 - **Domain:** Deterministic-first coverage · **Effort:** S-M · **Depends on:** none ·
   **Mode:** LOOP (offline shape/caller test) + OWNER/LIVE confirm.
 - **Evidence (VERIFIED):** the confirmation leg is sound-by-design — `JwtForgeValidator`
@@ -4253,6 +4274,21 @@ triggering / live soundness, not missing code. They map to
   single captured-exchange path (`shape_precondition_findings` has no jwt leg), and a JWT that
   appears only in the captured request rather than in a supplied role. Re-scope to those cases only.
   **Canonical owner → I09.**
+- **Closed for the supported scope 2026-10-17 (I09):** a GET node reachable by a role whose
+  session COOKIE carries a JWT reaches the forge leg with no model label, and an opaque cookie
+  does not (`harness/test_det_shape_dispatch_callers.py`). The Authorization-header case was
+  already covered by `test_smoke_investigate`. The uncovered cases are re-filed as DET-JWT-SCOPE.
+
+### [ ] DET-JWT-SCOPE — JWT forge dispatch beyond role-carried JWTs on GET
+- **Domain:** Deterministic-first coverage · **Effort:** S-M · **Depends on:** DET-JWT-DETECT ·
+  **Mode:** LOOP (offline caller test). **Canonical owner → I09.**
+- **Uncovered (source, HEAD after I09):** (1) non-GET methods: `shape_precondition_legs` adds `jwt`
+  only for GET, and a forged token on a mutating request needs the mutating-replay opt-in;
+  (2) the analyze() path: `shape_precondition_findings` has no jwt leg; (3) a JWT present only in
+  the captured request, not in a supplied role.
+- **Acceptance criteria:** decide per case whether it is in scope. Each in-scope case dispatches
+  with no model label through the real caller, with a non-JWT negative control. Out-of-scope
+  cases are documented as such.
 
 ### [ ] DET-SSRF — Resolve SSRF collaborator reachability for live confirmation
 - **Domain:** Deterministic-first validator soundness · **Effort:** M · **Depends on:** an

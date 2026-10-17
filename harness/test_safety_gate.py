@@ -623,6 +623,44 @@ class PerFindingMutationCeilingTests(unittest.TestCase):
                    for _ in range(4)]
         self.assertEqual(allowed, [True, True, True, False])
 
+    def test_second_order_plant_gets_two_writes_per_case_by_default(self):
+        # Owner-approved 2026-10-17: the second-order SQLi pair needs a TRUE and a
+        # FALSE plant under one case reference; a third write is still refused.
+        gate = self._gate(ceiling=1)
+        allowed = [gate.authorize(validator_name="second_order_plant", method="POST",
+                                  url="https://x.example/a", finding_id="case").allowed
+                   for _ in range(3)]
+        self.assertEqual(allowed, [True, True, False])
+
+    def test_other_checks_keep_the_global_ceiling(self):
+        gate = self._gate(ceiling=1)
+        allowed = [gate.authorize(validator_name="second_order_read", method="POST",
+                                  url="https://x.example/a", finding_id="case").allowed
+                   for _ in range(2)]
+        self.assertEqual(allowed, [True, False])
+
+    def test_operator_can_lower_a_per_check_allowance(self):
+        cfg = SafetyGateConfig.from_dict({"active_enabled": True, "allow_mutating_replay": True,
+                                          "allowed_hosts": ["x.example"],
+                                          "mutating_ceiling_by_check": {"second_order_plant": 1}})
+        gate = SafetyGate(cfg)
+        allowed = [gate.authorize(validator_name="second_order_plant", method="POST",
+                                  url="https://x.example/a", finding_id="case").allowed
+                   for _ in range(2)]
+        self.assertEqual(allowed, [True, False])
+
+    def test_per_check_allowance_is_capped_by_the_hard_ceiling(self):
+        from harness.safety_gate import HARD_MAX_MUTATING_REQUESTS_PER_FINDING
+        cfg = SafetyGateConfig.from_dict({"active_enabled": True, "allow_mutating_replay": True,
+                                          "mutating_ceiling_by_check": {"second_order_plant": 10_000}})
+        self.assertEqual(SafetyGate(cfg)._mutating_ceiling("second_order_plant"),
+                         HARD_MAX_MUTATING_REQUESTS_PER_FINDING)
+
+    def test_per_check_allowance_still_needs_mutating_replay(self):
+        gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=False))
+        self.assertFalse(gate.authorize(validator_name="second_order_plant", method="POST",
+                                        url="https://x.example/a", finding_id="case").allowed)
+
     def test_no_finding_id_is_not_counted_backcompat(self):
         # Existing callers that pass no finding_id keep the old behaviour.
         gate = self._gate(ceiling=1)

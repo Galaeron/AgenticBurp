@@ -29,8 +29,11 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
 - **Status 2026-10-17:** the candidate is frozen and reproduces precondition, smoke and full
   in isolation; dispositions and canonical owners are recorded in
   [the I01 manifest](I01_CANDIDATE_MANIFEST_2026-10-17.md). The candidate is committed as
-  `ba080691`, local and not pushed. Remaining: commit the 18 untracked tests of committed
-  code, and split W1–W4 into reviewed commits (W2 needs an owner decision first).
+  `ba080691` (pushed with PR #1). Of the 18 untracked tests that pass alone, 14 are committed.
+  The other four import W-dependent test modules and stay with W2: `test_captured_shapes_passive`,
+  `test_data_maintenance`, `test_data_lifecycle_callers` and
+  `test_unverified_priority_consistency`. The last two were found by CI and untracked again. Remaining: split W1–W4 into reviewed commits (W2 needs an owner
+  decision first).
 - **Type:** integration / bookkeeping. **Depends on:** none.
 - Inventory tracked and untracked files required by the current fixes. Record a
   complete candidate manifest, including resources, dependencies and test fixtures.
@@ -41,7 +44,17 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   file has a disposition and every open item has one canonical owner/ticket.
 - **Maps to:** R01/R28, ARCH follow-ups, backlog status drift.
 
-### [ ] I02 — Bind confirmation evidence through storage and exports
+### [~] I02 — Bind confirmation evidence through storage and exports
+- **Status 2026-10-17 — batch B (default history) done:** owner decision: one shared pile per
+  site by default, `engagement_id` = optional named pile. Reproduced the audit's defect on
+  committed code. The writer stored an empty captured principal in the default pile while the
+  reader filtered by the computed one, so a later analysis never saw earlier findings. Fixed in
+  `store.persist_findings` (principal always recorded; default-pile fingerprint unchanged).
+  `harness/test_default_history_caller.py` drives `analyze()` twice with real storage: same
+  identity sees it; another identity, another named pile and a severed reader do not; zero
+  target sends. Batches A (proof binding through storage/export) and C (non-finding
+  observations) remain open. Legacy default-pile rows (empty principal) stay out of prior
+  context, as before.
 - **Type:** implementation if reproduced + integration verification. **Depends on:** I01.
 - Trace original finding identity/class, validator result, proof/case reference,
   stored finding and API/Markdown/SARIF output. Define explicit supported class
@@ -53,7 +66,14 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   restore confirmation after restart/export. A guard-removal control is detected.
 - **Maps to:** false-confirmation follow-up, R15, confirmation/evidence gates.
 
-### [ ] I03 — Verify budget, cancellation and TLS at actual engagement callers
+### [~] I03 — Verify budget, cancellation and TLS at actual engagement callers
+- **Status 2026-10-17:** implemented + caller-verified (commit `2a883761`, local); awaiting the
+  owner approved (2026-10-17), including two writes for the second-order SQLi pair.
+  Caller-verified by `harness/test_engagement_transport_callers.py`.
+  The tests found and fixed real bypasses: header-audit, XSS, sequence and mass-assignment
+  legs sent outside the run (budget, TLS), and the browser ignored run cancellation. See
+  `docs/ARCH_RECONCILIATION_TRACKING.md`. Open: plain-client validators outside these call
+  sites are I05.
 - **Type:** integration verification; fix only demonstrated bypasses. **Depends on:** I01.
 - Drive `investigate_engagement` into its iterative probe and second-order plant/read
   closures using owned fixtures, instead of calling their transport helpers alone.
@@ -64,7 +84,14 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   under normal trust; removing context forwarding makes a test fail.
 - **Maps to:** ARCH-1/ARCH-2, SC-7/R7, request-accounting acceptance.
 
-### [ ] I04 — Resolve the reported non-browser CSRF replay branch
+### [~] I04 — Resolve the reported non-browser CSRF replay branch
+- **Status 2026-10-17:** reproduced (a reflecting endpoint confirmed at 0.95) and retired (commit
+  `fe9b8f3`), owner approved with a request for operator guidance. Production callers do not
+  enable the LB-5 PoC, so real-target CSRF is manual-verification only. Unconfirmed
+  cookie-authenticated candidates now show as low-severity "NEEDS MANUAL CHECK" items with
+  copy-ready steps and a test form (analyze caller test). Validator-level controls and a fault
+  injection restoring the retired decision are in `harness/test_csrf_reflection_control.py`.
+  Open: caller -> storage -> export label check (with I02).
 - **Type:** reproduce historical issue, then correct or close with evidence.
   **Depends on:** I01; coordinate confirmation expectations with I02.
 - Inspect the current WIP branch named by LB-CSRF-REPLAY. Use a benign reflecting
@@ -125,7 +152,11 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   routes. All calibration spends budget; budget exhaustion is not complete coverage.
 - **Maps to:** reported /health explosion and current wildcard limitations.
 
-### [ ] I09 — Close deterministic SQLi/JWT caller acceptance gaps
+### [~] I09 — Close deterministic SQLi/JWT caller acceptance gaps
+- **Status 2026-10-17:** caller evidence committed (`d5802ec`,
+  `harness/test_det_shape_dispatch_callers.py`): body-only SQLi and cookie-JWT dispatch with no
+  label, negative controls, and a fault injection that removes both precondition routes. Not
+  closed: depends on I02/I07; the W4 label-normalization review is outstanding; DET-JWT-SCOPE is open.
 - **Type:** verification first; avoid duplicating existing preconditions.
   **Depends on:** I02/I07.
 - DET-SQLI-POST: prove a body-only captured request reaches the correct validator
@@ -149,7 +180,11 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
 
 ## Priority 2 — reproducible verification and measured efficacy
 
-### [ ] I11 — Remove test flakiness and reconcile requirement evidence
+### [~] I11 — Remove test flakiness and reconcile requirement evidence
+- **Status 2026-10-17:** LB-FLAKE closed (fixed clock committed; controls added). The audit
+  logger file-handle leak is fixed. The 36 gaps are classified in
+  `docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md`. Remaining: wire evidence for the 14
+  caller-tested requirements, and trace the 3 unclosed loopback sockets.
 - **Type:** verification infrastructure. **Depends on:** I01; can start alongside I02.
 - Reproduce LB-FLAKE and reconcile it with the existing deterministic report-clock
   work before changing it. Inject a fixed clock; retain a content-change negative control.

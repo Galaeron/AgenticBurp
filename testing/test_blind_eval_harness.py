@@ -161,20 +161,26 @@ class _CannedFindingModel:
         self._derived_pairs = set(derived_pairs)
 
     def _canned(self, user_prompt: str) -> dict:
+        # Match the exchange's OWN "METHOD/URL" lines: prior-findings context in
+        # the same prompt legitimately mentions earlier exchanges' URLs too.
+        def own(url, method=None):
+            if method is not None:
+                return f"METHOD: {method}\nURL: {url}\n" in user_prompt
+            return f"\nURL: {url}\n" in user_prompt
         for method, url in self._assumed_pairs:
-            if f"METHOD: {method}" in user_prompt and url in user_prompt:
+            if own(url, method):
                 return {"findings": [_idor_finding("assumed")], "components": []}
         for method, url in self._derived_pairs:
-            if f"METHOD: {method}" in user_prompt and url in user_prompt:
+            if own(url, method):
                 return {"findings": [_idor_finding("derived")], "components": []}
         for url in self._assumed_urls:
-            if url in user_prompt:
+            if own(url):
                 return {"findings": [_idor_finding("assumed")], "components": []}
         for url in self._derived_urls:
-            if url in user_prompt:
+            if own(url):
                 return {"findings": [_idor_finding("derived")], "components": []}
         for url in self._dependency_urls:
-            if url in user_prompt:
+            if own(url):
                 return {"findings": [_dependency_finding()], "components": []}
         return {"findings": [], "components": []}
 

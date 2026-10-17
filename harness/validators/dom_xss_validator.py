@@ -107,7 +107,8 @@ class DomXssValidator(Validator):
         errors: list[str] = []
         # R7: only forwarded when a RunContext is bound -- see
         # browser_xss_validator's identical comment.
-        rc = self.run_context
+        from harness.run_context import current_run_context
+        rc = self.run_context or current_run_context()  # I03: enclosing run if unbound
         visit_kw = (dict(scope=rc.scope, gate=rc.gate, budget=rc.budget, cancel=rc.cancel)
                     if rc is not None else {})
         for url in urls:

@@ -240,9 +240,9 @@ class AuditLogger:
         self._logger = logging.getLogger(f"{name}.audit")
         self._logger.setLevel(self.log_level)
 
-        # Remove existing handlers
-        for handler in self._logger.handlers[:]:
-            self._logger.removeHandler(handler)
+        # Replace existing handlers. Close them too: the named logger is shared,
+        # so a replaced RotatingFileHandler otherwise keeps its file open (I11).
+        self.close()
 
         # Add console handler
         if self.enable_console:
@@ -281,6 +281,12 @@ class AuditLogger:
             'events_by_type': {},
             'events_by_level': {},
         }
+
+    def close(self) -> None:
+        """Detach and close this logger's handlers (releases the audit file)."""
+        for handler in self._logger.handlers[:]:
+            self._logger.removeHandler(handler)
+            handler.close()
 
     def _disable_file_logging(self, message: str, error: Exception) -> None:
         """Apply the require_file policy when audit file storage fails.
