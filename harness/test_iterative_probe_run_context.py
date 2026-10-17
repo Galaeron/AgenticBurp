@@ -177,6 +177,15 @@ class ArchOneThreadingOwnershipTests(unittest.IsolatedAsyncioTestCase):
             await host.run_active_probe(_exchange(), "h", "sqli", step_budget=10)
         self.assertEqual(_RecordingAgent.last_run_context.budget.remaining, 7)
 
+    async def test_standalone_zero_ceiling_blocks_real_agent_send(self):
+        host = _ProbeHost({"iterative_agent": {"max_requests": 0}})
+        host.ollama = _ScriptedOllama([_mutate("benign")])
+        with patch("httpx.AsyncClient.request") as request, patch(
+                "harness.pivot_memory.integrate",
+                AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {}))):
+            await host.run_active_probe(_exchange(), "h", "sqli", step_budget=1)
+        request.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

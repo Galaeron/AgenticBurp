@@ -79,6 +79,30 @@ class StandaloneAnalyzeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # the finally must still close the owned context -- no leak on the error path
         self.created["ctx"].aclose.assert_awaited_once()
 
+    async def test_zero_ceiling_is_preserved(self):
+        host = _Host(config={"analyze": {"max_requests": 0}})
+        host._seed_identities_from_store = Mock()
+        host._analyze_inner = AsyncMock(return_value="RESP")
+        await host.analyze(_exchange())
+        self.assertEqual(self.created["kwargs"]["max_requests"], 0)
+
+    async def test_seeding_failure_closes_owned_context(self):
+        host = _Host()
+        host._seed_identities_from_store = Mock(side_effect=RuntimeError("seed failure"))
+        host._analyze_inner = AsyncMock()
+        with self.assertRaisesRegex(RuntimeError, "seed failure"):
+            await host.analyze(_exchange())
+        self.created["ctx"].aclose.assert_awaited_once()
+        host._analyze_inner.assert_not_awaited()
+
+    async def test_invalid_ceiling_is_rejected_before_context_creation(self):
+        for value in (-1, True, 1.5, "bad"):
+            with self.subTest(value=value):
+                host = _Host(config={"analyze": {"max_requests": value}})
+                with self.assertRaises(ValueError):
+                    await host.analyze(_exchange())
+                self.assertEqual(self.created, {})
+
     async def test_borrowed_engagement_context_is_neither_created_nor_closed(self):
         host = _Host()
         host._seed_identities_from_store = Mock()

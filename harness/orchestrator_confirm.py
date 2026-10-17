@@ -141,7 +141,9 @@ class ConfirmMixin:
         if probe_ctx is None:
             _ia_cfg = (self.config or {}).get("iterative_agent", {}) or {}
             _cfg_max = _ia_cfg.get("max_requests")
-            ceiling = int(_cfg_max) if _cfg_max else effective_budget * 2 + 10
+            ceiling = effective_budget * 2 + 10 if _cfg_max is None else _cfg_max
+            if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+                raise ValueError("iterative_agent.max_requests must be a nonnegative integer")
             owned_ctx = standalone_context(self.allowed_hosts, config=self.config,
                                            gate=get_default_gate(), max_requests=ceiling)
             probe_ctx = owned_ctx
