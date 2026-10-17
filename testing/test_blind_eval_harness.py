@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import json
+import re
 import shutil
 import tempfile
 import unittest
@@ -158,20 +159,26 @@ class _CannedFindingModel:
         self._derived_pairs = set(derived_pairs)
 
     def _canned(self, user_prompt: str) -> dict:
+        # Match the exchange's OWN "METHOD/URL" lines: prior-findings context in
+        # the same prompt legitimately mentions earlier exchanges' URLs too.
+        def own(url, method=None):
+            if method is not None:
+                return f"METHOD: {method}\nURL: {url}\n" in user_prompt
+            return f"\nURL: {url}\n" in user_prompt
         for method, url in self._assumed_pairs:
-            if f"METHOD: {method}" in user_prompt and url in user_prompt:
+            if own(url, method):
                 return {"findings": [_idor_finding("assumed")], "components": []}
         for method, url in self._derived_pairs:
-            if f"METHOD: {method}" in user_prompt and url in user_prompt:
+            if own(url, method):
                 return {"findings": [_idor_finding("derived")], "components": []}
         for url in self._assumed_urls:
-            if url in user_prompt:
+            if own(url):
                 return {"findings": [_idor_finding("assumed")], "components": []}
         for url in self._derived_urls:
-            if url in user_prompt:
+            if own(url):
                 return {"findings": [_idor_finding("derived")], "components": []}
         for url in self._dependency_urls:
-            if url in user_prompt:
+            if own(url):
                 return {"findings": [_dependency_finding()], "components": []}
         return {"findings": [], "components": []}
 
@@ -784,7 +791,15 @@ class ExchangeProvenanceAttributionAR3Tests(unittest.TestCase):
         self.assertEqual(sc1["surfaced_finding_ids"], sc2["surfaced_finding_ids"])
         self.assertEqual(sc1["n_controls_issue_level"], sc2["n_controls_issue_level"])
         self.assertEqual(sc1["controls_clean_issue_level"], sc2["controls_clean_issue_level"])
-        self.assertEqual(sc1["markdown_reports"], sc2["markdown_reports"])
+        # Each isolated store has its own random HMAC key for captured-auth
+        # pseudonyms (privacy: credentials are unlinkable across stores), so the
+        # opaque "captured:<hmac>" tokens differ between the two runs by design.
+        # Everything else -- including where those tokens appear -- must match.
+        def _without_pseudonyms(reports):
+            return {host: re.sub(r"captured:[0-9a-f]{64}", "captured:<per-store-id>", text)
+                    for host, text in reports.items()}
+        self.assertEqual(_without_pseudonyms(sc1["markdown_reports"]),
+                         _without_pseudonyms(sc2["markdown_reports"]))
 
 
 class ScorecardShapeTests(unittest.TestCase):

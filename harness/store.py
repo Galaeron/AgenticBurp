@@ -661,7 +661,11 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
         return
     host = host_of(exchange.url)
     engagement_id = _engagement_partition(engagement_id)
-    captured_principal = captured_principal_id(exchange) if engagement_id else ""
+    # I02-B: always record the captured principal. prior_findings_summary filters
+    # by it in every partition, so storing "" for the default (host-wide) pile
+    # made a site's earlier findings invisible to later analyses by the same
+    # identity. The default-pile fingerprint is unchanged (dedupe/suppression).
+    captured_principal = captured_principal_id(exchange)
     now = time.time()
     # AR-3 (LOOP half): exact provenance. Prefer the capture driver's own id
     # (trusted transport field, not agent JSON); fall back to a stable content

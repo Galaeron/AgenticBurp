@@ -93,11 +93,13 @@ class _PromptSpyModel:
 
     def _canned(self, user_prompt: str) -> dict:
         self.prompts.append(user_prompt)
+        # Match the exchange's OWN URL line: prior-findings context in the same
+        # prompt legitimately mentions earlier exchanges' URLs too.
         for (method, url), payload in self._by_pair.items():
-            if f"METHOD: {method}" in user_prompt and url in user_prompt:
+            if f"METHOD: {method}\nURL: {url}\n" in user_prompt:
                 return payload
         for url, payload in self._by_url.items():
-            if url in user_prompt:
+            if f"\nURL: {url}\n" in user_prompt:
                 return payload
         return {"findings": [], "components": []}
 
