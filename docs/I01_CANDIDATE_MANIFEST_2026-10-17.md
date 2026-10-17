@@ -145,8 +145,9 @@ mapping given in the plan.
   DET-SQLI-POST, DET-JWT-DETECT).
 - The candidate is committed as `ba080691` and not pushed; this document follows in its own
   docs commit.
-- Not done: the 18 untracked tests of committed code are still not in Git. W1–W4 still
-  need their own reviewed commits, and W2 needs the partition decision first. Untracked
+- 16 of the 18 tests of committed code are committed (`1be5ed04`). `test_captured_shapes_passive`
+  and `test_data_maintenance` import W-dependent test modules, so they stay with W2.
+- Not done: W1–W4 still need their own reviewed commits, and W2 needs the partition decision first. Untracked
   tests were classified by running each module on its own:
   `.test-work/i01-untracked-tests-vs-candidate.log` and
   `.test-work/i01-wip-dependent-tests-mixed-tree.log`. The 36 coverage-evidence gaps are not

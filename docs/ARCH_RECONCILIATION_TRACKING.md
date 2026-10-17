@@ -24,7 +24,13 @@ or released. The remaining acceptance for each item has one owner in
   `run_active_probe` forwarding + owned-ceiling).
 - **Test boundary (2026-10-17):** every test calls `run_active_probe` directly with
   a borrowed or owned context. None drives `investigate_engagement` into the probe
-  or removes its forwarding. **Open → I03** (engagement-caller negative control).
+  or removes its forwarding.
+- **Caller-verified (I03, 2026-10-17):** `harness/test_engagement_transport_callers.py`
+  drives `investigate_engagement` (entered as the server does) into the probe against
+  an owned loopback target that counts every received request. Exhausted, cancelled
+  and out-of-scope runs send nothing, and allowed traffic equals the run's
+  `budget.used`. Dropping the context forwarding leaks probe traffic, and the test
+  detects that.
 
 ## [x] ARCH-2 — second-order write bypassed the central transport
 - **Fixed:** commit `d82c49d`. New `second_order.send_through_run` is the single
@@ -38,8 +44,32 @@ or released. The remaining acceptance for each item has one owner in
   write moves `rc.budget` — bypass regression; `case_ref` forwarded).
 - **Test boundary (2026-10-17):** the tests call `send_through_run` through a
   test-local `_plant` helper. They do not drive the production plant/read closures
-  in `orchestrator_chain`, so they cannot alone prove the wiring. **Open → I03**
-  (engagement caller, including cancellation between plant and read).
+  in `orchestrator_chain`, so they cannot alone prove the wiring.
+- **Caller-verified (I03, 2026-10-17):** the same test module drives the real
+  plant/read closures. Both receive the owning run. Budget exhaustion or cancellation
+  at the moment of the plant stops every later request, a run gate denying mutation
+  blocks every write, and an untrusted certificate is rejected.
+- **Resolved (owner decision 2026-10-17: allow 2 writes):** with the default gate
+  (`max_mutating_requests_per_finding` = 1), only the first plant of the boolean pair was
+  admitted for its shared `case_ref`, so the differential could never confirm. The gate now
+  has an explicit per-check allowance, `DEFAULT_MUTATING_CEILING_BY_CHECK = {"second_order_plant": 2}`.
+  It is capped by the hard ceiling, still requires active + mutating replay, and operators can
+  lower it via `validators.mutating_ceiling_by_check`. The caller test now asserts exactly 2
+  plants and 2 reads.
+
+## [x] I03 — every engagement leg spends the owning run (2026-10-17)
+- **Found by the caller tests:** with a run budget of 1, the target received 51
+  requests. The CORS/CSP header audit, stored/reflected/DOM XSS, sequence and
+  mass-assignment legs sent through private clients, most with `verify=False`.
+  The browser's cancel guard also ignored `run_context.CancelToken`.
+- **Fixed:** `RunContext` publishes itself while entered, and `GatedAsyncClient` then
+  sends through that run's transport. That covers budget, scope, cancellation, TLS
+  trust and evidence, and a refused send raises `SafetyGateBlocked`. The header audit
+  and the engagement's XSS validators receive the run. Browser/DOM XSS and CSP fall
+  back to the enclosing run. `browser_driver.is_cancelled` now honours `CancelToken`.
+- **Residual → I05:** validators that use a plain `httpx.AsyncClient`, not
+  `GatedAsyncClient`, outside these call sites are not covered by the ambient
+  routing. The caller tests prove only the legs the fixture shapes trigger.
 
 ## ARCH-3 — standalone-analysis gate policy + lifecycle (SPLIT)
 - **[x] Policy half (resolved earlier):** gate-flag inheritance + identity seeding —
