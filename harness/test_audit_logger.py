@@ -133,7 +133,19 @@ class TestAuditLogger(unittest.TestCase):
     def tearDown(self):
         """Clean up temporary files."""
         import shutil
+        self.logger.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_close_releases_the_audit_file(self):
+        """I11: close() detaches and closes the file handler; a replacement
+        logger with the same name closes the handlers it replaces."""
+        handler = next(h for h in self.logger._logger.handlers
+                       if isinstance(h, logging.handlers.RotatingFileHandler))
+        replacement = AuditLogger(name="test", log_file=self.log_file,
+                                  enable_console=False, enable_file=True)
+        self.assertIsNone(handler.stream, "a replaced audit file handler was left open")
+        replacement.close()
+        self.assertEqual(replacement._logger.handlers, [])
     
     def test_log_event(self):
         """log should create and log an event."""
