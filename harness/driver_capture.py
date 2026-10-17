@@ -32,11 +32,10 @@ touches NEITHER `playwright.async_api` NOR `harness.role_crawl` itself:
     field, so `discover()` below populates it by attribute, keeping this
     module free of a role_crawl dependency and role_crawl itself unmodified.
 
-OFF by default. Gated by the `driver_capture.enabled` config flag
-(harness/config.yaml), which also means "no caller in this codebase invokes
-this module's entrypoints yet" -- today it is exercised only by its own
-tests and the leg-verification fixture integration test. Wiring it into the
-autonomous crawl loop is explicitly out of scope for LB-2.
+OFF by default. Engagement discovery invokes this component when
+`driver_capture.enabled` is enabled, passing the owning RunContext's scope,
+gate, budget and cancellation. Captures retain their identity and request
+shape when imported into the engagement worklist.
 """
 from __future__ import annotations
 

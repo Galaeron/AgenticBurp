@@ -483,6 +483,7 @@ async def crawl_roles(
     run_context=None,
     session_refs: list[str | None] | None = None,
     owned_object_ids: dict | None = None,
+    seed_paths: list[str] | None = None,
 ) -> RoleCrawlResult:
     """Crawl `base_url` once per role, union the surface, probe every endpoint
     with every role, and derive auth-bypass + IDOR candidates from the matrix.
@@ -535,6 +536,10 @@ async def crawl_roles(
                 discovered.add(discovered_path)
                 if observed_query:
                     observed_queries.setdefault(discovered_path, observed_query)
+            for shape in getattr(cr, "call_shapes", []):
+                shape_path, _ = _split_discovered_endpoint(shape.path)
+                discovered.add(shape_path)
+                path_methods.setdefault(shape_path, set()).add(shape.method.upper())
             for form in getattr(cr, "forms", []):
                 parts = urlsplit(form.action)
                 form_path = _template_ids(parts.path or "/")
@@ -579,7 +584,7 @@ async def crawl_roles(
                     # namespaces they reveal (Phase 0.2(a)) and later sweeps benefit.
                     disc = SurfaceDiscovery(base_url, headers=sr.norm_headers(),
                                             allowed_hosts=allowed_hosts, max_probes=per_budget,
-                                            seed_paths=sorted(discovered),
+                                            seed_paths=sorted(discovered | set(seed_paths or [])),
                                             run_context=run_context,
                                             session_ref=(session_refs[roles.index(sr)]
                                                          if session_refs is not None else None))

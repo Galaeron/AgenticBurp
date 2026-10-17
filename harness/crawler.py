@@ -28,11 +28,15 @@ import httpx
 
 from harness import global_throttle
 from harness.feature_workflow import FormAction, extract_forms
-from harness.js_endpoint_extractor import extract_endpoints
+from harness.js_endpoint_extractor import extract_endpoints, extract_call_shapes, CallShape
 
 # <script src="..."> and bare .js references in HTML, to know which bundles to
 # fetch and mine.
 _SCRIPT_SRC = re.compile(r"""<script[^>]+src\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
+# Literal module dependencies only; never execute target JavaScript or guess
+# dynamic import expressions. Each dependency uses the existing page/run budget.
+_MODULE_SRC = re.compile(
+    r"""(?:\b(?:import|export)\s+(?:[^;'"\n]*?\s+from\s*)?|\bimport\s*\(\s*)['"]([^'"\s]+\.m?js(?:\?[^'"\s]*)?)['"]""")
 # same-origin anchor targets, to follow a little HTML too (not just JS).
 _HREF = re.compile(r"""<a[^>]+href\s*=\s*['"]([^'"#]+)""", re.IGNORECASE)
 # Query-bearing resource URLs are also executable application surface. Product
@@ -67,6 +71,7 @@ class CrawlResult:
     external_urls: set[str] = field(default_factory=set)
     from_request_calls: set[str] = field(default_factory=set)  # endpoints seen in fetch/axios/xhr
     forms: list[FormAction] = field(default_factory=list)       # observed request shapes; never submitted here
+    call_shapes: list[CallShape] = field(default_factory=list)
     suppressed_navigation: set[str] = field(default_factory=set)  # observed state-changing-looking links
     errors: list[str] = field(default_factory=list)
 
@@ -79,6 +84,7 @@ class CrawlResult:
             "endpoint_count": len(self.endpoints),
             "endpoints": sorted(self.endpoints),
             "from_request_calls": sorted(self.from_request_calls),
+            "call_shapes": [shape.to_dict() for shape in self.call_shapes],
             "forms": [
                 {"method": f.method, "action": f.action, "body": f.body(),
                  "enctype": f.enctype}
@@ -196,9 +202,21 @@ async def crawl(
                 p for p in found.from_request_calls
                 if not _DESTRUCTIVE_NAVIGATION.search(urlsplit(p).path or "/")
             }
+            known_shapes = set(result.call_shapes)
+            for shape in extract_call_shapes(body):
+                if shape not in known_shapes and not _DESTRUCTIVE_NAVIGATION.search(shape.path):
+                    result.call_shapes.append(shape)
+                    known_shapes.add(shape)
 
             if is_script:
                 result.scripts_mined += 1
+                if depth < max_depth:
+                    for match in _MODULE_SRC.finditer(body):
+                        dependency = urljoin(final_url, match.group(1))
+                        parts = urlsplit(dependency)
+                        if ((parts.scheme, parts.netloc) == (base_origin.scheme, base_origin.netloc)
+                                and dependency.split("#", 1)[0] not in seen):
+                            queue.append((dependency, depth + 1, True))
                 continue
             # robots.txt is a standard, bounded discovery source rather than an
             # HTML page. Seed its same-origin path directives into the normal

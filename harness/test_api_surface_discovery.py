@@ -531,7 +531,8 @@ class FfufIntegrationTests(unittest.TestCase):
                        R(path="/api/secret", status=403, length=10, source="ffuf")]
         mock_result = FfufResult(routes=ffuf_routes, returncode=0)
 
-        known = {"/api/login": (200, '{"ok":true}', "")}
+        known = {"/api/login": (200, '{"ok":true}', ""),
+                 "/api/secret": (403, "protected resource", "")}
         disc = _FakeDiscovery(self._responder(known),
                               prefixes=["/api/"], collections=[], nouns=["login"],
                               actions=[], sensitive_files=[])

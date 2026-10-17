@@ -613,7 +613,8 @@ class PlaywrightDriver:
                 context = None
                 try:
                     _extra, _cookies = _extra_headers_and_cookies(headers, url)
-                    context = await browser.new_context()
+                    # Service-worker fetches bypass Playwright route interception.
+                    context = await browser.new_context(service_workers="block")
 
                     async def _handle_route(route, request):
                         if is_cancelled(cancel):

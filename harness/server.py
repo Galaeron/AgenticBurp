@@ -1389,6 +1389,8 @@ class InvestigateRequest(_BaseModel):
     max_nodes: int = 8
     step_budget: int = 16
     max_chain_rounds: int = 2
+    seed_exchanges: list[HttpExchange] = []
+    active_discovery: bool = True
 
 
 @app.post("/engagement/{host}/investigate")
@@ -1524,7 +1526,9 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                     max_nodes=max(1, min(req.max_nodes, 100)),
                     step_budget=max(1, min(req.step_budget, 64)),
                     max_chain_rounds=max(0, min(req.max_chain_rounds, 10)),
-                    run_context=run_context)
+                    run_context=run_context,
+                    seed_exchanges=req.seed_exchanges,
+                    active_discovery=req.active_discovery)
             job["result"].setdefault("run_id", run_context.run_id)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
             job["result"].setdefault("request_count", run_context.budget.used)

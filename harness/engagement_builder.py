@@ -49,6 +49,8 @@ async def build_engagement(
     discovery_max_probes: int = 6000,
     id_fill: str = "1",
     run_context=None,
+    seed_exchanges=None,
+    driver_capture_config=None,
 ) -> tuple[engagement.EngagementState, role_crawl.RoleCrawlResult]:
     """Discover + build the access matrix + fuse into an EngagementState.
 
@@ -68,6 +70,57 @@ async def build_engagement(
                 allowed_origins=[permitted_origin], role=role.role,
                 name=role.name or principal_id, principal=role.to_principal())
             session_refs.append(session_id)
+    # Browser/Burp captures are observations, not guessed endpoints. Keep their
+    # original method/body/query and identity; never relabel authenticated traffic
+    # as anonymous or import another origin's traffic into this engagement.
+    from harness.models import HttpExchange
+    from harness.run_context import ScopePolicy
+    seeds = []
+    seed_errors = []
+    capture_config = driver_capture_config or {}
+    supplied = list(seed_exchanges or [])[:200]
+    if capture_config.get("enabled", False):
+        if run_context is None:
+            seed_errors.append("browser capture skipped: owning RunContext required")
+        else:
+            from harness import driver_capture
+            for role in role_crawl._distinct_discovery_roles(roles):
+                if run_context.cancel.cancelled or len(supplied) >= 200:
+                    break
+                try:
+                    observation = await driver_capture.capture_requests(
+                        base_url, headers=role.norm_headers(), scope=run_context.scope,
+                        gate=run_context.gate, budget=run_context.budget,
+                        cancel=run_context.cancel,
+                        wait_ms=min(10000, max(0, int(capture_config.get("wait_ms", 1500)))),
+                        max_captured=min(200 - len(supplied), max(0, int(capture_config.get("max_captured", 50)))))
+                    supplied.extend(observation.exchanges[:200 - len(supplied)])
+                    if observation.load_error:
+                        seed_errors.append("browser capture incomplete: " + observation.load_error)
+                except Exception as exc:
+                    seed_errors.append("browser capture failed: " + type(exc).__name__)
+    origin = ScopePolicy.origin_of(base_url)
+    scope = ScopePolicy(allowed_hosts=allowed_hosts or [])
+    identity_header_names = {"authorization", "cookie", "proxy-authorization", "x-api-key", "x-auth-token"}
+    identity_header_names.update(k.lower() for role in roles for k in (role.headers or {}))
+    def credentials(headers):
+        return {k.lower(): v for k, v in (headers or {}).items()
+                if k.lower() in identity_header_names}
+    for item in supplied:
+        try:
+            ex = item if isinstance(item, HttpExchange) else HttpExchange(**item)
+            if ScopePolicy.origin_of(ex.url) != origin or not scope.in_scope(ex.url):
+                seed_errors.append("capture ignored: outside engagement origin/scope")
+                continue
+            owners = [r for r in roles if credentials(r.headers) == credentials(ex.request_headers)]
+            if not owners:
+                seed_errors.append("capture ignored: no matching supplied identity")
+                continue
+            seeds.append((ex, owners))
+        except (TypeError, ValueError):
+            seed_errors.append("capture ignored: invalid exchange")
+    if len(seed_exchanges or []) > 200:
+        seed_errors.append("supplied captures truncated to 200")
     result = await role_crawl.crawl_roles(
         base_url, roles,
         allowed_hosts=allowed_hosts,
@@ -78,10 +131,29 @@ async def build_engagement(
         discovery_max_probes=discovery_max_probes,
         run_context=run_context,
         session_refs=session_refs,
+        **({"seed_paths": [urlsplit(ex.url).path for ex, _ in seeds]} if seeds else {}),
     )
 
     state = engagement.EngagementState(host=host or _host_of(base_url))
     state.ingest_role_crawl(result.to_dict())
+    result.errors.extend(seed_errors)
+    for ex, owners in seeds:
+        result.captured.append(ex.model_dump())
+        ep = state._ep(ex.method, engagement.normalize_path(ex.url))
+        access = next((entry for entry in result.endpoints
+                       if entry.method == ex.method and entry.path == ep.path), None)
+        if access is None:
+            access = role_crawl.EndpointAccess(method=ex.method, path=ep.path)
+            result.endpoints.append(access)
+        for owner in owners:
+            ep.access[owner.role] = ex.response_status
+            access.by_role[owner.role] = ex.response_status
+            if ex.response_status is not None and 200 <= ex.response_status < 300:
+                if owner.role not in ep.reachable_roles:
+                    ep.reachable_roles.append(owner.role)
+                if owner.role not in access.reachable_roles:
+                    access.reachable_roles.append(owner.role)
+        state.record_template(ex.url, ex.method, ex)
     for r in roles:
         state.ingest_identity(f"rolecrawl:{r.role}", r.role, source="seed")
 

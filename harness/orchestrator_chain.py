@@ -514,32 +514,29 @@ class ChainMixin:
             crawl_max_pages=discovery_max_pages,
             max_endpoints=discovery_max_endpoints,
             active_discovery=active_discovery,
-            discovery_max_probes=discovery_max_probes, run_context=run_context)
+            discovery_max_probes=discovery_max_probes, run_context=run_context,
+            **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
+            **({"driver_capture_config": self.config["driver_capture"]}
+               if (self.config.get("driver_capture") or {}).get("enabled") else {}))
 
         # Operator/capture supplied shapes (for example the runner's successful
         # login setup exchange) are first-class evidence. They do not trigger new
         # traffic here; they only prevent session-setup forms from disappearing at
         # the discovery boundary before deterministic validators can inspect them.
-        for _seed in list(seed_exchanges or []):
-            try:
-                from harness import engagement as _engagement
-                _seed_ex = _seed if isinstance(_seed, HttpExchange) else HttpExchange(**_seed)
-                rc.captured.append(_seed_ex)
-                _seed_ep = state._ep(_seed_ex.method, _engagement.normalize_path(_seed_ex.url))
-                # A login boundary is publicly reachable; the submitted values may
-                # authenticate, but the route itself belongs to the anonymous role.
-                # Use a real role name so worklist seeding can bind the template.
-                _seed_ep.access.setdefault("anonymous", _seed_ex.response_status)
-                if "anonymous" not in _seed_ep.reachable_roles:
-                    _seed_ep.reachable_roles.append("anonymous")
-            except Exception:
-                pass
+        # build_engagement now imports these captures with their actual identity
+        # and request shape, instead of granting every supplied capture anonymous
+        # reachability here.
 
         # R30: operational failures in the additive phases below are caught so one
         # broken phase can't sink the run -- but they must not vanish silently. Each
         # is recorded here and surfaced in the result as `errors` + `degraded`, so a
         # run that skipped a phase is declared incomplete rather than looking clean.
-        _errors: list[dict] = []
+        _errors: list[dict] = [
+            {"phase": "browser_capture", "error": message}
+            for message in getattr(rc, "errors", [])
+            if message.startswith(("browser capture incomplete:", "browser capture failed:",
+                                   "browser capture skipped:"))
+        ]
         workflow_results: list[dict] = []
 
         # Preserve real request shapes before any worklist leg runs. Full model

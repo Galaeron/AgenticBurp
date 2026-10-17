@@ -99,6 +99,30 @@ class DriverCaptureTest(unittest.TestCase):
         self.assertEqual(ex["response_status"], 200)
         self.assertEqual(ex["response_body"], '{"hello":"world"}')
 
+    def test_real_browser_capture_reaches_engagement_worklist(self):
+        from unittest.mock import AsyncMock, patch
+        from harness import crawler, engagement_builder, role_crawl
+        from harness.run_context import RunContext
+
+        async def run():
+            ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=10,
+                                    gate_config={"active_enabled": True, "allow_mutating_replay": True})
+            try:
+                with patch("harness.crawler.crawl", AsyncMock(return_value=crawler.CrawlResult(self._base))):
+                    state, result = await engagement_builder.build_engagement(
+                        self._base + "/", [role_crawl.RoleSession("anonymous", {})],
+                        allowed_hosts=["127.0.0.1"], active_discovery=False, run_context=ctx,
+                        driver_capture_config={"enabled": True, "wait_ms": 800})
+                self.assertFalse(result.errors, result.errors)
+                self.assertTrue(any(e.path == "/echo" and e.method == "POST"
+                                    for e in state.endpoints.values()))
+                self.assertTrue(any(e["request_body"] == '{"hello":"world"}' for e in result.captured))
+                self.assertGreater(ctx.budget.used, 0)
+                self.assertLessEqual(ctx.budget.used, 10)
+            finally:
+                await ctx.aclose()
+        asyncio.run(run())
+
     def test_only_xhr_and_fetch_resource_types_are_captured(self):
         # The navigation document itself and the plain <img> must NOT appear --
         # only JS-issued XHR/fetch requests are what this module exists to capture.
