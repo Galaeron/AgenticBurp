@@ -32,6 +32,20 @@ import json
 import sys
 from pathlib import Path
 
+# P1-3: precision/recall/f1 arithmetic lives once in testing/eval_metrics.py.
+# Bare top-level import (not `from testing import eval_metrics`) to match how
+# this module itself is always loaded -- as a bare `score` module with
+# `testing/` on sys.path (e.g. testing/test_score.py, testing/nightly_precision.py,
+# `python score.py`), and ALSO as a dotted `testing.score` import (e.g.
+# harness/ablation_harness.py, which puts the repo root -- not testing/ -- on
+# sys.path). The guarded sys.path insert below makes the bare `import
+# eval_metrics` resolve in both cases, mirroring testing/strict_score.py's
+# proven approach for the same edge.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import eval_metrics  # noqa: E402  (shared precision/recall/f1 -- P1-3)
+
 # --- OWASP 2021 taxonomy -----------------------------------------------------
 # Ordered most-specific -> most-general: classify() returns the FIRST category
 # whose any keyword is a substring of the finding's vulnerability_class, so the
@@ -133,9 +147,13 @@ def score(labeled_findings: dict[str, list[str]],
                 fp[pc] += 1
 
     def _row(c: str) -> dict:
-        prec = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) else None
-        rec = tp[c] / support[c] if support[c] else None
-        f1 = (2 * prec * rec / (prec + rec)) if (prec and rec) else (0.0 if (prec is not None and rec is not None) else None)
+        # support[c] == tp[c] + fn[c] by construction (the loop above
+        # increments support[c] exactly once per truth-labeled exchange,
+        # alongside either tp[truth] or fn[truth] -- see the per-exchange
+        # loop above), so recall(tp[c], fn[c]) == tp[c] / support[c] exactly.
+        prec = eval_metrics.precision(tp[c], fp[c], on_zero=None)
+        rec = eval_metrics.recall(tp[c], fn[c], on_zero=None)
+        f1 = eval_metrics.f1(prec, rec)
         return {"category": c, "support": support[c], "tp": tp[c], "fp": fp[c], "fn": fn[c],
                 "precision": round(prec, 3) if prec is not None else None,
                 "recall": round(rec, 3) if rec is not None else None,
@@ -143,9 +161,9 @@ def score(labeled_findings: dict[str, list[str]],
 
     rows = [_row(c) for c in categories]
     TP, FP, FN = sum(tp.values()), sum(fp.values()), sum(fn.values())
-    micro_p = TP / (TP + FP) if (TP + FP) else 0.0
-    micro_r = TP / (TP + FN) if (TP + FN) else 0.0
-    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) else 0.0
+    micro_p = eval_metrics.precision(TP, FP, on_zero=0.0)
+    micro_r = eval_metrics.recall(TP, FN, on_zero=0.0)
+    micro_f1 = eval_metrics.f1(micro_p, micro_r)
     return {
         "metric_scope": METRIC_SCOPE,
         "per_category": rows,

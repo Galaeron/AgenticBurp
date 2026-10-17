@@ -4,15 +4,15 @@ This directory implements supplemental tasks S-01 through S-05 as standalone,
 read-only tooling. It does not import or initialize `harness`, open harness
 databases, contact targets, invoke models, or change production scoring.
 
-Run an audit from the repository root with the bundled Python interpreter:
+Run an audit from the repository root (use whatever `python` is on your PATH --
+3.11+; the module is pure-stdlib and imports no third-party packages):
 
-```powershell
-& 'C:\Users\arthu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' `
-  -m evaluation_integrity.audit `
-  --input C:\path\to\results.json `
-  --input C:\path\to\score.json `
-  --json C:\path\to\audit.json `
-  --markdown C:\path\to\audit.md
+```bash
+python -m evaluation_integrity.audit \
+  --input path/to/results.json \
+  --input path/to/score.json \
+  --json path/to/audit.json \
+  --markdown path/to/audit.md
 ```
 
 The generic input adapter accepts schema versions
@@ -54,9 +54,8 @@ do not belong in the manifest; only non-secret identities and fingerprints do.
 
 ## Tests
 
-```powershell
-& 'C:\Users\arthu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' `
-  -m unittest discover -s evaluation_integrity/tests -p 'test_*.py'
+```bash
+python -m unittest discover -s evaluation_integrity/tests -p 'test_*.py'
 ```
 
 All fixtures are synthetic and explicitly labelled. They do not read protected

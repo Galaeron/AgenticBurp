@@ -1,28 +1,31 @@
-"""
-CSRF confirmation leg (V32, WSTG-SESS-09).
+"""CSRF confirmation leg (V32, WSTG-SESS-09).
 
-Deterministic property check: a state-changing request is accepted with NO
-anti-CSRF token and NO SameSite cookie protection. The oracle:
-  (a) the endpoint accepts a mutating method (POST/PUT/PATCH/DELETE),
-  (b) replay without any CSRF token still succeeds (2xx),
-  (c) the session cookie (if any) lacks SameSite=Lax|Strict.
+A token-bearing, cookie-authenticated form can be confirmed when a tokenless
+top-level GET performs the same state change and the authenticated redirect page
+independently reads back a distinct submitted value. This covers applications
+whose CSRF-token validation depends on the request method. SameSite=Strict blocks
+the check; SameSite=Lax permits the top-level GET navigation.
 
-(a∧b∧c) = CONFIRMED. This is a checkable property, not an execution proof
-(same-origin policy is browser-enforced), but the combination is the standard
-CSRF condition per WSTG. Active; mutating replay gated by allow_mutating_replay.
+Ordinary token-stripping POST replays remain observations rather than confirmation
+because a successful status alone does not prove that the state changed.
 """
 from __future__ import annotations
 
+import logging
 import re
-from urllib.parse import urlsplit
+import secrets
+from typing import Callable
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 
-from harness import global_throttle
+from harness import browser_driver, global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
 from .injection_targets import replay_headers
+
+log = logging.getLogger("harness.validators.csrf_validator")
 
 _CSRF_TOKEN_NAMES = re.compile(
     r"(csrf|xsrf|_token|authenticity_token|__RequestVerificationToken|csrfmiddlewaretoken"
@@ -62,16 +65,139 @@ def _session_cookie_samesite(exchange: HttpExchange) -> str | None:
     return None
 
 
+_SENSITIVE_FIELD = re.compile(r"pass|secret|token|key|otp|pin|card|cvv|ssn", re.IGNORECASE)
+
+
+def _manual_verification(exchange: HttpExchange) -> str:
+    """Operator guidance for a CSRF candidate the harness does not confirm (I04).
+
+    Plain steps plus a click-to-submit test form built from the captured write.
+    Token fields are omitted and secret-looking values replaced, so the text is
+    safe to show in reports. Nothing here is sent by the harness."""
+    import html
+    method = (exchange.method or "POST").upper()
+    url = exchange.url or ""
+    headers = {str(k).lower(): str(v) for k, v in (exchange.request_headers or {}).items()}
+    body = exchange.request_body or ""
+    lines = [
+        "NEEDS MANUAL CHECK: CSRF is not confirmed automatically by this harness.",
+        "To verify by hand (authorized testing only):",
+        "  1. Log in to the application as a test user in your browser.",
+    ]
+    if "json" in headers.get("content-type", "") or body.lstrip().startswith(("{", "[")):
+        lines += [
+            "  2. This request has a JSON body. A cross-site HTML form cannot send JSON, so",
+            "     re-send the same fields as an ordinary form (in Burp Repeater: change the",
+            "     body to name=value pairs and Content-Type to application/x-www-form-urlencoded).",
+            "  3. If the server rejects the form version, CSRF through a browser is unlikely.",
+            "     If it accepts it, put those fields in an HTML form, open it from another",
+            "     origin (a local file) while logged in, submit, and check whether data changed.",
+        ]
+        return "\n".join(lines)
+    form_method = method if method in ("GET", "POST") else "POST"
+    fields = [(k, v) for k, v in parse_qsl(body, keep_blank_values=True)
+              if not _CSRF_TOKEN_NAMES.search(k or "")]
+    inputs = "\n".join(
+        f'  <input type="hidden" name="{html.escape(k, quote=True)}" '
+        f'value="{"REPLACE_ME" if _SENSITIVE_FIELD.search(k) else html.escape(v, quote=True)}">'
+        for k, v in fields)
+    lines += [
+        "  2. Save the form below as csrf-test.html, open it in that same browser (as a",
+        "     local file, which is a different origin) and click \"Submit test\".",
+        "  3. Reload the page that shows this data (for example account or settings).",
+        "  Result: data changed -> CSRF likely (no token/Origin check on this request).",
+        "          request rejected or data unchanged -> this form is not exploitable.",
+    ]
+    if method not in ("GET", "POST"):
+        lines.append(f"  Note: the original method is {method}; a cross-site form can only send "
+                     "GET/POST, so this needs a method-override parameter to apply.")
+    lines += [
+        "--- csrf-test.html ---",
+        "<html><body>",
+        f'<form action="{html.escape(url, quote=True)}" method="{form_method}">',
+        inputs,
+        '  <button type="submit">Submit test</button>',
+        "</form>",
+        "</body></html>",
+    ]
+    return "\n".join(line for line in lines if line != "")
+
+
+def _readback_matches(body: str, submitted: list[tuple[str, str]]) -> bool:
+    """Require an independently fetched response to contain a submitted value.
+
+    Short/common values are ignored so an ordinary 200 page cannot accidentally
+    confirm a state transition merely because it contains `1` or `on`.
+    """
+    rendered = body or ""
+    return any(len(value.strip()) >= 5 and value in rendered for _, value in submitted)
+
+
+def _primary_cookie(cookie_header: str) -> tuple[str, str] | None:
+    """The first name=value pair in a Cookie header, or None. Good enough for
+    a single ambient-session cookie -- LB-5's scope is proving ONE ambient
+    cookie rides along cross-site, not picking the "right" one out of
+    several the original capture may have carried."""
+    for part in (cookie_header or "").split(";"):
+        if "=" in part:
+            name, _, value = part.strip().partition("=")
+            if name:
+                return name, value
+    return None
+
+
+def _cross_site_form_fields(exchange: HttpExchange) -> tuple[dict, list[tuple[str, str]]] | None:
+    """Build the LB-5 auto-submit form's fields from the captured request
+    body. A real cross-site <form> can only carry
+    application/x-www-form-urlencoded (or multipart) content, never raw
+    JSON -- so this only ever applies to an urlencoded body; a JSON-bodied
+    capture returns None (not form-submittable, nothing to prove with that
+    shape).
+
+    Swaps exactly ONE non-token field's value for a fresh, distinguishing
+    token (secrets.token_hex) -- enough to prove an INDEPENDENTLY-submitted
+    value reached victim state via the GET-only readback (_readback_matches),
+    without needing every field to be a sentinel. Returns None when there is
+    no eligible field to swap."""
+    pairs = parse_qsl(exchange.request_body or "", keep_blank_values=True)
+    if not pairs:
+        return None
+    token = secrets.token_hex(8)
+    fields: dict = {}
+    submitted: list[tuple[str, str]] = []
+    swapped = False
+    for k, v in pairs:
+        if not swapped and not _CSRF_TOKEN_NAMES.search(k or ""):
+            fields[k] = token
+            submitted.append((k, token))
+            swapped = True
+        else:
+            fields.setdefault(k, v)
+    if not swapped:
+        return None
+    return fields, submitted
+
+
 class CsrfValidator(Validator):
     name = "csrf"
     finding_classes = {"csrf", "cross-site request forgery", "cross site request forgery", "xsrf"}
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 run_context=None):
+                 run_context=None, cross_site_poc_enabled: bool = False,
+                 cross_site_readback_url: "Callable[[str], str] | None" = None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self.run_context = run_context
+        # LB-5 (default OFF, config: cross_site_poc.enabled): when True AND a
+        # real browser driver is available AND `cross_site_readback_url` can
+        # map the captured victim URL to a GET-only state-readback URL,
+        # `validate()` attempts a REAL cross-site browser PoC (ambient
+        # cookie, no header forged by us) instead of settling for the
+        # RETIRED token-strip-replay-as-observation path below. See
+        # `_attempt_cross_site_poc`.
+        self.cross_site_poc_enabled = cross_site_poc_enabled
+        self.cross_site_readback_url = cross_site_readback_url
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if not super().applies(finding, exchange):
@@ -81,6 +207,99 @@ class CsrfValidator(Validator):
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "csrf", summary=why)
+
+    @staticmethod
+    def _guided(result: ValidationResult, exchange: HttpExchange,
+                headers_lower: dict) -> ValidationResult:
+        """Attach manual-verification guidance when the request rides an ambient
+        cookie (the only browser-deliverable CSRF shape). Bearer-only requests and
+        SameSite/rejected outcomes never reach here or get none."""
+        if "cookie" not in headers_lower or "authorization" in headers_lower:
+            return result
+        from dataclasses import replace
+        return replace(result, manual_verification=_manual_verification(exchange))
+
+    async def _attempt_cross_site_poc(self, exchange: HttpExchange, method: str,
+                                      headers_lower: dict) -> "ValidationResult | None":
+        """LB-5: attempt the real cross-site browser PoC instead of settling
+        for the RETIRED token-strip-replay observation below. Returns a
+        ValidationResult ONLY on a decisive CONFIRM; returns None for every
+        other outcome (disabled, no driver, no ambient cookie, no readback
+        mapping, the PoC ran but the victim stayed unchanged) so the caller
+        falls through to the EXISTING 0.4 OBSERVATION path UNCHANGED -- this
+        method only ever ADDS a confirm path, it never changes what
+        "not confirmed" looks like.
+
+        Requires an ambient Cookie (never an Authorization-only exchange --
+        a bearer-only/non-ambient victim has nothing for this primitive's
+        cookie jar to carry, so it is skipped here, by construction, exactly
+        matching the "stays silent on bearer-only" control) and a body this
+        validator can turn into form fields (urlencoded only -- see
+        `_cross_site_form_fields`)."""
+        if not self.cross_site_poc_enabled or self.cross_site_readback_url is None:
+            return None
+        if "authorization" in headers_lower:
+            return None
+        primary = _primary_cookie(headers_lower.get("cookie", ""))
+        if primary is None:
+            return None
+        cookie_name, cookie_value = primary
+        fields_info = _cross_site_form_fields(exchange)
+        if fields_info is None:
+            return None
+        fields, submitted = fields_info
+
+        driver = browser_driver.default_driver()
+        if driver is None:
+            return None
+
+        victim_url = exchange.url
+        try:
+            readback_url = self.cross_site_readback_url(victim_url)
+        except Exception:
+            return None
+        if not readback_url:
+            return None
+
+        scheme = urlsplit(victim_url).scheme or "http"
+        cookie_domain = urlsplit(victim_url).hostname or ""
+        if not cookie_domain:
+            return None
+        # Synthesized attacker origin -- NEVER dispatched to the real
+        # network (cross_site_submit's own route policy fulfils it locally),
+        # so this placeholder host needs no real DNS entry. It only needs to
+        # be a different SITE than the victim, which any domain name is,
+        # relative to the victim's loopback/IP-literal or distinct-hostname
+        # origin.
+        attacker_url = f"{scheme}://csrf-poc-attacker.localhost/csrf-poc-attacker"
+
+        try:
+            result = await driver.cross_site_submit(
+                attacker_url=attacker_url, victim_url=victim_url, victim_method=method,
+                form_fields=fields, readback_url=readback_url,
+                cookie_name=cookie_name, cookie_value=cookie_value,
+                cookie_domain=cookie_domain, same_site=None)
+        except Exception as e:
+            log.debug("CSRF cross-site PoC attempt errored: %s", e)
+            return None
+
+        if result.load_error:
+            return None
+
+        if (result.submitted and result.readback_status is not None
+                and 200 <= result.readback_status < 300
+                and _readback_matches(result.readback_body, submitted)):
+            names = ", ".join(k for k, _ in submitted)
+            return ValidationResult(
+                self.name, "confirmed", "csrf", confidence=0.95, confirmed=True,
+                summary=("A real cross-site browser PoC delivered the victim's AMBIENT session "
+                         "cookie on a tokenless, cross-site auto-submit POST, and an "
+                         "INDEPENDENT GET-only readback confirmed the resulting state change."),
+                evidence=(f"Attacker-origin auto-submit form POSTed to {victim_url} "
+                          f"(status {result.submit_status}); independent GET {readback_url} "
+                          f"(status {result.readback_status}) read back the submitted "
+                          f"field(s): {names}."))
+        return None
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
@@ -92,6 +311,19 @@ class CsrfValidator(Validator):
             return self._skip("endpoint does not accept a state-changing method")
 
         samesite = _session_cookie_samesite(exchange)
+        headers_lower = {str(k).lower(): str(v)
+                         for k, v in (exchange.request_headers or {}).items()}
+
+        # RETIRED (I04 / LB-CSRF-REPLAY, 2026-10-17): a tokenless GET replay of the
+        # write, confirmed when that SAME response contained a submitted value. The
+        # harness attached the session cookie itself, the "readback" was not
+        # independent, and a server that merely echoes its query string confirmed
+        # at 0.95 -- even with mutating replay off, since the write travelled as a
+        # GET. The only remaining confirm path is the cross-site browser PoC below
+        # (ambient cookie, fresh sentinel, independent GET readback); production
+        # callers do not enable it, so a real-target CSRF candidate is reported
+        # with manual verification guidance instead (_manual_verification).
+
         if samesite and samesite.lower() in ("strict", "lax"):
             return ValidationResult(
                 self.name, "not_confirmed", "csrf", confidence=0.0, confirmed=False,
@@ -117,7 +349,8 @@ class CsrfValidator(Validator):
                                  body=stripped_body or None),
                     capability=self.name, session_ref=session_ref)
                 if not outcome.executed:
-                    return self._skip(f"CSRF replay declined: {outcome.outcome}")
+                    return self._guided(self._skip(f"CSRF replay declined: {outcome.outcome}"),
+                                        exchange, headers_lower)
                 if outcome.outcome == "error":
                     return ValidationResult(self.name, "error", "csrf",
                                             summary=f"HTTP error during replay: {outcome.error}")
@@ -131,12 +364,18 @@ class CsrfValidator(Validator):
                                                 content=stripped_body or None)
                 status_code = resp.status_code
         except SafetyGateBlocked:
-            return self._skip("mutating CSRF replay not authorized (set validators.allow_mutating_replay)")
+            return self._guided(self._skip(
+                "mutating CSRF replay not authorized (set validators.allow_mutating_replay)"),
+                exchange, headers_lower)
         except httpx.HTTPError as e:
             return ValidationResult(
                 self.name, "error", "csrf", summary=f"HTTP error during replay: {e}")
 
         if 200 <= status_code < 300:
+            poc_result = await self._attempt_cross_site_poc(exchange, method, headers_lower)
+            if poc_result is not None:
+                return poc_result
+
             token_present = _has_csrf_token(exchange)
             evidence_parts = [
                 f"Replayed {method} {exchange.url} without CSRF token → {status_code}.",
@@ -158,13 +397,13 @@ class CsrfValidator(Validator):
             # and independently verifies the state change, plus controls for
             # bearer-only requests, Origin enforcement and default-SameSite; only
             # then confirmed=True (and re-add "csrf" to the gate's LIVE set).
-            return ValidationResult(
+            return self._guided(ValidationResult(
                 self.name, "not_confirmed", "csrf", confidence=0.4, confirmed=False,
                 summary=f"OBSERVATION (not confirmed): {method} request was accepted without an "
                         f"anti-CSRF token. NOT a confirmed CSRF -- needs a cross-site browser PoC "
                         f"with ambient credentials (this replay proves neither ambient-credential "
                         f"delivery nor absence of Origin/SameSite protection).",
-                evidence=" ".join(evidence_parts))
+                evidence=" ".join(evidence_parts)), exchange, headers_lower)
 
         return ValidationResult(
             self.name, "not_confirmed", "csrf", confidence=0.0, confirmed=False,

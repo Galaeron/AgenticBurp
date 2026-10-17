@@ -70,7 +70,8 @@ _GARBAGE_TOKEN = "Bearer harness.invalid.0000000000000000000000000000"
 # than the protected resource -- so we don't call a served login form a leak.
 _LOGIN_PAGE = re.compile(
     r"""(?:type\s*=\s*['"]password['"]|name\s*=\s*['"]password['"]"""
-    r"""|<form[^>]*(?:login|signin|sign-in)|please\s+(?:log\s?in|sign\s?in)"""
+    r"""|<form[^>]*(?:action|id|name)\s*=\s*['"][^'"]*(?:login|signin|sign-in)"""
+    r"""|please\s+(?:log\s?in|sign\s?in)"""
     r"""|<title[^>]*>[^<]*(?:log\s?in|sign\s?in)[^<]*</title>)""",
     re.IGNORECASE,
 )

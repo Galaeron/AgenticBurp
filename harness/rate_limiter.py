@@ -267,11 +267,15 @@ class TokenRateLimiter:
         self._limiter = RateLimiter(self.config, name)
         self._token_usage: deque[tuple[float, int]] = deque()  # (timestamp, tokens_used)
         self._total_tokens_used = 0
-    
-    def record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
-        """Record token usage for a request."""
-        total_tokens = prompt_tokens + completion_tokens
-        self._token_usage.append((time.time(), total_tokens))
+        self._unknown_usage: deque[float] = deque()
+
+    def record_usage(self, prompt_tokens: int | None, completion_tokens: int | None) -> None:
+        """Track known consumption; missing counts retain a separate marker."""
+        recorded_at = time.time()
+        if prompt_tokens is None or completion_tokens is None:
+            self._unknown_usage.append(recorded_at)
+        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+        self._token_usage.append((recorded_at, total_tokens))
         self._total_tokens_used += total_tokens
         
         # Clean up old entries (older than 1 minute)
@@ -279,6 +283,8 @@ class TokenRateLimiter:
         while self._token_usage and self._token_usage[0][0] < cutoff:
             _, tokens = self._token_usage.popleft()
             self._total_tokens_used -= tokens
+        while self._unknown_usage and self._unknown_usage[0] < cutoff:
+            self._unknown_usage.popleft()
     
     def get_recent_usage(self, seconds: float = 60.0) -> int:
         """Get token usage in the last N seconds."""
@@ -329,14 +335,18 @@ class TokenRateLimiter:
         self._limiter.reset()
         self._token_usage.clear()
         self._total_tokens_used = 0
+        self._unknown_usage.clear()
     
     def get_stats(self) -> dict:
         """Get token rate limiter statistics."""
         stats = self._limiter.get_stats()
+        unknown = sum(recorded_at >= time.time() - 60.0 for recorded_at in self._unknown_usage)
         return {
             **stats.__dict__,
             'total_tokens_used': self._total_tokens_used,
             'recent_usage_60s': self.get_recent_usage(60.0),
+            'unknown_usage_calls_60s': unknown,
+            'usage_complete_60s': unknown == 0,
         }
 
 
@@ -443,7 +453,7 @@ class CombinedRateLimiter:
         async with self:
             return await func(*args, **kwargs)
     
-    def record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+    def record_usage(self, prompt_tokens: int | None, completion_tokens: int | None) -> None:
         """Record token usage for a request."""
         self.token_limiter.record_usage(prompt_tokens, completion_tokens)
     

@@ -177,6 +177,8 @@ class SurfaceResult:
     probes_sent: int = 0
     errors: list[str] = field(default_factory=list)
     sensitive_file_hits: list[str] = field(default_factory=list)
+    wildcard_prefixes: list[str] = field(default_factory=list)
+    wildcard_candidates_suppressed: int = 0
 
     def paths(self) -> list[str]:
         return sorted({r.path for r in self.routes})
@@ -192,6 +194,8 @@ class SurfaceResult:
                 for r in sorted(self.routes, key=lambda x: x.path)
             ],
             "errors": self.errors,
+            "wildcard_prefixes": self.wildcard_prefixes,
+            "wildcard_candidates_suppressed": self.wildcard_candidates_suppressed,
         }
 
 
@@ -247,6 +251,9 @@ class SurfaceDiscovery:
         # recognised as "not found" by SHAPE, not mistaken for a real route.
         # None until calibrated, or when the app returns honest 404s.
         self._soft404: tuple[int, str] | None = None
+        self._prefix_controls: dict[tuple[str, str], tuple[int, str] | None] = {}
+        self._wildcard_prefixes: set[str] = set()
+        self._wildcard_suppressed = 0
 
     async def _probe(self, method: str, path: str):
         """One live request. A method seam so tests inject a canned responder and
@@ -292,7 +299,34 @@ class SurfaceDiscovery:
         a soft-404 is recognised whatever path it was probed with."""
         b = (body or "").replace(path, "PATH")
         b = re.sub(r"\d+", "N", b)
-        return hashlib.sha1(b[:2000].encode("utf-8", "ignore")).hexdigest()[:16]
+        return hashlib.sha1(b.encode("utf-8", "ignore")).hexdigest()[:16]
+
+    async def _prefix_wildcard(self, method: str, path: str, status: int, body: str) -> bool:
+        """Compare a candidate with two random siblings in its own namespace.
+
+        Root-only calibration misses mounted catch-alls (e.g. /health/*). All
+        controls consume the ordinary discovery and owning-run request budgets.
+        Failed/inconsistent controls never establish a wildcard signature.
+        """
+        parent = path.split("?", 1)[0].rsplit("/", 1)[0] + "/"
+        key = (method, parent)
+        if parent == "/":
+            return False  # already calibrated at discovery start
+        if key not in self._prefix_controls:
+            sigs = []
+            for _ in range(2):
+                bogus = parent + "__harness_missing_" + secrets.token_hex(12)
+                control = await self._raw(method, bogus)
+                if control is None:
+                    return True  # insufficient budget: candidate existence remains unproven
+                sigs.append((control[0], self._norm_body_hash(control[1], bogus)))
+            self._prefix_controls[key] = sigs[0] if sigs[0] == sigs[1] else None
+        signature = self._prefix_controls[key]
+        if signature is not None and (status, self._norm_body_hash(body, path)) == signature:
+            self._wildcard_prefixes.add(parent)
+            self._wildcard_suppressed += 1
+            return True
+        return False
 
     def _not_found(self, status: int, body: str, path: str) -> bool:
         """Existence oracle: a hard 404/framework marker, OR a match to the
@@ -328,12 +362,21 @@ class SurfaceDiscovery:
             return self._seen[path]
         if (method, path) in self._attempted or not self._budget_left():
             return None
+        # Stop guessed descendant expansion after a namespace proves wildcard.
+        # App/capture references still get their own comparison, so a genuine
+        # distinct endpoint in that namespace is not hidden by this pruning.
+        referenced = source in {"seed", "body", "html"} or path in self.seed_paths
+        if not referenced and any(path.startswith(p) for p in self._wildcard_prefixes):
+            self._wildcard_suppressed += 1
+            return None
         self._attempted.add((method, path))
         r = await self._raw(method, path)
         if r is None:
             return None
         status, body, allow = r
         if self._not_found(status, body, path):
+            return None
+        if await self._prefix_wildcard(method, path, status, body):
             return None
         methods = tuple(m.strip().upper() for m in allow.split(",") if m.strip()) or (method,)
         route = Route(path=path, status=status, methods=methods, length=len(body), source=source)
@@ -377,6 +420,10 @@ class SurfaceDiscovery:
 
         # 1. spec probe -- if the app hands us its contract, use it verbatim.
         for sp in SPEC_PATHS:
+            # Leave room for a candidate plus its two sibling controls, even
+            # when the operator supplies a very small discovery budget.
+            if self._phase_limit - self._probes <= 3:
+                break
             r = await self._raw("GET", sp)
             if r and not _is_not_found(r[0], r[1]) and r[0] == 200 and _looks_like_spec(r[1]):
                 result.spec_found = sp
@@ -395,6 +442,9 @@ class SurfaceDiscovery:
                 break
 
         # 2. wordlist: single-segment, bare and id-scoped, across prefixes.
+        # Spend on observed app references before speculative combinations.
+        for path in self.seed_paths:
+            await self._check(path.replace("{id}", "1"), "seed")
         for pre in self.prefixes:
             for n in self.nouns:
                 for suffix in ("", "/1"):
@@ -482,6 +532,10 @@ class SurfaceDiscovery:
         result.routes = list(self._seen.values())
         result.probes_sent = self._probes
         result.sensitive_file_hits = list(self._sensitive_hits)
+        result.wildcard_prefixes = sorted(self._wildcard_prefixes)
+        result.wildcard_candidates_suppressed = self._wildcard_suppressed
+        if self._wildcard_prefixes:
+            result.errors.append("wildcard responses suppressed; guessed descendants were not expanded")
         return result
 
     async def _ffuf_fast_path(self, result: SurfaceResult) -> int:
@@ -489,6 +543,9 @@ class SurfaceDiscovery:
         Returns the number of routes found. Fails silently (returns 0) when
         Docker or the image is absent."""
         from harness import ffuf_runner
+        if self.run_context is not None:
+            result.errors.append("ffuf skipped: external requests cannot spend the owning run budget")
+            return 0
         ok, reason = ffuf_runner.ffuf_available(self.ffuf_image)
         if not ok:
             result.errors.append(f"ffuf skipped: {reason}")
@@ -501,8 +558,9 @@ class SurfaceDiscovery:
         count = 0
         for route in ffuf_result.routes:
             if route.path not in self._seen:
-                self._seen[route.path] = route
-                count += 1
+                # External tool hits are candidates, not proof of existence.
+                if await self._check(route.path, "ffuf") is not None:
+                    count += 1
         if count:
             result.errors.append(f"ffuf seeded {count} routes")
         return count
@@ -676,7 +734,9 @@ class SurfaceDiscovery:
                     return
                 qpath = f"{p}?{param}=1"
                 r = await self._raw("GET", qpath)
-                if r is None or _is_not_found(r[0], r[1]):
+                if r is None or self._not_found(r[0], r[1], qpath):
+                    continue
+                if await self._prefix_wildcard("GET", qpath, r[0], r[1]):
                     continue
                 r_hash = self._norm_body_hash(r[1], qpath)
                 if r_hash != base_hash or abs(len(r[1]) - base_len) > 50:

@@ -303,5 +303,32 @@ class FallbackFlagTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(coordinator.is_fallback_reason(reason))
 
 
+class CoordinatorSeedTests(unittest.IsolatedAsyncioTestCase):
+    """Phase 1.2 reproducibility control: the coordinator forwards its configured
+    Ollama seed to the model call. Proved at the caller level -- the mocked client
+    records the seed kwarg it actually received -- including seed=0, which a
+    truthiness check would silently drop."""
+
+    def _ok(self):
+        return OllamaResult(data={"dispatch": ["idor"], "reason": "r"},
+                            prompt_tokens=1, completion_tokens=1)
+
+    async def test_configured_seed_zero_reaches_the_routing_call(self):
+        ollama = AsyncMock()
+        ollama.chat_json_metered.return_value = self._ok()
+        coord = Coordinator(ollama, {"model": "m", "seed": 0})
+        await coord.choose_agents(_exchange(), ["idor", "auth"])
+        ollama.chat_json_metered.assert_called_once()
+        self.assertEqual(ollama.chat_json_metered.call_args.kwargs.get("seed"), 0,
+                         "coordinator dropped a configured seed of 0 on the way to the model")
+
+    async def test_no_configured_seed_forwards_none_so_client_default_applies(self):
+        ollama = AsyncMock()
+        ollama.chat_json_metered.return_value = self._ok()
+        coord = Coordinator(ollama, {"model": "m"})  # no seed in config
+        await coord.choose_agents(_exchange(), ["idor", "auth"])
+        self.assertIsNone(ollama.chat_json_metered.call_args.kwargs.get("seed"))
+
+
 if __name__ == "__main__":
     unittest.main()

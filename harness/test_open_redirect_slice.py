@@ -48,7 +48,13 @@ class OpenRedirectSliceTest(EvidenceCase):
         global_throttle.configure(0)
         self.addCleanup(safety_gate.reset_default_gate)
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": False})
+        # Seed the process-wide gate with the loopback fixture host in scope,
+        # exactly as ValidatorRegistry seeds it from server.allowed_hosts in
+        # production. Required since the gate fails closed on an empty active
+        # scope (commit 3c622c3): without this the send to 127.0.0.1 is refused
+        # and the validator reports 'skipped' instead of exercising the fixture.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": False,
+                                      "allowed_hosts": [HOST]})
 
     def _fixture(self, mode):
         fx = OpenRedirectFixture(mode)

@@ -10,6 +10,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 from __future__ import annotations
 
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.validators.base import ValidationResult
 
 
 class ConfirmMixin:
@@ -54,7 +55,7 @@ class ConfirmMixin:
         self._leg_self_test_cache = markers
         return markers
 
-    async def _oracle_gate(self, finding, exchange) -> None:
+    async def _oracle_gate(self, finding, exchange, *, routing_finding=None) -> None:
         """P0.1-WIRE: run the deterministic verification oracle over a just-
         confirmed finding, behind config `oracle.enabled` (default false).
 
@@ -80,12 +81,13 @@ class ConfirmMixin:
         registry = oracle_framework.OracleRegistry(
             self.validator_registry, n_required=n_required)
 
+        oracle_finding = routing_finding if routing_finding is not None else finding
         if enabled:
-            capsule = await registry.verify(finding, exchange)
+            capsule = await registry.verify(oracle_finding, exchange)
         else:
             # safe_passive_default: passive-only oracle, zero new requests
-            oracle = registry.oracle_for(finding, exchange, passive_only=True)
-            capsule = await oracle.run(finding, exchange) if oracle is not None else None
+            oracle = registry.oracle_for(oracle_finding, exchange, passive_only=True)
+            capsule = await oracle.run(oracle_finding, exchange) if oracle is not None else None
 
         oracle_framework.stamp_finding(finding, capsule)
 
@@ -98,6 +100,7 @@ class ConfirmMixin:
         model: str = "",
         step_budget: int | None = None,
         on_step=None,
+        run_context=None,
     ) -> dict:
         """Drive the iterative agent (F4) against one captured exchange, then
         integrate its result through F2 (pivot_memory): hold the findings as
@@ -116,13 +119,37 @@ class ConfirmMixin:
         from harness.iterative_agent import IterativeAgent
         from harness import pivot_memory
         from harness import activity_feed
+        from harness.run_context import standalone_context
+        from harness.safety_gate import get_default_gate
 
         # Phase 4 cloud-coordinator seam: the iterative agent's reasoning runs on
         # the cloud model when the seam is toggled on (else local).
         chosen_model = model or self.reasoning_model()
+        effective_budget = step_budget or self.iterative_agent_max_steps
+        # ARCH-1: the probe must spend the OWNING run's budget and travel its ONE
+        # TargetTransport. Inside an engagement, run_context is the engagement's
+        # (passed by investigate_engagement), and the agent borrows it. A
+        # standalone probe (e.g. the /active-probe endpoint, which passes no
+        # run_context) owns ONE properly-configured context for the WHOLE probe,
+        # with an explicit request ceiling, closed in the finally below -- never
+        # a throwaway per-send client that escaped all accounting (the ARCH-1
+        # defect). The ceiling defaults to a generous multiple of the step budget
+        # (each step issues at most one send) and is overridable via
+        # config iterative_agent.max_requests.
+        owned_ctx = None
+        probe_ctx = run_context
+        if probe_ctx is None:
+            _ia_cfg = (self.config or {}).get("iterative_agent", {}) or {}
+            _cfg_max = _ia_cfg.get("max_requests")
+            ceiling = effective_budget * 2 + 10 if _cfg_max is None else _cfg_max
+            if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+                raise ValueError("iterative_agent.max_requests must be a nonnegative integer")
+            owned_ctx = standalone_context(self.allowed_hosts, config=self.config,
+                                           gate=get_default_gate(), max_requests=ceiling)
+            probe_ctx = owned_ctx
         agent = IterativeAgent(
             self.ollama, chosen_model, self.allowed_hosts,
-            max_steps=self.iterative_agent_max_steps,
+            max_steps=self.iterative_agent_max_steps, run_context=probe_ctx,
         )
 
         # Publish each step to the live feed (V1), and still call any caller-
@@ -138,14 +165,21 @@ class ConfirmMixin:
             if on_step is not None:
                 on_step(step)
 
-        result = await agent.run(
-            exchange, hypothesis, specialty,
-            step_budget=step_budget or self.iterative_agent_max_steps,
-            effort_budget=self.effort_budget,
-            on_step=_feed_step,
-        )
-        outcome = await pivot_memory.integrate(result, exchange, model=chosen_model)
-        return {"iterative_result": result.to_dict(), "integration": outcome.to_dict()}
+        try:
+            result = await agent.run(
+                exchange, hypothesis, specialty,
+                step_budget=effective_budget,
+                effort_budget=self.effort_budget,
+                on_step=_feed_step,
+            )
+            outcome = await pivot_memory.integrate(result, exchange, model=chosen_model)
+            return {"iterative_result": result.to_dict(), "integration": outcome.to_dict()}
+        finally:
+            # ARCH-1: close ONLY a context this call owns (the standalone probe).
+            # A context borrowed from an engagement is never closed here -- its
+            # lifetime belongs to investigate_engagement.
+            if owned_ctx is not None:
+                await owned_ctx.aclose()
 
     async def run_retry_agents(
         self,
@@ -245,8 +279,108 @@ class ConfirmMixin:
                 return pr.proof_id, case.case_id
             log.warning("failed to persist coverage proof for %s: %s", result.validator, reason)
         except Exception as e:  # proof bookkeeping must never break coverage
-            log.debug("coverage proof bookkeeping failed: %s", e)
+            # Surfaced at WARNING, not debug: a confirmed finding whose proof
+            # record silently fails to persist is exactly the "confirmation
+            # without a proof record" integrity gap the project already tracks,
+            # and a debug line is invisible on the default log level.
+            log.warning("coverage proof bookkeeping failed (proof record NOT persisted): %s", e)
         return "", ""
+
+    async def _persist_confirmation_proof(
+        self, *, case, validator_name: str, status: str, confirmed: bool,
+        finding_ref: str, ledger_summary: str, ledger_data: dict,
+        validator_version: str = "", observed_result: str = "",
+        expected_invariant: str = "",
+    ) -> tuple[bool, dict | None, str]:
+        """RB-4/INV-2 shared proof+ledger persistence.
+
+        The ONE place a case-bound ProofRecord is built/persisted
+        (store.persist_proof_record) and the matching evidence_ledger
+        VALIDATION_DECISION is emitted, so every confirmation call site --
+        PASS1's _validate_findings below, AND PASS2's engagement graph loop
+        (orchestrator_chain.py::_apply) -- reuses the SAME mechanism instead of
+        a second, divergent implementation (the exact hazard INV-2 warns
+        against: no 2nd ledger).
+
+        Returns (ok, proof.to_dict() or None, reason). Read-only w.r.t.
+        verdict/severity/scope/gate: this only ever adds a durable record. The
+        ledger emit is best-effort and never raises (matches
+        _validate_findings' original discipline for this call); a proof
+        persistence failure DOES propagate to the caller (ok=False, or an
+        exception from a malformed case/ProofRecord), exactly as
+        _validate_findings' own try/except around this step already expects.
+        """
+        from harness import evidence_ledger
+        try:
+            evidence_ledger.emit(
+                evidence_ledger.EventType.VALIDATION_DECISION, finding_ref,
+                ledger_summary, data=ledger_data,
+                provenance=evidence_ledger.Provenance.capture(
+                    config=getattr(self, "config", {})),
+                case_ref=case.case_id)
+        except Exception:
+            pass
+        pr = evidence.ProofRecord.from_validation_result(
+            case=case, validator=validator_name, validator_version=validator_version,
+            status=status, confirmed=confirmed, observed_result=observed_result,
+            expected_invariant=expected_invariant)
+        ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
+        if ok:
+            return True, pr.to_dict(), reason
+        return False, None, reason
+
+    # ER-4: names scoped for the reproduction-replay determinism gate. A
+    # single successful observation can confirm one of these active legs; a
+    # flaky one-shot confirmation would not reproduce, inflating precision.
+    _CONFIRM_REPLAY_SCOPE = frozenset({"ssrf", "ssti", "command_injection"})
+
+    async def _maybe_replay(self, validator, finding, exchange):
+        """ER-4: optional determinism gate wrapping validator.validate().
+
+        DEFAULT OFF (self.confirm_replay false, or not set on this instance):
+        awaits validate() exactly ONCE and returns that result object
+        UNCHANGED -- byte-for-byte identical to calling validator.validate()
+        directly. This is the common/shipped path.
+
+        When confirm_replay is on AND validator.name is in the scoped set
+        AND the first attempt confirmed, awaits validate() a SECOND time (via
+        the same validate() path, so scope lock / global_throttle / safety
+        gate budget / allow_mutating_replay the leg already enforces still
+        apply -- no hand-rolled re-send). If the second run agrees
+        (confirmed), the original (first) confirmed result is returned
+        unchanged. If it disagrees, a downgraded ValidationResult (confirmed
+        False, status "not_confirmed") is returned instead -- this is NOT a
+        new downgrade mechanism, it simply means the finding never gets
+        `finding.confirmed = True` set at the call site (~line 488), so
+        confirmation_gate routes it through the existing provisional/unproven
+        path exactly as it would any other not-confirmed active leg.
+        """
+        first = await validator.validate(finding, exchange)
+        if not getattr(self, "confirm_replay", False):
+            return first
+        if getattr(validator, "name", None) not in self._CONFIRM_REPLAY_SCOPE:
+            return first
+        if not first.confirmed:
+            return first
+        second = await validator.validate(finding, exchange)
+        if second.confirmed:
+            return first
+        # Disagreement: downgrade. Let the existing provisional/unproven path
+        # (confirmation_gate) handle this finding from here -- no new
+        # mechanism, just a not-confirmed result like any other.
+        note = "replay disagreed: second confirmation attempt did not reproduce"
+        summary = (first.summary or "") + ((" " + note) if first.summary else note)
+        return ValidationResult(
+            validator=first.validator,
+            status="not_confirmed",
+            finding_class=first.finding_class,
+            confidence=first.confidence,
+            confirmed=False,
+            summary=summary,
+            evidence=first.evidence,
+            raw_output=first.raw_output,
+            command=first.command,
+        )
 
     async def _validate_findings(
         self, exchange: HttpExchange, reports: list[AgentReport], *, run_context=None
@@ -296,12 +430,20 @@ class ConfirmMixin:
             return [], []
         jobs = []
         plans: list = []
-        metas: list = []  # (finding, validator, exact case) parallel to jobs
+        metas: list = []  # (original finding, validator, exact case, routed finding) parallel to jobs
         if run_context is None:
             from harness.run_context import RunContext
+            # Fallback create for direct callers that pass no context (the real
+            # analyze() path builds and seeds the context itself). Carry the
+            # operator's active/mutating policy into the per-run gate so a
+            # validator authorizing a mutating send through run_context.gate is
+            # not blocked by a flag-less default gate when active mode is on
+            # (see per_run_gate_config / orchestrator_detect.analyze).
+            _cfg = getattr(self, "config", {}) or {}
             run_context = RunContext.create(
                 allowed_hosts=getattr(self, "allowed_hosts", []),
-                config=getattr(self, "config", {}))
+                config=_cfg,
+                gate_config=per_run_gate_config(_cfg, getattr(self, "validator_registry", None)))
         _run_id = run_context.run_id
         _template_id = evidence._short(
             (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
@@ -326,7 +468,8 @@ class ConfirmMixin:
         for report_index, report in enumerate(reports):
             for finding_index, finding in enumerate(report.findings):
                 case = _case_for(finding, report, report_index, finding_index)
-                validators = self.validator_registry.for_finding(finding, exchange)
+                validators = self.validator_registry.for_finding(
+                    finding, exchange, agent=report.agent)
                 bind_context = getattr(self.validator_registry, "bind_run_context", None)
                 if bind_context is not None:
                     validators = bind_context(validators, run_context)
@@ -352,9 +495,23 @@ class ConfirmMixin:
                     except Exception:
                         pass
                 for validator in validators:
-                    jobs.append(validator.validate(finding, exchange))
-                    plans.append(validator.plan(finding, exchange))
-                    metas.append((finding, validator, case))
+                    # Applicability must survive validators' plan/validate rechecks.
+                    # Prefer the original label per validator; route only a private
+                    # copy, retaining the original evidence and case coordinates.
+                    routed = finding
+                    applies = getattr(validator, "applies", None)
+                    if report.agent and applies is not None and not applies(finding, exchange):
+                        candidate = finding.model_copy(
+                            deep=True, update={"vulnerability_class": report.agent})
+                        if not applies(candidate, exchange):
+                            continue
+                        routed = candidate
+                    jobs.append(self._maybe_replay(validator, routed, exchange))
+                    plan = validator.plan(routed, exchange)
+                    if plan is not None and routed is not finding:
+                        plan = plan.model_copy(update={"finding_class": finding.vulnerability_class})
+                    plans.append(plan)
+                    metas.append((finding, validator, case, routed))
         if not jobs:
             return [], []
         # R29: bound this phase's concurrency instead of firing every
@@ -369,7 +526,7 @@ class ConfirmMixin:
         output: list[ValidationReport] = []
         proofs: list[dict] = []
         for result, plan, meta in zip(results, plans, metas):
-            finding, validator, case = meta
+            finding, validator, case, routed = meta
             if isinstance(result, Exception):
                 log.warning("validator failed: %s", result)
                 # W-11: count the crashed leg so a run where a validator throws on
@@ -395,14 +552,58 @@ class ConfirmMixin:
                         output.append(ValidationReport(
                             validator=getattr(validator, "name", "validator"), status="error",
                             finding_class=finding.vulnerability_class, confirmed=False,
-                            summary=f"proof persistence failed: {reason}", evidence=str(result)[:300]))
+                            summary=f"proof persistence failed: {reason}", evidence=str(result)[:300],
+                            url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                            parameter=getattr(finding, "parameter_name", "")))
                 except Exception as e:  # proof bookkeeping must never break analysis
                     log.warning("proof bookkeeping failed for errored validator: %s", e)
                     output.append(ValidationReport(
                         validator=getattr(validator, "name", "validator"), status="error",
                         finding_class=finding.vulnerability_class, confirmed=False,
-                        summary=f"proof persistence failed: {e}", evidence=str(result)[:300]))
+                        summary=f"proof persistence failed: {e}", evidence=str(result)[:300],
+                        url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                        parameter=getattr(finding, "parameter_name", "")))
                 continue
+            # Results may come from a cache; never mutate the shared value.
+            if routed is not finding:
+                from dataclasses import replace
+                # `routed` was only reached via the agent-fallback (its own
+                # declared classes matched nothing on `finding` directly --
+                # see ValidatorRegistry.for_finding): `routed.vulnerability_class`
+                # is the bare PRODUCING-AGENT name (e.g. "auth", "sqli"), a
+                # routing token, not a claim. A well-behaved validator echoes
+                # whatever class it was handed back in `result.finding_class`
+                # (sqlmap, cross_identity, crypto, ... all do), so this is a
+                # no-op for them. But a validator that instead returns some
+                # OTHER hardcoded class naming a specific sub-check it ran
+                # (auth_sequence's session_fixation/weak_password/
+                # username_enumeration/2fa_bypass) can fire a check wholly
+                # unrelated to `finding`'s real claim and still report
+                # confirmed=True -- which must never be stamped onto a
+                # finding it was never actually about. Reproduced bug:
+                # REPORT_2026-10-15_decisive_reproducibility.md (a confirmed
+                # username-enumeration result validating an unrelated
+                # cleartext_transmission finding, 6/30 per run, 3/3 runs).
+                # This check is the general backstop; auth_sequence's own
+                # dispatch is additionally hardened (see
+                # AuthSequenceValidator._which_checks) so it declines to run
+                # an unrelated check at all, rather than running it and
+                # relying on this catch after the fact.
+                tested_class = (result.finding_class or "").strip().lower()
+                fallback_label = (routed.vulnerability_class or "").strip().lower()
+                if result.confirmed and tested_class != fallback_label:
+                    result = replace(
+                        result, confirmed=False, status="skipped",
+                        finding_class=finding.vulnerability_class,
+                        summary=(
+                            f"{result.validator} confirmed {result.finding_class!r} via the "
+                            f"agent-fallback route (producing agent {routed.vulnerability_class!r}), "
+                            f"which does not match this finding's own class "
+                            f"{finding.vulnerability_class!r} -- not treated as confirmation of "
+                            f"this finding."),
+                    )
+                else:
+                    result = replace(result, finding_class=finding.vulnerability_class)
             output.append(ValidationReport(
                 validator=result.validator,
                 status=result.status,
@@ -411,51 +612,65 @@ class ConfirmMixin:
                 confirmed=result.confirmed,
                 summary=result.summary,
                 evidence=result.evidence,
+                # FR-5 (F09): case identity for this validation attempt -- lets the
+                # confirmation gate bind a controlled negative to the SAME
+                # parameter it actually tested, not just the class.
+                url=getattr(exchange, "url", ""),
+                method=getattr(exchange, "method", ""),
+                parameter=getattr(finding, "parameter_name", ""),
+                # SC-3: bind this validation attempt to the principal it ran
+                # under, so the gate can't let a negative from one principal
+                # suppress a finding discovered under a different principal.
+                principal_id=getattr(finding, "principal_id", ""),
+                control_outcome=getattr(result, "control_outcome", "") or "",
+                manual_verification=getattr(result, "manual_verification", "") or "",
             ))
-            # P0-1: VALIDATION_DECISION -- "why was it concluded (vulnerable or
-            # not)", the confirmation half of a finding's audit trail. Recorded
-            # for every reached verdict (confirmed, not_confirmed, skipped), not
-            # only confirmations, so a REFUTED/UNVERIFIED finding's reconstruction
-            # is just as complete. Read-only: this call cannot affect `result`,
-            # `finding`, or anything read below it.
+            # I04: a check that cannot confirm automatically but leaves a
+            # human-verifiable candidate surfaces its steps as the finding's next
+            # step (Burp details pane, reports, API). Guidance, never authority.
+            if getattr(result, "manual_verification", "") and not result.confirmed:
+                _previous = (finding.suggested_test or "").strip()
+                finding.manual_verification = result.manual_verification
+                finding.suggested_test = result.manual_verification + (
+                    f"\n\nAgent suggestion: {_previous}"
+                    if _previous and result.manual_verification not in _previous else "")
+            # P0-1/T01 (RB-4 shared helper): VALIDATION_DECISION -- "why was it
+            # concluded (vulnerable or not)" -- plus the case-bound structured
+            # proof for this attempt, built/persisted together by
+            # _persist_confirmation_proof so PASS1 (here) and PASS2
+            # (orchestrator_chain.py) share one mechanism instead of two.
+            # Recorded for every reached verdict (confirmed, not_confirmed,
+            # skipped), not only confirmations, so a REFUTED/UNVERIFIED
+            # finding's reconstruction is just as complete, and each attempt
+            # gets its OWN proof (unique proof_id). Additive -- the class-keyed
+            # confirmed-flag binding below stays as the compatibility view
+            # during migration (full case-bound confirmation is sequenced with
+            # issue identity, T06).
             try:
-                from harness import evidence_ledger
-                evidence_ledger.emit(
-                    evidence_ledger.EventType.VALIDATION_DECISION, finding.finding_id,
-                    f"{result.validator}: {result.status}"
-                    + (" (confirmed)" if result.confirmed else "")
-                    + (f" -- {result.summary}" if result.summary else ""),
-                    data={"validator": result.validator, "status": result.status,
-                          "confirmed": result.confirmed, "confidence": result.confidence,
-                          "evidence": (result.evidence or "")[:1000]},
-                    provenance=evidence_ledger.Provenance.capture(
-                        config=getattr(self, "config", {})),
-                    case_ref=case.case_id)
-            except Exception:
-                pass
-            # Case-bound structured proof for this attempt (T01): persisted and
-            # returned through the response so a confirmation is evidence, not a bare
-            # boolean, and each attempt gets its OWN proof (unique proof_id). Additive
-            # -- the class-keyed confirmed-flag binding below stays as the
-            # compatibility view during migration (full case-bound confirmation is
-            # sequenced with issue identity, T06).
-            try:
-                pr = evidence.ProofRecord.from_validation_result(
-                    case=case, validator=result.validator,
+                ok, proof_dict, reason = await self._persist_confirmation_proof(
+                    case=case, validator_name=result.validator,
                     validator_version=getattr(validator, "version", ""),
                     status=result.status, confirmed=result.confirmed,
                     observed_result=(result.summary or result.evidence or "")[:500],
-                    expected_invariant=getattr(validator, "expected_invariant", ""))
-                ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
+                    expected_invariant=getattr(validator, "expected_invariant", ""),
+                    finding_ref=finding.finding_id,
+                    ledger_summary=(
+                        f"{result.validator}: {result.status}"
+                        + (" (confirmed)" if result.confirmed else "")
+                        + (f" -- {result.summary}" if result.summary else "")),
+                    ledger_data={"validator": result.validator, "status": result.status,
+                                 "confirmed": result.confirmed, "confidence": result.confidence,
+                                 "evidence": (result.evidence or "")[:1000]},
+                )
                 if ok:
-                    proofs.append(pr.to_dict())
+                    proofs.append(proof_dict)
                     if result.confirmed:
                         finding.confirmed = True
                         finding.confidence = max(finding.confidence, result.confidence)
                         finding.review_verdict = finding.review_verdict or "validator-confirmed"
                         finding.review_note = (finding.review_note or "") + (
                             " " if finding.review_note else "") + result.summary
-                        finding.proof_id = pr.proof_id
+                        finding.proof_id = proof_dict["proof_id"]
                         finding.case_id = case.case_id
                         # Shape-precondition placeholders start with empty evidence.
                         # Preserve any agent evidence; otherwise retain the
@@ -468,19 +683,26 @@ class ConfirmMixin:
                         finding.confirmed_by_leg = result.validator
                         # P0.1-WIRE: oracle gate runs (or no-ops, per config)
                         # at the exact moment a finding is first confirmed.
-                        await self._oracle_gate(finding, exchange)
+                        if routed is finding:
+                            await self._oracle_gate(finding, exchange)
+                        else:
+                            await self._oracle_gate(finding, exchange, routing_finding=routed)
                 else:
                     log.warning("failed to persist proof for %s: %s", result.validator, reason)
                     output[-1] = ValidationReport(
                         validator=result.validator, status="error",
                         finding_class=result.finding_class, confidence=0.0, confirmed=False,
-                        summary=f"proof persistence failed: {reason}", evidence=result.evidence)
+                        summary=f"proof persistence failed: {reason}", evidence=result.evidence,
+                        url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                        parameter=getattr(finding, "parameter_name", ""))
             except Exception as e:
                 log.warning("proof bookkeeping failed for %s: %s", result.validator, e)
                 output[-1] = ValidationReport(
                     validator=result.validator, status="error",
                     finding_class=result.finding_class, confidence=0.0, confirmed=False,
-                    summary=f"proof persistence failed: {e}", evidence=result.evidence)
+                    summary=f"proof persistence failed: {e}", evidence=result.evidence,
+                    url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                    parameter=getattr(finding, "parameter_name", ""))
             if plan is not None:
                 await asyncio.to_thread(
                     store.persist_test_plans, exchange, [plan]
@@ -511,11 +733,22 @@ class ConfirmMixin:
         # access-control hypothesis is false, exactly like access_control_gate's
         # denial rule. Cap confidence and severity so the guess stops reading as
         # actionable, while keeping it (at low) for audit.
+        #
+        # RA-7: cross_identity_validator returns status="not_confirmed" for
+        # THREE distinct outcomes -- a genuine control-held reject (every
+        # considered identity + anon denied), an ownership-authorized
+        # observation, and a BFLA reached-but-unproven observation. Only the
+        # first is a real refutation; the other two are inconclusive leads
+        # that must not be capped/demoted/stamped "access correctly
+        # restricted". control_outcome=="control_held" is the discriminator
+        # (getattr for safety against older/foreign ValidationResult
+        # instances that predate the field).
         for result, meta in zip(results, metas):
-            finding, validator, _case = meta
+            finding, validator, _case, _routed = meta
             if (not isinstance(result, Exception)
                     and result.validator == "cross_identity"
                     and result.status == "not_confirmed"
+                    and getattr(result, "control_outcome", "") == "control_held"
                     and not finding.confirmed
                     and finding.confidence > _CROSS_IDENTITY_REJECT_CAP):
                 finding.original_confidence = finding.confidence

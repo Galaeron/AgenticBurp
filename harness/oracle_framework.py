@@ -181,15 +181,19 @@ class Oracle:
     async def run_negative_control(
         self, finding: Finding, exchange: HttpExchange
     ) -> tuple[bool, bool, Optional[ValidationResult]]:
-        """Returns (available, clean, result). `clean` is True only when the probe
-        declined to confirm on the benign variant. Unavailable -> (False, False, None)."""
+        """Returns (available, clean, result). "clean" now means the control probe
+        EXECUTED to a `not_confirmed` verdict -- a `skipped`/`error`/`blocked` (or
+        otherwise cancelled) control run is INCONCLUSIVE, never clean, even though it
+        did not confirm (Q03/Q11: an unreachable probe must not read as a clean
+        negative). Reuses the same `_clean_negative` helper the reproduction path
+        uses. Unavailable -> (False, False, None)."""
         if self.negative_control is None:
             return False, False, None
         benign = self.negative_control(exchange)
         if benign is None:
             return False, False, None
         res = await self.validator.validate(finding, benign)
-        return True, (not _is_confirmed(res)), res
+        return True, _clean_negative([res]), res
 
     async def run(self, finding: Finding, exchange: HttpExchange) -> ProofCapsule:
         reproduced, reps = await self.reproduce(finding, exchange)
@@ -222,8 +226,14 @@ class Oracle:
                       "stays a candidate")
         elif available and not clean:
             verified = False
-            reason = ("reproduced N-of-N but the negative control ALSO confirmed on a benign "
-                      "variant -- the probe is not discriminating; likely false positive")
+            if _is_confirmed(neg):
+                reason = ("reproduced N-of-N but the negative control ALSO confirmed on a benign "
+                          "variant -- the probe is not discriminating; likely false positive")
+            else:
+                _cs = (getattr(neg, "status", "") or "").lower() or "unknown"
+                reason = ("reproduced N-of-N but the negative control did NOT execute to a clean "
+                          f"not_confirmed verdict (control status={_cs!r}) -- INCONCLUSIVE; cannot "
+                          "rule out a probe that confirms on any input, so it stays a candidate")
         else:
             verified = True
             reason = ("reproduced N-of-N"

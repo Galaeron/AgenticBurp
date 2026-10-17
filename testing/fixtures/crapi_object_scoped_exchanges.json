@@ -1,0 +1,106 @@
+{
+  "_comment": "Phase 1.4 dry-run corpus: the captured crAPI requests that touch other users' objects (vehicles, orders/videos, community posts) or admin-namespaced endpoints. Request headers/bodies are intentionally omitted -- the cross-user DISPATCH check keys off the object-scoped URL + an access-control finding, not the (throwaway, local) tokens. Selected with the validator's own has_object_identifier / is_admin_namespaced.",
+  "generated_from": "exchanges.json",
+  "generated_utc": "2026-10-11T05:54:55.116392+00:00",
+  "count": 14,
+  "exchanges": [
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/identity/api/v2/vehicle/b966f839-8a46-4e0e-afd4-3c9e93346fa2/location",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "POST",
+      "url": "http://localhost:8888/identity/api/v2/user/pictures",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/identity/api/v2/user/videos/9",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "PUT",
+      "url": "http://localhost:8888/identity/api/v2/user/videos/9",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/identity/api/v2/user/videos/convert_video?video_id=9",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/identity/api/v2/vehicle/d2653f7b-f111-4c34-9d0b-84dd68f5951d/location",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/identity/api/v2/user/videos/10",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "PUT",
+      "url": "http://localhost:8888/identity/api/v2/user/videos/10",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/community/api/v2/community/posts/mAgCrwkrzNinkKKzvRoBSG",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "POST",
+      "url": "http://localhost:8888/community/api/v2/community/posts/mAgCrwkrzNinkKKzvRoBSG/comment",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/community/api/v2/community/posts/bRxFafqgKuDHiiYZ8wKNVk",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/workshop/api/shop/orders/18",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "POST",
+      "url": "http://localhost:8888/workshop/api/shop/orders/return_order?order_id=18",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    },
+    {
+      "method": "GET",
+      "url": "http://localhost:8888/workshop/api/shop/orders/19",
+      "host": "localhost",
+      "object_scoped": true,
+      "function_level": false
+    }
+  ]
+}

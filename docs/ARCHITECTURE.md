@@ -34,7 +34,7 @@ and requalification requirements live in [ORACLE_RETIREMENTS.md](../ORACLE_RETIR
 Evaluation code has overlapping layers: `testing/score.py` and
 `testing/nightly_precision.py`, standalone `evaluation_integrity/`, and newer
 `harness/{score_provenance,evidence_audit,coverage_summary,eval_health}.py` helpers.
-The [implementation review](../reviews/2026-09-19/implementation-review/REVIEW.md)
+A 2026-09-19 implementation review (not retained in the repo)
 identified missing consumers at `8f63511`. Subsequent commits through `57bcc02`
 added consumers in `testing/score.py` (provenance), `issues.py` (proof audit),
 `coverage_tracker.py` (execution summary) and the evaluation driver (health).

@@ -308,11 +308,22 @@ class DeclaredIdentityTests(unittest.TestCase):
                 self.assertEqual(next(iter(suite)).id(), spec.test_id)
 
     def test_old_flat_module_identity_does_not_resolve(self):
+        # A pre-package flat module id must never be an accepted declared
+        # identity. Asserting an outright import error is not robust: it only
+        # held when the harness dir was not itself a sys.path entry. Under the
+        # full suite (`discover -s harness`) harness IS on sys.path, so the flat
+        # name imports -- but it loads as a DISTINCT id (no 'harness.' prefix)
+        # that matches no declared test_id, which is the guarantee that matters.
+        flat = ("test_mass_assignment_slice.MassAssignmentSliceTest."
+                "test_harness_sequence_validator_confirms_vulnerable")
+        declared = {s.test_id for s in cm.REQUIREMENT_TESTS}
+        self.assertNotIn(flat, declared, "the flat pre-package id must not be a declared identity")
         loader = unittest.TestLoader()
-        loader.loadTestsFromName(
-            "test_mass_assignment_slice.MassAssignmentSliceTest."
-            "test_harness_sequence_validator_confirms_vulnerable")
-        self.assertTrue(loader.errors, "negative control must reject the pre-package ID")
+        suite = loader.loadTestsFromName(flat)
+        loaded = set() if loader.errors else {t.id() for t in suite}
+        self.assertFalse(loaded & declared,
+                         "the flat pre-package id must not resolve to any declared "
+                         "(package-qualified) test")
 
 
 if __name__ == "__main__":

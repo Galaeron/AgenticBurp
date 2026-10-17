@@ -1,0 +1,143 @@
+{
+  "corpus": "dvwa",
+  "version": "0.0.1",
+  "hash": "3f1ffd43d9e00a738c6c8610fdb60d6cefbed888ba37a8e216b6bb5fdece3dbb",
+  "records": [
+    {
+      "exchange_id": "DV00",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "DV00: admin login (setup)",
+      "status": "setup",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV01",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "sqli"
+      ],
+      "label_scope": "DV01: SQLi baseline id=1 (single row)",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV02",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "DV02: SQLi id=1' OR '1'='1 (dumps all users)",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV03",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "DV03: SQLi UNION dumps password hashes",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV04",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "command_injection"
+      ],
+      "label_scope": "DV04: cmd-injection baseline ping 127.0.0.1",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV05",
+      "expected_classes": [
+        "command_injection"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "DV05: cmd-injection ;id executes",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV06",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "xss"
+      ],
+      "label_scope": "DV06: reflected-XSS benign name",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV07",
+      "expected_classes": [
+        "xss"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "DV07: reflected-XSS script unescaped",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV08",
+      "expected_classes": [],
+      "tested_negative_classes": [
+        "path_traversal"
+      ],
+      "label_scope": "DV08: LFI baseline include.php",
+      "status": "negative",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV09",
+      "expected_classes": [
+        "path_traversal"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "DV09: LFI /etc/passwd disclosure",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV10",
+      "expected_classes": [],
+      "tested_negative_classes": [],
+      "label_scope": "DV10: blind-SQLi false condition",
+      "status": "inconclusive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV11",
+      "expected_classes": [
+        "sqli"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "DV11: blind-SQLi true condition (exists)",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV12",
+      "expected_classes": [
+        "csrf"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "DV12: CSRF password change via GET, no token",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    },
+    {
+      "exchange_id": "DV13",
+      "expected_classes": [
+        "info_disclosure"
+      ],
+      "tested_negative_classes": [],
+      "label_scope": "DV13: phpinfo() exposed",
+      "status": "positive",
+      "provenance": "public app knowledge + permitted corpus label/note; no answer-key file read"
+    }
+  ]
+}

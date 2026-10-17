@@ -185,13 +185,19 @@ class ReportMixin:
 
     def effort_status(self) -> EffortStatus:
         """Get current effort budget status."""
+        accounting = self.effort_budget.accounting()
         return EffortStatus(
             mode=self.effort_budget.mode.value,
             total_tokens=self.effort_budget.total_tokens,
-            spent_tokens=self.effort_budget.spent,
-            remaining_tokens=self.effort_budget.remaining,
+            spent_tokens=accounting["known_tokens"],
+            remaining_tokens=accounting["remaining_admission_tokens"],
             exhausted=self.effort_budget.exhausted(),
             breakdown=self.effort_budget.ledger.breakdown(),
+            usage_complete=accounting["usage_complete"],
+            tokens_lower_bound=not accounting["usage_complete"],
+            pending_admission_tokens=accounting["pending_admission_tokens"],
+            unmeasured_admission_tokens=accounting["unmeasured_admission_tokens"],
+            call_counts={key: value for key, value in accounting.items() if key.endswith("_calls")},
         )
     
     def list_agents(self) -> list[dict]:

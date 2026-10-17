@@ -31,6 +31,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from harness.categories import canonicalize
 from harness.engagement import normalize_path
+from harness import security
 
 _ISSUE_VERSION = 1
 
@@ -61,6 +62,21 @@ def _affected_input(finding: dict) -> str:
     return f"{loc}:{name}"
 
 
+# RB-3 (INV-4): the `vulnerability_class` prefixes orchestrator_detect.py's
+# `_resolve_known_vulnerabilities`/`_check_registry_ages` stamp onto a
+# dependency/banner advisory (`known-vulnerable-dependency:<component>`,
+# `recently-published-dependency:<component>`). A finding in this family is a
+# HOST-level fact about the running software (e.g. "this host runs a
+# vulnerable Werkzeug version"), observed passively from a response header/
+# manifest -- not an endpoint- or method-scoped claim, and it never carries a
+# parameter_location/parameter_name (so `_affected_input` above is always "").
+_DEPENDENCY_CLASS_PREFIXES = ("known-vulnerable-dependency:", "recently-published-dependency:")
+
+
+def _is_dependency_class(vulnerability_class: str) -> bool:
+    return (vulnerability_class or "").strip().lower().startswith(_DEPENDENCY_CLASS_PREFIXES)
+
+
 # --------------------------------------------------------------------------- #
 # Redaction -- an export/replay must never carry a live secret
 # --------------------------------------------------------------------------- #
@@ -89,7 +105,8 @@ def redact(text: str) -> str:
     Authorization/Cookie lines, secret-keyed query/form/JSON values, and bare JWTs.
     Conservative and idempotent: it never fabricates, only masks recognizable
     secret shapes."""
-    out = text or ""
+    from harness import security
+    out = security.sanitize_text(text or "")
     for pat, repl in _SECRET_PATTERNS:
         out = pat.sub(repl, out)
     return out
@@ -101,6 +118,8 @@ def redact_url(url: str) -> str:
     `user:pass@` while keeping the endpoint itself legible."""
     if not url:
         return url or ""
+    from harness import security
+    url = security.redact_secrets_in_url(url)
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -222,13 +241,34 @@ def issue_key(finding: dict) -> tuple:
     input, and authorization boundary. When the affected input is UNKNOWN, a
     per-finding disambiguator (finding_id/fingerprint) is added so two distinct
     unattributed findings do NOT collapse into one issue (review R04); attributed
-    inputs and repeated object ids that share a known input still group."""
+    inputs and repeated object ids that share a known input still group.
+
+    RB-3 (INV-4) exception: a dependency/banner-class finding (see
+    `_is_dependency_class`) is a host-level advisory about running software,
+    not an endpoint-scoped claim -- the identical advisory can be
+    independently re-observed on many different exchanges/endpoints (each
+    carrying its own url/finding_id), and, having no parameter_location/
+    parameter_name, would otherwise always hit the UNKNOWN-input branch above
+    and get the finding_id/fingerprint disambiguator appended -- turning every
+    repeat into its own issue. That disambiguator exists to stop an unknown
+    input acting as a wildcard over otherwise-unrelated findings (R04); it is
+    not needed here because `canon` already carries the exact component
+    identity (canonicalize() returns None for these compound
+    "prefix:<component>" strings -- no CANONICAL_CATEGORIES/_SYNONYMS entry
+    matches -- so `canon` falls back to the raw lowercased string, keeping two
+    DIFFERENT components, e.g. Werkzeug vs Flask, on different keys). So this
+    branch groups by host + canonical class/component only: endpoint_family
+    and method are dropped (irrelevant to a host-wide banner) and no
+    disambiguator is added, letting genuinely identical advisories collapse to
+    ONE issue regardless of which exchange first surfaced them."""
     url = finding.get("url", "")
     host = _host_of(url)
-    family = normalize_path(url) if url else ""
     method = (finding.get("method") or "").upper()
     vc = finding.get("vulnerability_class", "") or ""
     canon = canonicalize(vc) or vc.strip().lower()
+    if _is_dependency_class(vc):
+        return (host, "", "", canon, "", "read", "")
+    family = normalize_path(url) if url else ""
     affected = _affected_input(finding)
     # Unknown input is not a wildcard: keep distinct findings distinct.
     disambiguator = "" if affected else (finding.get("finding_id") or finding.get("fingerprint") or "")
@@ -437,7 +477,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
     missing_artifacts.append("raw captured request/response bytes are not stored with the finding; "
                              "replay from the linked proof/exchange artifacts")
 
-    return {
+    return security.sanitize_data({
         "issue_id": issue.issue_id,
         "version": issue.version,
         "title": f"{issue.vulnerability_class} on {redact_url(issue.host)}{issue.endpoint_family or '/'}"
@@ -446,6 +486,8 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "severity": issue.severity,
         "confidence": round(issue.confidence, 3),
         "confirmed": issue.confirmed,
+        **__import__("harness.confirmation_gate", fromlist=["finding_triage"]).finding_triage(
+            {**best, "confirmed": issue.confirmed}),
         # R01/R06: oracle verification state must survive export, distinct
         # from the legacy `confirmed` (leg fired once) axis -- a consumer
         # reading only `confirmed` cannot tell a leg-confirmed-but-unverified
@@ -483,6 +525,8 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "proof_references": proof_refs,
         "affected_instances": [redact_url(u) for u in issue.affected_instances],
         "instances_count": len(issue.members),
+        "captured_auth_contexts": sorted({member.get("captured_principal_id") for member in issue.members
+                                          if member.get("captured_principal_id")}),
         "artifacts": {"replayable": has_proof, "missing": missing_artifacts},
         "limitations": _limitations(issue),
         "retest": (
@@ -490,7 +534,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
             f"a fix means the {boundary_word} attempt no longer succeeds. This retest "
             f"maps to issue {issue.issue_id} (stable id), so the result links to this "
             f"issue -- and is appended as a new attempt -- instead of opening a new one."),
-    }
+    })
 
 
 def replay_view(issue: Issue) -> dict:
@@ -509,8 +553,8 @@ def replay_view(issue: Issue) -> dict:
         "issue_id": issue.issue_id,
         "method": issue.method,
         "host": redact_url(issue.host),
-        "endpoint_family": issue.endpoint_family,
-        "affected_input": issue.affected_input,
+        "endpoint_family": security.sanitize_text(issue.endpoint_family),
+        "affected_input": security.sanitize_text(issue.affected_input),
         "principals": steps,
         "instances": [redact_url(u) for u in issue.affected_instances],
         # request bodies/evidence are redacted even in the local view -- the

@@ -42,6 +42,14 @@
 > first"). Where a specific claim here conflicts with `CLAUDE.md` /
 > `CURRENT_STATE.md` / `SCORECARD.md`, **those win** — this file is the *framing*,
 > they are the *ground truth*.
+>
+> **Correction (2026-09-28):** §0's "within six fixed confirmation legs" is now
+> a significant understatement, not a wrong-direction error like the 2026-09-04
+> ones — kept unstruck since the *shape* of the claim (deterministic legs prove
+> bugs, not the model) is still exactly right. [LEG_VERIFICATION.md](LEG_VERIFICATION.md)
+> now lists 14 distinct live-verified legs (real target/fixture + matched
+> negative control each) and `harness/validators/registry.py` registers 35
+> validators total. Treat "six" below as the 2026-09-04-era count, not current.
 
 ## 0. The verdict, before the evidence
 

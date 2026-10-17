@@ -4,7 +4,6 @@ import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.harness.llm.model.AnalysisModels.AnalysisRequest;
 import com.harness.llm.model.AnalysisModels.AnalysisResponse;
-import com.harness.llm.model.AnalysisModels.ErrorBody;
 import com.harness.llm.model.AnalysisModels.EstimateRequest;
 import com.harness.llm.model.AnalysisModels.EstimateResponse;
 import com.harness.llm.model.AnalysisModels.PrioritizeRequest;
@@ -36,6 +35,9 @@ public class HarnessClient {
     public static class HarnessException extends Exception {
         public HarnessException(String message) { super(message); }
         public HarnessException(String message, Throwable cause) { super(message, cause); }
+        private String failureKind = "unspecified";
+        public String getFailureKind() { return failureKind; }
+        private HarnessException(String kind, String message) { super(message); failureKind = kind; }
     }
 
     private final Gson gson = new Gson();
@@ -49,18 +51,23 @@ public class HarnessClient {
     // budget from timeoutSeconds: concurrency.max_parallel_agents (see
     // harness/config.yaml) trades dispatch throughput for staying within
     // a single GPU's VRAM, which means more total wall-clock time for a
-    // dispatch involving several agents, not less -- a single shared
-    // 120s budget across every endpoint was never going to survive real
-    // inference once Ollama was actually reachable, and generously
-    // covers even the coordinator's fail-open-to-all-36-agents fallback
-    // (see orchestrator.py) at limited concurrency.
-    private volatile int analysisTimeoutSeconds = 600;
+    // dispatch involving several agents, not less.
+    //
+    // Default raised 600 -> 1800s: at the default max_parallel_agents=1,
+    // individual qwen3:8b calls of 80-100s on a consumer GPU mean a single
+    // exchange that dispatches ~8 agents plus a critique pass can run well
+    // past 600s and time the client out mid-run (findings lost, server work
+    // wasted). 1800s (30 min) covers a realistic serial curated dispatch;
+    // raise concurrency.max_parallel_agents on capable hardware to cut this
+    // wall-clock time (see harness/config.yaml and docs/USER_MANUAL.md).
+    // Runtime-adjustable via setAnalysisTimeoutSeconds (no rebuild needed).
+    private volatile int analysisTimeoutSeconds = 1800;
     private volatile String bearerToken;
 
     public HarnessClient(String baseUrl, int timeoutSeconds) {
-        this.baseUrl = baseUrl;
+        this.baseUrl = validatedBaseUrl(baseUrl);
         this.timeoutSeconds = timeoutSeconds;
-        this.bearerToken = System.getenv("HARNESS_BEARER_TOKEN");
+        setBearerToken(System.getenv("HARNESS_BEARER_TOKEN"));
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
                 // Explicitly bypass any system/JVM-wide proxy. This client
@@ -94,8 +101,33 @@ public class HarnessClient {
                 .build();
     }
 
-    public void setBaseUrl(String baseUrl) {
-        this.baseUrl = baseUrl;
+    private static String validatedBaseUrl(String baseUrl) {
+        URI uri;
+        try {
+            uri = URI.create(baseUrl.trim());
+        } catch (RuntimeException malformedUrl) {
+            throw new IllegalArgumentException("Invalid harness URL; enter a loopback HTTP or HTTPS service origin");
+        }
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        boolean loopback = host != null && (host.equalsIgnoreCase("localhost")
+                || host.equals("127.0.0.1") || host.equals("[::1]") || host.equals("::1"));
+        if (host == null || !("https".equalsIgnoreCase(scheme)
+                || ("http".equalsIgnoreCase(scheme) && loopback))
+                || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null
+                || !(uri.getPath().isEmpty() || uri.getPath().equals("/"))
+                || uri.getPort() == 0 || uri.getPort() > 65535) {
+            throw new IllegalArgumentException("Harness URL must be loopback HTTP or HTTPS, without credentials, path, query or fragment");
+        }
+        int port = uri.getPort() == -1 ? ("https".equalsIgnoreCase(scheme) ? 443 : 80) : uri.getPort();
+        return scheme.toLowerCase(java.util.Locale.ROOT) + "://"
+                + host.toLowerCase(java.util.Locale.ROOT) + ":" + port;
+    }
+
+    public synchronized void setBaseUrl(String baseUrl) {
+        String normalized = validatedBaseUrl(baseUrl);
+        if (!normalized.equals(this.baseUrl)) bearerToken = null;
+        this.baseUrl = normalized;
     }
 
     public void setTimeoutSeconds(int timeoutSeconds) {
@@ -112,6 +144,93 @@ public class HarnessClient {
 
     private volatile String lastHealthCheckError = null;
 
+    private static HarnessException failed(String kind, String message) {
+        return new HarnessException(kind, message);
+    }
+
+    private static HarnessException httpFailure(int status) {
+        String kind = status == 401 ? "authentication" : status == 429 ? "throttled"
+                : status >= 500 ? "server_error" : "http_error";
+        String instruction = status == 401 ? " Enter the credential for this service and reconnect; an ephemeral credential changes after restart."
+                : status == 429 ? " Service throttled the request; no automatic retry was performed." : " Upstream details withheld.";
+        return failed(kind, "Harness request unsuccessful (HTTP " + status + ")." + instruction);
+    }
+
+    private HttpResponse<String> sendBounded(HttpRequest request) throws HarnessException {
+        try {
+            return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (HttpTimeoutException timeout) {
+            throw failed("timeout", "Client wait timed out; server completion and cancellation are unknown. No automatic retry was performed.");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw failed("interrupted", "Client wait interrupted; server completion and cancellation are unknown.");
+        } catch (IOException disconnected) {
+            throw failed("disconnected", "Harness connection failed; server completion is unknown. Transport details withheld.");
+        }
+    }
+
+    private static com.google.gson.JsonObject responseObject(String body) throws HarnessException {
+        var tree = responseValue(body);
+        if (!tree.isJsonObject()) throw failed("malformed", "Harness returned unsupported JSON shape; details withheld.");
+        return tree.getAsJsonObject();
+    }
+
+    private static com.google.gson.JsonElement responseValue(String body) throws HarnessException {
+        try {
+            if (body == null || body.isBlank() || body.length() > 2_000_000) throw new IllegalArgumentException();
+            var reader = new com.google.gson.stream.JsonReader(new java.io.StringReader(body));
+            reader.setLenient(false);
+            var tree = com.google.gson.internal.Streams.parse(reader);
+            if (!(tree.isJsonObject() || tree.isJsonArray()) || reader.peek() != com.google.gson.stream.JsonToken.END_DOCUMENT) throw new IllegalArgumentException();
+            return tree;
+        } catch (Exception malformed) {
+            throw failed("malformed", "Harness returned malformed or unsupported JSON; no successful result is available. Details withheld.");
+        }
+    }
+
+    private <T> T parseTypedResponse(String body, java.lang.reflect.Type type) throws HarnessException {
+        try {
+            return gson.fromJson(responseValue(body), type);
+        } catch (HarnessException failure) { throw failure; }
+        catch (RuntimeException malformed) {
+            throw failed("malformed", "Harness returned malformed typed data; details withheld.");
+        }
+    }
+
+    private static boolean stringField(com.google.gson.JsonObject object, String field) {
+        return object.has(field) && object.get(field).isJsonPrimitive() && object.get(field).getAsJsonPrimitive().isString();
+    }
+
+    private static void requireAnalysisShape(com.google.gson.JsonObject object) throws HarnessException {
+        boolean valid = stringField(object, "coordinator_model") && !object.get("coordinator_model").getAsString().isBlank()
+                && stringField(object, "summary") && object.has("dispatched_agents") && object.get("dispatched_agents").isJsonArray()
+                && object.has("agent_reports") && object.get("agent_reports").isJsonArray();
+        if (valid) {
+            for (var agent : object.getAsJsonArray("dispatched_agents"))
+                valid &= agent.isJsonPrimitive() && agent.getAsJsonPrimitive().isString();
+            for (var report : object.getAsJsonArray("agent_reports")) {
+                if (!report.isJsonObject()) { valid = false; break; }
+                var row = report.getAsJsonObject();
+                if (!stringField(row, "agent") || !stringField(row, "model") || !row.has("findings") || !row.get("findings").isJsonArray()) {
+                    valid = false; break;
+                }
+                for (var finding : row.getAsJsonArray("findings")) {
+                    if (!finding.isJsonObject()) { valid = false; break; }
+                    var item = finding.getAsJsonObject();
+                    for (String field : List.of("vulnerability_class", "summary", "evidence", "suggested_test", "basis"))
+                        valid &= stringField(item, field);
+                    valid &= item.has("confidence") && item.get("confidence").isJsonPrimitive()
+                            && item.get("confidence").getAsJsonPrimitive().isNumber();
+                    if (valid) {
+                        double confidence = item.get("confidence").getAsDouble();
+                        valid &= Double.isFinite(confidence) && confidence >= 0 && confidence <= 1;
+                    }
+                }
+            }
+        }
+        if (!valid) throw failed("malformed", "Harness analysis response is incomplete or malformed; no successful analysis result is available.");
+    }
+
     /** The exception message from the most recent healthCheck() failure,
      * or null if the last check succeeded or none has run yet. Exists so
      * the UI can show *why* a connection failed instead of just that it
@@ -125,17 +244,46 @@ public class HarnessClient {
             HttpRequest req = newRequestBuilder("/health", Duration.ofSeconds(5))
                     .GET()
                     .build();
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> resp = sendBounded(req);
             if (resp.statusCode() == 200) {
+                var health = responseObject(resp.body());
+                if (!stringField(health, "status") || !"ok".equals(health.get("status").getAsString())) {
+                    throw failed("malformed", "Harness liveness response is incomplete or malformed.");
+                }
                 lastHealthCheckError = null;
                 return true;
             }
-            lastHealthCheckError = "HTTP " + resp.statusCode() + ": " + resp.body();
+            lastHealthCheckError = httpFailure(resp.statusCode()).getMessage();
             return false;
         } catch (Exception e) {
-            lastHealthCheckError = e.getClass().getSimpleName()
-                    + (e.getMessage() != null ? ": " + e.getMessage() : "");
+            lastHealthCheckError = e instanceof HarnessException ? e.getMessage() : "Harness liveness check failed; details withheld.";
             return false;
+        }
+    }
+
+    /** Liveness alone does not prove permission to analyze or read results. */
+    public boolean connectionCheck() {
+        if (!healthCheck()) return false;
+        try {
+            com.google.gson.JsonObject pairing = getJson("/pairing/check", Duration.ofSeconds(5));
+            if (!pairing.has("status") || !"authenticated".equals(pairing.get("status").getAsString())) {
+                lastHealthCheckError = "Harness pairing response was invalid; check the selected service";
+                return false;
+            }
+            lastHealthCheckError = null;
+            return true;
+        } catch (HarnessException | IllegalArgumentException e) {
+            lastHealthCheckError = e.getMessage();
+            return false;
+        } catch (RuntimeException malformedResponse) {
+            lastHealthCheckError = "Harness pairing response was invalid; check the selected service";
+            return false;
+        }
+    }
+
+    private static void requireAuthenticatedResponse(HttpResponse<String> response) throws HarnessException {
+        if (response.statusCode() == 401) {
+            throw httpFailure(401);
         }
     }
 
@@ -146,9 +294,9 @@ public class HarnessClient {
     public List<String> listAgentNames() {
         try {
             HttpRequest req = newRequestBuilder("/health", Duration.ofSeconds(5)).GET().build();
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> resp = sendBounded(req);
             if (resp.statusCode() != 200) return List.of();
-            com.google.gson.JsonObject obj = com.google.gson.JsonParser.parseString(resp.body()).getAsJsonObject();
+            com.google.gson.JsonObject obj = responseObject(resp.body());
             List<String> out = new java.util.ArrayList<>();
             if (obj.has("agents") && obj.get("agents").isJsonArray()) {
                 obj.getAsJsonArray("agents").forEach(el -> out.add(el.getAsString()));
@@ -166,20 +314,17 @@ public class HarnessClient {
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
-        try {
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
-                throw new HarnessException("Harness validation result rejected (HTTP " + resp.statusCode() + "): " + resp.body());
-            }
-        } catch (IOException e) {
-            throw new HarnessException("Could not post validation result: " + e.getMessage(), e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Validation result submission interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
+        if (resp.statusCode() != 200) throw httpFailure(resp.statusCode());
+        responseObject(resp.body());
     }
 
-    public void setBearerToken(String token) {
+    public synchronized void setBearerToken(String token) {
+        if (token != null && (token.length() > 4096
+                || token.chars().anyMatch(c -> c < 32 || c > 126))) {
+            throw new IllegalArgumentException("Pairing token must be printable ASCII without control characters");
+        }
         this.bearerToken = (token == null || token.isBlank()) ? null : token.trim();
     }
 
@@ -198,14 +343,18 @@ public class HarnessClient {
      * noticed first, via a "Test Connection" button that made the
      * symptom visible.
      */
-    private HttpRequest.Builder newRequestBuilder(String path, Duration timeout) {
+    private synchronized HttpRequest.Builder newRequestBuilder(String path, Duration timeout) {
+        try {
         HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + path))
                 .timeout(timeout);
-        if (bearerToken != null && !bearerToken.isBlank()) {
+        if (!path.equals("/health") && bearerToken != null && !bearerToken.isBlank()) {
             builder.header("Authorization", "Bearer " + bearerToken);
         }
         return builder;
+        } catch (RuntimeException malformed) {
+            throw new IllegalArgumentException("Invalid harness request metadata; details withheld.");
+        }
     }
 
     public AnalysisResponse analyze(AnalysisRequest request) throws HarnessException {
@@ -215,48 +364,21 @@ public class HarnessClient {
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
 
-        HttpResponse<String> resp;
-        try {
-            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (HttpTimeoutException e) {
-            throw new HarnessException(
-                    "Analysis did not finish within " + analysisTimeoutSeconds + "s. This is a client-side "
-                    + "wait budget, not necessarily a failure -- a dispatch involving several agents at limited "
-                    + "concurrency (see config.yaml's concurrency.max_parallel_agents) with real LLM inference "
-                    + "can genuinely take a while, and the harness may still be working or may have already "
-                    + "finished server-side. Raise the analysis timeout in the Harness URL bar, or check the "
-                    + "harness server's own logs/audit trail for whether this exchange actually completed.", e);
-        } catch (IOException e) {
-            throw new HarnessException(
-                    "Could not reach harness at " + baseUrl +
-                    ". Is `python server.py` running? (" + e.getMessage() + ")", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Request interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
 
+        requireAuthenticatedResponse(resp);
         if (resp.statusCode() != 200) {
-            String detail;
-            try {
-                ErrorBody err = gson.fromJson(resp.body(), ErrorBody.class);
-                detail = (err != null && err.error != null) ? err.error : resp.body();
-            } catch (Exception parseFail) {
-                detail = resp.body();
-            }
-            throw new HarnessException("Harness returned HTTP " + resp.statusCode() + ": " + detail);
+            throw httpFailure(resp.statusCode());
         }
 
         try {
-            AnalysisResponse parsed = gson.fromJson(resp.body(), AnalysisResponse.class);
-            if (parsed == null) {
-                throw new HarnessException("Harness returned an empty/unparseable response body");
-            }
-            if (parsed.agent_reports == null) {
-                parsed.agent_reports = List.of();
-            }
-            return parsed;
-        } catch (Exception e) {
-            throw new HarnessException("Failed to parse harness response: " + e.getMessage(), e);
+            var object = responseObject(resp.body());
+            requireAnalysisShape(object);
+            return gson.fromJson(object, AnalysisResponse.class);
+        } catch (HarnessException failure) {
+            throw failure;
+        } catch (RuntimeException malformed) {
+            throw failed("malformed", "Harness analysis response is malformed; no successful analysis result is available.");
         }
     }
 
@@ -276,19 +398,12 @@ public class HarnessClient {
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
-        HttpResponse<String> resp;
-        try {
-            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new HarnessException("Could not reach harness at " + baseUrl + " for /estimate (" + e.getMessage() + ")", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Request interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
         if (resp.statusCode() != 200) {
-            throw new HarnessException("Harness /estimate returned HTTP " + resp.statusCode() + ": " + resp.body());
+            throw httpFailure(resp.statusCode());
         }
-        EstimateResponse parsed = gson.fromJson(resp.body(), EstimateResponse.class);
+        EstimateResponse parsed = parseTypedResponse(resp.body(), EstimateResponse.class);
         if (parsed == null) {
             throw new HarnessException("Harness /estimate returned an empty/unparseable response body");
         }
@@ -311,19 +426,12 @@ public class HarnessClient {
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
-        HttpResponse<String> resp;
-        try {
-            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new HarnessException("Could not reach harness at " + baseUrl + " for /prioritize (" + e.getMessage() + ")", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Request interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
         if (resp.statusCode() != 200) {
-            throw new HarnessException("Harness /prioritize returned HTTP " + resp.statusCode() + ": " + resp.body());
+            throw httpFailure(resp.statusCode());
         }
-        PrioritizeResponse parsed = gson.fromJson(resp.body(), PrioritizeResponse.class);
+        PrioritizeResponse parsed = parseTypedResponse(resp.body(), PrioritizeResponse.class);
         if (parsed == null) {
             throw new HarnessException("Harness /prioritize returned an empty/unparseable response body");
         }
@@ -335,19 +443,12 @@ public class HarnessClient {
         HttpRequest req = newRequestBuilder("/effort", Duration.ofSeconds(timeoutSeconds))
                 .GET()
                 .build();
-        HttpResponse<String> resp;
-        try {
-            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new HarnessException("Could not reach harness at " + baseUrl + " for /effort (" + e.getMessage() + ")", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Request interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
         if (resp.statusCode() != 200) {
-            throw new HarnessException("Harness /effort returned HTTP " + resp.statusCode() + ": " + resp.body());
+            throw httpFailure(resp.statusCode());
         }
-        EffortStatus parsed = gson.fromJson(resp.body(), EffortStatus.class);
+        EffortStatus parsed = parseTypedResponse(resp.body(), EffortStatus.class);
         if (parsed == null) {
             throw new HarnessException("Harness /effort returned an empty/unparseable response body");
         }
@@ -364,19 +465,12 @@ public class HarnessClient {
         HttpRequest req = newRequestBuilder("/identities", Duration.ofSeconds(timeoutSeconds))
                 .GET()
                 .build();
-        HttpResponse<String> resp;
-        try {
-            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new HarnessException("Could not reach harness at " + baseUrl + " for /identities (" + e.getMessage() + ")", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Request interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
         if (resp.statusCode() != 200) {
-            throw new HarnessException("Harness /identities returned HTTP " + resp.statusCode() + ": " + resp.body());
+            throw httpFailure(resp.statusCode());
         }
-        List<IdentityInfo> parsed = gson.fromJson(resp.body(), new TypeToken<List<IdentityInfo>>() {}.getType());
+        List<IdentityInfo> parsed = parseTypedResponse(resp.body(), new TypeToken<List<IdentityInfo>>() {}.getType());
         return parsed == null ? List.of() : parsed;
     }
 
@@ -393,19 +487,12 @@ public class HarnessClient {
         HttpRequest req = newRequestBuilder("/hosts/" + encodedHost + "/sessions", Duration.ofSeconds(timeoutSeconds))
                 .GET()
                 .build();
-        HttpResponse<String> resp;
-        try {
-            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new HarnessException("Could not reach harness at " + baseUrl + " for /hosts/" + host + "/sessions (" + e.getMessage() + ")", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Request interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
         if (resp.statusCode() != 200) {
-            throw new HarnessException("Harness /hosts/" + host + "/sessions returned HTTP " + resp.statusCode() + ": " + resp.body());
+            throw httpFailure(resp.statusCode());
         }
-        List<SessionInfo> parsed = gson.fromJson(resp.body(), new TypeToken<List<SessionInfo>>() {}.getType());
+        List<SessionInfo> parsed = parseTypedResponse(resp.body(), new TypeToken<List<SessionInfo>>() {}.getType());
         return parsed == null ? List.of() : parsed;
     }
 
@@ -429,17 +516,10 @@ public class HarnessClient {
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
-        HttpResponse<String> resp;
-        try {
-            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new HarnessException("Could not reach harness at " + baseUrl + " for /sessions (" + e.getMessage() + ")", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Request interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
         if (resp.statusCode() != 200) {
-            throw new HarnessException("Harness /sessions returned HTTP " + resp.statusCode() + ": " + resp.body());
+            throw httpFailure(resp.statusCode());
         }
         // The server's POST /sessions response is a small subset of
         // SessionInfo's fields (id, identity_id, host, exchange_hash,
@@ -447,7 +527,7 @@ public class HarnessClient {
         // re-join at creation time). Parse loosely; callers of
         // createSession don't need the joined fields back, only
         // confirmation the session was created.
-        SessionInfo parsed = gson.fromJson(resp.body(), SessionInfo.class);
+        SessionInfo parsed = parseTypedResponse(resp.body(), SessionInfo.class);
         if (parsed == null) {
             throw new HarnessException("Harness /sessions returned an empty/unparseable response body");
         }
@@ -482,31 +562,12 @@ public class HarnessClient {
     }
 
     private com.google.gson.JsonObject sendForJson(HttpRequest req, String path) throws HarnessException {
-        HttpResponse<String> resp;
-        try {
-            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (IOException e) {
-            throw new HarnessException("Could not reach harness at " + baseUrl + " for " + path
-                    + " (" + e.getMessage() + ")", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new HarnessException("Request interrupted", e);
-        }
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
         if (resp.statusCode() != 200) {
-            String detail;
-            try {
-                ErrorBody err = gson.fromJson(resp.body(), ErrorBody.class);
-                detail = (err != null && err.error != null) ? err.error : resp.body();
-            } catch (Exception ignore) {
-                detail = resp.body();
-            }
-            throw new HarnessException("Harness " + path + " returned HTTP " + resp.statusCode() + ": " + detail);
+            throw httpFailure(resp.statusCode());
         }
-        try {
-            return com.google.gson.JsonParser.parseString(resp.body()).getAsJsonObject();
-        } catch (Exception e) {
-            throw new HarnessException("Harness " + path + " returned an unparseable body: " + e.getMessage(), e);
-        }
+        return responseObject(resp.body());
     }
 
     private Duration shortTimeout() { return Duration.ofSeconds(timeoutSeconds); }

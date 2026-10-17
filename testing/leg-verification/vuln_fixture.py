@@ -25,9 +25,11 @@ import html
 import json as _json
 import os
 import pickle
+import re
 import secrets as _secrets
 import subprocess
 import urllib.request
+from urllib.parse import urlsplit
 
 from flask import Flask, request, redirect, Response, jsonify, make_response
 from jinja2 import Template
@@ -127,6 +129,59 @@ def make_app(file_base: str | None = None) -> Flask:
     def ssrf_safe():
         return Response(f"url noted: {html.escape(request.args.get('url', ''))}",  # never fetched
                         mimetype="text/plain")
+
+    # --- XXE via a JS-built XML body (LB-2 driver-capture fixture) ------------
+    #     The source page's inline JS POSTs an XML document via fetch() -- there
+    #     is no <form> and no server-rendered link to /xxe/parse, so a passive/
+    #     HTML-only crawl never sees this request's real shape (nothing to
+    #     synthesize a body from, let alone an XML one -- role_crawl's
+    #     _synthesize_body only ever guesses application/json). Only a real
+    #     browser executing the page's JS observes the actual POST. TP resolves
+    #     a SYSTEM external entity by fetching its URL server-side (mirrors
+    #     ssrf_fetch below -- OOB-provable via the in-process collaborator,
+    #     OS-independent); control reads the body but never resolves entities.
+    _XXE_SYSTEM_RE = re.compile(r'<!ENTITY\s+\w+\s+SYSTEM\s+"([^"]+)"', re.IGNORECASE)
+
+    @app.get("/xxe/js-form")
+    def xxe_js_form():
+        return Response(
+            "<html><body><div id=out>loading</div><script>"
+            "fetch('/xxe/parse', {method: 'POST', "
+            "headers: {'Content-Type': 'application/xml'}, "
+            "body: '<?xml version=\"1.0\"?><request><item>probe</item></request>'})"
+            ".then(function(r){return r.text();})"
+            ".then(function(t){document.getElementById('out').textContent = t;});"
+            "</script></body></html>", mimetype="text/html")
+
+    @app.post("/xxe/parse")
+    def xxe_parse():
+        body = request.get_data(as_text=True) or ""
+        m = _XXE_SYSTEM_RE.search(body)
+        if m:
+            try:
+                with urllib.request.urlopen(m.group(1), timeout=2) as r:  # nosec B310 - INTENTIONAL XXE sink (simulates a vulnerable XML parser resolving a SYSTEM external entity by fetching it server-side); disposable fixture for the xxe leg
+                    r.read(64)
+            except Exception:
+                pass
+        return Response("parsed", mimetype="text/plain")
+
+    @app.get("/xxe/js-form-safe")
+    def xxe_js_form_safe():
+        return Response(
+            "<html><body><div id=out>loading</div><script>"
+            "fetch('/xxe/parse-safe', {method: 'POST', "
+            "headers: {'Content-Type': 'application/xml'}, "
+            "body: '<?xml version=\"1.0\"?><request><item>probe</item></request>'})"
+            ".then(function(r){return r.text();})"
+            ".then(function(t){document.getElementById('out').textContent = t;});"
+            "</script></body></html>", mimetype="text/html")
+
+    @app.post("/xxe/parse-safe")
+    def xxe_parse_safe():
+        # CONTROL: the body is read but external entities are never resolved
+        # (no SYSTEM-URL fetch) -- a safely-configured parser.
+        request.get_data(as_text=True)
+        return Response("parsed", mimetype="text/plain")
 
     # --- Command injection: TP passes the param to a shell; control does not ---
     @app.get("/cmdi/ping")
@@ -303,6 +358,72 @@ def make_app(file_base: str | None = None) -> Flask:
                 + "</body></html>")
         return Response(body, mimetype="text/html")  # escaped on render -> safe
 
+    # --- Stored XSS via a CSRF-token-bound comment FORM (PortSwigger-shaped) ---
+    #     The write is a urlencoded form guarded by a per-session CSRF token: the
+    #     source page mints the token bound to a session cookie, and a POST whose
+    #     token does not match that session is rejected. This is the shape the
+    #     stored_xss leg must handle by minting a FRESH token in its own session
+    #     (reusing a captured/stale token yields 400 and stores nothing). The
+    #     source page lives at the PARENT path of the write action, exactly as the
+    #     leg derives it (POST /blog/comment -> GET /blog?postId=1).
+    csrf_sessions: dict[str, str] = {}
+    blog = {"comments": [], "comments_safe": []}
+
+    @app.post("/blog/reset")
+    def blog_reset():
+        blog["comments"].clear(); blog["comments_safe"].clear(); csrf_sessions.clear()
+        return jsonify({"ok": True})
+
+    def _blog_page(store_key, escape, action, post_id):
+        sid = request.cookies.get("session")
+        set_cookie = False
+        if not sid or sid not in csrf_sessions:
+            sid = _secrets.token_hex(8); set_cookie = True
+        token = _secrets.token_hex(16)
+        csrf_sessions[sid] = token  # freshly minted, bound to THIS session
+        rendered = "".join(
+            f"<div>{html.escape(c) if escape else c}</div>" for c in blog[store_key])
+        page = (f"<html><body><h1>post {html.escape(str(post_id))}</h1>{rendered}"
+                f"<form action='{action}' method='POST'>"
+                f"<input type='hidden' name='csrf' value='{token}'>"
+                f"<input type='hidden' name='postId' value='{html.escape(str(post_id))}'>"
+                f"<textarea name='comment'></textarea>"
+                f"<input type='text' name='name'>"
+                f"<input type='email' name='email'>"
+                f"<input type='text' name='website'>"
+                f"</form></body></html>")
+        resp = make_response(Response(page, mimetype="text/html"))
+        if set_cookie:
+            resp.set_cookie("session", sid)
+        return resp
+
+    def _blog_comment(store_key, escape):
+        sid = request.cookies.get("session", "")
+        token = request.form.get("csrf", "")
+        if not sid or csrf_sessions.get(sid) != token:
+            return Response("Invalid CSRF token", status=400, mimetype="text/plain")
+        website = request.form.get("website", "")
+        if website and not website.startswith(("http://", "https://")):
+            return Response("Invalid website.", status=400, mimetype="text/plain")
+        blog[store_key].append(str(request.form.get("comment", "")))
+        return redirect("/blog?postId=1" if not escape else "/blog-safe?postId=1", code=302)
+
+    @app.get("/blog")
+    def blog_page():
+        return _blog_page("comments", False, "/blog/comment", request.args.get("postId", "1"))
+
+    @app.post("/blog/comment")
+    def blog_comment():
+        return _blog_comment("comments", False)  # VULNERABLE: rendered raw
+
+    @app.get("/blog-safe")
+    def blog_page_safe():
+        return _blog_page("comments_safe", True, "/blog-safe/comment", request.args.get("postId", "1"))
+
+    @app.post("/blog-safe/comment")
+    def blog_comment_safe():
+        return _blog_comment("comments_safe", True)  # escaped on render -> safe
+
     # --- JWT kid key-confusion (jwt_forge kid variant) ------------------------
     def _b64url(b):
         return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
@@ -337,6 +458,243 @@ def make_app(file_base: str | None = None) -> Flask:
         if _verify_hs256(_bearer(), b"fixed-server-secret-value"):  # ignores kid -> safe
             return jsonify({"ok": True})
         return jsonify({"error": "unauthorized"}), 401
+
+    # --- JWT unverified signature (accepts ANY signature; denies tokenless) ----
+    @app.get("/jwt/unverified")
+    def jwt_unverified():
+        # VULNERABLE: trusts a structurally-valid token WITHOUT verifying its
+        # signature, but a tokenless request is denied. The confirmation is the
+        # differential invalid-signature-accepted vs tokenless-denied.
+        tok = _bearer()
+        if not tok:
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            payload = _json.loads(base64.urlsafe_b64decode(tok.split(".")[1] + "==="))
+            return jsonify({"ok": True, "sub": payload.get("sub"),
+                            "secret": "protected-account-data"})
+        except Exception:
+            return jsonify({"error": "unauthorized"}), 401
+
+    @app.get("/jwt/public")
+    def jwt_public():
+        # CONTROL: protected-looking content returned regardless of token -- a truly
+        # public endpoint accepts garbage AND tokenless, so the leg must SKIP (the
+        # token does not gate access; that is not a signature-verification bug).
+        return jsonify({"ok": True, "data": "public-listing"})
+
+    # --- File upload via a CSRF-bound multipart form (PortSwigger-shaped) ------
+    #     The upload uses a specific file-field name (`avatar`) alongside hidden
+    #     csrf/user fields; a bare `file` part with no token is rejected. The leg
+    #     must read the real form from the source page (fresh token) to succeed.
+    upl = {"csrf": {}, "files": {}}
+
+    def _upload_form_page(action):
+        sid = request.cookies.get("session")
+        setc = False
+        if not sid or sid not in upl["csrf"]:
+            sid = _secrets.token_hex(8); setc = True
+        token = _secrets.token_hex(16); upl["csrf"][sid] = token
+        page = (f"<html><body><form action='{action}' method='POST' "
+                f"enctype='multipart/form-data'>"
+                f"<input type='hidden' name='csrf' value='{token}'>"
+                f"<input type='hidden' name='user' value='wiener'>"
+                f"<input type='file' name='avatar'></form></body></html>")
+        resp = make_response(Response(page, mimetype="text/html"))
+        if setc:
+            resp.set_cookie("session", sid)
+        return resp
+
+    def _store_upload(prefix):
+        sid = request.cookies.get("session", "")
+        if upl["csrf"].get(sid) != request.form.get("csrf", ""):
+            return None, Response("Invalid CSRF token", status=400, mimetype="text/plain")
+        fs = request.files.get("avatar")  # REQUIRES the real field name, not `file`
+        if fs is None:
+            return None, Response("Missing avatar field", status=400, mimetype="text/plain")
+        name = prefix + fs.filename
+        upl["files"][name] = fs.read()
+        return name, None
+
+    @app.get("/upload/account")
+    def upload_account():
+        return _upload_form_page("/upload/avatar")
+
+    @app.post("/upload/avatar")
+    def upload_avatar():
+        name, err = _store_upload("")
+        if err is not None:
+            return err
+        return Response(f"<html><img src='/upload/files/{name}'></html>", mimetype="text/html")
+
+    @app.get("/upload/files/<path:name>")
+    def upload_files(name):
+        data = upl["files"].get(name)
+        if data is None:
+            return Response("not found", status=404)
+        return Response(data, mimetype="text/html")  # VULNERABLE: served as active HTML
+
+    @app.get("/upload/account-safe")
+    def upload_account_safe():
+        return _upload_form_page("/upload/avatar-safe")
+
+    @app.post("/upload/avatar-safe")
+    def upload_avatar_safe():
+        name, err = _store_upload("safe-")
+        if err is not None:
+            return err
+        return Response(f"<html><img src='/upload/files-safe/{name}'></html>", mimetype="text/html")
+
+    @app.get("/upload/files-safe/<path:name>")
+    def upload_files_safe(name):
+        data = upl["files"].get(name)
+        if data is None:
+            return Response("not found", status=404)
+        # CONTROL: forced as an attachment -> not an active execution context.
+        return Response(data, mimetype="text/html",
+                        headers={"Content-Disposition": f"attachment; filename={name}"})
+
+    # --- 2FA / MFA bypass (step-1 login reaches a protected page pre-2nd-factor) --
+    mfa = {"sessions": {}}
+
+    def _mfa_login(mode):
+        body = request.get_json(silent=True) or {}
+        user = request.form.get("username") or body.get("username") or "alice"
+        sid = _secrets.token_hex(8)
+        mfa["sessions"][sid] = {"user": user, "verified": False, "mode": mode}
+        resp = make_response(redirect("/2fa/verify", code=302))  # lands on the 2nd-factor step
+        resp.set_cookie("session", sid)
+        return resp
+
+    @app.post("/2fa/login")
+    def mfa_login():
+        return _mfa_login("vuln")
+
+    @app.post("/2fa/login-safe")
+    def mfa_login_safe():
+        return _mfa_login("safe")
+
+    @app.get("/2fa/verify")
+    def mfa_verify():
+        return Response("<html><body>Enter your verification code"
+                        "<form method='POST'><input name='mfa-code'></form></body></html>",
+                        mimetype="text/html")
+
+    @app.get("/my-account")
+    def mfa_account():
+        s = mfa["sessions"].get(request.cookies.get("session", ""))
+        if not s:
+            return redirect("/2fa/verify", code=302)  # no session -> denied
+        if s["mode"] == "safe" and not s["verified"]:
+            return redirect("/2fa/verify", code=302)  # ENFORCING: 2nd factor required
+        # VULNERABLE mode: the partial (step-1-only) session already reaches the account.
+        return Response(f"<html><body>My account for {s['user']}. "
+                        f"<a href='/logout'>Log out</a></body></html>", mimetype="text/html")
+
+    # --- Excessive trust in client-side controls (client-supplied price) -------
+    def _fmt(cents):
+        return f"{cents // 100}.{cents % 100:02d}"
+
+    @app.route("/shop/cart", methods=["POST"])
+    def shop_cart():
+        body = request.get_json(silent=True) or {}
+        price = request.form.get("price") or body.get("price") or "0"
+        try:
+            cents = int(price)  # VULNERABLE: the server trusts the client-supplied price
+        except ValueError:
+            cents = 0
+        return Response(f"<html><body>Cart total: ${_fmt(cents)}</body></html>", mimetype="text/html")
+
+    @app.route("/shop/cart-safe", methods=["POST"])
+    def shop_cart_safe():
+        # CONTROL: the client price is ignored; the server uses its own authoritative
+        # price, so a tampered value is never reflected back.
+        return Response(f"<html><body>Cart total: ${_fmt(133700)}</body></html>", mimetype="text/html")
+
+    # --- Cross-site browser PoC for CSRF confirmation (LB-5) -------------------
+    #     Each variant pairs a state-changing, cookie-authenticated POST with a
+    #     GET-only readback of the SAME state, so the leg's "independent GET-only
+    #     verification" is a real differential, not a trust-the-POST's-own-
+    #     response shortcut. The ambient session cookie's name/value/SameSite
+    #     attribute is supplied by the DRIVER (PlaywrightDriver.cross_site_submit's
+    #     own context.add_cookies call), not minted by a login flow here -- these
+    #     endpoints only check for the cookie's PRESENCE, mirroring a real app that
+    #     trusts whatever ambient cookie rides along on a request. No-defense and
+    #     the SameSite=Strict/Lax controls share these SAME /csrf-poc/transfer +
+    #     /csrf-poc/state endpoints -- SameSite enforcement is entirely the
+    #     BROWSER's job (which sameSite value cross_site_submit seeds the cookie
+    #     with), not something this server needs to vary for.
+    csrf_poc_state = {"note": "", "note_origin": "", "note_bearer": ""}
+
+    @app.post("/csrf-poc/reset")
+    def csrf_poc_reset():
+        for k in csrf_poc_state:
+            csrf_poc_state[k] = ""
+        return jsonify({"ok": True})
+
+    # No defense: cookie-authenticated, no Origin/Referer check, no CSRF
+    # token -- the "ambient cookie rides along on a cross-site auto-submit
+    # form" case a real-browser PoC must confirm.
+    @app.post("/csrf-poc/transfer")
+    def csrf_poc_transfer():
+        if not request.cookies.get("csrf_sid"):
+            return Response("unauthorized", status=401, mimetype="text/plain")
+        csrf_poc_state["note"] = request.form.get("note", "")
+        return Response("ok", mimetype="text/plain")
+
+    @app.get("/csrf-poc/state")
+    def csrf_poc_state_get():
+        if not request.cookies.get("csrf_sid"):
+            return Response("unauthorized", status=401, mimetype="text/plain")
+        return Response(csrf_poc_state["note"], mimetype="text/plain")
+
+    # CONTROL: Origin/Referer enforced -- the ambient cookie still rides along
+    # (same cookie check as above), but the handler additionally rejects a
+    # cross-origin Origin/Referer, so a real browser's own (unforgeable)
+    # Origin header on the cross-site POST is what must defeat this -- not a
+    # missing cookie, which IS present.
+    def _csrf_poc_same_origin(req) -> bool:
+        origin = req.headers.get("Origin", "")
+        if origin:
+            return urlsplit(origin).hostname == urlsplit(req.url).hostname
+        referer = req.headers.get("Referer", "")
+        if referer:
+            return urlsplit(referer).hostname == urlsplit(req.url).hostname
+        return False  # neither header present -- fail closed, treat as cross-site
+
+    @app.post("/csrf-poc/transfer-origin")
+    def csrf_poc_transfer_origin():
+        if not request.cookies.get("csrf_sid"):
+            return Response("unauthorized", status=401, mimetype="text/plain")
+        if not _csrf_poc_same_origin(request):
+            return Response("forbidden: cross-origin request rejected", status=403,
+                            mimetype="text/plain")
+        csrf_poc_state["note_origin"] = request.form.get("note", "")
+        return Response("ok", mimetype="text/plain")
+
+    @app.get("/csrf-poc/state-origin")
+    def csrf_poc_state_origin_get():
+        if not request.cookies.get("csrf_sid"):
+            return Response("unauthorized", status=401, mimetype="text/plain")
+        return Response(csrf_poc_state["note_origin"], mimetype="text/plain")
+
+    # CONTROL: bearer-only (non-ambient) -- requires an Authorization header
+    # the browser's cookie jar can never supply on its own, so an
+    # ambient-cookie-only PoC must never confirm this one regardless of
+    # whether a cookie is also present.
+    _CSRF_POC_BEARER_TOKEN = "csrf-poc-fixture-bearer-token"  # fixture-only constant, not a real secret
+
+    @app.post("/csrf-poc/transfer-bearer")
+    def csrf_poc_transfer_bearer():
+        if request.headers.get("Authorization", "") != f"Bearer {_CSRF_POC_BEARER_TOKEN}":
+            return Response("unauthorized", status=401, mimetype="text/plain")
+        csrf_poc_state["note_bearer"] = request.form.get("note", "")
+        return Response("ok", mimetype="text/plain")
+
+    @app.get("/csrf-poc/state-bearer")
+    def csrf_poc_state_bearer_get():
+        if request.headers.get("Authorization", "") != f"Bearer {_CSRF_POC_BEARER_TOKEN}":
+            return Response("unauthorized", status=401, mimetype="text/plain")
+        return Response(csrf_poc_state["note_bearer"], mimetype="text/plain")
 
     return app
 

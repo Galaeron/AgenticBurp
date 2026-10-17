@@ -39,7 +39,13 @@ class HostAllowScopeTests(unittest.TestCase):
     def test_subdomain_and_out_of_scope(self):
         scope = rc.HostAllowScope(hosts=("example.com",))
         self.assertTrue(scope.in_scope("http://example.com/x"))
-        self.assertTrue(scope.in_scope("http://api.example.com/x"))   # bare host = +subdomains
+        self.assertFalse(scope.in_scope("http://api.example.com/x"))  # bare host is exact
+        wildcard = rc.HostAllowScope(hosts=("*.example.com",))
+        # Reviewed containment contract (docs/SCOPE_POLICY.md): the strict intersection
+        # denies wildcard entries in EVERY adapter, including HostAllowScope, so an
+        # explicit "*.example.com" grants no subdomain authority. (Superseded permissive
+        # expectation migrated; coverage preserved per SCOPE_POLICY.md migration note.)
+        self.assertFalse(wildcard.in_scope("http://api.example.com/x"))
         self.assertFalse(scope.in_scope("http://evil.test/x"))
         # same_origin/origin_of inherited from the base ScopePolicy, unchanged.
         self.assertTrue(scope.same_origin("http://example.com/a", "http://example.com:80/b"))

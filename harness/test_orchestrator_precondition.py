@@ -30,10 +30,11 @@ from harness.orchestrator import (
 JWT = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo0fQ.c2lnbmF0dXJl"
 
 
-def _ex(url="http://t/api/tickets/1", method="GET", headers=None, body=""):
+def _ex(url="http://t/api/tickets/1", method="GET", headers=None, body="",
+        response_headers=None, response_status=None, response_body=""):
     return HttpExchange(url=url, method=method, request_headers=headers or {},
-                        request_body=body, response_status=None,
-                        response_headers={}, response_body="")
+                        request_body=body, response_status=response_status,
+                        response_headers=response_headers or {}, response_body=response_body)
 
 
 class ConfirmationCacheKeyTests(unittest.TestCase):
@@ -249,6 +250,24 @@ class HasUrlParamTests(unittest.TestCase):
 
 
 class ShapePreconditionLegsTests(unittest.TestCase):
+    def test_anonymous_privileged_get_routes_missing_authentication_probe(self):
+        node = {"method": "GET", "path": "/administrator-panel",
+                "reachable_roles": ["anonymous"]}
+        classes = [c for c, _ in shape_precondition_legs(
+            node, _ex(url="http://t/administrator-panel"), self.ROLES, "http://t")]
+        self.assertIn("auth_bypass", classes)
+
+    def test_missing_authentication_leg_requires_anonymous_privileged_get(self):
+        for node in (
+            {"method": "GET", "path": "/administrator-panel", "reachable_roles": ["admin"]},
+            {"method": "GET", "path": "/products", "reachable_roles": ["anonymous"]},
+            {"method": "POST", "path": "/administrator-panel", "reachable_roles": ["anonymous"]},
+        ):
+            classes = [c for c, _ in shape_precondition_legs(
+                node, _ex(url="http://t" + node["path"], method=node["method"]),
+                self.ROLES, "http://t")]
+            self.assertNotIn("auth_bypass", classes)
+
     ROLES = [RoleSession("anonymous", {}),
              RoleSession("user", {"Authorization": f"Bearer {JWT}"})]
 
@@ -303,12 +322,14 @@ class ShapePreconditionLegsTests(unittest.TestCase):
         self.assertIn("idor", classes)
         self.assertIn("jwt", classes)
 
-    def test_injectable_param_routes_cmdi_and_ssti(self):
+    def test_injectable_param_routes_sqli_cmdi_ssti_and_xss(self):
         node = {"method": "GET", "path": "/api/tickets/search", "reachable_roles": ["user"]}
         ex = _ex(url="http://t/api/tickets/search?q=test")
         classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertIn("sqli", classes)
         self.assertIn("command_injection", classes)
         self.assertIn("ssti", classes)
+        self.assertIn("xss", classes)
 
     def test_fileish_path_segment_routes_path_traversal(self):
         node = {"method": "GET", "path": "/uploads/{id}", "reachable_roles": ["anonymous"]}
@@ -327,7 +348,7 @@ class ShapePreconditionLegsTests(unittest.TestCase):
         classes = [c for c, _ in shape_precondition_legs(
             {"method": "GET", "path": "/api/tickets/{id}", "reachable_roles": ["user"]},
             _ex(), self.ROLES, "http://t")]
-        for c in ("command_injection", "ssti", "path_traversal", "open_redirect"):
+        for c in ("sqli", "command_injection", "ssti", "xss", "path_traversal", "open_redirect"):
             self.assertNotIn(c, classes)
 
     def test_settable_json_body_routes_mass_assignment(self):
@@ -365,6 +386,55 @@ class ShapePreconditionLegsTests(unittest.TestCase):
         classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
         self.assertNotIn("mass_assignment", classes)
 
+    # LB-4: client-trust (excessive trust in client-side controls) ----------
+    def test_client_side_value_field_routes_client_trust(self):
+        node = {"method": "POST", "path": "/cart/update", "reachable_roles": ["user"]}
+        ex = _ex(url="http://t/cart/update", method="POST", body="price=133700&qty=1")
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertIn("client_trust", classes)
+
+    def test_non_value_body_does_not_route_client_trust(self):
+        # Negative control: a POST with no server-owned value field (price/
+        # amount/total/...) in the body is not a client-trust target.
+        node = {"method": "POST", "path": "/comments", "reachable_roles": ["user"]}
+        ex = _ex(url="http://t/comments", method="POST", body="comment=hi")
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertNotIn("client_trust", classes)
+
+    # LB-4: 2fa-bypass -------------------------------------------------------
+    def test_login_post_landing_on_2fa_routes_2fa_bypass(self):
+        node = {"method": "POST", "path": "/login", "reachable_roles": ["anonymous"]}
+        ex = _ex(url="http://t/login", method="POST", body="username=alice&password=hunter2",
+                 response_headers={"location": "/2fa/verify"}, response_status=302)
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertIn("2fa_bypass", classes)
+
+    def test_login_post_with_mfa_body_marker_routes_2fa_bypass(self):
+        node = {"method": "POST", "path": "/login", "reachable_roles": ["anonymous"]}
+        ex = _ex(url="http://t/login", method="POST", body="username=alice&password=hunter2",
+                 response_status=200, response_body="Please enter your verification code")
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertIn("2fa_bypass", classes)
+
+    def test_login_post_without_mfa_marker_does_not_route_2fa_bypass(self):
+        # Negative control: a login POST whose captured response does NOT land
+        # on a second-factor step (plain success) is not a 2fa-bypass target.
+        node = {"method": "POST", "path": "/login", "reachable_roles": ["anonymous"]}
+        ex = _ex(url="http://t/login", method="POST", body="username=alice&password=hunter2",
+                 response_headers={"location": "/dashboard"}, response_status=302)
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertNotIn("2fa_bypass", classes)
+
+    def test_non_login_post_does_not_route_2fa_bypass(self):
+        # Negative control: an unrelated POST, even with an MFA-looking
+        # response, is not login-shaped (no username/password fields) so it
+        # must not be routed either.
+        node = {"method": "POST", "path": "/comments", "reachable_roles": ["user"]}
+        ex = _ex(url="http://t/comments", method="POST", body="comment=hi",
+                 response_headers={"location": "/2fa/verify"}, response_status=302)
+        classes = [c for c, _ in shape_precondition_legs(node, ex, self.ROLES, "http://t")]
+        self.assertNotIn("2fa_bypass", classes)
+
 
 class ShapePredicateTests(unittest.TestCase):
     def test_has_injectable_param(self):
@@ -384,11 +454,13 @@ class ShapePredicateTests(unittest.TestCase):
 
 
 class ShapePreconditionFindingsTests(unittest.TestCase):
-    def test_injectable_param_yields_cmdi_and_ssti_findings(self):
+    def test_injectable_param_yields_sqli_cmdi_ssti_and_xss_findings(self):
         classes = {f.vulnerability_class for f in
                    shape_precondition_findings(_ex(url="http://t/s?q=test"))}
+        self.assertIn("sqli", classes)
         self.assertIn("command_injection", classes)
         self.assertIn("ssti", classes)
+        self.assertIn("xss", classes)
 
     def test_fileish_segment_yields_path_traversal_finding(self):
         classes = {f.vulnerability_class for f in
@@ -414,12 +486,68 @@ class ShapePreconditionFindingsTests(unittest.TestCase):
                    shape_precondition_findings(_ex(url="http://t/api/tickets"))}
         self.assertNotIn("csrf", classes)
 
-    def test_no_csrf_shape_when_token_present(self):
+    def test_csrf_shape_when_cookie_form_has_token(self):
         classes = {f.vulnerability_class for f in
                    shape_precondition_findings(_ex(url="http://t/api/tickets",
                                                     method="POST",
+                                                    headers={"Cookie": "session=abc", "Content-Type": "application/x-www-form-urlencoded"},
                                                     body='csrf_token=abc&title=x'))}
+        self.assertIn("csrf", classes)
+
+    def test_no_method_bypass_csrf_shape_for_bearer_api(self):
+        classes = {f.vulnerability_class for f in
+                   shape_precondition_findings(_ex(url="http://t/api/tickets",
+                                                    method="POST",
+                                                    headers={"Authorization": "Bearer abc", "Content-Type": "application/json"},
+                                                    body='{"csrf_token":"abc","title":"x"}'))}
         self.assertNotIn("csrf", classes)
+
+    def test_form_login_yields_nosql_operator_leg(self):
+        classes = {f.vulnerability_class for f in
+                   shape_precondition_findings(_ex(
+                       url="http://t/login", method="POST",
+                       headers={"Content-Type": "application/x-www-form-urlencoded"},
+                       body="csrf=x&username=u&password=p"))}
+        self.assertIn("nosql", classes)
+
+    def test_json_api_does_not_yield_nosql_login_leg(self):
+        classes = {f.vulnerability_class for f in
+                   shape_precondition_findings(_ex(
+                       url="http://t/api/login", method="POST",
+                       headers={"Content-Type": "application/json"},
+                       body='{"username":"u","password":"p"}'))}
+        self.assertIn("nosql", classes)
+
+    def test_non_login_json_write_does_not_yield_nosql_login_leg(self):
+        classes = {f.vulnerability_class for f in
+                   shape_precondition_findings(_ex(
+                       url="http://t/api/profile", method="POST",
+                       headers={"Content-Type": "application/json"},
+                       body='{"username":"u","password":"p"}'))}
+        self.assertNotIn("nosql", classes)
+
+    def test_email_change_write_yields_race_condition_leg(self):
+        exchange = _ex(url="http://t/my-account/change-email", method="POST",
+                       headers={"Content-Type": "application/x-www-form-urlencoded",
+                                "Cookie": "session=u"},
+                       body="email=probe%40example.com&csrf=t")
+        node = {"path": "/my-account/change-email", "method": "POST",
+                "reachable_roles": ["user"]}
+        classes = {name for name, _ in shape_precondition_legs(
+            node, exchange, [RoleSession(role="user", headers={"Cookie": "session=u"})],
+            "http://t/")}
+        self.assertIn("race_condition", classes)
+        self.assertIn("race_condition", {f.vulnerability_class for f in
+                                          shape_precondition_findings(exchange)})
+
+    def test_non_email_write_does_not_yield_race_condition_leg(self):
+        exchange = _ex(url="http://t/profile", method="POST",
+                       body="display_name=probe&csrf=t")
+        node = {"path": "/profile", "method": "POST",
+                "reachable_roles": ["user"]}
+        classes = {name for name, _ in shape_precondition_legs(
+            node, exchange, [RoleSession(role="user", headers={})], "http://t/")}
+        self.assertNotIn("race_condition", classes)
 
     def test_mass_assignment_shape_on_post_with_json_body(self):
         classes = {f.vulnerability_class for f in

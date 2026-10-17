@@ -46,10 +46,11 @@ import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from harness.target_request_policy import TargetRequestPolicy
 
 log = logging.getLogger("harness.safety_gate")
 
-# Methods that are safe by default: no expected server-side state change.
+# Nominally safe HTTP methods; method classification is not a side-effect claim.
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
 # Methods this gate treats as mutating and therefore gated.
@@ -63,6 +64,15 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # authorization time (see SafetyGate.authorize_burst).
 HARD_MAX_BURST_SIZE = 20
 HARD_MAX_MUTATING_REQUESTS_PER_FINDING = 20
+
+# Owner-approved per-check write allowances (2026-10-17). A check listed here
+# inherently needs this many mutating sends for ONE case, and uses it instead of
+# max_mutating_requests_per_finding; still capped by the hard ceiling above and
+# still requiring active_enabled + allow_mutating_replay. The second-order SQLi
+# differential plants a TRUE and a FALSE marker under one case reference; with a
+# ceiling of 1 its second plant was always refused, so it could never confirm.
+# Operators can lower an entry (e.g. back to 1) via validators.mutating_ceiling_by_check.
+DEFAULT_MUTATING_CEILING_BY_CHECK = {"second_order_plant": 2}
 
 # Patterns the harness must never itself send in a body/URL it
 # constructs, regardless of any config flag. This is defense in depth
@@ -115,11 +125,14 @@ class SafetyGateConfig:
     allow_mutating_replay: bool = False  # separate, stricter flag from active_enabled
     max_burst_size: int = 1
     max_mutating_requests_per_finding: int = 1
+    mutating_ceiling_by_check: dict = field(
+        default_factory=lambda: dict(DEFAULT_MUTATING_CEILING_BY_CHECK))
     # Safety item #12: engagement scope. Empty = unset (no host restriction, the
     # historical default). Non-empty = every gated send is refused for a host not
     # listed -- central defense-in-depth so a validator that forgets its own scope
     # check, or follows an off-scope redirect, is still stopped at the transport.
     allowed_hosts: frozenset = field(default_factory=frozenset)
+    target_policy: TargetRequestPolicy = field(default_factory=TargetRequestPolicy)
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "SafetyGateConfig":
@@ -128,13 +141,18 @@ class SafetyGateConfig:
         # bool(value) (bool("false") is True). See parse_validators_flags's
         # docstring for the exact defect this closes.
         from harness.config_schema import parse_validators_flags
+        from harness.scope_lock import configured_entries
         flags = parse_validators_flags(cfg)
         return cls(
             active_enabled=flags["active_enabled"],
             allow_mutating_replay=flags["allow_mutating_replay"],
             max_burst_size=int(cfg.get("max_burst_size", 1)),
             max_mutating_requests_per_finding=int(cfg.get("max_mutating_requests_per_finding", 1)),
-            allowed_hosts=frozenset(str(h).lower() for h in (cfg.get("allowed_hosts") or [])),
+            mutating_ceiling_by_check={
+                **DEFAULT_MUTATING_CEILING_BY_CHECK,
+                **{str(k): int(v) for k, v in (cfg.get("mutating_ceiling_by_check") or {}).items()}},
+            allowed_hosts=configured_entries(cfg.get("allowed_hosts")),
+            target_policy=cfg.get('target_policy') or TargetRequestPolicy(),
         )
 
 
@@ -173,18 +191,20 @@ class SafetyGate:
         # min(config.max_mutating_requests_per_finding, HARD ceiling).
         self._mutating_counts: dict[str, int] = {}
 
-    def _mutating_ceiling(self) -> int:
-        return min(self.config.max_mutating_requests_per_finding,
-                   HARD_MAX_MUTATING_REQUESTS_PER_FINDING)
+    def _mutating_ceiling(self, validator_name: str | None = None) -> int:
+        per_check = (self.config.mutating_ceiling_by_check or {}).get(validator_name or "")
+        configured = per_check if per_check is not None else self.config.max_mutating_requests_per_finding
+        return min(configured, HARD_MAX_MUTATING_REQUESTS_PER_FINDING)
 
-    def _reserve_mutating(self, finding_id: str | None, n: int) -> tuple[bool, int, int]:
+    def _reserve_mutating(self, finding_id: str | None, n: int,
+                          validator_name: str | None = None) -> tuple[bool, int, int]:
         """Atomically reserve `n` mutating sends against a finding's budget (R16).
         Returns (ok, used_before, ceiling). A no-op that always succeeds when no
         finding_id is supplied (accounting is opt-in per call, so existing callers
         are unaffected) or n<=0."""
         if not finding_id or n <= 0:
             return True, 0, 0
-        ceiling = self._mutating_ceiling()
+        ceiling = self._mutating_ceiling(validator_name)
         used = self._mutating_counts.get(finding_id, 0)
         if used + n > ceiling:
             return False, used, ceiling
@@ -246,9 +266,11 @@ class SafetyGate:
         # Safety item #12: scope lock is checked FIRST -- an off-scope host is
         # refused regardless of method, before hard-deny/mutating classification,
         # so no probe (read-only or mutating) can be sent to a host outside the
-        # engagement scope. Empty allowed_hosts = unset = no restriction.
+        # engagement scope. Empty active scope fails closed; standalone passive
+        # compatibility is retained, independently of malformed URL rejection.
         from harness import scope_lock
-        if not scope_lock.host_in_scope(url, self.config.allowed_hosts):
+        if not scope_lock.host_in_scope(url, self.config.allowed_hosts,
+                                       active_mode=self.config.active_enabled):
             decision = AuthorizationDecision(
                 allowed=False, tier=ActionRiskTier.OUT_OF_SCOPE,
                 reason="Refused by scope lock: " + scope_lock.out_of_scope_reason(url, self.config.allowed_hosts),
@@ -256,6 +278,12 @@ class SafetyGate:
             self._log(validator_name, method, url, decision)
             return decision
 
+        restriction = self.config.target_policy.denial_reason(url)
+        if restriction:
+            decision = AuthorizationDecision(allowed=False, tier=ActionRiskTier.HARD_DENIED,
+                                             reason=restriction)
+            self._log(validator_name, method, url, decision)
+            return decision
         tier = self.classify(method, body=body, url=url)
 
         if tier == ActionRiskTier.HARD_DENIED:
@@ -266,7 +294,8 @@ class SafetyGate:
                        "allowed regardless of configuration.",
             )
         elif tier == ActionRiskTier.SAFE:
-            decision = AuthorizationDecision(allowed=True, tier=tier, reason="Safe method, no gating required.")
+            decision = AuthorizationDecision(allowed=True, tier=tier,
+                                             reason="Nominally safe method allowed under scope and endpoint policy; side effects are not established.")
         else:  # MUTATING
             if not self.config.active_enabled:
                 decision = AuthorizationDecision(
@@ -287,7 +316,7 @@ class SafetyGate:
                 # Enforce the per-finding mutating-request ceiling (R16) when a
                 # finding_id is supplied -- previously this ceiling was declared in
                 # config but never counted, so N separate POSTs all passed.
-                ok, used, ceiling = self._reserve_mutating(finding_id, count)
+                ok, used, ceiling = self._reserve_mutating(finding_id, count, validator_name)
                 if not ok:
                     decision = AuthorizationDecision(
                         allowed=False, tier=tier,
@@ -332,7 +361,7 @@ class SafetyGate:
             )
         else:
             reserve_ok, used, ceiling = (
-                self._reserve_mutating(finding_id, effective_burst)
+                self._reserve_mutating(finding_id, effective_burst, validator_name)
                 if base.tier == ActionRiskTier.MUTATING else (True, 0, 0))
             if not reserve_ok:
                 decision = AuthorizationDecision(
@@ -384,6 +413,9 @@ class GatedAsyncClient:
         self._client = httpx.AsyncClient(**httpx_kwargs)
         self._gate = gate
         self._validator_name = validator_name
+        self._headers = dict(httpx_kwargs.get("headers") or {})
+        self._follow_redirects = bool(httpx_kwargs.get("follow_redirects", False))
+        self._max_redirects = int(httpx_kwargs.get("max_redirects", 5) or 5)
 
     async def __aenter__(self) -> "GatedAsyncClient":
         await self._client.__aenter__()
@@ -393,6 +425,15 @@ class GatedAsyncClient:
         return await self._client.__aexit__(*exc)
 
     async def request(self, method: str, url: str, *, content=None, headers=None, **kwargs):
+        # I03: inside an entered RunContext, send through THAT run's transport so
+        # the request spends the run's budget under its scope, cancellation, TLS
+        # trust and evidence policy. Without this, every validator built on this
+        # client sent through a private (usually verify=False) httpx client.
+        from harness.run_context import current_run_context
+        run = current_run_context()
+        if run is not None:
+            return await self._request_through_run(run, method, url, content=content,
+                                                   headers=headers, **kwargs)
         decision = self._gate.authorize(
             validator_name=self._validator_name, method=method, url=url,
             body=content if isinstance(content, str) else None,
@@ -400,6 +441,58 @@ class GatedAsyncClient:
         if not decision.allowed:
             raise SafetyGateBlocked(decision)
         return await self._client.request(method, url, content=content, headers=headers, **kwargs)
+
+    async def get(self, url, **kwargs):
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url, **kwargs):
+        return await self.request("POST", url, **kwargs)
+
+    async def _request_through_run(self, run, method, url, *, content=None, headers=None, **kwargs):
+        import httpx
+        follow = kwargs.pop("follow_redirects", self._follow_redirects)
+        built = self._client.build_request(method, url, content=content, headers=headers, **kwargs)
+        raw = built.read()
+        try:
+            body = raw.decode("utf-8") if raw else None
+        except UnicodeDecodeError:
+            # The run transport carries text bodies only; never fall back to a
+            # private client, and never send a silently altered body.
+            raise SafetyGateBlocked(AuthorizationDecision(
+                False, ActionRiskTier.MUTATING,
+                "binary request body cannot be sent through the run transport")) from None
+        send_headers = {**self._headers, **dict(headers or {})}
+        lower = {k.lower() for k in send_headers}
+        for name in ("content-type", "cookie"):
+            if name not in lower and built.headers.get(name):
+                send_headers[name] = built.headers[name]
+        # A gate other than the run's own still restricts; the run's gate itself is
+        # consulted once, by the transport, so its counters are not spent twice.
+        if self._gate is not run.gate:
+            decision = self._gate.authorize(validator_name=self._validator_name,
+                                            method=method, url=str(built.url), body=body)
+            if not decision.allowed:
+                raise SafetyGateBlocked(decision)
+        outcome = await run.target_transport().send_creds(
+            method, str(built.url), capability=self._validator_name, headers=send_headers,
+            body=body, max_redirects=self._max_redirects if follow else 0)
+        request = httpx.Request(method, outcome.final_url or str(built.url))
+        if outcome.ok:
+            # The transport already decoded the body to text: drop framing headers
+            # that would make httpx decode or length-check it a second time.
+            resp_headers = {k: v for k, v in (outcome.headers or {}).items()
+                            if k.lower() not in ("content-encoding", "content-length",
+                                                 "transfer-encoding")}
+            return httpx.Response(outcome.status or 0, headers=resp_headers,
+                                  content=(outcome.body or "").encode("utf-8"), request=request)
+        if outcome.outcome == "error":
+            raise httpx.ConnectError(outcome.error or "transport error", request=request)
+        tier = ActionRiskTier.OUT_OF_SCOPE if outcome.outcome == "out_of_scope" else (
+            ActionRiskTier.SAFE if method.upper() in ("GET", "HEAD", "OPTIONS", "TRACE")
+            else ActionRiskTier.MUTATING)
+        raise SafetyGateBlocked(AuthorizationDecision(
+            False, tier, f"run transport refused the send: {outcome.outcome}"
+                         + (f" ({outcome.error})" if outcome.error else "")))
 
 
 _default_gate: SafetyGate | None = None

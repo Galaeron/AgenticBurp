@@ -1,98 +1,61 @@
-# Current state — 2026-09-20
+# Current state — 2026-10-17 (evening)
 
 ## Checkout
+- Branch `reconciliation-backlog`; base `474ad511`; head of
+  [Galaeron/AgenticBurp#1](https://github.com/Galaeron/AgenticBurp/pull/1) after today's push.
+  Auto-fix is on for PR #1.
+- Today's commits (oldest first): `ba080691` discovery fixes (I01 candidate), `1715022a`
+  I01 docs, `1be5ed04` 16 regression modules, `2a883761` I03 transport, `fe9b8f3` I04 CSRF,
+  `9adfa8a` I11, `d5802ec` I09 caller tests, `b9bcd18` gate: two writes for the
+  second-order pair, `a9b71f6` CSRF manual-check guidance, `6d10816` docs, `5506ee4` CI fix
+  (two W2-dependent tests untracked again; Python 3.14-valid TLS fixtures; short-path
+  compare), then a docs commit.
+- The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
+  as evidence only.
+- Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
+  trust, W2 passive ownership/export, W3 health, W4 label routing, docs and untracked tests.
+- Safe `harness/config.yaml` is unchanged. Another session's worktree
+  `.claude/worktrees/objective-shannon-457fc8` exists; do not touch it.
+- Implementation manual: docs/I01_I17_IMPLEMENTATION_GUIDE_2026-10-17.md (track
+  implemented / caller-verified / live-validated / released separately).
 
-Branch `reconciliation-backlog`, ahead of `main`, 0 behind. The agents-subsystem
-refactor and the precision & blind-control sprint (Items 1–3) are committed
-(base `02de8bf`, HEAD of that batch `bc5f599`). On top, the improvement-loop items
-below landed; re-verified green (full suite 2414 OK / 2 skip).
+## What changed today (offline; owned loopback fixtures only)
+- I03: engagement legs now all spend the owning run (budget, scope, cancellation, TLS);
+  the browser honours run cancellation. The second-order SQLi pair gets 2 writes per case
+  (`DEFAULT_MUTATING_CEILING_BY_CHECK`). See docs/ARCH_RECONCILIATION_TRACKING.md.
+- I04: the unsound CSRF confirmation is retired. On real targets CSRF is manual-check only
+  (LB-5 PoC is self-test only). Unconfirmed cookie-auth candidates show as low-severity
+  "NEEDS MANUAL CHECK" items whose next step holds copy-ready steps and a test form.
+- I09: caller evidence for label-free body-SQLi and cookie-JWT dispatch; DET-JWT-SCOPE filed.
+- I11: LB-FLAKE closed; audit-log file leak fixed; 36 gaps classified in
+  docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md.
+- Handoffs: `.test-work/{i03-transport,i04-csrf,i09-dispatch,i11-hygiene}-20261017-1731/HANDOFF.md`.
 
-## Astra T02–T08 workstream — merged, not open (verified 2026-09-21)
+## Verification
+- Verify in the in-repo worktree `.test-work/wt-verify`. Windows Defender deletes
+  `file_upload_agent.py` / `FileUploadLogic.java` from worktrees under %TEMP%. Block the
+  venv's editable-install leak (it imports modules missing from a worktree from the main
+  checkout) with an untracked `sitecustomize.py` there plus `PYTHONPATH=<worktree>`.
+- CI runs Python 3.14. Last verified state (`5506ee4`): on both system Python 3.14.7 and venv
+  3.12.14, smoke 93 OK and full exit 0 (3325 harness, 38 pytest, 312 evaluation with 17
+  artifact-absence skips, 42 integrity). Logs: `.test-work/cifix-*.log`. The coverage gate still
+  reports 36 gaps.
 
-The Astra roadmap (`reviews/review-Astra-Medium-10-09-06-30/`) T02–T08 is complete
-and reconciled **below** sprint base `02de8bf`, so it is already in this branch:
-W-13/W-14 (`1553178`), W-15 orchestrator split (`99c5712`), W-16 single
-`TargetTransport` (`cfb4504`, `routing_gaps()` empty), on the per-oracle T08
-migration + T08u websocket (`fa20bf7`); T04/T06 milestones wired
-(`test_smoke_authorization_workflow.py`, `issues.py`). Full suite re-verified green
-here 2026-09-21 (2365 OK / 2 skip). The `.worktrees/astra-*`, `supplemental-evidence`,
-`t08-final` and `../AgenticVibe-impl` checkouts hold only **superseded drafts** —
-do not resume them; the one un-merged commit, `t08-final 5aa4a1a` (T08v), was redone
-as W-16.
+## Open decisions for the owner
+- W2 default `/analyze` grouping: one shared pile per site (current) versus a separate pile per
+  Analyze click (W2 WIP). This blocks I02 batch B and I16.
 
-## Improvement loop (IMPROVEMENT_BACKLOG.md)
+## Open work and evidence boundaries
+- Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I03, I04, I09, I11.
+  Next: I02 (after the W2 decision), I05 (plain-client validators, process containment), I11
+  socket trace and evidence wiring; I04 storage/export label check with I02.
+- The live Part B crAPI experiment has not been run. Historical negative crAPI results still
+  govern efficacy, and offline tests do not establish recall.
+- Browser capture covers page-load traffic only; catch-all filtering is conservative.
+- Priority-5 release, live Burp validation and the W2/W3 Java edits remain unverified.
 
-Full per-item Result lines (evidence tags, tests, commits) live in the backlog.
-Shipped code items this session:
-- **P0-1** `25a737a` EvidenceLedger wiring · **P0-2** `533928c` run-derived leg trust
-  tiers · **P0-4** `0e993da` safe-default guard (`allowed_hosts→[]`) · **P1-1** `33392c9`
-  injection fence neutralization · **P1-2** `e54cfb6` scope-escape · **P1-4** `1e084e1`
-  operating profiles.
-- **P0-5** `c7e0ce4` — `passive-only` now safety-authoritative (force-off all 10
-  active knobs unconditionally) + `explicit_keys` provenance seam; fixes a P1-4 gap.
-- **P0-7** `ec03060` — leg qualification requires an EXECUTED negative control;
-  throttle isolated to a scoped contextvar; fixes a P0-2 gap.
-- **INV-1..4 dispatch COMPLETE** (`e0ba0aa`, `40104a9`, `cc8e817`, `a6e125f`):
-  evidence-tagged read-only diagnoses with filed tickets — INV-1 quarantine knob no-op
-  on `run_blind_eval.py`; INV-2 PASS2 confirm path persists no ProofRecord (9/13→6/13);
-  INV-3 graph `chains` computed on a pre-confirmation snapshot; INV-4 1914/641/107 is a
-  driver-side un-deduped union + no timing instrumentation. Production fixes are
-  separate tickets.
-- **P0-6 SKIPPED (still `[ ]`):** can't land as one offline unit — needs new per-hop
-  transport evidence emission + request/response storage that P0-6 gates behind P3-1
-  (unstarted). Left for the owner.
-- **P1-6 done (`4054135`):** `EngagementPolicy` dataclass extracts the 13 active/
-  engagement toggles from `Orchestrator.__init__` — behavior-preserving (parity +
-  safe-defaults tests). Single source for "what active traffic is on".
-- **P1-7 done (`912df45`):** `/investigate` enforces pre-authorized scope + route/
-  `base_url` host consistency before job allocation; removed the implicit `base_url`
-  self-grant (was silently widening scope). +3 tests.
-- **P1-8 done (`6a42cc6`):** bounded `/investigate` admission (`_MAX_RUNNING_JOBS=4`
-  → 503) + terminal-job retention/eviction (900s / max 50, running never evicted,
-  expired id → 404). Module constants only. +6 tests.
-- **P1-9 done (`bd96d9b`):** documented the scope contract honestly (hostname-string,
-  not address-pinning); corrected a P1-2 overclaim; +characterization test. Filed P1-10.
-- **P3-5 done (`349a51a`):** prior-context + knowledge-block text now defanged via
-  `_neutralize_fence_breakout` at fence interpolation (was unneutralized). +3 tests.
-- **P3-4 done (`6d1950c`):** `EvidenceLedger` bounded (5000, FIFO, id-index kept
-  consistent) + `reset_default_ledger()` seam; durable replay unbounded so
-  `reconstruct_persisted` is unaffected. +4 tests (incl. real-pipeline neg control).
-- **P1-10 DEFERRED (owner/dedicated iteration):** address-bound connect-time resolver
-  pin is not one clean offline unit — needs a custom httpx/httpcore resolver seam
-  through BOTH client factories, per-redirect-hop pinning, SNI/cert preservation.
-- **LOOP_DONE (offline items exhausted, confirmed 2026-09-21):** every remaining
-  unchecked item is blocked-by-dependency, needs a live model / Docker / JDK-Burp /
-  external tooling, needs an owner-reported measurement, or is multi-part. Owner-only:
-  P0-3, P0-6, P1-3, P1-5, P1-10, P2-1/2/3, P3-1, P3-2, P3-3. P3-1 must resolve its
-  redaction default (P0-6 depends on it); P1-10 needs splitting before it can automate.
-
-## Committed this session (agents refactor + sprint Items 1–3)
-
-Five focused commits `02de8bf..bc5f599`: `4dfa89c` agents refactor
-(`get_all_agent_classes()`), `50fe65a` ollama hardening, and sprint Items 1–3
-(`a549d0b`, `ee54d02`, `bc5f599`). The two new `config.yaml` knobs ship safe:
-`oracle.safe_passive_default: true` (zero live traffic) and
-`reporting.quarantine_unverified_leads: false`; `oracle.enabled` stays `false`. The
-vendored `testing/blind-test-kit/harness/config.yaml` is updated separately (bare
-`yaml.safe_load`, no overlay inheritance).
-
-Owner action required (NOT verified here): re-run PixelMart + blind helpdesk under
-`fail_open_mode=curated` and `quarantine_unverified_leads=true`; record precision AND
-recall deltas in this file as owner-reported.
-
-## Verified here (2026-09-21, current HEAD)
-
-From repo root, `.venv-rationalisation/Scripts/python.exe` (Python 3.12.14, isolated):
-`-m harness.suite smoke` = **90 OK**, exit 0; `-m harness.suite full` = **green, exit 0**
-(unittest **2418 OK, 2 skip** ~260s; pytest-native 13 OK; evaluation 42 OK). These are
-offline/stubbed-model, owned-loopback results only — no real-model benchmark,
-blind-target run, hosted CI or Java build was performed here.
-
-## Open work and pointers
-
-- Owner: run both corpora under curated + quarantine; record precision/recall deltas here (sprint exit criterion).
-- Items 4–6 are scoped in [PRECISION_BLIND_CONTROLS_PLAN.md](reviews/2026-09-19/PRECISION_BLIND_CONTROLS_PLAN.md)
-  (negative-control builders, per-endpoint baseline, coordinator model split).
-  Do not start until Items 1–3 are measured.
-- Concurrent branch history and implementation review remain revision-bound; do not
-  restart unrelated processes based on old notes.
+## Working rules
+- Follow AGENTS.md and the implementation guide; never read answer keys, blind labels or
+  blind-target implementations.
+- Preserve prior edits; live toggles belong in ignored local config; never `git add -A`.
+- Verify in an isolated worktree inside the repo; record exact source identity.

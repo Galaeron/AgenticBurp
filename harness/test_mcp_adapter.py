@@ -35,6 +35,31 @@ class _IsolatedDbTest(unittest.TestCase):
                           parameter_location="query", parameter_name=param)
         store.persist_findings(exchange, "sqli_agent", [finding])
 
+    def _persist_gate_fixture(self, host: str):
+        """Same demotable-catchall + concrete-confirmed pair as
+        test_sarif_endpoint.py::test_gate_uncorroborated_catchall_omits_demoted_finding_keeps_concrete
+        (harness/test_sarif_endpoint.py ~222-242) -- reused verbatim so this
+        fixture is known-demotable under reporting.gate_uncorroborated_catchall."""
+        catchall_url = f"https://{host}/admin/config"
+        sqli_url = f"https://{host}/api/items"
+
+        exchange_misconfig = HttpExchange(url=catchall_url, method="GET", request_headers={},
+                                          request_body="", response_status=200,
+                                          response_headers={}, response_body="")
+        catchall_finding = Finding(vulnerability_class="Security misconfiguration", confidence=0.7,
+                                   summary="Verbose stack trace exposed",
+                                   evidence="stack trace in response", suggested_test="t",
+                                   basis="assumed", severity="medium", confirmed=False)
+        store.persist_findings(exchange_misconfig, "misconfig_agent", [catchall_finding])
+
+        exchange_sqli = HttpExchange(url=sqli_url, method="GET", request_headers={}, request_body="",
+                                     response_status=200, response_headers={}, response_body="")
+        sqli_finding = Finding(vulnerability_class="sqli", confidence=0.9,
+                               summary="Boolean-blind SQL injection in id",
+                               evidence="db error surfaced", suggested_test="t",
+                               basis="derived", severity="high", confirmed=True)
+        store.persist_findings(exchange_sqli, "sqli_agent", [sqli_finding])
+
 
 class TestNoExecutionSurface(unittest.TestCase):
     """Negative control: this adapter must expose NOTHING that starts a scan,
@@ -96,6 +121,51 @@ class TestReadResourceMatchesNormalExport(_IsolatedDbTest):
         result = adapter.read_resource("mcp://harness/a.example.com/issues")
         self.assertEqual(result["data"], expected)
         self.assertEqual(result["total"], len(expected))
+
+    def test_default_no_config_still_surfaces_demotable_finding(self):
+        """SC-5 recall guard, negative side: proves it's the GATE that removes
+        the demotable finding below, not the wiring -- a default adapter (no
+        config kwarg at all) must still surface it, same as before this
+        parameter existed."""
+        host = "gate-default.example.com"
+        self._persist_gate_fixture(host)
+        adapter = ReadOnlyMcpAdapter()
+        result = adapter.read_resource(f"mcp://harness/{host}/issues")
+        rule_classes = {item["vulnerability_class"] for item in result["data"]}
+        self.assertIn("misconfig", rule_classes)
+        self.assertIn("sqli", rule_classes)
+
+    def test_config_gate_parity_with_export_issues_for_host(self):
+        """SC-5 (REVIEW.md A9): the MCP issues resource must agree with
+        report_generator.export_issues_for_host(url, config=...) when a
+        config is supplied at construction -- the same reporting.*
+        surfacing gates RA-5/RA-6/R07 wired into the export path must apply
+        on the MCP path too, not just /report and /report/sarif."""
+        host = "gate-mcp.example.com"
+        self._persist_gate_fixture(host)
+        catchall_url = f"https://{host}/admin/config"
+        gate_config = {"reporting": {"gate_uncorroborated_catchall": True}}
+
+        from harness import report_generator
+        expected = report_generator.export_issues_for_host(catchall_url, config=gate_config)
+
+        adapter = ReadOnlyMcpAdapter(config=gate_config)
+        result = adapter.read_resource(f"mcp://harness/{host}/issues")
+
+        # MCP agrees byte-for-byte with the gated export.
+        self.assertEqual(result["data"], expected)
+        self.assertEqual(result["total"], len(expected))
+
+        # The demotable catch-all finding is omitted on both paths.
+        expected_classes = {item["vulnerability_class"] for item in expected}
+        result_classes = {item["vulnerability_class"] for item in result["data"]}
+        self.assertNotIn("misconfig", expected_classes)
+        self.assertNotIn("misconfig", result_classes)
+
+        # RECALL GUARD: the concrete confirmed sqli finding survives the gate
+        # on both paths.
+        self.assertIn("sqli", expected_classes)
+        self.assertIn("sqli", result_classes)
 
     def test_redaction_hides_secrets(self):
         self._persist("a.example.com", secret_query="SUPERSECRETTOKEN123")
