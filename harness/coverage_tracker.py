@@ -127,15 +127,15 @@ class CoverageTracker:
     # --- build the matrix from the engagement ---
 
     def build(self, endpoints: dict[str, dict], identities: list[str],
-              identity_roles: dict[str, str] | None = None) -> dict:
+              identity_roles: dict[str, str] | None = None,
+              identity_columns: dict[str, str] | None = None) -> dict:
         """Fill applicability across identities × endpoints × checks, then mark
         reachability skips. `identities` are durable principal ids (R02);
-        `identity_roles` maps each to its role. reachable_roles holds access-matrix
-        principal keys (X03), which are role labels for a sole unnamed principal of
-        that role, so an identity matches its own id or its role. `endpoints`
-        maps endpoint_key -> a dict carrying path/methods/access/reachable_roles/
-        object_scoped (see `endpoint_view`). Returns {applicable, not_applicable,
-        skipped_reach}."""
+        `identity_roles` maps each to its role and `identity_columns` to its
+        access-matrix column (role_crawl.principal_keys) -- see `_reaches`.
+        `endpoints` maps endpoint_key -> a dict carrying path/methods/access/
+        reachable_roles/object_scoped (see `endpoint_view`). Returns {applicable,
+        not_applicable, skipped_reach}."""
         identity_roles = identity_roles or {}
         na = self.matrix.fill_applicability(identities, endpoints, self.checks)
         skipped = 0
@@ -144,7 +144,7 @@ class CoverageTracker:
             if not reach:
                 continue  # reachability unknown -> leave applicable cells pending
             for ident in identities:
-                if ident in reach or identity_roles.get(ident, ident) in reach:
+                if _reaches(ident, reach, identity_roles, identity_columns):
                     continue
                 # this identity never reached this endpoint -> not attemptable as it
                 for check in self.checks:
@@ -158,16 +158,18 @@ class CoverageTracker:
         return {"applicable": applicable, "not_applicable": na, "skipped_reachability": skipped}
 
     def _probe_identity(self, ep: dict, identities: list[str],
-                        identity_roles: dict[str, str] | None = None) -> str:
+                        identity_roles: dict[str, str] | None = None,
+                        identity_columns: dict[str, str] | None = None) -> str:
         identity_roles = identity_roles or {}
         reach = [str(r) for r in (ep.get("reachable_roles") or [])]
         pool = [i for i in identities
-                if i in reach or identity_roles.get(i, i) in reach] or list(identities)
+                if _reaches(i, reach, identity_roles, identity_columns)] or list(identities)
         return (min(pool, key=lambda i: _trust(identity_roles.get(i, i))) if pool
                 else (identities[0] if identities else "anonymous"))
 
     def record_findings_from_state(self, endpoints: dict[str, dict], identities: list[str],
-                                   identity_roles: dict[str, str] | None = None) -> int:
+                                   identity_roles: dict[str, str] | None = None,
+                                   identity_columns: dict[str, str] | None = None) -> int:
         """Record CONFIRMED/DETECTED cells from the findings attached to each
         endpoint, attributed to the endpoint's probe identity. Returns cells set."""
         n = 0
@@ -175,7 +177,7 @@ class CoverageTracker:
             findings = ep.get("findings") or []
             if not findings:
                 continue
-            ident = self._probe_identity(ep, identities, identity_roles)
+            ident = self._probe_identity(ep, identities, identity_roles, identity_columns)
             for f in findings:
                 vc = f.get("vulnerability_class", "")
                 confirmed = bool(f.get("confirmed"))
@@ -477,6 +479,27 @@ def endpoint_view(state) -> dict[str, dict]:
     return out
 
 
+def _reaches(ident: str, reach: list[str], identity_roles: dict[str, str],
+             identity_columns: dict[str, str] | None) -> bool:
+    """Whether identity `ident` reached an endpoint whose access-matrix columns
+    are `reach`. Columns are principal keys (X03), so an identity matches only
+    its own column: a principal NAMED "user" reaching an endpoint says nothing
+    about another principal whose ROLE is "user". A reach list naming none of
+    this run's columns comes from a role-keyed matrix (built before X03, or a
+    stub) and is matched by role, as it always was."""
+    columns = identity_columns or {}
+    if columns and any(column in reach for column in columns.values()):
+        return columns.get(ident) in reach
+    return ident in reach or identity_roles.get(ident, ident) in reach
+
+
+def _identity_columns(roles) -> dict[str, str]:
+    """principal id -> its access-matrix column for the same role sessions."""
+    from harness.role_crawl import principal_keys
+    roles = list(roles or [])
+    return {_principal_of(r): key for r, key in zip(roles, principal_keys(roles))}
+
+
 def _identities_of(roles) -> tuple[list[str], dict[str, str]]:
     """Durable principal identities + their role map for coverage (R02). Two
     same-role accounts stay distinct coverage identities via their principal id;
@@ -500,8 +523,9 @@ def build_coverage(state, roles, investigated_keys: set[str] | None = None,
     tracker = CoverageTracker()
     endpoints = endpoint_view(state)
     identities, identity_roles = _identities_of(roles)
-    tracker.build(endpoints, identities, identity_roles)
-    tracker.record_findings_from_state(endpoints, identities, identity_roles)
+    columns = _identity_columns(roles)
+    tracker.build(endpoints, identities, identity_roles, columns)
+    tracker.record_findings_from_state(endpoints, identities, identity_roles, columns)
     if execution_events:
         tracker.record_execution_events(execution_events)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
@@ -518,8 +542,9 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     tracker = CoverageTracker()
     endpoints = endpoint_view(state)
     identities, identity_roles = _identities_of(roles)
-    tracker.build(endpoints, identities, identity_roles)
-    tracker.record_findings_from_state(endpoints, identities, identity_roles)
+    columns = _identity_columns(roles)
+    tracker.build(endpoints, identities, identity_roles, columns)
+    tracker.record_findings_from_state(endpoints, identities, identity_roles, columns)
     # The driver records REAL leg outcomes cell-by-cell; there is no inference to
     # add afterwards. Cells the driver did not reach stay pending and are given an
     # honest skip reason below (R01: never fabricate a not_detected).
@@ -545,8 +570,9 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     tracker = CoverageTracker()
     endpoints = endpoint_view(state)
     identities, identity_roles = _identities_of(roles)
-    tracker.build(endpoints, identities, identity_roles)
-    tracker.record_findings_from_state(endpoints, identities, identity_roles)
+    columns = _identity_columns(roles)
+    tracker.build(endpoints, identities, identity_roles, columns)
+    tracker.record_findings_from_state(endpoints, identities, identity_roles, columns)
     enumerated = tracker.expand_parameter_cases(
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
     driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget)
