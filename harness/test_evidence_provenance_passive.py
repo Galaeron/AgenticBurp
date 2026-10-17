@@ -15,7 +15,8 @@ from harness.models import Finding
 class SourceIdentityTests(unittest.TestCase):
     def test_installed_package_without_git_has_content_identity_not_invented_head(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            # Resolve: Windows temp dirs can be 8.3 short names (RUNNER~1).
+            root = Path(tmp).resolve()
             package = root / "harness"
             package.mkdir()
             source = package / "ordinary.py"
