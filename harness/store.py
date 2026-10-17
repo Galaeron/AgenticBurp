@@ -661,7 +661,13 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
         return
     host = host_of(exchange.url)
     engagement_id = _engagement_partition(engagement_id)
-    captured_principal = captured_principal_id(exchange) if engagement_id else ""
+    # X02: record the captured auth context in every partition, including the
+    # shared host partition (''), because prior_findings_summary reads back by
+    # the caller's real principal; storing '' here made standalone prior context
+    # always empty. The fingerprint below still omits the principal for the ''
+    # partition, so standalone dedup is unchanged (a deduped row keeps its first
+    # sighting's principal). Rows written before this change keep ''.
+    captured_principal = captured_principal_id(exchange)
     now = time.time()
     # AR-3 (LOOP half): exact provenance. Prefer the capture driver's own id
     # (trusted transport field, not agent JSON); fall back to a stable content

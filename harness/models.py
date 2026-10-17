@@ -390,14 +390,19 @@ class AnalysisResponse(BaseModel):
     # Default False so a healthy run (the overwhelming common case) is
     # byte-for-byte unchanged from before this field existed.
     degraded: bool = False
+    # X08: True when SOME, but not all, dispatched model agents failed. Such a
+    # run is also `degraded`; this distinguishes it from a total model outage
+    # (every model agent failed, which leads the summary with a warning).
+    # Deterministic/rule-based reports never count as model agents here.
+    partial_inference: bool = False
     # Top-level, structured mirror of every dispatched agent's raw_error ("<agent>:
     # <error>"). Previously an agent failure (e.g. the model backend being down)
     # was recorded ONLY in the per-agent raw_error buried inside agent_reports, so
     # a run where every LLM agent failed still returned a normal-looking 200 with
     # a few deterministic hits. This surfaces the failures where a caller/UI can
-    # see them without walking agent_reports; empty on a clean run. When EVERY
-    # dispatched agent errored (the model-unavailable case), `degraded` is also
-    # True and the summary leads with an explicit warning.
+    # see them without walking agent_reports; empty on a clean run. When any
+    # dispatched model agent errored, `degraded` is also True and the summary
+    # leads with an explicit warning (all failed, or `partial_inference`).
     agent_errors: list[str] = Field(default_factory=list)
 
 

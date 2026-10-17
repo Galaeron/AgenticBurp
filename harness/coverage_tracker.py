@@ -130,8 +130,9 @@ class CoverageTracker:
               identity_roles: dict[str, str] | None = None) -> dict:
         """Fill applicability across identities × endpoints × checks, then mark
         reachability skips. `identities` are durable principal ids (R02);
-        `identity_roles` maps each to its role for reachability (reachable_roles is
-        role-based) -- defaulting a principal to itself when unmapped. `endpoints`
+        `identity_roles` maps each to its role. reachable_roles holds access-matrix
+        principal keys (X03), which are role labels for a sole unnamed principal of
+        that role, so an identity matches its own id or its role. `endpoints`
         maps endpoint_key -> a dict carrying path/methods/access/reachable_roles/
         object_scoped (see `endpoint_view`). Returns {applicable, not_applicable,
         skipped_reach}."""
@@ -143,7 +144,7 @@ class CoverageTracker:
             if not reach:
                 continue  # reachability unknown -> leave applicable cells pending
             for ident in identities:
-                if identity_roles.get(ident, ident) in reach:
+                if ident in reach or identity_roles.get(ident, ident) in reach:
                     continue
                 # this identity never reached this endpoint -> not attemptable as it
                 for check in self.checks:
@@ -160,7 +161,8 @@ class CoverageTracker:
                         identity_roles: dict[str, str] | None = None) -> str:
         identity_roles = identity_roles or {}
         reach = [str(r) for r in (ep.get("reachable_roles") or [])]
-        pool = [i for i in identities if identity_roles.get(i, i) in reach] or list(identities)
+        pool = [i for i in identities
+                if i in reach or identity_roles.get(i, i) in reach] or list(identities)
         return (min(pool, key=lambda i: _trust(identity_roles.get(i, i))) if pool
                 else (identities[0] if identities else "anonymous"))
 

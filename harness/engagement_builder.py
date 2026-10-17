@@ -106,13 +106,17 @@ async def build_engagement(
     def credentials(headers):
         return {k.lower(): v for k, v in (headers or {}).items()
                 if k.lower() in identity_header_names}
+    # Captures are attributed to the matrix column of the PRINCIPAL whose
+    # credentials they carry, not to its role label (X03).
+    principal_keys = role_crawl.principal_keys(roles)
     for item in supplied:
         try:
             ex = item if isinstance(item, HttpExchange) else HttpExchange(**item)
             if ScopePolicy.origin_of(ex.url) != origin or not scope.in_scope(ex.url):
                 seed_errors.append("capture ignored: outside engagement origin/scope")
                 continue
-            owners = [r for r in roles if credentials(r.headers) == credentials(ex.request_headers)]
+            owners = {key: r for key, r in zip(principal_keys, roles)
+                      if credentials(r.headers) == credentials(ex.request_headers)}
             if not owners:
                 seed_errors.append("capture ignored: no matching supplied identity")
                 continue
@@ -145,17 +149,19 @@ async def build_engagement(
         if access is None:
             access = role_crawl.EndpointAccess(method=ex.method, path=ep.path)
             result.endpoints.append(access)
-        for owner in owners:
-            ep.access[owner.role] = ex.response_status
-            access.by_role[owner.role] = ex.response_status
+        for key, owner in owners.items():
+            ep.access[key] = ex.response_status
+            ep.access_roles[key] = owner.role
+            access.by_role[key] = ex.response_status
+            access.principal_roles[key] = owner.role
             if ex.response_status is not None and 200 <= ex.response_status < 300:
-                if owner.role not in ep.reachable_roles:
-                    ep.reachable_roles.append(owner.role)
-                if owner.role not in access.reachable_roles:
-                    access.reachable_roles.append(owner.role)
+                if key not in ep.reachable_roles:
+                    ep.reachable_roles.append(key)
+                if key not in access.reachable_roles:
+                    access.reachable_roles.append(key)
         state.record_template(ex.url, ex.method, ex)
-    for r in roles:
-        state.ingest_identity(f"rolecrawl:{r.role}", r.role, source="seed")
+    for key, r in zip(principal_keys, roles):
+        state.ingest_identity(f"rolecrawl:{key}", r.role, source="seed")
 
     log.info("build_engagement: %s -- %d endpoints, %d idor candidates, %d idor findings",
              base_url, len(result.endpoints), len(result.idor_candidates), len(result.idor_findings))
