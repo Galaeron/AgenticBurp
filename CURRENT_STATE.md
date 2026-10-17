@@ -41,13 +41,15 @@
   artifact-absence skips, 42 integrity). Logs: `.test-work/cifix-*.log`. The coverage gate still
   reports 36 gaps.
 
-## Open decisions for the owner
-- W2 default `/analyze` grouping: one shared pile per site (current) versus a separate pile per
-  Analyze click (W2 WIP). This blocks I02 batch B and I16.
+## Owner decisions (2026-10-17)
+- `/analyze` grouping: one shared pile per site by default; `engagement_id` = optional named
+  pile. The W2 `analyze:<uuid>` server hunk is rejected (do not commit it). A Burp field for the
+  named pile is I16 work.
 
 ## Open work and evidence boundaries
-- Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I03, I04, I09, I11.
-  Next: I02 (after the W2 decision), I05 (plain-client validators, process containment), I11
+- Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I02, I03, I04, I09, I11.
+  I02 batch B (default history) is fixed. Next: I02 batches A/C, I05 (plain-client validators,
+  process containment), I11
   socket trace and evidence wiring; I04 storage/export label check with I02.
 - The live Part B crAPI experiment has not been run. Historical negative crAPI results still
   govern efficacy, and offline tests do not establish recall.

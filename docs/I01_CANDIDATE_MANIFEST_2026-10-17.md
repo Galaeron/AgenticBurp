@@ -91,12 +91,12 @@ The groups are uncommitted work that each needs its own reviewed, focused commit
 | **W4 label routing** | `validators/base.py` (`_snake_label`: spaced agent labels such as "Verbose Error" reach snake_case validator classes); `test_validator_routing.py`. **No backlog ticket tracks this work.** | I09 |
 | **Docs** | `README.md`, `docs/README.md`, `docs/TESTING.md`, `docs/USER_MANUAL.md` point to the untracked remediation-loop docs; commit them together. `COMPETITIVE_LANDSCAPE.md` points to the untracked 2026-10-09 comparison. `CURRENT_STATE.md` is the handover. `IMPROVEMENT_BACKLOG.md` holds the pre-existing DET deferrals and observed-ID note plus these I01 notes. `docs/ARCH_RECONCILIATION_TRACKING.md` holds the I01 test-boundary split. | I01 |
 
-**Design decision embedded in W2:** the `server.py` analyze hunk replaces the
-host-only partition with `analyze:<uuid>` when no `engagement_id` is supplied. Each
-standalone `/analyze` call then lands in its own partition, and Burp must reuse the
-returned `engagement_id` to share a report. This reverses the 2026-10-09 resolution toward
-operator visibility (`engagement_id or ""`). It needs an explicit owner decision before W2 is
-committed.
+**W2 grouping — owner decision 2026-10-17:** keep ONE shared pile per site by default (the
+host-wide partition, today's behaviour). An explicit `engagement_id` is an optional named pile
+for separation. The uncommitted W2 `server.py` hunk that defaulted `/analyze` to a fresh
+`analyze:<uuid>` partition is therefore REJECTED: exclude it when W2 is split into commits.
+Within a pile, the captured principal still isolates history (I02 batch B). A Burp field to
+set the optional named pile belongs to I16.
 
 ### Untracked files
 

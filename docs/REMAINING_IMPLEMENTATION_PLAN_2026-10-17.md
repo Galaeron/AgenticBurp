@@ -44,7 +44,17 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   file has a disposition and every open item has one canonical owner/ticket.
 - **Maps to:** R01/R28, ARCH follow-ups, backlog status drift.
 
-### [ ] I02 — Bind confirmation evidence through storage and exports
+### [~] I02 — Bind confirmation evidence through storage and exports
+- **Status 2026-10-17 — batch B (default history) done:** owner decision: one shared pile per
+  site by default, `engagement_id` = optional named pile. Reproduced the audit's defect on
+  committed code. The writer stored an empty captured principal in the default pile while the
+  reader filtered by the computed one, so a later analysis never saw earlier findings. Fixed in
+  `store.persist_findings` (principal always recorded; default-pile fingerprint unchanged).
+  `harness/test_default_history_caller.py` drives `analyze()` twice with real storage: same
+  identity sees it; another identity, another named pile and a severed reader do not; zero
+  target sends. Batches A (proof binding through storage/export) and C (non-finding
+  observations) remain open. Legacy default-pile rows (empty principal) stay out of prior
+  context, as before.
 - **Type:** implementation if reproduced + integration verification. **Depends on:** I01.
 - Trace original finding identity/class, validator result, proof/case reference,
   stored finding and API/Markdown/SARIF output. Define explicit supported class
