@@ -39,9 +39,7 @@ public class AnalysisTracker {
         AnalysisStatus analysis = activeAnalyses.get(requestId);
         if (analysis != null) {
             analysis.setStatus(status);
-            if (status == AnalysisStatus.Status.COMPLETED || 
-                status == AnalysisStatus.Status.ERROR || 
-                status == AnalysisStatus.Status.CANCELLED) {
+            if (status.isTerminal()) {
                 activeAnalyses.remove(requestId);
                 completedAnalyses.add(0, analysis); // Add to front
                 if (completedAnalyses.size() > maxCompletedToKeep) {
