@@ -32,6 +32,7 @@ per session, never shared across principals.
 """
 from __future__ import annotations
 
+import contextvars
 import ipaddress
 import json
 import socket
@@ -686,6 +687,20 @@ def transport_for(run_context, *, allowed_hosts, config: dict | None = None, gat
 # RunContext -- the per-run bundle
 # ---------------------------------------------------------------------------
 
+# I03: the run whose `async with` block is active, so a send site with no
+# run_context wiring of its own (safety_gate.GatedAsyncClient) still spends THIS
+# run's budget under its scope, cancellation and TLS trust instead of a private
+# client. Same plain get/set discipline as safety_gate.push_gate (a run may be
+# entered in one task and closed in another).
+_ambient_run: "contextvars.ContextVar[RunContext | None]" = contextvars.ContextVar(
+    "harness_run_context_ambient", default=None)
+
+
+def current_run_context() -> "RunContext | None":
+    """The RunContext whose `async with` block encloses this call, if any."""
+    return _ambient_run.get()
+
+
 @dataclass
 class RunContext:
     run_id: str
@@ -706,6 +721,9 @@ class RunContext:
     # aclose(). Not a contextvars.Token: see push_gate's docstring for why.
     _gate_restore: object = field(default=None, repr=False, compare=False)
     _gate_pushed: bool = field(default=False, repr=False, compare=False)
+    # I03: the run that was ambient before this one entered (restored on aclose).
+    _run_restore: object = field(default=None, repr=False, compare=False)
+    _run_pushed: bool = field(default=False, repr=False, compare=False)
     # AR-2 (LOOP half): a per-run Ollama circuit breaker + fail-open counter,
     # pushed ambient alongside the gate in __aenter__ and popped in aclose(),
     # so concurrent/sequential runs cannot poison each other's model-backend
@@ -788,6 +806,10 @@ class RunContext:
             pop_gate(self._gate_restore)
             self._gate_pushed = False
             self._gate_restore = None
+        if self._run_pushed:
+            _ambient_run.set(self._run_restore)
+            self._run_pushed = False
+            self._run_restore = None
         if self._ollama_breaker_pushed:
             from harness.circuit_breaker import pop_ollama_breaker
             pop_ollama_breaker(self._ollama_breaker_restore)
@@ -815,6 +837,9 @@ class RunContext:
         from harness.safety_gate import push_gate
         self._gate_restore = push_gate(self.gate)
         self._gate_pushed = True
+        self._run_restore = _ambient_run.get()
+        _ambient_run.set(self)
+        self._run_pushed = True
 
         # AR-2 (LOOP half): install this run's OWN Ollama circuit breaker and
         # fail-open counters as ambient, alongside the gate above, so model-

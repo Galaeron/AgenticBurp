@@ -169,9 +169,10 @@ class CspValidator(Validator):
 
     async def _fetch_fresh_headers(self, exchange: HttpExchange) -> dict | None:
         try:
-            if self.run_context is not None:
-                from harness.run_context import TypedRequest
-                outcome = await self.run_context.executor().execute(
+            from harness.run_context import TypedRequest, current_run_context
+            run = self.run_context or current_run_context()  # I03: enclosing run if unbound
+            if run is not None:
+                outcome = await run.executor().execute(
                     TypedRequest("GET", exchange.url,
                                  headers={"User-Agent": self.user_agent}),
                     capability=self.get_name(), max_redirects=self.max_redirects)

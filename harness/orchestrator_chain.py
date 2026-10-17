@@ -597,7 +597,7 @@ class ChainMixin:
             pass
         if not (stop_on_confirm and objective_class):
             try:
-                await universal_header_audit(self, state, _all_captured)
+                await universal_header_audit(self, state, _all_captured, run_context=run_context)
             except Exception as e:
                 log.warning("investigate_engagement: universal header audit failed: %s", e)
                 _errors.append({"phase": "universal_header_audit", "error": f"{type(e).__name__}: {e}"})
@@ -680,7 +680,7 @@ class ChainMixin:
             # like a tester who was told which record to reach).
             candidate_ids=(list(_idor_cfg.get("candidate_ids", []) or [])
                            + _harvest_object_ids(_all_captured, {r.principal_id() for r in roles})))
-        _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts)
+        _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts, run_context=run_context)
         _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts,
                                  run_context=run_context)
         _ssrf = SsrfValidator(allowed_hosts=self.allowed_hosts)
@@ -702,11 +702,11 @@ class ChainMixin:
         _deser = DeserializationOobValidator(allowed_hosts=self.allowed_hosts)
         _auth = AuthSequenceValidator(allowed_hosts=self.allowed_hosts)
         _ct = ClientTrustValidator(allowed_hosts=self.allowed_hosts)
-        _sxss = StoredXssValidator(allowed_hosts=self.allowed_hosts)
+        _sxss = StoredXssValidator(allowed_hosts=self.allowed_hosts, run_context=run_context)
         _rate = RateLimitValidator(allowed_hosts=self.allowed_hosts,
                                    run_context=run_context)
         _reset = ResetTokenValidator(allowed_hosts=self.allowed_hosts)
-        _domxss = DomXssValidator(allowed_hosts=self.allowed_hosts)
+        _domxss = DomXssValidator(allowed_hosts=self.allowed_hosts, run_context=run_context)
         _toctou = ToctouValidator(allowed_hosts=self.allowed_hosts,
                                   run_context=run_context)
         _csrf = CsrfValidator(allowed_hosts=self.allowed_hosts,

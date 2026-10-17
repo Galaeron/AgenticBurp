@@ -703,7 +703,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     return produced
 
 
-async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 200) -> int:
+async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 200,
+                                 run_context=None) -> int:
     """Universal header audit: run CORS, CSP, and verbose-error validators
     against EVERY captured exchange regardless of agent findings. This closes
     the passive analysis gap where header-level issues (CORS misconfiguration,
@@ -720,6 +721,9 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
     audit_validators = orch.validator_registry.header_audit_validators()
     if not audit_validators:
         return 0
+    if run_context is not None:
+        # I03: the audit's active probes spend the owning run's transport.
+        audit_validators = orch.validator_registry.bind_run_context(audit_validators, run_context)
 
     from harness.validators.verbose_error_validator import (
         findings_from_exchange as _ve_findings,

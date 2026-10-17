@@ -397,6 +397,9 @@ class GatedAsyncClient:
         self._client = httpx.AsyncClient(**httpx_kwargs)
         self._gate = gate
         self._validator_name = validator_name
+        self._headers = dict(httpx_kwargs.get("headers") or {})
+        self._follow_redirects = bool(httpx_kwargs.get("follow_redirects", False))
+        self._max_redirects = int(httpx_kwargs.get("max_redirects", 5) or 5)
 
     async def __aenter__(self) -> "GatedAsyncClient":
         await self._client.__aenter__()
@@ -406,6 +409,15 @@ class GatedAsyncClient:
         return await self._client.__aexit__(*exc)
 
     async def request(self, method: str, url: str, *, content=None, headers=None, **kwargs):
+        # I03: inside an entered RunContext, send through THAT run's transport so
+        # the request spends the run's budget under its scope, cancellation, TLS
+        # trust and evidence policy. Without this, every validator built on this
+        # client sent through a private (usually verify=False) httpx client.
+        from harness.run_context import current_run_context
+        run = current_run_context()
+        if run is not None:
+            return await self._request_through_run(run, method, url, content=content,
+                                                   headers=headers, **kwargs)
         decision = self._gate.authorize(
             validator_name=self._validator_name, method=method, url=url,
             body=content if isinstance(content, str) else None,
@@ -413,6 +425,58 @@ class GatedAsyncClient:
         if not decision.allowed:
             raise SafetyGateBlocked(decision)
         return await self._client.request(method, url, content=content, headers=headers, **kwargs)
+
+    async def get(self, url, **kwargs):
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url, **kwargs):
+        return await self.request("POST", url, **kwargs)
+
+    async def _request_through_run(self, run, method, url, *, content=None, headers=None, **kwargs):
+        import httpx
+        follow = kwargs.pop("follow_redirects", self._follow_redirects)
+        built = self._client.build_request(method, url, content=content, headers=headers, **kwargs)
+        raw = built.read()
+        try:
+            body = raw.decode("utf-8") if raw else None
+        except UnicodeDecodeError:
+            # The run transport carries text bodies only; never fall back to a
+            # private client, and never send a silently altered body.
+            raise SafetyGateBlocked(AuthorizationDecision(
+                False, ActionRiskTier.MUTATING,
+                "binary request body cannot be sent through the run transport")) from None
+        send_headers = {**self._headers, **dict(headers or {})}
+        lower = {k.lower() for k in send_headers}
+        for name in ("content-type", "cookie"):
+            if name not in lower and built.headers.get(name):
+                send_headers[name] = built.headers[name]
+        # A gate other than the run's own still restricts; the run's gate itself is
+        # consulted once, by the transport, so its counters are not spent twice.
+        if self._gate is not run.gate:
+            decision = self._gate.authorize(validator_name=self._validator_name,
+                                            method=method, url=str(built.url), body=body)
+            if not decision.allowed:
+                raise SafetyGateBlocked(decision)
+        outcome = await run.target_transport().send_creds(
+            method, str(built.url), capability=self._validator_name, headers=send_headers,
+            body=body, max_redirects=self._max_redirects if follow else 0)
+        request = httpx.Request(method, outcome.final_url or str(built.url))
+        if outcome.ok:
+            # The transport already decoded the body to text: drop framing headers
+            # that would make httpx decode or length-check it a second time.
+            resp_headers = {k: v for k, v in (outcome.headers or {}).items()
+                            if k.lower() not in ("content-encoding", "content-length",
+                                                 "transfer-encoding")}
+            return httpx.Response(outcome.status or 0, headers=resp_headers,
+                                  content=(outcome.body or "").encode("utf-8"), request=request)
+        if outcome.outcome == "error":
+            raise httpx.ConnectError(outcome.error or "transport error", request=request)
+        tier = ActionRiskTier.OUT_OF_SCOPE if outcome.outcome == "out_of_scope" else (
+            ActionRiskTier.SAFE if method.upper() in ("GET", "HEAD", "OPTIONS", "TRACE")
+            else ActionRiskTier.MUTATING)
+        raise SafetyGateBlocked(AuthorizationDecision(
+            False, tier, f"run transport refused the send: {outcome.outcome}"
+                         + (f" ({outcome.error})" if outcome.error else "")))
 
 
 _default_gate: SafetyGate | None = None
