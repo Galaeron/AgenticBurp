@@ -29,9 +29,10 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
 - **Status 2026-10-17:** the candidate is frozen and reproduces precondition, smoke and full
   in isolation; dispositions and canonical owners are recorded in
   [the I01 manifest](I01_CANDIDATE_MANIFEST_2026-10-17.md). The candidate is committed as
-  `ba080691` (pushed with PR #1). Of the 18 untracked tests that pass alone, 16 are committed
-  (`1be5ed04`). `test_captured_shapes_passive` and `test_data_maintenance` import W-dependent test
-  modules and stay with W2. Remaining: split W1–W4 into reviewed commits (W2 needs an owner
+  `ba080691` (pushed with PR #1). Of the 18 untracked tests that pass alone, 14 are committed.
+  The other four import W-dependent test modules and stay with W2: `test_captured_shapes_passive`,
+  `test_data_maintenance`, `test_data_lifecycle_callers` and
+  `test_unverified_priority_consistency`. The last two were found by CI and untracked again. Remaining: split W1–W4 into reviewed commits (W2 needs an owner
   decision first).
 - **Type:** integration / bookkeeping. **Depends on:** none.
 - Inventory tracked and untracked files required by the current fixes. Record a

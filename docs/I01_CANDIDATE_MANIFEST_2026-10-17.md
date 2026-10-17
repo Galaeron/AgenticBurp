@@ -145,8 +145,12 @@ mapping given in the plan.
   DET-SQLI-POST, DET-JWT-DETECT).
 - The candidate is committed as `ba080691` and not pushed; this document follows in its own
   docs commit.
-- 16 of the 18 tests of committed code are committed (`1be5ed04`). `test_captured_shapes_passive`
-  and `test_data_maintenance` import W-dependent test modules, so they stay with W2.
+- 16 of the 18 tests of committed code were committed in `1be5ed04`. CI (Python 3.14, clean
+  checkout) then showed that `test_data_lifecycle_callers` and `test_unverified_priority_consistency`
+  import the uncommitted `test_pairing_contract`. They are untracked again, so 14 remain committed.
+  `test_captured_shapes_passive` and `test_data_maintenance` also stay with W2. Local runs had
+  missed this because the venv's editable install resolves modules missing from a worktree from
+  the main checkout. Leak-free runs now block that finder (see CURRENT_STATE).
 - Not done: W1–W4 still need their own reviewed commits, and W2 needs the partition decision first. Untracked
   tests were classified by running each module on its own:
   `.test-work/i01-untracked-tests-vs-candidate.log` and

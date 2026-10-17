@@ -7,7 +7,9 @@
 - Today's commits (oldest first): `ba080691` discovery fixes (I01 candidate), `1715022a`
   I01 docs, `1be5ed04` 16 regression modules, `2a883761` I03 transport, `fe9b8f3` I04 CSRF,
   `9adfa8a` I11, `d5802ec` I09 caller tests, `b9bcd18` gate: two writes for the
-  second-order pair, `a9b71f6` CSRF manual-check guidance, then the docs commit.
+  second-order pair, `a9b71f6` CSRF manual-check guidance, `6d10816` docs, `5506ee4` CI fix
+  (two W2-dependent tests untracked again; Python 3.14-valid TLS fixtures; short-path
+  compare), then a docs commit.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
@@ -30,12 +32,14 @@
 - Handoffs: `.test-work/{i03-transport,i04-csrf,i09-dispatch,i11-hygiene}-20261017-1731/HANDOFF.md`.
 
 ## Verification
-- `.venv-rationalisation` Python 3.12.14 in isolated worktree `.test-work/wt-verify` (inside
-  the repo: Windows Defender deletes `harness/agents/file_upload_agent.py` and
-  `FileUploadLogic.java` from worktrees under %TEMP%, which breaks 2 tests there).
-- Last code commit verified: precondition 74, smoke 93, full exit 0 (3339 harness, 38 pytest,
-  312 evaluation with 17 artifact-absence skips, 42 integrity). Logs:
-  `.test-work/followups-*.log`. The coverage gate still reports 36 gaps.
+- Verify in the in-repo worktree `.test-work/wt-verify`. Windows Defender deletes
+  `file_upload_agent.py` / `FileUploadLogic.java` from worktrees under %TEMP%. Block the
+  venv's editable-install leak (it imports modules missing from a worktree from the main
+  checkout) with an untracked `sitecustomize.py` there plus `PYTHONPATH=<worktree>`.
+- CI runs Python 3.14. Last verified state (`5506ee4`): on both system Python 3.14.7 and venv
+  3.12.14, smoke 93 OK and full exit 0 (3325 harness, 38 pytest, 312 evaluation with 17
+  artifact-absence skips, 42 integrity). Logs: `.test-work/cifix-*.log`. The coverage gate still
+  reports 36 gaps.
 
 ## Open decisions for the owner
 - W2 default `/analyze` grouping: one shared pile per site (current) versus a separate pile per
