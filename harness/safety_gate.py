@@ -65,6 +65,15 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 HARD_MAX_BURST_SIZE = 20
 HARD_MAX_MUTATING_REQUESTS_PER_FINDING = 20
 
+# Owner-approved per-check write allowances (2026-10-17). A check listed here
+# inherently needs this many mutating sends for ONE case, and uses it instead of
+# max_mutating_requests_per_finding; still capped by the hard ceiling above and
+# still requiring active_enabled + allow_mutating_replay. The second-order SQLi
+# differential plants a TRUE and a FALSE marker under one case reference; with a
+# ceiling of 1 its second plant was always refused, so it could never confirm.
+# Operators can lower an entry (e.g. back to 1) via validators.mutating_ceiling_by_check.
+DEFAULT_MUTATING_CEILING_BY_CHECK = {"second_order_plant": 2}
+
 # Patterns the harness must never itself send in a body/URL it
 # constructs, regardless of any config flag. This is defense in depth
 # for the case where a future validator (or a bug in an existing one)
@@ -116,6 +125,8 @@ class SafetyGateConfig:
     allow_mutating_replay: bool = False  # separate, stricter flag from active_enabled
     max_burst_size: int = 1
     max_mutating_requests_per_finding: int = 1
+    mutating_ceiling_by_check: dict = field(
+        default_factory=lambda: dict(DEFAULT_MUTATING_CEILING_BY_CHECK))
     # Safety item #12: engagement scope. Empty = unset (no host restriction, the
     # historical default). Non-empty = every gated send is refused for a host not
     # listed -- central defense-in-depth so a validator that forgets its own scope
@@ -137,6 +148,9 @@ class SafetyGateConfig:
             allow_mutating_replay=flags["allow_mutating_replay"],
             max_burst_size=int(cfg.get("max_burst_size", 1)),
             max_mutating_requests_per_finding=int(cfg.get("max_mutating_requests_per_finding", 1)),
+            mutating_ceiling_by_check={
+                **DEFAULT_MUTATING_CEILING_BY_CHECK,
+                **{str(k): int(v) for k, v in (cfg.get("mutating_ceiling_by_check") or {}).items()}},
             allowed_hosts=configured_entries(cfg.get("allowed_hosts")),
             target_policy=cfg.get('target_policy') or TargetRequestPolicy(),
         )
@@ -177,18 +191,20 @@ class SafetyGate:
         # min(config.max_mutating_requests_per_finding, HARD ceiling).
         self._mutating_counts: dict[str, int] = {}
 
-    def _mutating_ceiling(self) -> int:
-        return min(self.config.max_mutating_requests_per_finding,
-                   HARD_MAX_MUTATING_REQUESTS_PER_FINDING)
+    def _mutating_ceiling(self, validator_name: str | None = None) -> int:
+        per_check = (self.config.mutating_ceiling_by_check or {}).get(validator_name or "")
+        configured = per_check if per_check is not None else self.config.max_mutating_requests_per_finding
+        return min(configured, HARD_MAX_MUTATING_REQUESTS_PER_FINDING)
 
-    def _reserve_mutating(self, finding_id: str | None, n: int) -> tuple[bool, int, int]:
+    def _reserve_mutating(self, finding_id: str | None, n: int,
+                          validator_name: str | None = None) -> tuple[bool, int, int]:
         """Atomically reserve `n` mutating sends against a finding's budget (R16).
         Returns (ok, used_before, ceiling). A no-op that always succeeds when no
         finding_id is supplied (accounting is opt-in per call, so existing callers
         are unaffected) or n<=0."""
         if not finding_id or n <= 0:
             return True, 0, 0
-        ceiling = self._mutating_ceiling()
+        ceiling = self._mutating_ceiling(validator_name)
         used = self._mutating_counts.get(finding_id, 0)
         if used + n > ceiling:
             return False, used, ceiling
@@ -300,7 +316,7 @@ class SafetyGate:
                 # Enforce the per-finding mutating-request ceiling (R16) when a
                 # finding_id is supplied -- previously this ceiling was declared in
                 # config but never counted, so N separate POSTs all passed.
-                ok, used, ceiling = self._reserve_mutating(finding_id, count)
+                ok, used, ceiling = self._reserve_mutating(finding_id, count, validator_name)
                 if not ok:
                     decision = AuthorizationDecision(
                         allowed=False, tier=tier,
@@ -345,7 +361,7 @@ class SafetyGate:
             )
         else:
             reserve_ok, used, ceiling = (
-                self._reserve_mutating(finding_id, effective_burst)
+                self._reserve_mutating(finding_id, effective_burst, validator_name)
                 if base.tier == ActionRiskTier.MUTATING else (True, 0, 0))
             if not reserve_ok:
                 decision = AuthorizationDecision(

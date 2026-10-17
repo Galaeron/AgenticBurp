@@ -348,10 +348,9 @@ class EngagementSecondOrderCallerTests(_EngagementCallerBase):
         result, rc, _ = self._run(target, max_requests=500, captured=self._PAIR, mutating=True,
                                   browser=True)
         plants, reads = target.plants(), target.second_order_reads()
-        # Under the default gate (max_mutating_requests_per_finding = 1) only the
-        # first plant of the pair is admitted for its case; see the I03 notes.
-        self.assertGreaterEqual(len(plants), 1, [(r[0], r[1], r[3][:60]) for r in target.requests])
-        self.assertGreaterEqual(len(reads), 1)
+        # The gate allows this check two writes per case (TRUE and FALSE plant).
+        self.assertEqual(len(plants), 2, [(r[0], r[1], r[3][:60]) for r in target.requests])
+        self.assertEqual(len(reads), 2)   # one trigger-read after each plant
         self.assertTrue(all(r[2].get("authorization") == "Bearer alice-token" for r in plants))
         self.assertEqual(len(target.requests), rc.budget.used)
         events = evidence_ledger.get_default_ledger().events_for(self._case_ref(target))
