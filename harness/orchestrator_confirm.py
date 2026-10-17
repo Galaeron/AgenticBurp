@@ -623,7 +623,17 @@ class ConfirmMixin:
                 # suppress a finding discovered under a different principal.
                 principal_id=getattr(finding, "principal_id", ""),
                 control_outcome=getattr(result, "control_outcome", "") or "",
+                manual_verification=getattr(result, "manual_verification", "") or "",
             ))
+            # I04: a check that cannot confirm automatically but leaves a
+            # human-verifiable candidate surfaces its steps as the finding's next
+            # step (Burp details pane, reports, API). Guidance, never authority.
+            if getattr(result, "manual_verification", "") and not result.confirmed:
+                _previous = (finding.suggested_test or "").strip()
+                finding.manual_verification = result.manual_verification
+                finding.suggested_test = result.manual_verification + (
+                    f"\n\nAgent suggestion: {_previous}"
+                    if _previous and result.manual_verification not in _previous else "")
             # P0-1/T01 (RB-4 shared helper): VALIDATION_DECISION -- "why was it
             # concluded (vulnerable or not)" -- plus the case-bound structured
             # proof for this attempt, built/persisted together by

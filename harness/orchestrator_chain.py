@@ -782,6 +782,15 @@ class ChainMixin:
             return ""
 
         async def _apply(finding, res, leg, floor, exchange):
+            # I04: an unconfirmed check that leaves a human-verifiable candidate
+            # puts its copy-ready steps in the finding's next step.
+            _guide = getattr(res, "manual_verification", "") if res is not None else ""
+            if _guide and not res.confirmed:
+                _previous = (finding.get("suggested_test") or "").strip()
+                finding["manual_verification"] = _guide
+                finding["suggested_test"] = _guide + (
+                    f"\n\nAgent suggestion: {_previous}"
+                    if _previous and _guide not in _previous else "")
             if res is not None and res.status == "confirmed" and res.confirmed:
                 finding["confirmed"] = True
                 finding["confidence"] = max(float(finding.get("confidence", 0) or 0), float(res.confidence or floor))
