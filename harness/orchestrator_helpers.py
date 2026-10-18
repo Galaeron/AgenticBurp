@@ -223,9 +223,13 @@ def _jwt_identity(node: dict, roles):
     from harness import worklist_investigator
     from harness.role_crawl import principal_keys
     reach = node.get("reachable_roles") or []
-    # reachable_roles holds principal keys (X03); a role label still matches.
-    reachable = sorted((r for key, r in zip(principal_keys(roles), roles)
-                        if key in reach or r.role in reach),
+    # reachable_roles holds principal keys (X03): match each session's own
+    # column. Only a role-keyed matrix (none of these columns present) is
+    # matched by role label.
+    keys = principal_keys(roles)
+    by_column = any(key in reach for key in keys)
+    reachable = sorted((r for key, r in zip(keys, roles)
+                        if (key if by_column else r.role) in reach),
                        key=lambda r: worklist_investigator._trust(r.role))
     for r in (reachable or list(roles)):
         if _carries_jwt(r.headers):

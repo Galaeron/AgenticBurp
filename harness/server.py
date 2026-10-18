@@ -709,7 +709,9 @@ class RoleCrawlRequest(_BaseModel):
     # Each role's real captured session headers (Authorization/Cookie) from Burp.
     # Include an anonymous role (empty headers) to detect auth bypass. Credentials
     # are used for this call only, never stored.
-    roles: list[dict]   # [{"role": "admin", "headers": {...}}, {"role": "anonymous", "headers": {}}]
+    # [{"role": "admin", "headers": {...}, "name": "ops"}, {"role": "anonymous", "headers": {}}]
+    # Optional per role: name (principal), tenant, expected_permissions -- see _role_sessions.
+    roles: list[dict]
     max_pages: int = 40
     max_endpoints: int = 150
     id_fill: str = "1"
@@ -721,6 +723,21 @@ class RoleCrawlRequest(_BaseModel):
     # finds nothing. Read-only, scope-gated, throttled; bounded by max_probes.
     active_discovery: bool = False
     discovery_max_probes: int = 6000
+
+
+def _role_sessions(raw_roles) -> list:
+    """API role dicts -> role_crawl.RoleSession, keeping the operator-declared
+    principal metadata (X03): `name` identifies the principal (two credentials
+    with one name are one principal, renewed), `tenant` and
+    `expected_permissions` are declared, never inferred. Credentials arrive
+    per call and are never persisted."""
+    from harness import role_crawl
+    return [role_crawl.RoleSession(
+                role=str(r.get("role", "user")), headers=r.get("headers") or {},
+                name=(str(r["name"]) if r.get("name") else None),
+                tenant=(str(r["tenant"]) if r.get("tenant") else None),
+                expected_permissions=frozenset(r.get("expected_permissions") or []))
+            for r in (raw_roles or [])]
 
 
 def _register_role_identities(roles) -> list[dict]:
@@ -784,9 +801,7 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
     _require_target_fetch(req.base_url, bulk=True)
     _require_active_crawl(req.base_url)
     from harness import role_crawl
-    roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
-                                    headers=r.get("headers") or {})
-             for r in req.roles]
+    roles = _role_sessions(req.roles)
     if not roles:
         raise HTTPException(status_code=400, detail="roles must be non-empty")
     result = await role_crawl.crawl_roles(
@@ -1277,8 +1292,7 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
     _require_auth(authorization)
     _require_target_fetch(req.base_url, bulk=True)
     from harness import role_crawl, engagement
-    roles = [role_crawl.RoleSession(role=str(r.get("role", "user")), headers=r.get("headers") or {})
-             for r in req.roles]
+    roles = _role_sessions(req.roles)
     if not roles:
         raise HTTPException(status_code=400, detail="roles must be non-empty")
     result = await role_crawl.crawl_roles(
@@ -1460,12 +1474,7 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                    f"running); retry later",
             headers={"Retry-After": "5"})
 
-    roles = [role_crawl.RoleSession(role=str(r.get("role", "user")),
-                                    headers=r.get("headers") or {}, name=r.get("name"),
-                                    tenant=r.get("tenant"),
-                                    expected_permissions=frozenset(
-                                        r.get("expected_permissions") or []))
-             for r in (req.roles or [])] or [role_crawl.RoleSession(role="anonymous", headers={})]
+    roles = _role_sessions(req.roles) or [role_crawl.RoleSession(role="anonymous", headers={})]
     job_id = _uuid.uuid4().hex[:12]
     runs_cfg = (config.get("runs", {}) or {})
     run_context = RunContext.create(

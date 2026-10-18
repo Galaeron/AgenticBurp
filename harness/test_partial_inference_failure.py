@@ -149,6 +149,16 @@ class PartialInferenceFailureTests(unittest.TestCase):
         self.assertTrue(report.raw_error)
         self.assertTrue(resp.degraded)
 
+    def test_findings_that_is_not_a_list_is_a_schema_error(self):
+        for reply in ({"findings": {}, "components": []}, {"findings": None}, {"findings": "none"}):
+            with self.subTest(reply=reply):
+                model = _Model(reply=reply)
+                resp = self._analyze(_build({"sqli": model}), agents=["sqli"])
+                (report,) = self._model_reports(resp, ["sqli"])
+                self.assertTrue(report.raw_error, f"{reply} became a clean empty report")
+                self.assertIn("findings", report.raw_error)
+                self.assertTrue(resp.degraded)
+
     def test_negative_control_healthy_run_is_unchanged(self):
         healthy = _Model(reply={"findings": [], "components": []})
         resp = self._analyze(_build({}, default=healthy))

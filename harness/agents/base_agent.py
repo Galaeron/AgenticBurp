@@ -26,11 +26,14 @@ class AgentReplySchemaError(ValueError):
 
 
 def required_findings(parsed) -> list:
-    """The reply's `findings`. A reply without that key (e.g. `{}`) is a schema
-    failure, not a clean miss (X08): it must surface as the agent's raw_error
-    instead of an empty, healthy-looking report."""
+    """The reply's `findings` list. A reply without that key (e.g. `{}`) or with a
+    non-list value (`{"findings": {}}`, null, a string) is a schema failure, not
+    a clean miss (X08): it must surface as the agent's raw_error instead of an
+    empty, healthy-looking report."""
     if not isinstance(parsed, dict) or "findings" not in parsed:
         raise AgentReplySchemaError("model reply has no 'findings' key")
+    if not isinstance(parsed["findings"], list):
+        raise AgentReplySchemaError("model reply 'findings' is not a list")
     return parsed["findings"]
 
 import re as _re

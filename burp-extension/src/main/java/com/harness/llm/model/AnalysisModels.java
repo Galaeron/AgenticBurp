@@ -108,6 +108,13 @@ public class AnalysisModels {
         public Integer effort_budget_remaining; // nullable -- null means no cap configured
         public String effort_budget_warning;    // "" when nothing to report
         public List<ToolRec> tool_recommendations; // A3 -- may be null on older servers
+        // X08: health of THIS analysis (harness/models.py AnalysisResponse).
+        // degraded = a dispatched model agent or a stage failed, or the model
+        // circuit breaker was open; partial_inference = some, not all, model
+        // agents failed. Absent on older servers -> false/null, read as healthy.
+        public boolean degraded;
+        public boolean partial_inference;
+        public List<String> agent_errors; // "<agent>: <error>"; may be null
     }
 
     public static class UrlEstimateItem {
