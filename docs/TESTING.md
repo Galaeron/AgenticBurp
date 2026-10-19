@@ -5,7 +5,7 @@ for local runs and CI; inspect a tier with `python -m harness.suite full --list`
 
 | Command | What runs | What a pass establishes |
 |---|---|---|
-| `python -m harness.suite smoke` | Pipeline smoke, real discovery gate, discovery/async guards and evidence gate | Selected caller paths still work under controlled inputs |
+| `python -m harness.suite smoke` | Pipeline smoke, real discovery gate, confirmation-leg fixtures, discovery/async guards and evidence gate | Selected caller paths still work under controlled inputs |
 | `python -m harness.suite native` | pytest-native plugin, execution protocol and hardening tests | Regressions that unittest cannot collect are executed |
 | `python -m harness.suite evaluation` | `testing/test_*.py` and `evaluation_integrity/tests/test_*.py` | Score math, stubbed corpus plumbing and standalone evaluation contracts |
 | `python -m harness.suite full` | Full harness unittest discovery, evidence gate, native and evaluation tiers in separate processes | Current regression suites pass, subject to reported skips |
@@ -91,6 +91,16 @@ from a helper unit test or compare different corpora as a model-only effect.
 - Requirement declarations must use runner-resolvable packaged test IDs;
   `test_coverage_manifest.DeclaredIdentityTests` guards this binding. The exact
   evidence identity check remains strict; do not normalize away mismatches.
+- Requirement evidence for the confirmation legs is declared once, in
+  `coverage_manifest._CALLER_EVIDENCE`, and bound with
+  `@evidence_for(**cm.caller_evidence(key))` on the exact caller test.
+  `DeclaredIdentityTests` pins declaration, decorator and test ID together. A bound
+  pair is a confirmation on the vulnerable fixture plus a control that must be a real
+  negative from a leg that reached the fixture. Each bound class also carries a
+  `*_when_the_leg_is_disconnected` test (`testing_fixtures.leg_fault`) that cuts the
+  async egress and requires every bound test to fail. A test with an optional
+  prerequisite (Playwright, curl) cannot honestly be bound unless CI provides it:
+  a skip leaves the declared aspect unproven and fails the evidence gate.
 - A failing old assertion is not automatically obsolete. Check the intended
   contract and caller before updating it. Do not hide known defects by deletion,
   broad skips, weakened assertions or a lower expected count.

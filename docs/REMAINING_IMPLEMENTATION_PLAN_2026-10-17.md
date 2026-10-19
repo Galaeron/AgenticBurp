@@ -101,7 +101,12 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   cookie-authenticated candidates now show as low-severity "NEEDS MANUAL CHECK" items with
   copy-ready steps and a test form (analyze caller test). Validator-level controls and a fault
   injection restoring the retired decision are in `harness/test_csrf_reflection_control.py`.
-  Open: caller -> storage -> export label check (with I02).
+  2026-10-19: the caller -> storage -> export label check is done (commit `14747a9`,
+  `harness/test_csrf_label_storage_export.py`, 8 tests). The candidate stays unconfirmed,
+  low severity and manual-verification in the stored row, issue export, SARIF and Markdown.
+  A SameSite=Lax control and a fault injection that reinstates the old decision are included.
+  The steps reach the API (Burp "Next step") and Markdown. Issue export and SARIF carry no
+  `suggested_test` for any finding; that parity gap is I16 work.
 - **Type:** reproduce historical issue, then correct or close with evidence.
   **Depends on:** I01; coordinate confirmation expectations with I02.
 - Inspect the current WIP branch named by LB-CSRF-REPLAY. Use a benign reflecting
@@ -208,8 +213,12 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
 ### [~] I11 — Remove test flakiness and reconcile requirement evidence
 - **Status 2026-10-17:** LB-FLAKE closed (fixed clock committed; controls added). The audit
   logger file-handle leak is fixed. The 36 gaps are classified in
-  `docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md`. Remaining: wire evidence for the 14
-  caller-tested requirements, and trace the 3 unclosed loopback sockets.
+  `docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md`. 2026-10-19: the 3 unclosed loopback
+  sockets are traced and closed in their owners (`Collaborator.stop`/`stop_shared`, the
+  `test_driver_capture` fixture); 11 of the 14 caller-tested requirements are wired to
+  confirmation + control evidence (gap count 36 -> 25). Remaining: WSTG-ATHZ-02 (no caller
+  test), WSTG-SESS-01 (shares the SESS-03 fixation pair), WSTG-INPV-01 (needs Playwright in
+  CI), plus the unit-only rows.
 - **Type:** verification infrastructure. **Depends on:** I01; can start alongside I02.
 - Reproduce LB-FLAKE and reconcile it with the existing deterministic report-clock
   work before changing it. Inject a fixed clock; retain a content-change negative control.
