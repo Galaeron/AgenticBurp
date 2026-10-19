@@ -20,6 +20,13 @@ authorization. Requiring a difference from R_missing rules out endpoints that
 return the same page for every id (no real object behind the parameter), the main
 false positive. The other object's contents are never dumped into the finding.
 
+A different object alone is not an IDOR: public records at sequential ids differ
+too (R14). So the foreign read is replayed once more with every credential header
+removed (R_anon). It confirms only when R_anon does not show the foreign object --
+the object is protected and this principal's session is what unlocks it. A capture
+with no credentials, a foreign object served to anyone, or a failed control stays
+an unconfirmed candidate ("inconclusive").
+
 Off by default with the rest of the active validators (validators.active_enabled),
 scope-gated, GET-only.
 """
@@ -31,6 +38,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import httpx
 
 from harness import global_throttle
+from harness.missing_auth_probe import _AUTH_HEADERS
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
@@ -98,6 +106,27 @@ def _is_object(status, body: str) -> bool:
     low = body.lower()
     # A denial/login/not-found page is not "an object returned".
     return not any(tok in low[:400] for tok in _DENIAL)
+
+
+def _tokens(body: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9][a-z0-9_.@$-]*", (body or "").lower()))
+
+
+def _object_markers(b_foreign: str, b_own: str, b_missing: str) -> set[str]:
+    """Tokens only the foreign object's response carries: the part of the page
+    that is that object, not the template shared with our own object or the
+    absent-id page."""
+    return _tokens(b_foreign) - _tokens(b_own) - _tokens(b_missing)
+
+
+def _exposes_object(markers: set[str], status, body: str) -> bool:
+    """Whether a response shows the foreign object. With no markers to look for,
+    a 2xx is assumed to show it, so an unbound read can never confirm (R14)."""
+    if status is None or not (200 <= status < 300):
+        return False
+    if not markers:
+        return True
+    return 2 * len(_tokens(body) & markers) >= len(markers)
 
 
 def _distinct(sa, ba: str, sb, bb: str) -> bool:
@@ -177,8 +206,12 @@ class IdorReadValidator(Validator):
                 evidence=(f"{exchange.method} {exchange.url} is object-scoped on the {kind} id "
                           f"{key!r}, but no numeric neighbour or supplied candidate id was available "
                           f"to attempt a cross-object read."))
+        anon_headers = {k: v for k, v in headers.items() if k.lower() not in _AUTH_HEADERS}
+        has_session = len(anon_headers) < len(headers)
+        candidate = ""  # a distinct foreign object we could not show is protected
         for cand in foreigns:
-            fr = await self._get(_with_id(exchange, kind, key, cand), headers)
+            foreign_url = _with_id(exchange, kind, key, cand)
+            fr = await self._get(foreign_url, headers)
             if fr is None:
                 continue
             s_f, b_f = fr
@@ -190,15 +223,45 @@ class IdorReadValidator(Validator):
             # endpoint just returns the same page for everything (no real object).
             if missing is not None and not _distinct(s_miss, b_miss, s_f, b_f):
                 continue
+            # R14: a different object is only an IDOR when it is protected and this
+            # principal's session is what unlocks it. Replay the same foreign read
+            # with every credential header removed (the unauthorized principal).
+            if not has_session:
+                candidate = candidate or (
+                    f"the capture carries no session or credential header, so the foreign "
+                    f"object (HTTP {s_f}) is readable without one: a public record or missing "
+                    f"authentication, not a proven cross-principal read")
+                continue
+            anon = await self._get(foreign_url, anon_headers)
+            if anon is None:
+                candidate = candidate or (
+                    "the unauthenticated control read of the foreign object was blocked or failed")
+                continue
+            s_a, b_a = anon
+            if _exposes_object(_object_markers(b_f, b_own, b_miss), s_a, b_a):
+                candidate = candidate or (
+                    f"the foreign object is also served without credentials (HTTP {s_a}), so it is "
+                    f"public to everyone, not protected from this principal")
+                continue
             return ValidationResult(
                 self.name, "confirmed", "idor", confidence=0.75, confirmed=True,
                 summary=(f"IDOR confirmed: changing the {kind} id {key!r} to another value returned "
-                         f"a different user/object's record to the same session."),
+                         f"a different user/object's protected record to the same session."),
                 evidence=(f"As the captured principal, {exchange.method} with the {kind} id set to a "
                           f"foreign value returned a substantive object (HTTP {s_f}) that differs from "
-                          f"both this principal's own object and a known-absent id -- broken "
-                          f"object-level authorization. The other object's contents are redacted; the "
-                          f"probe was read-only (no write or delete)."))
+                          f"both this principal's own object and a known-absent id. The same read "
+                          f"without credentials was refused (HTTP {s_a}; the object was not shown), so "
+                          f"the object is protected and this principal's session unlocks another "
+                          f"object -- broken object-level authorization. The other object's contents "
+                          f"are redacted; the probe was read-only (no write or delete)."))
+        if candidate:
+            return ValidationResult(
+                self.name, "inconclusive", "idor", confidence=0.3, confirmed=False,
+                summary="IDOR candidate (unconfirmed): another object was readable, but it was not "
+                        "shown to be protected from this principal",
+                evidence=(f"On the {kind} id {key!r}, a foreign id returned a different object, but "
+                          f"{candidate}. Different objects at neighbouring ids are not proof of "
+                          f"broken object-level authorization."))
         return ValidationResult(
             self.name, "not_confirmed", "idor", confidence=0.0, confirmed=False,
             summary="No cross-object read: foreign ids were denied or returned no distinct object",

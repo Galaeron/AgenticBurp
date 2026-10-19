@@ -57,11 +57,15 @@ class ReadDifferentialTests(_Gate):
 
     def test_confirms_username_idor_with_supplied_candidate(self):
         # Distinct account page per id; absent id -> not found. carlos supplied.
+        # R14: the account pages are protected -- without the session cookie the
+        # app redirects to its login page, so only the session unlocks carlos.
         async def app(self, method, url, headers=None, content=None):
             idv = parse_qs(urlsplit(url).query).get("id", [""])[0]
             class _R: pass
             r = _R(); r.status_code = 200
-            if idv == "wiener":
+            if "Cookie" not in (headers or {}):
+                r.status_code = 302; r.text = ""
+            elif idv == "wiener":
                 r.text = "Your username: wiener. Your API key: KEY-WIENER-" + "x" * 40
             elif idv == "carlos":
                 r.text = "Your username: carlos. Your API key: KEY-CARLOS-" + "y" * 40
@@ -76,11 +80,14 @@ class ReadDifferentialTests(_Gate):
         self.assertNotIn("KEY-CARLOS", res.evidence)  # other object's data redacted
 
     def test_confirms_numeric_idor_via_neighbour(self):
+        # R14: orders are protected -- an unauthenticated read is refused.
         async def app(self, method, url, headers=None, content=None):
             seg = urlsplit(url).path.rsplit("/", 1)[-1]
             class _R: pass
             r = _R(); r.status_code = 200
-            if seg == "123":
+            if "Cookie" not in (headers or {}):
+                r.status_code = 401; r.text = "Please log in"
+            elif seg == "123":
                 r.text = "Order 123 for wiener total $10 " + "a" * 40
             elif seg in ("124", "122", "125"):
                 r.text = f"Order {seg} for someone-else total $99 " + "b" * 40
