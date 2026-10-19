@@ -14,9 +14,9 @@
   proof binding through storage/export, then a docs commit. `2ba91da` I05-A (sends escaping
   their run) + `5bca380` docs. Then `14747a9` I04 label check, `d7201fc` I11 socket leaks,
   `d8eb094` I11 evidence wiring, and a docs commit. All pushed to PR #1.
-- Local, not yet pushed (network/process containment needs owner review per the guide):
-  `ae8f287` I05-C tool process lifecycle, `934c3e1` I05-C2 counting proxy, `f7d1321` I05-A2
-  standalone analyze publishes its run, and a docs commit.
+- Then, after the owner's containment review (pushed 2026-10-19): `ae8f287` I05-C tool
+  process lifecycle, `934c3e1` I05-C2 counting proxy, `f7d1321` I05-A2 standalone analyze
+  publishes its run, and `1431602` docs.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache

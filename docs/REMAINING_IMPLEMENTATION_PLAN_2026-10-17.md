@@ -131,7 +131,7 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   Guards: an unbound validator, or `transport_for(None)`, inside an entered run now uses
   that run. `harness/test_run_escape_callers.py` (14 tests) includes two fault injections.
 - **Status 2026-10-19 — batches C, C2 and A2 done** (implemented + caller-verified; local
-  commits `ae8f287`, `934c3e1`, `f7d1321`; push awaits owner review):
+  commits `ae8f287`, `934c3e1`, `f7d1321`; pushed after owner review):
   - **C, external-process lifecycle:** every tool (sqlmap host/container, ffuf) runs as an
     owned process tree (Windows Job Object, created suspended; POSIX process group).
     Output is bounded while it is read. Cancel or timeout stops the whole tree and removes
