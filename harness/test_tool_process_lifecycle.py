@@ -48,6 +48,10 @@ note(role=role, pid=os.getpid(), event="start")
 if role == "root" and os.environ.get("I05C_CHILD") == "1":
     subprocess.Popen([sys.executable, __file__], env=dict(os.environ, I05C_ROLE="child"),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.environ.get("I05C_WAIT_CHILD") == "1":    # the root exits only once its child runs
+        end = time.monotonic() + 10
+        while time.monotonic() < end and '"role": "child"' not in open(log, encoding="utf-8").read():
+            time.sleep(0.02)
 if role == "root":
     noise = int(os.environ.get("I05C_NOISE", "0"))
     line = "x" * 1023 + "\n"
@@ -360,6 +364,85 @@ class JobCancelLifecycleTests(_ToolFixture, unittest.TestCase):
         removed = [c for c in self.docker_calls() if c[:2] == ["rm", "-f"]]
         self.assertEqual(len(removed), 1, self.docker_calls())
         self.assertTrue(removed[0][2].startswith("harness_"))
+
+
+# --- R36: no Job Object, no tool ---------------------------------------------------------
+def _job_creation_fails():
+    return patch.object(tool_runner._Win, "create_kill_on_close_job",
+                        side_effect=OSError("synthetic job creation failure"))
+
+
+def _pid_fallback_tree():
+    class _PidFallbackTree(tool_runner._OwnedTree):
+        """Fault: the pre-R36 fallback -- no job, so the tree is tracked by its root PID."""
+
+        def attach(self, proc) -> None:
+            self._proc, self.kind = proc, "pid"
+            tool_runner._Win.resume(proc)
+
+        def terminate(self) -> None:
+            subprocess.run(["taskkill", "/PID", str(self._proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=15)
+
+        def alive(self) -> int:
+            return 0 if self._proc.poll() is not None else 1
+
+    return _PidFallbackTree
+
+
+@unittest.skipUnless(os.name == "nt", "Job Object containment is Windows-only")
+class JobObjectFailureLifecycleTests(_ToolFixture, unittest.TestCase):
+    """The root exits as soon as its child runs; the child would keep running.
+    Real owned workers, launched suspended through the real runner."""
+
+    def setUp(self):
+        super().setUp()
+        self.env.update(I05C_SLEEP="0", I05C_CHILD_SLEEP="30", I05C_WAIT_CHILD="1")
+
+    def _sqlmap(self):
+        return asyncio.run(SqlmapValidator(binary=_FAKE_SQLMAP, timeout_seconds=30,
+                                           allowed_hosts=["shop.test"]).validate(_sqli(), _exchange()))
+
+    def test_job_failure_refuses_the_host_sqlmap_tool(self):
+        with _job_creation_fails():
+            result = self._sqlmap()
+        self.assertEqual(result.status, "error", result.summary)
+        self.assertIn("not started", result.summary)
+        time.sleep(0.5)
+        self.assertEqual(self.pids(), [], "a tool ran although its tree could not be contained")
+
+    def test_job_failure_refuses_the_container_tool(self):
+        from harness import ffuf_runner
+        receipt: dict = {}
+        with _job_creation_fails():
+            with self.assertRaises(tool_runner.ToolContainmentUnavailable):
+                tool_runner.run("harness/sqlmap:test", ["-u", "http://x/"], timeout=10,
+                                receipt=receipt)
+            ffuf = ffuf_runner.run_sync("http://shop.test/", timeout=10)
+        self.assertEqual(receipt["outcome"], "containment_unavailable")
+        self.assertIn("not started", ffuf.error)
+        time.sleep(0.5)
+        self.assertEqual(self.pids(), [], "a container CLI ran without containment")
+
+    def test_job_object_stops_the_child_a_clean_exit_left(self):
+        """Control: with the job, the surviving child is stopped before the caller returns."""
+        result = self._sqlmap()
+        self.assertNotEqual(result.status, "error", result.summary)
+        self.assertTrue(self.pids("child"), self.events())
+        self.assertEqual(self.survivors(), [], "the child outlived the validator")
+        receipt: dict = {}
+        with patch.object(tool_runner, "_force_remove", return_value=True):
+            tool_runner.run("harness/sqlmap:test", ["-u", "http://x/"], timeout=10, receipt=receipt)
+        self.assertEqual((receipt["containment"], receipt["cleanup"]), ("job", "terminated"))
+        self.assertEqual(self.survivors(), [])
+
+    def test_pid_only_fallback_is_detected(self):
+        """Fault injection: the old PID fallback reports not_needed while the child runs on."""
+        with _job_creation_fails(), patch.object(tool_runner, "_OwnedTree", _pid_fallback_tree()):
+            result = tool_runner.run_process([_FAKE_SQLMAP], timeout=10)
+        self.assertEqual(result.cleanup, "not_needed")
+        self.assertTrue(self.pids("child") and self.survivors(),
+                        "the PID-only fallback no longer leaks -- the control is vacuous")
 
 
 # --- fault injection --------------------------------------------------------------------

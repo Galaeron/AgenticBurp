@@ -248,6 +248,12 @@ class ToolCleanupFailed(RuntimeError):
     stop while owned work may continue."""
 
 
+class ToolContainmentUnavailable(RuntimeError):
+    """The tool's process tree could not be contained (Windows: no Job Object), so
+    the tool was never started. A PID alone cannot find or prove gone a descendant
+    whose parent has exited (R36), so there is no unproven fallback."""
+
+
 @dataclass
 class ProcessResult:
     args: list
@@ -256,7 +262,7 @@ class ProcessResult:
     stderr: str
     outcome: str            # exit | timeout | cancelled
     cleanup: str            # not_needed | terminated | cleanup_failed
-    containment: str        # job | process-group | pid
+    containment: str        # job | process-group
     pid: int | None = None
     stdout_dropped: int = 0
     stderr_dropped: int = 0
@@ -432,13 +438,14 @@ class _Win:
 class _OwnedTree:
     """Every process a launched tool starts. Windows: the tool starts suspended, is
     placed in a kill-on-close Job Object and only then resumed, so no descendant can
-    escape; the job's ActiveProcesses proves emptiness. POSIX: a fresh session, so
-    the process group holds every descendant that does not create its own."""
+    escape; the job's ActiveProcesses proves emptiness. Without a job the tool is
+    never resumed (ToolContainmentUnavailable). POSIX: a fresh session, so the
+    process group holds every descendant that does not create its own."""
 
     def __init__(self):
         self._proc = None
         self._job = None
-        self.kind = "pid"
+        self.kind = ""
 
     @staticmethod
     def popen_kwargs() -> dict:
@@ -454,21 +461,18 @@ class _OwnedTree:
         try:
             self._job = _Win.create_kill_on_close_job()
             _Win.assign(self._job, proc)
-            self.kind = "job"
-        except OSError:
-            if self._job is not None:
-                _Win.close(self._job)
-                self._job = None
-            self.kind = "pid"     # fallback: exact-PID tree kill via taskkill /T
+        except OSError as exc:
+            self.close()
+            # Fail closed: the old PID-only fallback reported cleanup not_needed once
+            # the root exited, while a child it started kept running (R36).
+            raise ToolContainmentUnavailable(
+                f"no Job Object for pid {proc.pid}; the tool was not started: {exc}") from exc
+        self.kind = "job"
         _Win.resume(proc)
 
     def terminate(self) -> None:
         if os.name == "nt":
-            if self._job is not None:
-                _Win.terminate_job(self._job)
-            else:
-                subprocess.run(["taskkill", "/PID", str(self._proc.pid), "/T", "/F"],
-                               capture_output=True, timeout=15)
+            _Win.terminate_job(self._job)
             return
         import signal
         try:
@@ -479,9 +483,7 @@ class _OwnedTree:
     def alive(self) -> int:
         """Members still running; 0 means none is left."""
         if os.name == "nt":
-            if self._job is not None:
-                return _Win.active_processes(self._job)
-            return 0 if self._proc.poll() is not None else 1
+            return _Win.active_processes(self._job)
         try:
             os.killpg(self._proc.pid, 0)
         except ProcessLookupError:
@@ -514,8 +516,9 @@ def run_process(argv, *, timeout: float, cancel=None, env=None,
     normal exit. Raises ToolRunCancelled when `cancel` fires (before or after launch)
     and subprocess.TimeoutExpired when `timeout` elapses -- in both cases only after
     the whole tree has been terminated; the exception carries `.result`. Raises
-    ToolCleanupFailed when that termination cannot be proved. FileNotFoundError from
-    a missing executable propagates unchanged."""
+    ToolCleanupFailed when that termination cannot be proved, and
+    ToolContainmentUnavailable (the tool never ran) when its tree cannot be
+    contained. FileNotFoundError from a missing executable propagates unchanged."""
     argv = [str(a) for a in argv]
     if _is_cancelled(cancel):
         raise ToolRunCancelled(f"tool run cancelled before launch: {argv[0]!r}")
@@ -526,11 +529,15 @@ def run_process(argv, *, timeout: float, cancel=None, env=None,
     try:
         tree.attach(proc)
     except BaseException:
+        # Not resumed yet (Windows), so nothing of the tool has run.
         try:
             proc.kill()
             proc.wait(_KILL_WAIT_SECONDS)
         except Exception:
             pass
+        tree.close()
+        for stream in (proc.stdout, proc.stderr):
+            stream.close()
         raise
     sinks = (_BoundedSink(max_output), _BoundedSink(max_output))
     readers = [threading.Thread(target=_drain, args=(stream, sink), daemon=True)
@@ -668,7 +675,9 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
     except Exception as exc:
         outcome = ("timeout" if isinstance(exc, subprocess.TimeoutExpired)
                    else "cancelled" if isinstance(exc, ToolRunCancelled)
-                   else "cleanup_failed" if isinstance(exc, ToolCleanupFailed) else "error")
+                   else "cleanup_failed" if isinstance(exc, ToolCleanupFailed)
+                   else "containment_unavailable" if isinstance(exc, ToolContainmentUnavailable)
+                   else "error")
         if receipt is not None:
             receipt["outcome"] = outcome
             partial = getattr(exc, "result", None)
