@@ -65,3 +65,44 @@ P1 findings are in bold. Batches have disjoint files.
 
 The review's own disposition of non-promoted hypotheses (its last two sections) stands. It
 adds no findings beyond R01–R53.
+
+## Status
+
+Landed on PR #1 (2026-10-19): RV-A and RV-G, verified together at `9d76c5d`. Both are
+caller-verified, not live-validated. Handoffs are in `.test-work/rv-a-toolcleanup-20261019/` and
+`.test-work/rv-g-norunroutes-20261019/`.
+
+- **RV-A** (`aa97fc2`, `8b5ed4e`, `cf4a264`):
+  - R35: the tool proxy's close() is bounded, and a client that stalls for 30 s gets a 408.
+  - R36: on Windows, when no Job Object can contain a tool, the harness refuses to start it
+    (outcome `containment_unavailable`). The PID-only fallback is removed.
+  - R34: a same-origin redirect is returned origin-relative, so a container client keeps its
+    own proxy address. This is checked against an emulated container client only.
+  - R37: the egress probe records a connection when it is accepted and drains handlers before
+    the verdict.
+  - Open: real Docker runs of R34 and of the R37 egress proof.
+- **RV-G** (`9d76c5d`):
+  - R01: `/settings` rejects non-boolean toggles with a 422 (also `coordinator.cloud_reasoning`).
+  - R02: `/crawl`, `/crawl-roles` and `/engagement/{host}/advance` each own a run. Every hop,
+    redirects included, passes scope, target policy, the safety gate and budget. Caller headers
+    stay on the base origin. Their clients are now pinned, which closes I05 B's limit.
+  - R03: `/advance` refuses with a 403 while active testing is off.
+  - R07: robots.txt paths and query endpoints that look destructive (`/logout` and similar)
+    are suppressed and never fetched.
+  - R15: `/probe-missing-auth` confirms only when the endpoint is declared protected and a
+    matching authenticated baseline exists. Otherwise the result is an unconfirmed
+    `unauthenticated_access` candidate.
+  - Interim choices, accepted by the owner for now (2026-10-19):
+    - the routes have no request ceiling beyond `runs.max_requests` (unset) and their own
+      page caps;
+    - they never send mutating probes;
+    - the Burp "Probe missing auth" panel sends no baseline, so its results stay
+      unconfirmed until an I16 Java change adds one.
+  - Follow-ups (not findings):
+    - A: orchestrator_chain's missing-auth confirm still hardcodes `expected_protected=True`.
+    - B: `_require_target_fetch(bulk=True)` could be relaxed for routes that own a run.
+    - C: `/probe-missing-auth` creates its runs without `config=`, so config transport
+      settings are not applied there.
+    - D: `/probe-missing-auth` sends anonymous GETs while active testing is off.
+
+Next: RV-H (it gates live targets), then RV-B, RV-D, RV-E and the rest in the order above.

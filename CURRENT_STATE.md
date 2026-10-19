@@ -5,7 +5,7 @@
   [Galaeron/AgenticBurp#1](https://github.com/Galaeron/AgenticBurp/pull/1) after today's push.
   Auto-fix is on for PR #1.
 - Commits: `git log --oneline 474ad511..HEAD` (each batch is followed by a docs commit).
-  Latest: I05-B `bcd56c9`, then I02-C `f846e36` + `aacc35a`. All pushed to PR #1.
+  Latest: code review 02 RV-A (`aa97fc2`..`cf4a264`) and RV-G (`9d76c5d`). All pushed to PR #1.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
@@ -35,21 +35,23 @@
   `file_upload_agent.py` / `FileUploadLogic.java` from worktrees under %TEMP%. Block the
   venv's editable-install leak (it imports modules missing from a worktree from the main
   checkout) with an untracked `sitecustomize.py` there plus `PYTHONPATH=<worktree>`.
-- CI runs Python 3.14. Last full verification: `aacc35a` exactly (isolated worktree
-  `.test-work/wt-i02c`, unchanged during the run).
+- CI runs Python 3.14. Last full verification: `9d76c5d` exactly (isolated worktree
+  `.test-work/wt-land-rvag`, unchanged during the run).
   - Interpreters: system Python 3.14.7 and venv 3.12.14, with the same results on both.
   - Results: precondition 74 OK, smoke 146 OK, full exit 0.
-  - Full breakdown: 3475 harness, 38 pytest, 312 evaluation (17 artifact-absence skips),
-    42 integrity.
+  - Full breakdown: 3506 harness, 317 evaluation (17 skips), 42 integrity.
   - 0 ResourceWarnings; the coverage gate reports 25 gaps.
-  - Logs: `.test-work/land-i02c-20261019/`.
+  - Logs: `.test-work/land-rv-ag-20261019/`.
 - Stopping a background run with TaskStop leaves its process tree running. End it by
   exact PID tree, and never by a pattern that could match another session's processes.
 
-## Owner decisions (2026-10-17)
-- `/analyze` grouping: one shared pile per site by default; `engagement_id` = optional named
+## Owner decisions
+- 2026-10-17, `/analyze` grouping: one shared pile per site by default; `engagement_id` = optional named
   pile. The W2 `analyze:<uuid>` server hunk is rejected (do not commit it). A Burp field for the
   named pile is I16 work.
+- RV-G interim choices accepted for now (2026-10-19): no request ceiling for the crawl routes
+  beyond `runs.max_requests`; the routes send no mutating probes; the Burp missing-auth panel
+  stays unconfirmed until I16 adds a baseline.
 
 ## Open work and evidence boundaries
 - Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I02, I03, I04, I05,
@@ -61,13 +63,15 @@
     standalone analyze) and B (redirect and DNS-rebinding destination policy).
   - The I04 storage/export label check and the I11 socket trace; 11 of the 14
     caller-tested requirements are wired.
+  - Code review 02 batches RV-A (tool proxy, Job Object fail-closed, egress probe) and RV-G
+    (no-run routes own a run, `/settings` strict booleans, missing-auth probe confirmation).
+    Status and follow-ups: docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md "Status".
 
   Next:
-  - Code review 02 (`reviews/2026-10-17-code-review-02/FINAL_REVIEW.md`, untracked) has 52
+  - Code review 02 (`reviews/2026-10-17-code-review-02/FINAL_REVIEW.md`, untracked) has 43
     open findings.
-    - They are in batches RV-A to RV-K in docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md.
-    - RV-G replaces I05's no-run-routes item.
-    - Run no live target until RV-A, RV-G and RV-H land.
+    - They are in batches RV-B to RV-K in docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md.
+    - Run no live target until RV-H lands.
   - I05 batch D (browser credential isolation; brief at
     `.test-work/i05d-browsercreds-20261019/BATCH.md`) and a real-container proof of C
     (Docker Desktop was off);

@@ -177,11 +177,13 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
     `harness/test_connect_address_pin.py` (8 tests).
   - Limits: behind an HTTP(S) proxy only the connection to the proxy is pinned; a name whose
     first answer is private or loopback is accepted (lab targets); no failover to another A
-    record within a run; clients on the no-run routes are not pinned. Not live-validated
-    against an external rebinding service.
+    record within a run. Not live-validated against an external rebinding service.
+  - The no-run routes `/crawl`, `/crawl-roles` and `/engagement/{host}/advance` now own a run
+    and are pinned (code review 02 RV-G, `9d76c5d`). RV-A (`aa97fc2`..`cf4a264`) fixed tool
+    proxy close, Job Object fail-closed, container redirects and the egress probe count. See
+    docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md "Status".
 
-  Next: batch D (browser credential isolation) and the no-run routes `/crawl`,
-  `/crawl-roles` and `/engagement/{host}/advance`.
+  Next: batch D (browser credential isolation).
 - **Type:** implementation + isolated environment proof. **Depends on:** I01/I03.
 - Reconcile connect-time address pinning with redirect handling and approved
   destination policy. Verify browser credential isolation across two origins.
@@ -378,6 +380,6 @@ Use I14 to justify subsequent model/architecture/performance changes. Finish I16
 and make the scoped release decision in I17. No new agents, validators or competitor
 features are needed merely to begin this sequence.
 
-Code review 02 (2026-10-19) has 52 open findings. They are mapped to I02, I05, I06/I07, I10,
+Code review 02 (2026-10-19) has 52 findings. They are mapped to I02, I05, I06/I07, I10,
 I12 and I16 as batches RV-A to RV-K in docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md, which also
-sets their order.
+sets their order. RV-A and RV-G (9 findings) have landed; 43 remain open.
