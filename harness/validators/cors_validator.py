@@ -16,6 +16,7 @@ Tests performed:
 
 from __future__ import annotations
 import asyncio
+import contextvars
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,25 @@ if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.cors")
+
+# The attacker origin every probe sends. Confirmation compares the returned
+# Access-Control-Allow-Origin with THIS origin (R09).
+_PROBE_ORIGIN = "https://evil-attacker.com"
+# Tests whose vulnerable result means the browser grants the attacker origin
+# itself (or "null") access. The other tests are weaknesses that only matter
+# once that is true, so they never confirm on their own (R09).
+_ORIGIN_GRANT_TESTS = {"Origin Reflection", "Null Origin", "Wildcard Origin + Credentials",
+                       "Credentials + Wildcard"}
+# Per-validate() record of each probe's fate ("ok", "blocked", "error"), so a
+# probe that never ran is not read as a pass (R08). A ContextVar rather than
+# instance state: one validator instance serves concurrent validations.
+_PROBES: contextvars.ContextVar[list | None] = contextvars.ContextVar("cors_probes", default=None)
+
+
+def _note_probe(outcome: str) -> None:
+    probes = _PROBES.get()
+    if probes is not None:
+        probes.append(outcome)
 
 
 @dataclass
@@ -160,6 +180,8 @@ class CorsValidator(Validator):
             )
         
         # Run all CORS tests
+        probes: list[str] = []
+        probe_scope = _PROBES.set(probes)
         try:
             tests.append(await self._test_wildcard_origin(base_url, exchange))
             tests.append(await self._test_null_origin(base_url, exchange))
@@ -169,10 +191,42 @@ class CorsValidator(Validator):
             tests.append(await self._test_allow_headers_wildcard(base_url, exchange))
             tests.append(await self._test_expose_headers(base_url, exchange))
             tests.append(await self._test_max_age(base_url, exchange))
-            
+
+            # R09: confirm only when the browser would grant the attacker origin
+            # access. Header weaknesses (Allow-Headers *, exposed headers, a long
+            # Max-Age, ...) matter only then; on their own they are informational.
+            origin_granted = any(t.vulnerable and t.test_name in _ORIGIN_GRANT_TESTS
+                                 for t in tests)
+            if not origin_granted:
+                for t in tests:
+                    if t.vulnerable:
+                        t.vulnerable = False
+                        t.severity = "info"
+                        t.detail += (f" (informational: the probe origin {_PROBE_ORIGIN} is not "
+                                     f"granted access, so this is not exploitable on its own)")
+
             # Check if any test found a vulnerability
             vulnerable = any(t.vulnerable for t in tests)
-            
+
+            # R08: a probe that was blocked (budget, gate, scope) or failed is not a
+            # pass. Without every probe answered, a negative is incomplete.
+            unanswered = [p for p in probes if p != "ok"]
+            if not vulnerable and (unanswered or not probes):
+                blocked = "blocked" in unanswered
+                answered = len(probes) - len(unanswered)
+                return ValidationResult(
+                    validator=self.get_name(),
+                    status="blocked" if blocked and not answered else "inconclusive",
+                    finding_class=finding.vulnerability_class,
+                    confidence=0.0,
+                    confirmed=False,
+                    summary=(f"CORS check incomplete: {len(unanswered)} of {len(probes)} probe(s) "
+                             f"got no response ({', '.join(sorted(set(unanswered))) or 'none sent'}); "
+                             f"not a negative result"),
+                    evidence=self._build_evidence(tests),
+                    raw_output=self._build_raw_output(tests),
+                )
+
             # Determine severity
             if vulnerable:
                 severities = [t.severity for t in tests if t.vulnerable]
@@ -221,7 +275,9 @@ class CorsValidator(Validator):
                 evidence="",
                 raw_output=str(e),
             )
-    
+        finally:
+            _PROBES.reset(probe_scope)
+
     def _get_base_url(self, url: str) -> str:
         """Extract base URL from a full URL."""
         from urllib.parse import urlparse
@@ -249,7 +305,9 @@ class CorsValidator(Validator):
                     capability=self.get_name(),
                     max_redirects=self.max_redirects if follow_redirects else 0)
                 if not outcome.ok:
+                    _note_probe("error" if outcome.outcome == "error" else "blocked")
                     return None
+                _note_probe("ok")
                 return httpx.Response(
                     outcome.status or 0, content=(outcome.body or "").encode(),
                     headers=outcome.headers, request=httpx.Request(method, url))
@@ -266,18 +324,22 @@ class CorsValidator(Validator):
                 follow_redirects=follow_redirects,
                 max_redirects=self.max_redirects,
             ) as client:
-                return await client.request(method, url, headers=headers)
+                response = await client.request(method, url, headers=headers)
+            _note_probe("ok")
+            return response
         except SafetyGateBlocked as e:
             log.debug(f"CORS request blocked by safety gate: {e}")
+            _note_probe("blocked")
             return None
         except Exception as e:
             log.debug(f"Request failed: {e}")
+            _note_probe("error")
             return None
     
     async def _test_wildcard_origin(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if server reflects wildcard origin."""
         # Test with arbitrary origin
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         
         headers = {
             "Origin": test_origin,
@@ -389,7 +451,7 @@ class CorsValidator(Validator):
     async def _test_credentials_wildcard(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if server allows credentials with wildcard origin."""
         # This is a spec violation but some browsers allow it
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         
         headers = {
             "Origin": test_origin,
@@ -436,7 +498,7 @@ class CorsValidator(Validator):
         # never send a mutating method (a POST here was an ungated state-changing
         # request to the target; see W-1). The OPTIONS preflight below is also
         # non-mutating.
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -460,16 +522,19 @@ class CorsValidator(Validator):
         
         # Check if CORS headers are present without preflight
         acao = response.headers.get("Access-Control-Allow-Origin", "")
-        
+
         if acao and acao != "*" and acao.lower() != test_origin.lower():
-            # Server returns CORS headers without proper preflight
+            # R09: one fixed allowed origin that is NOT the probe origin is the
+            # secure allow-list pattern -- the browser refuses the attacker origin
+            # whatever Allow-Credentials says. It is not a bypass.
             return CorsTestResult(
                 test_name="Preflight Bypass",
-                passed=False,
-                severity="medium",
-                detail="Server returns CORS headers without proper preflight validation",
+                passed=True,
+                severity="info",
+                detail=f"Server allows a fixed origin ({acao}) that is not the probe origin; "
+                       f"the browser refuses {test_origin}",
                 evidence=f"Simple GET with attacker Origin returned Access-Control-Allow-Origin: {acao}",
-                vulnerable=True,
+                vulnerable=False,
             )
         
         # Test actual preflight
@@ -516,7 +581,7 @@ class CorsValidator(Validator):
     
     async def _test_vary_origin(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if Vary: Origin header is present."""
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -582,7 +647,7 @@ class CorsValidator(Validator):
     
     async def _test_allow_headers_wildcard(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if Access-Control-Allow-Headers: * is present."""
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -625,7 +690,7 @@ class CorsValidator(Validator):
     
     async def _test_expose_headers(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if sensitive headers are exposed."""
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -681,7 +746,7 @@ class CorsValidator(Validator):
     
     async def _test_max_age(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if Access-Control-Max-Age is too high."""
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
