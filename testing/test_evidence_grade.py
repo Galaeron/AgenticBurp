@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 _TESTING_DIR = Path(__file__).resolve().parent
@@ -124,6 +125,39 @@ class GradeFindingsTests(unittest.TestCase):
         graded = grade_findings(findings, proofs, cases, artifacts)
         self.assertEqual(graded["f1"]["support"], "supported")
         self.assertEqual(graded["f1"]["tier"], "differential_reproduced")
+
+    def test_one_exchange_recorded_as_baseline_and_attack_is_not_differential(self):  # R40
+        findings = [_finding("f1", "EX1", "sql injection")]
+        proofs = [_proof(baseline_artifact_id="a1", attack_artifact_id="a1")]
+        graded = grade_findings(findings, proofs, [_case()], [_artifact("a1")])
+        self.assertEqual(graded["f1"]["support"], "supported")
+        self.assertEqual(graded["f1"]["tier"], "captured")
+
+    def test_baseline_and_attack_ids_differing_only_by_padding_are_one_exchange(self):  # R40
+        findings = [_finding("f1", "EX1", "sql injection")]
+        proofs = [_proof(baseline_artifact_id="a1", attack_artifact_id=" a1 ")]
+        graded = grade_findings(findings, proofs, [_case()], [_artifact("a1"), _artifact(" a1 ")])
+        self.assertEqual(graded["f1"]["tier"], "captured")
+
+    def test_same_exchange_as_both_sides_reaches_the_score_as_captured_not_differential(self):  # R40, caller
+        findings = [_finding("f1", "EX1", "sql injection")]
+        proofs = [_proof(baseline_artifact_id="a1", attack_artifact_id="a1")]
+        _hook, report = build_evidence_grade_hook(findings, proofs, [_case()], [_artifact("a1")])
+        self.assertEqual(report["per_finding"]["f1"]["tier"], "captured")
+        self.assertEqual(report["tier_counts"], {"captured": 1})
+
+    def test_fault_injection_old_differential_rule_is_detected(self):  # R40 defect injection
+        import evidence_grade
+
+        def pre_fix(proof):  # id presence only: the rule this fix replaced
+            return bool(proof) and bool(proof.get("baseline_artifact_id")) and bool(
+                proof.get("attack_artifact_id"))
+
+        findings = [_finding("f1", "EX1", "sql injection")]
+        proofs = [_proof(baseline_artifact_id="a1", attack_artifact_id="a1")]
+        with unittest.mock.patch.object(evidence_grade, "_is_differential", pre_fix):
+            graded = grade_findings(findings, proofs, [_case()], [_artifact("a1")])
+        self.assertEqual(graded["f1"]["tier"], "differential_reproduced")  # the defect is observable
 
     def test_proof_referencing_missing_artifact_is_graded_insufficient(self):
         findings = [_finding("f1", "EX1", "sql injection")]
