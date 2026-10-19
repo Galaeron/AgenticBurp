@@ -19,6 +19,14 @@ checkout/config" — WITHOUT weakening the trust discipline:
   when the attempt's own status is a clean completion.
 * One checkout/one config is enforced, not assumed: assembling the run refuses if
   the per-attempt artifacts span more than one ``checkout`` or ``config_hash``.
+* A "done" attempt is healthy only if its own artifact says so: ``result.degraded`` /
+  ``result.errors`` and ``auth.degraded`` reject it (it scores as an infrastructure
+  error, never as a success). Oracle verdicts must be real booleans; anything else is
+  reported and makes the run ineligible instead of being coerced.
+* The subprocess runner's artifact must belong to THIS invocation: a previous
+  ``attempt.json`` in a reused directory is set aside before launch, the new one must
+  carry this attempt's ``run_id``, and a non-zero exit can only pair with the
+  non-success statuses the smoke runner itself reports.
 
 Nothing here sends traffic; the live runs happen inside the subprocess runner the
 owner authorizes. Offline, the pure record-mapping / assembly / scoring path is
@@ -62,6 +70,58 @@ def select_cases(manifest: dict[str, Any], mode: str) -> list[dict[str, Any]]:
     return [c for c in manifest["cases"] if mode in c["modes"]]
 
 
+def _degradation(artifact: dict[str, Any]) -> list[str]:
+    """Reasons an attempt's own artifact says its execution was not healthy.
+
+    Absent ``result``/``auth`` blocks (older artifacts) say nothing; a present block
+    must be well formed and clean, because a malformed health field cannot be trusted
+    to mean "healthy"."""
+    reasons: list[str] = []
+    result = artifact.get("result")
+    if result is not None:
+        if not isinstance(result, dict):
+            reasons.append("result is not an object")
+        else:
+            degraded = result.get("degraded", False)
+            if degraded is True:
+                reasons.append("result.degraded is true")
+            elif degraded is not False and degraded is not None:
+                reasons.append("result.degraded is not a boolean")
+            errors = result.get("errors")
+            if errors is not None and not isinstance(errors, list):
+                reasons.append("result.errors is not a list")
+            elif errors:
+                reasons.append(f"result reports {len(errors)} error(s)")
+    auth = artifact.get("auth")
+    if auth is not None:
+        if not isinstance(auth, dict):
+            reasons.append("auth is not an object")
+        else:
+            degraded = auth.get("degraded", False)
+            if degraded is True:
+                reasons.append("auth.degraded is true")
+            elif degraded is not False and degraded is not None:
+                reasons.append("auth.degraded is not a boolean")
+            if auth.get("requested") is True and auth.get("ok") is not True:
+                reasons.append("authentication was requested but not established")
+    return reasons
+
+
+def _oracle_verdict(case_oracle: Any, attempt: int) -> tuple[bool, str | None]:
+    """The owner's verdict for one attempt, and a problem if it is not a real boolean.
+
+    ``bool()`` is not used: the JSON string ``"false"`` is truthy. Anything that is not
+    exactly ``True`` is unverified, and a non-boolean entry is reported."""
+    if not isinstance(case_oracle, list):
+        return False, f"oracle for the case is {type(case_oracle).__name__}, not a list of booleans"
+    if attempt > len(case_oracle):
+        return False, None
+    entry = case_oracle[attempt - 1]
+    if isinstance(entry, bool):
+        return entry, None
+    return False, f"oracle verdict is {type(entry).__name__} {entry!r}, not a boolean"
+
+
 def attempt_record(artifact: dict[str, Any], *, case_id: str, attempt: int,
                    artifact_ref: str, oracle_verified: bool = False) -> dict[str, Any]:
     """Map one ``attempt.json`` artifact into a scorer record.
@@ -69,10 +129,20 @@ def attempt_record(artifact: dict[str, Any], *, case_id: str, attempt: int,
     ``objective_verified`` is set ONLY when the owner's oracle says verified AND
     the attempt itself completed cleanly (status "success"); a solved lab behind a
     timed-out/errored attempt is excluded, matching CURRENT_STATE's discipline.
+    A "done" attempt whose artifact reports degraded execution is not a clean
+    completion: it maps to an infrastructure error, with its reasons kept on the
+    record.
     """
+    if not isinstance(oracle_verified, bool):
+        raise wob.BenchmarkContractError(
+            f"{case_id} attempt {attempt}: oracle_verified must be a boolean, "
+            f"got {type(oracle_verified).__name__}")
     smoke_status = str(artifact.get("status") or "")
     status, failure_stage = _STATUS_MAP.get(smoke_status, ("error", "infrastructure"))
-    verified = bool(oracle_verified) and status == "success"
+    health_problems = _degradation(artifact) if status == "success" else []
+    if health_problems:
+        status, failure_stage = "error", "infrastructure"
+    verified = oracle_verified and status == "success"
     record = {
         "case_id": case_id,
         "attempt": attempt,
@@ -87,9 +157,11 @@ def attempt_record(artifact: dict[str, Any], *, case_id: str, attempt: int,
         "human_interventions": int(artifact.get("human_interventions") or 0),
         "artifact_refs": [artifact_ref],
     }
+    if health_problems:
+        record["health_problems"] = health_problems
     # Surface an oracle/attempt conflict for the summary without lying in the
     # scored record (a solved lab that the run could not cleanly complete).
-    if bool(oracle_verified) and not verified:
+    if oracle_verified and not verified:
         record["_excluded_verified"] = True
     return record
 
@@ -116,7 +188,7 @@ def assemble_run(mode: str, attempts: list[dict[str, Any]], *,
     records = [
         attempt_record(a["artifact"], case_id=a["case_id"], attempt=a["attempt"],
                        artifact_ref=a["artifact_ref"],
-                       oracle_verified=bool(a.get("oracle_verified")))
+                       oracle_verified=a.get("oracle_verified", False))
         for a in attempts
     ]
     return {
@@ -131,24 +203,71 @@ def assemble_run(mode: str, attempts: list[dict[str, Any]], *,
             {"case_id": r["case_id"], "attempt": r["attempt"]}
             for r in records if r.get("_excluded_verified")
         ],
+        "_degraded_attempts": [
+            {"case_id": r["case_id"], "attempt": r["attempt"], "reasons": r["health_problems"]}
+            for r in records if r.get("health_problems")
+        ],
     }
+
+
+# The smoke runner exits 0 only for a clean "done"; "timeout" and "error" attempts
+# write their artifact and exit non-zero. A "done" artifact after a failed exit is
+# therefore not something the runner could have produced for this invocation.
+_NONZERO_EXIT_STATUSES = frozenset({"timeout", "error"})
+
+
+def _failed_attempt(error: str) -> dict[str, Any]:
+    return {"status": "error", "error": error, "findings": [],
+            "checkout": "unknown", "config_hash": "unknown"}
+
+
+def _set_aside(artifact_path: Path) -> str | None:
+    """Move an existing ``attempt.json`` out of the way before launching, keeping it.
+
+    A reused directory must not let a previous attempt stand in for this one. Returns
+    a problem description when the file cannot be moved (freshness cannot be shown)."""
+    if not artifact_path.exists():
+        return None
+    for number in range(1, 10_000):
+        target = artifact_path.with_name(f"{artifact_path.name}.superseded-{number}")
+        if not target.exists():
+            try:
+                artifact_path.rename(target)
+            except OSError as exc:
+                return f"cannot set aside previous {artifact_path.name}: {exc}"
+            return None
+    return f"too many superseded copies of {artifact_path.name}"
 
 
 def _default_runner(*, python: str, runner: Path, target: str, case_id: str,
                     objective_class: str, out_dir: Path, run_id: str,
                     budgets: dict[str, Any]) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = out_dir / "attempt.json"
+    problem = _set_aside(artifact_path)
+    if problem:
+        return _failed_attempt(problem)
     cmd = [python, str(runner), target, "--case-id", case_id,
            "--objective-class", objective_class, "--output", str(out_dir),
            "--run-id", run_id]
     for flag, value in budgets.items():
         cmd += [f"--{flag.replace('_', '-')}", str(value)]
-    subprocess.run(cmd, cwd=str(ROOT), check=False)
-    artifact_path = out_dir / "attempt.json"
-    if not artifact_path.exists():
-        return {"status": "error", "error": "runner produced no attempt.json",
-                "findings": [], "checkout": "unknown", "config_hash": "unknown"}
-    return json.loads(artifact_path.read_text(encoding="utf-8"))
+    exit_code = subprocess.run(cmd, cwd=str(ROOT), check=False).returncode
+    if not artifact_path.is_file():
+        return _failed_attempt(f"runner exited {exit_code} and produced no attempt.json")
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return _failed_attempt(f"runner exited {exit_code}; attempt.json is unreadable: {exc}")
+    if not isinstance(artifact, dict):
+        return _failed_attempt(f"runner exited {exit_code}; attempt.json is not an object")
+    if artifact.get("run_id") != run_id:
+        return _failed_attempt(
+            f"attempt.json run_id {artifact.get('run_id')!r} is not this invocation's {run_id!r}")
+    if exit_code != 0 and artifact.get("status") not in _NONZERO_EXIT_STATUSES:
+        return _failed_attempt(
+            f"runner exited {exit_code} but attempt.json claims status {artifact.get('status')!r}")
+    return artifact
 
 
 def orchestrate(manifest: dict[str, Any], targets: dict[str, str], *, mode: str,
@@ -179,6 +298,7 @@ def orchestrate(manifest: dict[str, Any], targets: dict[str, str], *, mode: str,
     attempts_required = manifest["attempts_per_case"]
 
     attempts: list[dict[str, Any]] = []
+    invalid_oracle: list[dict[str, Any]] = []
     for case in cases:
         for attempt in range(1, attempts_required + 1):
             out_dir = output_dir / case["id"] / f"attempt-{attempt}"
@@ -191,8 +311,10 @@ def orchestrate(manifest: dict[str, Any], targets: dict[str, str], *, mode: str,
                 ref = str((out_dir / "attempt.json").relative_to(output_dir))
             except ValueError:
                 ref = str(out_dir / "attempt.json")
-            case_oracle = oracle.get(case["id"], [])
-            oracle_verified = bool(attempt <= len(case_oracle) and case_oracle[attempt - 1])
+            oracle_verified, oracle_problem = _oracle_verdict(oracle.get(case["id"], []), attempt)
+            if oracle_problem:
+                invalid_oracle.append({"case_id": case["id"], "attempt": attempt,
+                                       "problem": oracle_problem})
             attempts.append({
                 "case_id": case["id"], "attempt": attempt, "artifact": artifact,
                 "artifact_ref": ref, "oracle_verified": oracle_verified,
@@ -200,8 +322,15 @@ def orchestrate(manifest: dict[str, Any], targets: dict[str, str], *, mode: str,
 
     run = assemble_run(mode, attempts, run_id=run_id)
     excluded = run.pop("_excluded_verified", [])
+    degraded = run.pop("_degraded_attempts", [])
     scorecard = wob.score(manifest, run, artifact_root=output_dir)
     scorecard["excluded_verified_attempts"] = excluded
+    scorecard["degraded_attempts"] = degraded
+    scorecard["invalid_oracle_entries"] = invalid_oracle
+    # A malformed oracle is an input error, not a verdict: the numbers cannot be
+    # certified against what the owner meant, so the run is not eligible.
+    scorecard["gates"]["valid_oracle_entries"] = not invalid_oracle
+    scorecard["eligible"] = bool(scorecard["eligible"]) and not invalid_oracle
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "scorecard.json").write_text(
@@ -226,7 +355,8 @@ def render_summary(scorecard: dict[str, Any]) -> str:
         f"zero_false_confirmations={gates.get('zero_false_confirmations')}, "
         f"zero_wrong_class_confirmations={gates.get('zero_wrong_class_confirmations')}, "
         f"zero_human_interventions={gates.get('zero_human_interventions')}, "
-        f"healthy_execution={gates.get('healthy_execution')})",
+        f"healthy_execution={gates.get('healthy_execution')}, "
+        f"valid_oracle_entries={gates.get('valid_oracle_entries')})",
         "",
         "## Objective (positive cases)",
         f"- First-attempt: {obj.get('first_attempt_successes')} "
@@ -244,6 +374,15 @@ def render_summary(scorecard: dict[str, Any]) -> str:
     if excluded:
         lines += ["", "## Excluded (lab-solved but attempt did not complete cleanly)",
                   *[f"- {e['case_id']} attempt {e['attempt']}" for e in excluded]]
+    degraded = scorecard.get("degraded_attempts", [])
+    if degraded:
+        lines += ["", "## Degraded attempts (rejected as evidence)",
+                  *[f"- {d['case_id']} attempt {d['attempt']}: {'; '.join(d['reasons'])}"
+                    for d in degraded]]
+    invalid = scorecard.get("invalid_oracle_entries", [])
+    if invalid:
+        lines += ["", "## Invalid oracle entries (run not eligible)",
+                  *[f"- {e['case_id']} attempt {e['attempt']}: {e['problem']}" for e in invalid]]
     return "\n".join(lines) + "\n"
 
 
