@@ -12,7 +12,7 @@ One exchange, two claims: A (sqli) is matched directly by a validator that
 confirms sqli; B (cleartext_transmission) reaches that same validator only via
 the agent-fallback route. A may become confirmed with its own proof; B must
 never borrow A's proof, confidence or confirmation. After a simulated restart, a
-missing, unresolvable or re-pointed proof must not keep an export "confirmed".
+missing, stale, unresolvable or re-pointed proof must not keep an export "confirmed".
 """
 from __future__ import annotations
 
@@ -199,6 +199,13 @@ class ProofBindingStorageExportTests(unittest.TestCase):
         self._sql("UPDATE findings SET proof_id = 'proof-that-does-not-exist' WHERE vulnerability_class = ?", _A)
         # The finding's own pointer is broken, so it is no longer confirmed; the
         # case's real recorded attempt still exists and stays replayable evidence.
+        self._assert_not_confirmed_anywhere(replayable=True)
+
+    def test_stale_proof_verdict_does_not_keep_confirmation(self):
+        # The record still exists but no longer says confirmed: it remains a
+        # replayable attempt, yet cannot carry the confirmation.
+        self._sql("UPDATE proof_records SET verdict = 'inconclusive' WHERE proof_id = ?",
+                  self._api(_A).proof_id)
         self._assert_not_confirmed_anywhere(replayable=True)
 
     def test_proof_of_another_case_does_not_keep_confirmation(self):
