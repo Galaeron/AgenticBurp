@@ -13,6 +13,16 @@ from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/h
 from harness.validators.base import ValidationResult
 
 
+def _fallback_result_binds(result, routed) -> bool:
+    """The agent-fallback class binding: a confirmation reached only through the
+    producing-agent routing token binds to the finding only when the validator
+    reports that same token back (see _validate_findings). A named seam so a
+    caller test can prove its removal is detected; there is no bypass flag."""
+    tested_class = (result.finding_class or "").strip().lower()
+    fallback_label = (routed.vulnerability_class or "").strip().lower()
+    return tested_class == fallback_label
+
+
 class ConfirmMixin:
     async def get_run_derived_live_markers(self):
         """P0-2: the run-derived confirmation-trust-tier override.
@@ -589,9 +599,7 @@ class ConfirmMixin:
                 # AuthSequenceValidator._which_checks) so it declines to run
                 # an unrelated check at all, rather than running it and
                 # relying on this catch after the fact.
-                tested_class = (result.finding_class or "").strip().lower()
-                fallback_label = (routed.vulnerability_class or "").strip().lower()
-                if result.confirmed and tested_class != fallback_label:
+                if result.confirmed and not _fallback_result_binds(result, routed):
                     result = replace(
                         result, confirmed=False, status="skipped",
                         finding_class=finding.vulnerability_class,

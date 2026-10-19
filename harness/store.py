@@ -1144,12 +1144,46 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
              finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed,
              oracle_verified, vstate, capsule_id, exchange_id, run_id, captured_principal_id) in rows
     ]
+    _resolve_confirmation_proofs(results)
     if not include_suppressed:
         results = [r for r in results if not r["suppressed"]]
     if not include_chains:
         results = [r for r in results
                    if not r["vulnerability_class"].startswith("potential-attack-chain:")]
     return results
+
+
+def _resolve_confirmation_proofs(results: list[dict]) -> None:
+    """I02-A: a stored confirmation that names a proof counts only while that exact
+    proof -- same proof_id AND case_id, verdict confirmed -- is still on record.
+    A missing, unresolvable or re-pointed proof is reported as proof unavailable,
+    never as confirmed, on every surface that reads this function (findings API,
+    Markdown report, issue/SARIF export). Rows with no proof pointer at all keep
+    their legacy meaning (proof_status "none")."""
+    for r in results:
+        r["proof_status"] = "none"
+    pointed = [r for r in results if r["confirmed"] and (r["proof_id"] or r["case_id"])]
+    if not pointed:
+        return
+    ids = sorted({r["proof_id"] for r in pointed if r["proof_id"]})
+    resolved: set[tuple[str, str]] = set()
+    if ids:
+        conn = _connect()
+        try:
+            marks = ",".join("?" for _ in ids)
+            resolved = {(pid, cid) for pid, cid in conn.execute(
+                f"SELECT proof_id, case_id FROM proof_records "
+                f"WHERE proof_id IN ({marks}) AND verdict = 'confirmed'", ids).fetchall()}
+        finally:
+            conn.close()
+    from harness import confirmation_gate
+    for r in pointed:
+        if (r["proof_id"], r["case_id"]) in resolved:
+            r["proof_status"] = "resolved"
+        else:
+            r["proof_status"] = "unavailable"
+            r["confirmed"] = False
+            r["lifecycle_state"] = confirmation_gate.lifecycle_state(False, r["review_verdict"])
 
 
 def suppress_finding(fingerprint: str, reason: str = "") -> None:
