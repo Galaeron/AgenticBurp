@@ -19,6 +19,20 @@ class HttpExchange(BaseModel):
     # back-compat: empty for older callers, which fall back to a content
     # hash of the exchange (see cache.ExchangeCache.compute_exchange_hash).
     capture_id: str = ""
+    # I02-C / I07 shared capture contract. All optional: an absent value means
+    # unknown and is never fabricated. `captured_at` is when the exchange was
+    # captured (epoch seconds), kept apart from when the harness ingested it;
+    # `state_version` is a supplied application state/version label, never
+    # inferred from the body; `completeness` says whether the bodies are whole.
+    # Unset values are left out of model_dump(), so an exchange without them
+    # dumps exactly as before (several plan ids hash the dump).
+    captured_at: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False,
+                                         exclude_if=lambda v: v is None)
+    capture_source: str = Field(default="", max_length=128, exclude_if=lambda v: v == "")
+    completeness: Literal["complete", "truncated", "binary_unsupported", "unknown"] = Field(
+        default="unknown", exclude_if=lambda v: v == "unknown")
+    state_version: Optional[str] = Field(default=None, max_length=128,
+                                         exclude_if=lambda v: v is None)
 
 
 class ComponentCandidate(BaseModel):
