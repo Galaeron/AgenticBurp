@@ -60,10 +60,21 @@ pytest-native and evaluation tests in separate processes; smoke is a subset.
 See [testing](docs/TESTING.md) for scope, limitations, dependencies and CI tiers.
 No offline tier establishes current model accuracy or blind-target recall.
 
+## Token budget
+
+Most usage is long contexts (>150k), so keep sessions short:
+- One batch per session: start from `.test-work/<batch>/BATCH.md` and end with its
+  `HANDOFF.md`. Start the next batch in a fresh session, never by continuing this one.
+- Near ~150k context mid-batch, write HANDOFF.md with the exact next step and stop.
+- Never read full suite logs (they run to MB). Have the run script write exit codes/counts to a
+  summary file; read that, and grep only failures.
+- Read the plan/guide by ticket section (grep the heading, read that range).
+- At most 3 sessions in parallel. Sonnet for tests-only/mechanical batches.
+
 ## Keep onboarding bounded
 
 Overwrite CURRENT_STATE.md with the current branch/base, verification, open work
-and pointers; do not append session histories. Keep it under 100 lines and this
+and pointers; do not append session histories or commit lists (git log has them). Keep it under 100 lines and this
 file under 100 lines. Put durable task-specific detail in docs/ or its existing
 reference. Preserve historical evidence in archive/ or reviews/ without promoting
 old completion claims. CLAUDE.md is a pointer to this file, not a duplicate.
