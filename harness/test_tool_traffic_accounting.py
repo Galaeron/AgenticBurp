@@ -11,15 +11,21 @@ budget.used); a small budget stops the tool after exactly that many requests and
 leaves no process behind; credentials reach only the target origin; an
 off-origin redirect is refused at the proxy. Handing the tool the real target URL
 (forwarding loss) must be detected by the same accounting assertion.
+
+Code review 02: a same-origin redirect stays reachable from a container (R34), and
+a stalled or half-open client can neither hold the validator in the proxy's
+close() nor a handler open forever (R35). Both fixes have a fault injection.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -98,7 +104,8 @@ class _AccountingFixture(unittest.TestCase):
         self.target.close()
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def _validate(self, *, max_requests=100, headers=None, extra_patches=(), **validator_kw):
+    def _validate(self, *, max_requests=100, headers=None, extra_patches=(), bound=None,
+                  **validator_kw):
         run = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=max_requests)
         exchange = HttpExchange(url=f"{self.target.base}/api/items/7", method="GET",
                                 request_headers=dict(headers or {}), response_status=200,
@@ -109,7 +116,8 @@ class _AccountingFixture(unittest.TestCase):
         async def go():
             try:
                 async with run:
-                    return await validator.validate(_sqli(), exchange)
+                    # `bound`: the test's own limit, so a hang fails instead of blocking.
+                    return await asyncio.wait_for(validator.validate(_sqli(), exchange), bound)
             finally:
                 await run.aclose()
 
@@ -180,6 +188,198 @@ class ToolTrafficAccountingTests(_AccountingFixture, unittest.TestCase):
                            "bypassing the proxy is no longer visible -- the control is vacuous")
 
 
+# --- R34: a redirect is followed on the address the tool can reach -----------------------
+_REDIRECT_TOOL = r'''
+import http.client, json, os, sys
+from urllib.parse import urljoin, urlsplit
+args = sys.argv[1:]
+url = args[args.index("-u") + 1]
+in_container = urlsplit(url).hostname == "host.docker.internal"
+
+def get(u):
+    # Inside a container, host.docker.internal reaches the host (Docker Desktop maps it
+    # to the host's loopback, emulated here) and 127.0.0.1 is the container itself.
+    p = urlsplit(u)
+    conn = http.client.HTTPConnection("127.0.0.1", p.port, timeout=10)
+    conn.request("GET", p.path + (f"?{p.query}" if p.query else ""), headers={"Host": p.netloc})
+    r = conn.getresponse()
+    r.read()
+    conn.close()
+    return r.status, r.getheader("Location")
+
+status, location = get(url)
+seen = {"first": status, "location": location}
+if location:
+    nxt = urljoin(url, location)      # resolved against what the tool requested
+    seen["resolved"] = nxt
+    if in_container and urlsplit(nxt).hostname in ("127.0.0.1", "localhost"):
+        seen["followed"] = "unreachable: container loopback"
+    else:
+        seen["followed"] = get(nxt)[0]
+with open(os.environ["I05D_OUT"], "w", encoding="utf-8") as f:
+    json.dump(seen, f)
+'''
+
+
+class _RedirectTarget:
+    """Owned loopback target: the scanned URL answers 302 with an ABSOLUTE same-origin
+    Location; /landed answers 200. Records each request it receives."""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.requests: list[tuple[str, str, dict, str]] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                outer.requests.append((self.command, self.path, {}, ""))
+                if self.path.startswith("/landed"):
+                    self.send_response(200)
+                else:
+                    self.send_response(302)
+                    self.send_header("Location", f"{outer.base}/landed?from=302")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(5)
+
+
+class ToolProxyRedirectCallerTests(_AccountingFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        Path(self.tool).write_text(_REDIRECT_TOOL, encoding="utf-8")
+        self.target.close()
+        self.target = _RedirectTarget()
+        self.env["I05D_OUT"] = os.path.join(self._tmp, "seen.json")
+
+    def _seen(self) -> dict:
+        import json
+        return json.loads(Path(self.env["I05D_OUT"]).read_text(encoding="utf-8"))
+
+    def _container_validate(self):
+        with patch.object(tool_runner, "available", return_value=(True, "")), \
+                patch.object(tool_runner, "_force_remove", return_value=True):
+            return self._validate(container_image="harness/sqlmap:test")
+
+    def test_container_follows_a_same_origin_redirect_through_the_proxy(self):
+        _, run = self._container_validate()
+        seen = self._seen()
+        self.assertEqual(urlsplit(seen["resolved"]).hostname, "host.docker.internal", seen)
+        self.assertEqual(seen["followed"], 200, seen)
+        self.assertEqual([r[1] for r in self.target.requests if r[1].startswith("/landed")],
+                         ["/landed?from=302"])
+        self.assertEqual(len(self.target.requests), run.budget.used)
+
+    def test_host_tool_keeps_loopback(self):
+        """Control: on the host the redirect resolves to the proxy on 127.0.0.1."""
+        _, run = self._validate()
+        seen = self._seen()
+        self.assertEqual(urlsplit(seen["resolved"]).hostname, "127.0.0.1", seen)
+        self.assertEqual(seen["followed"], 200, seen)
+        self.assertEqual(len(self.target.requests), 2)
+        self.assertEqual(run.budget.used, 2)
+
+    def test_absolute_loopback_rewrite_is_detected(self):
+        """Fault injection: the pre-R34 rewrite to http://127.0.0.1:<port> strands a container."""
+        def absolute(proxy, request_url, location):
+            p = urlsplit(location)
+            return f"http://{proxy.bind_host}:{proxy.port}{p.path}?{p.query}"
+
+        with patch.object(tool_proxy.ToolProxy, "_rewrite_location", absolute):
+            self._container_validate()
+        seen = self._seen()
+        self.assertEqual(seen["followed"], "unreachable: container loopback",
+                         "the loopback rewrite no longer strands the container -- the control is vacuous")
+        self.assertFalse([r for r in self.target.requests if r[1].startswith("/landed")])
+
+
+# --- R35: a stalled client cannot hold the proxy or its caller --------------------------
+async def _pre_r35_close(proxy):
+    """The close() before R35: stop listening, then wait for every client to finish."""
+    server, proxy._server = proxy._server, None
+    if server is not None:
+        server.close()
+        await server.wait_closed()
+
+
+class ToolProxyStalledClientCallerTests(_AccountingFixture, unittest.TestCase):
+    """A client that half-opens a proxy connection and never finishes its request --
+    a stray local process, or a forwarder that keeps the host side open -- while the
+    validator's own tool runs normally."""
+
+    def setUp(self):
+        super().setUp()
+        self.env["I05D_REQUESTS"] = "3"
+        self.stalled: list[socket.socket] = []
+        self.replies: list[bytes] = []
+        real_start = tool_proxy.ToolProxy.start
+        fixture = self
+
+        async def start_with_stalled_client(proxy):
+            await real_start(proxy)
+            sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            sock.sendall(b"GET /api/items/7?stalled=1 HTTP/1.1\r\n")   # never finished
+            fixture.stalled.append(sock)
+            threading.Thread(target=fixture._read_reply, args=(sock,), daemon=True).start()
+            return proxy
+
+        self.stall = patch.object(tool_proxy.ToolProxy, "start", start_with_stalled_client)
+
+    def _read_reply(self, sock: socket.socket) -> None:
+        data = b""
+        try:
+            while chunk := sock.recv(4096):
+                data += chunk
+        except OSError:
+            pass
+        self.replies.append(data)
+
+    def tearDown(self):
+        for sock in self.stalled:
+            sock.close()
+        super().tearDown()
+
+    def test_validator_returns_while_a_client_is_stalled(self):
+        start = time.monotonic()
+        result, run = self._validate(extra_patches=(self.stall,), bound=15)
+        self.assertLess(time.monotonic() - start, 12.0)
+        self.assertEqual(len(self._tool_requests()), 3, "control: the tool's requests are served")
+        self.assertEqual(len(self.target.requests), run.budget.used)
+        self.assertFalse([r for r in self.target.requests if "stalled=1" in r[1]],
+                         "an unfinished request was forwarded")
+
+    def test_stalled_client_gets_408_within_the_deadline_while_open(self):
+        self.env.update(I05D_REQUESTS="2", I05D_DELAY="1.0")   # the proxy stays open ~2 s
+        with patch.object(tool_proxy, "_CLIENT_TIMEOUT_SECONDS", 0.5):
+            result, run = self._validate(extra_patches=(self.stall,), bound=15)
+        end = time.monotonic() + 3
+        while not self.replies and time.monotonic() < end:
+            time.sleep(0.02)
+        # Only the deadline answers 408; close() would abort the connection without a reply.
+        self.assertTrue(self.replies and self.replies[0].startswith(b"HTTP/1.1 408"), self.replies)
+        self.assertEqual(len(self._tool_requests()), 2, "control: the tool's requests are served")
+
+    def test_unbounded_close_is_detected(self):
+        """Fault injection: the pre-R35 close() waits on the stalled client, so the
+        validator does not return within the test's own bound (and does not hang)."""
+        with patch.object(tool_proxy, "_CLIENT_TIMEOUT_SECONDS", 3600.0), \
+                patch.object(tool_proxy.ToolProxy, "close", _pre_r35_close):
+            with self.assertRaises(asyncio.TimeoutError,
+                                   msg="an unbounded close() no longer hangs -- the control is vacuous"):
+                self._validate(extra_patches=(self.stall,), bound=5)
+
+
 class ToolProxyBoundaryTests(unittest.TestCase):
     """The proxy itself: off-origin redirects and refusals never reach anything."""
 
@@ -187,10 +387,13 @@ class ToolProxyBoundaryTests(unittest.TestCase):
         proxy = tool_proxy.ToolProxy(None, "http://127.0.0.1:1/", capability="t")
         proxy.port = 4242
         self.assertEqual(proxy._rewrite_location("http://127.0.0.1:1/a", "/next"), "/next")
+        self.assertEqual(proxy._rewrite_location("http://127.0.0.1:1/a/b", "c"), "/a/c")
+        # Same origin: origin-relative, so the tool keeps the proxy address it used (R34).
         self.assertEqual(proxy._rewrite_location("http://127.0.0.1:1/a", "http://127.0.0.1:1/b?c=1"),
-                         "http://127.0.0.1:4242/b?c=1")
-        self.assertTrue(proxy._rewrite_location("http://127.0.0.1:1/a", "http://evil.test/x")
-                        .endswith(tool_proxy._OFF_ORIGIN_PATH))
+                         "/b?c=1")
+        for off in ("http://evil.test/x", "//evil.test/x", "http://127.0.0.1:1//evil.test/x"):
+            self.assertEqual(proxy._rewrite_location("http://127.0.0.1:1/a", off),
+                             tool_proxy._OFF_ORIGIN_PATH, off)
 
     def test_proxy_serves_exactly_one_origin(self):
         proxy = tool_proxy.ToolProxy(None, "http://127.0.0.1:1/", capability="t")

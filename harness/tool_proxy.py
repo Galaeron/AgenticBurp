@@ -7,33 +7,41 @@ PROXY for that one target origin. Every request the tool makes to the proxy is
 replayed through `run.target_transport()` -- one budget unit each, the run's scope
 and gate, its TLS trust and credential sessions -- and the response handed back.
 The tool never learns the real origin, so it has no address to bypass the proxy
-with; absolute redirects are rewritten back to the proxy (same origin) or to a
-refusal path (another origin).
+with. Redirects are handed back origin-relative -- the same path on the proxy
+(same origin) or a refusal path (another origin) -- so the tool follows them on
+the proxy address it actually used: 127.0.0.1 on the host, host.docker.internal
+from a container (R34).
 
 When the run refuses a request because its budget is exhausted or it was
 cancelled, `stop_requested` turns true; the tool runner polls it with the run's
 cancel signal and stops the tool's process tree.
 
 HTTP/1.1, one request per connection (`Connection: close`), text bodies only (the
-transport carries text); a body that is not UTF-8 is refused, never sent.
+transport carries text); a body that is not UTF-8 is refused, never sent. A client
+must send its request, and accept the response, within `client_timeout`; close()
+ends every accepted connection within a bound, so a stalled or half-open client
+cannot hold the tool's caller (R35).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 log = logging.getLogger("harness.tool_proxy")
 
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_BODY_BYTES = 4 * 1024 * 1024
 _OFF_ORIGIN_PATH = "/__harness_off_origin__"
+_CLIENT_TIMEOUT_SECONDS = 30.0   # a tool writes its whole request at once
+_CLOSE_TIMEOUT_SECONDS = 2.0
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization",
                "proxy-authenticate", "te", "trailer", "transfer-encoding", "upgrade",
                "host", "content-length"}
 _RESPONSE_DROP = {"connection", "keep-alive", "transfer-encoding", "content-length",
                   "content-encoding"}
-_REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 411: "Length Required",
+_REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 408: "Request Timeout",
+            411: "Length Required",
             413: "Payload Too Large", 415: "Unsupported Media Type", 502: "Bad Gateway",
             503: "Service Unavailable"}
 
@@ -47,16 +55,21 @@ class ToolProxy:
     """Loopback reverse proxy for one target origin, forwarding through a run."""
 
     def __init__(self, run, target_url: str, *, capability: str,
-                 bind_host: str = "127.0.0.1"):
+                 bind_host: str = "127.0.0.1",
+                 client_timeout: float | None = None):
         self.run = run
         self.target_origin = _origin(target_url)
         self.capability = capability
         self.bind_host = bind_host
+        self.client_timeout = _CLIENT_TIMEOUT_SECONDS if client_timeout is None else client_timeout
         self.port: int | None = None
         self.forwarded = 0
         self.refused: dict[str, int] = {}
         self.stop_reason = ""
         self._server: asyncio.base_events.Server | None = None
+        self._closing = False
+        self._handlers: set[asyncio.Task] = set()
+        self._writers: set[asyncio.StreamWriter] = set()
 
     # --- lifecycle --------------------------------------------------------------
     async def start(self) -> "ToolProxy":
@@ -65,10 +78,24 @@ class ToolProxy:
         return self
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        """Stop listening, then end every accepted connection within a bound: a
+        handler still reading or forwarding is cancelled and its socket aborted.
+        Server.wait_closed() alone waits for each client to finish (R35)."""
+        server, self._server = self._server, None
+        if server is None:
+            return
+        self._closing = True
+        server.close()
+        for task in list(self._handlers):
+            task.cancel()
+        if self._handlers:
+            await asyncio.wait(set(self._handlers), timeout=_CLOSE_TIMEOUT_SECONDS)
+        for writer in list(self._writers):
+            writer.transport.abort()
+        try:
+            await asyncio.wait_for(server.wait_closed(), _CLOSE_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            log.warning("tool proxy: a client connection outlived close()")
 
     async def __aenter__(self) -> "ToolProxy":
         return await self.start()
@@ -98,28 +125,44 @@ class ToolProxy:
 
     # --- one connection, one request ---------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        self._handlers.add(task)
+        self._writers.add(writer)
         try:
-            status, headers, body = await self._serve(reader)
-        except Exception as exc:   # never let one bad request take the proxy down
-            log.debug("tool proxy request failed: %s", type(exc).__name__)
-            status, headers, body = 502, {}, b"harness tool proxy: request failed"
-        try:
+            if self._closing:
+                return                  # accepted as close() began: never read or forward
+            try:
+                status, headers, body = await self._serve(reader)
+            except Exception as exc:   # never let one bad request take the proxy down
+                log.debug("tool proxy request failed: %s", type(exc).__name__)
+                status, headers, body = 502, {}, b"harness tool proxy: request failed"
             head = [f"HTTP/1.1 {status} {_REASONS.get(status, 'Response')}"]
             for k, v in headers.items():
                 head.append(f"{k}: {v}")
             head += [f"Content-Length: {len(body)}", "Connection: close", "", ""]
             writer.write("\r\n".join(head).encode("latin-1", errors="replace") + body)
-            await writer.drain()
+            try:
+                await asyncio.wait_for(writer.drain(), self.client_timeout)
+            except asyncio.TimeoutError:
+                writer.transport.abort()    # a client that never reads its response
         finally:
             writer.close()
             try:
                 await writer.wait_closed()
             except Exception:
                 pass
+            self._writers.discard(writer)
+            self._handlers.discard(task)
 
     async def _serve(self, reader: asyncio.StreamReader):
+        # One deadline for the whole request, head and body: a client that stalls or
+        # half-opens the connection gets a 408, not a handler that waits forever.
+        deadline = asyncio.get_running_loop().time() + self.client_timeout
         try:
-            raw = await reader.readuntil(b"\r\n\r\n")
+            async with asyncio.timeout_at(deadline):
+                raw = await reader.readuntil(b"\r\n\r\n")
+        except TimeoutError:
+            return self._timed_out()
         except asyncio.LimitOverrunError:
             return 400, {}, b"harness tool proxy: header too large"
         except asyncio.IncompleteReadError:
@@ -143,7 +186,11 @@ class ToolProxy:
         length = int(lower.get("content-length") or 0)
         if length > _MAX_BODY_BYTES:
             return 413, {}, b"harness tool proxy: request body too large"
-        body_bytes = await reader.readexactly(length) if length else b""
+        try:
+            async with asyncio.timeout_at(deadline):
+                body_bytes = await reader.readexactly(length) if length else b""
+        except TimeoutError:
+            return self._timed_out()
         try:
             body = body_bytes.decode("utf-8") if body_bytes else None
         except UnicodeDecodeError:
@@ -179,12 +226,19 @@ class ToolProxy:
         return out.status or 502, resp_headers, (out.body or "").encode("utf-8")
 
     def _rewrite_location(self, request_url: str, location: str) -> str:
-        p = urlsplit(location)
-        if not p.scheme and not p.netloc:
-            return location                         # relative: stays on the proxy
-        if _origin(location) == self.target_origin:
-            return urlunsplit(("http", f"{self.bind_host}:{self.port}", p.path or "/", p.query, ""))
-        return f"http://{self.bind_host}:{self.port}{_OFF_ORIGIN_PATH}"
+        """The redirect as the tool must follow it, always origin-relative: the tool
+        resolves it against the proxy address it used, which only the tool knows
+        (a container reaches the proxy as host.docker.internal, not 127.0.0.1)."""
+        resolved = urljoin(request_url, location)
+        p = urlsplit(resolved)
+        # A path starting "//" would read as a network-path reference to another host.
+        if _origin(resolved) == self.target_origin and not p.path.startswith("//"):
+            return (p.path or "/") + (f"?{p.query}" if p.query else "")
+        return _OFF_ORIGIN_PATH
+
+    def _timed_out(self):
+        self._refuse("client_timeout")
+        return 408, {}, b"harness tool proxy: request not received in time"
 
     def _refuse(self, reason: str) -> None:
         self.refused[reason] = self.refused.get(reason, 0) + 1
