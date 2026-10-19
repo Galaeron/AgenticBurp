@@ -16,7 +16,8 @@
   `d8eb094` I11 evidence wiring, and a docs commit. All pushed to PR #1.
 - Then, after the owner's containment review (pushed 2026-10-19): `ae8f287` I05-C tool
   process lifecycle, `934c3e1` I05-C2 counting proxy, `f7d1321` I05-A2 standalone analyze
-  publishes its run, and `1431602` docs.
+  publishes its run, and `1431602` docs. Then `bcd56c9` I05-B (each run pins a name to its
+  first address at connect) and a docs commit.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
@@ -54,6 +55,9 @@
   `.test-work/wt-verify` and `.test-work/wt-dev`). Both interpreters: smoke 146 OK, full
   exit 0 (3382 then 3397 harness, 38 pytest, 312 evaluation, 42 integrity), coverage gaps
   25. Logs: `.test-work/i05c-*.log`, `.test-work/i05de-*.log`.
+- I05-B was verified at `a7d03b5` + B (`.test-work/wt-dev`). On both interpreters: smoke
+  146 OK, full exit 0 (3408 harness, 38 pytest, 312 evaluation, 42 integrity), 0
+  ResourceWarnings, 25 coverage gaps. Logs: `.test-work/i05b-*.log`.
 - Stopping a background run with TaskStop leaves its process tree running. End it by
   exact PID tree, and never by a pattern that could match another session's processes.
 
@@ -65,10 +69,11 @@
 ## Open work and evidence boundaries
 - Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I02, I03, I04, I05,
   I09, I11. I02 batches B (default history) and A (proof binding: a missing, stale,
-  unresolvable or re-pointed proof no longer exports as confirmed) are fixed. I05 batch A
-  (sends escaping their run) is fixed. The I04 storage/export label check and the I11 socket
+  unresolvable or re-pointed proof no longer exports as confirmed) are fixed. I05 batches A
+  (sends escaping their run), C/C2/A2 (tool lifecycle, counting proxy, standalone analyze)
+  and B (redirect and DNS-rebinding destination policy) are fixed. The I04 storage/export label check and the I11 socket
   trace are done, and 11 of the 14 caller-tested requirements are wired. Next:
-  - I05 batches B (redirect/rebinding) and D (browser credential isolation); the no-run
+  - I05 batch D (browser credential isolation); the no-run
     routes `/crawl`, `/crawl-roles`, `/engagement/{host}/advance`; a real-container proof
     of C (Docker Desktop was off);
   - I02 batch C (non-finding observations): design at
@@ -83,6 +88,12 @@
     stats are unchanged.
   - External-tool traffic goes through a counting proxy (`934c3e1`): inside a run sqlmap
     never sees the real target, and an exhausted budget stops it.
+  - The connect-time pin is ON by default (`bcd56c9`, owner accepted). A run connects each
+    name to its first resolved address. It refuses link-local (including cloud metadata),
+    multicast, unspecified and reserved answers. Opt out with
+    `security.pin_connect_address: false` in config.local.yaml. Private and loopback
+    first answers are accepted, for lab targets. Behind an HTTP(S) proxy, only the
+    connection to the proxy is pinned.
 - The live Part B crAPI experiment has not been run. Historical negative crAPI results still
   govern efficacy, and offline tests do not establish recall.
 - Browser capture covers page-load traffic only; catch-all filtering is conservative.

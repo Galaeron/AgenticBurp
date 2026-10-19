@@ -149,9 +149,30 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
     fail-open stats) is kept. `harness/test_standalone_analyze_run.py` (6 tests).
 
   Not live-validated: no real container run (Docker Desktop off); POSIX paths are unexercised.
-  ffuf still refuses to launch inside a run (it could now use the proxy). Next: batch B
-  (redirect/rebinding destination policy), D (browser credential isolation), and the no-run
-  routes `/crawl`, `/crawl-roles` and `/engagement/{host}/advance`.
+  ffuf still refuses to launch inside a run (it could now use the proxy).
+- **Status 2026-10-19 — batch B (redirect and DNS-rebinding destination policy) done**
+  (implemented + caller-verified; pushed with the owner's approval of the default):
+  - Reproduced with owned servers on 127.0.0.1 and 127.0.0.2 and a controlled resolver for
+    `.test` names. A rebound in-scope name moved later traffic to the second address
+    between requests, on redirect hops, over real HTTPS, for gated validators, and with the
+    old opt-in P1-10 pin. A name answering 169.254.169.254 was connected to.
+  - Fix: every run client connects through `AddressPins` (an httpcore network backend).
+    Each name is resolved once per run and that first answer holds for the whole run; the
+    Host header, SNI and certificate checks stay on the name. Link-local, multicast,
+    unspecified and reserved answers are refused before any socket opens (outcome
+    `blocked`). This replaces P1-10's per-hop URL rewrite. It is ON by default;
+    `security.pin_connect_address: false` is an explicit opt-out.
+  - Out-of-scope redirect targets (zero requests) and cross-origin credential dropping were
+    already correct and are now covered. `harness/test_destination_policy_callers.py`
+    (10 tests, real sockets and TLS, one fault injection) and the rewritten
+    `harness/test_connect_address_pin.py` (8 tests).
+  - Limits: behind an HTTP(S) proxy only the connection to the proxy is pinned; a name whose
+    first answer is private or loopback is accepted (lab targets); no failover to another A
+    record within a run; clients on the no-run routes are not pinned. Not live-validated
+    against an external rebinding service.
+
+  Next: batch D (browser credential isolation) and the no-run routes `/crawl`,
+  `/crawl-roles` and `/engagement/{host}/advance`.
 - **Type:** implementation + isolated environment proof. **Depends on:** I01/I03.
 - Reconcile connect-time address pinning with redirect handling and approved
   destination policy. Verify browser credential isolation across two origins.
