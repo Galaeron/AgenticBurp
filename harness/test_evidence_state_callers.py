@@ -227,5 +227,60 @@ class CapturedBearerSessionTests(_TempStore):
                 self.test_captured_bearer_reaches_the_validator_boundary()
 
 
+class _Broken(Validator):
+    name = "broken"
+    finding_classes = {"ssti"}
+    active = False
+
+    async def validate(self, finding, exchange):
+        raise RuntimeError("synthetic validator crash")
+
+
+class _Holds(Validator):
+    name = "holds"
+    finding_classes = {"ssti"}
+    active = False
+
+    async def validate(self, finding, exchange):
+        return ValidationResult(self.name, "not_confirmed", "ssti", summary="control held")
+
+
+class ValidatorExceptionReportTests(_TempStore):
+    """R06 through Orchestrator._validate_findings with real proof storage."""
+
+    def _validate(self, validator):
+        orch = self._orch()
+        orch.validator_registry.validators = {validator.name: validator}
+        finding = Finding(vulnerability_class="ssti", confidence=0.5, summary="candidate",
+                          evidence="fixture", suggested_test="verify", basis="derived")
+        return asyncio.run(orch._validate_findings(
+            _exchange("http://shop.invalid/a"),
+            [AgentReport(agent="ssti", model="fake", findings=[finding])]))
+
+    def test_validator_exception_is_returned_as_an_error_report(self):
+        reports, proofs = self._validate(_Broken())
+        self.assertEqual(len(proofs), 1)
+        self.assertEqual(proofs[0]["verdict"], "error")
+        self.assertEqual([(r.validator, r.status, r.confirmed) for r in reports],
+                         [("broken", "error", False)])
+        self.assertIn("synthetic validator crash", reports[0].summary)
+        stored = store.proofs_for_case(proofs[0]["case"]["case_id"])
+        self.assertEqual([p["verdict"] for p in stored], ["error"])
+
+    def test_error_report_when_the_error_proof_cannot_be_persisted(self):
+        with patch.object(store, "persist_proof_record", return_value=(False, "synthetic refusal")):
+            reports, proofs = self._validate(_Broken())
+        self.assertEqual(proofs, [])
+        self.assertEqual([r.status for r in reports], ["error"])
+        self.assertIn("proof persistence failed: synthetic refusal", reports[0].summary)
+
+    def test_control_succeeding_validator_returns_its_normal_report(self):
+        reports, proofs = self._validate(_Holds())
+        self.assertEqual([(r.validator, r.status, r.summary) for r in reports],
+                         [("holds", "not_confirmed", "control held")])
+        self.assertEqual(len(proofs), 1)
+        self.assertNotEqual(proofs[0]["verdict"], "error")
+
+
 if __name__ == "__main__":
     unittest.main()
