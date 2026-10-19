@@ -11,7 +11,9 @@
   (two W2-dependent tests untracked again; Python 3.14-valid TLS fixtures; short-path
   compare), then a docs commit.
 - Since then: `8e1303c` I02-B default history, `c66ce27` docs, `8edf5a9` + `04b3dea` I02-A
-  proof binding through storage/export, then a docs commit.
+  proof binding through storage/export, then a docs commit. `2ba91da` I05-A (sends escaping
+  their run) and its docs commit are LOCAL ONLY: per the guide, network containment needs
+  owner review before the push.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
@@ -40,10 +42,12 @@
   `file_upload_agent.py` / `FileUploadLogic.java` from worktrees under %TEMP%. Block the
   venv's editable-install leak (it imports modules missing from a worktree from the main
   checkout) with an untracked `sitecustomize.py` there plus `PYTHONPATH=<worktree>`.
-- CI runs Python 3.14. Last full verification (`8edf5a9` content, isolated worktree): on both
-  system Python 3.14.7 and venv 3.12.14, smoke OK and full exit 0 (3337 harness, 38 pytest,
-  312 evaluation with 17 artifact-absence skips, 42 integrity). Logs: `.test-work/i02a-*.log`.
-  `04b3dea` adds one test, verified on both interpreters. The coverage gate still reports 36 gaps.
+- CI runs Python 3.14. Last full verification (`2ba91da` content, isolated worktree): on both
+  system Python 3.14.7 and venv 3.12.14, smoke 93 OK and full exit 0 (3352 harness, 38 pytest,
+  312 evaluation with 17 artifact-absence skips, 42 integrity). Logs: `.test-work/i05a-*.log`.
+  The coverage gate still reports 36 gaps.
+- Another session is running I11 socket-trace work in `.test-work/i11-sockets-evidence-20261019`.
+  Do not stop its processes, and match any process cleanup to your own PIDs.
 
 ## Owner decisions (2026-10-17)
 - `/analyze` grouping: one shared pile per site by default; `engagement_id` = optional named
@@ -51,11 +55,18 @@
   named pile is I16 work.
 
 ## Open work and evidence boundaries
-- Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I02, I03, I04, I09, I11.
-  I02 batches B (default history) and A (proof binding: a missing, stale, unresolvable or
-  re-pointed proof no longer exports as confirmed) are fixed. Next: I02 batch C (non-finding
-  observations), I05 (plain-client validators, process containment), I11 socket trace and
-  evidence wiring, and the I04 storage/export label check.
+- Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I02, I03, I04, I05,
+  I09, I11. I02 batches B (default history) and A (proof binding: a missing, stale,
+  unresolvable or re-pointed proof no longer exports as confirmed) are fixed. I05 batch A
+  (sends escaping their run) is fixed. Next:
+  - I05 batches B (redirect/rebinding), C (external-process lifecycle) and D (browser
+    credential isolation);
+  - I02 batch C (non-finding observations);
+  - I11 socket trace and evidence wiring;
+  - the I04 storage/export label check.
+- Owner decision pending (I05): a standalone `analyze()` never enters its own run, so gated
+  validators there do not spend `analyze.max_requests`. Entering it switches those sends to
+  verified TLS.
 - The live Part B crAPI experiment has not been run. Historical negative crAPI results still
   govern efficacy, and offline tests do not establish recall.
 - Browser capture covers page-load traffic only; catch-all filtering is conservative.

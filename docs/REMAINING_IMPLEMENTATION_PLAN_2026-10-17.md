@@ -114,7 +114,22 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   credential-delivery evidence appropriate to the claim, through the real caller.
 - **Maps to:** LB-CSRF-REPLAY. Treat as a release blocker until dispositioned.
 
-### [ ] I05 — Close remaining network and external-tool containment gaps
+### [~] I05 — Close remaining network and external-tool containment gaps
+- **Status 2026-10-19 — batch A (sends escaping their run) done:** implemented +
+  caller-verified (commit `2ba91da`, local; push awaits owner review per the guide).
+  Reproduced and fixed three escapes:
+  - the coverage drive's unbound registry sqlmap preflight (opt-in `coverage_drive_legs`);
+  - auto-escalation's credential probe and re-crawl outside `analyze()`'s run (opt-in
+    `auto_escalate`);
+  - `api_security`'s raw-client limit probe.
+
+  Guards: an unbound validator, or `transport_for(None)`, inside an entered run now uses
+  that run. `harness/test_run_escape_callers.py` (14 tests) includes two fault injections.
+  **Owner decision open:** a standalone `analyze()` creates its run but never enters it, so
+  gated validators there do not spend `analyze.max_requests`. Entering it would turn on TLS
+  verification for those sends. Next: batch B (redirect/rebinding destination policy),
+  C (external-process lifecycle), D (browser credential isolation), plus the no-run routes
+  `/crawl`, `/crawl-roles` and `/engagement/{host}/advance`.
 - **Type:** implementation + isolated environment proof. **Depends on:** I01/I03.
 - Reconcile connect-time address pinning with redirect handling and approved
   destination policy. Verify browser credential isolation across two origins.
