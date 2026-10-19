@@ -52,9 +52,19 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   `store.persist_findings` (principal always recorded; default-pile fingerprint unchanged).
   `harness/test_default_history_caller.py` drives `analyze()` twice with real storage: same
   identity sees it; another identity, another named pile and a severed reader do not; zero
-  target sends. Batches A (proof binding through storage/export) and C (non-finding
-  observations) remain open. Legacy default-pile rows (empty principal) stay out of prior
-  context, as before.
+  target sends. Legacy default-pile rows (empty principal) stay out of prior context, as before.
+- **Status 2026-10-19 — batch A (proof binding through storage/export) done:** implemented +
+  caller-verified (commits `8edf5a9`, `04b3dea`). Class binding already held at the decision
+  seam: claim B, reached only through the agent fallback, never borrowed claim A's sqli proof,
+  confidence or confirmation on the API, stored rows, issue export, SARIF or Markdown.
+  Reproduced defect: after a restart, a confirmed row whose proof was deleted, stale (verdict no
+  longer confirmed), unresolvable or re-pointed to another case still exported as confirmed.
+  `store.all_host_findings` now resolves the (proof_id, case_id) pair against confirmed proof
+  records; an unresolved row is downgraded and marked `proof_status: unavailable`, and
+  pointer-only issue references are marked unavailable rather than counted as proof.
+  `harness/test_proof_binding_storage_export.py` drives `analyze()` with real SQLite storage
+  (7 tests). Disabling the extracted `_fallback_result_binds` seam or the verdict filter is
+  detected. Batch C (non-finding observations) remains open.
 - **Type:** implementation if reproduced + integration verification. **Depends on:** I01.
 - Trace original finding identity/class, validator result, proof/case reference,
   stored finding and API/Markdown/SARIF output. Define explicit supported class
