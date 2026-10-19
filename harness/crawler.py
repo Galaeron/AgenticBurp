@@ -165,8 +165,15 @@ async def crawl(
             try:
                 if run_context is not None:
                     from harness.run_context import TypedRequest
+                    # The session's headers are attached per hop, and only to its
+                    # own origin; sending them here too would carry them across
+                    # an in-scope cross-origin redirect hop's first request.
+                    session = run_context.sessions.get(session_ref)
+                    session_names = {k.lower() for k in (session.headers if session else {})}
                     request_headers = {k: v for k, v in headers.items()
-                                       if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
+                                       if k.lower() not in ("authorization", "cookie", "proxy-authorization")
+                                       and k.lower() not in session_names}
+                    await global_throttle.acquire()
                     outcome = await run_context.executor().execute(
                         TypedRequest("GET", norm_url, headers=request_headers),
                         capability="crawler", session_ref=session_ref)
@@ -238,6 +245,12 @@ async def crawl(
                     rendered = parts.path or "/"
                     if parts.query:
                         rendered += "?" + parts.query
+                    # RV-G R07: a robots directive is a URL source like a link;
+                    # a destructive-looking path (Disallow: /logout) is recorded
+                    # as suppressed, never fetched or promoted to the probe list.
+                    if _DESTRUCTIVE_NAVIGATION.search(parts.path or "/"):
+                        result.suppressed_navigation.add(rendered)
+                        continue
                     result.endpoints.add(rendered)
                     if target.split("#", 1)[0] not in seen and max_depth >= 1:
                         queue.append((target, 0, False))
@@ -271,7 +284,11 @@ async def crawl(
             # it while fetching the page.
             final_parts = urlsplit(final_url)
             if final_url.startswith(origin_prefix) and final_parts.query:
-                result.endpoints.add(f"{final_parts.path or '/'}?{final_parts.query}")
+                final_endpoint = f"{final_parts.path or '/'}?{final_parts.query}"
+                if _DESTRUCTIVE_NAVIGATION.search(final_parts.path or "/"):
+                    result.suppressed_navigation.add(final_endpoint)
+                else:
+                    result.endpoints.add(final_endpoint)
 
             # Record dynamic resource handlers with their observed query. Do not
             # enqueue/fetch them as crawl pages; role_crawl owns the one bounded
@@ -282,6 +299,9 @@ async def crawl(
                 resource = urljoin(norm_url, m.group(1))
                 parts = urlsplit(resource)
                 if (resource.startswith(origin_prefix) and parts.query):
+                    if _DESTRUCTIVE_NAVIGATION.search(parts.path or "/"):
+                        result.suppressed_navigation.add(f"{parts.path or '/'}?{parts.query}")
+                        continue
                     mined = extract_endpoints(f'"{parts.path or "/"}"', norm_url)
                     result.endpoints |= {
                         f"{path}?{parts.query}"

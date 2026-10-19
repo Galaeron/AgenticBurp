@@ -44,6 +44,7 @@ class DiscoverySweepRoleSelectionTests(unittest.TestCase):
 class _Resp:
     def __init__(self, status, text):
         self.status_code, self.text = status, text
+        self.headers = {}   # the routes now send through the run executor, which reads them
 
 
 def _auth_of(headers):

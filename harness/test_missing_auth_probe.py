@@ -48,12 +48,22 @@ class MissingAuthProbeTests(unittest.TestCase):
     # --- the core positive: data served with no credentials ---
     def test_unauth_2xx_substantive_is_missing_auth(self):
         m = {("GET", "http://t.test/api/report"): {"unauth": (200, '{"salary": 90000}')}}
-        o = self._probe(m, CallShape("GET", "/api/report"))
+        o = self._probe(m, CallShape("GET", "/api/report"), expected_protected=True)
         self.assertEqual(o.classification, "missing_auth")
         self.assertIsNotNone(o.finding)
         self.assertEqual(o.finding.vulnerability_class, "missing_authentication")
         self.assertTrue(o.finding.confirmed)
         self.assertEqual(o.finding.severity, "high")
+
+    def test_unauth_2xx_on_undeclared_endpoint_is_only_a_candidate(self):
+        # RV-G R15: data served anonymously is not missing authentication unless
+        # the endpoint is known to need it; a public catalogue looks the same.
+        m = {("GET", "http://t.test/api/report"): {"unauth": (200, '{"salary": 90000}')}}
+        o = self._probe(m, CallShape("GET", "/api/report"))
+        self.assertEqual(o.classification, "unauthenticated_access")
+        self.assertIsNotNone(o.finding)
+        self.assertFalse(o.finding.confirmed)
+        self.assertIn("not declared protected", o.finding.summary)
 
     def test_expected_protected_raises_confidence(self):
         m = {("GET", "http://t.test/api/report"): {"unauth": (200, '{"x": 1}')}}
@@ -124,7 +134,7 @@ class MissingAuthProbeTests(unittest.TestCase):
 
     def test_id_placeholder_is_filled(self):
         m = {("GET", "http://t.test/api/users/1"): {"unauth": (200, '{"name":"admin"}')}}
-        o = self._probe(m, CallShape("GET", "/api/users/{id}"))
+        o = self._probe(m, CallShape("GET", "/api/users/{id}"), expected_protected=True)
         self.assertEqual(o.url, "http://t.test/api/users/1")
         self.assertEqual(o.classification, "missing_auth")
 
@@ -147,7 +157,8 @@ class MissingAuthProbeTests(unittest.TestCase):
         gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
                                            allowed_hosts={"t.test"}))
         m = {("POST", "http://t.test/api/x"): {"unauth": (200, '{"created": true, "id": 7}')}}
-        o = self._probe(m, ("POST", "/api/x"), include_mutating=True, gate=gate)
+        o = self._probe(m, ("POST", "/api/x"), include_mutating=True, gate=gate,
+                        expected_protected=True)
         self.assertEqual(o.classification, "missing_auth")
 
     def test_baseline_auth_headers_are_stripped(self):
@@ -187,7 +198,7 @@ class MissingAuthProbeTests(unittest.TestCase):
                 fixture.base, ("GET", "/public-data"),
                 allowed_hosts=["127.0.0.1"],
                 baseline_headers={"Authorization": "Bearer real"},
-                send_garbage_token=False, run_context=ctx)
+                send_garbage_token=False, expected_protected=True, run_context=ctx)
             await ctx.aclose()
             return result
         try:

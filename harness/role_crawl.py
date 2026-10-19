@@ -446,6 +446,7 @@ async def _probe(method: str, url: str, headers: dict, timeout: float, *,
     try:
         if run_context is not None:
             from harness.run_context import TypedRequest
+            await global_throttle.acquire()
             outcome = await run_context.executor().execute(
                 TypedRequest(method=method, url=url, body=body or None,
                             headers={"Content-Type": content_type} if content_type else {}),
