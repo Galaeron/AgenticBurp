@@ -144,5 +144,88 @@ class MissingProofDemotesOracleStateTests(_TempStore):
         self.assertTrue(issue["confirmed"])
 
 
+class CapturedBearerSessionTests(_TempStore):
+    """R05 through Orchestrator.analyze -> SstiValidator -> run-context executor."""
+
+    def _analyze(self, headers, *, allowed_hosts=("shop.invalid",), respond=None):
+        from harness.validators.ssti_validator import SstiValidator
+        orch = self._orch(allowed_hosts)
+        orch.validator_registry.active_enabled = True
+        orch.validator_registry.validators = {
+            "ssti": SstiValidator(allowed_hosts=list(allowed_hosts))}
+        finding = Finding(vulnerability_class="ssti", severity="low", confidence=0.5,
+                          summary="template candidate", evidence="fixture",
+                          suggested_test="fixture", basis="derived")
+        reports = [AgentReport(agent="ssti", model="fake", findings=[finding])]
+
+        async def pipeline(*args, **kwargs):
+            return reports, 0, 0, StageOutcome(name="critique", status="skipped", reason="fixture")
+        sent = []
+
+        async def fake_request(client, method, url, **kwargs):
+            sent.append((str(url), dict(kwargs.get("headers") or {})))
+            if respond is not None:
+                return respond(method, str(url))
+            return httpx.Response(200, text="literal", request=httpx.Request(method, url))
+        with patch("harness.analysis_pipeline.AnalysisPipeline.run_full_analysis", pipeline), \
+                patch.object(httpx.AsyncClient, "request", fake_request):
+            response = asyncio.run(orch.analyze(_exchange("http://shop.invalid/render?q=a", headers),
+                                                force_agents=["ssti"], bypass_cache=True))
+        return sent, response
+
+    @staticmethod
+    def _auth(headers):
+        return next((v for k, v in headers.items() if k.lower() == "authorization"), None)
+
+    def test_captured_bearer_reaches_the_validator_boundary(self):
+        sent, response = self._analyze({"Authorization": _BEARER})
+        summaries = [(v.validator, v.status, v.summary) for v in response.validation_reports]
+        self.assertTrue(sent, summaries)
+        self.assertTrue(all(self._auth(h) == _BEARER for _, h in sent), sent)
+        self.assertFalse(any("declined" in s for _, _, s in summaries), summaries)
+
+    def test_control_anonymous_capture_is_unchanged(self):
+        sent, _ = self._analyze({})
+        self.assertTrue(sent)
+        self.assertTrue(all(self._auth(h) is None for _, h in sent), sent)
+
+    def test_control_bearer_is_sent_only_to_the_captured_origin(self):
+        # The captured origin redirects every probe to another in-scope origin.
+        def respond(method, url):
+            if url.startswith("http://shop.invalid/"):
+                return httpx.Response(302, headers={"location": "http://cdn.invalid/landing"},
+                                      request=httpx.Request(method, url))
+            return httpx.Response(200, text="literal", request=httpx.Request(method, url))
+        sent, _ = self._analyze({"Authorization": _BEARER},
+                                allowed_hosts=("shop.invalid", "cdn.invalid"), respond=respond)
+        captured = [h for u, h in sent if u.startswith("http://shop.invalid/")]
+        elsewhere = [h for u, h in sent if not u.startswith("http://shop.invalid/")]
+        self.assertTrue(captured and elsewhere, sent)
+        self.assertTrue(all(self._auth(h) == _BEARER for h in captured), sent)
+        self.assertTrue(all(self._auth(h) is None for h in elsewhere), sent)
+
+    def test_control_passive_mode_registers_no_captured_session(self):
+        from harness.run_context import RunContext
+        orch = self._orch()
+        ctx = RunContext.create(allowed_hosts=["shop.invalid"], config=orch.config)
+        try:
+            asyncio.run(orch._bind_captured_session(
+                ctx, _exchange("http://shop.invalid/a", {"Authorization": _BEARER})))
+            self.assertIsNone(ctx.sessions.get("captured"))
+            orch.validator_registry.active_enabled = True
+            asyncio.run(orch._bind_captured_session(
+                ctx, _exchange("http://shop.invalid/a", {"Authorization": _BEARER})))
+            session = ctx.sessions.get("captured")
+            self.assertEqual(session.allowed_origins, frozenset({"http://shop.invalid"}))
+            self.assertTrue(session.principal_id.startswith("captured:"))
+        finally:
+            asyncio.run(ctx.aclose())
+
+    def test_fault_injection_without_binding_the_capture_is_blocked(self):
+        with patch.object(Orchestrator, "_bind_captured_session", AsyncMock(return_value=None)):
+            with self.assertRaises(AssertionError):
+                self.test_captured_bearer_reaches_the_validator_boundary()
+
+
 if __name__ == "__main__":
     unittest.main()
