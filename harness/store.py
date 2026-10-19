@@ -1788,10 +1788,16 @@ def _resolve_confirmation_proofs(results: list[dict]) -> None:
     A missing, unresolvable or re-pointed proof is reported as proof unavailable,
     never as confirmed, on every surface that reads this function (findings API,
     Markdown report, issue/SARIF export). Rows with no proof pointer at all keep
-    their legacy meaning (proof_status "none")."""
+    their legacy meaning (proof_status "none").
+
+    R49: an oracle verdict is only stamped onto a confirmed finding, so it falls
+    with the proof. A demoted row also loses oracle_verified/verification_state,
+    which the report's VERIFIED badge and the lead quarantine read."""
     for r in results:
         r["proof_status"] = "none"
-    pointed = [r for r in results if r["confirmed"] and (r["proof_id"] or r["case_id"])]
+    pointed = [r for r in results
+               if (r["confirmed"] or r["oracle_verified"] or r["verification_state"] == "verified")
+               and (r["proof_id"] or r["case_id"])]
     if not pointed:
         return
     ids = sorted({r["proof_id"] for r in pointed if r["proof_id"]})
@@ -1813,6 +1819,8 @@ def _resolve_confirmation_proofs(results: list[dict]) -> None:
             r["proof_status"] = "unavailable"
             r["confirmed"] = False
             r["lifecycle_state"] = confirmation_gate.lifecycle_state(False, r["review_verdict"])
+            r["oracle_verified"] = False
+            r["verification_state"] = "candidate"
 
 
 def suppress_finding(fingerprint: str, reason: str = "") -> None:
