@@ -27,8 +27,9 @@ and later resolves to a different address than it did at scope-check time
 (DNS rebinding) is NOT caught by this function -- the string is still allowed,
 so this still returns True. This is a hostname-authorization boundary, not an
 address-level rebinding defense; see harness/test_dns_resolution_boundary.py
-and IMPROVEMENT_BACKLOG.md P1-9 for the characterization and the proposed
-(not yet built) connect-time address-pinning follow-up.
+for the characterization. I05-B builds that defense at the connect: a run's
+clients pin each name to its first answer for the run and refuse special-purpose
+addresses (run_context.AddressPins).
 """
 from __future__ import annotations
 

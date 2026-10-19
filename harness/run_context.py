@@ -42,6 +42,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+import httpcore
 import httpx
 
 from harness import evidence
@@ -78,8 +79,9 @@ class ScopePolicy:
     True, and the request proceeds to whatever address it resolves to at connect
     time. This policy authorizes hostnames, not resolved addresses; it is not an
     address-level rebinding defense. See harness/test_dns_resolution_boundary.py
-    for the characterization tests and IMPROVEMENT_BACKLOG.md P1-9 for the
-    follow-up (connect-time address pinning) this deliberately does not build."""
+    for the characterization tests. I05-B: the address defense lives at the
+    connect instead -- every client a run builds pins each name to its first
+    answer for the whole run and refuses special-purpose addresses (AddressPins)."""
     allowed_hosts: frozenset = frozenset()
     allowed_schemes: frozenset = frozenset({"http", "https"})
 
@@ -187,19 +189,18 @@ class ManagedSession:
     _fixture_clients: dict = field(default_factory=dict, repr=False)
 
     def client(self, timeout: float, *, http2: bool = False,
-               trust_policy: TLSPolicy | None = None, destination: str | None = None) -> httpx.AsyncClient:
+               trust_policy: TLSPolicy | None = None, destination: str | None = None,
+               address_pins: "AddressPins | None" = None) -> httpx.AsyncClient:
         policy = trust_policy or TLSPolicy.from_config()
         profile = policy.profile_for(destination)
         if profile.pool_key:
             if profile.pool_key not in self._fixture_clients:
-                self._fixture_clients[profile.pool_key] = httpx.AsyncClient(
-                    follow_redirects=False, verify=profile.context, timeout=timeout,
-                    cookies=httpx.Cookies(), http2=http2)
+                self._fixture_clients[profile.pool_key] = _target_client(
+                    verify=profile.context, timeout=timeout, http2=http2, pins=address_pins)
             return self._fixture_clients[profile.pool_key]
         if self._client is None:
-            self._client = httpx.AsyncClient(follow_redirects=False, verify=profile.context,
-                                             timeout=timeout, cookies=httpx.Cookies(),
-                                             http2=http2)
+            self._client = _target_client(verify=profile.context, timeout=timeout,
+                                          http2=http2, pins=address_pins)
         return self._client
 
     async def aclose(self) -> None:
@@ -319,17 +320,6 @@ class TargetTransport:
 
     def __init__(self, ctx: "RunContext"):
         self.ctx = ctx
-        # P1-10 resolver seam: injectable so a caller-level test can drive
-        # rebinding scenarios without real DNS. Default is a real one-shot resolve.
-        self._resolver = _default_resolver
-
-    def _pin_connect_address(self) -> bool:
-        """P1-10 opt-in (OFF by default): pin each hop to its resolved address."""
-        cfg = getattr(self.ctx, "config", None) or {}
-        try:
-            return bool(cfg.get("security", {}).get("pin_connect_address", False))
-        except Exception:
-            return False
 
     async def send(self, method: str, url: str, *, capability: str,
                    session_ref: str | None = None, headers: dict | None = None,
@@ -530,25 +520,10 @@ class TargetTransport:
             if not ctx.budget.reserve(1):
                 return ExecutionOutcome(outcome="budget_exhausted", final_url=url,
                                         artifact=self._artifact(url, "budget_exhausted", session_ref, case_ref=case_ref))
-            # 3b. P1-10 (opt-in, OFF by default): resolve this hop's host ONCE and
-            #     pin the connection to that address, so a later/alternate resolution
-            #     cannot redirect the connect. Scope/gate/budget above ran on the
-            #     hostname URL, and credential-forwarding below still keys on the
-            #     hostname origin -- only the CONNECT target is pinned. Applied per
-            #     hop, so redirects re-resolve and re-pin.
-            pinned = None
-            if self._pin_connect_address():
-                _host = ScopePolicy.host_of(url)
-                if _host and not _is_ip_literal(_host):
-                    try:
-                        _ip = self._resolver(_host)
-                    except Exception as e:
-                        return ExecutionOutcome(
-                            outcome="error", final_url=url,
-                            error=f"address resolution failed for {_host}: {e}",
-                            artifact=self._artifact(url, f"error:resolve:{type(e).__name__}",
-                                                    session_ref, case_ref=case_ref))
-                    pinned = _pin_connect_url(url, _ip)
+            # 3b. I05-B: the CONNECT target is pinned by the run's clients themselves
+            #     (AddressPins, at the socket): one address per name for the whole
+            #     run, special-purpose addresses refused. Scope, gate and credential
+            #     forwarding keep keying on the name.
             # 4. Credential-forwarding rule: attach the session's auth headers ONLY
             #    when this hop is the session's own origin. Cross-origin -> no creds.
             credential_destination = bool(
@@ -561,22 +536,17 @@ class TargetTransport:
                     send_headers.setdefault(k, v)
             use_http2 = bool((ctx.config.get("transport", {}) or {}).get("http2", False))
             client = (session.client(ctx.timeout, http2=use_http2,
-                                     trust_policy=ctx.tls_policy, destination=url)
+                                     trust_policy=ctx.tls_policy, destination=url,
+                                     address_pins=ctx.address_pins)
                       if session and credential_destination else ctx.default_client(destination=url))
-            send_url = url
             request_kwargs: dict = {"headers": send_headers or None,
                                     "content": body if isinstance(body, str) else None}
-            if pinned is not None:
-                send_url, _host_header, _extensions = pinned
-                send_headers["Host"] = _host_header
-                request_kwargs["headers"] = send_headers or None
-                # Only pass `extensions` when pinning produced one (https SNI): the
-                # default/off path keeps the exact original call signature, so a
-                # caller's mock client that doesn't accept `extensions` is unaffected.
-                if _extensions:
-                    request_kwargs["extensions"] = _extensions
             try:
-                resp = await client.request(method, send_url, **request_kwargs)
+                resp = await client.request(method, url, **request_kwargs)
+            except DestinationBlocked as e:   # refused at connect: nothing was sent
+                return ExecutionOutcome(outcome="blocked", final_url=url, error=str(e),
+                                        artifact=self._artifact(url, "destination_blocked", session_ref,
+                                                                case_ref=case_ref))
             except Exception as e:  # transport error -> honest error artifact, never a crash
                 return ExecutionOutcome(outcome="error", final_url=url, error=str(e),
                                         artifact=self._artifact(url, f"error:{type(e).__name__}", session_ref, case_ref=case_ref))
@@ -608,18 +578,29 @@ Executor = TargetTransport
 
 
 # ---------------------------------------------------------------------------
-# P1-10: connect-time address pinning (DNS-rebinding enforcement), OFF by default.
+# I05-B: connect-time destination policy -- one address per name for the whole run.
 #
-# ScopePolicy authorizes HOSTNAMES, not resolved addresses (see its docstring):
-# an already-allowed name whose resolution changes between the scope check and the
-# connect is not blocked at the address level. When the opt-in
-# `security.pin_connect_address` is set (via config.local.yaml -- never a committed
-# default), TargetTransport.execute resolves each hop's host ONCE, then directs the
-# connection to that pinned address while preserving the Host header and TLS SNI, so
-# a later/alternate resolution can never redirect the connection. Applied on every
-# hop, including redirects. Ships OFF; a live two-origin/DNS-rebinding proof over
-# real HTTPS is the OWNER validation.
+# ScopePolicy authorizes HOSTNAMES, not resolved addresses (see its docstring). A
+# name whose DNS answer changes during a run (DNS rebinding) could otherwise move a
+# later request or redirect hop to another address -- an internal service, the
+# tester's own loopback services, or cloud metadata. Every client a run builds
+# therefore connects through AddressPins: each name is resolved ONCE per run and
+# that first answer holds for every later request and redirect hop. A name that
+# resolves to a special-purpose address (link-local incl. 169.254.169.254, multicast,
+# unspecified, reserved) is refused before any socket opens; an IP-literal URL is
+# connected as written (scope must already list that literal).
+#
+# The pin sits in the httpcore network backend, so the Host header, TLS SNI and
+# certificate hostname checks stay on the name, and nothing changes for clients that
+# never open a socket (mock transports). ON by default; `security.pin_connect_address:
+# false` is an explicit opt-out. Behind an HTTP(S) proxy (trust_env) the proxy
+# resolves the target, so only the connection to the proxy is pinned. A name whose
+# FIRST answer is private or loopback is accepted -- lab targets do that.
 # ---------------------------------------------------------------------------
+
+class DestinationBlocked(Exception):
+    """A connect the run's destination policy refused before any socket opened."""
+
 
 def _default_resolver(host: str) -> str:
     """Resolve `host` to a single IP once. Prefers IPv4; raises on failure so the
@@ -640,20 +621,92 @@ def _is_ip_literal(host: str) -> bool:
         return False
 
 
-def _pin_connect_url(url: str, ip: str) -> tuple[str, str, dict]:
-    """Rewrite `url` to connect to `ip` while preserving the original Host header and
-    TLS SNI. Returns (connect_url, host_header, extensions)."""
-    p = urlsplit(url)
-    host = p.hostname or ""
-    scheme = (p.scheme or "http").lower()
-    port = p.port
-    default_port = 443 if scheme == "https" else 80
-    host_header = host if (port in (None, default_port)) else f"{host}:{port}"
-    ip_host = f"[{ip}]" if ":" in ip else ip
-    netloc = ip_host if port is None else f"{ip_host}:{port}"
-    connect_url = urlunsplit((scheme, netloc, p.path or "", p.query or "", p.fragment or ""))
-    extensions = {"sni_hostname": host} if scheme == "https" else {}
-    return connect_url, host_header, extensions
+def special_purpose_reason(ip: str) -> str:
+    """Why `ip` is never a target reached through a NAME, or "" when it may be."""
+    addr = ipaddress.ip_address(ip)
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.is_loopback:      # ::1 sits in a "reserved" block; loopback is allowed like 127/8
+        return ""
+    for label, hit in (("link-local", addr.is_link_local), ("multicast", addr.is_multicast),
+                       ("unspecified", addr.is_unspecified), ("reserved", addr.is_reserved)):
+        if hit:
+            return f"resolved to a special-purpose ({label}) address {addr}"
+    return ""
+
+
+class AddressPins:
+    """Per-run name -> address pins; the first answer for a name holds for the run."""
+
+    def __init__(self, resolver=None):
+        self.resolver = resolver or _default_resolver
+        self._pins: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def pinned(self) -> dict:
+        with self._lock:
+            return dict(self._pins)
+
+    async def address_for(self, host: str) -> str:
+        if _is_ip_literal(host):
+            return host
+        key = host.lower()
+        with self._lock:
+            ip = self._pins.get(key)
+        if ip is None:
+            import asyncio
+            resolved = await asyncio.to_thread(self.resolver, host)   # raises on failure
+            with self._lock:
+                ip = self._pins.setdefault(key, resolved)   # a racing first answer wins
+        reason = special_purpose_reason(ip)
+        if reason:
+            raise DestinationBlocked(f"{host} {reason}; no connection was opened")
+        return ip
+
+
+class _PinnedBackend(httpcore.AsyncNetworkBackend):
+    """httpcore network backend that connects a name to its run-pinned address."""
+
+    def __init__(self, pins: AddressPins):
+        self._pins = pins
+        self._inner = httpcore.AnyIOBackend()
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None,
+                          socket_options=None):
+        ip = await self._pins.address_for(host)
+        return await self._inner.connect_tcp(ip, port, timeout=timeout,
+                                             local_address=local_address,
+                                             socket_options=socket_options)
+
+    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        return await self._inner.connect_unix_socket(path, timeout=timeout,
+                                                     socket_options=socket_options)
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def _pinned_backend(pins: "AddressPins | None"):
+    """The connect-time pin for a run's clients (None = connect by name)."""
+    return _PinnedBackend(pins) if pins is not None else None
+
+
+def _target_client(*, verify, timeout: float, http2: bool,
+                   pins: "AddressPins | None") -> httpx.AsyncClient:
+    """An httpx client for target traffic whose connections honour the run's pins."""
+    transport = httpx.AsyncHTTPTransport(verify=verify, http2=http2)
+    backend = _pinned_backend(pins)
+    if backend is not None:
+        transport._pool._network_backend = backend
+    # verify/http2 are passed to the client too, so environment-proxy mounts use the
+    # same trust as the pinned transport.
+    return httpx.AsyncClient(follow_redirects=False, verify=verify, timeout=timeout,
+                             cookies=httpx.Cookies(), http2=http2, transport=transport)
+
+
+def _address_pins_from_config(config: dict | None) -> "AddressPins | None":
+    security = (config or {}).get("security", {}) or {}
+    return AddressPins() if security.get("pin_connect_address", True) is not False else None
 
 
 def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
@@ -726,6 +779,8 @@ class RunContext:
     _default_client: httpx.AsyncClient | None = None
     _fixture_clients: dict = field(default_factory=dict, repr=False)
     tls_policy: TLSPolicy = field(default_factory=TLSPolicy.from_config, repr=False)
+    # I05-B: one connect address per name for the whole run (None = opted out).
+    address_pins: "AddressPins | None" = field(default_factory=AddressPins, repr=False)
     target_policy: TargetRequestPolicy = field(default_factory=TargetRequestPolicy, repr=False)
     # What safety_gate.push_gate returned when this run installed its gate as
     # ambient -- the gate (or None) that was ambient before it, to restore on
@@ -779,6 +834,7 @@ class RunContext:
             budget=RequestBudget(max_requests), cancel=CancelToken(),
             sessions=SessionManager(), config=config_snapshot,
             tls_policy=tls_policy,
+            address_pins=_address_pins_from_config(config_snapshot),
             target_policy=target_policy,
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
                              if configured_namespace else resolved_run_id), timeout=timeout)
@@ -788,14 +844,13 @@ class RunContext:
         use_http2 = bool((self.config.get("transport", {}) or {}).get("http2", False))
         if profile.pool_key:
             if profile.pool_key not in self._fixture_clients:
-                self._fixture_clients[profile.pool_key] = httpx.AsyncClient(
-                    follow_redirects=False, verify=profile.context, timeout=self.timeout,
-                    cookies=httpx.Cookies(), http2=use_http2)
+                self._fixture_clients[profile.pool_key] = _target_client(
+                    verify=profile.context, timeout=self.timeout, http2=use_http2,
+                    pins=self.address_pins)
             return self._fixture_clients[profile.pool_key]
         if self._default_client is None:
-            self._default_client = httpx.AsyncClient(follow_redirects=False, verify=profile.context,
-                                                     timeout=self.timeout, cookies=httpx.Cookies(),
-                                                     http2=use_http2)
+            self._default_client = _target_client(verify=profile.context, timeout=self.timeout,
+                                                  http2=use_http2, pins=self.address_pins)
         return self._default_client
 
     def target_transport(self) -> "TargetTransport":
