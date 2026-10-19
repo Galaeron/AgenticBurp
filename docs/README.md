@@ -15,6 +15,7 @@
 | Configure the optional safety proxy | [PROXY_SETUP.md](../PROXY_SETUP.md) |
 | Run the `improve-loop` skill (per-iteration coding loop) | [IMPROVEMENT_BACKLOG.md](../IMPROVEMENT_BACKLOG.md) — the skill's actual task source (`.claude/commands/improve-loop.md`, local/untracked); it does not read the file below |
 | Historical positioning | [COMPETITIVE_LANDSCAPE.md](../COMPETITIVE_LANDSCAPE.md) |
+| Retained observations (supplied captures with or without findings) | [OBSERVATION_MEMORY.md](OBSERVATION_MEMORY.md) |
 
 Historical measurements, plans and reviews describe their named revisions, not
 current capability. Code is authoritative for routing/configuration; executed

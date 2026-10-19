@@ -272,7 +272,8 @@ class ChainMixin:
                             url=url, method="GET", request_headers={}, request_body="",
                             response_status=out.status, response_headers=dict(out.headers),
                             response_body=(out.body or "")[: self.max_body_chars])
-                        result = await self.analyze(exchange)
+                        # Harness-fetched traffic, not a supplied capture (I02-C).
+                        result = await self.analyze(exchange, retain_observation=False)
                         n = len([f for r in result.agent_reports for f in r.findings])
                         analyzed.append({"url": url, "findings": n})
                     except Exception as e:

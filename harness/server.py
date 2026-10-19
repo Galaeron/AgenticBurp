@@ -17,7 +17,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from harness.models import (AnalysisRequest, AnalysisResponse, ValidationSubmission, EstimateRequest, EffortStatus,
                      IdentityCreateRequest, SessionCreateRequest, SuppressFindingRequest,
-                     PrioritizeRequest, PrioritizeResponse, PrioritizeResultItem, HttpExchange)
+                     PrioritizeRequest, PrioritizeResponse, PrioritizeResultItem, HttpExchange,
+                     ObservationAttributionCorrection)
 import harness.identity as identity_mod
 from harness.orchestrator import Orchestrator
 
@@ -573,8 +574,15 @@ async def validation_result(submission: ValidationSubmission, authorization: str
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(req: AnalysisRequest, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
+    attribution = req.observation_attribution.model_dump() if req.observation_attribution else None
+    try:
+        attribution = store.clean_observation_attribution(attribution) if attribution else None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     try:
         partition = {"engagement_id": req.engagement_id} if req.engagement_id else {}
+        if attribution:
+            partition["observation_attribution"] = attribution
         return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery,
                                           **partition)
     except Exception as e:
@@ -1785,6 +1793,55 @@ async def finding_evidence(finding_ref: str, authorization: str | None = Header(
     if not reconstruction.get("event_count"):
         raise HTTPException(status_code=404, detail="no evidence-ledger events for this finding_ref")
     return {"reconstruction": reconstruction, "reproduction_recipe": recipe}
+
+
+# I02-C: analyst actions on retained observations (supplied captures that later
+# analyses of the same endpoint are given). Each acts within one pile:
+# engagement_id '' is the site's shared pile. Nothing here sends traffic.
+@app.get("/observations/{observation_id}")
+async def get_observation(observation_id: str, authorization: str | None = Header(default=None),
+                          engagement_id: str = Query(default="", max_length=128)):
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    found = await __import__("asyncio").to_thread(store.get_observation, observation_id,
+                                                  engagement_id=engagement_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="no such observation in this pile")
+    return found
+
+
+@app.post("/observations/{observation_id}/attribution")
+async def correct_observation_attribution(observation_id: str, req: ObservationAttributionCorrection,
+                                          authorization: str | None = Header(default=None)):
+    """Append a complete new attribution revision. `expected_revision` must be
+    the current one (409 otherwise); later analyses use the new revision."""
+    _require_auth(authorization)
+    attribution = {name: getattr(req, name) for name in ("principal_ref", "role", "tenant", "session_ref")}
+    try:
+        return await __import__("asyncio").to_thread(
+            store.correct_observation_attribution, observation_id, engagement_id=req.engagement_id,
+            expected_revision=req.expected_revision, attribution=attribution, reason=req.reason)
+    except store.ObservationRevisionConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except store.ObservationDeleted as e:
+        raise HTTPException(status_code=410, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/observations/{observation_id}")
+async def delete_observation(observation_id: str, authorization: str | None = Header(default=None),
+                             engagement_id: str = Query(default="", max_length=128)):
+    """Delete one observation: a tombstone stays, its content and evidence go,
+    and later analyses see it as unavailable rather than as evidence."""
+    _require_auth(authorization)
+    try:
+        return await __import__("asyncio").to_thread(store.delete_observation, observation_id,
+                                                     engagement_id=engagement_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 class MergeIssuesRequest(_BaseModel):

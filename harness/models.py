@@ -198,6 +198,16 @@ class AgentReport(BaseModel):
     guide_version: str = ""
 
 
+class ObservationAttribution(BaseModel):
+    """Analyst-declared labels for a supplied capture (I02-C). An unverified
+    operator assertion, never derived from credentials; an absent field stays
+    unknown. Labels that look like credentials are rejected by the store."""
+    principal_ref: Optional[str] = Field(default=None, max_length=64)
+    role: Optional[str] = Field(default=None, max_length=64)
+    tenant: Optional[str] = Field(default=None, max_length=64)
+    session_ref: Optional[str] = Field(default=None, max_length=64)
+
+
 class AnalysisRequest(BaseModel):
     exchange: HttpExchange
     # Explicit snapshot partition. Omitted calls use their fresh run identity.
@@ -214,6 +224,17 @@ class AnalysisRequest(BaseModel):
     # exploitability evidence beyond the generic advisory text. This is
     # the analyst's call to make, not a default the harness assumes.
     attempt_rediscovery: bool = False
+    # I02-C: optional analyst-declared attribution for this capture (who/which
+    # tenant it belongs to). Stored as revision 1 of the observation's
+    # attribution; correct it later with POST /observations/{id}/attribution.
+    observation_attribution: Optional[ObservationAttribution] = None
+
+
+class ObservationAttributionCorrection(ObservationAttribution):
+    """Body of POST /observations/{id}/attribution: a complete new revision."""
+    engagement_id: str = Field(default="", max_length=128)
+    expected_revision: int = Field(ge=1)
+    reason: str = Field(default="", max_length=200)
 
 
 class TestPlan(BaseModel):
@@ -413,6 +434,11 @@ class AnalysisResponse(BaseModel):
     # dispatched agent errored (the model-unavailable case), `degraded` is also
     # True and the summary leads with an explicit warning.
     agent_errors: list[str] = Field(default_factory=list)
+    # I02-C: what earlier observations this analysis was given and whether this
+    # capture was retained: {status, write, selected [{observation_id, reason,
+    # order_basis}], unavailable, excluded_counts, digest}. Empty for callers
+    # that do not retain observations (engagement- and discovery-driven runs).
+    observation_context: dict = Field(default_factory=dict)
 
 
 class UrlEstimateItem(BaseModel):
