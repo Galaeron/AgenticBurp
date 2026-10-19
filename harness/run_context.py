@@ -832,6 +832,22 @@ class RunContext:
             self._fail_open_pushed = False
             self._fail_open_restore = None
 
+    def publish(self) -> "RunContext":
+        """Make this run the enclosing one for target sends (current_run_context) and
+        its gate the ambient default gate (get_default_gate), task-locally, until
+        aclose(). `async with` does this plus the per-run model-plane state; a caller
+        that owns a run but keeps the shared Ollama breaker and fail-open counters --
+        a standalone analyze (I05) -- publishes only."""
+        if not self._gate_pushed:
+            from harness.safety_gate import push_gate
+            self._gate_restore = push_gate(self.gate)
+            self._gate_pushed = True
+        if not self._run_pushed:
+            self._run_restore = _ambient_run.get()
+            _ambient_run.set(self)
+            self._run_pushed = True
+        return self
+
     async def __aenter__(self) -> "RunContext":
         # Install this run's gate as the AMBIENT one (safety_gate.get_default_gate)
         # for the `async with` block's lifetime, so a validator with no run_context
@@ -845,12 +861,7 @@ class RunContext:
         # directly and read `.gate` themselves (never through get_default_gate())
         # stay exactly as they were -- no eager global side effect at construction
         # time that a test forgetting to call aclose() could leak into another.
-        from harness.safety_gate import push_gate
-        self._gate_restore = push_gate(self.gate)
-        self._gate_pushed = True
-        self._run_restore = _ambient_run.get()
-        _ambient_run.set(self)
-        self._run_pushed = True
+        self.publish()
 
         # AR-2 (LOOP half): install this run's OWN Ollama circuit breaker and
         # fail-open counters as ambient, alongside the gate above, so model-

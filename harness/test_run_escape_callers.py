@@ -279,14 +279,20 @@ class AnalyzeAutoEscalationTests(_IsolatedStateBase, unittest.TestCase):
         asyncio.run(run.aclose())
 
     def test_dropping_the_run_from_the_escalation_is_detected(self):
-        """Fault injection: the escalation is called without analyze's run."""
+        """Fault injection: the escalation is called without analyze's run. Uses a
+        borrowed run that is not entered, where the explicit run argument is the only
+        thing binding the escalation (a standalone analyze also enters its own run,
+        which the enclosing-run fallback would catch)."""
         original = Orchestrator._auto_escalate
 
         async def unbound(self, host, source_url, credential_caps, st, run_context=None):
             return await original(self, host, source_url, credential_caps, st, run_context=None)
 
-        target = self._analyze(ceiling=0, extra_patches=[
+        run = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=0,
+                                gate_config={"active_enabled": True})
+        target = self._analyze(run=run, extra_patches=[
             patch.object(Orchestrator, "_auto_escalate", unbound)])
+        asyncio.run(run.aclose())
         self.assertTrue(target.requests,
                         "dropping the run no longer leaks -- the control is vacuous")
 
