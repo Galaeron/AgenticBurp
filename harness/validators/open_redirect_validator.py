@@ -33,6 +33,37 @@ _REDIRECT_PARAM_NAMES = {"url", "redirect", "redirect_uri", "redirect_url", "red
                          "target", "forward", "callback", "checkout_url", "success_url", "back"}
 # A sentinel host no legitimate same-origin redirect would ever point to.
 _SENTINEL_HOST = "oob-openredirect.example"
+# Statuses a browser follows to the Location header. A Location on any other
+# status (a 200, a 300 choice page, a 304) is not a redirect (R16).
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):(.*)$", re.DOTALL)
+
+
+def _destination_host(location: str, request_url: str) -> str:
+    """The host a browser navigates to for this Location, resolved against the
+    request URL the way browsers parse http(s) URLs: tab/newline dropped, outer
+    whitespace trimmed, a backslash read as a slash. An origin- or path-relative
+    Location (``/oob-openredirect.example/x``) resolves to the request's own host,
+    so a sentinel that only appears in the path never counts as off-origin (R16)."""
+    loc = re.sub(r"[\t\r\n]", "", location or "").strip().replace("\\", "/")
+    base = urlsplit(request_url)
+    m = _SCHEME.match(loc)
+    if m:
+        scheme, rest = m.group(1).lower(), m.group(2)
+        if scheme not in ("http", "https"):
+            return ""  # javascript:, data:, ... -- no http destination host
+        if scheme == (base.scheme or "").lower() and not rest.startswith("//"):
+            # "http:/x" on an http page is a relative path on the same origin.
+            return (base.hostname or "").lower()
+        authority = rest.lstrip("/")
+    elif loc.startswith("//"):
+        authority = loc.lstrip("/")  # scheme-relative: //host/...
+    else:
+        return (base.hostname or "").lower()
+    try:
+        return (urlsplit("//" + authority).hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 def _redirect_params(exchange: HttpExchange) -> list[tuple[str, str]]:
@@ -77,6 +108,7 @@ class OpenRedirectValidator(Validator):
             return self._skip("no redirect-shaped parameter to point off-origin")
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
+        candidate = ""  # sentinel reached Location, but no off-origin redirect
         for loc, param in targets:
             for payload in self._payloads(f"{loc}-{param}"):
                 url, body = mutate(exchange, loc, param, payload)
@@ -97,15 +129,30 @@ class OpenRedirectValidator(Validator):
                     location = ""
                 if not location:
                     continue
-                # Confirm only if the redirect actually lands on the sentinel host.
-                loc_host = (urlsplit(location).hostname or "")
-                if loc_host.lower() == _SENTINEL_HOST or location.lstrip("/\\").lower().startswith(_SENTINEL_HOST):
+                # Confirm only a real redirect whose parsed destination host is the
+                # sentinel. A relative Location that merely contains the sentinel in
+                # its path, or a Location on a non-redirect status, stays a candidate.
+                is_redirect = resp.status_code in _REDIRECT_STATUSES
+                if is_redirect and _destination_host(location, url) == _SENTINEL_HOST:
                     return ValidationResult(
                         self.name, "confirmed", "open_redirect", confidence=0.9, confirmed=True,
                         summary=f"Open redirect confirmed: the {loc} parameter {param!r} controls the "
                                 f"Location the server redirects to.",
-                        evidence=f"Set {param!r} to `{payload}`; the server responded with a redirect to the "
-                                 f"off-origin sentinel host {_SENTINEL_HOST!r} (Location: {location}).")
+                        evidence=f"Set {param!r} to `{payload}`; the server responded with HTTP "
+                                 f"{resp.status_code}, a redirect to the off-origin sentinel host "
+                                 f"{_SENTINEL_HOST!r} (Location: {location}).")
+                if not candidate and _SENTINEL_HOST in location.lower():
+                    why = ("it stays on the target's own origin" if is_redirect
+                           else f"HTTP {resp.status_code} is not a redirect status")
+                    candidate = (f"Set {loc} param {param!r} to `{payload}`; the response carried "
+                                 f"Location: {location}, but {why}.")
+        if candidate:
+            return ValidationResult(
+                self.name, "inconclusive", "open_redirect", confidence=0.3, confirmed=False,
+                summary="Open-redirect candidate (unconfirmed): the parameter reaches the Location "
+                        "header, but no redirect to an off-origin host was observed",
+                evidence=candidate + " A browser would not leave the site, so this is not proof of "
+                                     "an open redirect; check manually for another bypass.")
         return ValidationResult(
             self.name, "not_confirmed", "open_redirect", confidence=0.0, confirmed=False,
             summary="No off-origin redirect observed -- the redirect target is not attacker-controlled",
