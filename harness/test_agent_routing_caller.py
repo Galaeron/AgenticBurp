@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import unittest
 from contextlib import ExitStack
+from urllib.parse import urlsplit
 from unittest.mock import AsyncMock, patch
 from harness.models import AgentReport, Finding, HttpExchange
 from harness.orchestrator_confirm import ConfirmMixin
@@ -31,7 +32,11 @@ class AgentRoutingCallerTests(unittest.TestCase):
             commands = []
             def fake_run(command, **kwargs):
                 self.assertEqual(command[0], "sqlmap")
-                self.assertEqual(command[command.index("-u") + 1], exchange.url)
+                # I05: inside a run sqlmap is pointed at the run's loopback tool proxy
+                # for this exchange (same path), never at the target itself.
+                launched = urlsplit(command[command.index("-u") + 1])
+                self.assertEqual(launched.hostname, "127.0.0.1")
+                self.assertEqual(launched.path, urlsplit(exchange.url).path)
                 commands.append(command)
                 return subprocess.CompletedProcess(command, 0, "[INFO] no injectable parameter identified", "")
             try:

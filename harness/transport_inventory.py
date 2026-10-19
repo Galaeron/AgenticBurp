@@ -106,6 +106,12 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                        "bounded output; cancel or timeout stops the tree and force-removes "
                        "the exact container before returning. Executor container adapter "
                        "is T08 follow-on."),
+    TransportSite("tool_proxy.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="tools", constructs_client=False,
+                  note="I05: loopback reverse proxy an external tool (sqlmap) is pointed at "
+                       "inside a run; each tool request is replayed through the run's "
+                       "TargetTransport (budget, scope, gate, cancellation, TLS), and an "
+                       "exhausted budget stops the tool."),
     TransportSite("browser_driver.py", CHANNEL_BROWSER, SCOPE_INFRA, ROUTING_ADAPTER,
                   owner="tools",
                   note="Playwright/Chromium adapter for browser_xss/dom_xss/stored_xss. "

@@ -501,7 +501,20 @@ class SqlmapValidator(Validator):
             # `docker run --rm` and rewrite the -u target to host.docker.internal.
             # The safety-flag assertions above ran on the raw sqlmap `cmd`, so the
             # denied-flag invariant holds regardless of how the process is spawned.
-            run_cmd = cmd
+            # I05: inside a run sqlmap never sees the real target. It is pointed at a
+            # loopback proxy that replays each of its requests through the run --
+            # budget, scope, gate, cancellation, TLS -- so its own traffic is counted,
+            # and the run's budget running out stops it. `cmd` keeps the real target
+            # as the record of what was tested; only the launched argv is proxied.
+            proxy = None
+            launch_cmd = cmd
+            if run is not None:
+                from harness.tool_proxy import ToolProxy
+                proxy = await ToolProxy(run, exchange.url, capability="sqlmap_tool").start()
+                launch_cmd = list(cmd)
+                launch_cmd[launch_cmd.index("-u") + 1] = proxy.url_for(exchange.url)
+                _cancel = lambda: run.cancel.cancelled or proxy.stop_requested  # noqa: E731
+            run_cmd = launch_cmd
             _use_container = False
             _container_args: list[str] = []
             _egress_policy = None
@@ -510,7 +523,7 @@ class SqlmapValidator(Validator):
                 from harness import tool_runner
                 if tool_runner.available()[0]:
                     _use_container = True
-                    _container_args = list(cmd[1:])  # drop self.binary; the image entrypoint IS sqlmap
+                    _container_args = list(launch_cmd[1:])  # drop self.binary; the image entrypoint IS sqlmap
                     for i in range(1, len(_container_args)):
                         if _container_args[i - 1] == "-u":
                             _container_args[i] = tool_runner.localhost_url(_container_args[i])
@@ -609,11 +622,17 @@ class SqlmapValidator(Validator):
                 if isinstance(exc, tool_runner.ToolCleanupFailed):
                     raise   # never report a clean result while sqlmap may still run
                 if isinstance(exc, tool_runner.ToolRunCancelled):
+                    why = ("the run's request budget is exhausted "
+                           f"({proxy.forwarded} sqlmap request(s) were sent through the run)"
+                           if proxy is not None and proxy.stop_reason == "budget_exhausted"
+                           else "the run was cancelled")
                     return ValidationResult(self.name, "skipped", finding.vulnerability_class,
-                                            summary="sqlmap stopped: the run was cancelled",
-                                            command=cmd)
+                                            summary=f"sqlmap stopped: {why}", command=cmd)
                 return ValidationResult(self.name, "error", finding.vulnerability_class,
                                         summary=f"sqlmap execution failed: {exc}", command=cmd)
+            finally:
+                if proxy is not None:
+                    await proxy.close()
 
             output = ((proc.stdout or "") + "\n" + (proc.stderr or ""))[-12000:]
             lower = output.lower()
@@ -625,6 +644,15 @@ class SqlmapValidator(Validator):
                     summary="sqlmap independently reported the target as injectable",
                     evidence=output, raw_output=output, command=cmd,
                 )
+            if proxy is not None and proxy.stop_reason:
+                # The run refused part of the scan: an incomplete scan is not a negative.
+                why = ("the run's request budget ran out" if proxy.stop_reason == "budget_exhausted"
+                       else "the run was cancelled")
+                return ValidationResult(
+                    self.name, "skipped", finding.vulnerability_class,
+                    summary=f"sqlmap incomplete: {why} after {proxy.forwarded} request(s) "
+                            "were sent through the run -- not a negative result",
+                    evidence=output, raw_output=output, command=cmd)
             # Secondary confirmation for auth/login endpoints (HANDOVER_6 §3/§6.3):
             # sqlmap's own analysis is fragile on a valid-cred (2xx) login capture
             # even with --ignore-code, because it must infer the 2xx<->401 flip
