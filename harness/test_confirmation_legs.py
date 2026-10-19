@@ -2,9 +2,15 @@
 the OOB collaborator. Network is stubbed; the collaborator test uses a real
 loopback listener (no external network)."""
 import asyncio
+import gc
 import json
+import os
+import subprocess
+import sys
 import unittest
 import urllib.request
+import warnings
+from pathlib import Path
 from unittest.mock import patch
 
 from harness import collaborator
@@ -15,6 +21,9 @@ from harness.validators.jwt_forge_validator import (JwtForgeValidator, _JWT_RE, 
 from harness.validators.ssrf_validator import SsrfValidator
 from harness.validators.xxe_validator import XxeValidator
 from harness.testing_fixtures.sent_probe import CountingResponder
+
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def _f(vc):
@@ -45,6 +54,58 @@ class CollaboratorTests(unittest.TestCase):
             self.assertFalse(asyncio.run(c.wait_for_hit("nope", timeout=0.4)))
         finally:
             c.stop()
+
+
+    def test_stop_releases_the_listening_socket(self):
+        # I11 socket trace: stop() ended the serve loop but never closed the bound
+        # socket, so every stopped collaborator left an unclosed loopback socket that
+        # surfaced as a ResourceWarning at garbage collection. Closing it in the owner
+        # (not in each caller) is the fix; the warning must not come back.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            c = collaborator.Collaborator()
+            sock = c._srv.socket
+            self.assertNotEqual(sock.fileno(), -1)      # open while serving
+            c.stop()
+            self.assertEqual(sock.fileno(), -1)         # closed by stop(), not by the GC
+            c.stop()                                    # idempotent
+            del c, sock
+            gc.collect()
+        leaked = [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(leaked, [])
+
+    def test_stop_shared_closes_and_forgets_the_process_wide_collaborator(self):
+        collaborator.stop_shared()          # start from a known state
+        first = collaborator.shared()
+        sock = first._srv.socket
+        self.assertIs(collaborator.shared(), first)
+        collaborator.stop_shared()
+        self.assertEqual(sock.fileno(), -1)
+        second = collaborator.shared()      # a fresh one, usable again
+        self.addCleanup(collaborator.stop_shared)
+        self.assertIsNot(second, first)
+        tok = second.token()
+        urllib.request.urlopen(second.url(tok), timeout=5).read()
+        self.assertTrue(second.was_hit(tok))
+
+    def test_shared_collaborator_socket_is_closed_at_interpreter_exit(self):
+        # I11 socket trace: the process-wide collaborator was never stopped, so its
+        # listening socket was still open at interpreter exit. atexit hooks run last-in
+        # first-out, so the probe below is registered BEFORE shared() registers its own
+        # stop and therefore observes the socket after that hook ran. The warning is not
+        # suppressed: -W always::ResourceWarning stays on and stderr must stay clean.
+        code = (
+            "import atexit\n"
+            "from harness import collaborator\n"
+            "holder = []\n"
+            "atexit.register(lambda: print('closed' if holder[0].fileno() == -1 else 'OPEN'))\n"
+            "holder.append(collaborator.shared()._srv.socket)\n")
+        proc = subprocess.run([sys.executable, "-W", "always::ResourceWarning", "-c", code],
+                              cwd=ROOT, capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "PYTHONPATH": str(ROOT)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "closed", proc.stderr)
+        self.assertNotIn("ResourceWarning", proc.stderr)
 
 
 class _StubJwt(JwtForgeValidator):

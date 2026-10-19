@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import http.server
 import secrets
 import threading
@@ -76,19 +77,41 @@ class Collaborator:
         return False
 
     def stop(self) -> None:
+        """Stop serving AND release the listening socket (idempotent). `shutdown()`
+        alone only ends the serve loop; the bound socket stays open until
+        `server_close()`, which leaked one loopback socket per stopped collaborator."""
         try:
             self._srv.shutdown()
         except Exception:
             pass
+        try:
+            self._srv.server_close()
+        except Exception:
+            pass
+        self._thread.join(timeout=2.0)
 
 
 _SHARED: Collaborator | None = None
+_ATEXIT_REGISTERED = False
 
 
 def shared() -> Collaborator:
-    """The process-wide collaborator, started on first use (daemon thread -- it
-    dies with the process; nothing to clean up)."""
-    global _SHARED
+    """The process-wide collaborator, started on first use. Its serve loop is a daemon
+    thread, but its listening socket is not released by the daemon dying: it is closed
+    by `stop_shared()`, which is registered to run at interpreter exit."""
+    global _SHARED, _ATEXIT_REGISTERED
     if _SHARED is None:
         _SHARED = Collaborator()
+        if not _ATEXIT_REGISTERED:
+            atexit.register(stop_shared)
+            _ATEXIT_REGISTERED = True
     return _SHARED
+
+
+def stop_shared() -> None:
+    """Stop and forget the process-wide collaborator (idempotent); the next `shared()`
+    starts a fresh one."""
+    global _SHARED
+    collaborator, _SHARED = _SHARED, None
+    if collaborator is not None:
+        collaborator.stop()
