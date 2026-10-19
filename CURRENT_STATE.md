@@ -14,6 +14,9 @@
   proof binding through storage/export, then a docs commit. `2ba91da` I05-A (sends escaping
   their run) + `5bca380` docs. Then `14747a9` I04 label check, `d7201fc` I11 socket leaks,
   `d8eb094` I11 evidence wiring, and a docs commit. All pushed to PR #1.
+- Local, not yet pushed (network/process containment needs owner review per the guide):
+  `ae8f287` I05-C tool process lifecycle, `934c3e1` I05-C2 counting proxy, `f7d1321` I05-A2
+  standalone analyze publishes its run, and a docs commit.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
@@ -47,6 +50,12 @@
   smoke 146 OK, full exit 0 (3369 harness, 38 pytest, 312 evaluation with 17 artifact-absence
   skips, 42 integrity), 0 ResourceWarnings. The coverage gate reports 25 gaps (was 36).
   Logs: `.test-work/land-20261019/`.
+- I05-C was verified at `336f878` + C, and C2+A2 at `ae8f287` + both (isolated worktrees
+  `.test-work/wt-verify` and `.test-work/wt-dev`). Both interpreters: smoke 146 OK, full
+  exit 0 (3382 then 3397 harness, 38 pytest, 312 evaluation, 42 integrity), coverage gaps
+  25. Logs: `.test-work/i05c-*.log`, `.test-work/i05de-*.log`.
+- Stopping a background run with TaskStop leaves its process tree running. End it by
+  exact PID tree, and never by a pattern that could match another session's processes.
 
 ## Owner decisions (2026-10-17)
 - `/analyze` grouping: one shared pile per site by default; `engagement_id` = optional named
@@ -59,15 +68,21 @@
   unresolvable or re-pointed proof no longer exports as confirmed) are fixed. I05 batch A
   (sends escaping their run) is fixed. The I04 storage/export label check and the I11 socket
   trace are done, and 11 of the 14 caller-tested requirements are wired. Next:
-  - I05 batches B (redirect/rebinding), C (external-process lifecycle, in progress) and D
-    (browser credential isolation);
+  - I05 batches B (redirect/rebinding) and D (browser credential isolation); the no-run
+    routes `/crawl`, `/crawl-roles`, `/engagement/{host}/advance`; a real-container proof
+    of C (Docker Desktop was off);
   - I02 batch C (non-finding observations): design at
     `.test-work/i02c-observations-20261019/DESIGN.md` awaits owner review;
   - I11: WSTG-ATHZ-02, SESS-01 and INPV-01 are still unwired (blockers in the plan);
   - I16: issue export and SARIF lack `suggested_test` (API and Markdown have it).
-- Owner decisions (2026-10-19, I05): a standalone `analyze()` will enter its own run (it
-  will spend `analyze.max_requests` and use verified TLS; self-signed targets need the
-  per-origin `tls` exception). External-tool traffic goes through a counting proxy.
+- Owner decisions (2026-10-19, I05), now implemented:
+  - A standalone `analyze()` publishes its own run (`f7d1321`). Gated validators spend
+    `analyze.max_requests` and use the run's TLS policy; trust a self-signed target with
+    `transport.tls.ca_bundle` in config.local.yaml. They previously verified against the
+    default store with no way to configure trust. The shared Ollama breaker and fail-open
+    stats are unchanged.
+  - External-tool traffic goes through a counting proxy (`934c3e1`): inside a run sqlmap
+    never sees the real target, and an exhausted budget stops it.
 - The live Part B crAPI experiment has not been run. Historical negative crAPI results still
   govern efficacy, and offline tests do not establish recall.
 - Browser capture covers page-load traffic only; catch-all filtering is conservative.

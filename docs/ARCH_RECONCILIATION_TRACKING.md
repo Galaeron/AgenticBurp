@@ -72,8 +72,9 @@ or released. The remaining acceptance for each item has one owner in
   routing. The caller tests prove only the legs the fixture shapes trigger.
   **Closed by I05 batch A (`2ba91da`, 2026-10-19):** `Validator.run_context` falls back
   to the enclosing entered run, `transport_for(None)` does the same, auto-escalation
-  spends `analyze()`'s run, and `api_security`'s limit probe is gated. Still open: a
-  standalone `analyze()` never enters its own run (owner decision, TLS impact).
+  spends `analyze()`'s run, and `api_security`'s limit probe is gated. A standalone
+  `analyze()` now publishes its own run (I05-A2, `f7d1321`), and external-tool traffic
+  spends the run through a counting proxy (I05-C2, `934c3e1`).
 
 ## ARCH-3 — standalone-analysis gate policy + lifecycle (SPLIT)
 - **[x] Policy half (resolved earlier):** gate-flag inheritance + identity seeding —

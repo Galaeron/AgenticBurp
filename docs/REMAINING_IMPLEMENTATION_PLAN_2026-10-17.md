@@ -130,11 +130,28 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
 
   Guards: an unbound validator, or `transport_for(None)`, inside an entered run now uses
   that run. `harness/test_run_escape_callers.py` (14 tests) includes two fault injections.
-  **Owner decision open:** a standalone `analyze()` creates its run but never enters it, so
-  gated validators there do not spend `analyze.max_requests`. Entering it would turn on TLS
-  verification for those sends. Next: batch B (redirect/rebinding destination policy),
-  C (external-process lifecycle), D (browser credential isolation), plus the no-run routes
-  `/crawl`, `/crawl-roles` and `/engagement/{host}/advance`.
+- **Status 2026-10-19 — batches C, C2 and A2 done** (implemented + caller-verified; local
+  commits `ae8f287`, `934c3e1`, `f7d1321`; push awaits owner review):
+  - **C, external-process lifecycle:** every tool (sqlmap host/container, ffuf) runs as an
+    owned process tree (Windows Job Object, created suspended; POSIX process group).
+    Output is bounded while it is read. Cancel or timeout stops the whole tree and removes
+    the exact container before the caller (validator, task, server job) may finish; failed
+    cleanup is a distinct error. sqlmap refuses to launch for a cancelled, exhausted or
+    out-of-scope run. `harness/test_tool_process_lifecycle.py` (13 tests).
+  - **C2, tool traffic accounting** (owner decision: counting proxy): inside a run sqlmap is
+    pointed at `tool_proxy`, a loopback reverse proxy that replays each request through the
+    run. The target's count equals `budget.used`, the budget caps the tool exactly and stops
+    it, and handing the tool the real URL is detected.
+    `harness/test_tool_traffic_accounting.py` (9 tests).
+  - **A2, standalone analyze** (owner decision): `analyze()` publishes the run it owns, so
+    gated validators spend `analyze.max_requests` and use the run's TLS policy (self-signed
+    targets are trusted via `transport.tls`). The shared model plane (Ollama breaker,
+    fail-open stats) is kept. `harness/test_standalone_analyze_run.py` (6 tests).
+
+  Not live-validated: no real container run (Docker Desktop off); POSIX paths are unexercised.
+  ffuf still refuses to launch inside a run (it could now use the proxy). Next: batch B
+  (redirect/rebinding destination policy), D (browser credential isolation), and the no-run
+  routes `/crawl`, `/crawl-roles` and `/engagement/{host}/advance`.
 - **Type:** implementation + isolated environment proof. **Depends on:** I01/I03.
 - Reconcile connect-time address pinning with redirect handling and approved
   destination policy. Verify browser credential isolation across two origins.
