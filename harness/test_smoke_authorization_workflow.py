@@ -21,20 +21,23 @@ from pathlib import Path
 
 import httpx
 
+import harness.coverage_manifest as cm
 from harness import engagement
 from harness import evidence
 from harness import identity_headers
 from harness import principals
 from harness import store
+from harness.coverage_evidence_case import EvidenceCase, evidence_for
 from harness.models import Finding, HttpExchange
 from harness.run_context import RunContext
 from harness.validators.cross_identity_validator import CrossIdentityValidator
 from harness.testing_fixtures.authorization_workflow import AuthorizationWorkflowFixture
+from harness.testing_fixtures.leg_fault import bound_test_names, outcomes_with_leg_severed
 
 HOST = "127.0.0.1"
 
 
-class AuthorizationSliceSmokeTest(unittest.TestCase):
+class AuthorizationSliceSmokeTest(EvidenceCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="t04_")
         self._orig_db = store._DB_PATH
@@ -90,23 +93,46 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
 
     # --- assertions (handoff's required list) ------------------------------
 
+    @evidence_for(**cm.caller_evidence("idor_confirm"))
     def test_1_vulnerable_confirms_the_crossing(self):
         fx = AuthorizationWorkflowFixture("vulnerable")
         self.addCleanup(fx.close)
         _ex, res = self._validate(fx, "7", ledger=self._ledger(fx))
+        # Target-side proof that the validator's own cross-identity attempt ran (taken
+        # before this test sends anything itself), so the verdict cannot be vacuous.
+        attempts = [r["authorization"] for r in fx.requests_for("/objects/7")]
+        self.record_observation({"validator": res.validator, "status": res.status,
+                                 "confirmed": res.confirmed,
+                                 "second_principal_attempt_reached_target": "Bearer bob-token" in attempts,
+                                 "anonymous_control_reached_target": None in attempts})
         self.assertEqual(res.status, "confirmed")
         self.assertTrue(res.confirmed)
         self.assertGreaterEqual(res.confidence, 0.7)
+        self.assertIn("Bearer bob-token", attempts)
         # Exact unauthorized private-object evidence, proven at the HTTP layer: Bob,
         # who is NOT the owner, receives Alice's exact private marker in vulnerable mode.
         bob = httpx.get(fx.object_url("7"), headers={"Authorization": "Bearer bob-token"})
         self.assertEqual(bob.status_code, 200)
         self.assertIn(fx.marker("7"), bob.text)
 
+    @evidence_for(**cm.caller_evidence("idor_control"))
     def test_2_patched_does_not_confirm(self):
         fx = AuthorizationWorkflowFixture("patched")
         self.addCleanup(fx.close)
         _ex, res = self._validate(fx, "7", ledger=self._ledger(fx))
+        # A controlled negative needs the leg to have RUN: the second principal's attempt
+        # reached the target (counted before this test sends anything). The patched
+        # fixture answers that principal 403 but the anonymous baseline 401, so
+        # identity_compare cannot match the denial to the baseline and the validator
+        # reports "skipped" (inconclusive) rather than a clean "not_confirmed"; both are
+        # non-confirmations. A leg that never tried (no identity, out of scope, egress cut)
+        # has no attempt at the target and fails the attempt assertion below.
+        attempts = [r["authorization"] for r in fx.requests_for("/objects/7")]
+        self.record_observation({"validator": res.validator, "status": res.status,
+                                 "confirmed": res.confirmed,
+                                 "second_principal_attempt_reached_target": "Bearer bob-token" in attempts})
+        self.assertIn(res.status, ("not_confirmed", "skipped"))
+        self.assertIn("Bearer bob-token", attempts)
         self.assertFalse(res.confirmed)
         # The controlled negative is real: Bob's request actually ran and was denied.
         bob = httpx.get(fx.object_url("7"), headers={"Authorization": "Bearer bob-token"})
@@ -170,6 +196,17 @@ class AuthorizationSliceSmokeTest(unittest.TestCase):
         best = ep.best_finding()
         self.assertTrue(best.get("confirmed"))
         self.assertEqual(best.get("proof_id"), proof.proof_id)   # the link survived ingestion
+
+    def test_bound_aspects_fail_when_the_leg_is_disconnected(self):
+        # Fault injection: with the leg's egress cut, the evidence-bound confirmation AND
+        # its negative control must both fail -- a control that survives a disconnected
+        # leg only proves the validator did nothing.
+        names = bound_test_names(type(self))
+        self.assertEqual(len(names), 2, f"expected the IDOR confirm+control pair, got {names}")
+        for name, outcome in outcomes_with_leg_severed(type(self), names).items():
+            with self.subTest(test=name):
+                self.assertIn(outcome, ("failed", "errored"),
+                              f"{name} still {outcome} with the leg disconnected: not evidence")
 
     def test_6_rerun_isolated_reproduces(self):
         fx = AuthorizationWorkflowFixture("vulnerable")

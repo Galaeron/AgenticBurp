@@ -180,6 +180,120 @@ _ASPECT_OR_CONFIRM = ("harness OpenRedirectValidator confirms open redirect on t
 _ASPECT_OR_CONTROL = ("harness OpenRedirectValidator returns a controlled negative on the "
                       "patched fixture")
 
+# ---- caller-level evidence for the deterministic confirmation legs (I11) ----
+# Each row binds ONE existing caller/fixture test to ONE aspect: a confirmation on the
+# vulnerable fixture or a controlled negative on the matching secure control. Every
+# pair is real HTTP against an owned loopback fixture; no model. A test method carries
+# exactly the (check_id, aspect, label) listed here via `@evidence_for(**caller_evidence(key))`,
+# so the declaration and the decorator cannot drift apart. The aspect text names the
+# scenario exercised; it never claims the whole requirement.
+_LEG = "harness.test_leg_live_verification.LiveLegVerificationTest"
+_AUTHZ = "harness.test_smoke_authorization_workflow.AuthorizationSliceSmokeTest"
+_CONFIRM, _CONTROL = "harness_confirmation", "harness_control"
+
+# key -> (check_id, test class, test method, label, aspect)
+_CALLER_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
+    "idor_confirm": ("WSTG-ATHZ-04", _AUTHZ, "test_1_vulnerable_confirms_the_crossing", _CONFIRM,
+                     "harness CrossIdentityValidator confirms object-level authorization failure "
+                     "(a second principal reads the owner's private object over real HTTP)"),
+    "idor_control": ("WSTG-ATHZ-04", _AUTHZ, "test_2_patched_does_not_confirm", _CONTROL,
+                     "harness CrossIdentityValidator does not confirm on the patched fixture (the "
+                     "second principal's attempt reached the target; verdict is inconclusive, never "
+                     "confirmed)"),
+    "mfa_confirm": ("WSTG-ATHN-01", _LEG, "test_auth_2fa_bypass_confirms", _CONFIRM,
+                    "harness AuthSequenceValidator confirms a second-factor bypass (a step-1-only "
+                    "session reaches the account page that a tokenless request is denied)"),
+    "mfa_control": ("WSTG-ATHN-01", _LEG, "test_auth_2fa_bypass_silent_on_enforcing_control", _CONTROL,
+                    "harness AuthSequenceValidator returns a controlled negative where the account "
+                    "page enforces the second factor"),
+    "weakpw_confirm": ("WSTG-ATHN-07", _LEG, "test_auth_weak_password_confirms", _CONFIRM,
+                       "harness AuthSequenceValidator confirms an unrestricted password policy "
+                       "(a weak password is accepted at registration)"),
+    "weakpw_control": ("WSTG-ATHN-07", _LEG, "test_auth_weak_password_silent_on_policy_control", _CONTROL,
+                       "harness AuthSequenceValidator returns a controlled negative where the "
+                       "registration policy rejects the weak password"),
+    "fixation_confirm": ("WSTG-SESS-03", _LEG, "test_auth_session_fixation_confirms", _CONFIRM,
+                         "harness AuthSequenceValidator confirms session fixation (a pre-auth "
+                         "session cookie is not rotated across login)"),
+    "fixation_control": ("WSTG-SESS-03", _LEG, "test_auth_session_fixation_silent_on_rotating_control",
+                         _CONTROL,
+                         "harness AuthSequenceValidator returns a controlled negative where the "
+                         "session token rotates at login"),
+    "stored_xss_confirm": ("WSTG-INPV-02", _LEG, "test_stored_xss_confirms_on_raw_render", _CONFIRM,
+                           "harness StoredXssValidator confirms stored XSS (plant then independent "
+                           "raw render)"),
+    "stored_xss_control": ("WSTG-INPV-02", _LEG, "test_stored_xss_silent_on_escaped_render_control",
+                           _CONTROL,
+                           "harness StoredXssValidator returns a controlled negative where the "
+                           "stored value renders escaped"),
+    "stored_xss_form_confirm": ("WSTG-INPV-02", _LEG, "test_stored_xss_confirms_through_csrf_bound_form",
+                                _CONFIRM,
+                                "harness StoredXssValidator confirms stored XSS through a CSRF-token "
+                                "bound comment form (token refreshed in-session)"),
+    "stored_xss_form_control": ("WSTG-INPV-02", _LEG,
+                                "test_stored_xss_silent_on_escaped_csrf_bound_form_control", _CONTROL,
+                                "harness StoredXssValidator returns a controlled negative through a "
+                                "CSRF-token bound comment form that renders escaped"),
+    "cmdi_confirm": ("WSTG-INPV-12", _LEG, "test_command_injection_confirms_via_shell", _CONFIRM,
+                     "harness CommandInjectionValidator confirms command injection (shell fetch "
+                     "reaches the out-of-band collaborator)"),
+    "cmdi_control": ("WSTG-INPV-12", _LEG, "test_command_injection_silent_on_no_shell_control", _CONTROL,
+                     "harness CommandInjectionValidator returns a controlled negative where the "
+                     "parameter never reaches a shell"),
+    "ssti_confirm": ("WSTG-INPV-18", _LEG, "test_ssti_confirms_on_real_template_render", _CONFIRM,
+                     "harness SstiValidator confirms server-side template injection (the "
+                     "expression is evaluated by a real Jinja render)"),
+    "ssti_control": ("WSTG-INPV-18", _LEG, "test_ssti_silent_on_escaped_echo_control", _CONTROL,
+                     "harness SstiValidator returns a controlled negative where the probe is "
+                     "only echoed escaped"),
+    "xxe_confirm": ("WSTG-INPV-07", _LEG, "test_xxe_confirms_on_entity_resolving_parser", _CONFIRM,
+                    "harness XxeValidator confirms XXE (a SYSTEM entity in an XML POST is "
+                    "fetched server-side, seen by the out-of-band collaborator)"),
+    "xxe_control": ("WSTG-INPV-07", _LEG, "test_xxe_silent_on_non_resolving_parser_control", _CONTROL,
+                    "harness XxeValidator returns a controlled negative where the XML parser "
+                    "never resolves external entities"),
+    "ssrf_confirm": ("WSTG-INPV-19", _LEG, "test_ssrf_confirms_on_real_server_side_fetch", _CONFIRM,
+                     "harness SsrfValidator confirms SSRF (the server fetches the supplied URL, "
+                     "seen by the out-of-band collaborator)"),
+    "ssrf_control": ("WSTG-INPV-19", _LEG, "test_ssrf_silent_on_no_fetch_control", _CONTROL,
+                     "harness SsrfValidator returns a controlled negative where the URL "
+                     "parameter is never fetched"),
+    "jwt_kid_confirm": ("WSTG-CRYP-04", _LEG, "test_jwt_kid_confusion_confirms", _CONFIRM,
+                        "harness JwtForgeValidator confirms kid key-confusion (a token HS256-signed "
+                        "with the key its attacker-chosen kid implies is accepted)"),
+    "jwt_kid_control": ("WSTG-CRYP-04", _LEG, "test_jwt_kid_silent_on_fixed_secret_control", _CONTROL,
+                        "harness JwtForgeValidator returns a controlled negative where the "
+                        "verification key is fixed server-side"),
+    "jwt_unverified_confirm": ("WSTG-CRYP-04", _LEG, "test_jwt_unverified_signature_confirms",
+                               _CONFIRM,
+                               "harness JwtForgeValidator confirms an unverified JWT signature (an "
+                               "invalid-signature token is accepted where a tokenless request is denied)"),
+    "jwt_unverified_control": ("WSTG-CRYP-04", _LEG,
+                               "test_jwt_unverified_silent_on_public_endpoint_control", _CONTROL,
+                               "harness JwtForgeValidator claims no signature bug on a public endpoint "
+                               "the token does not gate (probed, then declined with that reason)"),
+    "deser_confirm": ("WSTG-INPV-11", _LEG, "test_deserialization_oob_confirms_on_pickle_sink", _CONFIRM,
+                      "harness DeserializationOobValidator confirms unsafe deserialization (a "
+                      "pickle payload reaches the out-of-band collaborator)"),
+    "deser_control": ("WSTG-INPV-11", _LEG, "test_deserialization_oob_silent_on_json_control", _CONTROL,
+                      "harness DeserializationOobValidator returns a controlled negative where "
+                      "the cookie is parsed as JSON"),
+}
+
+
+def caller_evidence(key: str) -> dict:
+    """The `@evidence_for` keyword arguments for one declared caller-evidence row."""
+    check_id, _cls, _method, label, aspect = _CALLER_EVIDENCE[key]
+    return {"check_id": check_id, "aspect": aspect, "label": label}
+
+
+def _caller_specs() -> tuple[TestSpec, ...]:
+    return tuple(
+        TestSpec(check_id, f"{cls}.{method}", aspect, mode="automated", label=label,
+                 evidence_file=evidence_basename(check_id, aspect))
+        for check_id, cls, method, label, aspect in _CALLER_EVIDENCE.values())
+
+
 REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
     TestSpec(_MASS,
              "harness.test_mass_assignment_slice.MassAssignmentSliceTest."
@@ -213,6 +327,9 @@ REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
              "test_harness_validator_controlled_negative_on_patched",
              _ASPECT_OR_CONTROL, mode="automated", label="harness_control",
              evidence_file=evidence_basename(_OR, _ASPECT_OR_CONTROL)),
+
+    # deterministic confirmation legs over real HTTP (I11): confirmation + control pairs
+    *_caller_specs(),
 
     # Manual checks: genuinely need a human / host access, so they are declared MANUAL
     # (a flagged gap, never automated coverage) rather than left as silent
