@@ -39,7 +39,7 @@ class AgentRoutingCallerTests(unittest.TestCase):
                     for target in ("subprocess.Popen", "socket.create_connection",
                                    "httpx.AsyncClient.send", "httpx.Client.send"):
                         stack.enter_context(patch(target, side_effect=AssertionError("unexpected external execution")))
-                    stack.enter_context(patch("subprocess.run", side_effect=fake_run))
+                    stack.enter_context(patch("harness.tool_runner.run_process", side_effect=fake_run))
                     stack.enter_context(patch.object(caller, "_persist_confirmation_proof", AsyncMock(
                         return_value=(True, {"proof_id": "synthetic-negative"}, ""))))
                     plans = stack.enter_context(patch("harness.store.persist_test_plans"))

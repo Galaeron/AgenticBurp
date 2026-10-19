@@ -451,7 +451,7 @@ class SqlmapValidatorFallsBackWhenBinaryMissingTests(unittest.IsolatedAsyncioTes
             request=httpx.Request("GET", exchange.url))
         with patch("httpx.AsyncClient.request", new_callable=AsyncMock,
                    side_effect=[large, small]), \
-             patch("harness.validators.sqlmap.subprocess.run") as sqlmap_run:
+             patch("harness.tool_runner.run_process") as sqlmap_run:
             result = await v.validate(_finding(), exchange)
         self.assertTrue(result.confirmed)
         self.assertEqual(result.status, "confirmed")
@@ -468,7 +468,7 @@ class SqlmapValidatorFallsBackWhenBinaryMissingTests(unittest.IsolatedAsyncioTes
             request=httpx.Request("GET", exchange.url))
         with patch("httpx.AsyncClient.request", new_callable=AsyncMock,
                    side_effect=[same, same]), \
-             patch("harness.validators.sqlmap.subprocess.run") as sqlmap_run:
+             patch("harness.tool_runner.run_process") as sqlmap_run:
             result = await v.validate(_finding(), exchange)
         self.assertEqual(result.status, "not_confirmed")
         self.assertFalse(result.confirmed)
@@ -522,7 +522,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         v = SqlmapValidator(binary="sqlmap")
         exchange = _login_exchange()  # POST, 2xx baseline, password field
         same = httpx.Response(200, content=b"x" * 100, request=httpx.Request("POST", exchange.url))
-        with patch("harness.validators.sqlmap.subprocess.run",
+        with patch("harness.tool_runner.run_process",
                    return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
              patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=same):
             result = await v.validate(_finding(), exchange)
@@ -536,7 +536,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         exchange = _login_exchange()
         big = httpx.Response(200, content=b"x" * 500, request=httpx.Request("POST", exchange.url))
         small = httpx.Response(401, content=b"y" * 5, request=httpx.Request("POST", exchange.url))
-        with patch("harness.validators.sqlmap.subprocess.run",
+        with patch("harness.tool_runner.run_process",
                    return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
              patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[big, small]):
             result = await v.validate(_finding(), exchange)
@@ -548,7 +548,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         # If sqlmap DOES confirm, that result stands -- the secondary never runs.
         v = SqlmapValidator(binary="sqlmap")
         exchange = _login_exchange()
-        with patch("harness.validators.sqlmap.subprocess.run",
+        with patch("harness.tool_runner.run_process",
                    return_value=_FakeProc(returncode=0, stdout="parameter is vulnerable")), \
              patch("httpx.AsyncClient.request", new_callable=AsyncMock) as mock_req:
             result = await v.validate(_finding(), exchange)
@@ -561,7 +561,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         url = "https://x.test/api/products?id=1"
         exchange = HttpExchange(url=url, method="GET", response_status=200)
         same = httpx.Response(200, content=b"same", request=httpx.Request("GET", url))
-        with patch("harness.validators.sqlmap.subprocess.run",
+        with patch("harness.tool_runner.run_process",
                    return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
              patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=same):
             result = await v.validate(_finding(), exchange)
@@ -594,7 +594,7 @@ class ContainerEgressRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(tool_runner, "available", return_value=(True, "27")), \
                 patch.object(tool_runner, "run", side_effect=fake_run) as mrun, \
-                patch("subprocess.run") as mraw:
+                patch.object(tool_runner, "run_process") as mraw:
             result = await validator.validate(_finding(), exchange)
 
         mrun.assert_called_once()
@@ -603,7 +603,7 @@ class ContainerEgressRoutingTests(unittest.IsolatedAsyncioTestCase):
                         "container sqlmap must enforce egress (fail-closed seam)")
         self.assertIsNotNone(captured["kwargs"].get("egress"),
                              "container sqlmap must pass a per-run EgressPolicy")
-        # The container path must NOT fall through to the raw subprocess.run.
+        # The container path must NOT fall through to the raw host launch.
         mraw.assert_not_called()
         self.assertEqual(result.status, "confirmed")
         self.assertTrue(result.confirmed)

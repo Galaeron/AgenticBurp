@@ -38,7 +38,7 @@ _SEARCH_NODE = {"method": "POST", "path": "/api/search", "by_role": {"anonymous"
 
 
 class _SqlmapRecorder:
-    """Stands in for subprocess.run inside the sqlmap validator."""
+    """Stands in for tool_runner.run_process, the sqlmap validator's host launch."""
 
     def __init__(self):
         self.commands: list[list[str]] = []
@@ -52,7 +52,7 @@ class SqliBodyDispatchCallerTests(_EngagementCallerBase, unittest.TestCase):
     def _run_sqli(self, body, *, defects=()):
         recorder = _SqlmapRecorder()
         target = self._target()
-        patches = [patch("harness.validators.sqlmap.subprocess.run", side_effect=recorder)]
+        patches = [patch("harness.tool_runner.run_process", side_effect=recorder)]
         patches.extend(defects)
         self._run(target, max_requests=500, endpoints=[_SEARCH_NODE],
                   captured=(lambda base: _post_search(base, body),), mutating=True,

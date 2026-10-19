@@ -101,8 +101,11 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                        "executor and mutating validators send through."),
     TransportSite("tool_runner.py", CHANNEL_CONTAINER, SCOPE_INFRA, ROUTING_ADAPTER,
                   owner="tools",
-                  note="docker/subprocess adapter (sqlmap/ffuf); force-removes the "
-                       "container on timeout. Executor container adapter is T08 follow-on."),
+                  note="docker/subprocess adapter (sqlmap/ffuf). I05-C: every tool runs as "
+                       "an owned process tree (Windows Job Object / POSIX process group) with "
+                       "bounded output; cancel or timeout stops the tree and force-removes "
+                       "the exact container before returning. Executor container adapter "
+                       "is T08 follow-on."),
     TransportSite("browser_driver.py", CHANNEL_BROWSER, SCOPE_INFRA, ROUTING_ADAPTER,
                   owner="tools",
                   note="Playwright/Chromium adapter for browser_xss/dom_xss/stored_xss. "
