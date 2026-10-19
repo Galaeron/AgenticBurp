@@ -301,10 +301,16 @@ class ChainMixin:
         snap = await asyncio.to_thread(store.load_engagement, host)
         return engagement.EngagementState.from_dict(snap or {"host": host}).summary()
 
-    async def _auto_escalate(self, host: str, source_url: str, credential_caps: list, st) -> None:
+    async def _auto_escalate(self, host: str, source_url: str, credential_caps: list, st,
+                             run_context=None) -> None:
         """Re-crawl the origin as each learned (derived) identity and fold the new
         surface into the engagement state. The credential headers are used here
         and discarded -- never persisted.
+
+        I05: every probe and crawl request spends `run_context` (the analysis run
+        that learned the credential) -- its budget, scope, gate and cancellation.
+        The learned identity gets an escalation-only session in that run, removed
+        again after the crawl, so it never joins the run's other checks.
 
         Blast-radius guards (this is active traffic fired as a side effect of
         analysis, so it is bounded three independent ways):
@@ -346,7 +352,8 @@ class ChainMixin:
         # Guard 2: verify each credential actually grants access before crawling.
         verified: list = []
         for cap in fresh:
-            if await self._credential_grants_access(source_url, cap.get("headers", {})):
+            if await self._credential_grants_access(source_url, cap.get("headers", {}),
+                                                    run_context=run_context):
                 verified.append(cap)
             else:
                 log.info("engagement auto-escalate: learned credential did not verify -- discarding")
@@ -356,9 +363,20 @@ class ChainMixin:
         roles = [role_crawl.RoleSession(role="anonymous", headers={})]
         for cap in verified:
             roles.append(role_crawl.RoleSession(role="derived", headers=cap.get("headers", {})))
+        session_refs = None
+        if run_context is not None:
+            from harness.run_context import ScopePolicy
+            session_refs = []
+            for index, role in enumerate(roles):
+                ref = f"auto-escalate:{index}:{role.principal_id()}"
+                run_context.sessions.register(
+                    ref, role.principal_id(), dict(role.headers or {}),
+                    allowed_origins=[ScopePolicy.origin_of(origin)], role=role.role)
+                session_refs.append(ref)
         try:
             result = await role_crawl.crawl_roles(
-                origin, roles, allowed_hosts=self.allowed_hosts, max_pages=20, max_endpoints=80)
+                origin, roles, allowed_hosts=self.allowed_hosts, max_pages=20, max_endpoints=80,
+                run_context=run_context, session_refs=session_refs)
             st.ingest_role_crawl(result.to_dict())
             for cap in verified:
                 st.resolve_action("recrawl_as_derived",
@@ -368,8 +386,12 @@ class ChainMixin:
                      origin, len(result.endpoints), self._escalation_counts[host])
         except Exception as e:
             log.warning("engagement auto-escalate failed: %s", e)
+        finally:
+            for ref in session_refs or ():
+                await run_context.sessions.unregister(ref)
 
-    async def _credential_grants_access(self, url: str, headers: dict) -> bool:
+    async def _credential_grants_access(self, url: str, headers: dict, *,
+                                        run_context=None) -> bool:
         """FR-6 (F10): a learned credential "grants access" only when it produces
         a response DISTINGUISHABLE from both an anonymous control and an
         invalid-token control on the same URL -- not merely a non-error (<400)
@@ -399,12 +421,12 @@ class ChainMixin:
         risk exactly the false grant this fix targets."""
         if not headers or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
             return False
-        # W-16: the credential probe goes through the single TargetTransport. It is a
-        # one-off throwaway send, so a standalone context; send_creds forwards the
-        # learned credential (ephemeral session scoped to the URL's origin), matching
-        # a raw client that just sent it to `url`.
+        # W-16: the credential probe goes through the single TargetTransport;
+        # send_creds forwards the learned credential (ephemeral session scoped to the
+        # URL's origin), matching a raw client that just sent it to `url`. I05: it
+        # spends the analysis run when there is one; a standalone context otherwise.
         _tt, _owned = transport_for(
-            None, allowed_hosts=self.allowed_hosts, config=self.config)
+            run_context, allowed_hosts=self.allowed_hosts, config=self.config)
         try:
             await global_throttle.acquire()
             cred = await _tt.send_creds("GET", url, capability="credential_probe",

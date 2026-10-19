@@ -229,6 +229,13 @@ class SessionManager:
         self._by_id[session_id] = s
         return s
 
+    async def unregister(self, session_id: str) -> None:
+        """Drop and close one session (I05: a learned credential's ephemeral
+        re-crawl session must not outlive that re-crawl inside the run)."""
+        s = self._by_id.pop(session_id, None)
+        if s is not None:
+            await s.aclose()
+
     def get(self, session_id: str | None) -> ManagedSession | None:
         return self._by_id.get(session_id) if session_id else None
 
@@ -675,7 +682,11 @@ def transport_for(run_context, *, allowed_hosts, config: dict | None = None, gat
     run of its own. If `run_context` is provided, its TargetTransport is used and
     owned_context is None (the caller must NOT close the shared run). Otherwise a
     `standalone_context` is built and returned as owned_context, which the caller
-    must aclose() when done."""
+    must aclose() when done. I05: inside an entered run, a call site that passed no
+    run uses the enclosing one (not owned) instead of a throwaway context that
+    would escape the run's budget and cancellation."""
+    if run_context is None:
+        run_context = current_run_context()
     if run_context is not None:
         return run_context.target_transport(), None
     rc = standalone_context(allowed_hosts, config=config, gate=gate,

@@ -23,8 +23,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse, parse_qs, urlunparse
 
-import httpx
-
 from .base import Validator, ValidationResult
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 
@@ -242,7 +240,10 @@ class ApiSecurityValidator(Validator):
         probe_url = urlunparse(parsed._replace(query=flat_qs))
 
         try:
-            async with httpx.AsyncClient(
+            # I05: the gated client, like the mass-assignment probe, so inside an
+            # entered run this probe spends that run (budget, scope, cancellation, TLS).
+            async with GatedAsyncClient(
+                get_default_gate(), self.get_name(),
                 timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
             ) as client:
                 from harness import global_throttle
@@ -251,6 +252,10 @@ class ApiSecurityValidator(Validator):
                     "GET", probe_url,  # pagination is inherently a read operation; never replay the captured method
                     headers={"User-Agent": self.user_agent},
                 )
+        except SafetyGateBlocked as e:
+            return ApiSecurityTestResult("Unbounded Limit Probe", True, "low",
+                                          f"Blocked by safety gate: {e.decision.reason}", "",
+                                          checked=True, vulnerable=False)
         except Exception as e:
             log.debug(f"Unbounded limit probe failed: {e}")
             return ApiSecurityTestResult("Unbounded Limit Probe", True, "low",

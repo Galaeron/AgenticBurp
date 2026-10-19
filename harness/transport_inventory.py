@@ -194,7 +194,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   note="container leg remains isolated behind tool_runner; its direct HTTP "
                        "boolean-probe fallback uses the invocation executor."),
     TransportSite("validators/api_security_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_GATED,
-                  owner="confirmation", note="mass-assignment/BOLA checks; mutating sends via the gate."),
+                  owner="confirmation", constructs_client=False,
+                  note="mass-assignment and unbounded-limit probes both send through "
+                       "GatedAsyncClient, so inside an entered run they spend that run. I05 "
+                       "removed the limit probe's raw httpx client."),
     TransportSite("validators/cors_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", constructs_client=False,
                   note="registry CORS probes use per-dispatch invocation scope, budget, "
