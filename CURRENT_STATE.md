@@ -4,20 +4,8 @@
 - Branch `reconciliation-backlog`; base `474ad511`; head of
   [Galaeron/AgenticBurp#1](https://github.com/Galaeron/AgenticBurp/pull/1) after today's push.
   Auto-fix is on for PR #1.
-- Today's commits (oldest first): `ba080691` discovery fixes (I01 candidate), `1715022a`
-  I01 docs, `1be5ed04` 16 regression modules, `2a883761` I03 transport, `fe9b8f3` I04 CSRF,
-  `9adfa8a` I11, `d5802ec` I09 caller tests, `b9bcd18` gate: two writes for the
-  second-order pair, `a9b71f6` CSRF manual-check guidance, `6d10816` docs, `5506ee4` CI fix
-  (two W2-dependent tests untracked again; Python 3.14-valid TLS fixtures; short-path
-  compare), then a docs commit.
-- Since then: `8e1303c` I02-B default history, `c66ce27` docs, `8edf5a9` + `04b3dea` I02-A
-  proof binding through storage/export, then a docs commit. `2ba91da` I05-A (sends escaping
-  their run) + `5bca380` docs. Then `14747a9` I04 label check, `d7201fc` I11 socket leaks,
-  `d8eb094` I11 evidence wiring, and a docs commit. All pushed to PR #1.
-- Then, after the owner's containment review (pushed 2026-10-19): `ae8f287` I05-C tool
-  process lifecycle, `934c3e1` I05-C2 counting proxy, `f7d1321` I05-A2 standalone analyze
-  publishes its run, and `1431602` docs. Then `bcd56c9` I05-B (each run pins a name to its
-  first address at connect) and a docs commit.
+- Commits: `git log --oneline 474ad511..HEAD` (each batch is followed by a docs commit).
+  Latest: I05-B `bcd56c9`, then I02-C `f846e36` + `aacc35a`. All pushed to PR #1.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
@@ -38,26 +26,23 @@
 - I11: LB-FLAKE closed; audit-log file leak fixed; 36 gaps classified in
   docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md.
 - Handoffs: `.test-work/{i03-transport,i04-csrf,i09-dispatch,i11-hygiene}-20261017-1731/HANDOFF.md`.
-- I02-B (2026-10-17) and I02-A (2026-10-19): see the plan's I02 status. Handoffs:
-  `.test-work/i02b-history-20261017/HANDOFF.md`, `.test-work/i02a-proofbinding-20261018/HANDOFF.md`.
+- I02-B (2026-10-17), I02-A and I02-C (2026-10-19): see the plan's I02 status. Handoffs:
+  `.test-work/i02b-history-20261017/`, `.test-work/i02a-proofbinding-20261018/`,
+  `.test-work/i02c-observations-20261019/` (HANDOFF.md in each).
 
 ## Verification
 - Verify in the in-repo worktree `.test-work/wt-verify`. Windows Defender deletes
   `file_upload_agent.py` / `FileUploadLogic.java` from worktrees under %TEMP%. Block the
   venv's editable-install leak (it imports modules missing from a worktree from the main
   checkout) with an untracked `sitecustomize.py` there plus `PYTHONPATH=<worktree>`.
-- CI runs Python 3.14. Last full verification (`d8eb094` content, isolated worktree
-  `.test-work/wt-land`): on both system Python 3.14.7 and venv 3.12.14, precondition 74 OK,
-  smoke 146 OK, full exit 0 (3369 harness, 38 pytest, 312 evaluation with 17 artifact-absence
-  skips, 42 integrity), 0 ResourceWarnings. The coverage gate reports 25 gaps (was 36).
-  Logs: `.test-work/land-20261019/`.
-- I05-C was verified at `336f878` + C, and C2+A2 at `ae8f287` + both (isolated worktrees
-  `.test-work/wt-verify` and `.test-work/wt-dev`). Both interpreters: smoke 146 OK, full
-  exit 0 (3382 then 3397 harness, 38 pytest, 312 evaluation, 42 integrity), coverage gaps
-  25. Logs: `.test-work/i05c-*.log`, `.test-work/i05de-*.log`.
-- I05-B was verified at `a7d03b5` + B (`.test-work/wt-dev`). On both interpreters: smoke
-  146 OK, full exit 0 (3408 harness, 38 pytest, 312 evaluation, 42 integrity), 0
-  ResourceWarnings, 25 coverage gaps. Logs: `.test-work/i05b-*.log`.
+- CI runs Python 3.14. Last full verification: `aacc35a` exactly (isolated worktree
+  `.test-work/wt-i02c`, unchanged during the run).
+  - Interpreters: system Python 3.14.7 and venv 3.12.14, with the same results on both.
+  - Results: precondition 74 OK, smoke 146 OK, full exit 0.
+  - Full breakdown: 3475 harness, 38 pytest, 312 evaluation (17 artifact-absence skips),
+    42 integrity.
+  - 0 ResourceWarnings; the coverage gate reports 25 gaps.
+  - Logs: `.test-work/land-i02c-20261019/`.
 - Stopping a background run with TaskStop leaves its process tree running. End it by
   exact PID tree, and never by a pattern that could match another session's processes.
 
@@ -68,16 +53,24 @@
 
 ## Open work and evidence boundaries
 - Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I02, I03, I04, I05,
-  I09, I11. I02 batches B (default history) and A (proof binding: a missing, stale,
-  unresolvable or re-pointed proof no longer exports as confirmed) are fixed. I05 batches A
-  (sends escaping their run), C/C2/A2 (tool lifecycle, counting proxy, standalone analyze)
-  and B (redirect and DNS-rebinding destination policy) are fixed. The I04 storage/export label check and the I11 socket
-  trace are done, and 11 of the 14 caller-tested requirements are wired. Next:
-  - I05 batch D (browser credential isolation); the no-run
-    routes `/crawl`, `/crawl-roles`, `/engagement/{host}/advance`; a real-container proof
-    of C (Docker Desktop was off);
-  - I02 batch C (non-finding observations): design at
-    `.test-work/i02c-observations-20261019/DESIGN.md` awaits owner review;
+  I09, I11. Fixed so far:
+  - I02 batches B (default history), A (proof binding: a missing, stale, unresolvable or
+    re-pointed proof no longer exports as confirmed) and C (supplied captures without
+    findings are kept as observations).
+  - I05 batches A (sends escaping their run), C/C2/A2 (tool lifecycle, counting proxy,
+    standalone analyze) and B (redirect and DNS-rebinding destination policy).
+  - The I04 storage/export label check and the I11 socket trace; 11 of the 14
+    caller-tested requirements are wired.
+
+  Next:
+  - Code review 02 (`reviews/2026-10-17-code-review-02/FINAL_REVIEW.md`, untracked) has 52
+    open findings.
+    - They are in batches RV-A to RV-K in docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md.
+    - RV-G replaces I05's no-run-routes item.
+    - Run no live target until RV-A, RV-G and RV-H land.
+  - I05 batch D (browser credential isolation; brief at
+    `.test-work/i05d-browsercreds-20261019/BATCH.md`) and a real-container proof of C
+    (Docker Desktop was off);
   - I11: WSTG-ATHZ-02, SESS-01 and INPV-01 are still unwired (blockers in the plan);
   - I16: issue export and SARIF lack `suggested_test` (API and Markdown have it).
 - Owner decisions (2026-10-19, I05), now implemented:

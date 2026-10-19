@@ -64,7 +64,16 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   pointer-only issue references are marked unavailable rather than counted as proof.
   `harness/test_proof_binding_storage_export.py` drives `analyze()` with real SQLite storage
   (7 tests). Disabling the extracted `_fallback_result_binds` seam or the verdict filter is
-  detected. Batch C (non-finding observations) remains open.
+  detected.
+- **Status 2026-10-19 — batch C (non-finding observations) done:** implemented +
+  caller-verified (commits `f846e36`, `aacc35a`; owner-approved option C in
+  `.test-work/i02c-observations-20261019/DESIGN.md`). Reproduced on `a7d03b5`: a supplied
+  capture with no finding left no row, and the next analysis had no trace of it. Such
+  captures are now kept (`exchange_observations` + `observation_attributions`, an additive
+  migration marked in `state_metadata`) and wiped with their data. A later analysis of the same
+  pile gets them as bounded prior context. Tests: `test_observation_store.py`,
+  `test_observation_migration.py`, `test_observation_memory_caller.py`. Not live-validated;
+  model usefulness is I14 and the Burp fields are I07/I16. See docs/OBSERVATION_MEMORY.md.
 - **Type:** implementation if reproduced + integration verification. **Depends on:** I01.
 - Trace original finding identity/class, validator result, proof/case reference,
   stored finding and API/Markdown/SARIF output. Define explicit supported class
@@ -368,3 +377,7 @@ Run I13 only when its acceptance prerequisites and authorized environment exist.
 Use I14 to justify subsequent model/architecture/performance changes. Finish I16
 and make the scoped release decision in I17. No new agents, validators or competitor
 features are needed merely to begin this sequence.
+
+Code review 02 (2026-10-19) has 52 open findings. They are mapped to I02, I05, I06/I07, I10,
+I12 and I16 as batches RV-A to RV-K in docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md, which also
+sets their order.
