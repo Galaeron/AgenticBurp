@@ -5,7 +5,8 @@ The ssrf agent can only GUESS that a URL-shaped parameter is server-side-fetched
 This proves it: replace the parameter's value with a unique collaborator URL,
 send the request, and watch for the target to CALL BACK. A callback is proof the
 server fetched an attacker-controlled URL -- confirmed SSRF -- with zero reliance
-on the response body (blind SSRF included).
+on the response body (blind SSRF included). A response that merely differs between
+a served and a closed loopback target is reported as a candidate, not confirmed.
 
 Targets URL-shaped parameters (by name -- url/uri/target/webhook/callback/... --
 or by value shape -- an http(s):// value). Scope-gated; sends the request the
@@ -34,8 +35,8 @@ _URL_PARAM_NAMES = {"url", "uri", "target", "callback", "webhook", "dest", "dest
 _URL_VALUE = re.compile(r"^https?://", re.IGNORECASE)
 
 # Connection-failure signatures a server-side fetcher surfaces when its target is
-# unreachable. Their presence/absence across two loopback targets is one signal
-# that the response depended on the fetch outcome (i.e. a real SSRF).
+# unreachable. Their presence/absence across two loopback targets is one candidate
+# signal that the response depended on the fetch outcome (never proof on its own).
 _FETCH_ERROR_TOKENS = (
     "connection refused", "connection reset", "could not connect", "failed to connect",
     "connection aborted", "econnrefused", "no route to host", "network is unreachable",
@@ -55,10 +56,9 @@ def _strip_all(text: str, subs) -> str:
 def _fetch_outcome_differs(status_a: int | None, body_a: str,
                            status_c: int | None, body_c: str) -> bool:
     """True when two same-host/different-port SSRF probes produced responses that
-    differ in a way only a real server-side fetch explains. The echoed URL has
-    already been stripped from both bodies, and both targets are syntactically
-    identical bar the port, so an app that merely validates the URL returns the
-    same thing for both -- a difference means the server actually connected."""
+    differ after the echoed URL is stripped from both bodies. A real fetch causes
+    this, but so does an app that validates the URL and rejects one of the ports
+    (R17), so a difference is a candidate signal, never proof of a fetch."""
     if status_a != status_c:
         return True
     if body_a == body_c:
@@ -157,13 +157,13 @@ class SsrfValidator(Validator):
         method = (exchange.method or "GET").upper()
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("host", "content-length")}
-        # 1) In-band differential proof first: fast (two loopback reads), needs no
-        #    reachable collaborator, and works on labs/egress-filtered targets.
-        inband = await self._inband_confirm(exchange, cands, method, headers)
-        if inband is not None:
-            return inband
-        # 2) Out-of-band proof: catches BLIND SSRF (no response differential) when
-        #    a collaborator is reachable.
+        # 1) In-band differential: fast (two loopback reads) and needs no reachable
+        #    collaborator, but it is a CANDIDATE signal only (R17). An app that
+        #    merely validates URL syntax (rejects port 1, accepts port 80) answers
+        #    the two probes differently without ever making a request.
+        inband = await self._inband_differential(exchange, cands, method, headers)
+        # 2) Out-of-band proof: the target calling back to a unique collaborator
+        #    URL is independent fetch evidence (blind SSRF included).
         for loc, param in cands:
             token = collab.token()
             url, body = self._mutated(exchange, loc, param, collab.url(token))
@@ -185,6 +185,15 @@ class SsrfValidator(Validator):
                             f"the {loc} parameter {param!r}.",
                     evidence=f"Set {loc} param {param!r} to a unique collaborator URL; the target called "
                              f"back to it out-of-band, proving server-side request forgery (blind-safe).")
+        if inband is not None:
+            return ValidationResult(
+                self.name, "inconclusive", "ssrf", confidence=0.4, confirmed=False,
+                summary="SSRF candidate (unconfirmed): the response depends on the URL supplied, "
+                        "but no request from the target was observed",
+                evidence=inband + " A server that only validates the URL (for example, rejects "
+                                  "some ports) answers the same way without fetching anything, "
+                                  "and no collaborator callback arrived. Confirm manually or with "
+                                  "a collaborator the target can reach.")
         return ValidationResult(
             self.name, "not_confirmed", "ssrf", confidence=0.0, confirmed=False,
             summary="No out-of-band callback and no in-band fetch differential observed",
@@ -196,7 +205,9 @@ class SsrfValidator(Validator):
     _INBAND_REACHABLE = "http://127.0.0.1:80/"
     _INBAND_CLOSED = "http://127.0.0.1:1/"
 
-    async def _inband_confirm(self, exchange, cands, method, headers):
+    async def _inband_differential(self, exchange, cands, method, headers):
+        """Evidence text when a served vs a closed loopback target change the
+        response (after removing the echoed URL), else None. Candidate only."""
         for loc, param in cands[:2]:  # bound the request budget
             ra_url, ra_body = self._mutated(exchange, loc, param, self._INBAND_REACHABLE)
             rc_url, rc_body = self._mutated(exchange, loc, param, self._INBAND_CLOSED)
@@ -215,13 +226,7 @@ class SsrfValidator(Validator):
             na = _strip_all(ta, echoes)
             nc = _strip_all(tc, echoes)
             if _fetch_outcome_differs(sa, na, sc, nc):
-                return ValidationResult(
-                    self.name, "confirmed", "ssrf", confidence=0.8, confirmed=True,
-                    summary=f"SSRF confirmed (in-band): the server fetched the URL in the {loc} "
-                            f"parameter {param!r}; its response depended on the internal target.",
-                    evidence=(f"Pointing {param!r} at a served loopback port vs a closed one produced "
-                              f"different responses (HTTP {sa} vs {sc}; body {len(na)} vs {len(nc)} "
-                              f"bytes after removing the echoed URL). Only a server-side fetch makes "
-                              f"the response depend on internal reachability. No application path or "
-                              f"state-changing action was touched."))
+                return (f"Pointing the {loc} parameter {param!r} at a served loopback port vs a "
+                        f"closed one produced different responses (HTTP {sa} vs {sc}; body "
+                        f"{len(na)} vs {len(nc)} bytes after removing the echoed URL).")
         return None

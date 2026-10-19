@@ -291,9 +291,11 @@ class SsrfTests(_GateAllowsMutating):
         self.assertEqual(r.status, "confirmed")
         self.assertGreaterEqual(responder.count, 1, responder.why())
 
-    def test_inband_differential_confirms_without_collaborator(self):
-        # A server that actually FETCHES the URL: the reachable loopback port
-        # serves content; the closed port yields a connection error. No OOB hit.
+    def test_inband_differential_without_callback_is_only_a_candidate(self):
+        # A served vs a closed loopback port change the response, but no OOB hit
+        # arrives. R17: a response difference alone is not fetch proof (a URL
+        # validator that rejects port 1 produces one too), so it stays an
+        # unconfirmed candidate. Before R17 this fixture expected "confirmed".
         async def fetching_app(self, method, url, headers=None, content=None):
             blob = (url or "") + " " + (content or "")
             class _R: pass
@@ -308,9 +310,10 @@ class SsrfTests(_GateAllowsMutating):
         responder = CountingResponder(fetching_app)
         with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("ssrf"), self._stock_form_exchange()))
-        self.assertEqual(r.status, "confirmed")
-        self.assertTrue(r.confirmed)
-        self.assertIn("in-band", r.summary)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertFalse(r.confirmed)
+        self.assertIn("candidate", r.summary)
+        self.assertIn("HTTP 200 vs 200", r.evidence)
         self.assertGreaterEqual(responder.count, 1, responder.why())
 
     def test_inband_echo_only_app_is_not_confirmed(self):
