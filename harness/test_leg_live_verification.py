@@ -6,12 +6,14 @@ Skipped cases establish no evidence. This is fixture integration, not a current
 blind-target measurement; path traversal has a separate operator-driven fixture.
 """
 import asyncio
+import re
 import importlib.util
 import shutil
 import threading
 import time
 import unittest
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -49,6 +51,52 @@ def _load_make_app():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.make_app
+
+
+class _ExecSinkParser(HTMLParser):
+    """Collects console.log nonces from the places a browser executes them: a
+    <script> element's text and an on* event-handler attribute."""
+    _LOG = re.compile(r"console\.log\('([0-9a-f]+)'\)")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.logged: list[str] = []
+        self._in_script = False
+
+    def handle_starttag(self, tag, attrs):
+        self._in_script = tag == "script"
+        for name, value in attrs:
+            if (name or "").startswith("on") and value:
+                self.logged += self._LOG.findall(value)
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._in_script = False
+
+    def handle_data(self, data):
+        if self._in_script:
+            self.logged += self._LOG.findall(data)
+
+
+class _ParsedRenderExecutionDouble:
+    """Browser-boundary double for the stored-XSS leg where CI has no Chromium
+    (requirements.lock carries no Playwright). It fetches the owned fixture's
+    rendered page and reports a console.log nonce only from an execution sink
+    (script text, on* handler); an escaped render parses as text and reports
+    nothing. Real Chromium is used instead whenever Playwright is installed,
+    and test_confirmation_soundness_rve pins Chromium on raw vs inert renders."""
+
+    async def visit(self, url, **kwargs):
+        def fetch():
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return r.read().decode("utf-8", "replace")
+        parser = _ExecSinkParser()
+        parser.feed(await asyncio.to_thread(fetch))
+        return browser_driver.ExecutionObservation(url=url, console=parser.logged)
+
+
+def _execution_driver():
+    return browser_driver.default_driver() or _ParsedRenderExecutionDouble()
 
 
 def _finding(vc):
@@ -416,6 +464,9 @@ class LiveLegVerificationTest(EvidenceCase):
         self._assert_controlled_negative(res)
 
     # --- Stored / second-order XSS (plant -> independent HTML render) ---------
+    # R19: the leg confirms only on execution of its payload's nonce, so each
+    # stored-XSS case is given a browser: real Chromium when Playwright is
+    # installed, else the parse-level boundary double below (CI has no browser).
     def _stored_reset(self):
         urllib.request.urlopen(urllib.request.Request(
             f"{self._base}/stored/reset", method="POST"), timeout=2).read()
@@ -428,7 +479,7 @@ class LiveLegVerificationTest(EvidenceCase):
     @evidence_for(**cm.caller_evidence("stored_xss_confirm"))
     def test_stored_xss_confirms_on_raw_render(self):
         self._stored_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._comment_exchange("/stored/comments"), "xss")
         self._observe(res)
         self.assertEqual(res.status, "confirmed",
@@ -438,7 +489,7 @@ class LiveLegVerificationTest(EvidenceCase):
     @evidence_for(**cm.caller_evidence("stored_xss_control"))
     def test_stored_xss_silent_on_escaped_render_control(self):
         self._stored_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._comment_exchange("/stored/comments-safe"), "xss")
         self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
@@ -463,7 +514,7 @@ class LiveLegVerificationTest(EvidenceCase):
     @evidence_for(**cm.caller_evidence("stored_xss_form_confirm"))
     def test_stored_xss_confirms_through_csrf_bound_form(self):
         self._blog_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._blog_comment_exchange("/blog/comment"), "xss")
         self._observe(res)
         self.assertEqual(res.status, "confirmed",
@@ -477,7 +528,7 @@ class LiveLegVerificationTest(EvidenceCase):
         # so a non-confirm here proves the leg keys on the UNESCAPED render, not on
         # a successful write.
         self._blog_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._blog_comment_exchange("/blog-safe/comment"), "xss")
         self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
