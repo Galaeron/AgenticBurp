@@ -205,6 +205,18 @@ def _is_not_found(status: int, body: str) -> bool:
     return any(m in body for m in _NOT_FOUND_MARKERS)
 
 
+def _header_value(headers, name: str) -> str:
+    """A response header by name, whatever its capitalisation. The run executor
+    hands back a plain dict keyed by LOWERCASE names, so an exact-case lookup
+    (``headers.get("Allow")``) never matched there and dropped every method the
+    route listed (code review 02 R13)."""
+    wanted = name.lower()
+    for key, value in (headers or {}).items():
+        if str(key).lower() == wanted:
+            return value or ""
+    return ""
+
+
 def _host_in_scope(url: str, allowed_hosts) -> bool:
     if not allowed_hosts:
         return True
@@ -271,7 +283,7 @@ class SurfaceDiscovery:
                 capability="surface_discovery", session_ref=self.session_ref)
             if not outcome.ok:
                 return None
-            return outcome.status or 0, outcome.body or "", outcome.headers.get("Allow", "")
+            return outcome.status or 0, outcome.body or "", _header_value(outcome.headers, "Allow")
         from harness import global_throttle
         await global_throttle.acquire()
         try:
@@ -279,7 +291,7 @@ class SurfaceDiscovery:
                 resp = await client.request(method, url, headers=self.headers or None)
         except Exception:
             return None
-        return resp.status_code, (resp.text or ""), resp.headers.get("Allow", "")
+        return resp.status_code, (resp.text or ""), _header_value(resp.headers, "Allow")
 
     def _budget_left(self) -> bool:
         return self._probes < min(self.max_probes, self._phase_limit)
