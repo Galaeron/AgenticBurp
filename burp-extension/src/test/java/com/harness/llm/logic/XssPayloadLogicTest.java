@@ -148,4 +148,83 @@ public final class XssPayloadLogicTest {
                 "<title>\"><script>ABC123</script></title><p>\"><script>ABC123</script></p>");
         assertEquals(Verdict.CONFIRMED, v);
     }
+
+    // ---------------------------------------------------------------- RV-N N4
+    private static Verdict js(String body) {
+        return classify(PAYLOADS.get(1), "ABC123", body); // '-__C__-'
+    }
+
+    @Test
+    @DisplayName("N4: the quote closes a single-quoted string in an event-handler attribute -> confirmed")
+    void eventHandlerStringBreakoutIsConfirmed() {
+        assertEquals(Verdict.CONFIRMED, js("<button onclick=\"track(''-ABC123-'')\">Go</button>"));
+        assertEquals(Verdict.CONFIRMED, js("<body ONLOAD=\"init(''-ABC123-'')\">"));
+        assertEquals(Verdict.CONFIRMED, js("<button onclick=track(''-ABC123-'')>Go</button>"));
+        assertEquals(Verdict.CONFIRMED, js("<button onclick=\"track(&#39;'-ABC123-'&#39;)\">"),
+                "the string was opened by a character reference");
+        assertEquals(Verdict.CONFIRMED, js("<button onclick=\"track(&apos;'-ABC123-'&apos;)\">"));
+    }
+
+    @Test
+    @DisplayName("N4: the quote closes a single-quoted string in a javascript: URL -> confirmed")
+    void javascriptUrlStringBreakoutIsConfirmed() {
+        assertEquals(Verdict.CONFIRMED, js("<a href=\"javascript:go(''-ABC123-'')\">Go</a>"));
+        assertEquals(Verdict.CONFIRMED, js("<a href=\" \tJava&#x0A;Script:go(''-ABC123-'')\">Go</a>"));
+        assertEquals(Verdict.CONFIRMED, js("<a href=\"javascript:go(%27'-ABC123-'%27)\">Go</a>"));
+        assertEquals(Verdict.CONFIRMED, js("<iframe src=\"javascript:go(''-ABC123-'')\"></iframe>"));
+        assertEquals(Verdict.CONFIRMED, js("<form action=\"javascript:go(''-ABC123-'')\"></form>"));
+    }
+
+    @Test
+    @DisplayName("N4: inert contexts for the same reflection stay unconfirmed")
+    void inertContextsAreNotConfirmed() {
+        assertNotEquals(Verdict.CONFIRMED, js("<p>''-ABC123-''</p>"), "text node");
+        assertNotEquals(Verdict.CONFIRMED, js("<input value=\"''-ABC123-''\">"), "ordinary attribute value");
+        assertNotEquals(Verdict.CONFIRMED, js("<button title=\"track(''-ABC123-'')\">"), "not a handler");
+        assertNotEquals(Verdict.CONFIRMED, js("<a href=\"/go?q=''-ABC123-''\">"), "not a javascript: URL");
+        assertNotEquals(Verdict.CONFIRMED, js("<img src=\"javascript:go(''-ABC123-'')\">"), "img src does not navigate");
+        assertNotEquals(Verdict.CONFIRMED, js("<button onclick='track(''-ABC123-'')'>"), "the quote ends the attribute");
+        assertNotEquals(Verdict.CONFIRMED, js("<button onclick=\"track(&quot;'-ABC123-'&quot;)\">"),
+                "inside a double-quoted JS string");
+        assertNotEquals(Verdict.CONFIRMED, js("</button onclick=\"track(''-ABC123-'')\">"), "end tag");
+        assertNotEquals(Verdict.CONFIRMED, js("<!-- <button onclick=\"track(''-ABC123-'')\"> -->"), "comment");
+        assertNotEquals(Verdict.CONFIRMED, js("<textarea><b onclick=\"t(''-ABC123-'')\"></textarea>"), "RCDATA");
+        assertNotEquals(Verdict.CONFIRMED, js("<button onclick=\"track('\" data-x=\"'-ABC123-'')\">"),
+                "the payload sits in another attribute");
+        assertNotEquals(Verdict.CONFIRMED, js("<button onclick=\"track(''-ABC123\" x=\"-'')\">"),
+                "the payload is split across attributes");
+    }
+
+    @Test
+    @DisplayName("N4: character references in attribute values decode as an HTML parser decodes them")
+    void characterReferencesDecode() {
+        assertEquals("'", decodeCharacterReferences("&#39;"));
+        assertEquals("'", decodeCharacterReferences("&#x27;"));
+        assertEquals("'x", decodeCharacterReferences("&#39x"));
+        assertEquals("'", decodeCharacterReferences("&apos;"));
+        assertEquals("\"", decodeCharacterReferences("&quot;"));
+        assertEquals("\")", decodeCharacterReferences("&quot)"));
+        assertEquals("&quotx", decodeCharacterReferences("&quotx"));
+        assertEquals("&quot=", decodeCharacterReferences("&quot="));
+        assertEquals("&apos", decodeCharacterReferences("&apos"));
+        assertEquals("\uFFFD", decodeCharacterReferences("&#0;"));
+        assertEquals("\uFFFD", decodeCharacterReferences("&#x110000;"));
+        assertEquals("&#;", decodeCharacterReferences("&#;"));
+        assertEquals("&unknown;", decodeCharacterReferences("&unknown;"));
+        assertEquals("&#39;", decodeCharacterReferences("&amp;#39;"));
+    }
+
+    @Test
+    @DisplayName("N4: a javascript: URL's script is found as a URL parser finds it")
+    void javascriptUrlSourceParsed() {
+        assertEquals("go()", javascriptUrlSource("javascript:go()"));
+        assertEquals("go()", javascriptUrlSource(" \tJava\nScript:go()"));
+        assertEquals("'", javascriptUrlSource("JAVASCRIPT:%27"));
+        assertEquals("%zz", javascriptUrlSource("javascript:%zz"));
+        assertNull(javascriptUrlSource("/go?x"));
+        assertNull(javascriptUrlSource("vbscript:x"));
+        assertNull(javascriptUrlSource("javascript go"));
+        assertNull(javascriptUrlSource("%6Aavascript:x"));
+        assertNull(javascriptUrlSource(null));
+    }
 }
