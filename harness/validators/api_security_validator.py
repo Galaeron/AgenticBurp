@@ -14,6 +14,14 @@ lend themselves to a concrete probe from a single captured exchange:
    unknown body fields are bound, not that a protected property changes.
 2. Unbounded resource consumption -- resend with a very large
    limit/count/page_size query parameter and see if the server caps it.
+   Confirmed only when the answer's item list follows the requested limit:
+   more than _UNBOUNDED_MIN_ITEMS items for the huge limit, and at most
+   _SMALL_LIMIT for a control request asking for _SMALL_LIMIT, with no
+   declared cap below the count. A large body alone is a candidate.
+
+A probe that was refused or got no response is neither a pass nor a
+failure: the result says the check is incomplete (blocked when every probe
+was refused), never that the endpoint is safe.
 
 Excessive data exposure and API-versioning/inventory issues stay
 agent-only (LLM judgment on what fields "should" be exposed, or on
@@ -39,6 +47,15 @@ log = logging.getLogger("harness.validators.api_security")
 
 _MASS_ASSIGNMENT_PROBE_FIELD = "harnessProbeIsAdmin"
 _LIMIT_PARAM_NAMES = {"limit", "count", "page_size", "pagesize", "per_page", "perpage", "size", "max"}
+# L5: an item count above this, for limit=999999, that drops to at most
+# _SMALL_LIMIT when _SMALL_LIMIT is asked for, shows the page size follows the
+# client's limit with no cap at or below that count. Owner-tunable.
+_UNBOUNDED_MIN_ITEMS = 1000
+_SMALL_LIMIT = 2
+_HUGE_LIMIT = 999999
+# Keys under which an answer may declare the page size it applied.
+_CAP_KEYS = {"limit", "max_limit", "maxlimit", "page_size", "pagesize", "per_page", "perpage",
+             "max_page_size", "maxpagesize", "cap", "max"}
 
 
 @dataclass
@@ -51,13 +68,22 @@ class ApiSecurityTestResult:
     vulnerable: bool = False
     checked: bool = True
     candidate: bool = False  # signal seen, proof missing -- never a confirmation
+    # Why the probe did not complete, never a pass: "blocked" (refused before it
+    # was sent), "error" (sent, no response), "readback" (an accepted write
+    # whose read-back got no response).
+    incomplete: str = ""
 
     def to_dict(self) -> dict:
         return {
             "test": self.test_name, "passed": self.passed, "severity": self.severity,
             "detail": self.detail, "evidence": self.evidence,
             "vulnerable": self.vulnerable, "checked": self.checked, "candidate": self.candidate,
+            "incomplete": self.incomplete,
         }
+
+
+def _incomplete(test_name: str, kind: str, detail: str) -> ApiSecurityTestResult:
+    return ApiSecurityTestResult(test_name, False, "low", detail, "", checked=False, incomplete=kind)
 
 
 def _probe_values(value: Any, _depth: int = 0) -> list:
@@ -79,6 +105,47 @@ def _probe_values(value: Any, _depth: int = 0) -> list:
 def _holds(values: list, submitted: bool) -> bool:
     # Identity, not equality: JSON 1 or 0 is not the boolean that was sent.
     return any(v is submitted for v in values)
+
+
+def _lists(text: str) -> dict:
+    """{path: length} of every list in a JSON answer, at the top level or under
+    up to two levels of wrapper objects; {} when the answer is not JSON."""
+    try:
+        data = jsonlib.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    out: dict = {}
+
+    def walk(value, path):
+        if isinstance(value, list):
+            out[path] = len(value)
+        elif isinstance(value, dict) and len(path) < 2:
+            for k, v in value.items():
+                walk(v, path + (str(k),))
+    walk(data, ())
+    return out
+
+
+def _declared_cap(text: str, requested: int) -> int | None:
+    """The smallest page size the answer declares (a cap key at the top level or
+    one level down) below the requested limit, else None."""
+    try:
+        data = jsonlib.loads(text)
+    except (ValueError, TypeError):
+        return None
+    found = []
+    for obj in [data] + (list(data.values()) if isinstance(data, dict) else []):
+        if isinstance(obj, dict):
+            found += [v for k, v in obj.items() if str(k).lower() in _CAP_KEYS
+                      and isinstance(v, int) and not isinstance(v, bool) and v < requested]
+    return min(found) if found else None
+
+
+def _limit_url(parsed, qs: dict, limit_param: str, value: int) -> str:
+    new_qs = dict(qs)
+    new_qs[limit_param] = [str(value)]
+    flat_qs = "&".join(f"{k}={v[0]}" for k, v in new_qs.items())
+    return urlunparse(parsed._replace(query=flat_qs))
 
 
 class ApiSecurityValidator(Validator):
@@ -168,6 +235,7 @@ class ApiSecurityValidator(Validator):
 
             vulnerable_tests = [t for t in tests if t.vulnerable]
             candidate_tests = [t for t in tests if t.candidate and not t.vulnerable]
+            incomplete_tests = [t for t in tests if t.incomplete]
             vulnerable = bool(vulnerable_tests)
             summary_parts = []
             if vulnerable_tests:
@@ -178,6 +246,12 @@ class ApiSecurityValidator(Validator):
                 summary_parts.append("Candidate only, not confirmed:")
                 for t in candidate_tests:
                     summary_parts.append(f"  - {t.test_name}: {t.detail}")
+            elif incomplete_tests:
+                # L4: a probe that was refused or got no response did not pass.
+                summary_parts.append(f"API security check incomplete: {len(incomplete_tests)} of "
+                                     f"{len(tests)} probe(s) got no response; not a negative result:")
+                for t in incomplete_tests:
+                    summary_parts.append(f"  - {t.test_name}: {t.detail}")
             else:
                 summary_parts.append("No mass assignment or unbounded resource consumption confirmed")
 
@@ -185,6 +259,10 @@ class ApiSecurityValidator(Validator):
                 status, confidence = "confirmed", 0.75
             elif candidate_tests:
                 status, confidence = "inconclusive", 0.4
+            elif incomplete_tests:
+                status = ("blocked" if all(t.incomplete == "blocked" for t in tests)
+                          else "inconclusive")
+                confidence = 0.0
             else:
                 status, confidence = "not_confirmed", 0.2
             return ValidationResult(
@@ -221,6 +299,7 @@ class ApiSecurityValidator(Validator):
 
         after = loc_state = None
         after_note = loc_url = ""
+        unread = ""  # L4: an accepted write's read-back that got no response
         try:
             async with GatedAsyncClient(
                 get_default_gate(), self.get_name(),
@@ -231,7 +310,7 @@ class ApiSecurityValidator(Validator):
                 # nothing is not mass assignment. Read the object first, and send
                 # a value it does not already hold (false when an earlier probe
                 # left it true), so the read-back can show a controlled change.
-                baseline, baseline_note = await self._read_state(client, exchange, url)
+                baseline, baseline_note, _ = await self._read_state(client, exchange, url)
                 before = None if baseline is None else _probe_values(baseline)
                 submitted = not (before is not None and _holds(before, True))
                 probed_body = dict(body)
@@ -245,18 +324,21 @@ class ApiSecurityValidator(Validator):
                 # reject it echoes it too). Only an accepted write is re-read,
                 # with an independent GET of the object that was baselined.
                 if 200 <= response.status_code < 300:
-                    after, after_note = await self._read_state(client, exchange, url)
+                    after, after_note, answered = await self._read_state(client, exchange, url)
+                    if not answered:
+                        unread = after_note
                     loc_url = self._created_location(exchange, response)
                     if loc_url and not (after is not None and _holds(_probe_values(after), submitted)):
-                        loc_state, _ = await self._read_state(client, exchange, loc_url)
+                        loc_state, loc_note, answered = await self._read_state(client, exchange, loc_url)
+                        if not answered:
+                            unread = (unread + " " + loc_note).strip()
         except SafetyGateBlocked as e:
-            return ApiSecurityTestResult("Mass Assignment Probe", True, "low",
-                                          f"Blocked by safety gate: {e.decision.reason}", "",
-                                          checked=True, vulnerable=False)
+            return _incomplete("Mass Assignment Probe", "blocked",
+                               f"Write not sent: refused by the safety gate ({e.decision.reason})")
         except Exception as e:
             log.debug(f"Mass assignment probe failed: {e}")
-            return ApiSecurityTestResult("Mass Assignment Probe", True, "low",
-                                          f"Could not send probe: {e}", "", checked=True, vulnerable=False)
+            return _incomplete("Mass Assignment Probe", "error",
+                               f"Write got no response: {type(e).__name__}: {e}")
 
         try:
             resp_json = response.json()
@@ -311,6 +393,10 @@ class ApiSecurityValidator(Validator):
                 f"(status {status}) did not change it {after_note} -- an earlier probe may have stored "
                 f"it, but this attempt did not show the field being bound.",
                 f"Baseline GET {url} -> {field} {before_desc}; write status {status} with {field}={value}")
+        if unread:
+            return _incomplete("Mass Assignment Probe", "readback",
+                               f"The write was accepted (status {status}) but its read-back got no "
+                               f"response {unread}, so whether {field} was stored is unknown")
         return ApiSecurityTestResult(
             "Mass Assignment Probe", True, "low",
             f"Unexpected field not reflected back (status {status}) and not seen "
@@ -337,9 +423,10 @@ class ApiSecurityValidator(Validator):
         a, b = urlparse(exchange.url), urlparse(target)
         return target if (a.scheme, a.netloc) == (b.scheme, b.netloc) and target != exchange.url else ""
 
-    async def _read_state(self, client, exchange: HttpExchange, url: str) -> tuple[Any, str]:
-        """GET url with the captured credentials. Returns (state, note): state is
-        the parsed JSON of a 2xx answer, else None with a note saying why."""
+    async def _read_state(self, client, exchange: HttpExchange, url: str) -> tuple[Any, str, bool]:
+        """GET url with the captured credentials. Returns (state, note, answered):
+        state is the parsed JSON of a 2xx answer, else None with a note saying
+        why; answered is False when the GET was refused or got no response."""
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("content-length", "content-type", "host")}
         headers["User-Agent"] = self.user_agent
@@ -348,16 +435,16 @@ class ApiSecurityValidator(Validator):
             await global_throttle.acquire()
             got = await client.request("GET", url, headers=headers)
         except SafetyGateBlocked as e:
-            return None, f"(GET blocked by safety gate: {e.decision.reason})"
+            return None, f"(GET blocked by safety gate: {e.decision.reason})", False
         except Exception as e:
             log.debug(f"Mass assignment state read failed: {e}")
-            return None, f"(GET {url} failed: {e})"
+            return None, f"(GET {url} failed: {type(e).__name__}: {e})", False
         if not 200 <= got.status_code < 300:
-            return None, f"(GET {url} -> status {got.status_code})"
+            return None, f"(GET {url} -> status {got.status_code})", True
         try:
-            return got.json(), ""
+            return got.json(), "", True
         except Exception:
-            return None, f"(GET {url} returned no JSON)"
+            return None, f"(GET {url} returned no JSON)", True
 
     async def _probe_unbounded_limit(self, exchange: HttpExchange) -> ApiSecurityTestResult | None:
         parsed = urlparse(exchange.url)
@@ -366,11 +453,8 @@ class ApiSecurityValidator(Validator):
         if limit_param is None:
             return None
 
-        new_qs = dict(qs)
-        new_qs[limit_param] = ["999999"]
-        flat_qs = "&".join(f"{k}={v[0]}" for k, v in new_qs.items())
-        probe_url = urlunparse(parsed._replace(query=flat_qs))
-
+        probe_url = _limit_url(parsed, qs, limit_param, _HUGE_LIMIT)
+        small = small_note = None
         try:
             # I05: the gated client, like the mass-assignment probe, so inside an
             # entered run this probe spends that run (budget, scope, cancellation, TLS).
@@ -384,31 +468,74 @@ class ApiSecurityValidator(Validator):
                     "GET", probe_url,  # pagination is inherently a read operation; never replay the captured method
                     headers={"User-Agent": self.user_agent},
                 )
+                large = _lists(response.text or "") if response.status_code == 200 else {}
+                many = {p: n for p, n in large.items() if n > _UNBOUNDED_MIN_ITEMS}
+                if many:
+                    # L5: the control. A list that follows the client's limit
+                    # shrinks to at most _SMALL_LIMIT items when that is asked for.
+                    try:
+                        await global_throttle.acquire()
+                        small = await client.request(
+                            "GET", _limit_url(parsed, qs, limit_param, _SMALL_LIMIT),
+                            headers={"User-Agent": self.user_agent})
+                    except SafetyGateBlocked as e:
+                        small_note = f"refused by the safety gate ({e.decision.reason})"
+                    except Exception as e:
+                        small_note = f"{type(e).__name__}: {e}"
         except SafetyGateBlocked as e:
-            return ApiSecurityTestResult("Unbounded Limit Probe", True, "low",
-                                          f"Blocked by safety gate: {e.decision.reason}", "",
-                                          checked=True, vulnerable=False)
+            return _incomplete("Unbounded Limit Probe", "blocked",
+                               f"{limit_param}={_HUGE_LIMIT} not sent: refused by the safety gate "
+                               f"({e.decision.reason})")
         except Exception as e:
             log.debug(f"Unbounded limit probe failed: {e}")
-            return ApiSecurityTestResult("Unbounded Limit Probe", True, "low",
-                                          f"Could not send probe: {e}", "", checked=True, vulnerable=False)
+            return _incomplete("Unbounded Limit Probe", "error",
+                               f"{limit_param}={_HUGE_LIMIT} got no response: {type(e).__name__}: {e}")
 
         body_len = len(response.text or "")
-        # Heuristic, not proof: a very large response body to a request for
-        # 999999 items is suggestive, not conclusive -- the endpoint might
-        # just have few total records regardless of the limit. Flag at
-        # moderate confidence and say so.
+        if many:
+            if small is not None:
+                small_lists = _lists(small.text or "") if small.status_code == 200 else {}
+                cap = _declared_cap(response.text or "", _HUGE_LIMIT) or 0
+                for path, n in many.items():
+                    if 0 < small_lists.get(path, 0) <= _SMALL_LIMIT and n > cap:
+                        where = ".".join(path) or "the top-level list"
+                        return ApiSecurityTestResult(
+                            "Unbounded Limit Probe", False, "medium",
+                            f"Requesting {limit_param}={_HUGE_LIMIT} returned {n} items in {where}, and "
+                            f"requesting {limit_param}={_SMALL_LIMIT} returned {small_lists[path]} -- the "
+                            f"page size follows the client's limit with no server-side cap at or below "
+                            f"{n} items",
+                            f"{limit_param}={_HUGE_LIMIT} -> {response.status_code}, {n} items "
+                            f"({body_len} bytes); {limit_param}={_SMALL_LIMIT} -> {small.status_code}, "
+                            f"{small_lists[path]} items", vulnerable=True,
+                        )
+                small_note = (f"{limit_param}={_SMALL_LIMIT} -> status {small.status_code}, "
+                              f"list sizes {sorted(small_lists.values()) or 'none'}")
+            n = max(many.values())
+            return ApiSecurityTestResult(
+                "Unbounded Limit Probe", True, "medium",
+                f"Requesting {limit_param}={_HUGE_LIMIT} returned a list of {n} items, but the control "
+                f"did not show the count following the requested limit ({small_note}) -- the size may "
+                f"come from a fixed collection or a cap above {n}. Candidate only.",
+                f"{limit_param}={_HUGE_LIMIT} -> {response.status_code}, {n} items, {body_len} bytes",
+                vulnerable=False, candidate=True,
+            )
+        # A very large body to a request for 999999 items is suggestive, not
+        # proof: the bytes may come from large items under a cap, or from
+        # content that does not follow the limit at all.
         if response.status_code == 200 and body_len > 500_000:
             return ApiSecurityTestResult(
-                "Unbounded Limit Probe", False, "medium",
-                f"Requesting {limit_param}=999999 returned a {body_len}-byte response with no "
-                "apparent server-side cap -- worth confirming this scales with actual record "
-                "count rather than being capped at a safe maximum",
-                f"{limit_param}=999999 -> {response.status_code}, {body_len} bytes", vulnerable=True,
+                "Unbounded Limit Probe", True, "medium",
+                f"Requesting {limit_param}={_HUGE_LIMIT} returned a {body_len}-byte response, but no "
+                f"item list longer than {_UNBOUNDED_MIN_ITEMS} -- the size alone does not show the "
+                "server honouring the limit (large items under a cap answer the same way). "
+                "Candidate only.",
+                f"{limit_param}={_HUGE_LIMIT} -> {response.status_code}, {body_len} bytes",
+                vulnerable=False, candidate=True,
             )
         return ApiSecurityTestResult(
             "Unbounded Limit Probe", True, "low",
-            f"{limit_param}=999999 returned {body_len} bytes (status {response.status_code}) -- "
+            f"{limit_param}={_HUGE_LIMIT} returned {body_len} bytes (status {response.status_code}) -- "
             "no evidence of unbounded response size from this probe",
             f"Status: {response.status_code}, size: {body_len}", vulnerable=False,
         )
@@ -420,6 +547,10 @@ class ApiSecurityValidator(Validator):
             if candidates:
                 return "No API security issue confirmed; candidate: " + " | ".join(
                     f"{t.test_name}: {t.evidence}" for t in candidates)
+            incomplete = [t for t in tests if t.incomplete]
+            if incomplete:
+                return "No API security issue confirmed; not completed: " + " | ".join(
+                    f"{t.test_name}: {t.detail}" for t in incomplete)
             return "No API security issue confirmed"
         return " | ".join(f"{t.test_name}: {t.evidence} -- {t.detail} ({t.severity})" for t in vulnerable)
 
