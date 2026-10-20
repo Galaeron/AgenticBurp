@@ -13,8 +13,12 @@ data-flow confirmation (#5): the value provably crosses requests.
   2. RENDER  -- independently GET the resource (and its collection) again.
   3. CONFIRM -- stored XSS only when the payload comes back UNESCAPED in a
                 text/html response on that independent read AND a headless
-                browser loading that page observes THIS attempt's console.log
-                nonce in an execution sink (R19). The unescaped string alone is a
+                browser loading that page logs a console message EXACTLY equal
+                to the value THIS attempt's payload computes at run time (R19,
+                E2). The payload logs a product of two random operands, so the
+                stored text holds the operands but never the result: a page
+                that logs the stored source (a textarea's value) shows the
+                operands, not the product. The unescaped string alone is a
                 candidate (inconclusive): an inert context (<textarea>, a comment,
                 a CSP) stores it without running it, and with no browser there is
                 no execution proof. A JSON API that stores-and-returns the string
@@ -39,8 +43,16 @@ from .base import Validator, ValidationResult
 from harness.validators.sqlmap import _looks_like_json, _content_type_of
 
 
-def _payloads(nonce: str) -> list[str]:
-    js = f"console.log('{nonce}')"
+def _challenge() -> tuple[int, int, str]:
+    """Two random six-digit operands and the product the payload logs when it
+    runs. The product (under 2**53, so exact in JavaScript) never appears in
+    the payload text, so only execution can produce it (E2)."""
+    a, b = (100000 + secrets.randbelow(900000) for _ in range(2))
+    return a, b, str(a * b)
+
+
+def _payloads(a: int, b: int) -> list[str]:
+    js = f"console.log({a}*{b})"
     return [f"<svg/onload={js}>", f"<script>{js}</script>", f"<img src=x onerror={js}>"]
 
 
@@ -202,8 +214,9 @@ class StoredXssValidator(Validator):
                     return None  # no discoverable source form -> caller falls back
                 fresh, source_url = found.form, found.source_url
                 via = f" through a fresh CSRF-bound form from {source_url}"
-                nonce, candidate = secrets.token_hex(6), None
-                for payload in _payloads(nonce):
+                a, b, expected = _challenge()
+                candidate = None
+                for payload in _payloads(a, b):
                     plant_body = self._form_plant_body(fresh, payload)
                     planted_headers = dict(headers)
                     planted_headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -214,7 +227,7 @@ class StoredXssValidator(Validator):
                         rr = await client.request("GET", rurl, headers=read_headers or None)
                         if ("html" in (rr.headers.get("content-type") or "").lower()
                                 and payload in (rr.text or "")):
-                            executed, note = await self._browser_confirm(rurl, nonce)
+                            executed, note = await self._browser_confirm(rurl, expected)
                             if executed:
                                 return self._executed(method, action_path, payload, rurl, note, via)
                             candidate = candidate or (payload, rurl, note)
@@ -257,8 +270,9 @@ class StoredXssValidator(Validator):
                 return via_source
 
         write_path = urlsplit(exchange.url).path
-        nonce, candidate = secrets.token_hex(6), None
-        for payload in _payloads(nonce):
+        a, b, expected = _challenge()
+        candidate = None
+        for payload in _payloads(a, b):
             body, ctype = self._plant_body(exchange, payload)
             planted_headers = dict(headers); planted_headers["Content-Type"] = ctype
             try:
@@ -273,9 +287,9 @@ class StoredXssValidator(Validator):
                         ct = (r.headers.get("content-type") or "").lower()
                         if "html" in ct and payload in (r.text or ""):
                             # R19: an unescaped string is not execution (an inert
-                            # <textarea>, a comment, a CSP). Only the nonce seen
-                            # executing in a browser confirms.
-                            executed, note = await self._browser_confirm(rurl, nonce)
+                            # <textarea>, a comment, a CSP). Only the payload's
+                            # computed value, logged by a browser, confirms.
+                            executed, note = await self._browser_confirm(rurl, expected)
                             if executed:
                                 return self._executed(method, write_path, payload, rurl, note)
                             candidate = candidate or (payload, rurl, note)
@@ -315,12 +329,14 @@ class StoredXssValidator(Validator):
                       f"text/html response. A raw string match is not execution (an inert context such "
                       f"as <textarea>, or a CSP, stops it). {note}"))
 
-    async def _browser_confirm(self, url: str, nonce: str) -> tuple[bool | None, str]:
-        """Load the rendered page in a headless browser and look for THIS
-        attempt's nonce in an execution sink (console, dialog, page error).
-        Returns (executed, note): True only when the nonce was observed; False
-        when the page loaded and the payload did not run; None when no browser
-        could check. Any other console output is the page's own, not ours."""
+    async def _browser_confirm(self, url: str, expected: str) -> tuple[bool | None, str]:
+        """Load the rendered page in a headless browser and look for a console
+        message exactly equal to ``expected``, the value THIS attempt's payload
+        computes when it runs. Returns (executed, note): True only for that
+        exact event; False when the page loaded and the payload did not run;
+        None when no browser could check. Any other console output, including
+        a message that merely contains the payload's text, is the page's own
+        (E2: a page that logs the stored source echoes it without running it)."""
         driver = self._driver
         try:
             if driver is None:
@@ -336,8 +352,8 @@ class StoredXssValidator(Validator):
             return None, f"The browser check of {url} failed ({type(e).__name__}); execution unproven."
         if getattr(obs, "load_error", None):
             return None, f"The browser could not load {url} ({obs.load_error}); execution unproven."
-        sinks = obs.all_text() if hasattr(obs, "all_text") else "\n".join(getattr(obs, "console", None) or [])
-        if nonce in sinks:
+        if any(str(m).strip() == expected for m in (getattr(obs, "console", None) or [])):
             return True, (f"Execution confirmed: the payload executed in a headless browser "
-                          f"(nonce {nonce} observed in an execution sink).")
+                          f"(it logged {expected}, a value computed at run time that the stored "
+                          f"text does not contain).")
         return False, f"A headless browser loaded {url} and the payload did not execute."

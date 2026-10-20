@@ -241,8 +241,8 @@ class StoredXssCallerTests(_CallerBase):
         self.assertEqual([v.status for v in reports], ["not_confirmed"], _verdicts(reports))
 
     def test_driver_observing_the_nonce_confirms(self):
-        # Boundary double for the browser: it reports the console.log nonce that
-        # the planted payload carries, as an executing browser does.
+        # Boundary double for the browser: it logs what the planted payload's
+        # console.log computes (the product, E2), as an executing browser does.
         class _ExecutingDriver(_QuietDriver):
             def __init__(self, state):
                 super().__init__()
@@ -251,8 +251,8 @@ class StoredXssCallerTests(_CallerBase):
             async def visit(self, url, **kwargs):
                 import re
                 self.visits.append(url)
-                m = re.search(r"console\.log\('([0-9a-f]+)'\)", self.state["note"])
-                return ExecutionObservation(url=url, console=[m.group(1)] if m else [])
+                m = re.search(r"console\.log\((\d+)\*(\d+)\)", self.state["note"])
+                return ExecutionObservation(url=url, console=[str(int(m[1]) * int(m[2]))] if m else [])
         state = {"note": "original"}
         v = StoredXssValidator(allowed_hosts=["shop.invalid"], driver=_ExecutingDriver(state))
         reports = self._validate("stored_xss", v, _finding("xss"),

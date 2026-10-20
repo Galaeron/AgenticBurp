@@ -54,9 +54,13 @@ def _load_make_app():
 
 
 class _ExecSinkParser(HTMLParser):
-    """Collects console.log nonces from the places a browser executes them: a
-    <script> element's text and an on* event-handler attribute."""
-    _LOG = re.compile(r"console\.log\('([0-9a-f]+)'\)")
+    """Collects what the stored-XSS payload's console.log would print -- the
+    product it computes (E2), never its source text -- from the places a
+    browser executes it: a <script> element's text and an on* handler."""
+    _LOG = re.compile(r"console\.log\((\d+)\*(\d+)\)")
+
+    def _run(self, js):
+        self.logged += [str(int(a) * int(b)) for a, b in self._LOG.findall(js)]
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -67,7 +71,7 @@ class _ExecSinkParser(HTMLParser):
         self._in_script = tag == "script"
         for name, value in attrs:
             if (name or "").startswith("on") and value:
-                self.logged += self._LOG.findall(value)
+                self._run(value)
 
     def handle_endtag(self, tag):
         if tag == "script":
@@ -75,7 +79,7 @@ class _ExecSinkParser(HTMLParser):
 
     def handle_data(self, data):
         if self._in_script:
-            self.logged += self._LOG.findall(data)
+            self._run(data)
 
 
 class _ParsedRenderExecutionDouble:
