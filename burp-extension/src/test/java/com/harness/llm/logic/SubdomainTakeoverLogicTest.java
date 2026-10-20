@@ -8,15 +8,26 @@ import static org.junit.jupiter.api.Assertions.*;
 public final class SubdomainTakeoverLogicTest {
 
     @Test
-    void knownFingerprintIsConfirmed() {
+    void knownFingerprintIsALeadNotConfirmed() {
         Evidence ev = evaluate(404, "<html>There isn't a GitHub Pages site here.</html>");
-        assertEquals(Verdict.CONFIRMED, ev.verdict());
-        assertTrue(ev.confirmed());
+        assertEquals(Verdict.SUPPORTED, ev.verdict());
+        assertFalse(ev.confirmed());
     }
 
     @Test
-    void s3FingerprintIsConfirmed() {
-        assertEquals(Verdict.CONFIRMED, evaluate(404, "<Error><Code>NoSuchBucket</Code></Error>").verdict());
+    void s3FingerprintIsALeadNotConfirmed() {
+        Evidence ev = evaluate(404, "<Error><Code>NoSuchBucket</Code></Error>");
+        assertEquals(Verdict.SUPPORTED, ev.verdict());
+        assertFalse(ev.confirmed());
+    }
+
+    @Test
+    void applicationProjectNotFoundIsNotConfirmed() {
+        // Code review 02 R29: an application's own 404 wording matches the
+        // Surge.sh fingerprint; with no DNS/provider evidence it is a lead.
+        Evidence ev = evaluate(404, "Project not found");
+        assertFalse(ev.confirmed());
+        assertNotEquals(Verdict.CONFIRMED, ev.verdict());
     }
 
     @Test
