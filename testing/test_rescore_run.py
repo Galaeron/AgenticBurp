@@ -12,18 +12,21 @@ test to the finding->prediction plumbing (which testing/test_eval_adapter.py cov
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _TESTING_DIR = Path(__file__).resolve().parent
 if str(_TESTING_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTING_DIR))
 
 import rescore_run as rr  # noqa: E402
-from labels.manifest import LabelRecord, Manifest, compute_hash  # noqa: E402
+from labels.manifest import LabelRecord, Manifest, ManifestError, compute_hash  # noqa: E402
 
 _HOST = "nc1-fixture.invalid"
 
@@ -148,6 +151,102 @@ class RunFromFilesTests(unittest.TestCase):
             card = rr.run_from_files(sp, mp, git_revision="revfile")
         self.assertEqual(card["corpus"], "nc1-file")
         self.assertTrue(card["baseline_controls"]["discriminating"])
+
+
+class RescoreCompletionThroughRunnerTests(unittest.TestCase):
+    """R41 at the runner's own boundary: the scorecard's provenance carries the
+    source run's completion status instead of asserting complete=True."""
+
+    def _card(self, complete):
+        saved = _saved()
+        saved["provenance"] = dict(saved["provenance"], complete=complete)
+        return rr.apply_strict_scorecard(saved, _manifest(), git_revision="rev1")
+
+    def test_incomplete_source_is_incomplete_in_the_scorecard(self):
+        self.assertIs(self._card(False)["provenance"]["complete"], False)
+
+    def test_completed_source_control(self):
+        card = self._card(True)
+        self.assertIs(card["provenance"]["complete"], True)
+        self.assertEqual(card["kind"], "historical_rescore")
+
+
+def _manifest_doc(recs, *, declared_hash=None):
+    return {
+        "corpus": "rv-c-file", "version": "0.0.1",
+        "hash": compute_hash(recs) if declared_hash is None else declared_hash,
+        "records": [
+            {"exchange_id": r.exchange_id, "expected_classes": list(r.expected_classes),
+             "tested_negative_classes": list(r.tested_negative_classes),
+             "label_scope": r.label_scope, "status": r.status, "provenance": r.provenance}
+            for r in recs
+        ],
+    }
+
+
+class ManifestIntegrityTests(unittest.TestCase):
+    """R42: a manifest whose declared content hash does not match its records
+    must be refused before anything is scored, by the file-based caller and by
+    the CLI entry point that wraps it."""
+
+    def _files(self, d, *, declared_hash=None):
+        sp, mp = Path(d) / "saved.json", Path(d) / "manifest.json"
+        sp.write_text(json.dumps(_saved()), encoding="utf-8")
+        mp.write_text(json.dumps(_manifest_doc(_records(), declared_hash=declared_hash)), encoding="utf-8")
+        return sp, mp
+
+    def test_corrupt_manifest_hash_is_rejected_by_rescore_caller(self):
+        with tempfile.TemporaryDirectory(prefix="rvc_") as d:
+            sp, mp = self._files(d, declared_hash="wrong-content-hash")
+            with self.assertRaises(ManifestError) as caught:
+                rr.run_from_files(sp, mp, git_revision="rev")
+        self.assertIn("wrong-content-hash", str(caught.exception))
+
+    def test_valid_manifest_control(self):
+        with tempfile.TemporaryDirectory(prefix="rvc_") as d:
+            sp, mp = self._files(d)
+            card = rr.run_from_files(sp, mp, git_revision="rev")
+        self.assertTrue(card["baseline_controls"]["discriminating"])
+
+    def test_records_edited_after_hashing_are_rejected(self):
+        """The failure the hash exists for: a record hand-edited without
+        updating the declared hash (the declared hash itself is well-formed)."""
+        with tempfile.TemporaryDirectory(prefix="rvc_") as d:
+            sp, mp = self._files(d)
+            doc = json.loads(mp.read_text(encoding="utf-8"))
+            doc["records"][0]["expected_classes"] = ["xss"]
+            mp.write_text(json.dumps(doc), encoding="utf-8")
+            with self.assertRaises(ManifestError):
+                rr.run_from_files(sp, mp, git_revision="rev")
+
+    def test_in_memory_manifest_with_a_wrong_hash_is_rejected_before_scoring(self):
+        recs = _records()
+        bad = Manifest(corpus="rv-c-mem", version="0.0.1", hash="wrong-content-hash", records=tuple(recs))
+        with mock.patch.object(rr.eval_adapter, "rescore_saved_run",
+                               side_effect=AssertionError("must not score")) as scored:
+            with self.assertRaises(ManifestError):
+                rr.apply_strict_scorecard(_saved(), bad, git_revision="rev")
+        scored.assert_not_called()
+
+    def test_cli_reports_a_corrupt_manifest_clearly_and_exits_nonzero(self):
+        with tempfile.TemporaryDirectory(prefix="rvc_") as d:
+            sp, mp = self._files(d, declared_hash="wrong-content-hash")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = rr.main([str(sp), str(mp), "--git-revision", "rev"])
+        self.assertEqual(rc, 2)
+        self.assertIn("REFUSED", err.getvalue())
+        self.assertIn("manifest hash mismatch", err.getvalue())
+        self.assertEqual(out.getvalue(), "", "no scorecard may be printed for a corrupt manifest")
+
+    def test_cli_valid_manifest_control(self):
+        with tempfile.TemporaryDirectory(prefix="rvc_") as d:
+            sp, mp = self._files(d)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = rr.main([str(sp), str(mp), "--git-revision", "rev"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Strict scorecard", out.getvalue())
 
 
 if __name__ == "__main__":
