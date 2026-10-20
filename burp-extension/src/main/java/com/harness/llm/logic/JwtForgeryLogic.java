@@ -2,6 +2,8 @@ package com.harness.llm.logic;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
@@ -16,11 +18,20 @@ import java.util.regex.Pattern;
  */
 public final class JwtForgeryLogic {
 
-    public enum Verdict { CONFIRMED, SUPPORTED, INVALID, REJECTED }
+    public enum Verdict { CONFIRMED, SUPPORTED, INVALID, REJECTED, INCONCLUSIVE }
 
     public record Evidence(Verdict verdict, double confidence, boolean confirmed, String summary, String detail) {}
 
     private static final Pattern ALG_FIELD = Pattern.compile("\"alg\"\\s*:\\s*\"[^\"]*\"");
+
+    /**
+     * Header names that carry a credential: the standard ones, the cookie
+     * (the browser's ambient credential), and custom names such as
+     * X-Auth-Token, X-Api-Key or X-Session-Id.
+     */
+    private static final Pattern CREDENTIAL_HEADER_NAME = Pattern.compile(
+            "(?i)^(authorization|proxy-authorization|cookie)$|auth|token|api[-_]?key|session|secret|credential|jwt|bearer");
+    private static final Pattern SCHEME_CREDENTIAL_VALUE = Pattern.compile("(?i)^\\s*(bearer|basic|digest|token)\\s+\\S");
 
     private JwtForgeryLogic() {}
 
@@ -89,6 +100,89 @@ public final class JwtForgeryLogic {
     }
 
     /**
+     * True if `token` is JWT-shaped and its header segment decodes to JSON
+     * naming an "alg" -- stricter than {@link #looksLikeJwt}, for values
+     * outside the Authorization header, where a dotted value such as a host
+     * name or a version string must not be taken for a token.
+     */
+    public static boolean isDecodableJwt(String token) {
+        if (!looksLikeJwt(token)) return false;
+        try {
+            String headerJson = b64UrlDecode(token.split("\\.", -1)[0]);
+            return headerJson.trim().startsWith("{") && ALG_FIELD.matcher(headerJson).find();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Where a request carries its JWT (code review 02 RV-J residual N2): a
+     * header, whose value is {@code prefix + token}, or a cookie.
+     */
+    public record Carrier(boolean cookie, String name, String prefix, String token) {
+        /** The header name a probe sends the token in. */
+        public String headerName() { return cookie ? "Cookie" : name; }
+        /** The header value carrying {@code token} in place of the original. */
+        public String headerValue(String token) { return cookie ? name + "=" + token : prefix + token; }
+        public String describe() { return (cookie ? "cookie " : "header ") + name; }
+    }
+
+    /**
+     * Finds the JWT a request authenticates with: an Authorization Bearer
+     * token first (JWT-shaped, as before), then another header whose value is
+     * a decodable JWT or "Bearer " and one, then a cookie whose value is a
+     * decodable JWT. Returns null if there is none.
+     *
+     * @param headers the request's headers, in order, as name/value pairs
+     */
+    public static Carrier findCarrier(List<Map.Entry<String, String>> headers) {
+        for (Map.Entry<String, String> h : headers) {
+            String value = h.getValue();
+            if ("authorization".equalsIgnoreCase(h.getKey()) && value != null
+                    && value.regionMatches(true, 0, "Bearer ", 0, 7)) {
+                String token = value.substring(7).trim();
+                if (looksLikeJwt(token)) return new Carrier(false, h.getKey(), "Bearer ", token);
+            }
+        }
+        for (Map.Entry<String, String> h : headers) {
+            String name = h.getKey();
+            String value = h.getValue() == null ? "" : h.getValue().trim();
+            if (name == null || "cookie".equalsIgnoreCase(name)) continue;
+            if (isDecodableJwt(value)) return new Carrier(false, name, "", value);
+            if (value.regionMatches(true, 0, "Bearer ", 0, 7) && isDecodableJwt(value.substring(7).trim())) {
+                return new Carrier(false, name, "Bearer ", value.substring(7).trim());
+            }
+        }
+        for (Map.Entry<String, String> h : headers) {
+            if (!"cookie".equalsIgnoreCase(h.getKey()) || h.getValue() == null) continue;
+            for (String pair : h.getValue().split(";")) {
+                int eq = pair.indexOf('=');
+                if (eq <= 0) continue;
+                String name = pair.substring(0, eq).trim();
+                String value = pair.substring(eq + 1).trim();
+                if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) value = value.substring(1, value.length() - 1);
+                if (!name.isEmpty() && isDecodableJwt(value)) return new Carrier(true, name, "", value);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * True if this header carries a credential, so the probes must not keep
+     * it: a credential-named header, or a value that is a scheme credential
+     * ("Bearer ...", "Basic ...") or a decodable JWT. The forged and the
+     * no-token requests carry no credential but the token under test --
+     * otherwise a session cookie or a second token header authenticates them
+     * and the forged token is never what the server checked.
+     */
+    public static boolean isCredentialHeader(String name, String value) {
+        if (name == null) return false;
+        if (CREDENTIAL_HEADER_NAME.matcher(name.trim()).find()) return true;
+        if (value == null) return false;
+        return SCHEME_CREDENTIAL_VALUE.matcher(value).find() || isDecodableJwt(value.trim());
+    }
+
+    /**
      * A forged token proves a signature bypass only on a resource that is
      * actually token-gated, so a confirmation needs the unauthenticated
      * control -- the same request with no token at all -- to have been
@@ -153,5 +247,25 @@ public final class JwtForgeryLogic {
                         + "the response shape differs enough from the original that this may be a different "
                         + "code path -- worth a manual comparison rather than treating this as confirmed.",
                 detail);
+    }
+
+    /**
+     * A refused forged token shows the signature is checked only if the
+     * original token alone is accepted -- sent in its carrier with the
+     * request's other credentials removed, exactly as the probes are (code
+     * review 02 RV-N, N2). If that is refused too, the request needs more
+     * than the token (a session cookie, a second credential header), and the
+     * forged token's refusal says nothing about signature verification.
+     *
+     * @param refused the evaluation of a forged token that was refused
+     * @param tokenAloneStatus status of the original token alone
+     */
+    public static Evidence requireTokenAloneAccepted(Evidence refused, int tokenAloneStatus) {
+        if (refused.verdict() != Verdict.REJECTED || isSuccess(tokenAloneStatus)) return refused;
+        return new Evidence(Verdict.INCONCLUSIVE, 0.3, false,
+                "The forged token was refused, but so was the original token alone (status " + tokenAloneStatus
+                        + ") once the request's other credentials were removed -- the request needs more than "
+                        + "the token, so the refusal does not show that the signature is verified.",
+                refused.detail() + " | original token alone status=" + tokenAloneStatus);
     }
 }

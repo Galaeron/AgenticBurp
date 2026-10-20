@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.List;
+import java.util.Map;
 
 import static com.harness.llm.logic.JwtForgeryLogic.*;
 import static org.junit.jupiter.api.Assertions.*;
@@ -138,5 +140,76 @@ public final class JwtForgeryLogicTest {
         Evidence e = evaluate("alg:none", 200, 200, 100, 105, 502);
         assertEquals(Verdict.SUPPORTED, e.verdict());
         assertFalse(e.confirmed());
+    }
+
+    // ---------------------------------------------------------------- RV-N N2
+    private static final String RVN_JWT = "eyJhbGciOiJIUzI1NiJ9.e30.c2ln";
+
+    private static List<Map.Entry<String, String>> hs(String... nameValuePairs) {
+        List<Map.Entry<String, String>> h = new java.util.ArrayList<>();
+        for (int i = 0; i < nameValuePairs.length; i += 2) h.add(Map.entry(nameValuePairs[i], nameValuePairs[i + 1]));
+        return h;
+    }
+
+    @Test
+    @DisplayName("N2: a JWT is found in Authorization first, then another header, then a cookie")
+    void carrierFoundWhereverTheTokenIs() {
+        Carrier auth = findCarrier(hs("Cookie", "token=" + RVN_JWT, "Authorization", "Bearer " + RVN_JWT));
+        assertEquals("header Authorization", auth.describe());
+        assertEquals("Bearer x", auth.headerValue("x"));
+
+        Carrier header = findCarrier(hs("Cookie", "token=" + RVN_JWT, "X-Access-Token", RVN_JWT));
+        assertEquals("header X-Access-Token", header.describe());
+        assertEquals("x", header.headerValue("x"));
+
+        Carrier bearer = findCarrier(hs("X-Auth", "Bearer " + RVN_JWT));
+        assertEquals("Bearer x", bearer.headerValue("x"));
+
+        Carrier cookie = findCarrier(hs("Cookie", "theme=dark; token=\"" + RVN_JWT + "\""));
+        assertTrue(cookie.cookie());
+        assertEquals(RVN_JWT, cookie.token());
+        assertEquals("Cookie", cookie.headerName());
+        assertEquals("token=x", cookie.headerValue("x"));
+    }
+
+    @Test
+    @DisplayName("N2: a dotted value outside Authorization must decode as a JWT header to count")
+    void dottedValuesAreNotTokens() {
+        assertNull(findCarrier(hs("Cookie", "host=www.shop.example; v=1.2.3")));
+        assertNull(findCarrier(hs("X-Version", "1.2.3", "X-Host", "www.shop.example")));
+        assertNull(findCarrier(hs("Accept", "text/html")));
+        assertTrue(isDecodableJwt(RVN_JWT));
+        assertFalse(isDecodableJwt("www.shop.example"));
+        assertFalse(isDecodableJwt("e30.e30.c2ln"));
+        assertFalse(isDecodableJwt(null));
+    }
+
+    @Test
+    @DisplayName("N2: credential headers are recognized by name or by value")
+    void credentialHeadersRecognized() {
+        for (String name : new String[] {"Cookie", "Authorization", "Proxy-Authorization", "X-Auth-Token",
+                "X-Api-Key", "X-API_KEY", "X-Session-Id", "X-Client-Secret", "X-JWT"}) {
+            assertTrue(isCredentialHeader(name, "v"), name);
+        }
+        assertTrue(isCredentialHeader("X-Custom", "Basic dXNlcjpwYXNz"));
+        assertTrue(isCredentialHeader("X-Custom", RVN_JWT));
+        for (String name : new String[] {"Accept", "User-Agent", "X-Requested-With", "Content-Type", "Referer"}) {
+            assertFalse(isCredentialHeader(name, "text/html"), name);
+        }
+        assertFalse(isCredentialHeader(null, "Bearer x"));
+    }
+
+    @Test
+    @DisplayName("N2: a refused forged token is rejected only if the original token alone is accepted")
+    void refusalCountsOnlyIfTokenAloneAccepted() {
+        Evidence refused = evaluate("garbled signature", 200, 401, 100, 20, -1);
+        assertEquals(Verdict.REJECTED, refused.verdict());
+        assertEquals(Verdict.REJECTED, requireTokenAloneAccepted(refused, 200).verdict());
+        Evidence notIsolated = requireTokenAloneAccepted(refused, 401);
+        assertEquals(Verdict.INCONCLUSIVE, notIsolated.verdict());
+        assertFalse(notIsolated.confirmed());
+        assertTrue(notIsolated.detail().contains("original token alone status=401"), notIsolated.detail());
+        Evidence confirmed = new Evidence(Verdict.CONFIRMED, 0.9, true, "s", "d");
+        assertEquals(confirmed, requireTokenAloneAccepted(confirmed, 401), "only a rejection is qualified");
     }
 }

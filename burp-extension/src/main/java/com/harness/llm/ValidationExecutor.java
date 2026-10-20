@@ -1267,63 +1267,93 @@ public final class ValidationExecutor {
     // ---------------------------------------------------------------
     private void jwtForgery(TestPlan plan, HttpRequestResponse source) {
         HttpRequest req = source.request();
-        String authHeader = null;
+        List<Map.Entry<String, String>> headerList = new ArrayList<>();
+        for (HttpHeader h : req.headers()) headerList.add(Map.entry(h.name(), h.value() == null ? "" : h.value()));
+        JwtForgeryLogic.Carrier carrier = JwtForgeryLogic.findCarrier(headerList);
+        if (carrier == null) {
+            statusFor(plan, source, "invalid", 0, false,
+                    "No JWT was found on this request for jwt_validation to target -- not as an Authorization "
+                            + "bearer token, in another header, or in a cookie. jwt_validation only applies to "
+                            + "JWTs, not opaque tokens.", "");
+            return;
+        }
+        String originalToken = carrier.token();
+
+        // The probes carry no credential but the token under test, in the
+        // carrier it came in (RV-J residual N2): every credential header and
+        // the cookie are removed first. Otherwise a session cookie or a
+        // second token authenticates the request, and a "forged token
+        // accepted" or a "no token" control says nothing about the JWT.
+        HttpRequest bare = req;
+        Set<String> removed = new LinkedHashSet<>();
         for (HttpHeader h : req.headers()) {
-            if (h.name().equalsIgnoreCase("Authorization")) { authHeader = h.value(); break; }
+            if (JwtForgeryLogic.isCredentialHeader(h.name(), h.value()) && removed.add(h.name().toLowerCase(Locale.ROOT))) {
+                bare = bare.withRemovedHeader(h.name());
+            }
         }
-        if (authHeader == null || !authHeader.regionMatches(true, 0, "Bearer ", 0, 7)) {
-            statusFor(plan, source, "invalid", 0, false,
-                    "No Bearer Authorization header was present on this request for jwt_validation to target.", "");
-            return;
-        }
-        String originalToken = authHeader.substring(7).trim();
-        if (!JwtForgeryLogic.looksLikeJwt(originalToken)) {
-            statusFor(plan, source, "invalid", 0, false,
-                    "The Authorization bearer value is not JWT-shaped (three dot-separated segments) -- "
-                            + "jwt_validation only applies to JWTs, not opaque tokens.", "");
-            return;
-        }
+        String carried = "token carrier=" + carrier.describe() + " | removed from the probes: "
+                + (removed.isEmpty() ? "none" : String.join(", ", removed));
 
         var originalResp = source.response();
         int originalStatus = originalResp == null ? 0 : originalResp.statusCode();
         int originalLen = originalResp == null ? 0 : originalResp.bodyToString().length();
 
         // Control, sent at most once and only after a forged token got a 2xx:
-        // the same request with no token. If that is answered too, the
-        // resource is public and a forged token proves nothing.
+        // the same request with no credential at all. If that is answered
+        // too, the resource is public and a forged token proves nothing.
         int unauthenticatedStatus = -1;
         boolean controlSent = false;
 
         String algNone = JwtForgeryLogic.forgeAlgNone(originalToken);
         if (algNone != null) {
-            var rr = api.http().sendRequest(req.withUpdatedHeader("Authorization", "Bearer " + algNone));
+            var rr = api.http().sendRequest(bare.withAddedHeader(carrier.headerName(), carrier.headerValue(algNone)));
             var resp = rr.response();
             if (resp != null) {
                 if (JwtForgeryLogic.isSuccess(resp.statusCode())) {
-                    unauthenticatedStatus = status(api.http().sendRequest(req.withRemovedHeader("Authorization")));
+                    unauthenticatedStatus = status(api.http().sendRequest(bare));
                     controlSent = true;
                 }
                 JwtForgeryLogic.Evidence ev = JwtForgeryLogic.evaluate("alg:none", originalStatus, resp.statusCode(), originalLen, resp.bodyToString().length(), unauthenticatedStatus);
                 if (ev.verdict() == JwtForgeryLogic.Verdict.CONFIRMED || ev.verdict() == JwtForgeryLogic.Verdict.SUPPORTED
                         || JwtForgeryLogic.isSuccess(unauthenticatedStatus)) {
-                    statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
+                    statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail() + " | " + carried);
                     return;
                 }
             }
         }
 
         String garbled = JwtForgeryLogic.forgeGarbledSignature(originalToken);
-        var rr2 = api.http().sendRequest(req.withUpdatedHeader("Authorization", "Bearer " + garbled));
+        var rr2 = api.http().sendRequest(bare.withAddedHeader(carrier.headerName(), carrier.headerValue(garbled)));
         var resp2 = rr2.response();
         if (resp2 == null) {
-            statusFor(plan, source, "inconclusive", 0, false, "No response was received for the garbled-signature probe.", "");
+            statusFor(plan, source, "inconclusive", 0, false, "No response was received for the garbled-signature probe.", carried);
             return;
         }
         if (JwtForgeryLogic.isSuccess(resp2.statusCode()) && !controlSent) {
-            unauthenticatedStatus = status(api.http().sendRequest(req.withRemovedHeader("Authorization")));
+            unauthenticatedStatus = status(api.http().sendRequest(bare));
         }
         JwtForgeryLogic.Evidence ev2 = JwtForgeryLogic.evaluate("garbled signature", originalStatus, resp2.statusCode(), originalLen, resp2.bodyToString().length(), unauthenticatedStatus);
-        statusFor(plan, source, ev2.verdict().name().toLowerCase(Locale.ROOT), ev2.confidence(), ev2.confirmed(), ev2.summary(), ev2.detail());
+        if (!JwtForgeryLogic.isSuccess(resp2.statusCode())) {
+            // The probes carried no other credential, so a refusal is about
+            // the token only if the original token alone is accepted. That
+            // request is the captured one unless other credentials were removed.
+            HttpRequest tokenAlone = bare.withAddedHeader(carrier.headerName(), carrier.headerValue(originalToken));
+            int tokenAloneStatus = sameHeaders(tokenAlone, req) ? originalStatus : status(api.http().sendRequest(tokenAlone));
+            ev2 = JwtForgeryLogic.requireTokenAloneAccepted(ev2, tokenAloneStatus);
+        }
+        statusFor(plan, source, ev2.verdict().name().toLowerCase(Locale.ROOT), ev2.confidence(), ev2.confirmed(), ev2.summary(), ev2.detail() + " | " + carried);
+    }
+
+    /** True if both requests carry the same headers and values, in any order and any name case. */
+    private static boolean sameHeaders(HttpRequest a, HttpRequest b) {
+        return headerSet(a).equals(headerSet(b));
+    }
+
+    private static List<String> headerSet(HttpRequest r) {
+        List<String> out = new ArrayList<>();
+        for (HttpHeader h : r.headers()) out.add(h.name().toLowerCase(Locale.ROOT) + ": " + h.value());
+        java.util.Collections.sort(out);
+        return out;
     }
 
     // ---------------------------------------------------------------
