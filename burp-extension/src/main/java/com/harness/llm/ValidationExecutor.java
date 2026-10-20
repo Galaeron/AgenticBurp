@@ -974,6 +974,14 @@ public final class ValidationExecutor {
         return null;
     }
 
+    /** A plain GET of {@code path} with the original request's session
+     * headers but none of its body or body-describing headers -- for
+     * reading back what a write stored, without repeating the write. */
+    private static HttpRequest readRequest(HttpRequest base, String path) {
+        return base.withMethod("GET").withPath(path).withBody("")
+                .withRemovedHeader("Content-Type").withRemovedHeader("Content-Length");
+    }
+
     private static int bodyLen(HttpRequestResponse rr) {
         if (rr == null || rr.response() == null) return 0;
         String b = rr.response().bodyToString();
@@ -1551,7 +1559,7 @@ public final class ValidationExecutor {
                         ? java.net.URI.create(extractedUrl).getRawPath()
                         : extractedUrl;
                 if (path != null && !path.isEmpty()) {
-                    var fetchRr = api.http().sendRequest(req.withPath(path).withBody(""));
+                    var fetchRr = api.http().sendRequest(readRequest(req, path));
                     if (fetchRr.response() != null) {
                         fetchStatus = fetchRr.response().statusCode();
                         fetchedContainsEicar = fetchRr.response().bodyToString().contains(FileUploadLogic.EICAR_STRING);
