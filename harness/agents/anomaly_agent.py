@@ -3,6 +3,28 @@ from harness.anomaly_detector import detector, Anomaly
 from harness.models import Finding
 
 
+def _lowercase_headers(headers) -> dict:
+    """Header names folded to lowercase (HTTP field names are case-insensitive).
+    Repeated names that differ only by case are combined, comma-separated."""
+    folded: dict = {}
+    for name, value in (headers or {}).items():
+        key = str(name).lower()
+        folded[key] = f"{folded[key]}, {value}" if key in folded else value
+    return folded
+
+
+def _with_normalised_headers(exchange):
+    """A copy of the exchange whose request and response header names are all
+    lowercase. The detector looks headers up by lowercase name, so a present
+    ``X-Frame-Options`` was reported missing (code review 02 R23). Normalising
+    once here, ahead of both profile update and detection, keeps the detector
+    unchanged and leaves the caller's exchange untouched."""
+    return exchange.model_copy(update={
+        "request_headers": _lowercase_headers(exchange.request_headers),
+        "response_headers": _lowercase_headers(exchange.response_headers),
+    })
+
+
 class AnomalyAgent(BaseAgent):
     """
     Agent for detecting unknown vulnerabilities through behavioral anomaly detection.
@@ -91,6 +113,8 @@ The first few exchanges may not produce useful findings.
         
         This overrides the base run method to use the anomaly detector.
         """
+        exchange = _with_normalised_headers(exchange)
+
         # Update the detector's profile with this exchange
         detector.update_profile(exchange)
         
