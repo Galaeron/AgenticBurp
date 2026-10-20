@@ -1212,13 +1212,24 @@ public final class ValidationExecutor {
         int originalStatus = originalResp == null ? 0 : originalResp.statusCode();
         int originalLen = originalResp == null ? 0 : originalResp.bodyToString().length();
 
+        // Control, sent at most once and only after a forged token got a 2xx:
+        // the same request with no token. If that is answered too, the
+        // resource is public and a forged token proves nothing.
+        int unauthenticatedStatus = -1;
+        boolean controlSent = false;
+
         String algNone = JwtForgeryLogic.forgeAlgNone(originalToken);
         if (algNone != null) {
             var rr = api.http().sendRequest(req.withUpdatedHeader("Authorization", "Bearer " + algNone));
             var resp = rr.response();
             if (resp != null) {
-                JwtForgeryLogic.Evidence ev = JwtForgeryLogic.evaluate("alg:none", originalStatus, resp.statusCode(), originalLen, resp.bodyToString().length());
-                if (ev.verdict() == JwtForgeryLogic.Verdict.CONFIRMED || ev.verdict() == JwtForgeryLogic.Verdict.SUPPORTED) {
+                if (JwtForgeryLogic.isSuccess(resp.statusCode())) {
+                    unauthenticatedStatus = status(api.http().sendRequest(req.withRemovedHeader("Authorization")));
+                    controlSent = true;
+                }
+                JwtForgeryLogic.Evidence ev = JwtForgeryLogic.evaluate("alg:none", originalStatus, resp.statusCode(), originalLen, resp.bodyToString().length(), unauthenticatedStatus);
+                if (ev.verdict() == JwtForgeryLogic.Verdict.CONFIRMED || ev.verdict() == JwtForgeryLogic.Verdict.SUPPORTED
+                        || JwtForgeryLogic.isSuccess(unauthenticatedStatus)) {
                     statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
                     return;
                 }
@@ -1232,7 +1243,10 @@ public final class ValidationExecutor {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the garbled-signature probe.", "");
             return;
         }
-        JwtForgeryLogic.Evidence ev2 = JwtForgeryLogic.evaluate("garbled signature", originalStatus, resp2.statusCode(), originalLen, resp2.bodyToString().length());
+        if (JwtForgeryLogic.isSuccess(resp2.statusCode()) && !controlSent) {
+            unauthenticatedStatus = status(api.http().sendRequest(req.withRemovedHeader("Authorization")));
+        }
+        JwtForgeryLogic.Evidence ev2 = JwtForgeryLogic.evaluate("garbled signature", originalStatus, resp2.statusCode(), originalLen, resp2.bodyToString().length(), unauthenticatedStatus);
         statusFor(plan, source, ev2.verdict().name().toLowerCase(Locale.ROOT), ev2.confidence(), ev2.confirmed(), ev2.summary(), ev2.detail());
     }
 

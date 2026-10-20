@@ -87,9 +87,9 @@ public final class JwtForgeryLogicTest {
     // --- classification ---
 
     @Test
-    @DisplayName("forged token accepted with same status and similar body shape -> confirmed")
+    @DisplayName("forged token accepted with same status and similar body shape, no-token control refused -> confirmed")
     void acceptedWithSimilarShapeIsConfirmed() {
-        Evidence e = evaluate("alg:none", 200, 200, 100, 105);
+        Evidence e = evaluate("alg:none", 200, 200, 100, 105, 401);
         assertEquals(Verdict.CONFIRMED, e.verdict());
         assertTrue(e.confirmed());
     }
@@ -97,7 +97,7 @@ public final class JwtForgeryLogicTest {
     @Test
     @DisplayName("forged token accepted (2xx) but very different body shape -> supported, not confirmed")
     void acceptedButDifferentShapeIsSupported() {
-        Evidence e = evaluate("alg:none", 200, 200, 1000, 5);
+        Evidence e = evaluate("alg:none", 200, 200, 1000, 5, 401);
         assertEquals(Verdict.SUPPORTED, e.verdict());
         assertFalse(e.confirmed());
     }
@@ -105,14 +105,38 @@ public final class JwtForgeryLogicTest {
     @Test
     @DisplayName("forged token rejected -> rejected")
     void rejectedForgedTokenIsRejected() {
-        Evidence e = evaluate("alg:none", 200, 401, 100, 20);
+        Evidence e = evaluate("alg:none", 200, 401, 100, 20, -1);
         assertEquals(Verdict.REJECTED, e.verdict());
     }
 
     @Test
     @DisplayName("forged token gets a different 2xx-adjacent redirect/etc -- still not confirmed without matching shape")
     void differentStatusEntirelyIsNotConfirmed() {
-        Evidence e = evaluate("garbled signature", 200, 403, 100, 20);
+        Evidence e = evaluate("garbled signature", 200, 403, 100, 20, -1);
         assertEquals(Verdict.REJECTED, e.verdict());
+    }
+
+    @Test
+    @DisplayName("R26: a public resource answering the forged token and no token alike is not a bypass")
+    void publicResourceIsNotConfirmed() {
+        Evidence e = evaluate("alg:none", 200, 200, 21, 21, 200);
+        assertEquals(Verdict.REJECTED, e.verdict());
+        assertFalse(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("R26: forged token accepted but the no-token control not run -> supported only")
+    void acceptedWithoutControlIsSupported() {
+        Evidence e = evaluate("alg:none", 200, 200, 100, 105, -1);
+        assertEquals(Verdict.SUPPORTED, e.verdict());
+        assertFalse(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("R26: a no-token control that errors is not a clean refusal -> supported only")
+    void controlServerErrorIsSupported() {
+        Evidence e = evaluate("alg:none", 200, 200, 100, 105, 502);
+        assertEquals(Verdict.SUPPORTED, e.verdict());
+        assertFalse(e.confirmed());
     }
 }

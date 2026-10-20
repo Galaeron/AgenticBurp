@@ -83,39 +83,75 @@ public final class JwtForgeryLogic {
         return parts[0] + "." + parts[1] + ".AAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     }
 
+    /** True for a 2xx status: the server served the request. */
+    public static boolean isSuccess(int status) {
+        return status >= 200 && status < 300;
+    }
+
     /**
+     * A forged token proves a signature bypass only on a resource that is
+     * actually token-gated, so a confirmation needs the unauthenticated
+     * control -- the same request with no token at all -- to have been
+     * refused. A public resource answers a forged token, a garbled token
+     * and no token alike; accepting one there says nothing about signature
+     * verification.
+     *
      * @param forgedVariant which forgery was attempted, for the summary text
      * @param originalStatus status code of the original, legitimately-signed request
      * @param forgedStatus status code of the forged-token request
      * @param originalBodyLength length of the original response body, for a coarse shape comparison
      * @param forgedBodyLength length of the forged-token response body
+     * @param unauthenticatedStatus status of the same request with no token, or -1 if that control was not sent
      */
     public static Evidence evaluate(String forgedVariant, int originalStatus, int forgedStatus,
-                                     int originalBodyLength, int forgedBodyLength) {
+                                     int originalBodyLength, int forgedBodyLength, int unauthenticatedStatus) {
         boolean sameStatus = originalStatus == forgedStatus;
-        boolean statusLooksAuthenticated = forgedStatus >= 200 && forgedStatus < 300;
+        boolean statusLooksAuthenticated = isSuccess(forgedStatus);
         boolean similarBodyShape = originalBodyLength > 0
                 && Math.abs(originalBodyLength - forgedBodyLength) < Math.max(20, originalBodyLength / 10);
+        String detail = "original status=" + originalStatus + " len=" + originalBodyLength
+                + " | forged status=" + forgedStatus + " len=" + forgedBodyLength
+                + " | no token status=" + unauthenticatedStatus;
 
-        if (sameStatus && statusLooksAuthenticated && similarBodyShape) {
+        if (!statusLooksAuthenticated) {
+            return new Evidence(Verdict.REJECTED, 0.8, false,
+                    "The forged token (" + forgedVariant + ") was rejected (status " + forgedStatus
+                            + ") -- signature verification appears to be enforced for this bypass attempt.",
+                    detail);
+        }
+        if (unauthenticatedStatus < 0) {
+            return new Evidence(Verdict.SUPPORTED, 0.5, false,
+                    "A forged token (" + forgedVariant + ") received a 2xx status, but the no-token control "
+                            + "was not run, so this cannot be told apart from a resource that is simply public.",
+                    detail);
+        }
+        if (isSuccess(unauthenticatedStatus)) {
+            return new Evidence(Verdict.REJECTED, 0.7, false,
+                    "The resource also answers with no token at all (status " + unauthenticatedStatus
+                            + ") -- it is not token-gated, so the forged token (" + forgedVariant + ") being "
+                            + "accepted says nothing about signature verification.",
+                    detail);
+        }
+        if (unauthenticatedStatus < 300 || unauthenticatedStatus >= 500) {
+            return new Evidence(Verdict.SUPPORTED, 0.5, false,
+                    "A forged token (" + forgedVariant + ") received a 2xx status, but the no-token control "
+                            + "returned " + unauthenticatedStatus + ", which is not a clean authentication "
+                            + "refusal -- worth a manual check rather than treating this as confirmed.",
+                    detail);
+        }
+        if (sameStatus && similarBodyShape) {
             return new Evidence(Verdict.CONFIRMED, 0.9, true,
                     "A forged token (" + forgedVariant + ") was accepted with the same status code ("
                             + forgedStatus + ") and a similarly-shaped response body as the original, "
-                            + "legitimately-signed request -- the server is not verifying the token's signature.",
-                    "original status=" + originalStatus + " len=" + originalBodyLength
-                            + " | forged status=" + forgedStatus + " len=" + forgedBodyLength);
+                            + "legitimately-signed request, while the same request with no token was refused "
+                            + "(status " + unauthenticatedStatus + ") -- the server is not verifying the "
+                            + "token's signature.",
+                    detail);
         }
-        if (statusLooksAuthenticated) {
-            return new Evidence(Verdict.SUPPORTED, 0.55, false,
-                    "A forged token (" + forgedVariant + ") received a 2xx status, but the response shape "
-                            + "differs enough from the original that this may be a different code path -- "
-                            + "worth a manual comparison rather than treating this as confirmed.",
-                    "original status=" + originalStatus + " len=" + originalBodyLength
-                            + " | forged status=" + forgedStatus + " len=" + forgedBodyLength);
-        }
-        return new Evidence(Verdict.REJECTED, 0.8, false,
-                "The forged token (" + forgedVariant + ") was rejected (status " + forgedStatus
-                        + ") -- signature verification appears to be enforced for this bypass attempt.",
-                "forged status=" + forgedStatus);
+        return new Evidence(Verdict.SUPPORTED, 0.55, false,
+                "A forged token (" + forgedVariant + ") received a 2xx status on a token-gated resource, but "
+                        + "the response shape differs enough from the original that this may be a different "
+                        + "code path -- worth a manual comparison rather than treating this as confirmed.",
+                detail);
     }
 }
