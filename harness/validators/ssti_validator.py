@@ -106,15 +106,15 @@ class SstiValidator(Validator):
                     f"{reads} readback(s) and the restore need {need}")
         finding_id = getattr(finding, "finding_id", "") or ""
         if finding_id:
-            gate = run.gate
+            # RV-L L6: the gate's public read-only view; anything it cannot
+            # answer refuses the plant (fail closed).
             try:
-                ceiling = gate._mutating_ceiling(self.name)
-                used = gate._mutating_counts.get(finding_id, 0)
-            except AttributeError:
+                left, used, ceiling = run.gate.mutating_headroom(finding_id, self.name)
+            except Exception:
                 return ("the safety gate's mutating-send accounting cannot be read, so the "
                         "restore cannot be guaranteed")
-            if ceiling - used < 2:
-                return (f"the per-finding write ceiling allows {max(ceiling - used, 0)} more "
+            if left < 2:
+                return (f"the per-finding write ceiling allows {left} more "
                         f"mutating send(s) ({used}/{ceiling} used); the plant and the restore "
                         f"need 2 (raise validators.mutating_ceiling_by_check.{self.name})")
         return None
@@ -175,6 +175,10 @@ class SstiValidator(Validator):
         residual: list[str] = []
         last_plant = ""
         answered = 0
+        # RV-L L3: sends that got no response. A check that never reached the
+        # target is not a negative.
+        failed: list[str] = []
+        sends = 0
 
         async def _restore_original():
             """Replay the captured request. None when no stored plant is in play, else
@@ -233,12 +237,16 @@ class SstiValidator(Validator):
                                      f"ran out of room to restore another."))
                 url, body = mutate(exchange, loc, param, payload)
                 last_plant = payload if readbacks else last_plant
+                sends += 1
                 try:
                     outcome = await _send(method, url, send_body=body or None,
                                           send_headers=request_headers, redirects=2)
                     if not outcome.executed:
                         return _finish(self._skip(f"SSTI replay declined: {outcome.outcome}"))
                     if not outcome.ok:
+                        error = getattr(outcome, "error", "") or ""
+                        failed.append(f"{loc} {param!r}: {outcome.outcome}"
+                                      + (f" ({error})" if error else ""))
                         # the plant may have landed even though no response came back
                         await _restore_original()
                         continue
@@ -246,7 +254,8 @@ class SstiValidator(Validator):
                 except SafetyGateBlocked:
                     return _finish(self._skip("mutating SSTI replay not authorized "
                                               "(set validators.allow_mutating_replay)"))
-                except httpx.HTTPError:
+                except httpx.HTTPError as exc:
+                    failed.append(f"{loc} {param!r}: {type(exc).__name__}")
                     await _restore_original()
                     continue
                 answered += 1
@@ -282,6 +291,13 @@ class SstiValidator(Validator):
                                           f"`{_EXPR}`, the rendered page contained `{_PRODUCT}`. "
                                           f"{replayed}")))
                 await _restore_original()
+        if failed:
+            return _finish(ValidationResult(
+                self.name, "inconclusive", "ssti", confidence=0.0, confirmed=False,
+                summary=f"SSTI check incomplete: {len(failed)} of {sends} send(s) got no response "
+                        f"({'; '.join(dict.fromkeys(failed[:3]))}); not a negative result",
+                evidence=f"{answered} answered send(s) showed no evaluated product, but a send that "
+                         f"never reached the target cannot show one."))
         return _finish(ValidationResult(
             self.name, "not_confirmed", "ssti", confidence=0.0, confirmed=False,
             summary="No template expression was evaluated -- parameters are reflected literally, if at all",
