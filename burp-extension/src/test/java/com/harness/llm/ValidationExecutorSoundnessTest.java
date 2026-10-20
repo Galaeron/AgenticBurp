@@ -82,6 +82,8 @@ final class ValidationExecutorSoundnessTest {
                 request("POST", "/change", "", headers("X-CSRF-Token", "test", "Authorization", "Bearer synthetic")),
                 Reply.of(200, SAME), always(200, SAME));
         assertFalse(run.confirmed(), "bearer-only: " + run.status() + " " + run.submission().summary);
+        // No ambient cookie means no cookie-CSRF premise: send no forged probe at all.
+        assertEquals(0, run.sent().size(), "no state-changing probe without a session cookie; sent " + describe(run));
     }
 
     @Test
