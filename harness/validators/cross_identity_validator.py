@@ -29,6 +29,7 @@ server.allowed_hosts. GET-only.
 """
 from __future__ import annotations
 import re
+from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
 
 import httpx
@@ -148,6 +149,23 @@ def has_object_identifier(url: str) -> bool:
     return any(k.lower() in _ID_QUERY_KEYS for k in parse_qs(p.query))
 
 
+@dataclass
+class _UnsentProbe(identity_compare.Probe):
+    """A probe the executor refused or never sent (budget, safety gate, scope,
+    cancellation). It still reads as status 0 / empty body, the 'policy-declined ->
+    not reached' contract of ``_probe``, but carries why, so a caller can tell it
+    from a response (R10)."""
+    outcome: str = ""
+
+
+def _not_reached(probe) -> bool:
+    """True when no HTTP response was obtained for this probe. A request that was
+    refused or never sent is neither a denial nor an authorization verdict: it must
+    never be compared as if the target had answered (R10). A real response never has
+    status 0."""
+    return isinstance(probe, _UnsentProbe) or (getattr(probe, "status", 0) or 0) <= 0
+
+
 def _auth_signature(headers: dict | None) -> tuple:
     """A normalized fingerprint of the PRINCIPAL a set of request headers
     authenticates as: its Authorization value plus its Cookie header. Two header
@@ -226,7 +244,7 @@ class CrossIdentityValidator(Validator):
         responder and never touch the network. When a RunContext is configured (T03)
         the send goes through its Executor -- one policy path (scope + gate + budget,
         redirects re-checked per hop); a policy-declined send is reported as
-        'not reached' (status 0), never a crash."""
+        'not reached' (status 0, an ``_UnsentProbe``), never a crash."""
         if self.run_context is not None:
             from harness.run_context import TypedRequest
             out = await self.run_context.executor().execute(
@@ -235,7 +253,7 @@ class CrossIdentityValidator(Validator):
             if out.outcome == "error":
                 raise RuntimeError(out.error or "probe transport error")
             if not out.executed:   # out_of_scope / blocked / budget / cancelled -> not reached
-                return identity_compare.Probe(0, "")
+                return _UnsentProbe(0, "", outcome=out.outcome or "not sent")
             return identity_compare.Probe(out.status or 0, out.body or "")
         from harness import global_throttle
         await global_throttle.acquire()
@@ -269,6 +287,29 @@ class CrossIdentityValidator(Validator):
     def _skip(self, fc: str, why: str) -> ValidationResult:
         return ValidationResult(validator=self.name, status="skipped", finding_class=fc, summary=why)
 
+    def _blocked(self, fc: str, why: str, evidence: str = "") -> ValidationResult:
+        """The access-control check was refused or never sent (R10). Not a negative:
+        no control_outcome, so it is never read as a held control."""
+        return ValidationResult(validator=self.name, status="blocked", finding_class=fc,
+                                confidence=0.0, confirmed=False, summary=why, evidence=evidence)
+
+    @staticmethod
+    def _unsent_reason(probe) -> str:
+        return getattr(probe, "outcome", "") or "not sent"
+
+    @staticmethod
+    def _incomplete_detail(errored: int, unsent: int, unsent_why: str) -> str:
+        parts = []
+        if errored:
+            parts.append(f"{errored} errored")
+        if unsent:
+            parts.append(f"{unsent} not sent: {unsent_why}")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _last_error_note(errored: int, last_error) -> str:
+        return f" (last error: {last_error})" if errored else ""
+
     @staticmethod
     def _reached(probe: "identity_compare.Probe") -> bool:
         """A substantive success: 2xx with a non-trivial body (not an empty/error
@@ -299,6 +340,8 @@ class CrossIdentityValidator(Validator):
                     admin_probe = await self._probe_identity(exchange.url, ident)
                 except Exception:
                     admin_probe = None
+                if admin_probe is not None and _not_reached(admin_probe):
+                    admin_probe = None   # refused/unsent: no baseline, not a denial (R10)
                 if admin_probe is not None:
                     break
         have_admin_baseline = admin_probe is not None and self._reached(admin_probe)
@@ -306,6 +349,8 @@ class CrossIdentityValidator(Validator):
         considered = 0
         rejects = 0
         errored = 0
+        unsent = 0
+        unsent_why = ""
         last_error = None
         reached_unproven = None
         for ident in idents[:self.max_identities]:
@@ -316,6 +361,10 @@ class CrossIdentityValidator(Validator):
             except Exception as e:
                 errored += 1       # an errored probe is an UNKNOWN, not a denial
                 last_error = e
+                continue
+            if _not_reached(attempt):
+                unsent += 1        # a refused/unsent probe is an UNKNOWN too (R10)
+                unsent_why = self._unsent_reason(attempt)
                 continue
             considered += 1
             if self._reached(attempt):
@@ -338,6 +387,12 @@ class CrossIdentityValidator(Validator):
             else:
                 rejects += 1
         if considered == 0:
+            if unsent:
+                return self._blocked(
+                    fc, f"function-level authorization NOT tested: {unsent} non-privileged identity "
+                        f"request(s) were not sent ({unsent_why}); a refused request is not evidence "
+                        f"that the control held",
+                    evidence=f"No response was obtained for {exchange.url}; this is not a negative result.")
             if errored:
                 return self._skip(fc, f"could not test a function-level bypass: every non-privileged probe "
                                       f"errored ({errored}; last: {last_error}) -- an errored probe is an "
@@ -356,8 +411,8 @@ class CrossIdentityValidator(Validator):
                 evidence=f"Supply an admin session for a privileged-data comparison, or verify the returned "
                          f"content is genuinely admin-only, before treating this as a confirmed BFLA.",
                 control_outcome="inconclusive")
-        if errored:
-            # An errored probe is an UNKNOWN, not a denial. Without this guard it
+        if errored or unsent:
+            # An errored or unsent probe is an UNKNOWN, not a denial. Without this guard it
             # silently drops out of `considered`, so a single remaining denial
             # satisfies rejects==considered and the leg reports "authorization
             # holds" at 0.8 with control_outcome="control_held" -- which the
@@ -367,11 +422,13 @@ class CrossIdentityValidator(Validator):
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.0, confirmed=False,
                 summary=f"Function-level authorization test INCONCLUSIVE: {rejects} non-privileged "
-                        f"identity/identities were denied, but {errored} probe(s) errored and could not "
-                        f"be evaluated -- 'every non-privileged identity was denied' cannot be asserted.",
+                        f"identity/identities were denied, but {errored + unsent} probe(s) "
+                        f"({self._incomplete_detail(errored, unsent, unsent_why)}) could not be "
+                        f"evaluated -- 'every non-privileged identity was denied' cannot be asserted.",
                 evidence=f"{considered} non-privileged identity/identities tested against {exchange.url} "
-                         f"({rejects} denied); {errored} errored (last: {last_error}). An errored probe is "
-                         f"an unknown, not a denial, so this is NOT reported as a held control.",
+                         f"({rejects} denied); {self._incomplete_detail(errored, unsent, unsent_why)}"
+                         f"{self._last_error_note(errored, last_error)}. An errored or unsent probe "
+                         f"is an unknown, not a denial, so this is NOT reported as a held control.",
                 control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
@@ -429,6 +486,15 @@ class CrossIdentityValidator(Validator):
         except Exception as e:  # network/scope error -- degrade, never crash the pipeline
             return ValidationResult(validator=self.name, status="error", finding_class=fc,
                                     summary=f"anonymous baseline probe failed: {e}")
+        if _not_reached(anon):
+            # R10: the baseline was refused (budget, gate, scope, cancellation) or never
+            # sent. Comparing an identity against an empty "denial" would claim a held
+            # control the target never exercised.
+            return self._blocked(
+                fc, f"cross-identity access control NOT tested: the anonymous baseline request was "
+                    f"not sent ({self._unsent_reason(anon)}); a refused request is not evidence "
+                    f"that the control held",
+                evidence=f"No response was obtained for {exchange.url}; this is not a negative result.")
 
         # Function-level authorization (BFLA): an admin-namespaced function reached
         # by a NON-privileged identity while anonymous is denied. The namespace
@@ -441,6 +507,8 @@ class CrossIdentityValidator(Validator):
         rejects = 0
         authorized = 0
         errored = 0
+        unsent = 0
+        unsent_why = ""
         last_error = None
         for ident in idents_distinct[:self.max_identities]:
             try:
@@ -448,6 +516,10 @@ class CrossIdentityValidator(Validator):
             except Exception as e:
                 errored += 1       # an errored probe is an UNKNOWN, not a denial
                 last_error = e
+                continue
+            if _not_reached(attempt):
+                unsent += 1        # a refused/unsent probe is an UNKNOWN too (R10)
+                unsent_why = self._unsent_reason(attempt)
                 continue
             considered += 1
             ev = identity_compare.evaluate(
@@ -479,6 +551,11 @@ class CrossIdentityValidator(Validator):
                 rejects += 1
 
         if considered == 0:
+            if unsent:
+                return self._blocked(
+                    fc, f"cross-identity access control NOT tested: {unsent} identity request(s) were "
+                        f"not sent ({unsent_why}); a refused request is not evidence that the control held",
+                    evidence=f"No response was obtained for {exchange.url}; this is not a negative result.")
             if errored:
                 return self._skip(fc, f"no configured identity probe completed: every probe errored "
                                       f"({errored}; last: {last_error}) -- cannot test access control")
@@ -493,8 +570,8 @@ class CrossIdentityValidator(Validator):
                 evidence=f"OwnershipLedger authorized {authorized} of {considered} tested "
                          f"principal(s) for {self._object_ref(exchange.url)!r}.",
                 control_outcome="inconclusive")
-        if errored:
-            # An errored probe is an UNKNOWN, not a denial. Without this guard it
+        if errored or unsent:
+            # An errored or unsent probe is an UNKNOWN, not a denial. Without this guard it
             # silently drops out of `considered`, so a single remaining denial
             # satisfies rejects==considered and the leg reports "access correctly
             # restricted" at 0.8 with control_outcome="control_held" -- which the
@@ -504,11 +581,14 @@ class CrossIdentityValidator(Validator):
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.0, confirmed=False,
                 summary=f"Cross-identity access-control test INCONCLUSIVE: {rejects} identity/identities "
-                        f"were denied, but {errored} probe(s) errored and could not be evaluated -- "
-                        f"'every other identity was denied' cannot be asserted.",
+                        f"were denied, but {errored + unsent} probe(s) "
+                        f"({self._incomplete_detail(errored, unsent, unsent_why)}) could not be "
+                        f"evaluated -- 'every other identity was denied' cannot be asserted.",
                 evidence=f"{considered} identity/identities evaluated against {exchange.url} "
-                         f"({rejects} rejected); {errored} errored (last: {last_error}). An errored probe "
-                         f"is an unknown, not a denial, so this is NOT reported as a restricted/held control.",
+                         f"({rejects} rejected); {self._incomplete_detail(errored, unsent, unsent_why)}"
+                         f"{self._last_error_note(errored, last_error)}. An errored or unsent "
+                         f"probe is an unknown, not a denial, so this is NOT reported as a "
+                         f"restricted/held control.",
                 control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
