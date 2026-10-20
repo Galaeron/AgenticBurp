@@ -60,7 +60,9 @@ def _refuse_all(sent):
     return request
 
 
-class _RvlBase(_CallerBase):
+# unittest.TestCase is named explicitly (already in _CallerBase's MRO) so the
+# static collection guard in test_no_orphan_test_files sees these as test cases.
+class _RvlBase(_CallerBase, unittest.TestCase):
     def _in_run(self, key, validator, finding, exchange, *, max_requests, fake_request,
                 mutating=True, hosts=("shop.invalid",), extra_gate=None):
         """One validator through _validate_findings inside an explicit run whose
