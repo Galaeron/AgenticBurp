@@ -213,15 +213,17 @@ _CALLER_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
                        "harness AuthSequenceValidator returns a controlled negative where the "
                        "registration policy rejects the weak password"),
     "fixation_confirm": ("WSTG-SESS-03", _LEG, "test_auth_session_fixation_confirms", _CONFIRM,
-                         "harness AuthSequenceValidator confirms session fixation (a pre-auth "
-                         "session cookie is not rotated across login)"),
+                         "harness AuthSequenceValidator confirms session fixation (the login "
+                         "succeeds, the pre-auth session id is not rotated and is then "
+                         "authenticated, and the anonymous control is a healthy denial)"),
     "fixation_control": ("WSTG-SESS-03", _LEG, "test_auth_session_fixation_silent_on_rotating_control",
                          _CONTROL,
                          "harness AuthSequenceValidator returns a controlled negative where the "
                          "session token rotates at login"),
     "stored_xss_confirm": ("WSTG-INPV-02", _LEG, "test_stored_xss_confirms_on_raw_render", _CONFIRM,
-                           "harness StoredXssValidator confirms stored XSS (plant then independent "
-                           "raw render)"),
+                           "harness StoredXssValidator confirms stored XSS (plant, then the "
+                           "payload executes on an independent render, logging a value computed "
+                           "at run time to the console; a raw render alone is a candidate)"),
     "stored_xss_control": ("WSTG-INPV-02", _LEG, "test_stored_xss_silent_on_escaped_render_control",
                            _CONTROL,
                            "harness StoredXssValidator returns a controlled negative where the "
