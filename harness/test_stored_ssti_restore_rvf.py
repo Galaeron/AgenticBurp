@@ -67,7 +67,8 @@ class StoredSstiRestoreTests(_CallerBase):
 
     PAGE = ORIGIN + "/page"
 
-    def _stored(self, *, ceiling=None, restore_status=200, max_requests=None):
+    def _stored(self, *, ceiling=None, restore_status=200, max_requests=None,
+                lose_plant_response=False):
         """Drive the stored-SSTI leg through _validate_findings against a fake
         settings page whose value is rendered on /page. Returns (reports, state, sent)."""
         from harness.validators.ssti_validator import SstiValidator
@@ -94,6 +95,8 @@ class StoredSstiRestoreTests(_CallerBase):
                 body = kwargs.get("content") or ""
                 body = body.decode() if isinstance(body, bytes) else body
                 state["display"] = parse_qs(body)["display"][0]
+                if lose_plant_response and len(posts) == 1:
+                    raise httpx.ReadTimeout("response lost after the write", request=request)
             text = "8633" if method == "GET" and state["display"] == "89*97" else "fixture"
             return httpx.Response(200, text=text, request=request)
         agent_reports = [AgentReport(agent="ssti", model="fake", findings=[_finding("ssti")])]
@@ -152,6 +155,15 @@ class StoredSstiRestoreTests(_CallerBase):
         self.assertEqual(state["display"], "original")             # really restored
         self.assertEqual([m for m, _ in sent if m == "POST"], ["POST", "POST"])
         self.assertIn("replayed afterward", self._text(reports))
+        self.assertNotIn("NOT restored", self._text(reports))
+
+    def test_a_plant_whose_response_was_lost_is_still_restored(self):
+        # The write landed but its response never arrived: the state is unknown, so the
+        # captured request is replayed rather than leaving the plant behind.
+        reports, state, sent = self._stored(ceiling=2, lose_plant_response=True)
+        self.assertEqual([m for m, _ in sent if m == "POST"], ["POST", "POST"])
+        self.assertEqual(state["display"], "original")
+        self.assertFalse(any(v.confirmed for v in reports), _verdicts(reports))
         self.assertNotIn("NOT restored", self._text(reports))
 
     # a restore the target rejects after the plant was written is disclosed
