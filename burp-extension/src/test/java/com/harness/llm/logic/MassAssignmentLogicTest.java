@@ -34,24 +34,66 @@ public final class MassAssignmentLogicTest {
     @Test
     @DisplayName("field already in the original request body -> invalid, not a useful probe")
     void fieldAlreadyPresentIsInvalid() {
-        Evidence e = evaluate("role", "\"admin\"", true, "{}", "{\"role\":\"admin\"}");
+        Evidence e = evaluate("role", "\"admin\"", true, "{}", 200, "{\"role\":\"admin\"}", 200, "{}", 200, "{}");
         assertEquals(Verdict.INVALID, e.verdict());
     }
 
     @Test
-    @DisplayName("injected field reflected back, absent from baseline -> confirmed mass assignment")
-    void reflectedAndNewIsConfirmed() {
+    @DisplayName("write accepted, read before lacks the field, read after shows it -> confirmed mass assignment")
+    void persistedChangeIsConfirmed() {
         Evidence e = evaluate("role", "\"admin\"", false,
-                "{\"id\":1,\"name\":\"alice\"}", "{\"id\":1,\"name\":\"alice\",\"role\":\"admin\"}");
+                "{\"id\":1,\"name\":\"alice\"}",
+                200, "{\"id\":1,\"name\":\"alice\",\"role\":\"admin\"}",
+                200, "{\"id\":1,\"name\":\"alice\",\"role\":\"user\"}",
+                200, "{\"id\":1,\"name\":\"alice\",\"role\":\"admin\"}");
         assertEquals(Verdict.CONFIRMED, e.verdict());
         assertTrue(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("R27: injected field reflected back but not stored -> supported only, reflection alone is not proof")
+    void reflectedWithoutPersistenceIsSupported() {
+        Evidence e = evaluate("role", "\"admin\"", false,
+                "{\"id\":1,\"name\":\"alice\"}",
+                200, "{\"id\":1,\"name\":\"alice\",\"role\":\"admin\"}",
+                200, "{\"id\":1,\"name\":\"alice\",\"role\":\"user\"}",
+                200, "{\"id\":1,\"name\":\"alice\",\"role\":\"user\"}");
+        assertEquals(Verdict.SUPPORTED, e.verdict());
+        assertFalse(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("R27: a 400 that names the rejected field -> rejected")
+    void refusedWriteIsRejected() {
+        Evidence e = evaluate("role", "\"admin\"", false, "{\"name\":\"sample\"}",
+                400, "{\"error\":\"Unknown field. Request rejected.\",\"rejected\":{\"role\":\"admin\"}}",
+                200, "{\"name\":\"sample\"}", -1, null);
+        assertEquals(Verdict.REJECTED, e.verdict());
+        assertFalse(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("R27: a read after the write without a successful read before it is not persistence evidence")
+    void afterReadWithoutBeforeReadIsNotConfirmed() {
+        Evidence e = evaluate("role", "\"admin\"", false, "{\"name\":\"sample\"}",
+                200, "{\"name\":\"sample\"}", 405, "method not allowed", 200, "{\"role\":\"admin\"}");
+        assertFalse(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("the field must be bound to the value as one key/value pair")
+    void carriesFieldBindsKeyToValue() {
+        assertTrue(carriesField("{\"role\" : \"admin\"}", "role", "\"admin\""));
+        assertFalse(carriesField("{\"role\":\"user\",\"title\":\"admin\"}", "role", "\"admin\""));
+        assertFalse(carriesField(null, "role", "\"admin\""));
     }
 
     @Test
     @DisplayName("injected field absent from mutated response -> rejected")
     void notReflectedIsRejected() {
         Evidence e = evaluate("role", "\"admin\"", false,
-                "{\"id\":1,\"name\":\"alice\"}", "{\"id\":1,\"name\":\"alice\"}");
+                "{\"id\":1,\"name\":\"alice\"}", 200, "{\"id\":1,\"name\":\"alice\"}",
+                200, "{\"id\":1,\"name\":\"alice\"}", 200, "{\"id\":1,\"name\":\"alice\"}");
         assertEquals(Verdict.REJECTED, e.verdict());
         assertFalse(e.confirmed());
     }
@@ -60,7 +102,8 @@ public final class MassAssignmentLogicTest {
     @DisplayName("field/value already present in baseline response too -> supported, not confirmed")
     void alreadyInBaselineIsSupportedNotConfirmed() {
         Evidence e = evaluate("role", "\"admin\"", false,
-                "{\"id\":1,\"role\":\"admin\"}", "{\"id\":1,\"role\":\"admin\"}");
+                "{\"id\":1,\"role\":\"admin\"}", 200, "{\"id\":1,\"role\":\"admin\"}",
+                200, "{\"id\":1,\"role\":\"admin\"}", 200, "{\"id\":1,\"role\":\"admin\"}");
         assertEquals(Verdict.SUPPORTED, e.verdict());
         assertFalse(e.confirmed());
     }

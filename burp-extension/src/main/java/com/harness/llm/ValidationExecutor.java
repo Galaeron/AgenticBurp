@@ -918,8 +918,8 @@ public final class ValidationExecutor {
     // api_security_validation -- mass-assignment probe. Directly
     // implements the api_security agent's own suggested_test: resend a
     // create/update request with an extra unrequested field ("role":
-    // "admin") added to the JSON body and check whether the response
-    // reflects it back as accepted. See MassAssignmentLogic.
+    // "admin") added to the JSON body, then read the resource back to
+    // see whether the field was stored. See MassAssignmentLogic.
     // ---------------------------------------------------------------
     private static final String MASS_ASSIGNMENT_FIELD_NAME = "role";
     private static final String MASS_ASSIGNMENT_FIELD_VALUE_JSON = "\"admin\"";
@@ -942,16 +942,23 @@ public final class ValidationExecutor {
                             + "probe requires an object-shaped body to inject a field into.", "");
             return;
         }
+        // Persistence evidence: read the resource before and after the write.
+        // An echo of the request in the write's own response proves nothing
+        // about what was stored.
+        var before = api.http().sendRequest(readRequest(req, req.path()));
         var rr = api.http().sendRequest(req.withBody(mutatedBody));
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the mass-assignment probe request.", "");
             return;
         }
+        var after = MassAssignmentLogic.isSuccess(resp.statusCode())
+                ? api.http().sendRequest(readRequest(req, req.path())) : null;
         String baselineResponseBody = source.response() == null ? null : source.response().bodyToString();
         MassAssignmentLogic.Evidence ev = MassAssignmentLogic.evaluate(
                 MASS_ASSIGNMENT_FIELD_NAME, MASS_ASSIGNMENT_FIELD_VALUE_JSON, fieldAlreadyPresent,
-                baselineResponseBody, resp.bodyToString());
+                baselineResponseBody, resp.statusCode(), resp.bodyToString(),
+                status(before), responseBody(before), status(after), responseBody(after));
         statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
     }
 
@@ -990,6 +997,10 @@ public final class ValidationExecutor {
 
     private static int status(HttpRequestResponse rr) {
         return (rr == null || rr.response() == null) ? -1 : rr.response().statusCode();
+    }
+
+    private static String responseBody(HttpRequestResponse rr) {
+        return (rr == null || rr.response() == null) ? null : rr.response().bodyToString();
     }
 
     // crypto_transport_validation -- passive; classifies the captured exchange's
