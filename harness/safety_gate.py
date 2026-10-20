@@ -211,6 +211,16 @@ class SafetyGate:
         self._mutating_counts[finding_id] = used + n
         return True, used, ceiling
 
+    def mutating_headroom(self, finding_id: str | None,
+                          validator_name: str | None = None) -> tuple[int, int, int]:
+        """Read-only view of a finding's mutating-send budget: (remaining, used,
+        ceiling) under the same ceiling _reserve_mutating enforces. Reserves
+        nothing, so a validator can check it can afford a write and its undo
+        before sending either."""
+        ceiling = self._mutating_ceiling(validator_name)
+        used = self._mutating_counts.get(finding_id, 0) if finding_id else 0
+        return max(ceiling - used, 0), used, ceiling
+
     def reset_finding_budget(self, finding_id: str | None = None) -> None:
         """Clear the mutating-request budget for one finding, or all of them."""
         if finding_id is None:
