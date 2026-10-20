@@ -167,6 +167,71 @@ Independent verification (same report) of the code at `7cd6fdd`, exported with `
 RV-A, RV-G and RV-H have now landed. The review's "no live target" gate is lifted, but any live
 target still needs the owner's authorization.
 
-Next: RV-E, RV-F and RV-I are in progress (started 2026-10-20 from `7cd6fdd`). Then RV-D2
-(P1), then RV-C (brief `.test-work/rv-c-evalprovenance-20261020/BATCH.md`). RV-J and RV-K need
-a JDK build.
+Landed on PR #1 (2026-10-20): RV-E, RV-F and RV-I, verified together at `c648dbd`. All are
+caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-e-falseconfirm2-20261020/`,
+`.test-work/rv-f-blockednotneg-20261020/` and `.test-work/rv-i-discovery-20261020/`.
+
+- **RV-E** (`b50ccad`, `78e71dc`, `59d5005`, `10e09f4`, `f59f91b`):
+  - R18: mass assignment needs an accepted write and an independent read-back. A rejected
+    request that echoes the field is a candidate.
+  - R19: a raw stored-payload match is a candidate; only the planted nonce executing in a
+    browser confirms. Without Playwright, stored XSS is now at most inconclusive.
+  - R20: session fixation needs a successful login and authenticated use of the fixed
+    identifier. An HTTP 401 with an unrotated cookie no longer confirms.
+  - R33: attribution relabels from the leg that executed, never from an unexecuted hint.
+  - Stored-XSS tests in two files and the session-fixation fixture encoded the unsound
+    confirmations. They were changed to supply real execution or login evidence; their
+    assertions stand. The evaluation score is unchanged.
+  - **The false-confirmation work is not closed.** A second independent verification
+    (`reviews/2026-10-20-rvei-implementation-verification/REPORT.md`, untracked) confirmed R33
+    and reproduced three P1 residuals at `c648dbd` through the production callers:
+    - E1 (R18): the probe field may already be true before a write that changes nothing; no
+      baseline read shows the write changed it;
+    - E2 (R19): the nonce matches as a substring of console text, so a page that logs the
+      inert payload's source counts as execution (reproduced with real Chromium);
+    - E3 (R20): an anonymous HTTP 500 or timeout counts as a session denial (the V1 shape).
+    - None is a regression: the code before RV-E confirmed on weaker evidence. Batch RV-E2
+      (brief `.test-work/rv-e2-falseconfirm-residual-20261020/BATCH.md`) owns them.
+  - Follow-ups:
+    - api_security probes that were blocked or unsent still read as passed (R08 shape);
+    - the unbounded-limit probe still confirms on a response-size heuristic;
+    - two coverage-manifest descriptions (`fixation_confirm`, `stored_xss_confirm`) are out
+      of date;
+    - leg_self_test's xss case should say it needs Playwright.
+- **RV-F** (`9e6461b`, `3e5010b`, `67c07d8`, `937b927`):
+  - R10: a cross-identity request that was refused or never sent is `blocked`, never a held
+    control.
+  - R11: only an executed negative counts as tested coverage; a blocked or skipped leg is
+    untested.
+  - R12: stored SSTI checks the restore's outcome, discloses residual state, and refuses a
+    plant whose restore it cannot afford. Under the default gate (one write per finding) the
+    stored-SSTI leg is now `blocked`; `validators.mutating_ceiling_by_check: {ssti: 2}` in
+    config.local.yaml enables it.
+  - Owner decision (2026-10-20, recorded in RV-F's handoff): stored SSTI stays opt-in, with
+    no built-in `ssti` allowance.
+  - Owner decision open: whether cleanup should run after cancellation (the restore does not
+    pass `allow_cancelled_cleanup`).
+  - Follow-ups:
+    - `SafetyGate` needs a public headroom accessor; the fix reads private fields and fails
+      closed without them;
+    - `CoverageMatrix.not_tested()` omits BLOCKED, INCONCLUSIVE and ERROR cells from its list;
+    - an SSTI check whose sends all failed still reads as a negative.
+- **RV-I** (`30ff6d3`, `fb2fe3a`, `b4344ff`, `c648dbd`):
+  - R13: the Allow header is read case-insensitively.
+  - R21: recon selects crawl links on the fetched set, so captured links are requested. Scope
+    and the destructive-navigation filter still apply.
+  - R22: each captured path ID is replayed in its own slot. This adds `path_ids` and
+    `path_id_values()` to `harness/engagement.py`, outside the batch's file list; the owner
+    approved it (2026-10-20).
+  - R23: header names are normalised once before anomaly analysis.
+  - The second verification confirmed R13, R21, R22 and R23 independently.
+  - Follow-ups:
+    - a nested child with no template of its own still gets its parent's single ID in every
+      slot;
+    - templates stored before this change keep the old behaviour;
+    - links shown only in the captured page, not the live page, are still not crawled (a
+      design decision).
+
+Next: RV-C (branch `rv-c-evalprovenance`) and RV-J (branch `rv-j-burpexecutors`) have
+committed fixes, not yet landed. RV-D2 (P1) and RV-E2 (P1) are running their gates. RV-K waits
+for the I01 W-split, because `HarnessPanel.java` carries WIP.

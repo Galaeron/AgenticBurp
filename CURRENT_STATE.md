@@ -5,8 +5,8 @@
   [Galaeron/AgenticBurp#1](https://github.com/Galaeron/AgenticBurp/pull/1) after today's push.
   Auto-fix is on for PR #1.
 - Commits: `git log --oneline 474ad511..HEAD` (each batch is followed by a docs commit).
-  Latest: code review 02 RV-B (`268358b`..`d70e049`), RV-H (`7beb9de`..`7fba139`) and RV-D
-  (`6533b18`..`7cd6fdd`), after RV-A and RV-G. All pushed to PR #1.
+  Latest: code review 02 RV-E (`b50ccad`..`f59f91b`), RV-F (`9e6461b`..`937b927`) and RV-I
+  (`30ff6d3`..`c648dbd`), after RV-A, RV-G, RV-B, RV-H and RV-D. All pushed to PR #1.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
@@ -36,13 +36,13 @@
   `file_upload_agent.py` / `FileUploadLogic.java` from worktrees under %TEMP%. Block the
   venv's editable-install leak (it imports modules missing from a worktree from the main
   checkout) with an untracked `sitecustomize.py` there plus `PYTHONPATH=<worktree>`.
-- CI runs Python 3.14. Last full verification: `7cd6fdd` exactly (isolated worktree
-  `.test-work/wt-land-rvbhd`, unchanged during the run).
+- CI runs Python 3.14. Last full verification: `c648dbd` exactly (isolated worktree
+  `.test-work/wt-land-rvefi`, unchanged during the run).
   - Interpreters: system Python 3.14.7 and venv 3.12.14, with the same results on both.
   - Results: precondition 74 OK, smoke 146 OK, full exit 0.
-  - Full breakdown: 3536 harness, 342 evaluation (17 skips), 59 integrity.
+  - Full breakdown: 3613 harness, 342 evaluation (17 skips), 59 integrity.
   - 0 ResourceWarnings; the coverage gate reports 25 gaps.
-  - Logs: `.test-work/land-rv-bhd-20261020/`.
+  - Logs: `.test-work/land-rv-efi-20261020/`.
 - Stopping a background run with TaskStop leaves its process tree running. End it by
   exact PID tree, and never by a pattern that could match another session's processes.
 
@@ -53,6 +53,10 @@
 - RV-G interim choices accepted for now (2026-10-19): no request ceiling for the crawl routes
   beyond `runs.max_requests`; the routes send no mutating probes; the Burp missing-auth panel
   stays unconfirmed until I16 adds a baseline.
+- 2026-10-20: RV-I's additive `harness/engagement.py` edit (R22 `path_ids`) approved.
+- 2026-10-20: stored SSTI stays opt-in (no built-in `ssti` write allowance). Under the default
+  gate it reports `blocked`; `validators.mutating_ceiling_by_check: {ssti: 2}` in
+  config.local.yaml enables it.
 
 ## Open work and evidence boundaries
 - Plan: docs/REMAINING_IMPLEMENTATION_PLAN_2026-10-17.md. Partial: I01, I02, I03, I04, I05,
@@ -71,19 +75,30 @@
     - RV-B: evaluation certification;
     - RV-H: evidence states (no VERIFIED without proof, standalone session, crash is error);
     - RV-D: false confirmations in CORS, IDOR, open redirect and SSRF (V1 to V3 remain,
-      below).
+      below);
+    - RV-E: false confirmations in mass assignment, stored XSS, session fixation and
+      attribution;
+    - RV-F: blocked or unsent checks are not negatives; stored SSTI checks its restore;
+    - RV-I: discovery and anomaly analysis keep what was captured.
     - Status and follow-ups: docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md "Status".
 
   Next:
-  - Code review 02 (`reviews/2026-10-17-code-review-02/FINAL_REVIEW.md`, untracked) has 29
-    open findings, in batches RV-C, RV-E, RV-F, RV-I, RV-J and RV-K of
+  - Code review 02 (`reviews/2026-10-17-code-review-02/FINAL_REVIEW.md`, untracked) has 18
+    open findings, in batches RV-C, RV-J and RV-K of
     docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md.
     - Independent verification (`reviews/2026-10-20-rv-implementation-verification/REPORT.md`,
       untracked) found three P1 false confirmations RV-D left: V1 IDOR on an anonymous
       HTTP 500, V2 single-principal IDOR, V3 wildcard CORS with credentials. Batch RV-D2 owns
       them; none is a regression.
-    - RV-E, RV-F and RV-I are in progress (started 2026-10-20 from `7cd6fdd`); then RV-D2, then
-      RV-C. RV-J and RV-K need a JDK build.
+    - A second verification (`reviews/2026-10-20-rvei-implementation-verification/REPORT.md`,
+      untracked) confirmed RV-I and R33, and found three P1 residuals RV-E left: E1 mass
+      assignment without a baseline, E2 the XSS nonce matched as a substring of console text,
+      E3 an anonymous HTTP 500 or timeout taken as a session denial. Batch RV-E2 owns them;
+      none is a regression.
+    - RV-C and RV-J have committed fixes on their own branches, not yet landed. RV-D2 and
+      RV-E2 are running their gates. RV-K waits for the I01 W-split (`HarnessPanel.java`
+      carries WIP).
+    - Owner decision open from RV-F: whether cleanup runs after cancellation.
     - Owner decision needed: `testing/run_web_objective_smoke.py`, the efficacy runner's
       default, is untracked, so a clean checkout cannot run it.
     - RV-A, RV-G and RV-H have landed, so the review's live-target gate is met. Any live
