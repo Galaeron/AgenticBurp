@@ -1397,11 +1397,16 @@ public final class ValidationExecutor {
 
     // ---------------------------------------------------------------
     // csrf_validation -- if a CSRF-token-shaped header or body/form
-    // parameter is found, removes it and resends once, comparing
-    // status codes; if none is found, reports the passive signal
-    // without an extra request. See CsrfLogic for the full scope note
-    // (this only evaluates classic cookie-based session CSRF).
+    // parameter is found, sends what a cross-site page could make the
+    // browser send (session cookie kept, token removed or invalidated,
+    // no header such a page cannot set), a no-cookie control, and reads
+    // the state back to see whether the forged request changed it; if
+    // no token is found, reports the passive signal without an extra
+    // request. See CsrfLogic for the full scope note (this only
+    // evaluates classic cookie-based session CSRF).
     // ---------------------------------------------------------------
+    private static final String CSRF_INVALIDATED_TOKEN = "invalidated-by-harness";
+
     private void csrfValidation(TestPlan plan, HttpRequestResponse source) {
         HttpRequest req = source.request();
         // Only the cookie is ambient: a browser attaches it to a cross-site
@@ -1409,40 +1414,91 @@ public final class ValidationExecutor {
         String cookie = reqHeader(req, "Cookie");
         boolean cookieAuthPresent = cookie != null && !cookie.isBlank();
 
-        // The forged request starts as the captured one without a valid token:
-        // a token header is removed, a token parameter is invalidated.
-        HttpRequest forged = null;
+        // The forged request is what a cross-site page can make the browser
+        // send: every header such a page cannot set is removed -- a token
+        // header, and a credential in Authorization or a custom header such
+        // as X-Auth-Token (RV-J residual N2) -- and every token parameter is
+        // invalidated. The cookie stays.
+        HttpRequest forged = req;
+        List<String> tokenCarriers = new ArrayList<>();
+        Set<String> removedHeaders = new LinkedHashSet<>();
         for (HttpHeader h : req.headers()) {
-            if (CsrfLogic.looksLikeCsrfTokenName(h.name())) { forged = req.withRemovedHeader(h.name()); break; }
-        }
-        if (forged == null) {
-            for (var p : req.parameters()) {
-                if (p.type() == HttpParameterType.COOKIE) continue;
-                if (CsrfLogic.looksLikeCsrfTokenName(p.name())) {
-                    forged = req.withParameter(HttpParameter.parameter(p.name(), "invalidated-by-harness", p.type()));
-                    break;
-                }
+            if (CsrfLogic.looksLikeCsrfTokenName(h.name())) tokenCarriers.add("header " + h.name());
+            if (!CsrfLogic.isCrossSiteSendableHeader(h.name()) && removedHeaders.add(h.name().toLowerCase(Locale.ROOT))) {
+                forged = forged.withRemovedHeader(h.name());
             }
         }
-        boolean tokenFound = forged != null;
+        HttpParameter markable = null;
+        for (var p : req.parameters()) {
+            if (p.type() == HttpParameterType.COOKIE) continue;
+            if (CsrfLogic.looksLikeCsrfTokenName(p.name())) {
+                forged = forged.withParameter(HttpParameter.parameter(p.name(), CSRF_INVALIDATED_TOKEN, p.type()));
+                tokenCarriers.add(p.type().name().toLowerCase(Locale.ROOT) + " parameter " + p.name());
+            } else if (markable == null && CsrfLogic.isMarkableField(p.name(), p.value())) {
+                markable = p;
+            }
+        }
+        boolean tokenFound = !tokenCarriers.isEmpty();
         int originalStatus = status(source);
         int forgedStatus = -1;
         int anonymousStatus = -1;
+        CsrfLogic.ReadBack readBack = CsrfLogic.ReadBack.notRun("the forged request was not sent or not answered with a 2xx");
         if (tokenFound && cookieAuthPresent && !CsrfLogic.isSafeMethod(req.method())
                 && CsrfLogic.isSuccess(originalStatus)) {
-            // What a cross-site page can make the browser send: the session
-            // cookie, no valid token, no non-ambient credential.
-            forged = forged.withRemovedHeader("Authorization");
+            // A 2xx is not a state change (RV-J residual N1): the forged
+            // request appends a unique marker to one submitted field, and the
+            // page that shows that state is read once before it and twice after.
+            String marker = null;
+            String readTarget = null;
+            HttpRequestResponse before = null;
+            if (markable != null) {
+                marker = CsrfLogic.newChangeMarker(java.util.concurrent.ThreadLocalRandom.current());
+                forged = forged.withParameter(HttpParameter.parameter(markable.name(), markable.value() + marker, markable.type()));
+                for (String candidate : csrfReadTargets(req)) {
+                    before = api.http().sendRequest(readRequest(req, candidate));
+                    if (CsrfLogic.isSuccess(status(before))) { readTarget = candidate; break; }
+                }
+            }
             forgedStatus = status(api.http().sendRequest(forged));
             if (CsrfLogic.isSuccess(forgedStatus)) {
+                if (readTarget != null) {
+                    var after = api.http().sendRequest(readRequest(req, readTarget));
+                    var again = api.http().sendRequest(readRequest(req, readTarget));
+                    readBack = CsrfLogic.readBack(readTarget, markable.name(), marker,
+                            status(before), responseBody(before), status(after), responseBody(after),
+                            status(again), responseBody(again));
+                } else {
+                    readBack = CsrfLogic.ReadBack.notRun(markable == null
+                            ? "no submitted field could carry a change marker"
+                            : "no page showing the state could be read (tried " + String.join(", ", csrfReadTargets(req)) + ")");
+                }
                 // Control: the same request without the cookie either. If it
                 // also succeeds, the action is not gated on the session.
                 anonymousStatus = status(api.http().sendRequest(forged.withRemovedHeader("Cookie")));
             }
         }
         CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, tokenFound,
-                originalStatus, forgedStatus, anonymousStatus);
-        statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
+                originalStatus, forgedStatus, anonymousStatus, readBack);
+        String probe = "token carriers: " + (tokenCarriers.isEmpty() ? "none" : String.join(", ", tokenCarriers))
+                + " | removed (a cross-site page cannot send them): "
+                + (removedHeaders.isEmpty() ? "none" : String.join(", ", removedHeaders))
+                + (markable == null ? "" : " | change marker appended to field '" + markable.name() + "'");
+        String detail = ev.detail() == null || ev.detail().isEmpty() ? probe : ev.detail() + " | " + probe;
+        statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), detail);
+    }
+
+    /**
+     * Pages that may show the state a CSRF-able write changes, in order: the
+     * page the form was submitted from (a same-origin Referer), then the
+     * action's own path without its query.
+     */
+    private static List<String> csrfReadTargets(HttpRequest req) {
+        List<String> targets = new ArrayList<>();
+        String referer = sameOriginPath(req.url(), reqHeader(req, "Referer"));
+        if (referer != null) targets.add(referer);
+        String action = pathOnly(req.path());
+        if (!action.isEmpty() && !targets.contains(action)) targets.add(action);
+        return targets;
     }
 
     // ---------------------------------------------------------------

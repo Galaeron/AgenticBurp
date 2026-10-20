@@ -1,5 +1,8 @@
 package com.harness.llm.logic;
 
+import java.util.Locale;
+import java.util.Random;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -26,6 +29,29 @@ public final class CsrfLogic {
             "(?i)^(csrf[_-]?token|x[_-]?csrf[_-]?token|xsrf[_-]?token|x[_-]?xsrf[_-]?token|"
                     + "authenticity_token|csrfmiddlewaretoken|__requestverificationtoken|_csrf)$");
 
+    /**
+     * Request headers a cross-site page can make a victim's browser send:
+     * those the browser sets itself, and the CORS-safelisted ones a form or a
+     * no-cors fetch may carry. Any other header on a captured request was set
+     * by the application's own script (a token header, Authorization, a
+     * custom credential such as X-Auth-Token) and needs a preflight the
+     * attacker's origin cannot pass.
+     */
+    private static final Set<String> CROSS_SITE_SENDABLE_HEADERS = Set.of(
+            "host", "cookie", "content-type", "content-length", "content-language", "accept",
+            "accept-language", "accept-encoding", "user-agent", "connection", "keep-alive", "origin",
+            "referer", "cache-control", "pragma", "upgrade-insecure-requests", "dnt", "te", "priority");
+
+    /**
+     * Fields the change marker is never appended to: credentials, contact
+     * details and links the account depends on, and identifiers. Matched
+     * anywhere in the name, so it errs towards not marking.
+     */
+    private static final Pattern UNMARKABLE_FIELD = Pattern.compile(
+            "(?i)pass|pwd|secret|token|key|otp|pin|code|captcha|user|login|account|mail|phone|url|uri|link|redirect|"
+                    + "return|next|callback|(^|[_-])id$|^id");
+    private static final Pattern BOOLEAN_LIKE = Pattern.compile("(?i)true|false|on|off|yes|no");
+
     private CsrfLogic() {}
 
     public static boolean isSafeMethod(String method) {
@@ -41,16 +67,92 @@ public final class CsrfLogic {
         return status >= 200 && status < 300;
     }
 
+    /** True if a cross-site page can make the victim's browser send this header (see the allowlist above). */
+    public static boolean isCrossSiteSendableHeader(String name) {
+        if (name == null) return false;
+        String n = name.trim().toLowerCase(Locale.ROOT);
+        return n.startsWith(":") || n.startsWith("sec-fetch-") || n.startsWith("sec-ch-") || n.equals("sec-gpc")
+                || CROSS_SITE_SENDABLE_HEADERS.contains(n);
+    }
+
+    /**
+     * True if the change marker may be appended to this submitted field: a
+     * free-text-looking value (it has a letter and is not an e-mail address,
+     * a link or a boolean) in a field whose name is not a credential, a
+     * contact detail, a link or an identifier -- so the marked value is
+     * likely to pass validation, and the probe never rewrites a password, an
+     * address the account depends on or a redirect target.
+     */
+    public static boolean isMarkableField(String name, String value) {
+        if (name == null || value == null || looksLikeCsrfTokenName(name)) return false;
+        if (UNMARKABLE_FIELD.matcher(name).find()) return false;
+        String v = value.trim();
+        if (v.isEmpty() || v.length() > 200 || v.indexOf('@') >= 0 || v.contains("://")) return false;
+        if (BOOLEAN_LIKE.matcher(v).matches()) return false;
+        return v.chars().anyMatch(Character::isLetter);
+    }
+
+    /** A unique, letters-only marker, so it survives most text validation and needs no escaping. */
+    public static String newChangeMarker(Random random) {
+        StringBuilder marker = new StringBuilder("csrfmark");
+        for (int i = 0; i < 10; i++) marker.append((char) ('a' + random.nextInt(26)));
+        return marker.toString();
+    }
+
+    /**
+     * What independent reads showed about the forged request's effect (code
+     * review 02 RV-J residual N1). A 2xx is not a state change: an error page,
+     * an "invalid token" page or a re-rendered form all return 200.
+     */
+    public record ReadBack(boolean showsChange, String description) {
+        public static ReadBack notRun(String why) {
+            return new ReadBack(false, "read-back not run: " + why);
+        }
+    }
+
+    /**
+     * The forged request appended a unique marker to one submitted field.
+     * The change is shown only if a read of the page that displays that
+     * state, made before the forged request, succeeded without the marker,
+     * and two reads after it both succeeded with it -- two, so a one-shot
+     * re-render of the submitted input (a form flashed back after an
+     * "invalid token" error) does not pass for stored state.
+     */
+    public static ReadBack readBack(String target, String field, String marker,
+                                    int beforeStatus, String beforeBody,
+                                    int afterStatus, String afterBody,
+                                    int againStatus, String againBody) {
+        boolean markerBefore = carries(beforeBody, marker);
+        boolean markerAfter = carries(afterBody, marker);
+        boolean markerAgain = carries(againBody, marker);
+        boolean shows = marker != null && !marker.isEmpty()
+                && isSuccess(beforeStatus) && !markerBefore
+                && isSuccess(afterStatus) && markerAfter
+                && isSuccess(againStatus) && markerAgain;
+        String description = "read-back GET " + target + " for the marker on field '" + field + "': before status="
+                + beforeStatus + (markerBefore ? " (marker already present)" : "")
+                + ", after status=" + afterStatus + (markerAfter ? " (marker shown)" : " (marker absent)")
+                + ", again status=" + againStatus + (markerAgain ? " (marker shown)" : " (marker absent)");
+        return new ReadBack(shows, description);
+    }
+
+    private static boolean carries(String body, String marker) {
+        return body != null && marker != null && !marker.isEmpty() && body.contains(marker);
+    }
+
     /**
      * Cookie CSRF is confirmed only when all of these hold: the method
      * changes state; the request is authenticated by an ambient cookie (the
      * one credential a browser attaches to a cross-site request by itself);
      * the captured request succeeded; the forged request -- token removed or
-     * invalidated, non-ambient credentials such as Authorization removed,
-     * cookie kept -- still succeeded; and the same forged request with no
-     * cookie either was refused, so that success is owed to the session
-     * cookie and not to the action being open to anyone. A status that
-     * merely repeats (403 before and after) is never a success.
+     * invalidated, every header a cross-site page cannot send removed (so
+     * no Authorization or custom credential header), cookie kept -- still
+     * succeeded; the same forged request with no cookie either was refused,
+     * so that success is owed to the session cookie and not to the action
+     * being open to anyone; and an independent read-back shows the forged
+     * request changed state (see {@link #readBack}), since a 2xx can be an
+     * error or "invalid token" page. A status that merely repeats (403
+     * before and after) is never a success.
      *
      * @param method the request method
      * @param cookieAuthPresent true if the request carries a non-empty Cookie header
@@ -58,9 +160,11 @@ public final class CsrfLogic {
      * @param originalStatus status of the captured request (with the real token), or -1 if unknown
      * @param forgedStatus status of the forged request (cookie only, no valid token), or -1 if not sent
      * @param anonymousStatus status of the forged request without the cookie too, or -1 if not sent
+     * @param readBack what reads of the state before and after the forged request showed; null if none were made
      */
     public static Evidence evaluate(String method, boolean cookieAuthPresent, boolean tokenFound,
-                                     int originalStatus, int forgedStatus, int anonymousStatus) {
+                                     int originalStatus, int forgedStatus, int anonymousStatus, ReadBack readBack) {
+        if (readBack == null) readBack = ReadBack.notRun("no read of the state was made");
         if (isSafeMethod(method)) {
             return new Evidence(Verdict.INVALID, 0.0, false,
                     "Method " + method + " is a safe/idempotent method -- CSRF protection is conventionally "
@@ -84,7 +188,7 @@ public final class CsrfLogic {
                             + "recognize).", "");
         }
         String detail = "original status=" + originalStatus + " | cookie only, token removed=" + forgedStatus
-                + " | no cookie, no token=" + anonymousStatus;
+                + " | no cookie, no token=" + anonymousStatus + " | " + readBack.description();
         if (!isSuccess(originalStatus)) {
             return new Evidence(Verdict.INVALID, 0.0, false,
                     "The captured request did not succeed (status " + originalStatus + "), so there is no "
@@ -121,11 +225,27 @@ public final class CsrfLogic {
                             + "and no token, but the no-cookie control returned " + anonymousStatus
                             + ", which is not a clean authentication refusal.", detail);
         }
+        if (!readBack.showsChange()) {
+            return new Evidence(Verdict.SUPPORTED, 0.55, false,
+                    "The request returned " + forgedStatus + " carrying only the ambient session cookie, with "
+                            + "the CSRF token removed/invalidated and no other credential, and the same request "
+                            + "without the cookie was refused (status " + anonymousStatus + ") -- but no "
+                            + "independent read-back showed that the forged request changed anything. A 2xx "
+                            + "alone is not a state change: an error page, an \"invalid token\" page or a "
+                            + "re-rendered form also return 200.", detail);
+        }
         return new Evidence(Verdict.CONFIRMED, 0.88, true,
                 "The request still succeeded (status " + forgedStatus + ") carrying only the ambient session "
-                        + "cookie, with the CSRF token removed/invalidated and no other credential, while the "
-                        + "same request without the cookie was refused (status " + anonymousStatus + ") -- "
-                        + "the token is not enforced and the session cookie alone authorizes the action.",
+                        + "cookie, with the CSRF token removed/invalidated and no other credential, the same "
+                        + "request without the cookie was refused (status " + anonymousStatus + "), and fresh "
+                        + "reads of the state show the marker the forged request submitted -- the token is not "
+                        + "enforced and the session cookie alone performs the action.",
                 detail);
+    }
+
+    /** As above with no read-back made, so it can never confirm. */
+    public static Evidence evaluate(String method, boolean cookieAuthPresent, boolean tokenFound,
+                                     int originalStatus, int forgedStatus, int anonymousStatus) {
+        return evaluate(method, cookieAuthPresent, tokenFound, originalStatus, forgedStatus, anonymousStatus, null);
     }
 }

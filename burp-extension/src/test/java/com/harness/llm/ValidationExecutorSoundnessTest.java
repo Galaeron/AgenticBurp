@@ -103,10 +103,25 @@ final class ValidationExecutorSoundnessTest {
         assertFalse(run.confirmed());
     }
 
-    /** Cookie-gated action: no Cookie is refused; a Cookie without the token still succeeds. */
-    private static Reply cookieGatedTokenIgnored(HttpRequest r) {
-        String cookie = headerOf(r, "Cookie");
-        return cookie == null ? Reply.of(403, "login required") : Reply.of(200, "{\"changed\":true}");
+    /**
+     * Cookie-gated action that ignores its CSRF token: no Cookie is refused;
+     * a Cookie alone stores display_name, which GET /profile shows. RV-N (N1):
+     * these positive controls used a constant 200 {"changed":true}, which
+     * proves no state change, so they now read the stored value back.
+     */
+    private static Function<HttpRequest, Reply> cookieGatedTokenIgnored() {
+        AtomicReference<String> name = new AtomicReference<>("Alice");
+        return r -> {
+            if (headerOf(r, "Cookie") == null) return Reply.of(403, "login required");
+            if (r.method().equals("GET")) return Reply.of(200, "<p>Name: " + name.get() + "</p>");
+            String submitted = paramOf(r, "display_name");
+            if (submitted != null) name.set(submitted);
+            return Reply.of(200, "{\"changed\":true}");
+        };
+    }
+
+    private static HttpRequest firstPost(Run run) {
+        return run.sent().stream().filter(r -> r.method().equals("POST")).findFirst().orElseThrow();
     }
 
     @Test
@@ -114,10 +129,11 @@ final class ValidationExecutorSoundnessTest {
     void csrfCookieOnlySuccessIsConfirmed() throws Exception {
         Run run = execute("csrf_validation",
                 request("POST", "/change", "email=a@b.example", headers("X-CSRF-Token", "test",
-                        "Cookie", "session=synthetic", "Authorization", "Bearer synthetic")),
-                Reply.of(200, "{\"changed\":true}"), ValidationExecutorSoundnessTest::cookieGatedTokenIgnored);
+                        "Cookie", "session=synthetic", "Authorization", "Bearer synthetic",
+                        "Referer", FakeMontoya.ORIGIN + "/profile"), Map.of("display_name", "Alice")),
+                Reply.of(200, "{\"changed\":true}"), cookieGatedTokenIgnored());
         assertTrue(run.confirmed(), run.status() + " " + run.submission().summary);
-        HttpRequest forged = run.sent().get(0);
+        HttpRequest forged = firstPost(run);
         assertNull(headerOf(forged, "X-CSRF-Token"), "forged request drops the token");
         assertNull(headerOf(forged, "Authorization"), "forged request drops the non-ambient credential");
         assertEquals("session=synthetic", headerOf(forged, "Cookie"), "forged request keeps the ambient cookie");
@@ -136,10 +152,11 @@ final class ValidationExecutorSoundnessTest {
     @DisplayName("R25 positive control, form-token path: invalidated token, ambient cookie, anonymous refused")
     void csrfParameterTokenPathIsConfirmed() throws Exception {
         Run run = execute("csrf_validation",
-                request("POST", "/change", "", headers("Cookie", "session=synthetic"), Map.of("csrf_token", "real")),
-                Reply.of(200, "{\"changed\":true}"), ValidationExecutorSoundnessTest::cookieGatedTokenIgnored);
+                request("POST", "/change", "", headers("Cookie", "session=synthetic",
+                        "Referer", FakeMontoya.ORIGIN + "/profile"), Map.of("csrf_token", "real", "display_name", "Alice")),
+                Reply.of(200, "{\"changed\":true}"), cookieGatedTokenIgnored());
         assertTrue(run.confirmed(), run.status() + " " + run.submission().summary);
-        assertNotEquals("real", paramOf(run.sent().get(0), "csrf_token"), "forged request does not carry the real token");
+        assertNotEquals("real", paramOf(firstPost(run), "csrf_token"), "forged request does not carry the real token");
     }
 
     // ---------------------------------------------------------------- R26
