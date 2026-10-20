@@ -1,5 +1,9 @@
 """Code review 02, batch RV-D (I10): false confirmations in the CORS, IDOR,
-open-redirect and SSRF validators (R08, R09, R14, R16, R17).
+open-redirect and SSRF validators (R08, R09, R14, R16, R17). Batch RV-D2 adds
+the residuals an independent verification found (V1, V2, V3 in
+reviews/2026-10-20-rv-implementation-verification/REPORT.md): an anonymous 5xx is
+not a denial, single-principal IDOR never confirms, and a wildcard origin with
+credentials grants no credentialed read.
 
 Each test drives the production caller -- ``Orchestrator.analyze`` or
 ``Orchestrator._validate_findings`` -- the way the reviewer's
@@ -136,6 +140,32 @@ class CorsCallerTests(_CallerBase):
         self.assertTrue(confirmed, _verdicts(result.validation_reports))
         self.assertIn("Origin Reflection", confirmed[0].summary)
 
+    # RV-D2 V3
+    def test_wildcard_with_credentials_does_not_confirm_credentialed_read(self):
+        # The Fetch standard's CORS check fails a credentialed request answered
+        # with Access-Control-Allow-Origin: *, so the probe origin reads nothing
+        # with the victim's cookies: an informational misconfiguration only.
+        result, sent = self._analyze({"Access-Control-Allow-Origin": "*",
+                                      "Access-Control-Allow-Credentials": "true"})
+        self.assertTrue(sent)
+        reports = result.validation_reports
+        self.assertFalse(any(v.confirmed for v in reports), _verdicts(reports))
+        self.assertEqual([v.status for v in reports], ["safe"], _verdicts(reports))
+        self.assertIn("Informational, unconfirmed: Wildcard Origin + Credentials, "
+                      "Credentials + Wildcard", reports[0].summary)
+        self.assertNotIn("appears secure", reports[0].summary)
+
+    def test_wildcard_with_credentials_does_not_unlock_header_weaknesses(self):
+        # V3 with R09's rule: header weaknesses stay informational because the
+        # wildcard grants the probe origin no credentialed access.
+        result, sent = self._analyze({"Access-Control-Allow-Origin": "*",
+                                      "Access-Control-Allow-Credentials": "true",
+                                      "Access-Control-Allow-Headers": "*",
+                                      "Access-Control-Expose-Headers": "Set-Cookie"})
+        self.assertTrue(sent)
+        self.assertFalse(any(v.confirmed for v in result.validation_reports),
+                         _verdicts(result.validation_reports))
+
     def test_no_cors_headers_negative_control(self):
         # R08 control: every probe ran and found nothing -> still a negative.
         result, sent = self._analyze({})
@@ -211,12 +241,17 @@ class IdorCallerTests(_CallerBase):
             _exchange("http://shop.invalid/orders/1", {"Cookie": "session=alice"}), fake_request)
         return reports, sent
 
-    def test_cross_principal_read_of_protected_object_confirms(self):
-        # Genuine positive: alice's session reads bob's order, which is refused
-        # (login redirect) without a session.
+    def test_protected_object_read_by_one_principal_is_only_a_candidate(self):
+        # RV-D2 V2: alice's session reads bob's order, which is refused (login
+        # redirect) without a session. RV-D confirmed this. To this validator it
+        # is the same evidence as alice reading her own second order (V2), so it
+        # stays a candidate naming the missing second identity. IDOR read cannot
+        # confirm alone; cross_identity is the two-principal proof.
         reports, sent = self._orders_verdict(protected=True)
-        self.assertEqual([v.status for v in reports], ["confirmed"], _verdicts(reports))
-        self.assertTrue(reports[0].confirmed)
+        self.assertEqual([v.status for v in reports], ["inconclusive"], _verdicts(reports))
+        self.assertFalse(reports[0].confirmed)
+        self.assertIn("second identity", reports[0].summary)
+        self.assertIn("redirect to the login page /login", reports[0].evidence)
         # The unauthorized-principal control really went out, without the cookie.
         self.assertIn(("http://shop.invalid/orders/2", False), sent)
 
@@ -226,6 +261,95 @@ class IdorCallerTests(_CallerBase):
         reports, sent = self._orders_verdict(protected=False)
         self.assertFalse(any(v.confirmed for v in reports), _verdicts(reports))
         self.assertEqual([v.status for v in reports], ["inconclusive"], _verdicts(reports))
+        self.assertIn(("http://shop.invalid/orders/2", False), sent)
+
+
+class IdorResidualCallerTests(_CallerBase):
+    """RV-D2 V1 and V2 (reviews/2026-10-20-rv-implementation-verification):
+    a failed anonymous control is not a denial, and one principal reading
+    another protected object never confirms IDOR on its own."""
+
+    def _verdict(self, anon_status, owner="alice", anon_text="temporary upstream failure",
+                 anon_headers=None, missing_status=404):
+        """The verifier's fixture: orders 1-3 are served to alice's session,
+        every request without the cookie gets ``anon_status``."""
+        from harness.validators.idor_read_validator import IdorReadValidator
+        sent = []
+
+        async def request(client, method, url, **kwargs):
+            req = httpx.Request(method, url)
+            headers = {k.lower(): v for k, v in (kwargs.get("headers") or {}).items()}
+            sent.append((str(url), "cookie" in headers))
+            if "cookie" not in headers:
+                return httpx.Response(anon_status, text=anon_text, headers=anon_headers or {},
+                                      request=req)
+            key = str(url).rsplit("/", 1)[-1]
+            if key not in ("1", "2", "3"):
+                return httpx.Response(missing_status, text="not found", request=req)
+            return httpx.Response(200, request=req, text=(
+                f"Order {key} belongs to {owner}: purchased item number {key}, "
+                f"total {key}9 dollars, delivery home."))
+        reports = self._validate(
+            IdorReadValidator(allowed_hosts=["shop.invalid"]), "idor",
+            _exchange("http://shop.invalid/orders/1", {"Cookie": "session=alice"}), request)
+        self.assertEqual(len(reports), 1, _verdicts(reports))
+        return reports[0], sent
+
+    # V1
+    def test_anonymous_500_is_not_authorization_denial(self):
+        report, sent = self._verdict(500, owner="public catalog")
+        self.assertFalse(report.confirmed, report.summary)
+        self.assertEqual(report.status, "inconclusive", report.summary)
+        self.assertIn(("http://shop.invalid/orders/2", False), sent)
+        self.assertIn("answered HTTP 500, which is not an authorization denial", report.evidence)
+        self.assertNotIn("is protected", report.evidence)
+        self.assertEqual(report.confidence, 0.3)
+
+    def test_uninterpretable_anonymous_answers_are_not_denials(self):
+        # V1: a 404, a rate limit, a bad gateway, a redirect that is not to a
+        # login page, or a 2xx that is neither the object nor a login wall.
+        for status, headers in ((404, None), (429, None), (502, None),
+                                (302, {"Location": "/maintenance"}), (200, None)):
+            with self.subTest(status=status, headers=headers):
+                report, _sent = self._verdict(status, anon_headers=headers)
+                self.assertFalse(report.confirmed, report.summary)
+                self.assertIn(f"answered HTTP {status}, which is not an authorization denial",
+                              report.evidence)
+
+    def test_healthy_denials_mark_the_object_protected(self):
+        # V1 control: 401, 403, a redirect to a login page and a login page are
+        # interpretable denials -- the object is protected (still unconfirmed, V2).
+        for status, text, headers, shown in (
+                (401, "Please log in", None, "HTTP 401"),
+                (403, "Forbidden", None, "HTTP 403"),
+                (302, "", {"Location": "/users/sign_in"},
+                 "HTTP 302 redirect to the login page /users/sign_in"),
+                (200, "Sign in to continue", None, "HTTP 200 login page")):
+            with self.subTest(status=status):
+                report, sent = self._verdict(status, anon_text=text, anon_headers=headers)
+                self.assertFalse(report.confirmed, report.summary)
+                self.assertEqual(report.status, "inconclusive", report.summary)
+                self.assertIn(f"refused ({shown}", report.evidence)
+                self.assertIn("so the object is protected", report.evidence)
+                self.assertEqual(report.confidence, 0.5)
+
+    def test_failed_absent_id_control_is_a_weaker_candidate(self):
+        # A 5xx for the absent id leaves the three-way differential unproven, so
+        # the object is not classed as protected and no anonymous replay is spent.
+        report, sent = self._verdict(401, missing_status=500)
+        self.assertFalse(report.confirmed, report.summary)
+        self.assertIn("the absent-id control answered HTTP 500", report.evidence)
+        self.assertEqual(report.confidence, 0.3)
+        self.assertFalse([u for u, cookie in sent if not cookie], sent)
+
+    # V2
+    def test_two_objects_owned_by_alice_are_not_idor(self):
+        report, sent = self._verdict(401, owner="alice")
+        self.assertFalse(report.confirmed, report.summary)
+        self.assertEqual(report.status, "inconclusive", report.summary)
+        self.assertIn("a single principal cannot show it belongs to someone else", report.summary)
+        self.assertIn("second identity", report.summary)
+        self.assertIn("Missing evidence: a second identity", report.evidence)
         self.assertIn(("http://shop.invalid/orders/2", False), sent)
 
 
