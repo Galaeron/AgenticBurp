@@ -54,6 +54,27 @@ _MFA_MARKERS = re.compile(
     r"one[\s-]*time\s*(?:code|password)|\botp\b|two[\s-]*factor|multi[\s-]*factor|2fa", re.I)
 # Post-authentication resources to probe for reachability before the 2nd factor.
 _PROTECTED_CANDIDATES = ("/my-account", "/account", "/dashboard", "/profile", "/home", "/settings")
+# A redirect path segment that names a login page (login, sign-in, logon, login.php, ...).
+_LOGIN_SEGMENT = re.compile(r"^(?:log[-_]?in|sign[-_]?in|log[-_]?on)\b", re.I)
+
+
+def _anonymous_denial(status: int, body: str, location: str) -> str:
+    """Describe the anonymous control as an authorization denial, or "" when it
+    is not one (E3). Only an answer that says "log in first" counts: 401/403, a
+    redirect to a login page, or a 2xx login page. A 5xx, a 404, a rate limit or
+    a page that is neither the account nor a login wall says nothing about
+    whether the page needs the session (the rule RV-D2 applies to IDOR)."""
+    from harness.missing_auth_probe import _LOGIN_PAGE
+    if status in (401, 403):
+        return f"HTTP {status}"
+    if 300 <= status < 400:
+        path = urlsplit(location or "").path
+        if any(_LOGIN_SEGMENT.match(seg) for seg in path.split("/") if seg):
+            return f"HTTP {status} redirect to the login page {location}"
+        return ""
+    if 200 <= status < 300 and _LOGIN_PAGE.search(body or ""):
+        return f"HTTP {status} login page"
+    return ""
 
 
 def _parse_body(exchange: HttpExchange):
@@ -226,8 +247,9 @@ class AuthSequenceValidator(Validator):
         """R20: a pre-login cookie that was not rotated is only a candidate. The
         login must succeed, and the fixed identifier ALONE (no other cookie, no
         captured credential header) must then reach an authenticated page that
-        an anonymous request does not -- the planted id is now a logged-in
-        session. Rotation of every pre-login cookie is the negative."""
+        an anonymous request is denied (E3: a healthy denial, not a 5xx or a
+        timeout) -- the planted id is now a logged-in session. Rotation of
+        every pre-login cookie is the negative."""
         fc = "session_fixation"
         method = (exchange.method or "POST").upper()
         async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
@@ -259,7 +281,15 @@ class AuthSequenceValidator(Validator):
                 f"(HTTP {resp.status_code})",
                 f"No authenticated session was established, so an unrotated pre-login id proves "
                 f"nothing about fixation. Retry with working credentials.")
-        proof = await self._fixed_id_authenticates(exchange, resp, fixed)
+        proof, failed_control = await self._fixed_id_authenticates(exchange, resp, fixed)
+        if proof is None and failed_control:
+            return self._candidate(
+                f"pre-login session cookie ({names}) survived login and alone reached an authenticated "
+                f"page, but the anonymous control was not a healthy denial",
+                f"Login answered HTTP {resp.status_code}. Presenting only the fixed {names} reached a page "
+                f"showing an authenticated session, but {failed_control}, so the page was not shown to "
+                f"need the session. A 5xx, a timeout or a transport error is not an authorization "
+                f"denial; retry when the target answers normally.")
         if proof is None:
             return self._candidate(
                 f"pre-login session cookie ({names}) was not rotated across login, but that id alone "
@@ -267,7 +297,7 @@ class AuthSequenceValidator(Validator):
                 f"Login answered HTTP {resp.status_code}. Presenting only the fixed {names} reached no "
                 f"page showing an authenticated session (a logout control or the account's username) "
                 f"that an anonymous request is denied, so the fixed id is not shown to carry the login.")
-        url, status = proof
+        url, status, denial = proof
         return ValidationResult(
             self.name, "confirmed", fc, confidence=0.9, confirmed=True,
             summary=f"Session fixation confirmed: the pre-login {names} survived login and alone "
@@ -275,16 +305,19 @@ class AuthSequenceValidator(Validator):
             evidence=f"Pre-auth {names} was not rotated by a successful login (HTTP {resp.status_code}). "
                      f"GET {url} with only that cookie returned an authenticated page (HTTP {status}, a "
                      f"logout control or the account's username), while the same request with no session "
-                     f"was denied: an attacker-planted id becomes a logged-in session.")
+                     f"was denied ({denial}): an attacker-planted id becomes a logged-in session.")
 
     def _candidate(self, why: str, evidence: str, fc: str = "session_fixation") -> ValidationResult:
         return ValidationResult(self.name, "inconclusive", fc, confidence=0.4, confirmed=False,
                                 summary=f"Candidate only, not confirmed: {why}.", evidence=evidence)
 
-    async def _fixed_id_authenticates(self, exchange, login_resp, fixed: dict) -> tuple[str, int] | None:
+    async def _fixed_id_authenticates(self, exchange, login_resp, fixed: dict
+                                      ) -> tuple[tuple[str, int, str] | None, str]:
         """GET-only proof that the fixed cookie(s) carry the login: the login's
         same-origin redirect target, then common account pages, each fetched in
-        a fresh client with only the fixed cookie, and an anonymous control."""
+        a fresh client with only the fixed cookie, and an anonymous control.
+        Returns ((url, status, denial), "") on proof, else (None, why the first
+        failed anonymous control did not count, or "")."""
         from urllib.parse import urljoin
         from harness.missing_auth_probe import _AUTH_HEADERS, _substantive
         fields, _ = _parse_body(exchange)
@@ -307,7 +340,7 @@ class AuthSequenceValidator(Validator):
             return _substantive(status, body or "") and (
                 "log out" in low or "logout" in low or bool(username and username in low))
 
-        seen = set()
+        seen, failed = set(), ""
         for url in targets:
             if url in seen:
                 continue
@@ -321,16 +354,26 @@ class AuthSequenceValidator(Validator):
                     continue
             if not authed(got.status_code, got.text):
                 continue
+            # E3: a timeout or an HTTP 500 is not the anonymous request being
+            # denied. Only a completed, interpretable denial shows the page needs
+            # the session.
             async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                         follow_redirects=False, verify=False) as anon:
                 try:
                     anon_got = await self._send(anon, "GET", url, dict(headers), None)
-                    anon_authed = authed(anon_got.status_code, anon_got.text)
-                except httpx.HTTPError:
-                    anon_authed = False
-            if not anon_authed:
-                return url, got.status_code
-        return None
+                except httpx.HTTPError as e:
+                    failed = failed or f"the anonymous control GET {url} failed ({type(e).__name__})"
+                    continue
+            if authed(anon_got.status_code, anon_got.text):
+                continue  # the same page with no session: public, not the fixed id
+            denial = _anonymous_denial(anon_got.status_code, anon_got.text or "",
+                                       anon_got.headers.get("location") or "")
+            if denial:
+                return (url, got.status_code, denial), ""
+            failed = failed or (
+                f"the anonymous control GET {url} answered HTTP {anon_got.status_code}, which is not an "
+                f"authorization denial (only 401/403, a redirect to a login page or a login page is)")
+        return None, failed
 
     # --- 2FA / MFA bypass -----------------------------------------------------
     async def _check_mfa_bypass(self, exchange) -> ValidationResult:
