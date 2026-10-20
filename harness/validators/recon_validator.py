@@ -457,13 +457,35 @@ class ReconValidator(Validator):
             if 'html' in content_type:
                 links = self._extract_links_from_html(response.text, url)
                 for link in links:
-                    if link not in self.visited_urls and link not in self.discovered_urls:
-                        self.discovered_urls.add(link)
-                        await self._crawl(base_url, link, depth + 1, max_depth, result)
+                    # "Seen" is not "fetched": passive analysis of the captured
+                    # response has already put this page's links in
+                    # discovered_urls, so selecting on that set skipped every
+                    # link the capture showed (code review 02 R21). Only
+                    # visited_urls (requested) decides whether to fetch.
+                    self.discovered_urls.add(link)
+                    if link in self.visited_urls or not self._may_follow(link):
+                        continue
+                    await self._crawl(base_url, link, depth + 1, max_depth, result)
             
         except Exception as e:
             log.debug(f"Error crawling {url}: {e}")
     
+    def _may_follow(self, link: str) -> bool:
+        """Whether the crawl may request a link taken from a page, captured or live.
+
+        The same two gates apply to every link: it must be in scope, and a
+        state-changing-looking navigation (logout, delete, reset, ...) is never
+        fetched speculatively -- a GET is not proof of a read-only action.
+        """
+        from harness import crawler, scope_lock
+        if not scope_lock.host_in_scope(link, self.allowed_hosts):
+            log.debug(f"Not following out-of-scope link {link}")
+            return False
+        if crawler._DESTRUCTIVE_NAVIGATION.search(urlparse(link).path or "/"):
+            log.debug(f"Not following state-changing navigation {link}")
+            return False
+        return True
+
     async def _send_request(self, url: str, method: str = 'GET', headers: dict = None) -> httpx.Response | None:
         """Send an HTTP request."""
         headers = headers or {}
