@@ -120,7 +120,8 @@ class LegCase(NamedTuple):
     given, is called with base_url before EACH of the TP and NEG probes (to
     reset any fixture-side mutable state). `available`, if given, gates the
     whole case on an external tool being present (fail-safe: unavailable ==
-    left out, never assumed live)."""
+    left out, never assumed live); `unavailable_reason` says which tool, for
+    `run_self_test(report_out=...)`."""
     marker: str
     finding_class: str
     validator_factory: Callable[[], object]
@@ -128,6 +129,7 @@ class LegCase(NamedTuple):
     build_neg: Callable[[str], object]
     setup: Callable[[str], None] | None = None
     available: Callable[[], bool] = lambda: True
+    unavailable_reason: str = ""
 
 
 def _reset(path: str):
@@ -276,10 +278,16 @@ def _default_cases() -> list[LegCase]:
                 lambda b: _auth_post(b, "/auth/login-enum", '{"username": "alice", "password": "alicepw"}'),
                 lambda b: _auth_post(b, "/auth/login-uniform", '{"username": "alice", "password": "alicepw"}')),
 
+        # Stored XSS confirms only when the planted payload executes in a
+        # browser (RV-E R19, RV-E2 E2), so without Playwright the case cannot
+        # pass and is reported unavailable instead of run (RV-M M4).
         LegCase("xss", "xss",
                 lambda: StoredXssValidator(allowed_hosts=["127.0.0.1"]),
                 lambda b: _comment_post(b, "/stored/comments"), lambda b: _comment_post(b, "/stored/comments-safe"),
-                setup=_reset("/stored/reset")),
+                setup=_reset("/stored/reset"),
+                available=lambda: browser_driver.playwright_available(),
+                unavailable_reason="needs Playwright: stored XSS confirms only when the "
+                                   "planted payload executes in a browser"),
 
         LegCase("jwt", "jwt",
                 lambda: JwtForgeValidator(allowed_hosts=["127.0.0.1"]),
@@ -345,12 +353,13 @@ def _is_executed_refutation(result) -> bool:
     return result.status == "not_confirmed" and result.confirmed is not True
 
 
-def _case_passes(case: LegCase, base_url: str) -> bool:
+def _case_outcome(case: LegCase, base_url: str) -> tuple[bool, str]:
     """A case passes only on the full EXECUTED-PAIR double-check: the
     positive probe genuinely confirmed-true (`_is_executed_confirmation`)
     AND the negative control genuinely EXECUTED and was refuted
     (`_is_executed_refutation`) -- both real, decisive, executed outcomes
-    from this run, not assumed ones. Any exception propagates to the
+    from this run, not assumed ones. Returns (passed, reason); the reason
+    names the leg that did not hold. Any exception propagates to the
     caller, which treats it as a fail (leave the marker out) -- never as a
     pass."""
     validator = case.validator_factory()
@@ -359,18 +368,29 @@ def _case_passes(case: LegCase, base_url: str) -> bool:
         case.setup(base_url)
     tp = asyncio.run(validator.validate(_finding(case.finding_class), case.build_tp(base_url)))
     if not _is_executed_confirmation(tp):
-        return False
+        return False, f"the positive probe returned {tp.status!r}, not an executed confirmation"
 
     if case.setup:
         case.setup(base_url)
     neg = asyncio.run(validator.validate(_finding(case.finding_class), case.build_neg(base_url)))
     if not _is_executed_refutation(neg):
-        return False
+        return False, f"the negative control returned {neg.status!r}, not an executed refutation"
 
-    return True
+    return True, "confirmed the vulnerable endpoint and refuted its negative control"
 
 
-def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float = 5.0) -> frozenset:
+def _case_passes(case: LegCase, base_url: str) -> bool:
+    """`_case_outcome` without the reason."""
+    return _case_outcome(case, base_url)[0]
+
+
+def _report(report_out: dict | None, marker: str, status: str, reason: str) -> None:
+    if report_out is not None:
+        report_out[marker] = {"status": status, "reason": reason}
+
+
+def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float = 5.0,
+                  report_out: dict | None = None) -> frozenset:
     """Fire every self-test case against a fresh, in-process fixture
     instance and return the frozenset of markers that BOTH confirmed-true
     on their vulnerable endpoint and refuted-false on their paired negative
@@ -378,7 +398,12 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
     leg crashes, a tool is missing) degrades to leaving that marker (or all
     of them) out of the returned set, which is exactly the fail-safe this
     exists to guarantee: "could not verify" must never read as "verified
-    live"."""
+    live".
+
+    `report_out`, if given, receives one entry per case that was reached,
+    `{marker: {"status": "live" | "failed" | "unavailable" | "error",
+    "reason": str}}`, so a case left out says why: an unavailable tool
+    (e.g. "needs Playwright") is not an unexplained failure (RV-M M4)."""
     cases = _default_cases() if cases is None else cases
     if not cases:
         return frozenset()
@@ -468,12 +493,21 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
                 for case in cases:
                     try:
                         if not case.available():
-                            continue  # fail-safe: unavailable tool -- never counted as live
-                        if _case_passes(case, base_url):
+                            # fail-safe: unavailable tool -- never counted as live
+                            reason = case.unavailable_reason or "a required tool is unavailable"
+                            log.info("leg self-test: case %r unavailable (%s) -- leaving it "
+                                     "provisional this run", case.marker, reason)
+                            _report(report_out, case.marker, "unavailable", reason)
+                            continue
+                        passed, reason = _case_outcome(case, base_url)
+                        if passed:
                             live.add(case.marker)
-                    except Exception:
+                        _report(report_out, case.marker, "live" if passed else "failed", reason)
+                    except Exception as exc:
                         log.debug("leg self-test: case %r errored -- leaving it "
                                   "provisional this run", case.marker, exc_info=True)
+                        _report(report_out, case.marker, "error",
+                                f"the case raised {type(exc).__name__}")
                         continue
         finally:
             # Restore BOTH the contextvar and the module-level free function
