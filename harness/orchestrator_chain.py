@@ -899,9 +899,14 @@ class ChainMixin:
             vc = (finding.get("vulnerability_class") or "")
             low = vc.lower()
             if low in ("auth_bypass", "missing_authentication", "missing authentication"):
-                # Anonymous access to a privileged-looking route is confirmed by
-                # replaying the captured read with every credential stripped.
-                # This is not an IDOR/BFLA comparison and needs no second user.
+                # Replay the captured read with every credential stripped. This is
+                # not an IDOR/BFLA comparison and needs no second user. An anonymous
+                # payload confirms only for a route declared protected (RV-G R15);
+                # a model label or a privileged-looking path is a hypothesis, not
+                # that declaration, and no operator or engagement declaration
+                # reaches this caller, so the probe reports an unconfirmed
+                # `unauthenticated_access` candidate (RV-M M1). A future declaration
+                # must also pass the authenticated baseline, as /probe-missing-auth does.
                 try:
                     parts = urlsplit(exchange.url)
                     path = parts.path or "/"
@@ -912,16 +917,18 @@ class ChainMixin:
                         allowed_hosts=self.allowed_hosts,
                         baseline_headers=exchange.request_headers,
                         send_garbage_token=False,
-                        expected_protected=True,
+                        expected_protected=False,
+                        protected_baseline=True,
                         run_context=run_context)
                     if outcome.finding is not None:
                         proof = outcome.finding
                         await _apply(
                             finding,
                             ValidationResult(
-                                validator="missing_auth_probe", status="confirmed",
+                                validator="missing_auth_probe",
+                                status="confirmed" if proof.confirmed else "inconclusive",
                                 finding_class="missing_authentication",
-                                confidence=proof.confidence, confirmed=True,
+                                confidence=proof.confidence, confirmed=bool(proof.confirmed),
                                 summary=proof.summary, evidence=proof.evidence),
                             "missing-auth", 0.85, exchange)
                 except Exception:
