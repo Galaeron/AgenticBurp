@@ -36,6 +36,27 @@ from harness.coverage_model import (
 
 log = logging.getLogger("harness.coverage_tracker")
 
+# A driven leg's result status -> its matrix cell status (R11). Only an EXECUTED
+# negative ("not_confirmed", or a validator's "safe") becomes NOT_DETECTED, i.e. tested
+# coverage. A leg that was blocked (budget, safety gate, scope), skipped, or gave no
+# verdict is untested. A status nobody mapped fails conservatively to INCONCLUSIVE,
+# never to an optimistic negative -- the same rule drive_coverage_cases applies (R06).
+_LEG_STATUS = {
+    "confirmed": CellStatus.CONFIRMED,
+    "not_confirmed": CellStatus.NOT_DETECTED,
+    "safe": CellStatus.NOT_DETECTED,
+    "controlled_negative": CellStatus.CONTROLLED_NEGATIVE,
+    "blocked": CellStatus.BLOCKED,
+    "inconclusive": CellStatus.INCONCLUSIVE,
+    "skipped": CellStatus.SKIPPED,
+    "error": CellStatus.ERROR,
+}
+_LEG_STATUS_UNKNOWN = CellStatus.INCONCLUSIVE
+# Cell statuses that mean the leg actually dispatched its comparison (an errored
+# attempt was dispatched; a blocked/skipped/no-verdict one was not).
+_LEG_EXECUTED = frozenset({CellStatus.CONFIRMED, CellStatus.NOT_DETECTED,
+                           CellStatus.CONTROLLED_NEGATIVE, CellStatus.ERROR})
+
 # Trust ordering mirrors worklist_investigator: the driver probes from the
 # lowest-trust identity that can reach a node, so a finding is attributed there.
 _TRUST = {"anonymous": 0, "user": 1, "agent": 2, "service": 2, "manager": 3, "admin": 4}
@@ -268,8 +289,6 @@ class CoverageTracker:
         every applicable deterministic check is attempted deterministically,
         independent of whether the LLM labelled it. Returns cells driven. Bounded
         by `budget` so a large surface can't fan out unboundedly."""
-        _STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.NOT_DETECTED,
-                   "skipped": CellStatus.SKIPPED, "error": CellStatus.ERROR}
         n = 0
         for (ident, ep_key, check) in self.pending_leg_cells(driveable):
             if n >= budget:
@@ -283,13 +302,14 @@ class CoverageTracker:
             if res is None:
                 continue
             n += 1
-            status = _STATUS.get(getattr(res, "status", ""), CellStatus.NOT_DETECTED)
+            status = _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN)
             self.matrix.record(
                 ident, ep_key, check.id, status=status,
                 reason=(getattr(res, "summary", "") or f"{check.confirmation} leg driven off the matrix")[:180],
                 confidence=getattr(res, "confidence", None),
                 validator=getattr(res, "validator", None) or check.confirmation,
-                evidence=(getattr(res, "evidence", "") or "")[:200], executed=True)
+                evidence=(getattr(res, "evidence", "") or "")[:200],
+                executed=status in _LEG_EXECUTED)
         return n
 
     def expand_parameter_cases(self, endpoints: dict[str, dict], *,
