@@ -15,8 +15,11 @@ payload could only have reached a sink via CLIENT-SIDE code reading
 `location.hash` -- proof of a DOM source->sink taint, not server reflection.
 
 Same real-browser driver seam as browser_xss (Playwright/CDP, injectable fake in
-tests), same nonce-in-an-execution-sink oracle, same safe posture: GET navigation
-only, scope-gated, throttled, degrades to skipped when no browser is installed.
+tests), same computed-challenge oracle (RV-L L7: the payload logs a*b, and only
+a console message exactly equal to the product confirms -- an echo or log of
+the fragment text, a dialog or a page error cannot produce it), same safe
+posture: GET navigation only, scope-gated, throttled, degrades to skipped when
+no browser is installed.
 """
 from __future__ import annotations
 
@@ -31,11 +34,18 @@ from .base import Validator, ValidationResult
 log = logging.getLogger("harness.dom_xss_validator")
 
 
-def _fragment_payloads(nonce: str) -> list[str]:
+def _challenge() -> tuple[int, int, str]:
+    """Two random six-digit operands and the text of their product. The payload
+    carries `a*b`, never the product, so only evaluating it yields the product."""
+    a, b = (100000 + secrets.randbelow(900000) for _ in range(2))
+    return a, b, str(a * b)
+
+
+def _fragment_payloads(a: int, b: int) -> list[str]:
     """Payloads that, if a client-side sink reads location.hash and writes it to
-    an HTML/JS context, surface `nonce` via a console/dialog/error sink. Placed in
-    the fragment, so they never reach the server."""
-    js = f"console.log('{nonce}')"
+    an HTML/JS context, log the product a*b to the console. Placed in the
+    fragment, so they never reach the server."""
+    js = f"console.log({a}*{b})"
     return [
         f"<img src=x onerror={js}>",
         f"<svg onload={js}>",
@@ -74,13 +84,13 @@ class DomXssValidator(Validator):
         host = (urlsplit(url).hostname or "").lower()
         return any(host == h.lower() or host.endswith("." + h.lower()) for h in self.allowed_hosts)
 
-    def _candidate_urls(self, exchange: HttpExchange, nonce: str) -> list[str]:
+    def _candidate_urls(self, exchange: HttpExchange, a: int, b: int) -> list[str]:
         """One URL per payload: the captured URL (query preserved) with the
         payload placed in the FRAGMENT. The fragment is never sent to the server,
         so execution can only be client-side (DOM XSS)."""
         parts = urlsplit(exchange.url)
         urls: list[str] = []
-        for pl in _fragment_payloads(nonce):
+        for pl in _fragment_payloads(a, b):
             urls.append(urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, pl)))
         return urls[: self.max_visits]
 
@@ -102,8 +112,8 @@ class DomXssValidator(Validator):
             return ValidationResult(validator=self.name, status="skipped", finding_class="dom_xss",
                                     summary="target out of scope", evidence=urlsplit(exchange.url).hostname or "")
 
-        nonce = "HARNESSDOM" + secrets.token_hex(8)
-        urls = self._candidate_urls(exchange, nonce)
+        a, b, expected = _challenge()
+        urls = self._candidate_urls(exchange, a, b)
         errors: list[str] = []
         # R7: only forwarded when a RunContext is bound -- see
         # browser_xss_validator's identical comment.
@@ -123,16 +133,17 @@ class DomXssValidator(Validator):
             if getattr(obs, "load_error", None):
                 errors.append(f"{url[:120]}: {obs.load_error}")
                 continue
-            if nonce in obs.all_text():
-                sink = ("dialog" if any(nonce in d for d in obs.dialogs)
-                        else "console" if any(nonce in c for c in obs.console)
-                        else "page-error")
+            # RV-L L7: an exact console message equal to the computed product.
+            # A page that logs or shows the fragment text carries a*b, not the
+            # product, so it never confirms.
+            if any(str(m).strip() == expected for m in obs.console):
                 return ValidationResult(
                     validator=self.name, status="confirmed", finding_class="dom_xss",
                     confidence=0.95, confirmed=True,
                     summary=f"DOM-based XSS executed in a real browser at {url.split('#')[0]}",
-                    evidence=(f"Payload placed in the URL FRAGMENT (never sent to the server) fired the "
-                              f"per-run nonce via the {sink} sink -- a client-side source (location.hash) "
+                    evidence=(f"Payload placed in the URL FRAGMENT (never sent to the server) ran: the "
+                              f"console logged {expected}, the product of {a}*{b}, which the payload "
+                              f"computes but does not contain -- a client-side source (location.hash) "
                               f"flowed to a DOM sink. This is DOM-based XSS, not server reflection. "
                               f"URL: {url[:300]}"),
                     raw_output=obs.all_text()[:800])
@@ -142,5 +153,5 @@ class DomXssValidator(Validator):
             validator=self.name, status=status, finding_class="dom_xss",
             confidence=0.0, confirmed=False,
             summary="No DOM-based script execution observed in a headless browser",
-            evidence=(f"Tried {len(urls)} fragment payload(s); the nonce never reached a "
-                      f"dialog/console/error sink." + (f" Errors: {'; '.join(errors[:3])}" if errors else "")))
+            evidence=(f"Tried {len(urls)} fragment payload(s); the console never logged the computed "
+                      f"product {expected}." + (f" Errors: {'; '.join(errors[:3])}" if errors else "")))

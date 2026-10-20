@@ -2,7 +2,7 @@
 import asyncio
 import re
 import unittest
-from urllib.parse import unquote
+from urllib.parse import unquote, unquote_plus
 
 from harness import global_throttle
 from harness import browser_driver
@@ -11,12 +11,20 @@ from harness.models import Finding, HttpExchange
 from harness.validators.browser_xss_validator import BrowserXssValidator
 
 _NONCE = re.compile(r"HARNESSXSS[0-9a-f]+")
+# RV-L L7: a payload that runs logs the product a*b; that product, never the
+# payload text, is what a computing double puts in the console.
+_LOGGED = re.compile(r"console\.log\((\d+)\*(\d+)\)")
+
+
+def _executed(text: str) -> list[str]:
+    """The console lines a browser shows when the payloads in `text` run."""
+    return [str(int(a) * int(b)) for a, b in _LOGGED.findall(unquote_plus(text))]
 
 
 class _VulnDriver:
-    """Simulates a page that EXECUTES a reflected payload: whatever nonce shows
-    up in the URL's payload is echoed into the console (as real execution would).
-    `sink` picks which execution channel carries it."""
+    """Simulates a page that EXECUTES a reflected payload: the console carries
+    the product the payload computes (as real execution would). Any other `sink`
+    instead receives the alert payload's nonce text, which is not execution proof."""
     def __init__(self, sink="console"):
         self.sink = sink
         self.visited = []
@@ -24,6 +32,9 @@ class _VulnDriver:
     async def visit(self, url, *, wait_ms=1500, headers=None):
         self.visited.append(url)
         obs = ExecutionObservation(url=url)
+        if self.sink == "console":
+            obs.console.extend(_executed(url))
+            return obs
         m = _NONCE.search(url)
         if m:
             getattr(obs, self.sink).append(f"fired {m.group(0)}")
@@ -84,10 +95,13 @@ class BrowserXssValidatorTests(unittest.TestCase):
         self.assertEqual(drv.seen[0].get("Authorization"), "Bearer alice")
         self.assertEqual(drv.seen[0].get("Cookie"), "session=abc")
 
-    def test_confirms_on_dialog_execution(self):
+    def test_dialog_alone_does_not_confirm(self):
+        # RV-L L7 (was test_confirms_on_dialog_execution): a dialog showing the
+        # nonce is what a page that alerts its own input shows too, so only the
+        # console's computed product confirms.
         r = self._validate(_VulnDriver("dialogs"))
-        self.assertEqual(r.status, "confirmed")
-        self.assertIn("dialog", r.evidence)
+        self.assertEqual(r.status, "not_confirmed")
+        self.assertFalse(r.confirmed)
 
     def test_first_payload_uses_dialog_for_external_completion_oracle(self):
         driver = _SafeDriver()
@@ -161,6 +175,9 @@ class _PolicyAwareDriver:
                      scope=None, cancel=None, gate=None, budget=None):
         self.calls.append(dict(scope=scope, cancel=cancel, gate=gate, budget=budget))
         obs = ExecutionObservation(url=url)
+        if self.sink == "console":
+            obs.console.extend(_executed(url))
+            return obs
         m = _NONCE.search(url)
         if m:
             getattr(obs, self.sink).append(f"fired {m.group(0)}")
@@ -222,7 +239,7 @@ class _BudgetEnforcingDriver:
     """Simulates the real driver's SC-7 interception: consult the forwarded
     budget before 'navigating'. If it is exhausted, deny -- the payload never
     executes, so no sink is populated. A driver that received budget=None (the
-    pre-R7 call shape) would instead fire the nonce."""
+    pre-R7 call shape) would instead run the payload."""
     def __init__(self):
         self.denied = 0
 
@@ -232,9 +249,7 @@ class _BudgetEnforcingDriver:
             self.denied += 1
             return ExecutionObservation(url=url)  # denied: no execution sink
         obs = ExecutionObservation(url=url)
-        m = _NONCE.search(url)
-        if m:
-            obs.console.append(f"fired {m.group(0)}")
+        obs.console.extend(_executed(url))
         return obs
 
 

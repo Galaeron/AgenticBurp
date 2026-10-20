@@ -4,17 +4,19 @@ Browser-driven XSS validation -- A2.
 Every other XSS signal in this harness is inferential: an agent sees a payload
 reflected in a response and reasons that it *would* execute. This validator is
 the one that actually checks, by loading candidate URLs in a real headless
-browser and watching for the injected script to fire -- a dialog, a console
-message, or a page error carrying a per-run nonce. Only the nonce actually
-appearing in one of those execution sinks confirms; reflection in the HTML body
-does not (that's what the inferential agents already do).
+browser and watching for the injected script to run. The payload logs a*b for
+two random operands; only a console message exactly equal to the product
+confirms (RV-L L7). The product appears nowhere in the payload, so a page that
+echoes or logs the payload text, shows it in a dialog, or quotes it in an error
+cannot produce it -- only evaluating the script can. Reflection in the HTML body
+does not confirm (that's what the inferential agents already do).
 
 Bounded and safe:
   - GET navigation only, scope-gated to allowed_hosts (URLs are derived from the
     captured exchange's own parameters -- never a model-chosen destination), and
     each visit passes through the global request throttle.
-  - The nonce is fresh per validate() call, so a page that happens to contain
-    the literal word "alert" can't produce a false confirm.
+  - The operands are fresh per validate() call (from `secrets`), so a page that
+    happens to contain some number can't produce a false confirm.
   - Degrades cleanly: with no headless browser installed it returns
     status="skipped" naming what to install, never an error or a crash. The
     whole validator is exercised in tests via an injected fake driver.
@@ -31,22 +33,30 @@ from .base import Validator, ValidationResult
 log = logging.getLogger("harness.browser_xss_validator")
 
 
-def _payloads(nonce: str) -> list[str]:
+def _challenge() -> tuple[int, int, str]:
+    """Two random six-digit operands and the text of their product. The payload
+    carries `a*b`, never the product, so only evaluating it yields the product."""
+    a, b = (100000 + secrets.randbelow(900000) for _ in range(2))
+    return a, b, str(a * b)
+
+
+def _payloads(nonce: str, a: int, b: int) -> list[str]:
     """Execution payloads across the common reflection contexts. Each, if it
-    runs, surfaces `nonce` in a console message, dialog, or page error."""
-    js = f"console.log('{nonce}')"
+    runs, logs the product a*b to the console."""
+    js = f"console.log({a}*{b})"
     return [
-        # Lead with a dialog payload. A dialog is the strongest browser-visible
-        # execution proof and is also the completion oracle used by common XSS
-        # benchmark labs; console-only execution can prove the sink internally
-        # while leaving that independent oracle unsatisfied.
-        f"<script>alert('{nonce}')</script>",
+        # Lead with a dialog payload. A dialog is the completion oracle used by
+        # common XSS benchmark labs; console-only execution can prove the sink
+        # internally while leaving that independent oracle unsatisfied. The
+        # dialog itself is not proof (a page can alert its input as text); the
+        # logged product that follows it is.
+        f"<script>alert('{nonce}');{js}</script>",
         f"<script>{js}</script>",
         f"\"><script>{js}</script>",
         f"\"><img src=x onerror={js}>",
         f"<svg onload={js}>",
         f"';{js};//",
-        f"\"><script>alert('{nonce}')</script>",
+        f"\"><script>alert('{nonce}');{js}</script>",
     ]
 
 
@@ -86,7 +96,7 @@ class BrowserXssValidator(Validator):
         host = (urlsplit(url).hostname or "").lower()
         return any(host == h.lower() or host.endswith("." + h.lower()) for h in self.allowed_hosts)
 
-    def _candidate_urls(self, exchange: HttpExchange, nonce: str) -> list[str]:
+    def _candidate_urls(self, exchange: HttpExchange, nonce: str, a: int, b: int) -> list[str]:
         """One URL per (query param, payload): the captured URL with a single
         parameter's value replaced by an execution payload. Bounded by
         max_visits. When the URL has no query params, the payloads are tried as
@@ -94,7 +104,7 @@ class BrowserXssValidator(Validator):
         probed."""
         parts = urlsplit(exchange.url)
         params = parse_qsl(parts.query, keep_blank_values=True)
-        payloads = _payloads(nonce)
+        payloads = _payloads(nonce, a, b)
         urls: list[str] = []
         if not params:
             for pl in payloads:
@@ -128,7 +138,8 @@ class BrowserXssValidator(Validator):
                                     summary="target out of scope", evidence=urlsplit(exchange.url).hostname or "")
 
         nonce = "HARNESSXSS" + secrets.token_hex(8)
-        urls = self._candidate_urls(exchange, nonce)
+        a, b, expected = _challenge()
+        urls = self._candidate_urls(exchange, nonce, a, b)
         errors: list[str] = []
         # R7: forwarded only when a RunContext is actually bound -- omitted
         # entirely otherwise, so a standalone/no-context caller (and every
@@ -152,16 +163,17 @@ class BrowserXssValidator(Validator):
             if obs.load_error:
                 errors.append(f"{url[:120]}: {obs.load_error}")
                 continue
-            if nonce in obs.all_text():
-                sink = ("dialog" if any(nonce in d for d in obs.dialogs)
-                        else "console" if any(nonce in c for c in obs.console)
-                        else "page-error")
+            # RV-L L7: an exact console message equal to the computed product.
+            # Dialogs and page errors can carry the payload's own text, so they
+            # never confirm.
+            if any(str(m).strip() == expected for m in obs.console):
                 return ValidationResult(
                     validator=self.name, status="confirmed", finding_class="xss",
                     confidence=0.95, confirmed=True,
                     summary=f"Reflected XSS executed in a real browser at {url.split('?')[0]}",
-                    evidence=(f"Injected payload executed: the per-run nonce fired via the {sink} "
-                              f"sink when loading {url[:300]}"),
+                    evidence=(f"Injected payload executed: the browser console logged {expected}, "
+                              f"the product of {a}*{b}, which the payload computes but does not "
+                              f"contain, when loading {url[:300]}"),
                     raw_output=obs.all_text()[:800])
 
         status = "not_confirmed" if not errors or len(errors) < len(urls) else "error"
@@ -169,6 +181,6 @@ class BrowserXssValidator(Validator):
             validator=self.name, status=status, finding_class="xss",
             confidence=0.0, confirmed=False,
             summary="No script execution observed in a headless browser",
-            evidence=(f"Tried {len(urls)} candidate URL(s); the injected nonce never reached a "
-                      f"dialog/console/error sink." + (f" Errors: {'; '.join(errors[:3])}" if errors else "")),
+            evidence=(f"Tried {len(urls)} candidate URL(s); the console never logged the computed "
+                      f"product {expected}." + (f" Errors: {'; '.join(errors[:3])}" if errors else "")),
             raw_output="")
