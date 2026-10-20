@@ -118,7 +118,8 @@ class MassAssignmentCallerTests(_CallerBase):
         self.assertFalse(any(v.confirmed for v in reports), _verdicts(reports))
         self.assertEqual([v.status for v in reports], ["inconclusive"], _verdicts(reports))
         self.assertIn("candidate", reports[0].summary.lower())
-        self.assertEqual(sent, ["POST"], "a rejected write must not be followed by a read-back")
+        # E1: the baseline GET precedes the write; nothing re-reads a rejected one.
+        self.assertEqual(sent, ["GET", "POST"], "a rejected write must not be followed by a read-back")
 
     def test_accepted_echo_without_persisted_state_is_only_a_candidate(self):
         # 2xx echo, but an independent GET of the resource shows the field was
@@ -136,7 +137,7 @@ class MassAssignmentCallerTests(_CallerBase):
                             fake_request)
         self.assertFalse(any(v.confirmed for v in reports), _verdicts(reports))
         self.assertEqual([v.status for v in reports], ["inconclusive"], _verdicts(reports))
-        self.assertEqual(sent, ["POST", "GET"])
+        self.assertEqual(sent, ["GET", "POST", "GET"])  # baseline, write, read-back (E1)
 
     def test_silently_persisted_field_confirms_via_read_back(self):
         # No echo at all (204), but the independent read-back shows the
@@ -161,8 +162,8 @@ class MassAssignmentCallerTests(_CallerBase):
                             hosts=("127.0.0.1",))
         self.assertEqual([v.status for v in reports], ["confirmed"], _verdicts(reports))
         self.assertIs(fx.users["1"].get("harnessProbeIsAdmin"), True)
-        self.assertEqual([r["method"] for r in fx.requests_for("/users/1")], ["PATCH", "GET"],
-                         "confirmation must rest on an independent GET read-back")
+        self.assertEqual([r["method"] for r in fx.requests_for("/users/1")], ["GET", "PATCH", "GET"],
+                         "confirmation must rest on a baseline and an independent GET read-back")
 
     def test_server_with_field_allowlist_is_negative_control(self):
         fx = MassAssignmentFixture("patched")
