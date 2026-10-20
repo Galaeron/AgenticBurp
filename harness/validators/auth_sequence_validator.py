@@ -6,9 +6,11 @@ single-request replay-and-diff shape -- each needs a multi-request FLOW with a
 state boundary. This leg confirms the three that have a clean, deterministic
 oracle, dispatched by the finding's class:
 
-  - session_fixation      -- the session identifier does NOT change across the
-                             login boundary (a pre-auth session id is still valid
-                             / re-issued unchanged after authenticating).
+  - session_fixation      -- the session identifier does NOT change across a
+                             SUCCESSFUL login and that pre-auth id alone then
+                             reaches an authenticated page an anonymous request
+                             cannot (an unrotated id without that proof, or after
+                             a failed login, is only a candidate).
   - weak_password_policy   -- a trivially weak password is ACCEPTED at registration
                              (throwaway account), i.e. no strength policy.
   - username_enumeration   -- a login/reset response DISCRIMINATES a valid account
@@ -221,6 +223,11 @@ class AuthSequenceValidator(Validator):
 
     # --- session fixation -----------------------------------------------------
     async def _check_session_fixation(self, exchange) -> ValidationResult:
+        """R20: a pre-login cookie that was not rotated is only a candidate. The
+        login must succeed, and the fixed identifier ALONE (no other cookie, no
+        captured credential header) must then reach an authenticated page that
+        an anonymous request does not -- the planted id is now a logged-in
+        session. Rotation of every pre-login cookie is the negative."""
         fc = "session_fixation"
         method = (exchange.method or "POST").upper()
         async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
@@ -241,22 +248,89 @@ class AuthSequenceValidator(Validator):
             post_cookies = _session_cookies(resp.headers.get_list("set-cookie"))
         if not pre_cookies and not post_cookies:
             return self._not("no session cookie issued (token-based auth?) -- fixation N/A", fc)
-        # Fixation: a pre-auth session id survives login unchanged, OR login issues
-        # NO fresh session cookie at all despite one existing pre-auth.
-        for n, v in pre_cookies.items():
-            if post_cookies.get(n) == v:
-                return ValidationResult(
-                    self.name, "confirmed", fc, confidence=0.85, confirmed=True,
-                    summary=f"Session fixation confirmed: cookie {n!r} was not rotated across login.",
-                    evidence=f"Pre-auth {n} == post-auth {n}; an attacker-fixed session id survives "
-                             f"authentication, so a planted session becomes an authenticated one.")
-        if pre_cookies and not post_cookies:
-            return ValidationResult(
-                self.name, "confirmed", fc, confidence=0.7, confirmed=True,
-                summary="Session fixation confirmed: login issued no fresh session cookie.",
-                evidence=f"A pre-auth session cookie {list(pre_cookies)} existed but login set no new "
-                         f"session cookie, so the pre-auth id remains in force post-authentication.")
-        return self._not("session id rotated on login (no fixation)", fc)
+        # Pre-auth cookies that survive login: re-issued unchanged, or not replaced.
+        fixed = {n: v for n, v in pre_cookies.items() if post_cookies.get(n, v) == v}
+        if not fixed:
+            return self._not("session id rotated on login (no fixation)", fc)
+        names = ", ".join(sorted(fixed))
+        if resp.status_code >= 400:
+            return self._candidate(
+                f"pre-login session cookie ({names}) was not rotated, but the login itself failed "
+                f"(HTTP {resp.status_code})",
+                f"No authenticated session was established, so an unrotated pre-login id proves "
+                f"nothing about fixation. Retry with working credentials.")
+        proof = await self._fixed_id_authenticates(exchange, resp, fixed)
+        if proof is None:
+            return self._candidate(
+                f"pre-login session cookie ({names}) was not rotated across login, but that id alone "
+                f"never reached an authenticated page",
+                f"Login answered HTTP {resp.status_code}. Presenting only the fixed {names} reached no "
+                f"page showing an authenticated session (a logout control or the account's username) "
+                f"that an anonymous request is denied, so the fixed id is not shown to carry the login.")
+        url, status = proof
+        return ValidationResult(
+            self.name, "confirmed", fc, confidence=0.9, confirmed=True,
+            summary=f"Session fixation confirmed: the pre-login {names} survived login and alone "
+                    f"reaches the authenticated {urlsplit(url).path}.",
+            evidence=f"Pre-auth {names} was not rotated by a successful login (HTTP {resp.status_code}). "
+                     f"GET {url} with only that cookie returned an authenticated page (HTTP {status}, a "
+                     f"logout control or the account's username), while the same request with no session "
+                     f"was denied: an attacker-planted id becomes a logged-in session.")
+
+    def _candidate(self, why: str, evidence: str, fc: str = "session_fixation") -> ValidationResult:
+        return ValidationResult(self.name, "inconclusive", fc, confidence=0.4, confirmed=False,
+                                summary=f"Candidate only, not confirmed: {why}.", evidence=evidence)
+
+    async def _fixed_id_authenticates(self, exchange, login_resp, fixed: dict) -> tuple[str, int] | None:
+        """GET-only proof that the fixed cookie(s) carry the login: the login's
+        same-origin redirect target, then common account pages, each fetched in
+        a fresh client with only the fixed cookie, and an anonymous control."""
+        from urllib.parse import urljoin
+        from harness.missing_auth_probe import _AUTH_HEADERS, _substantive
+        fields, _ = _parse_body(exchange)
+        ukey = _find_key(fields, _USER_KEYS)
+        username = str(fields.get(ukey) or "").strip().lower() if ukey else ""
+        p = urlsplit(exchange.url)
+        origin = f"{p.scheme}://{p.netloc}"
+        targets = []
+        loc = login_resp.headers.get("location") or ""
+        if loc:
+            target = urljoin(exchange.url, loc)
+            if urlsplit(target).netloc == p.netloc and urlsplit(target).scheme == p.scheme:
+                targets.append(target)
+        targets += [origin + path for path in _PROTECTED_CANDIDATES]
+        headers = {k: v for k, v in self._headers(exchange).items()
+                   if k.lower() not in _AUTH_HEADERS and k.lower() != "content-type"}
+
+        def authed(status, body):
+            low = (body or "").lower()
+            return _substantive(status, body or "") and (
+                "log out" in low or "logout" in low or bool(username and username in low))
+
+        seen = set()
+        for url in targets:
+            if url in seen:
+                continue
+            seen.add(url)
+            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                        follow_redirects=False, verify=False) as fixed_client:
+                try:
+                    got = await self._send(fixed_client, "GET", url, dict(
+                        headers, Cookie="; ".join(f"{n}={v}" for n, v in fixed.items())), None)
+                except httpx.HTTPError:
+                    continue
+            if not authed(got.status_code, got.text):
+                continue
+            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                        follow_redirects=False, verify=False) as anon:
+                try:
+                    anon_got = await self._send(anon, "GET", url, dict(headers), None)
+                    anon_authed = authed(anon_got.status_code, anon_got.text)
+                except httpx.HTTPError:
+                    anon_authed = False
+            if not anon_authed:
+                return url, got.status_code
+        return None
 
     # --- 2FA / MFA bypass -----------------------------------------------------
     async def _check_mfa_bypass(self, exchange) -> ValidationResult:
