@@ -35,8 +35,8 @@ import re as _re
 
 # Foreign object identifiers to try in a single-principal IDOR read (usernames of
 # OTHER people mentioned in public content, numeric ids seen in links). Purely a
-# seed list: the IDOR read validator's three-way differential rejects any id that
-# is not a real, distinct, unauthorised object, so a stray candidate is harmless.
+# seed list: the IDOR read validator never confirms (RV-D2), so its best result
+# for any id is an inconclusive candidate and a stray id cannot confirm anything.
 _ID_QUERY_KEYS = {"id", "user", "user_id", "userid", "uid", "account", "account_id",
                   "customer", "customer_id", "profile", "pid", "oid", "owner"}
 _AUTHOR_MENTION = _re.compile(
@@ -693,8 +693,10 @@ class ChainMixin:
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a
-        # username-keyed IDOR is reachable, not just numeric neighbours. Bad
-        # candidates are harmless -- the three-way differential rejects them.
+        # username-keyed IDOR is reachable, not just numeric neighbours. It never
+        # confirms (RV-D2): one principal cannot show the object is unauthorised,
+        # so its best result is an inconclusive candidate; only cross_identity
+        # confirms IDOR.
         _idor_cfg = (self.config.get("validators", {}) or {}).get("idor_read", {}) or {}
         _idor_read = IdorReadValidator(
             allowed_hosts=self.allowed_hosts,
@@ -956,9 +958,11 @@ class ChainMixin:
                             await _owned.aclose()
                 try:
                     await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9, exchange)
-                    # Single-principal fallback: if no second identity confirmed a
-                    # cross-identity breach, try the object-id read differential
-                    # (own vs foreign vs absent) as the captured principal.
+                    # Single-principal follow-up: if no second identity confirmed a
+                    # cross-identity breach, run the object-id read differential
+                    # (own vs foreign vs absent) as the captured principal. It never
+                    # confirms (RV-D2), so `_apply` leaves the finding unconfirmed
+                    # and keeps only any manual-verification guidance it carries.
                     if not finding.get("confirmed"):
                         await _apply(finding, await _cached_validate(_idor_read, _as_finding(finding, "idor"), exchange), "idor-read", 0.75, exchange)
                 except Exception:
