@@ -34,29 +34,29 @@ public final class CsrfLogicTest {
     @Test
     @DisplayName("GET request -> invalid, CSRF not applicable")
     void safeMethodIsInvalid() {
-        Evidence e = evaluate("GET", true, true, 200, 200);
+        Evidence e = evaluate("GET", true, true, 200, 200, -1);
         assertEquals(Verdict.INVALID, e.verdict());
     }
 
     @Test
     @DisplayName("non-cookie (Bearer token) auth -> rejected, not applicable the same way")
     void nonCookieAuthIsRejected() {
-        Evidence e = evaluate("POST", false, false, 200, -1);
+        Evidence e = evaluate("POST", false, false, 200, -1, -1);
         assertEquals(Verdict.REJECTED, e.verdict());
     }
 
     @Test
     @DisplayName("token found, removal probe not run -> supported only, presence alone isn't proof")
     void tokenFoundButNotProbedIsSupported() {
-        Evidence e = evaluate("POST", true, true, 200, -1);
+        Evidence e = evaluate("POST", true, true, 200, -1, -1);
         assertEquals(Verdict.SUPPORTED, e.verdict());
         assertFalse(e.confirmed());
     }
 
     @Test
-    @DisplayName("token found, request still succeeds after removal -> confirmed, token not enforced")
+    @DisplayName("token removed, cookie alone still succeeds, no-cookie control refused -> confirmed")
     void tokenRemovedButStillSucceedsIsConfirmed() {
-        Evidence e = evaluate("POST", true, true, 200, 200);
+        Evidence e = evaluate("POST", true, true, 200, 200, 403);
         assertEquals(Verdict.CONFIRMED, e.verdict());
         assertTrue(e.confirmed());
     }
@@ -64,7 +64,7 @@ public final class CsrfLogicTest {
     @Test
     @DisplayName("token found, request correctly rejected after removal -> rejected, properly protected")
     void tokenRemovedAndRejectedIsRejected() {
-        Evidence e = evaluate("POST", true, true, 200, 403);
+        Evidence e = evaluate("POST", true, true, 200, 403, -1);
         assertEquals(Verdict.REJECTED, e.verdict());
         assertFalse(e.confirmed());
     }
@@ -72,7 +72,7 @@ public final class CsrfLogicTest {
     @Test
     @DisplayName("no token found at all, cookie-authenticated state change -> supported, passive signal only")
     void noTokenFoundIsSupported() {
-        Evidence e = evaluate("PUT", true, false, 200, -1);
+        Evidence e = evaluate("PUT", true, false, 200, -1, -1);
         assertEquals(Verdict.SUPPORTED, e.verdict());
         assertFalse(e.confirmed());
     }
@@ -80,7 +80,49 @@ public final class CsrfLogicTest {
     @Test
     @DisplayName("both original and mutated requests succeed within the 2xx range even at different codes -> still confirmed")
     void differentButBothSuccessfulStatusesStillConfirmed() {
-        Evidence e = evaluate("POST", true, true, 200, 201);
+        Evidence e = evaluate("POST", true, true, 200, 201, 401);
         assertEquals(Verdict.CONFIRMED, e.verdict());
+    }
+
+    @Test
+    @DisplayName("R25: the same refusal before and after token removal is not a successful state change")
+    void sameRefusalBeforeAndAfterIsNotConfirmed() {
+        Evidence e = evaluate("POST", true, true, 403, 403, -1);
+        assertFalse(e.confirmed());
+        assertEquals(Verdict.INVALID, e.verdict());
+    }
+
+    @Test
+    @DisplayName("R25: token-free success without the no-cookie control is supported only")
+    void forgedSuccessWithoutControlIsSupported() {
+        Evidence e = evaluate("POST", true, true, 200, 200, -1);
+        assertEquals(Verdict.SUPPORTED, e.verdict());
+        assertFalse(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("R25: an action that also succeeds with no cookie is not gated on the session -> rejected")
+    void actionOpenWithoutCookieIsRejected() {
+        Evidence e = evaluate("POST", true, true, 200, 200, 200);
+        assertEquals(Verdict.REJECTED, e.verdict());
+        assertFalse(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("R25: a no-cookie control that errors is not a clean refusal -> supported only")
+    void controlServerErrorIsSupported() {
+        Evidence e = evaluate("POST", true, true, 200, 200, 500);
+        assertEquals(Verdict.SUPPORTED, e.verdict());
+        assertFalse(e.confirmed());
+    }
+
+    @Test
+    @DisplayName("only 2xx counts as success")
+    void successIsTwoHundredRange() {
+        assertTrue(isSuccess(200));
+        assertTrue(isSuccess(204));
+        assertFalse(isSuccess(302));
+        assertFalse(isSuccess(403));
+        assertFalse(isSuccess(-1));
     }
 }

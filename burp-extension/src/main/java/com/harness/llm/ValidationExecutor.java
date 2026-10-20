@@ -1284,42 +1284,44 @@ public final class ValidationExecutor {
     // ---------------------------------------------------------------
     private void csrfValidation(TestPlan plan, HttpRequestResponse source) {
         HttpRequest req = source.request();
-        boolean cookieAuthPresent = false;
-        for (HttpHeader h : req.headers()) {
-            if (h.name().equalsIgnoreCase("Cookie")) { cookieAuthPresent = true; break; }
-        }
+        // Only the cookie is ambient: a browser attaches it to a cross-site
+        // request by itself, but never an Authorization header.
+        String cookie = reqHeader(req, "Cookie");
+        boolean cookieAuthPresent = cookie != null && !cookie.isBlank();
 
-        HttpParameter tokenParam = null;
+        // The forged request starts as the captured one without a valid token:
+        // a token header is removed, a token parameter is invalidated.
+        HttpRequest forged = null;
         for (HttpHeader h : req.headers()) {
-            if (CsrfLogic.looksLikeCsrfTokenName(h.name())) {
-                // Header-based token: remove the header itself and resend.
-                var resp0 = source.response();
-                int originalStatus0 = resp0 == null ? 0 : resp0.statusCode();
-                var rr0 = api.http().sendRequest(req.withRemovedHeader(h.name()));
-                var mutatedResp0 = rr0.response();
-                int mutatedStatus0 = mutatedResp0 == null ? -1 : mutatedResp0.statusCode();
-                CsrfLogic.Evidence ev0 = CsrfLogic.evaluate(req.method(), true, true, originalStatus0, mutatedStatus0);
-                statusFor(plan, source, ev0.verdict().name().toLowerCase(Locale.ROOT), ev0.confidence(), ev0.confirmed(), ev0.summary(), ev0.detail());
-                return;
+            if (CsrfLogic.looksLikeCsrfTokenName(h.name())) { forged = req.withRemovedHeader(h.name()); break; }
+        }
+        if (forged == null) {
+            for (var p : req.parameters()) {
+                if (p.type() == HttpParameterType.COOKIE) continue;
+                if (CsrfLogic.looksLikeCsrfTokenName(p.name())) {
+                    forged = req.withParameter(HttpParameter.parameter(p.name(), "invalidated-by-harness", p.type()));
+                    break;
+                }
             }
         }
-        for (var p : req.parameters()) {
-            if (p.type() == HttpParameterType.COOKIE) continue;
-            if (CsrfLogic.looksLikeCsrfTokenName(p.name())) { tokenParam = p; break; }
+        boolean tokenFound = forged != null;
+        int originalStatus = status(source);
+        int forgedStatus = -1;
+        int anonymousStatus = -1;
+        if (tokenFound && cookieAuthPresent && !CsrfLogic.isSafeMethod(req.method())
+                && CsrfLogic.isSuccess(originalStatus)) {
+            // What a cross-site page can make the browser send: the session
+            // cookie, no valid token, no non-ambient credential.
+            forged = forged.withRemovedHeader("Authorization");
+            forgedStatus = status(api.http().sendRequest(forged));
+            if (CsrfLogic.isSuccess(forgedStatus)) {
+                // Control: the same request without the cookie either. If it
+                // also succeeds, the action is not gated on the session.
+                anonymousStatus = status(api.http().sendRequest(forged.withRemovedHeader("Cookie")));
+            }
         }
-
-        if (tokenParam != null) {
-            var resp = source.response();
-            int originalStatus = resp == null ? 0 : resp.statusCode();
-            var rr = api.http().sendRequest(req.withParameter(HttpParameter.parameter(tokenParam.name(), "invalidated-by-harness", tokenParam.type())));
-            var mutatedResp = rr.response();
-            int mutatedStatus = mutatedResp == null ? -1 : mutatedResp.statusCode();
-            CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, true, originalStatus, mutatedStatus);
-            statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
-            return;
-        }
-
-        CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, false, 0, -1);
+        CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, tokenFound,
+                originalStatus, forgedStatus, anonymousStatus);
         statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
     }
 
