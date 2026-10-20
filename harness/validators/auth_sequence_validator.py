@@ -417,6 +417,7 @@ class AuthSequenceValidator(Validator):
             # with the partial, step-1-only session.
             candidates = ([f"/my-account?id={username}"] if username else []) + list(_PROTECTED_CANDIDATES)
             seen = set()
+            unproven = ""  # RV-L L8: a reachable page whose anonymous control did not deny
             for path in candidates:
                 if path in seen:
                     continue
@@ -439,14 +440,26 @@ class AuthSequenceValidator(Validator):
                     continue
                 # Control: the same resource with NO session must be denied, else it is
                 # simply public (not a bypass).
+                anon_answer = ""
                 async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                             follow_redirects=False, verify=False) as anon:
                     try:
                         anon_got = await self._send(anon, "GET", url, self._headers(exchange), None)
-                        anon_ok = _substantive(anon_got.status_code, anon_got.text or "")
-                    except httpx.HTTPError:
-                        anon_ok = False
-                if anon_ok:
+                    except httpx.HTTPError as e:
+                        anon_got, anon_answer = None, f"a transport error ({type(e).__name__})"
+                if anon_got is not None:
+                    if _substantive(anon_got.status_code, anon_got.text or ""):
+                        continue
+                    # RV-L L8: a server error or a missing page says nothing about
+                    # whether an anonymous caller is denied.
+                    if anon_got.status_code >= 500 or anon_got.status_code == 404:
+                        anon_answer = f"HTTP {anon_got.status_code}"
+                if anon_answer:
+                    unproven = unproven or (
+                        f"GET {url} returned authenticated content (HTTP {got.status_code}) to the "
+                        f"step-1-only session, but the same path with no session answered "
+                        f"{anon_answer}, which is not a denial, so the page may be public or "
+                        f"broken rather than protected.")
                     continue
                 return ValidationResult(
                     self.name, "confirmed", fc, confidence=0.9, confirmed=True,
@@ -456,6 +469,9 @@ class AuthSequenceValidator(Validator):
                              f"GET {url} returned authenticated content (HTTP {got.status_code}) while the same "
                              f"path with no session was denied. The protected page is reachable without the "
                              f"2FA code -- the second factor is not enforced on the session.")
+        if unproven:
+            return self._candidate("a page is reachable before the second factor, but the "
+                                   "anonymous control did not deny it", unproven, fc)
         return self._not("no protected resource reachable before the second factor", fc)
 
     async def _refresh_login_body(self, client, exchange) -> str:
