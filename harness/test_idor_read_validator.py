@@ -1,6 +1,8 @@
 """Tests for the single-principal IDOR read-differential validator: it must
-confirm a cross-object read (own vs foreign vs absent all differ), stay quiet when
-the endpoint returns the same page for every id, and never send a mutating request."""
+report a cross-object read of a protected object (own vs foreign vs absent all
+differ, refused without credentials) as a candidate -- one principal never
+confirms IDOR (RV-D2 V2) -- stay quiet when the endpoint returns the same page
+for every id, and never send a mutating request."""
 import asyncio
 import unittest
 from unittest.mock import patch
@@ -55,16 +57,18 @@ class ReadDifferentialTests(_Gate):
         with patch("httpx.AsyncClient.request", app):
             return asyncio.run(v.validate(_f(), exchange))
 
-    def test_confirms_username_idor_with_supplied_candidate(self):
+    def test_username_idor_with_supplied_candidate_is_a_candidate(self):
         # Distinct account page per id; absent id -> not found. carlos supplied.
         # R14: the account pages are protected -- without the session cookie the
         # app redirects to its login page, so only the session unlocks carlos.
+        # RV-D2 V2: wiener's session alone cannot show carlos's page is not
+        # wiener's to read, so it stays a candidate naming a second identity.
         async def app(self, method, url, headers=None, content=None):
             idv = parse_qs(urlsplit(url).query).get("id", [""])[0]
             class _R: pass
             r = _R(); r.status_code = 200
             if "Cookie" not in (headers or {}):
-                r.status_code = 302; r.text = ""
+                r.status_code = 302; r.text = ""; r.headers = {"location": "/login"}
             elif idv == "wiener":
                 r.text = "Your username: wiener. Your API key: KEY-WIENER-" + "x" * 40
             elif idv == "carlos":
@@ -75,12 +79,15 @@ class ReadDifferentialTests(_Gate):
         ex = HttpExchange(url="http://t.test/my-account?id=wiener", method="GET",
                           request_headers={"Cookie": "session=wiener"}, response_status=200)
         res = self._run(app, ex, candidate_ids=["carlos"])
-        self.assertEqual(res.status, "confirmed")
-        self.assertTrue(res.confirmed)
+        self.assertEqual(res.status, "inconclusive")
+        self.assertFalse(res.confirmed)
+        self.assertIn("second identity", res.summary)
+        self.assertIn("redirect to the login page /login", res.evidence)
         self.assertNotIn("KEY-CARLOS", res.evidence)  # other object's data redacted
 
-    def test_confirms_numeric_idor_via_neighbour(self):
+    def test_numeric_idor_via_neighbour_is_a_candidate(self):
         # R14: orders are protected -- an unauthenticated read is refused.
+        # RV-D2 V2: still one principal, so a candidate, not a confirmation.
         async def app(self, method, url, headers=None, content=None):
             seg = urlsplit(url).path.rsplit("/", 1)[-1]
             class _R: pass
@@ -97,7 +104,9 @@ class ReadDifferentialTests(_Gate):
         ex = HttpExchange(url="http://t.test/api/orders/123", method="GET",
                           request_headers={"Cookie": "session=wiener"}, response_status=200)
         res = self._run(app, ex)
-        self.assertEqual(res.status, "confirmed")
+        self.assertEqual(res.status, "inconclusive")
+        self.assertFalse(res.confirmed)
+        self.assertIn("refused (HTTP 401)", res.evidence)
 
     def test_same_page_for_every_id_is_not_confirmed(self):
         # No real object behind the id: identical page for own, foreign, absent.
