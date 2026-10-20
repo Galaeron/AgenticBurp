@@ -72,7 +72,80 @@ public final class XssPayloadLogicTest {
     @DisplayName("JS string breakout surviving raw -> CONFIRMED")
     void jsBreakoutIsConfirmed() {
         Payload p = PAYLOADS.get(1); // '-__C__-'
+        Verdict v = classify(p, "ABC123", "<script>var x=''-ABC123-'';</script>");
+        assertEquals(Verdict.CONFIRMED, v);
+    }
+
+    @Test
+    @DisplayName("R28: the payload as a whole JS string literal is not a breakout -> not CONFIRMED")
+    void jsPayloadAsHarmlessLiteralIsNotConfirmed() {
+        Payload p = PAYLOADS.get(1);
         Verdict v = classify(p, "ABC123", "<script>var x='-ABC123-'</script>");
+        assertEquals(Verdict.SUPPORTED, v, "the canary came back, but inside code position it is just a string");
+    }
+
+    @Test
+    @DisplayName("R28: an escaped quote does not end the JS string -> not CONFIRMED")
+    void escapedJsQuoteIsNotConfirmed() {
+        Payload p = PAYLOADS.get(1);
+        Verdict v = classify(p, "ABC123", "<script>var x='a\\'-ABC123-'</script>");
+        assertEquals(Verdict.SUPPORTED, v);
+    }
+
+    @Test
+    @DisplayName("R28: an ordinary page script without the injected canary -> REJECTED")
+    void ordinaryScriptWithoutCanaryIsRejected() {
+        Verdict v = classify(PAYLOADS.get(0), "ABC123", "<script>console.log('ordinary application script');</script>");
+        assertEquals(Verdict.REJECTED, v);
+    }
+
+    @Test
+    @DisplayName("R28: the tag-breakout payload reflected inside a textarea is inert -> not CONFIRMED")
+    void tagBreakoutInsideTextareaIsNotConfirmed() {
+        Verdict v = classify(PAYLOADS.get(0), "ABC123", "<textarea>\"><script>ABC123</script></textarea>");
+        assertEquals(Verdict.SUPPORTED, v);
+    }
+
+    @Test
+    @DisplayName("R28: the tag-breakout payload reflected inside an HTML comment is inert -> not CONFIRMED")
+    void tagBreakoutInsideCommentIsNotConfirmed() {
+        Verdict v = classify(PAYLOADS.get(0), "ABC123", "<!-- q=\"><script>ABC123</script> -->");
+        assertEquals(Verdict.SUPPORTED, v);
+    }
+
+    @Test
+    @DisplayName("the tag-breakout payload closing a double-quoted attribute -> CONFIRMED")
+    void tagBreakoutFromDoubleQuotedAttributeIsConfirmed() {
+        Verdict v = classify(PAYLOADS.get(0), "ABC123", "<input value=\"\"><script>ABC123</script>\">");
+        assertEquals(Verdict.CONFIRMED, v);
+    }
+
+    @Test
+    @DisplayName("R28: the tag-breakout payload stuck inside a single-quoted attribute -> not CONFIRMED")
+    void tagBreakoutInsideSingleQuotedAttributeIsNotConfirmed() {
+        Verdict v = classify(PAYLOADS.get(0), "ABC123", "<input value='\"><script>ABC123</script>'>");
+        assertEquals(Verdict.SUPPORTED, v);
+    }
+
+    @Test
+    @DisplayName("event-handler payload closing a double-quoted attribute -> CONFIRMED")
+    void eventHandlerInDoubleQuotedAttributeIsConfirmed() {
+        Verdict v = classify(PAYLOADS.get(2), "ABC123", "<input value=\"\"onmouseover=\"ABC123\">");
+        assertEquals(Verdict.CONFIRMED, v);
+    }
+
+    @Test
+    @DisplayName("R28: event-handler payload reflected as text -> not CONFIRMED")
+    void eventHandlerAsTextIsNotConfirmed() {
+        Verdict v = classify(PAYLOADS.get(2), "ABC123", "<p>\"onmouseover=\"ABC123</p>");
+        assertEquals(Verdict.SUPPORTED, v);
+    }
+
+    @Test
+    @DisplayName("any one executable occurrence is enough, even after an inert one")
+    void laterExecutableOccurrenceIsConfirmed() {
+        Verdict v = classify(PAYLOADS.get(0), "ABC123",
+                "<title>\"><script>ABC123</script></title><p>\"><script>ABC123</script></p>");
         assertEquals(Verdict.CONFIRMED, v);
     }
 }

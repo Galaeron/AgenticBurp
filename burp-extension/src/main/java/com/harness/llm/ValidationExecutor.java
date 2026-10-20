@@ -202,11 +202,12 @@ public final class ValidationExecutor {
 
         switch (best) {
             case CONFIRMED -> statusFor(plan, source, "confirmed", 0.9, true,
-                    "A breakout payload survived unescaped in the response for parameter '" + bestParam.name() + "'.",
+                    "The injected payload, unique canary included, came back unescaped where it executes ("
+                            + bestPayload.context() + ") for parameter '" + bestParam.name() + "'.",
                     bestDetail);
             case SUPPORTED -> statusFor(plan, source, "supported", 0.6, false,
-                    "Content was reflected for parameter '" + bestParam.name() + "' but no breakout payload survived "
-                            + "unescaped across " + XssPayloadLogic.PAYLOADS.size() + " tried -- this does not by itself "
+                    "Content was reflected for parameter '" + bestParam.name() + "' but no breakout payload came back "
+                            + "unescaped in an executable context across " + XssPayloadLogic.PAYLOADS.size() + " tried -- this does not by itself "
                             + "prove executable XSS.", bestDetail);
             default -> statusFor(plan, source, "rejected", 0.72, false,
                     "No reflection was observed for any of " + XssPayloadLogic.PAYLOADS.size()
