@@ -5,7 +5,9 @@ Active validator covering two of the API-security agent's checks that
 lend themselves to a concrete probe from a single captured exchange:
 
 1. Mass assignment -- resend a JSON body with an extra unexpected
-   field and see if the response reflects it as accepted.
+   field; confirmed only when the write is accepted (2xx) AND an
+   independent GET read-back shows the field persisted. An echo of the
+   field without that read-back is a candidate, never a confirmation.
 2. Unbounded resource consumption -- resend with a very large
    limit/count/page_size query parameter and see if the server caps it.
 
@@ -21,7 +23,7 @@ import json as jsonlib
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse, parse_qs, urlunparse
+from urllib.parse import urljoin, urlparse, parse_qs, urlunparse
 
 from .base import Validator, ValidationResult
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
@@ -44,13 +46,29 @@ class ApiSecurityTestResult:
     evidence: str
     vulnerable: bool = False
     checked: bool = True
+    candidate: bool = False  # signal seen, proof missing -- never a confirmation
 
     def to_dict(self) -> dict:
         return {
             "test": self.test_name, "passed": self.passed, "severity": self.severity,
             "detail": self.detail, "evidence": self.evidence,
-            "vulnerable": self.vulnerable, "checked": self.checked,
+            "vulnerable": self.vulnerable, "checked": self.checked, "candidate": self.candidate,
         }
+
+
+def _carries_probe(value: Any, require_true: bool = False, _depth: int = 0) -> bool:
+    """Whether the probe field appears anywhere in a parsed JSON value (objects
+    nest under wrapper keys and lists); with require_true, only as ``true``."""
+    if _depth > 8:
+        return False
+    if isinstance(value, dict):
+        if _MASS_ASSIGNMENT_PROBE_FIELD in value and (
+                not require_true or value[_MASS_ASSIGNMENT_PROBE_FIELD] is True):
+            return True
+        value = list(value.values())
+    if isinstance(value, list):
+        return any(_carries_probe(v, require_true, _depth + 1) for v in value)
+    return False
 
 
 class ApiSecurityValidator(Validator):
@@ -139,20 +157,31 @@ class ApiSecurityValidator(Validator):
                 )
 
             vulnerable_tests = [t for t in tests if t.vulnerable]
+            candidate_tests = [t for t in tests if t.candidate and not t.vulnerable]
             vulnerable = bool(vulnerable_tests)
             summary_parts = []
             if vulnerable_tests:
                 summary_parts.append(f"API security issue(s) confirmed: {len(vulnerable_tests)}")
                 for t in vulnerable_tests:
                     summary_parts.append(f"  - {t.test_name}: {t.detail}")
+            elif candidate_tests:
+                summary_parts.append("Candidate only, not confirmed:")
+                for t in candidate_tests:
+                    summary_parts.append(f"  - {t.test_name}: {t.detail}")
             else:
                 summary_parts.append("No mass assignment or unbounded resource consumption confirmed")
 
+            if vulnerable:
+                status, confidence = "confirmed", 0.75
+            elif candidate_tests:
+                status, confidence = "inconclusive", 0.4
+            else:
+                status, confidence = "not_confirmed", 0.2
             return ValidationResult(
                 validator=self.get_name(),
-                status="confirmed" if vulnerable else "not_confirmed",
+                status=status,
                 finding_class=finding.vulnerability_class,
-                confidence=0.75 if vulnerable else 0.2,
+                confidence=confidence,
                 confirmed=vulnerable,
                 summary=" ".join(summary_parts),
                 evidence=self._build_evidence(tests),
@@ -182,6 +211,7 @@ class ApiSecurityValidator(Validator):
         headers["User-Agent"] = self.user_agent
         headers.setdefault("Content-Type", "application/json")
 
+        read_back = None
         try:
             async with GatedAsyncClient(
                 get_default_gate(), self.get_name(),
@@ -193,6 +223,11 @@ class ApiSecurityValidator(Validator):
                     exchange.method, exchange.url,
                     headers=headers, content=jsonlib.dumps(probed_body),
                 )
+                # R18: an echo is not persistence (a 400 that names the field to
+                # reject it echoes it too). Only an accepted write is re-read,
+                # with an independent GET of the resource it changed.
+                if 200 <= response.status_code < 300:
+                    read_back = await self._read_back(client, exchange, response)
         except SafetyGateBlocked as e:
             return ApiSecurityTestResult("Mass Assignment Probe", True, "low",
                                           f"Blocked by safety gate: {e.decision.reason}", "",
@@ -207,25 +242,72 @@ class ApiSecurityValidator(Validator):
         except Exception:
             resp_json = None
 
-        reflected = isinstance(resp_json, dict) and _MASS_ASSIGNMENT_PROBE_FIELD in resp_json
-        if reflected:
+        echoed = _carries_probe(resp_json)
+        persisted_url, persisted_detail = read_back or (None, "")
+        if persisted_url:
             return ApiSecurityTestResult(
                 "Mass Assignment Probe", False, "high",
                 f"An unexpected field ({_MASS_ASSIGNMENT_PROBE_FIELD}) added to the request body was "
-                "accepted and reflected back in the response -- the endpoint appears to bind the "
-                "request body to an internal object without an allowlist of settable fields, which "
-                "means a genuinely privileged field name (role, isAdmin, etc.) sent the same way "
-                "might also be accepted",
-                f"Status {response.status_code}, response contains {_MASS_ASSIGNMENT_PROBE_FIELD}",
+                f"accepted (status {response.status_code}) and an independent read-back of "
+                f"{persisted_url} shows it persisted -- the endpoint binds the request body to an "
+                "internal object without an allowlist of settable fields, so a genuinely privileged "
+                "field name (role, isAdmin, etc.) sent the same way would be stored too",
+                f"Write status {response.status_code}; read-back GET {persisted_url} -> "
+                f"{_MASS_ASSIGNMENT_PROBE_FIELD}=true",
                 vulnerable=True,
+            )
+        if echoed:
+            return ApiSecurityTestResult(
+                "Mass Assignment Probe", True, "medium",
+                f"The response echoed the unexpected field ({_MASS_ASSIGNMENT_PROBE_FIELD}) with "
+                f"status {response.status_code}, but no independent read-back showed it persisted "
+                f"{persisted_detail or '(the write was not accepted, so nothing was re-read)'} -- "
+                "an echo alone is not mass assignment (a validation error naming the field echoes "
+                "it too). Candidate only; confirm by re-reading the object.",
+                f"Status {response.status_code}, response contains {_MASS_ASSIGNMENT_PROBE_FIELD}",
+                vulnerable=False, candidate=True,
             )
         return ApiSecurityTestResult(
             "Mass Assignment Probe", True, "low",
-            f"Unexpected field not reflected back (status {response.status_code}) -- "
-            "no evidence of unrestricted mass assignment from this probe alone "
-            "(a field that's silently accepted but not echoed back would not be caught by this check)",
+            f"Unexpected field not reflected back (status {response.status_code}) and not seen "
+            f"persisted {persisted_detail or '(the write was not accepted)'} -- "
+            "no evidence of unrestricted mass assignment from this probe",
             f"Status: {response.status_code}", vulnerable=False,
         )
+
+    async def _read_back(self, client, exchange: HttpExchange, response) -> tuple[str | None, str]:
+        """GET the written resource -- the 201's same-origin Location when given,
+        else the captured URL -- with the captured credentials. Returns
+        (url, detail): url is set only when the persisted state carries the
+        probe field set to true."""
+        url = exchange.url
+        location = response.headers.get("location") or ""
+        if location:
+            target = urljoin(exchange.url, location)
+            a, b = urlparse(exchange.url), urlparse(target)
+            if (a.scheme, a.netloc) == (b.scheme, b.netloc):
+                url = target
+        headers = {k: v for k, v in (exchange.request_headers or {}).items()
+                   if k.lower() not in ("content-length", "content-type", "host")}
+        headers["User-Agent"] = self.user_agent
+        try:
+            from harness import global_throttle
+            await global_throttle.acquire()
+            got = await client.request("GET", url, headers=headers)
+        except SafetyGateBlocked as e:
+            return None, f"(read-back blocked by safety gate: {e.decision.reason})"
+        except Exception as e:
+            log.debug(f"Mass assignment read-back failed: {e}")
+            return None, f"(read-back of {url} failed: {e})"
+        if not 200 <= got.status_code < 300:
+            return None, f"(read-back GET {url} -> status {got.status_code})"
+        try:
+            state = got.json()
+        except Exception:
+            return None, f"(read-back GET {url} returned no JSON)"
+        if _carries_probe(state, require_true=True):
+            return url, ""
+        return None, f"(read-back GET {url} does not carry the field)"
 
     async def _probe_unbounded_limit(self, exchange: HttpExchange) -> ApiSecurityTestResult | None:
         parsed = urlparse(exchange.url)
@@ -284,8 +366,12 @@ class ApiSecurityValidator(Validator):
     def _build_evidence(self, tests: list[ApiSecurityTestResult]) -> str:
         vulnerable = [t for t in tests if t.vulnerable]
         if not vulnerable:
+            candidates = [t for t in tests if t.candidate]
+            if candidates:
+                return "No API security issue confirmed; candidate: " + " | ".join(
+                    f"{t.test_name}: {t.evidence}" for t in candidates)
             return "No API security issue confirmed"
-        return " | ".join(f"{t.test_name}: {t.detail} ({t.severity})" for t in vulnerable)
+        return " | ".join(f"{t.test_name}: {t.evidence} -- {t.detail} ({t.severity})" for t in vulnerable)
 
     def _build_raw_output(self, tests: list[ApiSecurityTestResult]) -> str:
         return jsonlib.dumps([t.to_dict() for t in tests], indent=2)
