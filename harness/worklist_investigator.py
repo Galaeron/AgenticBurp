@@ -22,6 +22,7 @@ integrate loop.
 from __future__ import annotations
 
 import logging
+import re
 from urllib.parse import urlsplit
 
 from harness.models import HttpExchange
@@ -125,6 +126,21 @@ def _parent_template_object_id(state, node: dict) -> str | None:
     return None
 
 
+def _fill_path_ids(path: str, template: dict | None, id_val: str) -> str:
+    """Fill the `{id}` slots of a node path.
+
+    A captured template records every path id in order (`path_ids`), so each slot
+    gets ITS OWN captured value: /accounts/{id}/orders/{id} replays as
+    /accounts/17/orders/42, not /accounts/42/orders/42. Without a recorded list
+    that matches the slot count -- a template stored before `path_ids` existed,
+    or no template at all -- every slot takes `id_val`, as before."""
+    ids = (template or {}).get("path_ids") or []
+    if ids and len(ids) == path.count("{id}"):
+        values = iter(str(i) for i in ids)
+        return re.sub(r"\{id\}", lambda _m: next(values), path)
+    return path.replace("{id}", id_val)
+
+
 def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
                    template: dict | None = None) -> HttpExchange:
     """Build the probe exchange for a node. When a captured request TEMPLATE exists
@@ -138,7 +154,7 @@ def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
     query = (template.get("query", "") if template else "") or ""
     ctype = (template.get("content_type", "") if template else "") or ""
 
-    path = node.get("path", "/").replace("{id}", id_val)
+    path = _fill_path_ids(node.get("path", "/"), template, id_val)
     url = base_url.rstrip("/") + path
     if query and "?" not in url:
         url = f"{url}?{query}"

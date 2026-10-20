@@ -51,6 +51,7 @@ _PRIVILEGED = re.compile(
 
 _NUM_SEG = re.compile(r"/\d+(?=/|$)")
 _HEXISH = re.compile(r"/[0-9a-fA-F]{12,}(?=/|$)")
+_ID_SEG = re.compile(r"\d+|[0-9a-fA-F]{12,}")   # one path segment normalize_path turns into {id}
 
 # 2026-09-17 coverage-recovery plan, Step 2: a percent-encoded byte surviving
 # INTO the normalized path is a discovery artifact (an encoded traversal probe,
@@ -83,6 +84,19 @@ def normalize_path(url_or_path: str) -> str:
     return s or "/"
 
 
+def path_id_values(url_or_path: str) -> list[str]:
+    """The concrete value at each `{id}` slot that normalize_path() produces for
+    this URL, in path order. /accounts/17/orders/42 -> ["17", "42"]. Matches the
+    same segments normalize_path collapses (all-digit, or 12+ hex characters), so
+    the n-th value belongs to the n-th `{id}` of the normalized path."""
+    s = url_or_path or ""
+    if "://" in s:
+        s = urlsplit(s).path or "/"
+    else:
+        s = s.split("?", 1)[0].split("#", 1)[0]
+    return [seg for seg in s.split("/") if _ID_SEG.fullmatch(seg)]
+
+
 def _looks_privileged(path: str) -> bool:
     return bool(_PRIVILEGED.search(path or ""))
 
@@ -106,8 +120,12 @@ def template_from_exchange(ex) -> dict:
     for seg in [s for s in (parts.path or "").split("/") if s]:
         if re.fullmatch(r"\d+|[0-9a-fA-F-]{8,}", seg):
             obj_id = seg  # keep the LAST matching segment -> the leaf object id
+    # object_id is the LEAF id only. path_ids keeps every id in path order, so a
+    # nested route (/accounts/17/orders/42) can be replayed with each parameter
+    # intact rather than the leaf id copied into every slot.
     return {"method": method, "query": parts.query or "", "body": body,
-            "content_type": ctype or "", "object_id": obj_id}
+            "content_type": ctype or "", "object_id": obj_id,
+            "path_ids": path_id_values(url)}
 
 
 @dataclass
