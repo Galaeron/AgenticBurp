@@ -107,4 +107,40 @@ public final class MassAssignmentLogicTest {
         assertEquals(Verdict.SUPPORTED, e.verdict());
         assertFalse(e.confirmed());
     }
+
+    // ---------------------------------------------------------------- RV-N N3
+    @Test
+    @DisplayName("N3: the created object is the Location header, else the write path plus a top-level id")
+    void createdObjectReferenceFromLocationOrId() {
+        assertEquals("/users/43", createdObjectReference("/users", " /users/43 ", "{\"id\":99}"));
+        assertEquals("/users/44", createdObjectReference("/users?x=1", null, "{\"id\":44}"));
+        assertEquals("/users/44", createdObjectReference("/users/", "", "{\"id\":44}"));
+        assertEquals("/users/u_9-a", createdObjectReference("/users", null, "{\"name\":\"x\", \"id\" : \"u_9-a\"}"));
+        assertNull(createdObjectReference("/users", null, "{}"));
+        assertNull(createdObjectReference(null, null, "{\"id\":1}"));
+    }
+
+    @Test
+    @DisplayName("N3: only a top-level id of safe characters names the created object")
+    void topLevelIdOnly() {
+        assertEquals("43", topLevelId("{\"id\":43}"));
+        assertNull(topLevelId("{\"user\":{\"id\":5}}"));
+        assertNull(topLevelId("{\"items\":[{\"id\":5}]}"));
+        assertNull(topLevelId("[{\"id\":1}]"));
+        assertNull(topLevelId("{\"id\":\"../admin\"}"));
+        assertNull(topLevelId("{\"id\":true}"));
+        assertNull(topLevelId("{\"ids\":\"5\"}"));
+        assertNull(topLevelId("{\"note\":\"\\\"id\\\":9\"}"));
+        assertNull(topLevelId(null));
+    }
+
+    @Test
+    @DisplayName("N3: the detail says which resources the before and after reads fetched")
+    void readTargetsInDetail() {
+        Evidence e = evaluate("role", "\"admin\"", false, "{\"id\":43}", 201, "{\"id\":44,\"role\":\"admin\"}",
+                200, "{\"id\":43,\"role\":\"user\"}", 200, "{\"id\":44,\"role\":\"admin\"}",
+                "read before: /users/43, read after: /users/44");
+        assertEquals(Verdict.CONFIRMED, e.verdict());
+        assertTrue(e.detail().contains("read after: /users/44"), e.detail());
+    }
 }

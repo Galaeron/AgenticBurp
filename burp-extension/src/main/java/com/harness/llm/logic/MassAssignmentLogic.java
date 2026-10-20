@@ -15,7 +15,11 @@ import java.util.regex.Pattern;
  * review 02 R27): the write must succeed and a read of the resource
  * after it must show the field at the injected value where a read
  * before it did not -- only then has the server bound request JSON onto
- * the stored object without an allowlist of settable fields.
+ * the stored object without an allowlist of settable fields. For a
+ * create-style write (POST to a collection) the resource is the created
+ * object, which the response names (RV-J residual N3): the "before" read
+ * is of the object the captured request created, the "after" read of the
+ * one the probe created.
  *
  * Deliberately string-based, not a full JSON parse/serialize round
  * trip: injectField() only ever needs to insert one flat key before the
@@ -52,6 +56,81 @@ public final class MassAssignmentLogic {
         return status >= 200 && status < 300;
     }
 
+    private static final Pattern SAFE_ID = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+    private static final Pattern NUMERIC_ID = Pattern.compile("[0-9]{1,19}");
+
+    /**
+     * Where a create-style write's response says the created object lives
+     * (code review 02 RV-J residual N3): its Location header, else the write
+     * path (query dropped) joined with a top-level "id" of the JSON body.
+     * The caller still has to check the reference is same-origin. Returns
+     * null if the response names no object.
+     */
+    public static String createdObjectReference(String writePath, String location, String responseBody) {
+        if (location != null && !location.isBlank()) return location.trim();
+        String id = topLevelId(responseBody);
+        if (id == null || writePath == null) return null;
+        String path = writePath;
+        int query = path.indexOf('?');
+        if (query >= 0) path = path.substring(0, query);
+        while (path.endsWith("/")) path = path.substring(0, path.length() - 1);
+        return path + "/" + id;
+    }
+
+    /**
+     * The value of the top-level "id" key of a JSON object body, if it is a
+     * string of safe path characters or a plain integer; null otherwise. An
+     * "id" nested in another object or an array is not the created object's.
+     */
+    static String topLevelId(String body) {
+        if (body == null) return null;
+        String b = body.trim();
+        if (!b.startsWith("{")) return null;
+        int depth = 0;
+        for (int i = 0; i < b.length(); i++) {
+            char c = b.charAt(i);
+            if (c == '"') {
+                int end = endOfString(b, i);
+                if (end < 0) return null;
+                if (depth == 1 && b.substring(i + 1, end).equals("id")) {
+                    int j = skipSpace(b, end + 1);
+                    if (j < b.length() && b.charAt(j) == ':') {
+                        j = skipSpace(b, j + 1);
+                        if (j < b.length() && b.charAt(j) == '"') {
+                            int valueEnd = endOfString(b, j);
+                            if (valueEnd < 0) return null;
+                            String value = b.substring(j + 1, valueEnd);
+                            return SAFE_ID.matcher(value).matches() ? value : null;
+                        }
+                        int valueEnd = j;
+                        while (valueEnd < b.length() && Character.isDigit(b.charAt(valueEnd))) valueEnd++;
+                        String value = b.substring(j, valueEnd);
+                        return NUMERIC_ID.matcher(value).matches() ? value : null;
+                    }
+                }
+                i = end;
+                continue;
+            }
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') depth--;
+        }
+        return null;
+    }
+
+    private static int endOfString(String s, int openQuote) {
+        for (int i = openQuote + 1; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\') { i++; continue; }
+            if (c == '"') return i;
+        }
+        return -1;
+    }
+
+    private static int skipSpace(String s, int i) {
+        while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
+        return i;
+    }
+
     /**
      * True if `body` carries `"fieldName": fieldValueJson` as one key/value
      * pair. The key and the value must be bound to each other: the key in
@@ -83,11 +162,12 @@ public final class MassAssignmentLogic {
      * @param beforeReadBody body of that read, or null
      * @param afterReadStatus status of a read of the resource after the write, or -1 if not sent
      * @param afterReadBody body of that read, or null
+     * @param readTargets which resources the two reads fetched, for the detail; null if not stated
      */
     public static Evidence evaluate(String fieldName, String fieldValueJson, boolean fieldAlreadyInRequestBody,
                                      String baselineResponseBody, int mutatedStatus, String mutatedResponseBody,
                                      int beforeReadStatus, String beforeReadBody,
-                                     int afterReadStatus, String afterReadBody) {
+                                     int afterReadStatus, String afterReadBody, String readTargets) {
         if (fieldAlreadyInRequestBody) {
             return new Evidence(Verdict.INVALID, 0.0, false,
                     "The field '" + fieldName + "' was already present in the original request body -- not a "
@@ -96,7 +176,7 @@ public final class MassAssignmentLogic {
                     "");
         }
         String detail = "write status=" + mutatedStatus + " | read before status=" + beforeReadStatus
-                + " | read after status=" + afterReadStatus;
+                + " | read after status=" + afterReadStatus + (readTargets == null ? "" : " | " + readTargets);
         if (!isSuccess(mutatedStatus)) {
             return new Evidence(Verdict.REJECTED, 0.75, false,
                     "The server refused the write carrying the injected field ('" + fieldName + "': "
@@ -136,5 +216,14 @@ public final class MassAssignmentLogic {
                         + "'" + fieldName + "': " + fieldValueJson + " -- no evidence of mass assignment for "
                         + "this field.",
                 detail);
+    }
+
+    /** As above, with no statement of which resources were read. */
+    public static Evidence evaluate(String fieldName, String fieldValueJson, boolean fieldAlreadyInRequestBody,
+                                     String baselineResponseBody, int mutatedStatus, String mutatedResponseBody,
+                                     int beforeReadStatus, String beforeReadBody,
+                                     int afterReadStatus, String afterReadBody) {
+        return evaluate(fieldName, fieldValueJson, fieldAlreadyInRequestBody, baselineResponseBody, mutatedStatus,
+                mutatedResponseBody, beforeReadStatus, beforeReadBody, afterReadStatus, afterReadBody, null);
     }
 }

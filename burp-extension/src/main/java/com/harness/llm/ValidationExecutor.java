@@ -945,21 +945,50 @@ public final class ValidationExecutor {
         }
         // Persistence evidence: read the resource before and after the write.
         // An echo of the request in the write's own response proves nothing
-        // about what was stored.
-        var before = api.http().sendRequest(readRequest(req, req.path()));
+        // about what was stored. A create-style write (a POST whose captured
+        // response names the object it created, same-origin and not the
+        // write path itself) is read back from the created object, not from
+        // the collection it was posted to (RV-J residual N3): before, the
+        // object the captured request created; after, the one the probe did.
+        String writePath = pathOnly(req.path());
+        String capturedObject = null;
+        if ("POST".equalsIgnoreCase(method) && source.response() != null
+                && MassAssignmentLogic.isSuccess(source.response().statusCode())) {
+            capturedObject = sameOriginPath(req.url(), MassAssignmentLogic.createdObjectReference(
+                    writePath, source.response().headerValue("Location"), source.response().bodyToString()));
+            if (capturedObject != null && pathOnly(capturedObject).equals(writePath)) capturedObject = null;
+        }
+        HttpRequestResponse before = null;
+        boolean createStyle = false;
+        if (capturedObject != null) {
+            before = api.http().sendRequest(readRequest(req, capturedObject));
+            createStyle = MassAssignmentLogic.isSuccess(status(before));
+        }
+        if (!createStyle) before = api.http().sendRequest(readRequest(req, req.path()));
         var rr = api.http().sendRequest(req.withBody(mutatedBody));
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the mass-assignment probe request.", "");
             return;
         }
-        var after = MassAssignmentLogic.isSuccess(resp.statusCode())
-                ? api.http().sendRequest(readRequest(req, req.path())) : null;
+        String afterPath = null;
+        if (MassAssignmentLogic.isSuccess(resp.statusCode())) {
+            afterPath = createStyle
+                    ? sameOriginPath(req.url(), MassAssignmentLogic.createdObjectReference(
+                            writePath, resp.headerValue("Location"), resp.bodyToString()))
+                    : req.path();
+        }
+        var after = afterPath == null ? null : api.http().sendRequest(readRequest(req, afterPath));
+        String readTargets = createStyle
+                ? "create-style: read before GET " + capturedObject + " (object the captured request created), read after "
+                        + (afterPath == null ? "not sent (the probe's response named no same-origin object)"
+                                             : "GET " + afterPath + " (object the probe created)")
+                : "read before/after GET " + req.path();
         String baselineResponseBody = source.response() == null ? null : source.response().bodyToString();
         MassAssignmentLogic.Evidence ev = MassAssignmentLogic.evaluate(
                 MASS_ASSIGNMENT_FIELD_NAME, MASS_ASSIGNMENT_FIELD_VALUE_JSON, fieldAlreadyPresent,
                 baselineResponseBody, resp.statusCode(), resp.bodyToString(),
-                status(before), responseBody(before), status(after), responseBody(after));
+                status(before), responseBody(before), status(after), responseBody(after), readTargets);
         statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
     }
 
@@ -988,6 +1017,41 @@ public final class ValidationExecutor {
     private static HttpRequest readRequest(HttpRequest base, String path) {
         return base.withMethod("GET").withPath(path).withBody("")
                 .withRemovedHeader("Content-Type").withRemovedHeader("Content-Length");
+    }
+
+    /**
+     * The path (and query) {@code candidate} names, resolved against
+     * {@code requestUrl}, if it is on the same origin -- scheme, host and
+     * effective port -- else null. Keeps every read-back on the target the
+     * captured request went to.
+     */
+    static String sameOriginPath(String requestUrl, String candidate) {
+        if (requestUrl == null || candidate == null || candidate.isBlank()) return null;
+        try {
+            URI base = new URI(requestUrl);
+            URI target = base.resolve(new URI(candidate.trim()));
+            if (base.getHost() == null || target.getHost() == null || target.getScheme() == null) return null;
+            if (!target.getScheme().equalsIgnoreCase(base.getScheme())
+                    || !target.getHost().equalsIgnoreCase(base.getHost())
+                    || effectivePort(target) != effectivePort(base)) return null;
+            String path = target.getRawPath() == null || target.getRawPath().isEmpty() ? "/" : target.getRawPath();
+            return target.getRawQuery() == null ? path : path + "?" + target.getRawQuery();
+        } catch (java.net.URISyntaxException | IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private static int effectivePort(URI uri) {
+        if (uri.getPort() >= 0) return uri.getPort();
+        if ("https".equalsIgnoreCase(uri.getScheme())) return 443;
+        if ("http".equalsIgnoreCase(uri.getScheme())) return 80;
+        return -1;
+    }
+
+    private static String pathOnly(String path) {
+        if (path == null) return "";
+        int query = path.indexOf('?');
+        return query < 0 ? path : path.substring(0, query);
     }
 
     private static int bodyLen(HttpRequestResponse rr) {
