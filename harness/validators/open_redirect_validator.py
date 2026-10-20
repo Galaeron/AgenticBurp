@@ -109,18 +109,25 @@ class OpenRedirectValidator(Validator):
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
         candidate = ""  # sentinel reached Location, but no off-origin redirect
+        # Sends that got no response: a check that never reached the target is
+        # not a negative (RV-L L2). The gate's refusal stops the remaining sends.
+        refused, errors, sends = "", [], 0
         for loc, param in targets:
             for payload in self._payloads(f"{loc}-{param}"):
+                if refused:
+                    break
                 url, body = mutate(exchange, loc, param, payload)
+                sends += 1
                 try:
                     await global_throttle.acquire()
                     async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                                 follow_redirects=False, verify=False) as client:
                         resp = await client.request(method, url, headers=headers or None, content=body or None)
-                except SafetyGateBlocked:
-                    return self._skip("mutating open-redirect replay not authorized "
-                                      "(set validators.allow_mutating_replay)")
-                except httpx.HTTPError:
+                except SafetyGateBlocked as e:
+                    refused = e.decision.reason
+                    continue
+                except httpx.HTTPError as e:
+                    errors.append(f"{param!r} = `{payload}`: {e.__class__.__name__}")
                     continue
                 location = ""
                 try:
@@ -153,6 +160,18 @@ class OpenRedirectValidator(Validator):
                         "header, but no redirect to an off-origin host was observed",
                 evidence=candidate + " A browser would not leave the site, so this is not proof of "
                                      "an open redirect; check manually for another bypass.")
+        unanswered = len(errors) + (1 if refused else 0)
+        if unanswered:
+            answered = sends - unanswered
+            why = "; ".join(([f"refused by the safety gate ({refused})"] if refused else []) + errors[:3])
+            return ValidationResult(
+                self.name, "blocked" if refused and not answered else "inconclusive", "open_redirect",
+                confidence=0.0, confirmed=False,
+                summary=f"Open-redirect check incomplete: {unanswered} of {sends} send(s) got no "
+                        f"response ({why}); not a negative result",
+                evidence=f"Tried {len(targets)} redirect-shaped parameter(s); {answered} answered "
+                         f"send(s) carried no Location pointing at the sentinel host, but a send that "
+                         f"never reached the target cannot show one.")
         return ValidationResult(
             self.name, "not_confirmed", "open_redirect", confidence=0.0, confirmed=False,
             summary="No off-origin redirect observed -- the redirect target is not attacker-controlled",
