@@ -142,8 +142,9 @@ caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-b-ev
     evidence. The out-of-band probes now always run.
   - The evaluation score is unchanged. Two existing tests encoded the unsound confirmations
     and were updated, not weakened.
-  - **The false-confirmation work is not closed.** The independent verification
-    (`reviews/2026-10-20-rv-implementation-verification/REPORT.md`, untracked) reproduced
+  - **RV-D did not close the false-confirmation work; RV-D2 did (below).** The independent
+    verification (`reviews/2026-10-20-rv-implementation-verification/REPORT.md`, untracked)
+    reproduced
     three P1 residuals at `7cd6fdd` through the production callers:
     - V1: an anonymous control that returns HTTP 500 counts as "access refused", so IDOR
       confirms;
@@ -152,7 +153,7 @@ caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-b-ev
     - V3: `Access-Control-Allow-Origin: *` with credentials still confirms credentialed
       cross-origin reads, which the Fetch standard forbids.
     - None is a regression: the code before RV-D confirmed all three as well. Batch RV-D2
-      (brief `.test-work/rv-d2-falseconfirm-residual-20261020/BATCH.md`) owns them.
+      (brief `.test-work/rv-d2-falseconfirm-residual-20261020/BATCH.md`) fixed them.
   - Other follow-up: all-failed sends in SSRF's out-of-band step and in open redirect still
     read as negatives.
 
@@ -182,7 +183,8 @@ caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-e-fa
   - Stored-XSS tests in two files and the session-fixation fixture encoded the unsound
     confirmations. They were changed to supply real execution or login evidence; their
     assertions stand. The evaluation score is unchanged.
-  - **The false-confirmation work is not closed.** A second independent verification
+  - **RV-E did not close the false-confirmation work; RV-E2 did (below).** A second
+    independent verification
     (`reviews/2026-10-20-rvei-implementation-verification/REPORT.md`, untracked) confirmed R33
     and reproduced three P1 residuals at `c648dbd` through the production callers:
     - E1 (R18): the probe field may already be true before a write that changes nothing; no
@@ -191,7 +193,7 @@ caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-e-fa
       inert payload's source counts as execution (reproduced with real Chromium);
     - E3 (R20): an anonymous HTTP 500 or timeout counts as a session denial (the V1 shape).
     - None is a regression: the code before RV-E confirmed on weaker evidence. Batch RV-E2
-      (brief `.test-work/rv-e2-falseconfirm-residual-20261020/BATCH.md`) owns them.
+      (brief `.test-work/rv-e2-falseconfirm-residual-20261020/BATCH.md`) fixed them.
   - Follow-ups:
     - api_security probes that were blocked or unsent still read as passed (R08 shape);
     - the unbounded-limit probe still confirms on a response-size heuristic;
@@ -232,6 +234,116 @@ caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-e-fa
     - links shown only in the captured page, not the live page, are still not crawled (a
       design decision).
 
-Next: RV-C (branch `rv-c-evalprovenance`) and RV-J (branch `rv-j-burpexecutors`) have
-committed fixes, not yet landed. RV-D2 (P1) and RV-E2 (P1) are running their gates. RV-K waits
-for the I01 W-split, because `HarnessPanel.java` carries WIP.
+Landed on PR #1 (2026-10-20): RV-C, RV-J, RV-D2 and RV-E2, verified together at `7a97e6e`. All are
+caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-c-evalprovenance-20261020/`,
+`.test-work/rv-j-burpexecutors-20261020/`, `.test-work/rv-d2-falseconfirm-residual-20261020/` and
+`.test-work/rv-e2-falseconfirm-residual-20261020/`.
+
+- **RV-C** (`63876e9`, `a9cb68e`, `c4e5a4d`, `ca2ffe3`):
+  - R41: a rescore keeps the source's completion status. A source that does not state
+    completion counts as incomplete.
+  - R42: the rescore refuses a manifest whose hash does not match its records, before scoring
+    (the CLI exits 2).
+  - R43: identical case records for one case id collapse to one. Conflicting records stay
+    ambiguous.
+  - R44: each captured exchange needs HTTP 200, a non-empty `agent_reports` list and a boolean
+    `degraded`. Degraded or agent-error exchanges count against the existing 10% tolerance.
+  - R45: a cache rescore is labelled `historical` and binds to the cache (`run_id`
+    `cache:<inputs_hash>`), not to the revision that rescored it.
+  - Two existing tests encoded the unsound behaviour: a `{}` analysis fixture in
+    `test_remote_run_provenance.py` (now a healthy analysis) and a test that accepted `fresh`
+    for a cache rescore (now requires `historical`). No assertion was loosened. Evaluation
+    metrics are unchanged; 39 evaluation tests were added.
+  - Follow-ups:
+    - the fixture cache stores no git revision, so a historical rescore cannot name the
+      revision that produced it;
+    - the new payload rule is not checked against a live server.
+- **RV-J** (`3991a58`..`69e5fcb`, 10 commits):
+  - R24: the upload fetch-back is a GET with no upload body or headers.
+  - R25: CSRF confirms only an ambient-cookie request that succeeds without its token, with a
+    no-cookie control refused.
+  - R26: a JWT bypass needs a refused no-token control.
+  - R27: mass assignment needs a successful write and a read-back that shows the field absent
+    before and present after.
+  - R28: XSS proof needs the whole payload, canary included, in an executable context.
+  - R29: a takeover fingerprint is a lead (SUPPORTED). Nothing gathers DNS or
+    provider-ownership evidence, so a takeover never confirms.
+  - R31: OAuth compares the parsed Location host.
+  - R32: CSP frame-ancestors source lists are parsed; a list that admits any origin is not
+    protection.
+  - The R25–R29 rules live in five `*Logic` classes outside the batch's file list
+    (`CsrfLogic`, `JwtForgeryLogic`, `MassAssignmentLogic`, `XssPayloadLogic`,
+    `SubdomainTakeoverLogic`). Only `ValidationExecutor` uses them, and none carried WIP.
+    Existing tests that confirmed on reflection or on a fingerprint were changed; none was
+    loosened.
+  - Build: offline Gradle 8.7 on the in-repo JDK 17 (`.audit-external/toolchains/jdk17`),
+    because Gradle 8.7 cannot run on JDK 27.
+  - Follow-ups:
+    - the CSRF and JWT controls strip only `Authorization`, not a token carried in a cookie or
+      a custom header;
+    - CSRF counts any 2xx as a state change;
+    - the mass-assignment read-back uses the write's own path, so create-style endpoints stay
+      SUPPORTED;
+    - the XSS JavaScript check covers `<script>` blocks only;
+    - R25–R27 send extra control requests, so request counts rise.
+- **RV-D2** (`e84cacc`, `f190ffc`, `473c252`):
+  - V1: the IDOR anonymous control marks an object protected only on HTTP 401/403, a redirect
+    to a login path or a 2xx login page. A 5xx, a 404, any other answer or a transport failure
+    leaves a weaker candidate. The absent-id control must now be answered, and not with a 5xx.
+  - V2: `idor_read` never confirms. A protected object that one session can read is an
+    `inconclusive` candidate naming the missing evidence: a second identity (cross_identity) or
+    a manual ownership check.
+  - V3: `Access-Control-Allow-Origin: *` with credentials is informational, not a grant; the
+    Fetch standard rejects that pair for credentialed requests.
+  - Four existing tests encoded these confirmations: RV-D's cross-principal test, two
+    `test_idor_read_validator` confirmations and the wildcard-with-credentials CORS test. They
+    now assert the candidate or informational result; none was loosened. The evaluation score
+    is unchanged.
+  - Follow-ups:
+    - recall: a single-principal IDOR now confirms only through cross_identity, which needs a
+      registered second identity;
+    - comments in `orchestrator_chain.py` and `objective_profiles.py` still say the read
+      differential confirms (batch RV-M);
+    - owner decisions: `manual_verification` guidance for the IDOR candidate, and whether a
+      declared victim id counts as ownership evidence;
+    - an anonymous 404 is treated as uninterpretable, though some apps hide protected objects
+      behind a 404;
+    - origin reflection without credentials still confirms (batch RV-L records it for an owner
+      decision).
+- **RV-E2** (`ab63dd4`, `51d5f4e`, `408f717`, `a56caea`, `7a97e6e`):
+  - E1: mass assignment reads a baseline first, submits a value the baseline lacks, and confirms
+    only on an accepted write followed by a read-back that holds that value. The wording calls
+    the field harness-invented metadata: a confirmation shows the endpoint binds an unknown
+    field, not that a protected property can change. Severity is medium.
+  - E2: the stored-XSS payload logs the product of two random operands, and only a console
+    message exactly equal to that product confirms. Dialogs, page errors and echoed source no
+    longer count.
+  - E3: session fixation counts as denied only on HTTP 401/403, a redirect to a login path or a
+    2xx login page (the V1 rule). A 5xx, a 404 or a timeout leaves a candidate.
+  - Existing tests changed only for the new request sequence (an extra baseline GET) and the
+    payload shape (the doubles compute the product); their assertions are unchanged. The
+    evaluation score is unchanged.
+  - Follow-ups:
+    - the MFA-bypass anonymous control has the E3 shape, and browser and DOM XSS have the E2
+      shape (batch RV-L; whether an MFA step-up redirect counts as a denial is an owner
+      decision);
+    - owner decisions: a value seen only on a new object's Location is a candidate; a
+      mass-assignment confirmation is medium severity; a 302 to a non-login page is
+      inconclusive.
+
+Next: RV-L, RV-M and I05 batch D, at most three sessions at a time (RV-N is already running).
+- RV-L (brief `.test-work/rv-l-unsentnotnegative-20261020/BATCH.md`) takes these follow-ups:
+  all-failed sends in SSRF, open redirect and SSTI; api_security's blocked or unsent probes and
+  its size heuristic; the `SafetyGate` headroom accessor; the browser and DOM XSS substring
+  checks; the MFA control. It also records the CORS reflection-without-credentials question.
+- RV-M (brief `.test-work/rv-m-chaincoverage-20261020/BATCH.md`) takes the chain's
+  `expected_protected` from a model label, `CoverageMatrix.not_tested()`, the two manifest
+  descriptions, leg_self_test's xss case and the stale IDOR comments.
+- RV-N (running from `7a97e6e`; handoff due at `.test-work/rv-n-burpresiduals-20261020/`) takes
+  RV-J's follow-ups: CSRF counting any 2xx as a state change, CSRF and JWT controls that strip
+  only `Authorization`, the create-style mass-assignment read-back and XSS contexts beyond
+  `<script>`.
+- I05 batch D (brief `.test-work/i05d-browsercreds-20261020/BATCH.md`) is not a code review 02
+  batch.
+
+RV-K waits for the I01 W-split, because `HarnessPanel.java` carries WIP.

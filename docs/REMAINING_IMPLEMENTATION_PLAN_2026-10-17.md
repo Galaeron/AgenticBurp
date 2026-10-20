@@ -382,7 +382,7 @@ features are needed merely to begin this sequence.
 
 Code review 02 (2026-10-19) has 52 findings. They are mapped to I02, I05, I06/I07, I10,
 I12 and I16 as batches RV-A to RV-K in docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md, which also
-sets their order. RV-A, RV-G, RV-B, RV-H, RV-D, RV-E, RV-F and RV-I (34 findings) have
-landed; 18 remain open.
-Independent verifications found three P1 false confirmations RV-D left (V1 to V3, batch
-RV-D2) and three RV-E left (E1 to E3, batch RV-E2). Status is in that document's "Status" section.
+sets their order. RV-A to RV-J (47 findings) have landed; the 5 in RV-K remain open.
+Independent verifications found three P1 false confirmations RV-D left (V1 to V3) and three
+RV-E left (E1 to E3); batches RV-D2 and RV-E2 fixed them. Status is in that document's "Status"
+section.
