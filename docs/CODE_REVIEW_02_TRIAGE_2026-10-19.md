@@ -105,4 +105,68 @@ caller-verified, not live-validated. Handoffs are in `.test-work/rv-a-toolcleanu
       settings are not applied there.
     - D: `/probe-missing-auth` sends anonymous GETs while active testing is off.
 
-Next: RV-H (it gates live targets), then RV-B, RV-D, RV-E and the rest in the order above.
+Landed on PR #1 (2026-10-20): RV-B, RV-H and RV-D, verified together at `7cd6fdd`. All are
+caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-b-evalcert-20261019/`,
+`.test-work/rv-h-evidencestates-20261019/` and `.test-work/rv-d-falseconfirm1-20261019/`.
+
+- **RV-B** (`268358b`, `e1d946f`, `d70e049`):
+  - R38: the audit certifies only inputs listed in the run's manifest.
+  - R39: a failed health check on any input fails the audit.
+  - R40: a single exchange is not a reproduced baseline/attack differential.
+  - R46: the efficacy runner requires an attempt artifact carrying its own run ID and a
+    successful exit; an old `attempt.json` in a reused folder is not loaded.
+  - R47: a `done` attempt with degraded health is an error, not verified evidence.
+  - R48: only real booleans count for `objective_verified`; the string `"false"` does not.
+  - Follow-ups:
+    - one failed attempt in a batch makes `assemble_run` raise, so the scorecard is lost
+      (fail-closed);
+    - five other `build_audit` fields still read only the first input;
+    - the R46 exit-code contract comes from the untracked `run_web_objective_smoke.py`.
+    - artifacts from a test-supplied `runner_fn` are not run-ID checked.
+- **RV-H** (`7beb9de`, `a5c7378`, `7fba139`):
+  - R49: a missing proof also demotes `oracle_verified` and `verification_state`, so the
+    Markdown report no longer shows VERIFIED. Issue export and SARIF were already correct; a
+    test now pins them.
+  - R05: a standalone `analyze()` in active mode binds the capture's own Authorization/Cookie
+    as a run session limited to the captured origin, so bound validators can send.
+  - R06: a crashed validator returns a `status="error"` report (never a controlled negative).
+  - Follow-ups: engagement-owned runs keep their own session seeding (not re-tested);
+    `scope_discovery` (off by default) now sends as the capture in active mode.
+- **RV-D** (`6533b18`, `4d9395a`, `2567133`, `0917073`, `7cd6fdd`):
+  - R09: CORS confirms only an origin grant to the actual probe origin.
+  - R08: an unrun CORS probe is `blocked`, not safe.
+  - R14: IDOR needs a protected object (anonymous read refused); public sequential records
+    stay candidates. It costs one extra anonymous GET per object.
+  - R16: open redirect needs a redirect status and a parsed off-origin Location.
+  - R17: an in-band SSRF response difference is a candidate; confirmation needs out-of-band
+    evidence. The out-of-band probes now always run.
+  - The evaluation score is unchanged. Two existing tests encoded the unsound confirmations
+    and were updated, not weakened.
+  - **The false-confirmation work is not closed.** The independent verification
+    (`reviews/2026-10-20-rv-implementation-verification/REPORT.md`, untracked) reproduced
+    three P1 residuals at `7cd6fdd` through the production callers:
+    - V1: an anonymous control that returns HTTP 500 counts as "access refused", so IDOR
+      confirms;
+    - V2: Alice reading two of her own protected objects confirms IDOR. A single principal
+      cannot show the object belongs to someone else (the follow-up RV-D recorded);
+    - V3: `Access-Control-Allow-Origin: *` with credentials still confirms credentialed
+      cross-origin reads, which the Fetch standard forbids.
+    - None is a regression: the code before RV-D confirmed all three as well. Batch RV-D2
+      (brief `.test-work/rv-d2-falseconfirm-residual-20261020/BATCH.md`) owns them.
+  - Other follow-up: all-failed sends in SSRF's out-of-band step and in open redirect still
+    read as negatives.
+
+Independent verification (same report) of the code at `7cd6fdd`, exported with `git archive`:
+- A, G, H and B pass their scoped checks (159 focused tests, with controls and fault
+  injections). Real Docker networking for RV-A was simulated, not tested in a container.
+- RV-B's default objective runner, `testing/run_web_objective_smoke.py`, is untracked, so a
+  clean checkout cannot run the default efficacy attempt. This predates RV-B. Committing or
+  replacing that runner needs an owner decision.
+- RV-C is still open: all five findings reproduce (it had not started).
+
+RV-A, RV-G and RV-H have now landed. The review's "no live target" gate is lifted, but any live
+target still needs the owner's authorization.
+
+Next: RV-E, RV-F and RV-I are in progress (started 2026-10-20 from `7cd6fdd`). Then RV-D2
+(P1), then RV-C (brief `.test-work/rv-c-evalprovenance-20261020/BATCH.md`). RV-J and RV-K need
+a JDK build.
