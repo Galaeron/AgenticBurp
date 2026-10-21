@@ -98,11 +98,14 @@ class RateLimitValidator(Validator):
         content = exchange.request_body or None
         completed = 0
         statuses: dict[int, int] = {}
+        # Attempts that got no response are never counted as "not limited"
+        # (RV-P P4): a dropped or refused attempt may itself be the throttle.
+        refused, errors = "", []
         try:
             client = None if self.run_context is not None else httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=False, verify=False)
             try:
-                for _ in range(allowed):
+                for attempt in range(1, allowed + 1):
                     try:
                         if self.run_context is not None:
                             from types import SimpleNamespace
@@ -113,7 +116,12 @@ class RateLimitValidator(Validator):
                                 TypedRequest(method, exchange.url, headers=request_headers,
                                              body=content),
                                 capability=self.name, session_ref=session_ref)
+                            if not result.executed:
+                                # Nothing more can send once the run refuses (budget, scope).
+                                refused = result.outcome
+                                break
                             if not result.ok:
+                                errors.append(f"attempt {attempt}: {result.error or 'transport error'}")
                                 continue
                             resp = SimpleNamespace(status_code=result.status,
                                                    text=result.body, headers=result.headers)
@@ -121,7 +129,8 @@ class RateLimitValidator(Validator):
                             await global_throttle.acquire()
                             resp = await client.request(method, exchange.url,
                                                         headers=headers or None, content=content)
-                    except httpx.HTTPError:
+                    except httpx.HTTPError as e:
+                        errors.append(f"attempt {attempt}: {e.__class__.__name__}")
                         continue
                     completed += 1
                     statuses[resp.status_code] = statuses.get(resp.status_code, 0) + 1
@@ -140,6 +149,16 @@ class RateLimitValidator(Validator):
 
         if completed < 2:
             return self._skip(f"only {completed} attempt(s) completed -- too few for any claim")
+        if refused or errors:
+            failed = len(errors) + (allowed - completed - len(errors) if refused else 0)
+            why = "; ".join(([f"refused by the run ({refused})"] if refused else []) + errors[:3])
+            return ValidationResult(
+                self.name, "inconclusive", "rate_limit", confidence=0.0, confirmed=False,
+                summary=f"Rate-limit check incomplete: {failed} of {allowed} attempt(s) got no "
+                        f"response ({why}); not a negative result",
+                evidence=f"{completed} answered attempt(s) carried no 429/Retry-After/lockout "
+                         f"signal (status distribution: {statuses}), but an attempt that got no "
+                         f"response may itself have been throttled or dropped.")
 
         # RETIRED (review 2026-09-09): replaying a VALID captured request N times
         # without a 429 does NOT confirm a rate-limit / lockout bypass. A failed-
