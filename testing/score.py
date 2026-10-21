@@ -32,6 +32,20 @@ import json
 import sys
 from pathlib import Path
 
+# P1-3: precision/recall/f1 arithmetic lives once in testing/eval_metrics.py.
+# Bare top-level import (not `from testing import eval_metrics`) to match how
+# this module itself is always loaded -- as a bare `score` module with
+# `testing/` on sys.path (e.g. testing/test_score.py, testing/nightly_precision.py,
+# `python score.py`), and ALSO as a dotted `testing.score` import (e.g.
+# harness/ablation_harness.py, which puts the repo root -- not testing/ -- on
+# sys.path). The guarded sys.path insert below makes the bare `import
+# eval_metrics` resolve in both cases, mirroring testing/strict_score.py's
+# proven approach for the same edge.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import eval_metrics  # noqa: E402  (shared precision/recall/f1 -- P1-3)
+
 # --- OWASP 2021 taxonomy -----------------------------------------------------
 # Ordered most-specific -> most-general: classify() returns the FIRST category
 # whose any keyword is a substring of the finding's vulnerability_class, so the
@@ -133,9 +147,13 @@ def score(labeled_findings: dict[str, list[str]],
                 fp[pc] += 1
 
     def _row(c: str) -> dict:
-        prec = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) else None
-        rec = tp[c] / support[c] if support[c] else None
-        f1 = (2 * prec * rec / (prec + rec)) if (prec and rec) else (0.0 if (prec is not None and rec is not None) else None)
+        # support[c] == tp[c] + fn[c] by construction (the loop above
+        # increments support[c] exactly once per truth-labeled exchange,
+        # alongside either tp[truth] or fn[truth] -- see the per-exchange
+        # loop above), so recall(tp[c], fn[c]) == tp[c] / support[c] exactly.
+        prec = eval_metrics.precision(tp[c], fp[c], on_zero=None)
+        rec = eval_metrics.recall(tp[c], fn[c], on_zero=None)
+        f1 = eval_metrics.f1(prec, rec)
         return {"category": c, "support": support[c], "tp": tp[c], "fp": fp[c], "fn": fn[c],
                 "precision": round(prec, 3) if prec is not None else None,
                 "recall": round(rec, 3) if rec is not None else None,
@@ -143,9 +161,9 @@ def score(labeled_findings: dict[str, list[str]],
 
     rows = [_row(c) for c in categories]
     TP, FP, FN = sum(tp.values()), sum(fp.values()), sum(fn.values())
-    micro_p = TP / (TP + FP) if (TP + FP) else 0.0
-    micro_r = TP / (TP + FN) if (TP + FN) else 0.0
-    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) else 0.0
+    micro_p = eval_metrics.precision(TP, FP, on_zero=0.0)
+    micro_r = eval_metrics.recall(TP, FN, on_zero=0.0)
+    micro_f1 = eval_metrics.f1(micro_p, micro_r)
     return {
         "metric_scope": METRIC_SCOPE,
         "per_category": rows,
@@ -255,30 +273,62 @@ def _ensure_harness_importable() -> None:
         sys.path.insert(0, repo_root)
 
 
+# What a cache rescore records as the revision of the inference it reads. The
+# fixture cache (testing/*/detection_fixture.json) stores no revision, so the
+# revision that produced it is unknown -- say so, never substitute the current one.
+UNRECORDED_CACHE_REVISION = "unrecorded-historical-cache"
+
+
 def _score_provenance(*, corpus: str, conf: float, min_severity: str,
                       n_exchanges: int, cache_path: Path | None, refresh: bool) -> dict:
-    """R01/R05: bind this score artifact to an auditable ScoreProvenance
+    """R01/R05/R45: bind this score artifact to an auditable ScoreProvenance
     record -- the actual production consumer of harness.score_provenance,
     replacing "a score file exists" with an explicit fresh/historical/invalid
     label. `complete` is n_exchanges > 0 (the run actually scored something);
     `inputs_hash` is over the fixture's own real cache file when resolvable,
     "" (an id field score_provenance.py then classifies as invalid) when not
-    -- never a fabricated hash for a file that wasn't actually read."""
+    -- never a fabricated hash for a file that wasn't actually read.
+
+    What the record binds to depends on where the inference came from:
+
+    * `refresh=True`: every label was re-run through the real agents in THIS
+      invocation, so the invocation id and the current revision ARE the
+      inference's provenance (`provenance_basis` = "live_refresh").
+    * `refresh=False`: no inference ran here. The numbers are read from a cache
+      written by an earlier run, so the record binds to that cache: its content
+      hash, a run id derived from that hash (the same cache is the same "run";
+      no invocation is invented), and an explicitly unrecorded inference
+      revision. The revision that merely did the rescoring is kept under
+      `rescore_revision`, never as `git_revision`. Because the inference is not
+      from the current code, the label can only be "historical" (or "invalid"
+      when there is no readable cache or nothing was scored) -- stamping the
+      rescore's own identity on it and comparing that to itself used to yield a
+      nested "fresh" beside the outer historical-cache label."""
     import uuid
     _ensure_harness_importable()
     from harness.score_provenance import ScoreProvenance, freshness_label as _score_freshness
 
-    run_id = uuid.uuid4().hex
     inputs_hash = ""
     if cache_path is not None and cache_path.exists():
         inputs_hash = compute_inputs_hash([cache_path])
-    revision = _git_revision()
+    current_revision = _git_revision()
     corpus_id = f"{corpus}@conf{conf}_sev{min_severity}"
+    if refresh:
+        basis, revision = "live_refresh", current_revision
+        run_id = uuid.uuid4().hex
+        expected_run_id = run_id
+    else:
+        basis, revision = "historical_cache", UNRECORDED_CACHE_REVISION
+        run_id = f"cache:{inputs_hash}" if inputs_hash else ""
+        expected_run_id = None  # no independent invocation to match against
     prov = ScoreProvenance(git_revision=revision, run_id=run_id, corpus_id=corpus_id,
                            inputs_hash=inputs_hash, complete=n_exchanges > 0)
-    label = _score_freshness(prov, revision, corpus_id, expected_run_id=run_id,
+    label = _score_freshness(prov, current_revision, corpus_id, expected_run_id=expected_run_id,
                              expected_inputs_hash=inputs_hash)
-    return {**prov.to_dict(), "evaluation_integrity_label": label}
+    out = {**prov.to_dict(), "evaluation_integrity_label": label, "provenance_basis": basis}
+    if not refresh:
+        out["rescore_revision"] = current_revision
+    return out
 
 
 def compute_inputs_hash(paths):
@@ -344,7 +394,8 @@ def main() -> int:
 
     print(format_table(report, args.corpus, f"{model} @conf>={args.conf},sev>={args.min_severity}"))
     if args.json:
-        json.dump(report, open(args.json, "w"), indent=2)
+        with open(args.json, "w") as fh:
+            json.dump(report, fh, indent=2)
         print(f"\n(wrote {args.json})")
 
     failed = False

@@ -22,6 +22,7 @@ integrate loop.
 from __future__ import annotations
 
 import logging
+import re
 from urllib.parse import urlsplit
 
 from harness.models import HttpExchange
@@ -125,6 +126,21 @@ def _parent_template_object_id(state, node: dict) -> str | None:
     return None
 
 
+def _fill_path_ids(path: str, template: dict | None, id_val: str) -> str:
+    """Fill the `{id}` slots of a node path.
+
+    A captured template records every path id in order (`path_ids`), so each slot
+    gets ITS OWN captured value: /accounts/{id}/orders/{id} replays as
+    /accounts/17/orders/42, not /accounts/42/orders/42. Without a recorded list
+    that matches the slot count -- a template stored before `path_ids` existed,
+    or no template at all -- every slot takes `id_val`, as before."""
+    ids = (template or {}).get("path_ids") or []
+    if ids and len(ids) == path.count("{id}"):
+        values = iter(str(i) for i in ids)
+        return re.sub(r"\{id\}", lambda _m: next(values), path)
+    return path.replace("{id}", id_val)
+
+
 def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
                    template: dict | None = None) -> HttpExchange:
     """Build the probe exchange for a node. When a captured request TEMPLATE exists
@@ -138,7 +154,7 @@ def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
     query = (template.get("query", "") if template else "") or ""
     ctype = (template.get("content_type", "") if template else "") or ""
 
-    path = node.get("path", "/").replace("{id}", id_val)
+    path = _fill_path_ids(node.get("path", "/"), template, id_val)
     url = base_url.rstrip("/") + path
     if query and "?" not in url:
         url = f"{url}?{query}"
@@ -203,6 +219,7 @@ async def investigate_worklist(
     *,
     confirm_fn=None,
     precondition_fn=None,
+    stop_on_confirm: bool = False,
     max_nodes: int = 8,
     max_precondition_legs: int = 24,
     step_budget: int = 16,
@@ -321,10 +338,14 @@ async def investigate_worklist(
                     f.setdefault("url", exchange.url)
                 node_findings.extend(precond_findings)
 
-        # 2. The iterative agent probe (unchanged) -- only when a specialty
-        #    derived and the agent budget remains.
+        precondition_confirmed = any(f.get("confirmed") for f in precond_findings)
+
+        # 2. The iterative agent probe -- only when a specialty derived and the
+        #    agent budget remains. Objective-style runs can stop after a
+        #    deterministic confirmation instead of spending their remaining
+        #    wall-clock budget on a model pass that cannot improve that verdict.
         agent_stop = None
-        if do_agent:
+        if do_agent and not (stop_on_confirm and precondition_confirmed):
             specialty, hypothesis = derived
             investigated += 1
             try:
@@ -368,6 +389,8 @@ async def investigate_worklist(
             "confirmed": any(f.get("confirmed") for f in node_findings),
             "stop_reason": agent_stop,
         })
+        if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
+            break
 
     log.info("investigate_worklist: %s -- investigated %d nodes, %d proactive legs attempted, "
              "%d node(s) skipped (of %d eligible)",

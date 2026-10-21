@@ -9,9 +9,9 @@ from harness.engagement import EngagementState
 
 
 class _Resp:
-    def __init__(self, status):
+    def __init__(self, status, text=""):
         self.status_code = status
-        self.text = ""
+        self.text = text
         # W-16: the credential probe now sends via run_context.TargetTransport, which
         # inspects response headers (redirect handling), so the mock must carry them.
         self.headers = {}
@@ -47,7 +47,17 @@ class AutoEscalateGuardTests(unittest.TestCase):
             return _FakeCrawlResult()
 
         async def fake_request(self, method, url, headers=None, **kw):  # W-16: transport uses .request
-            return _Resp(verify_status)
+            # FR-6: _credential_grants_access now sends credentialed + anonymous +
+            # invalid-token probes and requires a differential, so the mock must
+            # distinguish the genuine, uncorrupted credential from everything else
+            # (no credential at all, or the FR-6-corrupted invalid-token control).
+            # Only the genuine credential ever sees `verify_status`; anon/invalid
+            # always see a fixed 401 denial, so a `verify_status < 400` case is a
+            # real grant (distinguishable from both controls) and a `>= 400` case
+            # is caught by the early-exit before any control is even sent.
+            if (headers or {}).get("Authorization") == "Bearer learned":
+                return _Resp(verify_status, text="granted" if verify_status < 400 else "denied")
+            return _Resp(401, text="denied")
 
         with patch("harness.role_crawl.crawl_roles", fake_crawl), \
              patch("httpx.AsyncClient.request", fake_request):
@@ -59,6 +69,61 @@ class AutoEscalateGuardTests(unittest.TestCase):
         self._run(st, [_cred_cap()], verify_status=200, crawl_spy=spy)
         self.assertEqual(len(spy), 1)
         self.assertEqual(self.orch._escalation_counts["shop.test"], 1)
+
+    def test_verified_credential_reaches_protected_owner_bound_object_triggers_crawl(self):
+        """SC-2 positive control: a genuine credential reaching a protected,
+        owner-bound object (a distinct privileged body) escalates, while
+        anonymous/invalid-token controls are denied with a login page. Distinct
+        from test_verified_credential_triggers_crawl's generic "granted" body --
+        this pins the privileged-body/denied-controls shape the noise-tolerant
+        differential is meant to still recognise as a grant."""
+        st = EngagementState(host="shop.test")
+        spy = []
+
+        async def fake_crawl(*a, **k):
+            spy.append(True)
+            return _FakeCrawlResult()
+
+        async def fake_request(self, method, url, headers=None, **kw):
+            if (headers or {}).get("Authorization") == "Bearer learned":
+                return _Resp(200, text="account #4471 owner=alice balance $500")
+            return _Resp(401, text="please log in")
+
+        with patch("harness.role_crawl.crawl_roles", fake_crawl), \
+             patch("httpx.AsyncClient.request", fake_request):
+            asyncio.run(self.orch._auto_escalate("shop.test", "http://shop.test/login", [_cred_cap()], st))
+        self.assertEqual(len(spy), 1)
+        self.assertEqual(self.orch._escalation_counts["shop.test"], 1)
+
+    def test_noisy_public_bogus_credential_does_not_escalate(self):
+        """SC-2 negative control: EVERY probe (genuine-cred, anonymous,
+        invalid-token -- regardless of Authorization header) reaches the SAME
+        public page, differing only by a per-request volatile token (a CSRF
+        meta tag that increments each call). The old byte-exact differential
+        would see three distinct bodies and wrongly treat the bogus credential
+        as verified, spending a role-recrawl; the noise-tolerant check must
+        recognise all three as materially the same public access and skip the
+        crawl entirely. This test MUST fail against the pre-fix byte-exact
+        `_responses_equivalent` (which would report len(spy) == 1) and pass
+        against the fix."""
+        st = EngagementState(host="shop.test")
+        spy = []
+        stable = "this is a public marketing page. " * 20  # far longer than the token
+        counter = {"n": 0}
+
+        async def fake_crawl(*a, **k):
+            spy.append(True)
+            return _FakeCrawlResult()
+
+        async def fake_request(self, method, url, headers=None, **kw):
+            counter["n"] += 1
+            return _Resp(200, text=f'{stable}<meta name="csrf" content="{counter["n"]}">')
+
+        with patch("harness.role_crawl.crawl_roles", fake_crawl), \
+             patch("httpx.AsyncClient.request", fake_request):
+            asyncio.run(self.orch._auto_escalate("shop.test", "http://shop.test/login", [_cred_cap()], st))
+        self.assertEqual(spy, [])
+        self.assertEqual(self.orch._escalation_counts.get("shop.test", 0), 0)
 
     def test_unverified_credential_skipped(self):
         st = EngagementState(host="shop.test")

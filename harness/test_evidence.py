@@ -243,13 +243,13 @@ class _FakeRegistry:
     def __init__(self, mapping):
         self._mapping = mapping
 
-    def for_finding(self, finding, exchange):
+    def for_finding(self, finding, exchange, agent=None):
         v = self._mapping.get(finding.vulnerability_class)
         return [v] if v else []
 
 
 class _PerFindingRegistry:
-    def for_finding(self, finding, exchange):
+    def for_finding(self, finding, exchange, agent=None):
         if finding.summary == "confirmed-case":
             return [_FakeValidator("sqlmap", "confirmed", True)]
         return [_FakeValidator("sqlmap", "skipped", False)]
@@ -331,7 +331,10 @@ class ValidateFindingsWiringTests(unittest.TestCase):
     def test_errored_validator_is_error_not_controlled_negative(self):
         reg = _FakeRegistry({"xxe": _FakeValidator("xxe", "confirmed", True, raise_exc=True)})
         vreports, proofs = self._run(self._reports("xxe"), self._exchange(), reg)
-        self.assertEqual(len(vreports), 0)                 # crashed leg -> no validation report
+        # R06: the crashed leg is returned as an error report, never a controlled negative.
+        self.assertEqual([(v.status, v.confirmed) for v in vreports], [("error", False)])
+        from harness import confirmation_gate
+        self.assertEqual(confirmation_gate._controlled_negatives(vreports), {})
         self.assertEqual(len(proofs), 1)
         self.assertEqual(proofs[0]["verdict"], "error")    # honestly recorded, never controlled_negative
 

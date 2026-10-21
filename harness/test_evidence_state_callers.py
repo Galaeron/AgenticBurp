@@ -1,0 +1,286 @@
+"""Code review 02 batch RV-H (I02 follow-up): evidence states at their real callers.
+
+R49: a stored confirmed, oracle-verified finding whose proof is missing is demoted
+by store.all_host_findings (I02-A). The demotion must take the oracle verdict with
+it, so the Markdown report never shows "VERIFIED (oracle-reproduced)" for it.
+Driven through real SQLite storage and report_generator; issue export and SARIF
+are read back from the same store.
+
+R05: a standalone analyze() of a capture that carries a bearer token must let a
+replaying validator send as that capture, and only to the captured origin. The
+validator, run context, executor and gate are real; only the LLM stage and the
+httpx send boundary are faked.
+
+R06: a validator that raises is recorded as an error proof AND returned as an
+error validation report through Orchestrator._validate_findings.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import httpx
+
+from harness import cache, evidence, report_generator, safety_gate, sarif_adapter, store
+from harness.models import AgentReport, Finding, StageOutcome
+from harness.orchestrator import Orchestrator
+from harness.test_default_history_caller import _config, _exchange, _RecordingModel
+from harness.validators.base import ValidationResult, Validator
+
+_BADGE = "VERIFIED (oracle-reproduced)"
+_BEARER = "Bearer synthetic-source"
+
+
+class _TempStore(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="rvh_states_")
+        self._orig = (store._DB_PATH, cache._cache)
+        store._DB_PATH = Path(self._tmp) / "state.db"
+        cache.init_cache(db_path=str(Path(self._tmp) / "cache.db"))
+        safety_gate.reset_default_gate()
+
+    def tearDown(self):
+        safety_gate.reset_default_gate()
+        store._DB_PATH, cache._cache = self._orig
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _orch(self, allowed_hosts=("shop.invalid",)):
+        cfg = _config()
+        cfg["server"]["allowed_hosts"] = list(allowed_hosts)
+        orch = Orchestrator(cfg)
+        model = _RecordingModel()
+        orch.ollama = model
+        for agent in orch.agent_manager.agents.values():
+            agent.ollama = model
+        return orch
+
+
+class MissingProofDemotesOracleStateTests(_TempStore):
+    """R49 through store -> report_generator (Markdown), issue export and SARIF."""
+
+    _URL = "http://shop.invalid/review"
+
+    def _persist(self, *, confirmed=True, oracle=True, proof="missing"):
+        case_id, proof_id = "case-missing", "proof-missing"
+        if proof == "valid":
+            case = evidence.TestCaseRef(run_id="run-rvh", request_template_id="tmpl-rvh",
+                                        check_id="ssti")
+            record = evidence.ProofRecord.from_validation_result(
+                case=case, validator="ssti", status="confirmed", confirmed=True)
+            ok, reason = store.persist_proof_record(record)
+            self.assertTrue(ok, reason)
+            case_id, proof_id = case.case_id, record.proof_id
+        finding = Finding(vulnerability_class="ssti", severity="high", confidence=0.9,
+                          summary="synthetic review claim", evidence="synthetic",
+                          suggested_test="verify", basis="derived", confirmed=confirmed,
+                          case_id=case_id, proof_id=proof_id, oracle_verified=oracle,
+                          verification_state="verified" if oracle else "candidate")
+        store.persist_findings(_exchange(self._URL), "ssti", [finding])
+        rows = store.all_host_findings(self._URL)
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def _markdown(self):
+        return report_generator.generate_report_for_host(self._URL)
+
+    def _issue_and_sarif(self):
+        issues = report_generator.export_issues_for_host(self._URL)
+        self.assertEqual(len(issues), 1)
+        sarif = sarif_adapter.export_issues_to_sarif(issues)
+        props = [r["properties"] for run in sarif["runs"] for r in run["results"]]
+        self.assertEqual(len(props), 1)
+        return issues[0], props[0]
+
+    def test_missing_proof_drops_the_oracle_verified_badge(self):
+        row = self._persist()
+        self.assertEqual({k: row[k] for k in ("confirmed", "oracle_verified",
+                                              "verification_state", "proof_status")},
+                         {"confirmed": False, "oracle_verified": False,
+                          "verification_state": "candidate", "proof_status": "unavailable"})
+        md = self._markdown()
+        self.assertNotIn(_BADGE.upper(), md.upper())
+        self.assertIn("**0 confirmed finding(s)**", md)
+
+    def test_missing_proof_is_a_candidate_in_issue_export_and_sarif(self):
+        self._persist()
+        issue, props = self._issue_and_sarif()
+        self.assertFalse(issue["confirmed"])
+        self.assertFalse(issue["oracle_verified"])
+        self.assertEqual(issue["verification_state"], "candidate")
+        self.assertEqual(props["observation_type"], "candidate")
+
+    def test_oracle_claim_without_confirmation_is_demoted_too(self):
+        # A row that kept only the oracle claim still points at a proof that is gone.
+        row = self._persist(confirmed=False)
+        self.assertFalse(row["oracle_verified"])
+        self.assertEqual(row["verification_state"], "candidate")
+        self.assertEqual(row["proof_status"], "unavailable")
+        self.assertNotIn(_BADGE.upper(), self._markdown().upper())
+
+    # --- negative controls: unchanged rendering ---------------------------------
+    def test_control_candidate_renders_as_before(self):
+        row = self._persist(oracle=False)
+        self.assertFalse(row["oracle_verified"])
+        self.assertEqual(row["verification_state"], "candidate")
+        md = self._markdown()
+        self.assertNotIn(_BADGE.upper(), md.upper())
+        self.assertIn("**0 confirmed finding(s)**, **1 unconfirmed finding(s)**", md)
+
+    def test_control_valid_proof_keeps_confirmation_and_badge(self):
+        row = self._persist(proof="valid")
+        self.assertEqual({k: row[k] for k in ("confirmed", "oracle_verified",
+                                              "verification_state", "proof_status")},
+                         {"confirmed": True, "oracle_verified": True,
+                          "verification_state": "verified", "proof_status": "resolved"})
+        md = self._markdown()
+        self.assertIn(_BADGE, md)
+        self.assertIn("**1 confirmed finding(s)**", md)
+        issue, _ = self._issue_and_sarif()
+        self.assertTrue(issue["confirmed"])
+
+
+class CapturedBearerSessionTests(_TempStore):
+    """R05 through Orchestrator.analyze -> SstiValidator -> run-context executor."""
+
+    def _analyze(self, headers, *, allowed_hosts=("shop.invalid",), respond=None):
+        from harness.validators.ssti_validator import SstiValidator
+        orch = self._orch(allowed_hosts)
+        orch.validator_registry.active_enabled = True
+        orch.validator_registry.validators = {
+            "ssti": SstiValidator(allowed_hosts=list(allowed_hosts))}
+        finding = Finding(vulnerability_class="ssti", severity="low", confidence=0.5,
+                          summary="template candidate", evidence="fixture",
+                          suggested_test="fixture", basis="derived")
+        reports = [AgentReport(agent="ssti", model="fake", findings=[finding])]
+
+        async def pipeline(*args, **kwargs):
+            return reports, 0, 0, StageOutcome(name="critique", status="skipped", reason="fixture")
+        sent = []
+
+        async def fake_request(client, method, url, **kwargs):
+            sent.append((str(url), dict(kwargs.get("headers") or {})))
+            if respond is not None:
+                return respond(method, str(url))
+            return httpx.Response(200, text="literal", request=httpx.Request(method, url))
+        with patch("harness.analysis_pipeline.AnalysisPipeline.run_full_analysis", pipeline), \
+                patch.object(httpx.AsyncClient, "request", fake_request):
+            response = asyncio.run(orch.analyze(_exchange("http://shop.invalid/render?q=a", headers),
+                                                force_agents=["ssti"], bypass_cache=True))
+        return sent, response
+
+    @staticmethod
+    def _auth(headers):
+        return next((v for k, v in headers.items() if k.lower() == "authorization"), None)
+
+    def test_captured_bearer_reaches_the_validator_boundary(self):
+        sent, response = self._analyze({"Authorization": _BEARER})
+        summaries = [(v.validator, v.status, v.summary) for v in response.validation_reports]
+        self.assertTrue(sent, summaries)
+        self.assertTrue(all(self._auth(h) == _BEARER for _, h in sent), sent)
+        self.assertFalse(any("declined" in s for _, _, s in summaries), summaries)
+
+    def test_control_anonymous_capture_is_unchanged(self):
+        sent, _ = self._analyze({})
+        self.assertTrue(sent)
+        self.assertTrue(all(self._auth(h) is None for _, h in sent), sent)
+
+    def test_control_bearer_is_sent_only_to_the_captured_origin(self):
+        # The captured origin redirects every probe to another in-scope origin.
+        def respond(method, url):
+            if url.startswith("http://shop.invalid/"):
+                return httpx.Response(302, headers={"location": "http://cdn.invalid/landing"},
+                                      request=httpx.Request(method, url))
+            return httpx.Response(200, text="literal", request=httpx.Request(method, url))
+        sent, _ = self._analyze({"Authorization": _BEARER},
+                                allowed_hosts=("shop.invalid", "cdn.invalid"), respond=respond)
+        captured = [h for u, h in sent if u.startswith("http://shop.invalid/")]
+        elsewhere = [h for u, h in sent if not u.startswith("http://shop.invalid/")]
+        self.assertTrue(captured and elsewhere, sent)
+        self.assertTrue(all(self._auth(h) == _BEARER for h in captured), sent)
+        self.assertTrue(all(self._auth(h) is None for h in elsewhere), sent)
+
+    def test_control_passive_mode_registers_no_captured_session(self):
+        from harness.run_context import RunContext
+        orch = self._orch()
+        ctx = RunContext.create(allowed_hosts=["shop.invalid"], config=orch.config)
+        try:
+            asyncio.run(orch._bind_captured_session(
+                ctx, _exchange("http://shop.invalid/a", {"Authorization": _BEARER})))
+            self.assertIsNone(ctx.sessions.get("captured"))
+            orch.validator_registry.active_enabled = True
+            asyncio.run(orch._bind_captured_session(
+                ctx, _exchange("http://shop.invalid/a", {"Authorization": _BEARER})))
+            session = ctx.sessions.get("captured")
+            self.assertEqual(session.allowed_origins, frozenset({"http://shop.invalid"}))
+            self.assertTrue(session.principal_id.startswith("captured:"))
+        finally:
+            asyncio.run(ctx.aclose())
+
+    def test_fault_injection_without_binding_the_capture_is_blocked(self):
+        with patch.object(Orchestrator, "_bind_captured_session", AsyncMock(return_value=None)):
+            with self.assertRaises(AssertionError):
+                self.test_captured_bearer_reaches_the_validator_boundary()
+
+
+class _Broken(Validator):
+    name = "broken"
+    finding_classes = {"ssti"}
+    active = False
+
+    async def validate(self, finding, exchange):
+        raise RuntimeError("synthetic validator crash")
+
+
+class _Holds(Validator):
+    name = "holds"
+    finding_classes = {"ssti"}
+    active = False
+
+    async def validate(self, finding, exchange):
+        return ValidationResult(self.name, "not_confirmed", "ssti", summary="control held")
+
+
+class ValidatorExceptionReportTests(_TempStore):
+    """R06 through Orchestrator._validate_findings with real proof storage."""
+
+    def _validate(self, validator):
+        orch = self._orch()
+        orch.validator_registry.validators = {validator.name: validator}
+        finding = Finding(vulnerability_class="ssti", confidence=0.5, summary="candidate",
+                          evidence="fixture", suggested_test="verify", basis="derived")
+        return asyncio.run(orch._validate_findings(
+            _exchange("http://shop.invalid/a"),
+            [AgentReport(agent="ssti", model="fake", findings=[finding])]))
+
+    def test_validator_exception_is_returned_as_an_error_report(self):
+        reports, proofs = self._validate(_Broken())
+        self.assertEqual(len(proofs), 1)
+        self.assertEqual(proofs[0]["verdict"], "error")
+        self.assertEqual([(r.validator, r.status, r.confirmed) for r in reports],
+                         [("broken", "error", False)])
+        self.assertIn("synthetic validator crash", reports[0].summary)
+        stored = store.proofs_for_case(proofs[0]["case"]["case_id"])
+        self.assertEqual([p["verdict"] for p in stored], ["error"])
+
+    def test_error_report_when_the_error_proof_cannot_be_persisted(self):
+        with patch.object(store, "persist_proof_record", return_value=(False, "synthetic refusal")):
+            reports, proofs = self._validate(_Broken())
+        self.assertEqual(proofs, [])
+        self.assertEqual([r.status for r in reports], ["error"])
+        self.assertIn("proof persistence failed: synthetic refusal", reports[0].summary)
+
+    def test_control_succeeding_validator_returns_its_normal_report(self):
+        reports, proofs = self._validate(_Holds())
+        self.assertEqual([(r.validator, r.status, r.summary) for r in reports],
+                         [("holds", "not_confirmed", "control held")])
+        self.assertEqual(len(proofs), 1)
+        self.assertNotEqual(proofs[0]["verdict"], "error")
+
+
+if __name__ == "__main__":
+    unittest.main()

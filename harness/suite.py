@@ -15,6 +15,8 @@ SMOKE_MODULES = (
     'harness.test_open_redirect_slice', 'harness.test_coverage_manifest',
     'harness.test_pipeline_gate', 'harness.test_no_orphan_test_files',
     'harness.test_async_test_hygiene',
+    # Writes the evidence for the confirmation-leg requirement aspects the smoke gate checks.
+    'harness.test_leg_live_verification',
 )
 PYTEST_NATIVE = (
     'harness/test_plugin_system.py', 'harness/test_execution_protocol.py',

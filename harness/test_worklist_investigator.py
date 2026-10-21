@@ -173,6 +173,48 @@ class InvestigateTests(unittest.IsolatedAsyncioTestCase):
                                       precondition_fn=precond, max_precondition_legs=3, max_nodes=0)
         self.assertEqual(attempts["n"], 3)                     # bounded by attempts, not confirmations
 
+    async def test_stop_on_confirm_returns_before_agent_and_later_nodes(self):
+        st = _state_with([OBJ, ADMIN])
+        agent_calls, precondition_calls = [], []
+
+        async def probe(exchange, hypothesis, specialty, step_budget):
+            agent_calls.append(exchange.url)
+            return _nothing()
+
+        async def precondition(node, exchange):
+            precondition_calls.append(node["path"])
+            return [{"vulnerability_class": "sqli", "confirmed": True,
+                     "confidence": 0.95, "severity": "high", "summary": "confirmed"}]
+
+        outcomes = await wi.investigate_worklist(
+            probe, st, "http://t", ROLES, precondition_fn=precondition,
+            stop_on_confirm=True)
+
+        self.assertEqual(len(precondition_calls), 1)
+        self.assertEqual(agent_calls, [])
+        self.assertEqual(len(outcomes), 1)
+        self.assertTrue(outcomes[0]["confirmed"])
+
+    async def test_default_keeps_broad_agent_sweep_after_confirmation(self):
+        st = _state_with([OBJ, ADMIN])
+        agent_calls, precondition_calls = [], []
+
+        async def probe(exchange, hypothesis, specialty, step_budget):
+            agent_calls.append(exchange.url)
+            return _nothing()
+
+        async def precondition(node, exchange):
+            precondition_calls.append(node["path"])
+            return [{"vulnerability_class": "sqli", "confirmed": True,
+                     "confidence": 0.95, "severity": "high", "summary": "confirmed"}]
+
+        outcomes = await wi.investigate_worklist(
+            probe, st, "http://t", ROLES, precondition_fn=precondition)
+
+        self.assertGreaterEqual(len(precondition_calls), 2)
+        self.assertGreaterEqual(len(agent_calls), 2)
+        self.assertGreaterEqual(len(outcomes), 2)
+
     async def test_one_node_failure_does_not_sink_the_sweep(self):
         st = _state_with([OBJ, ADMIN])
         async def probe(exchange, hypothesis, specialty, step_budget):

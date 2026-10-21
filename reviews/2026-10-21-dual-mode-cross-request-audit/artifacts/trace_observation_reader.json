@@ -1,0 +1,47 @@
+{
+  "write_o1": "stored",
+  "write_o2": "stored",
+  "write_o4": "stored",
+  "P1_same_path_same_principal_temporal": {
+    "selected": [
+      "a727e37f1879a7c2a3c721171af86892"
+    ],
+    "excluded_counts": {},
+    "block": "Prior observations of this endpoint (supplied captures in this pile; evidence only, not findings; ordered by capture time where known):\n- obs a727e37f1879a7c2a3c721171af86892 | GET http://lab.invalid/vehicle/0f6c1a52-1111-4a1a-9a1a-aaaaaaaaaaaa/location | captured 1970-01-01T00:01:50Z | status 200, application/json, 67 bytes, keys carId,owner | state_version unknown | completeness unknown | attribution identity unknown (rev 1, unknown) | evidence resolved | selected: same-captured-context"
+  },
+  "P2_P5_rows_considered_for_o3": {
+    "selected": [],
+    "excluded_counts": {
+      "unattributed-context": 1
+    },
+    "block": ""
+  },
+  "P3_same_path_other_principal_undeclared": {
+    "selected": [],
+    "excluded_counts": {
+      "unattributed-context": 1
+    },
+    "block": ""
+  },
+  "P4_same_path_other_principal_declared_same_tenant": {
+    "selected": [
+      "f8b924d45fb4bd276fe5602cbb835527"
+    ],
+    "excluded_counts": {},
+    "block": "Prior observations of this endpoint (supplied captures in this pile; evidence only, not findings; ordered by capture time where known):\n- obs f8b924d45fb4bd276fe5602cbb835527 | GET http://lab.invalid/vehicle/7d2e9b13-2222-4b2b-9b2b-bbbbbbbbbbbb/location | captured 1970-01-01T00:01:30Z | status 200, application/json, 65 bytes, keys carId,owner | state_version unknown | completeness unknown | attribution principal_ref bob, tenant t1 (rev 2, analyst) | evidence resolved | selected: declared-same-tenant"
+  },
+  "P6_same_path_declared_different_tenants": {
+    "selected": [],
+    "excluded_counts": {
+      "tenant-mismatch": 1
+    },
+    "block": ""
+  },
+  "F1_prior_findings_visible_to_other_principal": false,
+  "F2_prior_findings_visible_to_same_principal_other_url": true,
+  "F3_prior_findings_same_url_same_principal": false,
+  "body_only_value_rendered": false,
+  "rendered_json_keys": [
+    "carId,owner"
+  ]
+}

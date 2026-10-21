@@ -7,7 +7,17 @@ from pathlib import Path
 
 import httpx
 
+from harness import telemetry
+
 log = logging.getLogger("harness.kev_check")
+
+# WL-11: telemetry counter label for the one outbound call this module makes
+# (the CISA feed download). Service name only; see telemetry.record_event.
+_SERVICE = "cisa_kev"
+EXTERNAL_LOOKUP_EVENT = f"external_lookup:{_SERVICE}"
+# Status of a check NOT performed because privacy.external_lookups is false and
+# there is no local_file to read instead. Not "not_listed": nothing was checked.
+STATUS_SKIPPED_EXTERNAL_DISABLED = "skipped_external_lookups_disabled"
 
 # Answers Horizon3.ai's third framing question from this project's own
 # comparison notes: "are attackers actively using this." A GitHub
@@ -40,7 +50,8 @@ _KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulne
 @dataclass
 class KevResult:
     cve_id: str
-    status: str  # "listed" | "not_listed" | "error"
+    # "listed" | "not_listed" | "error" | "skipped_external_lookups_disabled"
+    status: str
     date_added: str | None = None
     known_ransomware_use: str | None = None
     detail: str = ""
@@ -48,8 +59,12 @@ class KevResult:
 
 class KevClient:
     def __init__(self, local_file: str | None = None, cache_ttl_hours: float = 24.0,
-                 timeout_seconds: float = 15.0):
+                 timeout_seconds: float = 15.0, external_lookups: bool = True):
         self.local_file = Path(local_file) if local_file else None
+        # WL-11 (privacy.external_lookups): when not exactly True the CISA feed
+        # is never fetched (`is True` so a stray truthy string fails closed). A
+        # configured local_file still works -- reading it is not egress.
+        self.external_lookups = external_lookups is True
         self.cache_ttl_hours = cache_ttl_hours
         self.timeout_seconds = timeout_seconds
         self._cache: dict[str, dict] | None = None  # cve_id -> entry
@@ -69,8 +84,13 @@ class KevClient:
             except (json.JSONDecodeError, OSError) as e:
                 return f"could not read/parse local KEV file: {e}"
         else:
+            # Second, independent gate at the only network site (check() gates
+            # first; this keeps a direct _ensure_loaded() caller from egressing).
+            if not self.external_lookups:
+                return "privacy.external_lookups is false and no local KEV file is configured"
             try:
                 async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                    telemetry.record_event(EXTERNAL_LOOKUP_EVENT)
                     resp = await client.get(_KEV_URL)
                 if resp.status_code != 200:
                     return (f"CISA KEV feed returned HTTP {resp.status_code} "
@@ -96,6 +116,13 @@ class KevClient:
     async def check(self, cve_id: str | None) -> KevResult:
         if not cve_id:
             return KevResult(cve_id="", status="error", detail="no CVE ID provided")
+
+        # Privacy gate (WL-11): with lookups off and no local feed file there is
+        # nothing to check against -- say so instead of reporting "not_listed".
+        if not self.external_lookups and self.local_file is None:
+            return KevResult(
+                cve_id=cve_id, status=STATUS_SKIPPED_EXTERNAL_DISABLED,
+                detail="privacy.external_lookups is false; no KEV check was performed")
 
         error = await self._ensure_loaded()
         if error is not None:

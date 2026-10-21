@@ -55,6 +55,24 @@ _REJECTION = re.compile(
     r"not found|forbidden|unauthorized|denied|error", re.IGNORECASE)
 
 
+class _NoResponse(Exception):
+    """An in-run read that got no response: refused by the run (nothing was
+    sent) or a transport failure. Not a negative (RV-P P5)."""
+
+    def __init__(self, why: str, *, refused: bool = False):
+        super().__init__(why)
+        self.refused = refused
+
+
+def _unanswered(result) -> str:
+    """Name an in-run send that got no response: the refusal outcome, or the
+    transport exception class the executor recorded."""
+    if not result.executed:
+        return f"refused by the run ({result.outcome})"
+    art = getattr(result, "artifact", None)
+    return getattr(art, "transport_outcome", "") or result.error or result.outcome
+
+
 class ToctouValidator(Validator):
     name = "toctou"
     finding_classes = {"toctou", "time-of-check", "time of check", "toctou_privilege_escalation",
@@ -98,7 +116,7 @@ class ToctouValidator(Validator):
                 TypedRequest("GET", url, headers=request_headers),
                 capability=self.name, session_ref=session_ref)
             if not result.ok:
-                return result.status, None
+                raise _NoResponse(_unanswered(result), refused=not result.executed)
             try:
                 return result.status, json.loads(result.body or "")
             except (ValueError, TypeError):
@@ -140,6 +158,13 @@ class ToctouValidator(Validator):
         # 1. baseline read of the authority state.
         try:
             b_status, baseline = await self._get_json(exchange.url, headers)
+        except _NoResponse as e:
+            if e.refused:
+                return ValidationResult(
+                    self.name, "blocked", "toctou", confidence=0.0, confirmed=False,
+                    summary=f"TOCTOU check incomplete: the baseline read was {e}; "
+                            f"not a negative result")
+            return self._skip(f"baseline read failed: {e}")
         except httpx.HTTPError as e:
             return self._skip(f"baseline read failed: {e.__class__.__name__}")
         if not isinstance(baseline, dict):
@@ -175,7 +200,13 @@ class ToctouValidator(Validator):
             return self._skip(f"burst ceiling {n} < 2 -- raise validators.max_burst_size to test a "
                               f"check-then-write race (inconclusive)")
 
-        async def fire_one():
+        # Burst sends that got no response (RV-P P5): a race whose writes never
+        # answered is not a negative, and a flip under a partly failed burst
+        # cannot be told apart from a plain mass-assignment.
+        unanswered: list[str] = []
+        refusals: list[str] = []
+
+        async def fire_one(i):
             try:
                 if self.run_context is not None:
                     from types import SimpleNamespace
@@ -186,6 +217,8 @@ class ToctouValidator(Validator):
                         TypedRequest(method, exchange.url, headers=request_headers, body=content),
                         capability=self.name, session_ref=session_ref)
                     if not result.ok:
+                        (unanswered if result.executed else refusals).append(
+                            f"{method} #{i}: {_unanswered(result)}")
                         return None
                     return SimpleNamespace(status_code=result.status, text=result.body,
                                            headers=result.headers)
@@ -194,10 +227,11 @@ class ToctouValidator(Validator):
                                              verify=False) as client:
                     return await client.request(method, exchange.url, headers=headers,
                                                 content=content.encode())
-            except Exception:
+            except Exception as e:
+                unanswered.append(f"{method} #{i}: {e.__class__.__name__}")
                 return None
 
-        responses = await asyncio.gather(*[fire_one() for _ in range(n)])
+        responses = await asyncio.gather(*[fire_one(i) for i in range(1, n + 1)])
         clean = 0
         for r in responses:
             if r is None:
@@ -206,11 +240,24 @@ class ToctouValidator(Validator):
             if 200 <= r.status_code < 400 and not _REJECTION.search(body):
                 clean += 1
 
+        failed = refusals + unanswered
+        answered = n - len(failed)
+        if not answered:
+            return ValidationResult(
+                self.name, "blocked" if not unanswered else "inconclusive", "toctou",
+                confidence=0.0, confirmed=False,
+                summary=f"TOCTOU check incomplete: {len(failed)} of {n} burst send(s) got no "
+                        f"response ({'; '.join(failed[:3])}); not a negative result")
+
         # 3. verify read: did an authority field actually flip?
         try:
             v_status, after = await self._get_json(exchange.url, headers)
-        except httpx.HTTPError as e:
-            return self._skip(f"verify read failed: {e.__class__.__name__}")
+        except (_NoResponse, httpx.HTTPError) as e:
+            why = str(e) if isinstance(e, _NoResponse) else e.__class__.__name__
+            return ValidationResult(
+                self.name, "inconclusive", "toctou", confidence=0.0, confirmed=False,
+                summary=f"TOCTOU check incomplete: the verify read got no response ({why}), so a "
+                        f"flip under the {n}-way burst could not be read back; not a negative result")
         if not isinstance(after, dict):
             return self._not_confirmed(f"verify read returned no JSON object (GET -> {v_status})")
 
@@ -228,6 +275,14 @@ class ToctouValidator(Validator):
                          f"a fresh GET shows the privileged value set. A single serialized write is the "
                          f"sequence leg's case; requiring concurrency + a state re-read isolates a "
                          f"check-then-write atomicity failure on a privilege boundary.")
+        if failed:
+            return ValidationResult(
+                self.name, "inconclusive", "toctou", confidence=0.0, confirmed=False,
+                summary=f"TOCTOU check incomplete: {len(failed)} of {n} burst send(s) got no "
+                        f"response ({'; '.join(failed[:3])}); not a negative result",
+                evidence=f"{clean} of {answered} answered send(s) succeeded cleanly; authority "
+                         f"field(s) flipped: {flipped or 'none'}. With part of the burst unanswered "
+                         f"neither a race nor a plain mass-assignment can be told apart.")
         if flipped:
             return self._not_confirmed(
                 f"an authority field flipped but only {clean} concurrent request(s) succeeded cleanly -- "

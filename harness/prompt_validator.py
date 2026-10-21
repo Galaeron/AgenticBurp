@@ -356,8 +356,9 @@ class PromptValidator:
             'failed': 0,
             'blocked_patterns': 0,
             'length_violations': 0,
+            'whitespace_collapsed': 0,
         }
-    
+
     def _compile_patterns(self):
         """Compile regex patterns for efficiency."""
         if self._compiled_patterns is None:
@@ -393,6 +394,29 @@ class PromptValidator:
         
         return system_validated, user_validated
     
+    def _collapse_whitespace_runs(self, prompt: str) -> str:
+        """Bound runs of consecutive spaces/newlines to the configured ceiling
+        instead of rejecting the prompt. Returns the (possibly) collapsed text;
+        leaves the prompt untouched when no run exceeds its limit. See the
+        call site for why this is a collapse, not a reject."""
+        collapsed = prompt
+        max_newlines = self.config.max_consecutive_newlines
+        if max_newlines and max_newlines > 0:
+            collapsed = re.sub(r'\n{%d,}' % (max_newlines + 1),
+                               '\n' * max_newlines, collapsed)
+        max_spaces = self.config.max_consecutive_spaces
+        if max_spaces and max_spaces > 0:
+            collapsed = re.sub(r' {%d,}' % (max_spaces + 1),
+                               ' ' * max_spaces, collapsed)
+        if collapsed != prompt:
+            self._stats['whitespace_collapsed'] += 1
+            log.debug(
+                "Collapsed excessive whitespace run(s) in prompt (bounded to "
+                "newlines<=%s, spaces<=%s); content preserved, exchange not dropped.",
+                max_newlines, max_spaces,
+            )
+        return collapsed
+
     def _validate_prompt(self, prompt: str, prompt_type: str) -> str:
         """Internal validation method."""
         self._stats['total_checks'] += 1
@@ -439,22 +463,29 @@ class PromptValidator:
                     len(lines), max_lines
                 )
         
-        # Check consecutive newlines
+        # Consecutive-whitespace handling: COLLAPSE, never reject.
+        #
+        # Found live, and re-confirmed by the 2026-10 review (pt 4): long runs
+        # of consecutive spaces or newlines are an ordinary FORMATTING quirk of
+        # real captured content -- deeply-indented HTML (13+ nesting levels
+        # easily exceeds 50 leading spaces), minified/pretty-printed bodies,
+        # and templates with blank-line runs -- not an attack and not a
+        # security boundary. The old behavior RAISED a ValidationError here,
+        # which propagated out of ollama_client as an OllamaError and made
+        # EVERY dispatched agent return zero findings for that exchange, with
+        # the reason buried in an error field. That is exactly the "silently
+        # produced zero findings on a real vulnerability" failure class this
+        # module already fixed for the blocked-pattern check (weakness #1):
+        # the captured exchange is the evidence under test, so a cosmetic quirk
+        # in it must never discard the analysis.
+        #
+        # The limit's real purpose -- bounding degenerate token usage -- is
+        # preserved by collapsing any run down to the configured ceiling
+        # instead of rejecting the whole prompt. Applied to both prompt types:
+        # collapsing is lossless for analysis and harmless for the trusted
+        # system prompt.
         if self.config.check_characters:
-            max_newlines = self.config.max_consecutive_newlines
-            if '\n' * (max_newlines + 1) in prompt:
-                self._stats['failed'] += 1
-                raise ValidationError(
-                    f"{prompt_type.capitalize()} prompt has too many consecutive newlines (>{max_newlines})"
-                )
-            
-            # Check consecutive spaces
-            max_spaces = self.config.max_consecutive_spaces
-            if ' ' * (max_spaces + 1) in prompt:
-                self._stats['failed'] += 1
-                raise ValidationError(
-                    f"{prompt_type.capitalize()} prompt has too many consecutive spaces (>{max_spaces})"
-                )
+            prompt = self._collapse_whitespace_runs(prompt)
         
         # Check blocked patterns -- USER prompts only, never system prompts.
         #
@@ -556,6 +587,7 @@ class PromptValidator:
             'failed': 0,
             'blocked_patterns': 0,
             'length_violations': 0,
+            'whitespace_collapsed': 0,
         }
 
 

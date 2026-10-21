@@ -17,8 +17,6 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
-import httpx
-
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
@@ -88,16 +86,42 @@ class VerbTamperValidator(Validator):
         if orig_status not in (401, 403, 405):
             return self._skip(f"original status {orig_status} is not a denial (401/403/405)")
 
+        # Sends that got no response (RV-P P6): an alternate or override that was
+        # never answered is not part of a negative. A refusal that ends the run
+        # (budget, cancellation) stops the remaining sends.
+        refused: list[str] = []
+        errors: list[str] = []
+        planned = 0
+        stopped = False
+
+        async def probe(label: str, method: str, h: dict):
+            nonlocal planned, stopped
+            planned += 1
+            if stopped:
+                refused.append(f"{label}: not sent after the run stopped")
+                return None, ""
+            try:
+                resp = await self._request(method, url, h)
+            except SafetyGateBlocked as e:
+                refused.append(f"{label}: refused ({e.decision.reason})")
+                return None, ""
+            except Exception as e:
+                errors.append(f"{label}: {e.__class__.__name__}")
+                return None, ""
+            if self.run_context is not None and not resp.ok:
+                if not resp.executed:
+                    refused.append(f"{label}: refused by the run ({resp.outcome})")
+                    stopped = resp.outcome in ("budget_exhausted", "cancelled")
+                else:
+                    art = getattr(resp, "artifact", None)
+                    errors.append(f"{label}: {getattr(art, 'transport_outcome', '') or resp.error}")
+                return None, ""
+            return self._response_parts(resp)
+
         for method in _SAFE_METHODS:
             if method == orig_method:
                 continue
-            try:
-                resp = await self._request(method, url, headers)
-            except httpx.HTTPError:
-                continue
-            except Exception:
-                continue
-            status, text = self._response_parts(resp)
+            status, text = await probe(method, method, headers)
             if status is not None and 200 <= status < 300 and len(text) > 10:
                 # RETIRED (review 2026-09-09): an alternate method returning 2xx where
                 # the original was denied is NOT proof of an authz bypass -- it can be
@@ -114,15 +138,9 @@ class VerbTamperValidator(Validator):
                              f"Alternate: {method} -> {status} ({len(text)} bytes).")
 
         for override_header in _OVERRIDE_HEADERS:
-            try:
-                h = dict(headers or {})
-                h[override_header] = orig_method
-                resp = await self._request("POST", url, h)
-            except httpx.HTTPError:
-                continue
-            except Exception:
-                continue
-            status, text = self._response_parts(resp)
+            h = dict(headers or {})
+            h[override_header] = orig_method
+            status, text = await probe(f"POST + {override_header}", "POST", h)
             if status is not None and 200 <= status < 300 and len(text) > 10:
                 # RETIRED (review 2026-09-09) -- see the note above; observation only.
                 return ValidationResult(
@@ -140,16 +158,15 @@ class VerbTamperValidator(Validator):
             for method in _MUTATING_METHODS:
                 if method == orig_method:
                     continue
-                try:
-                    resp = await self._request(method, url, headers)
-                except SafetyGateBlocked:
+                n_refused = len(refused)
+                status, text = await probe(method, method, headers)
+                if len(refused) > n_refused:
                     # mutating replay not authorized -- stop trying mutating methods.
+                    rest = [m for m in _MUTATING_METHODS[_MUTATING_METHODS.index(method) + 1:]
+                            if m != orig_method]
+                    refused.extend(f"{m}: not sent after {method} was refused" for m in rest)
+                    planned += len(rest)
                     break
-                except httpx.HTTPError:
-                    continue
-                except Exception:
-                    continue
-                status, text = self._response_parts(resp)
                 if status is not None and 200 <= status < 300 and len(text) > 10:
                     # RETIRED (review 2026-09-09) -- see the note above; observation only.
                     return ValidationResult(
@@ -163,6 +180,17 @@ class VerbTamperValidator(Validator):
                                  f"+ allow_mutating_replay.")
 
         tried_mut = f" + {len(_MUTATING_METHODS)} mutating methods" if self.try_mutating_methods else ""
+        if refused or errors:
+            unanswered = refused + errors
+            answered = planned - len(unanswered)
+            return ValidationResult(
+                self.name, "blocked" if refused and not errors and not answered else "inconclusive",
+                "misconfig", confidence=0.0, confirmed=False,
+                summary=f"Verb-tamper check incomplete: {len(unanswered)} of {planned} send(s) got no "
+                        f"response ({'; '.join(unanswered[:4])}); not a negative result",
+                evidence=f"Original: {orig_method} {url} -> {orig_status}. {answered} answered "
+                         f"alternate(s)/override(s) returned no substantive 2xx; the unanswered ones "
+                         f"were never tested.")
         return ValidationResult(
             self.name, "not_confirmed", "misconfig", confidence=0.0, confirmed=False,
             summary="No verb-tamper bypass found with safe methods and override headers"

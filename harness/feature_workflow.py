@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlencode
@@ -41,6 +42,19 @@ log = logging.getLogger("harness.feature_workflow")
 # and actually create the object, never an attack payload (the confirmation legs
 # inject payloads later; this leg's job is only to REACH the workflow surface).
 _MARKER = "harness-workflow-probe"
+
+# A workflow crawl must preserve the authenticated state it is meant to inspect.
+# Following logout/signout links destroys that state before deeper privileged
+# links are reached; delete/remove/reset actions are unsafe speculative workflow
+# steps.  Keep this guard local because crawler.py imports this module.
+_DESTRUCTIVE_NAVIGATION = re.compile(
+    r"(?:^|/)(?:delete|remove|destroy|logout|log-out|signout|sign-out|reset)(?:[/?_-]|$)",
+    re.IGNORECASE,
+)
+
+
+def _destructive_navigation(url: str) -> bool:
+    return bool(_DESTRUCTIVE_NAVIGATION.search(urlsplit(url).path or "/"))
 
 
 @dataclass
@@ -84,7 +98,11 @@ def _default_value(name: str, input_type: str) -> str:
         return "1"
     if t == "checkbox" or t == "radio":
         return "on"
-    if t == "url" or "url" in n or "link" in n:
+    if t == "url" or "url" in n or "link" in n or "website" in n or "homepage" in n:
+        # A URL-shaped field (including a "website" input) rejects an arbitrary
+        # marker string with a 400, which would drop the whole form template at
+        # capture time -- give it a syntactically valid URL so the probe is
+        # accepted and the replay shape survives.
         return "http://example.com/"
     if t == "date":
         return "2020-01-01"
@@ -109,6 +127,12 @@ class _FormParser(HTMLParser):
         self.links: list[str] = []
         self._cur: FormAction | None = None
         self._in_textarea_name: str | None = None
+        # The <select> currently open inside self._cur, so its <option> values
+        # can be captured as the field's real submitted value.
+        self._cur_select: FormField | None = None
+        self._in_option = False
+        self._option_has_value = False
+        self._submitter_captured = False
 
     def handle_starttag(self, tag, attrs):
         a = {k.lower(): (v or "") for k, v in attrs}
@@ -117,25 +141,74 @@ class _FormParser(HTMLParser):
             action = urljoin(self.base_url, a.get("action") or self.base_url)
             self._cur = FormAction(method=method, action=action,
                                    enctype=a.get("enctype") or "application/x-www-form-urlencoded")
-        elif tag in ("input", "select") and self._cur is not None:
+            self._submitter_captured = False
+        elif tag == "input" and self._cur is not None:
             name = a.get("name") or ""
             if name:
                 self._cur.fields.append(FormField(
-                    name=name, type=a.get("type") or ("select" if tag == "select" else "text"),
-                    value=a.get("value") or ""))
+                    name=name, type=a.get("type") or "text", value=a.get("value") or ""))
+        elif tag == "select" and self._cur is not None:
+            name = a.get("name") or ""
+            if name:
+                fld = FormField(name=name, type="select", value="")
+                self._cur.fields.append(fld)
+                self._cur_select = fld
+        elif tag == "option" and self._cur_select is not None:
+            # A <select>'s real submitted value is one of its <option> values,
+            # not a synthesized default. Capture the first option and prefer an
+            # explicitly selected one, so a URL-bearing control (e.g. an SSRF
+            # stockApi select) replays a value the app actually accepts instead
+            # of a marker string that the server rejects with 400.
+            val = a.get("value")
+            selected = "selected" in a
+            self._in_option = True
+            self._option_has_value = val is not None
+            if val is not None and (selected or not self._cur_select.value):
+                self._cur_select.value = val
+            self._option_selected = selected
         elif tag == "textarea" and self._cur is not None:
             self._in_textarea_name = a.get("name") or ""
             if self._in_textarea_name:
                 self._cur.fields.append(FormField(name=self._in_textarea_name, type="textarea"))
+        elif tag == "button" and self._cur is not None:
+            # HTML submits only the button that triggered the form.  A headless
+            # workflow needs one deterministic submitter; choose the first named
+            # submit button, which is commonly the safer Preview/Test action
+            # before Save/Delete.  Capturing no button at all can select a server
+            # 404/default branch and lose the real request shape.
+            name = a.get("name") or ""
+            button_type = (a.get("type") or "submit").lower()
+            if name and button_type == "submit" and not self._submitter_captured:
+                self._cur.fields.append(FormField(
+                    name=name, type="submit", value=a.get("value") or ""))
+                self._submitter_captured = True
         elif tag == "a":
             href = a.get("href") or ""
             if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
                 self.links.append(urljoin(self.base_url, href))
 
+    def handle_data(self, data):
+        # <option> with no value attribute submits its visible text. Capture it
+        # as the select's value when no earlier option already supplied one.
+        if (self._in_option and not self._option_has_value
+                and self._cur_select is not None):
+            text = (data or "").strip()
+            if text and (getattr(self, "_option_selected", False)
+                         or not self._cur_select.value):
+                self._cur_select.value = text
+
     def handle_endtag(self, tag):
         if tag == "form" and self._cur is not None:
             self.forms.append(self._cur)
             self._cur = None
+            self._cur_select = None
+            self._in_option = False
+            self._submitter_captured = False
+        elif tag == "select":
+            self._cur_select = None
+            self._in_option = False
+        elif tag == "option":
+            self._in_option = False
         elif tag == "textarea":
             self._in_textarea_name = None
 
@@ -251,20 +324,24 @@ async def crawl_features(
     seen_get: set[str] = set()
     seen_form: set[tuple] = set()
 
-    async def _do(method, url, body):
+    async def _do(method, url, body, extra_headers=None):
         if allowed_hosts and (urlsplit(url).hostname or "") not in allowed_hosts:
             return None
         try:
-            return await fetch_fn(method, url, dict(headers or {}), body)
+            request_headers = dict(headers or {})
+            request_headers.update(extra_headers or {})
+            return await fetch_fn(method, url, request_headers, body)
         except Exception as e:  # one bad request must not sink the walk
             result.errors.append(f"{method} {url}: {e.__class__.__name__}")
             return None
 
-    def _capture(method, url, body, resp):
+    def _capture(method, url, body, resp, extra_headers=None):
         if len(result.captured) >= max_captured:
             return
+        request_headers = dict(headers or {})
+        request_headers.update(extra_headers or {})
         result.captured.append(HttpExchange(
-            url=url, method=method, request_headers=dict(headers or {}),
+            url=url, method=method, request_headers=request_headers,
             request_body=body or "",
             response_status=getattr(resp, "status_code", None),
             response_headers=dict(getattr(resp, "headers", {}) or {}),
@@ -290,12 +367,15 @@ async def crawl_features(
             links = extract_links(body, url) if _looks_html(resp_headers, body) else []
             links += extract_json_links(body, url)
             for link in links:
-                if link.startswith(origin) and link not in seen_get:
+                if (link.startswith(origin) and link not in seen_get
+                        and not _destructive_navigation(link)):
                     queue.append((link, depth + 1))
 
         # Submit forms found on this page (the workflow-driving step).
         if submit_forms and _looks_html(resp_headers, body):
             for form in extract_forms(body, url):
+                if _destructive_navigation(form.action):
+                    continue
                 sig = form.signature()
                 if sig in seen_form:
                     continue
@@ -310,12 +390,24 @@ async def crawl_features(
                         queue.append((target, depth + 1))
                     continue
                 sub_body = form.body()
-                sub_resp = await _do(form.method, form.action, sub_body)
+                enctype = form.enctype or "application/x-www-form-urlencoded"
+                # `form.body()` is URL encoded.  Advertising that body as
+                # multipart without a boundary makes otherwise valid forms fail
+                # with 400 (notably Academy comment workflows).  For multipart
+                # forms that contain no actual file control, normalize the live
+                # submit and captured replay shape to URL encoding.  File-bearing
+                # forms keep their declared type and remain for the upload path.
+                has_file = any((field.type or "").lower() == "file"
+                               for field in form.fields)
+                if enctype.lower().startswith("multipart/form-data") and not has_file:
+                    enctype = "application/x-www-form-urlencoded"
+                form_headers = {"Content-Type": enctype}
+                sub_resp = await _do(form.method, form.action, sub_body, form_headers)
                 result.steps += 1
                 if sub_resp is None:
                     continue
                 result.forms_submitted += 1
-                _capture(form.method, form.action, sub_body, sub_resp)
+                _capture(form.method, form.action, sub_body, sub_resp, form_headers)
                 # follow the result page (a create usually redirects/renders the object)
                 loc = _redirect_location(sub_resp, form.action)
                 if loc and depth < max_depth and loc.startswith(origin) and loc not in seen_get:

@@ -185,18 +185,26 @@ class ResetTokenValidator(Validator):
                    if k.lower() not in ("content-length", "host")}
         content = exchange.request_body.encode() if exchange.request_body else None
         tokens: list[str] = []
+        # Samples that got no response (RV-P P9): a sample never drawn is not
+        # evidence the tokens are random. A refusal stops sampling.
+        refused, errors, answered = "", [], 0
         try:
             async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                         follow_redirects=False, verify=False) as client:
-                for _ in range(self.samples):
+                for i in range(1, self.samples + 1):
                     await global_throttle.acquire()
                     try:
                         resp = await client.request(method, exchange.url,
                                                     headers=headers or None, content=content)
                     except SafetyGateBlocked as e:
-                        return self._skip(f"mutating reset replay not authorized: {e.decision.reason}")
-                    except httpx.HTTPError:
+                        if not answered and not errors:
+                            return self._skip(f"mutating reset replay not authorized: {e.decision.reason}")
+                        refused = e.decision.reason
+                        break
+                    except httpx.HTTPError as e:
+                        errors.append(f"sample {i}: {e.__class__.__name__}")
                         continue
+                    answered += 1
                     tok = self._extract_token(resp)
                     if tok:
                         tokens.append(tok)
@@ -226,6 +234,15 @@ class ResetTokenValidator(Validator):
                         f"next token and show it is accepted for another account) to confirm.",
                 evidence=f"Sampled {len(tokens)} reset tokens from independent requests; {reason}. "
                          f"Small-sample pattern only -- no holdout prediction/acceptance was performed.")
+        if refused or errors:
+            why = "; ".join(([f"refused by the safety gate ({refused})"] if refused else []) + errors[:3])
+            return ValidationResult(
+                self.name, "inconclusive", "reset_token", confidence=0.0, confirmed=False,
+                summary=f"Reset-token check incomplete: {self.samples - answered} of {self.samples} "
+                        f"sample request(s) got no response ({why}); not a negative result",
+                evidence=f"Sampled {len(tokens)} tokens from {answered} answered request(s); "
+                         f"{reason}. A token that was never drawn may be the one that breaks the "
+                         f"pattern tests.")
         return ValidationResult(
             self.name, "not_confirmed", "reset_token", confidence=0.1, confirmed=False,
             summary=f"No deterministic reset-token weakness observed: {reason}.",

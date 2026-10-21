@@ -92,7 +92,8 @@ class ReadOnlyMcpAdapter:
     method exists on this class at all -- see module docstring."""
 
     def __init__(self, *, tokens_by_tenant: dict[str, str] | None = None,
-                 run_output_dir: Path | str | None = None, page_size: int = DEFAULT_PAGE_SIZE):
+                 run_output_dir: Path | str | None = None, page_size: int = DEFAULT_PAGE_SIZE,
+                 config: dict | None = None):
         # {token: tenant_host}. Empty -> auth is OFF (matches server.py's own
         # _require_auth default: loopback-only deployments with no configured
         # bearer token are open). Non-empty -> every request needs a valid,
@@ -100,6 +101,13 @@ class ReadOnlyMcpAdapter:
         self._tokens_by_tenant = dict(tokens_by_tenant or {})
         self._run_output_dir = Path(run_output_dir or Path(__file__).parent / "run-output")
         self.page_size = max(1, int(page_size))
+        # SC-5 (MCP parity): the effective config to pass at construction is
+        # `server.config` -- the SAME load_config() module global that
+        # /report and /report/sarif already use to gate export_issues_for_host
+        # -- never a re-parse of config.yaml. Wiring a live MCP server route
+        # that constructs this adapter is out of scope for this change.
+        # Default None -> reporting gates OFF -> byte-for-byte unchanged.
+        self._config = config
 
     def _authorize(self, token: str, host: str) -> None:
         if not self._tokens_by_tenant:
@@ -127,7 +135,7 @@ class ReadOnlyMcpAdapter:
 
         if kind == "issues":
             from harness import report_generator
-            all_items = report_generator.export_issues_for_host(host)
+            all_items = report_generator.export_issues_for_host(host, config=self._config)
             start = max(0, page) * self.page_size
             page_items = all_items[start:start + self.page_size]
             return {"uri": uri, "mimeType": "application/json", "page": page,

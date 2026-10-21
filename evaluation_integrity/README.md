@@ -4,15 +4,15 @@ This directory implements supplemental tasks S-01 through S-05 as standalone,
 read-only tooling. It does not import or initialize `harness`, open harness
 databases, contact targets, invoke models, or change production scoring.
 
-Run an audit from the repository root with the bundled Python interpreter:
+Run an audit from the repository root (use whatever `python` is on your PATH --
+3.11+; the module is pure-stdlib and imports no third-party packages):
 
-```powershell
-& 'C:\Users\arthu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' `
-  -m evaluation_integrity.audit `
-  --input C:\path\to\results.json `
-  --input C:\path\to\score.json `
-  --json C:\path\to\audit.json `
-  --markdown C:\path\to\audit.md
+```bash
+python -m evaluation_integrity.audit \
+  --input path/to/results.json \
+  --input path/to/score.json \
+  --json path/to/audit.json \
+  --markdown path/to/audit.md
 ```
 
 The generic input adapter accepts schema versions
@@ -47,6 +47,13 @@ invocation binding, paths, and artifact hashes. A clean-tree
 build. A `historical_rescore` remains usable but is never labelled a fresh
 end-to-end validation. Dirty or mismatched provenance is unknown.
 
+The audit also binds every `--input` to the manifest: an input whose SHA-256 is not
+among the manifest's hashed artifacts, or that names another `invocation_id`, makes
+the provenance `unknown_or_mismatched` (`provenance.bound_inputs` lists each input), so
+a valid manifest for one run cannot certify a different run's file. Health controls and
+logs are merged across all inputs; a failed control on any input invalidates the
+evaluation whatever the input order.
+
 Hashes establish that the supplied files are internally consistent with the
 manifest. They do **not** independently authenticate who created the files, how
 they were produced, or whether the producer was trustworthy. Credential values
@@ -54,9 +61,8 @@ do not belong in the manifest; only non-secret identities and fingerprints do.
 
 ## Tests
 
-```powershell
-& 'C:\Users\arthu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' `
-  -m unittest discover -s evaluation_integrity/tests -p 'test_*.py'
+```bash
+python -m unittest discover -s evaluation_integrity/tests -p 'test_*.py'
 ```
 
 All fixtures are synthetic and explicitly labelled. They do not read protected

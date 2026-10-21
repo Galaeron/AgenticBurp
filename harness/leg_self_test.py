@@ -120,7 +120,8 @@ class LegCase(NamedTuple):
     given, is called with base_url before EACH of the TP and NEG probes (to
     reset any fixture-side mutable state). `available`, if given, gates the
     whole case on an external tool being present (fail-safe: unavailable ==
-    left out, never assumed live)."""
+    left out, never assumed live); `unavailable_reason` says which tool, for
+    `run_self_test(report_out=...)`."""
     marker: str
     finding_class: str
     validator_factory: Callable[[], object]
@@ -128,6 +129,7 @@ class LegCase(NamedTuple):
     build_neg: Callable[[str], object]
     setup: Callable[[str], None] | None = None
     available: Callable[[], bool] = lambda: True
+    unavailable_reason: str = ""
 
 
 def _reset(path: str):
@@ -138,6 +140,23 @@ def _reset(path: str):
         except OSError:
             pass
     return _do
+
+
+def _cross_site_poc_enabled() -> bool:
+    """Fail-safe config read for the csrf LegCase's `available` gate (LB-5),
+    mirroring how the command_injection case below gates on
+    `shutil.which("curl")`: the self-test only attempts the real cross-site
+    browser PoC when the operator has explicitly turned harness/config.yaml's
+    `cross_site_poc.enabled` on (default OFF everywhere it ships). ANY
+    failure to read config (missing file, bad YAML, import error) is treated
+    as "not enabled", never as "enabled" -- same fail-safe-by-construction
+    rule as every other `available` gate in this module."""
+    try:
+        from harness.server import load_config
+        cfg, _ = load_config()
+        return bool((cfg.get("cross_site_poc", {}) or {}).get("enabled", False))
+    except Exception:
+        return False
 
 
 def _default_cases() -> list[LegCase]:
@@ -157,6 +176,8 @@ def _default_cases() -> list[LegCase]:
     from harness.validators.auth_sequence_validator import AuthSequenceValidator
     from harness.validators.stored_xss_validator import StoredXssValidator
     from harness.validators.jwt_forge_validator import JwtForgeValidator
+    from harness.validators.csrf_validator import CsrfValidator
+    from harness import browser_driver
 
     def _get(base_url, path):
         return HttpExchange(url=f"{base_url}{path}", method="GET",
@@ -182,6 +203,24 @@ def _default_cases() -> list[LegCase]:
         seed = base64.b64encode(pickle.dumps({"user": "alice"})).decode()
         return HttpExchange(url=f"{base_url}{path}", method="GET",
                             request_headers={"Cookie": f"session={seed}"}, request_body="")
+
+    def _csrf_poc_exchange(base_url, path):
+        # Form-urlencoded body (never JSON): a real cross-site <form> can
+        # only auto-submit application/x-www-form-urlencoded (or multipart)
+        # content, which is exactly the shape _cross_site_form_fields expects.
+        # The Origin header mirrors what a REAL capture of a legitimate
+        # same-origin submission would show -- letting the plain token-strip
+        # replay branch (which simply forwards whatever Origin the capture
+        # had) reach 2xx so execution falls through to the NEW cross-site-PoC
+        # branch, where the REAL browser's own (unforgeable) cross-origin
+        # Origin header is what the fixture's Origin-enforced control
+        # actually exercises and rejects.
+        return HttpExchange(
+            url=f"{base_url}{path}", method="POST",
+            request_headers={"Content-Type": "application/x-www-form-urlencoded",
+                             "Cookie": "csrf_sid=leg-self-test-seed-session",
+                             "Origin": base_url},
+            request_body="note=seed")
 
     def _jwt_get(base_url, path):
         import base64, json
@@ -239,14 +278,41 @@ def _default_cases() -> list[LegCase]:
                 lambda b: _auth_post(b, "/auth/login-enum", '{"username": "alice", "password": "alicepw"}'),
                 lambda b: _auth_post(b, "/auth/login-uniform", '{"username": "alice", "password": "alicepw"}')),
 
+        # Stored XSS confirms only when the planted payload executes in a
+        # browser (RV-E R19, RV-E2 E2), so without Playwright the case cannot
+        # pass and is reported unavailable instead of run (RV-M M4).
         LegCase("xss", "xss",
                 lambda: StoredXssValidator(allowed_hosts=["127.0.0.1"]),
                 lambda b: _comment_post(b, "/stored/comments"), lambda b: _comment_post(b, "/stored/comments-safe"),
-                setup=_reset("/stored/reset")),
+                setup=_reset("/stored/reset"),
+                available=lambda: browser_driver.playwright_available(),
+                unavailable_reason="needs Playwright: stored XSS confirms only when the "
+                                   "planted payload executes in a browser"),
 
         LegCase("jwt", "jwt",
                 lambda: JwtForgeValidator(allowed_hosts=["127.0.0.1"]),
                 lambda b: _jwt_get(b, "/jwt/kid"), lambda b: _jwt_get(b, "/jwt/kid-safe")),
+
+        # LB-5: cross-site browser PoC for CSRF -- gated on BOTH Playwright
+        # being installed AND the operator explicitly opting into
+        # config.yaml's `cross_site_poc.enabled` (default OFF). Unlike every
+        # other case above, an unset flag means this case is simply never
+        # attempted this run (fail-safe: "csrf" stays provisional, exactly as
+        # today, with the flag off). TP = no declared defense (ambient
+        # cookie rides along); NEG = the Origin/Referer-enforced control
+        # (ambient cookie still present, but a real browser's own Origin
+        # header on the cross-site POST is what the fixture rejects) -- the
+        # SameSite=Strict/Lax and bearer-only controls are exercised directly
+        # against the mechanism/validator in
+        # harness/test_leg_live_verification.py, not via this TP/NEG pairing.
+        LegCase("csrf", "csrf",
+                lambda: CsrfValidator(
+                    allowed_hosts=["127.0.0.1"], cross_site_poc_enabled=True,
+                    cross_site_readback_url=lambda u: u.replace("/transfer", "/state")),
+                lambda b: _csrf_poc_exchange(b, "/csrf-poc/transfer"),
+                lambda b: _csrf_poc_exchange(b, "/csrf-poc/transfer-origin"),
+                setup=_reset("/csrf-poc/reset"),
+                available=lambda: browser_driver.playwright_available() and _cross_site_poc_enabled()),
     ]
 
 
@@ -287,12 +353,13 @@ def _is_executed_refutation(result) -> bool:
     return result.status == "not_confirmed" and result.confirmed is not True
 
 
-def _case_passes(case: LegCase, base_url: str) -> bool:
+def _case_outcome(case: LegCase, base_url: str) -> tuple[bool, str]:
     """A case passes only on the full EXECUTED-PAIR double-check: the
     positive probe genuinely confirmed-true (`_is_executed_confirmation`)
     AND the negative control genuinely EXECUTED and was refuted
     (`_is_executed_refutation`) -- both real, decisive, executed outcomes
-    from this run, not assumed ones. Any exception propagates to the
+    from this run, not assumed ones. Returns (passed, reason); the reason
+    names the leg that did not hold. Any exception propagates to the
     caller, which treats it as a fail (leave the marker out) -- never as a
     pass."""
     validator = case.validator_factory()
@@ -301,18 +368,29 @@ def _case_passes(case: LegCase, base_url: str) -> bool:
         case.setup(base_url)
     tp = asyncio.run(validator.validate(_finding(case.finding_class), case.build_tp(base_url)))
     if not _is_executed_confirmation(tp):
-        return False
+        return False, f"the positive probe returned {tp.status!r}, not an executed confirmation"
 
     if case.setup:
         case.setup(base_url)
     neg = asyncio.run(validator.validate(_finding(case.finding_class), case.build_neg(base_url)))
     if not _is_executed_refutation(neg):
-        return False
+        return False, f"the negative control returned {neg.status!r}, not an executed refutation"
 
-    return True
+    return True, "confirmed the vulnerable endpoint and refuted its negative control"
 
 
-def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float = 5.0) -> frozenset:
+def _case_passes(case: LegCase, base_url: str) -> bool:
+    """`_case_outcome` without the reason."""
+    return _case_outcome(case, base_url)[0]
+
+
+def _report(report_out: dict | None, marker: str, status: str, reason: str) -> None:
+    if report_out is not None:
+        report_out[marker] = {"status": status, "reason": reason}
+
+
+def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float = 5.0,
+                  report_out: dict | None = None) -> frozenset:
     """Fire every self-test case against a fresh, in-process fixture
     instance and return the frozenset of markers that BOTH confirmed-true
     on their vulnerable endpoint and refuted-false on their paired negative
@@ -320,7 +398,12 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
     leg crashes, a tool is missing) degrades to leaving that marker (or all
     of them) out of the returned set, which is exactly the fail-safe this
     exists to guarantee: "could not verify" must never read as "verified
-    live"."""
+    live".
+
+    `report_out`, if given, receives one entry per case that was reached,
+    `{marker: {"status": "live" | "failed" | "unavailable" | "error",
+    "reason": str}}`, so a case left out says why: an unavailable tool
+    (e.g. "needs Playwright") is not an unexplained failure (RV-M M4)."""
     cases = _default_cases() if cases is None else cases
     if not cases:
         return frozenset()
@@ -410,12 +493,21 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
                 for case in cases:
                     try:
                         if not case.available():
-                            continue  # fail-safe: unavailable tool -- never counted as live
-                        if _case_passes(case, base_url):
+                            # fail-safe: unavailable tool -- never counted as live
+                            reason = case.unavailable_reason or "a required tool is unavailable"
+                            log.info("leg self-test: case %r unavailable (%s) -- leaving it "
+                                     "provisional this run", case.marker, reason)
+                            _report(report_out, case.marker, "unavailable", reason)
+                            continue
+                        passed, reason = _case_outcome(case, base_url)
+                        if passed:
                             live.add(case.marker)
-                    except Exception:
+                        _report(report_out, case.marker, "live" if passed else "failed", reason)
+                    except Exception as exc:
                         log.debug("leg self-test: case %r errored -- leaving it "
                                   "provisional this run", case.marker, exc_info=True)
+                        _report(report_out, case.marker, "error",
+                                f"the case raised {type(exc).__name__}")
                         continue
         finally:
             # Restore BOTH the contextvar and the module-level free function

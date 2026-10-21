@@ -15,8 +15,15 @@ plus an anonymous baseline, and runs the already-proven identity_compare decisio
 logic (authorization_boundary_compare):
 
   - CONFIRMED  -> another identity reached the owner's protected resource while
-                 anon was denied: a real broken-access-control finding. Sets
+                 anon was denied AND declared ownership says that identity is not
+                 entitled to it: a real broken-access-control finding. Sets
                  finding.confirmed and boosts confidence (via _validate_findings).
+  - supported  -> the same response match, but ownership of the object was NOT
+                 declared (WL-04, RETIRED (review 2026-10-21): a resource shared
+                 with every logged-in user matches identically, so similarity
+                 alone cannot tell a crossing from authorized sharing). A lead
+                 with manual-verification guidance; never a confirmation and
+                 never a negative.
   - not_confirmed (deterministic REJECT) -> every other identity AND anon were
                  denied: the control held. The orchestrator downgrades the
                  single-exchange hypothesis (mirroring access_control_gate).
@@ -29,6 +36,7 @@ server.allowed_hosts. GET-only.
 """
 from __future__ import annotations
 import re
+from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
 
 import httpx
@@ -148,6 +156,23 @@ def has_object_identifier(url: str) -> bool:
     return any(k.lower() in _ID_QUERY_KEYS for k in parse_qs(p.query))
 
 
+@dataclass
+class _UnsentProbe(identity_compare.Probe):
+    """A probe the executor refused or never sent (budget, safety gate, scope,
+    cancellation). It still reads as status 0 / empty body, the 'policy-declined ->
+    not reached' contract of ``_probe``, but carries why, so a caller can tell it
+    from a response (R10)."""
+    outcome: str = ""
+
+
+def _not_reached(probe) -> bool:
+    """True when no HTTP response was obtained for this probe. A request that was
+    refused or never sent is neither a denial nor an authorization verdict: it must
+    never be compared as if the target had answered (R10). A real response never has
+    status 0."""
+    return isinstance(probe, _UnsentProbe) or (getattr(probe, "status", 0) or 0) <= 0
+
+
 def _auth_signature(headers: dict | None) -> tuple:
     """A normalized fingerprint of the PRINCIPAL a set of request headers
     authenticates as: its Authorization value plus its Cookie header. Two header
@@ -189,6 +214,41 @@ def _distinct_other_principals(idents: list, source_sig: tuple) -> list:
     return out
 
 
+# Ids the harness derives from a CREDENTIAL rather than from an account name:
+# role_crawl.RoleSession.principal_id() with no name ("<role>#<8 hex>") and the R05
+# captured-session id store.captured_principal_id() mints ("captured:<hmac>"). Such
+# an id names a credential, not an account, so it cannot be matched against a
+# declared owner: the owner's own second session would read as "not the owner".
+_CREDENTIAL_ALIAS = re.compile(r"(?:#[0-9a-fA-F]{8}$|^captured:)")
+
+
+def _principal_for(ident: dict):
+    """The durable principal an identity entry authenticates as. A Principal carried
+    by the run session is authoritative; otherwise one is built from the entry's
+    name/role, marked provisional when the name is only a credential alias."""
+    import harness.principals as _pr
+    principal = ident.get("principal")
+    if principal is not None:
+        return principal
+    pid = ident.get("principal_id") or ident.get("name") or ident.get("role") or "unknown"
+    return _pr.Principal(
+        id=pid, role=ident.get("role", "user"),
+        trust=_pr.TRUST_BY_ROLE.get((ident.get("role") or "").lower(), 1),
+        provisional=bool(_CREDENTIAL_ALIAS.search(pid)) or pid == "unknown")
+
+
+def _source_identity(idents: list, source_sig: tuple) -> dict | None:
+    """The configured identity whose credentials made the captured request, if it
+    is registered (WL-04: the capture may itself be the crossing, so its principal
+    must be resolvable to apply a declaration to it)."""
+    if not source_sig:
+        return None
+    for i in idents:
+        if _auth_signature(i.get("headers")) == source_sig:
+            return i
+    return None
+
+
 class CrossIdentityValidator(Validator):
     name = "cross_identity"
     active = True  # sends live requests; only runs when validators.active_enabled
@@ -226,7 +286,7 @@ class CrossIdentityValidator(Validator):
         responder and never touch the network. When a RunContext is configured (T03)
         the send goes through its Executor -- one policy path (scope + gate + budget,
         redirects re-checked per hop); a policy-declined send is reported as
-        'not reached' (status 0), never a crash."""
+        'not reached' (status 0, an ``_UnsentProbe``), never a crash."""
         if self.run_context is not None:
             from harness.run_context import TypedRequest
             out = await self.run_context.executor().execute(
@@ -235,7 +295,7 @@ class CrossIdentityValidator(Validator):
             if out.outcome == "error":
                 raise RuntimeError(out.error or "probe transport error")
             if not out.executed:   # out_of_scope / blocked / budget / cancelled -> not reached
-                return identity_compare.Probe(0, "")
+                return _UnsentProbe(0, "", outcome=out.outcome or "not sent")
             return identity_compare.Probe(out.status or 0, out.body or "")
         from harness import global_throttle
         await global_throttle.acquire()
@@ -269,6 +329,80 @@ class CrossIdentityValidator(Validator):
     def _skip(self, fc: str, why: str) -> ValidationResult:
         return ValidationResult(validator=self.name, status="skipped", finding_class=fc, summary=why)
 
+    def _blocked(self, fc: str, why: str, evidence: str = "") -> ValidationResult:
+        """The access-control check was refused or never sent (R10). Not a negative:
+        no control_outcome, so it is never read as a held control."""
+        return ValidationResult(validator=self.name, status="blocked", finding_class=fc,
+                                confidence=0.0, confirmed=False, summary=why, evidence=evidence)
+
+    def _ownership_decision(self, principal, url: str):
+        """WL-04 ownership gate: what the declared/observed ownership of the object
+        at `url` says about `principal` reaching it. UNKNOWN when no ownership
+        source is configured, when nothing is known about this object, or when the
+        principal's id is only a credential alias (it cannot be compared with a
+        declared owner, so "not the owner" cannot be asserted for it)."""
+        import harness.principals as _pr
+        if self.ownership is None:
+            return _pr.AuthzDecision.UNKNOWN
+        decision = self.ownership.authorization(principal, self._object_ref(url))
+        if decision == _pr.AuthzDecision.UNAUTHORIZED and getattr(principal, "provisional", False):
+            return _pr.AuthzDecision.UNKNOWN
+        return decision
+
+    def _undeclared_lead(self, fc: str, exchange: HttpExchange, ident: dict, detail: str,
+                         function_level: bool = False) -> ValidationResult:
+        """RETIRED (review 2026-10-21, WL-04): a response match with anonymous
+        denied used to confirm on its own. A resource legitimately shared with every
+        authenticated user (a team announcement, a shared catalogue) produces the
+        same match, so without declared ownership this is a LEAD, not a
+        confirmation -- and not a negative either: status `supported` is neither a
+        controlled negative (confirmation_gate) nor tested coverage
+        (coverage_tracker), and carries the analyst's next step."""
+        ref = self._object_ref(exchange.url)
+        kind = "function" if function_level else "object"
+        who = f"{ident.get('name')!r} (role {ident.get('role', '?')!r})"
+        guidance = (
+            f"Establish ownership before treating this as broken access control. "
+            f"Identity {who} received materially the same response as the source "
+            f"principal at {exchange.url} while the anonymous request was denied, but "
+            f"nothing declares who may reach this {kind}. (1) Identify the owning "
+            f"principal, e.g. the account that created the {kind} or the owner field in "
+            f"its response. (2) Check whether {ident.get('name')!r} is entitled to it: "
+            f"explicit sharing, team/organisation membership, or visibility to every "
+            f"authenticated user -- any of those is authorized sharing, not BOLA/BFLA. "
+            f"(3) Declare the result (owner principal plus the explicitly entitled "
+            f"principals, or public) as an ownership fact for this {kind} and re-run the "
+            f"cross-identity check; it confirms only when the declaration says the "
+            f"accessor is not entitled.")
+        return ValidationResult(
+            validator=self.name, status="supported", finding_class=fc,
+            confidence=0.55, confirmed=False,
+            summary=f"LEAD (not confirmed): cross-identity read by {ident.get('name')} matched the "
+                    f"source principal's response at {exchange.url} with anonymous denied, but "
+                    f"ownership of the {kind} was not declared -- authorized sharing (e.g. a "
+                    f"resource visible to every logged-in user) cannot be ruled out.",
+            evidence=f"Ownership NOT declared for {ref!r}: no owner, share or public fact is "
+                     f"known for this {kind}, so the response match is not a confirmed "
+                     f"boundary crossing. {detail}",
+            control_outcome="inconclusive", manual_verification=guidance)
+
+    @staticmethod
+    def _unsent_reason(probe) -> str:
+        return getattr(probe, "outcome", "") or "not sent"
+
+    @staticmethod
+    def _incomplete_detail(errored: int, unsent: int, unsent_why: str) -> str:
+        parts = []
+        if errored:
+            parts.append(f"{errored} errored")
+        if unsent:
+            parts.append(f"{unsent} not sent: {unsent_why}")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _last_error_note(errored: int, last_error) -> str:
+        return f" (last error: {last_error})" if errored else ""
+
     @staticmethod
     def _reached(probe: "identity_compare.Probe") -> bool:
         """A substantive success: 2xx with a non-trivial body (not an empty/error
@@ -299,41 +433,95 @@ class CrossIdentityValidator(Validator):
                     admin_probe = await self._probe_identity(exchange.url, ident)
                 except Exception:
                     admin_probe = None
+                if admin_probe is not None and _not_reached(admin_probe):
+                    admin_probe = None   # refused/unsent: no baseline, not a denial (R10)
                 if admin_probe is not None:
                     break
         have_admin_baseline = admin_probe is not None and self._reached(admin_probe)
 
+        import harness.principals as _pr
         considered = 0
         rejects = 0
+        authorized = 0
+        undeclared = None   # first (identity, detail) admin-data match with no declaration
+        errored = 0
+        unsent = 0
+        unsent_why = ""
+        last_error = None
         reached_unproven = None
         for ident in idents[:self.max_identities]:
             if _PRIVILEGED_ROLE.search(ident.get("role", "") or ""):
                 continue  # an admin reaching an admin function is expected, not a bypass
             try:
                 attempt = await self._probe_identity(exchange.url, ident)
-            except Exception:
+            except Exception as e:
+                errored += 1       # an errored probe is an UNKNOWN, not a denial
+                last_error = e
+                continue
+            if _not_reached(attempt):
+                unsent += 1        # a refused/unsent probe is an UNKNOWN too (R10)
+                unsent_why = self._unsent_reason(attempt)
                 continue
             considered += 1
             if self._reached(attempt):
                 # Confirm ONLY when the non-admin's response materially MATCHES the
                 # admin's -- i.e. it returned the same privileged data, not merely a
-                # 2xx on an admin-looking path.
-                if have_admin_baseline and identity_compare.similarity(
-                        attempt.body, admin_probe.body) >= identity_compare.MATCH_THRESHOLD:
-                    return ValidationResult(
-                        validator=self.name, status="confirmed", finding_class=fc,
-                        confidence=0.85, confirmed=True,
-                        summary=f"Broken function-level authorization: non-privileged identity "
-                                f"{ident['name']!r} (role {ident.get('role','?')!r}) obtained the same "
-                                f"privileged response an admin sees at {exchange.url} while anonymous was denied.",
-                        evidence=f"Anonymous -> HTTP {anon.status} (denied); {ident['name']!r} -> HTTP "
-                                 f"{attempt.status} returning content materially matching the admin baseline "
-                                 f"(similarity >= {identity_compare.MATCH_THRESHOLD}). A non-admin obtained "
-                                 f"the admin function's privileged data.")
+                # 2xx on an admin-looking path -- AND a declaration says this identity
+                # is not entitled to the function (WL-04). The admin namespace is a
+                # path-name lead, not a declaration of who may reach the function
+                # (RV-M M1: a label never declares a route protected); a management
+                # view shared with all staff matches the admin's response identically.
+                sim = identity_compare.similarity(attempt.body, admin_probe.body) \
+                    if have_admin_baseline else 0.0
+                if have_admin_baseline and sim >= identity_compare.MATCH_THRESHOLD:
+                    detail = (f"Anonymous -> HTTP {anon.status} (denied); {ident['name']!r} -> HTTP "
+                              f"{attempt.status} returning content materially matching the admin "
+                              f"baseline (similarity {sim:.3f} >= {identity_compare.MATCH_THRESHOLD}).")
+                    accessor = _principal_for(ident)
+                    decision = self._ownership_decision(accessor, exchange.url)
+                    if decision == _pr.AuthzDecision.UNAUTHORIZED:
+                        return ValidationResult(
+                            validator=self.name, status="confirmed", finding_class=fc,
+                            confidence=0.85, confirmed=True,
+                            summary=f"Broken function-level authorization: non-privileged identity "
+                                    f"{ident['name']!r} (role {ident.get('role','?')!r}) obtained the same "
+                                    f"privileged response an admin sees at {exchange.url} while anonymous was denied.",
+                            evidence=f"{detail} The declared entitlement for "
+                                     f"{self._object_ref(exchange.url)!r} does not include "
+                                     f"{accessor.id!r}: a non-admin obtained the admin function's "
+                                     f"privileged data.")
+                    if decision == _pr.AuthzDecision.AUTHORIZED:
+                        authorized += 1
+                        continue
+                    if undeclared is None:
+                        undeclared = (ident, detail)
+                    continue
                 reached_unproven = ident  # reached, but not proven to be a real bypass
             else:
                 rejects += 1
+        if undeclared is not None:
+            return self._undeclared_lead(fc, exchange, *undeclared, function_level=True)
+        if authorized:
+            return ValidationResult(
+                validator=self.name, status="not_confirmed", finding_class=fc,
+                confidence=0.3, confirmed=False,
+                summary=f"OBSERVATION (not confirmed): {authorized} principal(s) declared entitled "
+                        f"to {exchange.url} reached it; authorized access to the function, not a "
+                        f"bypass. All {considered} configured non-privileged principals were evaluated.",
+                evidence=f"Declared entitlement authorized {authorized} of {considered} tested "
+                         f"principal(s) for {self._object_ref(exchange.url)!r}.",
+                control_outcome="inconclusive")
         if considered == 0:
+            if unsent:
+                return self._blocked(
+                    fc, f"function-level authorization NOT tested: {unsent} non-privileged identity "
+                        f"request(s) were not sent ({unsent_why}); a refused request is not evidence "
+                        f"that the control held",
+                    evidence=f"No response was obtained for {exchange.url}; this is not a negative result.")
+            if errored:
+                return self._skip(fc, f"could not test a function-level bypass: every non-privileged probe "
+                                      f"errored ({errored}; last: {last_error}) -- an errored probe is an "
+                                      f"unknown, never evidence that the control held")
             return self._skip(fc, "only privileged-role identities are configured -- cannot test a "
                                   "function-level bypass (an admin reaching an admin function is expected). "
                                   "Supply a lower-privilege identity's session to test BFLA")
@@ -346,14 +534,35 @@ class CrossIdentityValidator(Validator):
                         f"({'no admin baseline configured' if not have_admin_baseline else 'the responses differed'}). "
                         f"An admin namespace is a lead, not proof -- delegated/read-only access may be legitimate.",
                 evidence=f"Supply an admin session for a privileged-data comparison, or verify the returned "
-                         f"content is genuinely admin-only, before treating this as a confirmed BFLA.")
+                         f"content is genuinely admin-only, before treating this as a confirmed BFLA.",
+                control_outcome="inconclusive")
+        if errored or unsent:
+            # An errored or unsent probe is an UNKNOWN, not a denial. Without this guard it
+            # silently drops out of `considered`, so a single remaining denial
+            # satisfies rejects==considered and the leg reports "authorization
+            # holds" at 0.8 with control_outcome="control_held" -- which the
+            # downgrade block in orchestrator_confirm treats as a refutation,
+            # turning a network/scope failure into a confident clean bill of
+            # health against a real BFLA lead. Report inconclusive, never held.
+            return ValidationResult(
+                validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.0, confirmed=False,
+                summary=f"Function-level authorization test INCONCLUSIVE: {rejects} non-privileged "
+                        f"identity/identities were denied, but {errored + unsent} probe(s) "
+                        f"({self._incomplete_detail(errored, unsent, unsent_why)}) could not be "
+                        f"evaluated -- 'every non-privileged identity was denied' cannot be asserted.",
+                evidence=f"{considered} non-privileged identity/identities tested against {exchange.url} "
+                         f"({rejects} denied); {self._incomplete_detail(errored, unsent, unsent_why)}"
+                         f"{self._last_error_note(errored, last_error)}. An errored or unsent probe "
+                         f"is an unknown, not a denial, so this is NOT reported as a held control.",
+                control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.8, confirmed=False,
                 summary="Function-level authorization holds: every non-privileged identity was denied "
                         "this admin-namespaced function (and anonymous too).",
                 evidence=f"{considered} non-privileged identity/identities tested against {exchange.url}; "
-                         f"all denied.")
+                         f"all denied.",
+                control_outcome="control_held")
         return self._skip(fc, "function-level comparison inconclusive")
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
@@ -402,6 +611,15 @@ class CrossIdentityValidator(Validator):
         except Exception as e:  # network/scope error -- degrade, never crash the pipeline
             return ValidationResult(validator=self.name, status="error", finding_class=fc,
                                     summary=f"anonymous baseline probe failed: {e}")
+        if _not_reached(anon):
+            # R10: the baseline was refused (budget, gate, scope, cancellation) or never
+            # sent. Comparing an identity against an empty "denial" would claim a held
+            # control the target never exercised.
+            return self._blocked(
+                fc, f"cross-identity access control NOT tested: the anonymous baseline request was "
+                    f"not sent ({self._unsent_reason(anon)}); a refused request is not evidence "
+                    f"that the control held",
+                evidence=f"No response was obtained for {exchange.url}; this is not a negative result.")
 
         # Function-level authorization (BFLA): an admin-namespaced function reached
         # by a NON-privileged identity while anonymous is denied. The namespace
@@ -410,45 +628,88 @@ class CrossIdentityValidator(Validator):
         if function_level:
             return await self._confirm_bfla(fc, exchange, idents_distinct, anon)
 
+        import harness.principals as _pr
         considered = 0
         rejects = 0
         authorized = 0
+        undeclared = None   # first (identity, evidence) crossing with no ownership declared
+        errored = 0
+        unsent = 0
+        unsent_why = ""
+        last_error = None
         for ident in idents_distinct[:self.max_identities]:
             try:
                 attempt = await self._probe_identity(exchange.url, ident)
-            except Exception:
+            except Exception as e:
+                errored += 1       # an errored probe is an UNKNOWN, not a denial
+                last_error = e
+                continue
+            if _not_reached(attempt):
+                unsent += 1        # a refused/unsent probe is an UNKNOWN too (R10)
+                unsent_why = self._unsent_reason(attempt)
                 continue
             considered += 1
             ev = identity_compare.evaluate(
                 "authorization_boundary_compare", False, candidate, candidate, attempt, anon)
             if ev.verdict == identity_compare.Verdict.CONFIRMED:
-                # T02 ownership gate: reaching another identity's object is only a
-                # crossing if that identity was NOT entitled to it. If observed
-                # ownership shows AUTHORIZED access (own / explicitly shared /
-                # public), this is authorized sharing, not BOLA -> observation, not
-                # a confirmation. UNKNOWN ownership falls through to the existing
-                # response-similarity verdict (it neither invents nor suppresses).
-                if self.ownership is not None:
-                    import harness.principals as _pr
-                    accessor = ident.get("principal") or _pr.Principal(
-                        id=ident.get("principal_id") or ident.get("name")
-                           or ident.get("role") or "unknown",
-                        role=ident.get("role", "user"),
-                        trust=_pr.TRUST_BY_ROLE.get((ident.get("role") or "").lower(), 1),
-                        provisional=True)
-                    if self.ownership.authorization(accessor, self._object_ref(exchange.url)) \
-                            == _pr.AuthzDecision.AUTHORIZED:
-                        authorized += 1
-                        continue
-                return ValidationResult(
-                    validator=self.name, status="confirmed", finding_class=fc,
-                    confidence=ev.confidence, confirmed=True,
-                    summary=f"Cross-identity ({ident['name']}): {ev.summary}", evidence=ev.detail)
+                # WL-04 ownership gate (T02 made strict): a response match with
+                # anonymous denied is a boundary crossing ONLY when declared ownership
+                # says the principal that received it was not entitled to it.
+                #   UNAUTHORIZED accessor -> confirmed (the other identity crossed).
+                #   AUTHORIZED accessor (owner / shared / public): the owner's own
+                #     replay matching the capture shows the content is the protected
+                #     object, so if the SOURCE principal is declared not entitled, the
+                #     capture itself is the crossing -> confirmed; otherwise this is
+                #     authorized sharing -> observation.
+                #   UNKNOWN (no ownership source, nothing declared for this object,
+                #     or a credential-alias id) -> a `supported` lead, never a
+                #     confirmation (a resource shared with every authenticated user
+                #     matches identically) and never a negative.
+                accessor = _principal_for(ident)
+                decision = self._ownership_decision(accessor, exchange.url)
+                if decision == _pr.AuthzDecision.UNAUTHORIZED:
+                    return ValidationResult(
+                        validator=self.name, status="confirmed", finding_class=fc,
+                        confidence=ev.confidence, confirmed=True,
+                        summary=f"Cross-identity ({ident['name']}): {ev.summary}",
+                        evidence=f"Declared ownership of {self._object_ref(exchange.url)!r} does not "
+                                 f"entitle {accessor.id!r} to it. {ev.detail}")
+                if decision == _pr.AuthzDecision.AUTHORIZED:
+                    source_ident = _source_identity(idents, source_sig)
+                    source = _principal_for(source_ident) if source_ident is not None else None
+                    if source is not None and self._ownership_decision(source, exchange.url) \
+                            == _pr.AuthzDecision.UNAUTHORIZED:
+                        return ValidationResult(
+                            validator=self.name, status="confirmed", finding_class=fc,
+                            confidence=ev.confidence, confirmed=True,
+                            summary=f"Cross-identity ({source.id}): the captured read by "
+                                    f"{source.id!r} returned the protected object that the entitled "
+                                    f"principal {accessor.id!r} sees, while anonymous was denied.",
+                            evidence=f"Declared ownership of {self._object_ref(exchange.url)!r} does "
+                                     f"not entitle the source principal {source.id!r}; the entitled "
+                                     f"principal's replay matched its captured response. {ev.detail}")
+                    authorized += 1
+                    continue
+                if undeclared is None:
+                    undeclared = (ident, ev.detail)
+                continue
             if ev.verdict == identity_compare.Verdict.REJECTED:
                 rejects += 1
 
         if considered == 0:
+            if unsent:
+                return self._blocked(
+                    fc, f"cross-identity access control NOT tested: {unsent} identity request(s) were "
+                        f"not sent ({unsent_why}); a refused request is not evidence that the control held",
+                    evidence=f"No response was obtained for {exchange.url}; this is not a negative result.")
+            if errored:
+                return self._skip(fc, f"no configured identity probe completed: every probe errored "
+                                      f"({errored}; last: {last_error}) -- cannot test access control")
             return self._skip(fc, "no configured identity probe could be sent")
+        if undeclared is not None:
+            # A crossing-shaped match with no ownership declared outranks the other
+            # non-confirmations: it is the lead the analyst must resolve.
+            return self._undeclared_lead(fc, exchange, *undeclared)
         if authorized:
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc,
@@ -457,13 +718,35 @@ class CrossIdentityValidator(Validator):
                         f"{exchange.url} with explicit ownership/share/public permission; "
                         f"all {considered} configured principals were still evaluated.",
                 evidence=f"OwnershipLedger authorized {authorized} of {considered} tested "
-                         f"principal(s) for {self._object_ref(exchange.url)!r}.")
+                         f"principal(s) for {self._object_ref(exchange.url)!r}.",
+                control_outcome="inconclusive")
+        if errored or unsent:
+            # An errored or unsent probe is an UNKNOWN, not a denial. Without this guard it
+            # silently drops out of `considered`, so a single remaining denial
+            # satisfies rejects==considered and the leg reports "access correctly
+            # restricted" at 0.8 with control_outcome="control_held" -- which the
+            # downgrade block in orchestrator_confirm treats as a refutation,
+            # turning a network/scope failure into a confident clean bill of
+            # health against a real IDOR/BOLA lead. Report inconclusive, never held.
+            return ValidationResult(
+                validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.0, confirmed=False,
+                summary=f"Cross-identity access-control test INCONCLUSIVE: {rejects} identity/identities "
+                        f"were denied, but {errored + unsent} probe(s) "
+                        f"({self._incomplete_detail(errored, unsent, unsent_why)}) could not be "
+                        f"evaluated -- 'every other identity was denied' cannot be asserted.",
+                evidence=f"{considered} identity/identities evaluated against {exchange.url} "
+                         f"({rejects} rejected); {self._incomplete_detail(errored, unsent, unsent_why)}"
+                         f"{self._last_error_note(errored, last_error)}. An errored or unsent "
+                         f"probe is an unknown, not a denial, so this is NOT reported as a "
+                         f"restricted/held control.",
+                control_outcome="inconclusive")
         if rejects == considered:
             return ValidationResult(
                 validator=self.name, status="not_confirmed", finding_class=fc, confidence=0.8, confirmed=False,
                 summary="Access correctly restricted: every configured other identity, and the anonymous "
                         "baseline, were denied this resource -- the single-exchange access-control hypothesis "
                         "is contradicted by an active cross-identity test.",
-                evidence=f"{considered} identity/identities tested against {exchange.url}; all rejected")
+                evidence=f"{considered} identity/identities tested against {exchange.url}; all rejected",
+                control_outcome="control_held")
         return self._skip(fc, "cross-identity comparison inconclusive (no confirmation, and not every "
                               "identity was cleanly rejected)")

@@ -101,8 +101,17 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                        "executor and mutating validators send through."),
     TransportSite("tool_runner.py", CHANNEL_CONTAINER, SCOPE_INFRA, ROUTING_ADAPTER,
                   owner="tools",
-                  note="docker/subprocess adapter (sqlmap/ffuf); force-removes the "
-                       "container on timeout. Executor container adapter is T08 follow-on."),
+                  note="docker/subprocess adapter (sqlmap/ffuf). I05-C: every tool runs as "
+                       "an owned process tree (Windows Job Object / POSIX process group) with "
+                       "bounded output; cancel or timeout stops the tree and force-removes "
+                       "the exact container before returning. Executor container adapter "
+                       "is T08 follow-on."),
+    TransportSite("tool_proxy.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="tools", constructs_client=False,
+                  note="I05: loopback reverse proxy an external tool (sqlmap) is pointed at "
+                       "inside a run; each tool request is replayed through the run's "
+                       "TargetTransport (budget, scope, gate, cancellation, TLS), and an "
+                       "exhausted budget stops the tool."),
     TransportSite("browser_driver.py", CHANNEL_BROWSER, SCOPE_INFRA, ROUTING_ADAPTER,
                   owner="tools",
                   note="Playwright/Chromium adapter for browser_xss/dom_xss/stored_xss. "
@@ -194,7 +203,10 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   note="container leg remains isolated behind tool_runner; its direct HTTP "
                        "boolean-probe fallback uses the invocation executor."),
     TransportSite("validators/api_security_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_GATED,
-                  owner="confirmation", note="mass-assignment/BOLA checks; mutating sends via the gate."),
+                  owner="confirmation", constructs_client=False,
+                  note="mass-assignment and unbounded-limit probes both send through "
+                       "GatedAsyncClient, so inside an entered run they spend that run. I05 "
+                       "removed the limit probe's raw httpx client."),
     TransportSite("validators/cors_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="confirmation", constructs_client=False,
                   note="registry CORS probes use per-dispatch invocation scope, budget, "

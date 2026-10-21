@@ -9,11 +9,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 
 import httpx
 
 from harness.ollama_client import OllamaResult
 from harness.openai_provider import ProviderCallError
+from harness import security
 
 log = logging.getLogger("harness.anthropic_provider")
 
@@ -44,6 +46,8 @@ class AnthropicProvider:
         self, model: str, system_prompt: str, user_prompt: str,
         temperature: float = 0.1, **kw,
     ) -> OllamaResult:
+        system_prompt, user_prompt = security.sanitize_for_inference(system_prompt, user_prompt)
+        started = time.monotonic()
         payload = {
             "model": model,
             "system": system_prompt,
@@ -62,23 +66,32 @@ class AnthropicProvider:
                 resp.raise_for_status()
                 body = resp.json()
         except httpx.TimeoutException as e:
-            raise ProviderCallError(f"anthropic call timed out after {self._timeout}s: {e}") from e
+            raise ProviderCallError(f"anthropic call timed out after {self._timeout}s") from None
         except httpx.HTTPError as e:
-            raise ProviderCallError(f"anthropic call failed: {e}") from e
+            raise ProviderCallError(f"anthropic call failed: {security.safe_error_summary(e)}") from None
 
+        usage = body.get("usage") or {}
+        def count(key):
+            value = usage.get(key)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+        receipt = {"attempted": True, "completed": True, "usable": False,
+                   "prompt_tokens": count("input_tokens"), "completion_tokens": count("output_tokens"),
+                   "outcome": "error", "wall_ms": (time.monotonic() - started) * 1000.0}
         try:
             text = "".join(
                 block.get("text", "") for block in body.get("content", [])
                 if block.get("type") == "text")
             data = _extract_json(text)
         except (json.JSONDecodeError, TypeError, AttributeError) as e:
-            raise ProviderCallError(f"anthropic returned an unparseable response: {e}") from e
+            error = ProviderCallError("anthropic returned an unparseable response")
+            error.inference_usage = receipt
+            raise error from None
 
-        usage = body.get("usage") or {}
+        receipt.update(usable=True, outcome="ok")
         return OllamaResult(
             data=data,
-            prompt_tokens=int(usage.get("input_tokens", 0) or 0),
-            completion_tokens=int(usage.get("output_tokens", 0) or 0),
+            prompt_tokens=receipt["prompt_tokens"],
+            completion_tokens=receipt["completion_tokens"], measurement=receipt,
         )
 
     chat_json_metered = chat_json

@@ -92,9 +92,109 @@ class ValidatorTests(unittest.TestCase):
         self.assertIn("cross_identity", s["registered"])
         self.assertEqual(s["registered"], sorted(s["registered"]))
 
+    def test_arming_active_without_mutating_replay_warns(self):
+        # Second-switch visibility: arming active mode while allow_mutating_replay
+        # is OFF silently disables every mutating-proof validator. The operator
+        # must be warned up front, not left to infer it from per-send logs.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": False}})
+        with self.assertLogs("harness.validators.registry", level="WARNING") as cm:
+            reg.set_active_enabled(True)
+        joined = "\n".join(cm.output)
+        self.assertIn("allow_mutating_replay", joined)
+        self.assertIn("BLOCKED", joined)
+
+    def test_arming_active_with_mutating_replay_does_not_warn(self):
+        # Negative control: with replay armed too, there is nothing to warn about.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": True}})
+        with self.assertNoLogs("harness.validators.registry", level="WARNING"):
+            reg.set_active_enabled(True)
+
+    def test_no_accounts_for_host_warns_on_access_control_finding(self):
+        # Second crAPI failure mode: active armed + an IDOR candidate on a host
+        # with NO registered identities -> the cross-user validator can't arm and
+        # the check silently skips. Warn once per host (replay armed here so the
+        # set_active_enabled mutating-replay warning doesn't fire).
+        from harness import identity_headers
+        identity_headers.clear()
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": True}})
+        reg.set_active_enabled(True)
+        with self.assertLogs("harness.validators.registry", level="WARNING") as cm:
+            matched = reg.for_finding(self._idor_finding(), self.exchange)
+        self.assertNotIn("cross_identity", [v.name for v in matched])  # could not arm
+        self.assertIn("no identities", "\n".join(cm.output).lower())
+        # deduped: a second access-control finding on the same host warns no more
+        with self.assertNoLogs("harness.validators.registry", level="WARNING"):
+            reg.for_finding(self._idor_finding(), self.exchange)
+        identity_headers.clear()
+
+    def test_no_accounts_warning_suppressed_when_identities_registered(self):
+        from harness import identity_headers
+        identity_headers.clear()
+        identity_headers.set_identity("example.test", "other", {"Authorization": "Bearer o"})
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": True}})
+        reg.set_active_enabled(True)
+        with self.assertNoLogs("harness.validators.registry", level="WARNING"):
+            matched = reg.for_finding(self._idor_finding(), self.exchange)
+        self.assertIn("cross_identity", [v.name for v in matched])  # auto-armed instead
+        identity_headers.clear()
+
+    # --- Phase 2.2 route-by-agent (producing-agent fallback) ------------------
+    def _mislabelled_sqli(self) -> Finding:
+        # "sql_injection" is a real captured spelling that does NOT route by label
+        # (it is in the 2.1 baseline's missing set); the sqli agent is reliable.
+        return Finding(vulnerability_class="sql_injection", confidence=0.8,
+                       severity="high", summary="injection on id", evidence="id param",
+                       suggested_test="probe id", basis="derived")
+
+    def test_route_by_agent_recovers_a_mislabelled_finding(self):
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": True}})
+        f = self._mislabelled_sqli()
+        label_only = {v.name for v in reg.for_finding(f, self.exchange)}
+        self.assertNotIn("sqlmap", label_only, "mis-worded label unexpectedly routed")
+        with_agent = {v.name for v in reg.for_finding(f, self.exchange, agent="sqli")}
+        self.assertIn("sqlmap", with_agent,
+                      "the reliable producing agent did not recover the mislabelled finding")
+
+    def test_agent_fallback_is_opt_in_no_agent_is_label_only(self):
+        # Negative control: with no agent context the behaviour is exactly the old
+        # label-only routing, so existing callers are unchanged.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": True}})
+        f = self._mislabelled_sqli()
+        self.assertEqual({v.name for v in reg.for_finding(f, self.exchange)},
+                         {v.name for v in reg.for_finding(f, self.exchange, agent=None)})
+
+    def test_route_by_agent_does_not_defeat_shape_gating(self):
+        # Negative control: the agent recovers the CLASS, not the shape. A
+        # file_upload agent on a plain GET must NOT pull in the file-upload
+        # validator -- confirmation still needs the right request shape.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": True}})
+        names = {v.name for v in reg.for_finding(self._mislabelled_sqli(), self.exchange,
+                                                 agent="file_upload")}
+        self.assertNotIn("file_upload", names)
+
+    def test_route_by_agent_arms_cross_identity_via_the_agent(self):
+        from harness import identity_headers
+        identity_headers.clear()
+        identity_headers.set_identity("example.test", "other", {"Authorization": "Bearer o"})
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
+                                                 "allow_mutating_replay": True}})
+        reg.set_active_enabled(True)
+        # A finding whose LABEL is not access-control, produced by the idor agent.
+        f = self._mislabelled_sqli()
+        label_only = {v.name for v in reg.for_finding(f, self.exchange)}
+        self.assertNotIn("cross_identity", label_only)  # label alone does not arm it
+        with_agent = {v.name for v in reg.for_finding(f, self.exchange, agent="idor")}
+        self.assertIn("cross_identity", with_agent,
+                      "the idor agent did not arm the cross-user check via route-by-agent")
+        identity_headers.clear()
+
     def test_sqlmap_confirmation_promotes_only_on_explicit_tool_result(self):
         validator = SqlmapValidator()
-        with patch("subprocess.run", return_value=FakeProc()):
+        with patch("harness.tool_runner.run_process", return_value=FakeProc()):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertTrue(result.confirmed)
         self.assertEqual(result.status, "confirmed")
@@ -108,8 +208,10 @@ class ValidatorTests(unittest.TestCase):
         captured = {}
         def fake_run(cmd, *a, **k):
             captured["cmd"] = cmd
-            return FakeProc()
-        with patch("subprocess.run", fake_run), \
+            proc = FakeProc()
+            return tool_runner.ProcessResult(cmd, proc.returncode, proc.stdout, proc.stderr,
+                                             "exit", "not_needed", "job")
+        with patch("harness.tool_runner.run_process", fake_run), \
              patch("harness.tool_runner.available", return_value=(True, "ok")):
             asyncio.run(validator.validate(self.finding, loopback_ex))
         cmd = captured["cmd"]
@@ -126,7 +228,7 @@ class ValidatorTests(unittest.TestCase):
         def fake_run(cmd, *a, **k):
             captured["cmd"] = cmd
             return FakeProc()
-        with patch("subprocess.run", fake_run):
+        with patch("harness.tool_runner.run_process", fake_run):
             asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertEqual(captured["cmd"][0], "sqlmap")  # host binary, no docker wrapping
 
@@ -136,7 +238,7 @@ class ValidatorTests(unittest.TestCase):
             stdout = "[INFO] testing parameter id"
             stderr = ""
         validator = SqlmapValidator()
-        with patch("subprocess.run", return_value=NoHit()):
+        with patch("harness.tool_runner.run_process", return_value=NoHit()):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertFalse(result.confirmed)
         self.assertEqual(result.status, "not_confirmed")
@@ -161,7 +263,7 @@ class ValidatorTests(unittest.TestCase):
             output=b"[INFO] testing parameter id\npartial output",
             stderr=b"some stderr bytes",
         )
-        with patch("subprocess.run", side_effect=timeout_exc):
+        with patch("harness.tool_runner.run_process", side_effect=timeout_exc):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertEqual(result.status, "error")
         self.assertIn("timed out", result.summary)
@@ -178,7 +280,7 @@ class ValidatorTests(unittest.TestCase):
             cmd=["sqlmap"], timeout=90,
             output="already a str", stderr="also already a str",
         )
-        with patch("subprocess.run", side_effect=timeout_exc):
+        with patch("harness.tool_runner.run_process", side_effect=timeout_exc):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertEqual(result.status, "error")
         self.assertIn("already a str", result.evidence)
@@ -190,7 +292,7 @@ class ValidatorTests(unittest.TestCase):
         import subprocess
         validator = SqlmapValidator()
         timeout_exc = subprocess.TimeoutExpired(cmd=["sqlmap"], timeout=90)
-        with patch("subprocess.run", side_effect=timeout_exc):
+        with patch("harness.tool_runner.run_process", side_effect=timeout_exc):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertEqual(result.status, "error")
         self.assertEqual(result.evidence, "\n")
@@ -317,8 +419,10 @@ class _FakeResponse:
 class CorsWildcardGateTests(unittest.TestCase):
     """A bare `Access-Control-Allow-Origin: *` without credentials must NOT
     be reported as a vulnerability (Juice Shop full-run: this was 58 of 60
-    false 'confirmed' findings). The dangerous wildcard+credentials
-    combination MUST still confirm."""
+    false 'confirmed' findings). Wildcard with credentials is no exploit
+    either (RV-D2 V3): browsers fail the CORS check for a credentialed request
+    answered with `*` (Fetch standard), so it is an informational
+    misconfiguration, never a confirmation."""
 
     def setUp(self):
         from harness.validators.cors_validator import CorsValidator
@@ -344,19 +448,34 @@ class CorsWildcardGateTests(unittest.TestCase):
         self.assertFalse(result.vulnerable)
         self.assertEqual(result.severity, "info")
 
-    def test_wildcard_with_credentials_is_vulnerable(self):
+    def test_wildcard_with_credentials_is_informational_not_vulnerable(self):
         result = self._run_wildcard({
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Credentials": "true",
         })
-        self.assertTrue(result.vulnerable)
-        self.assertEqual(result.severity, "critical")
+        self.assertFalse(result.vulnerable)
+        self.assertFalse(result.passed)  # still reported as a misconfiguration
+        self.assertEqual(result.severity, "info")
+        self.assertIn("Fetch standard", result.detail)
+
+    def test_credentials_wildcard_test_is_informational_not_vulnerable(self):
+        async def fake_send(*args, **kwargs):
+            return _FakeResponse({"Access-Control-Allow-Origin": "*",
+                                  "Access-Control-Allow-Credentials": "true"})
+        with patch.object(self.validator, "_send_request", side_effect=fake_send):
+            result = asyncio.run(self.validator._test_credentials_wildcard(
+                "https://example.test", self.exchange))
+        self.assertFalse(result.vulnerable)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.severity, "info")
 
     def test_arbitrary_origin_reflection_still_vulnerable(self):
         result = self._run_wildcard(
             {"Access-Control-Allow-Origin": "https://evil-attacker.com"}
         )
         self.assertTrue(result.vulnerable)
+        # RV-R R2: without credentials it still confirms, noting the limited impact.
+        self.assertIn("without the user's cookies", result.detail)
 
     def _run_vary(self, headers):
         async def fake_send(*args, **kwargs):

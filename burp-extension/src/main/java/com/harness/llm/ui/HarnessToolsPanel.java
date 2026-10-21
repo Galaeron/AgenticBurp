@@ -161,7 +161,7 @@ public class HarnessToolsPanel extends JPanel {
     // ------------------------------------------------------------------
 
     private JComponent buildEngagementTab() {
-        JTextField hostField = new JTextField("localhost:3000", 20);
+        JTextField hostField = new JTextField("", 20);
         DefaultTableModel model = new DefaultTableModel(
                 new Object[]{"#", "score", "method", "path", "status", "why"}, 0) {
             @Override public boolean isCellEditable(int r, int c) { return false; }
@@ -178,7 +178,7 @@ public class HarnessToolsPanel extends JPanel {
         loadBtn.addActionListener(e -> loadEngagement(hostField.getText().trim(), model, detail, loadBtn));
 
         // Advance: re-crawl as roles and fold new surface back into the ranking.
-        JTextField advBase = new JTextField("http://localhost:3000/", 28);
+        JTextField advBase = new JTextField("", 28);
         JTextArea advRoles = new JTextArea(3, 28);
         advRoles.setText("anonymous |\nadmin | Authorization=Bearer <token>");
         advRoles.setBorder(BorderFactory.createTitledBorder(
@@ -372,7 +372,7 @@ public class HarnessToolsPanel extends JPanel {
         JTextArea out = outputArea();
 
         // --- plain crawl (+ optional Target import) ---
-        JTextField crawlUrl = new JTextField("http://localhost:3000/", 30);
+        JTextField crawlUrl = new JTextField("", 30);
         JTextField maxPages = new JTextField("40", 5);
         JCheckBox crawlImport = new JCheckBox("Add discovered endpoints to Target site map", true);
         crawlImport.setEnabled(siteMapImporter != null);
@@ -389,7 +389,7 @@ public class HarnessToolsPanel extends JPanel {
         rolesArea.setText("anonymous |\nadmin | Authorization=Bearer <token>");
         rolesArea.setBorder(BorderFactory.createTitledBorder(
                 "Roles -- one per line: <role> | <Header>=<value>; <Header2>=<value2>   (blank headers = anonymous)"));
-        JTextField roleBase = new JTextField("http://localhost:3000/", 30);
+        JTextField roleBase = new JTextField("", 30);
         JCheckBox roleImport = new JCheckBox("Add discovered endpoints to Target site map", true);
         roleImport.setEnabled(siteMapImporter != null);
         JButton roleBtn = new JButton("Role crawl -> access matrix");
@@ -402,7 +402,7 @@ public class HarnessToolsPanel extends JPanel {
         });
 
         // --- missing-auth probe ---
-        JTextField maUrl = new JTextField("http://localhost:3000/", 30);
+        JTextField maUrl = new JTextField("", 30);
         JTextArea maPaths = new JTextArea(4, 30);
         maPaths.setBorder(BorderFactory.createTitledBorder("Paths to probe (one per line; blank -> use discover)"));
         JCheckBox discover = new JCheckBox("Discover endpoints first (crawl)");
@@ -533,7 +533,7 @@ public class HarnessToolsPanel extends JPanel {
     private JComponent buildActiveTab() {
         JTextArea out = outputArea();
 
-        JTextField url = new JTextField("http://localhost:3000/rest/user/whoami", 30);
+        JTextField url = new JTextField("", 30);
         JComboBox<String> method = new JComboBox<>(new String[]{"GET", "POST", "PUT", "PATCH", "DELETE"});
         JTextField hypothesis = new JTextField("IDOR on the id parameter", 30);
         JTextField specialty = new JTextField("idor", 12);
@@ -617,7 +617,7 @@ public class HarnessToolsPanel extends JPanel {
                 () -> client.setValidators(activeToggle.isSelected(), xidToggle.isSelected())));
 
         // --- supply another identity's session headers (Autorize low-priv cookie) ---
-        JTextField host = new JTextField("localhost:3000", 20);
+        JTextField host = new JTextField("", 20);
         JTextField name = new JTextField("victim", 14);
         JTextField role = new JTextField("user", 10);
         JTextArea headers = new JTextArea(5, 30);

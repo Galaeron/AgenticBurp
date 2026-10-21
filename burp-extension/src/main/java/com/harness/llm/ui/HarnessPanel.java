@@ -26,6 +26,8 @@ public class HarnessPanel extends JPanel {
     private final JList<ResultEntry> resultList = new JList<>(listModel);
     private final JTextArea detailArea = new JTextArea();
     private final JTextField baseUrlField = new JTextField("http://localhost:8787", 24);
+    private final JPasswordField bearerTokenField = new JPasswordField(18);
+    private Runnable tokenClearHandler = () -> {};
     private final JTextField analysisTimeoutField = new JTextField("600", 5);
     private final JTextArea validationResultArea = new JTextArea();
     private final JLabel statusLabel = new JLabel("Not connected");
@@ -50,6 +52,16 @@ public class HarnessPanel extends JPanel {
         JPanel topBar = new JPanel(new FlowLayout(FlowLayout.LEFT));
         topBar.add(new JLabel("Harness URL:"));
         topBar.add(baseUrlField);
+        topBar.add(new JLabel("Pairing token:"));
+        bearerTokenField.setToolTipText("Explicit token for this service, kept in memory. Blank retains the current credential. Changing the URL clears its credential.");
+        topBar.add(bearerTokenField);
+        JButton clearToken = new JButton("Clear token");
+        clearToken.addActionListener(e -> {
+            bearerTokenField.setText("");
+            tokenClearHandler.run();
+            statusLabel.setText("Credential cleared");
+        });
+        topBar.add(clearToken);
         topBar.add(new JLabel("Analysis timeout (s):"));
         analysisTimeoutField.setToolTipText("How long to wait for a single \"send to LLM Harness\" call to "
                 + "finish before giving up client-side. A dispatch involving several agents at limited "
@@ -59,8 +71,16 @@ public class HarnessPanel extends JPanel {
         topBar.add(analysisTimeoutField);
         JButton testBtn = new JButton("Test Connection");
         testBtn.addActionListener(e -> {
-            boolean ok = onTestConnection.get();
-            statusLabel.setText(ok ? "Connected" : "Unreachable");
+            boolean ok;
+            try {
+                ok = onTestConnection.get();
+            } catch (IllegalArgumentException invalidUrl) {
+                statusLabel.setText("Invalid harness URL");
+                statusLabel.setToolTipText(invalidUrl.getMessage());
+                statusLabel.setForeground(Color.RED);
+                return;
+            }
+            statusLabel.setText(ok ? "Authenticated" : "Connection failed");
             statusLabel.setForeground(ok ? new Color(0, 128, 0) : Color.RED);
             String reason = lastConnectionError.get();
             statusLabel.setToolTipText(ok || reason == null ? null : reason);
@@ -227,6 +247,21 @@ public class HarnessPanel extends JPanel {
         return baseUrlField.getText().trim();
     }
 
+    public void setTokenClearHandler(Runnable handler) {
+        tokenClearHandler = handler;
+    }
+
+    /** Consume and erase the masked entry after applying it to the client. */
+    public String consumeBearerTokenInput() {
+        char[] chars = bearerTokenField.getPassword();
+        try {
+            return new String(chars).trim();
+        } finally {
+            java.util.Arrays.fill(chars, '\0');
+            bearerTokenField.setText("");
+        }
+    }
+
     /** Parses the analysis-timeout field; falls back to 600s (and
      * resets the field to show that) on anything unparseable rather
      * than silently using a stale or nonsensical value. */
@@ -277,21 +312,18 @@ public class HarnessPanel extends JPanel {
         sb.append("# LLM Harness Report\n\n");
         sb.append("Generated ").append(java.time.Instant.now()).append("\n\n");
 
-        int total = 0, critical = 0, high = 0;
+        // R16: severity is impact, not proof -- the headline separates the two so a critical
+        // unverified finding is never read as a confirmed critical.
+        java.util.List<Finding> allFindings = new java.util.ArrayList<>();
         for (int i = 0; i < listModel.size(); i++) {
             ResultEntry e = listModel.get(i);
             if (e.error() != null) continue;
             for (AgentReport ar : e.response().agent_reports) {
                 if (ar.findings == null) continue;
-                for (Finding f : ar.findings) {
-                    total++;
-                    if ("critical".equals(f.severity)) critical++;
-                    if ("high".equals(f.severity)) high++;
-                }
+                allFindings.addAll(ar.findings);
             }
         }
-        sb.append(String.format("**%d findings** (%d critical, %d high) across %d analyzed exchange(s).%n%n",
-                total, critical, high, listModel.size()));
+        sb.append(FindingPresentation.tally(allFindings).headline(listModel.size())).append("\n\n");
 
         for (int i = 0; i < listModel.size(); i++) {
             ResultEntry e = listModel.get(i);
@@ -322,15 +354,11 @@ public class HarnessPanel extends JPanel {
                     // control). Before this change the panel collapsed both axes into one
                     // CONFIRMED/HYPOTHESIS label, so an oracle-verified finding and a
                     // merely leg-confirmed one were shown identically.
-                    String verificationLabel;
-                    if (f.oracle_verified || "verified".equals(f.verification_state)) {
-                        verificationLabel = "ORACLE-VERIFIED";
-                    } else if (f.confirmed) {
-                        verificationLabel = "CONFIRMED (leg fired, not oracle-verified)";
-                    } else {
-                        verificationLabel = "HYPOTHESIS / NOT CONFIRMED";
-                    }
+                    // R16: the label is derived from the same server-owned maturity as the
+                    // evidence line below (FindingPresentation), so the two cannot disagree.
+                    String verificationLabel = FindingPresentation.stateLabel(f);
                     sb.append("  - Verification status: ").append(verificationLabel).append('\n');
+                    sb.append("  - ").append(FindingPresentation.evidenceLine(f)).append('\n');
                     if (f.review_verdict != null) {
                         sb.append("  - Reviewed: ").append(f.review_verdict)
                           .append(" -- ").append(f.review_note).append('\n');
@@ -385,6 +413,8 @@ public class HarnessPanel extends JPanel {
                         f.owasp_category != null ? " owasp=" + f.owasp_category : ""));
                 sb.append("    summary: ").append(f.summary).append('\n');
                 sb.append("    evidence: ").append(f.evidence).append('\n');
+                sb.append("    status: ").append(FindingPresentation.stateLabel(f)).append('\n');
+                sb.append("    ").append(FindingPresentation.evidenceLine(f)).append('\n');
                 sb.append("    next step: ").append(f.suggested_test).append('\n');
                 if (f.review_verdict != null) {
                     sb.append(String.format("    reviewed: %s (was %.2f -> %.2f) -- %s%n",
@@ -412,12 +442,17 @@ public class HarnessPanel extends JPanel {
                 }
 
                 int n = 0;
+                int unverified = 0;
                 FindingSeverity highest = FindingSeverity.UNKNOWN;
                 for (AgentReport ar : entry.response().agent_reports) {
                     if (ar.findings == null) continue;
                     for (Finding f : ar.findings) {
-                        if (f.confidence < MIN_REPORT_CONFIDENCE) continue;
+                        // R16: the confidence cut-off hides low-confidence HYPOTHESES from the
+                        // headline; a harness-confirmed finding (including a passive observation)
+                        // is never hidden by the model's confidence.
+                        if (f.confidence < MIN_REPORT_CONFIDENCE && !FindingPresentation.isConfirmed(f)) continue;
                         n++;
+                        if (FindingPresentation.isUnverified(f)) unverified++;
                         FindingSeverity sev = FindingSeverity.fromString(f.severity);
                         if (sev.isAtLeast(highest)) highest = sev;
                     }
@@ -431,6 +466,7 @@ public class HarnessPanel extends JPanel {
                 label.setText(runnable > 0
                         ? String.format("[%d ▸%d] %s", n, runnable, entry.label())
                         : String.format("[%d] %s", n, entry.label()));
+                if (unverified > 0) label.setText(label.getText() + " (" + unverified + " unverified; manual verification)");
                 if (n == 0) return label;
 
                 JPanel row = new JPanel(new BorderLayout(6, 0));

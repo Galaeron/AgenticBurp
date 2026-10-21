@@ -191,7 +191,7 @@ class TelemetryInvocationBindingTests(unittest.TestCase):
             agent_names = list(orch.agent_manager.agents)[:1]
             observed_run_ids = []
 
-            async def inert_agent(name, exchange, max_body_chars, prior_context):
+            async def inert_agent(name, exchange, max_body_chars, prior_context, effort_budget=None):
                 observed_run_ids.append(telemetry.current_run_id())
                 telemetry.record_event("dispatched")
                 await asyncio.sleep(0.02)
@@ -232,8 +232,14 @@ class TelemetryEndpointTests(unittest.TestCase):
         import importlib
         import harness.server as server_module
         importlib.reload(server_module)
+        self.server_module = server_module
         from fastapi.testclient import TestClient
         self.client = TestClient(server_module.app, base_url="http://localhost")
+
+    def _auth(self):
+        # /telemetry is a sensitive-read endpoint: it requires the effective
+        # bearer token (even over loopback), like the rest of the API.
+        return {"Authorization": f"Bearer {self.server_module._mutation_token()}"}
 
     def tearDown(self):
         store._DB_PATH = self._orig
@@ -242,7 +248,7 @@ class TelemetryEndpointTests(unittest.TestCase):
 
     def test_telemetry_endpoint_exposes_diagnostics(self):
         telemetry.record_swallowed_exception("universal_header_audit", ValueError())
-        resp = self.client.get("/telemetry")
+        resp = self.client.get("/telemetry", headers=self._auth())
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertIn("diagnostics", body)
@@ -256,7 +262,7 @@ class TelemetryEndpointTests(unittest.TestCase):
         telemetry.bind_current_run("scoped-run")
         telemetry.record_swallowed_exception("scoped_site", ValueError())
         telemetry.bind_current_run("")  # back to unscoped for the request itself
-        resp = self.client.get("/telemetry", params={"run_id": "scoped-run"})
+        resp = self.client.get("/telemetry", params={"run_id": "scoped-run"}, headers=self._auth())
         self.assertEqual(resp.status_code, 200)
         diag = resp.json()["diagnostics"]
         self.assertEqual(diag["scope"], "run")

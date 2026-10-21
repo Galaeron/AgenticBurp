@@ -1,0 +1,716 @@
+{
+  "_comment": "Phase 2.2 agent-routing study: every captured finding as an (agent, label) pair across the three crAPI result files, with the occurrence-weighted miss rate under three routing strategies -- label-only (today), agent-only, and combined (label OR agent, what 2.2 implements). The combined route is the ACHIEVABLE target for 2.1's 'miss near zero'; the residual agents below have no confirming validator (observations, not hypotheses). This is a vocabulary study on captured output, NOT a measurement of production dispatch -- a caller-level test must establish that the harness actually routes by agent.",
+  "generated_from": [
+    "results/run1.json",
+    "results/run2.json",
+    "results/run_active1_full.json"
+  ],
+  "generated_utc": "2026-10-14T07:54:04.129346+00:00",
+  "total_findings": 978,
+  "baseline_label_miss_rate": 0.3824,
+  "baseline_agent_miss_rate": 0.0859,
+  "baseline_combined_miss_rate": 0.0307,
+  "residual_unrouted_agents": {
+    "anomaly": 12,
+    "ai_security": 12,
+    "ai_llm": 5,
+    "chain_detector": 1
+  },
+  "combos": [
+    {
+      "agent": "ai_llm",
+      "label": "Excessive Agency / Insecure Integration",
+      "count": 1
+    },
+    {
+      "agent": "ai_llm",
+      "label": "Information Exposure",
+      "count": 3
+    },
+    {
+      "agent": "ai_llm",
+      "label": "Prompt Injection",
+      "count": 1
+    },
+    {
+      "agent": "ai_security",
+      "label": "AI Agent Surface Discovery",
+      "count": 3
+    },
+    {
+      "agent": "ai_security",
+      "label": "AI Agent Surface Identification",
+      "count": 2
+    },
+    {
+      "agent": "ai_security",
+      "label": "Authentication Token Exposure",
+      "count": 1
+    },
+    {
+      "agent": "ai_security",
+      "label": "Prompt Injection",
+      "count": 6
+    },
+    {
+      "agent": "anomaly",
+      "label": "information_disclosure_header",
+      "count": 12
+    },
+    {
+      "agent": "anomaly",
+      "label": "missing_security_header",
+      "count": 12
+    },
+    {
+      "agent": "api_security",
+      "label": "API Inventory / Undocumented Endpoint",
+      "count": 1
+    },
+    {
+      "agent": "api_security",
+      "label": "API VERSIONING / INVENTORY ISSUES",
+      "count": 1
+    },
+    {
+      "agent": "api_security",
+      "label": "API Versioning / Inventory Issues",
+      "count": 2
+    },
+    {
+      "agent": "api_security",
+      "label": "EXCESSIVE DATA EXPOSURE",
+      "count": 4
+    },
+    {
+      "agent": "api_security",
+      "label": "Excessive Data Exposure",
+      "count": 14
+    },
+    {
+      "agent": "api_security",
+      "label": "Function-Level Authorization",
+      "count": 5
+    },
+    {
+      "agent": "api_security",
+      "label": "LACK OF RESOURCE / RATE LIMITING AT THE API LAYER",
+      "count": 5
+    },
+    {
+      "agent": "api_security",
+      "label": "Lack of Resource / Rate Limiting at the API Layer",
+      "count": 1
+    },
+    {
+      "agent": "api_security",
+      "label": "Lack of Resource Limiting",
+      "count": 3
+    },
+    {
+      "agent": "api_security",
+      "label": "MASS ASSIGNMENT",
+      "count": 3
+    },
+    {
+      "agent": "api_security",
+      "label": "MASS ASSIGNMENT / EXCESSIVE DATA BINDING",
+      "count": 4
+    },
+    {
+      "agent": "api_security",
+      "label": "Mass Assignment",
+      "count": 27
+    },
+    {
+      "agent": "api_security",
+      "label": "Server-Side Request Forgery (SSRF)",
+      "count": 3
+    },
+    {
+      "agent": "auth",
+      "label": "broken_access_control",
+      "count": 15
+    },
+    {
+      "agent": "auth",
+      "label": "broken_authentication",
+      "count": 3
+    },
+    {
+      "agent": "auth",
+      "label": "broken_authorization",
+      "count": 1
+    },
+    {
+      "agent": "auth",
+      "label": "cleartext_transmission",
+      "count": 5
+    },
+    {
+      "agent": "auth",
+      "label": "csrf",
+      "count": 13
+    },
+    {
+      "agent": "auth",
+      "label": "idor",
+      "count": 1
+    },
+    {
+      "agent": "auth",
+      "label": "insufficient_anti_automation",
+      "count": 1
+    },
+    {
+      "agent": "auth",
+      "label": "insufficient_otp_entropy",
+      "count": 2
+    },
+    {
+      "agent": "auth",
+      "label": "missing_csrf_protection",
+      "count": 1
+    },
+    {
+      "agent": "auth",
+      "label": "sensitive_data_transmitted_over_http",
+      "count": 9
+    },
+    {
+      "agent": "auth",
+      "label": "ssrf",
+      "count": 1
+    },
+    {
+      "agent": "auth",
+      "label": "trust_boundary_bypass",
+      "count": 2
+    },
+    {
+      "agent": "auth",
+      "label": "user_enumeration",
+      "count": 1
+    },
+    {
+      "agent": "auth",
+      "label": "username_enumeration",
+      "count": 12
+    },
+    {
+      "agent": "business_logic",
+      "label": "Authentication Bypass / Workflow Flaw",
+      "count": 4
+    },
+    {
+      "agent": "business_logic",
+      "label": "Broken Access Control",
+      "count": 33
+    },
+    {
+      "agent": "business_logic",
+      "label": "Broken Access Control / Privilege Escalation",
+      "count": 6
+    },
+    {
+      "agent": "business_logic",
+      "label": "Broken Access Control / Workflow Bypass",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "Broken Authentication",
+      "count": 2
+    },
+    {
+      "agent": "business_logic",
+      "label": "Broken Authentication / MFA Bypass",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "Broken Authentication / OTP Bypass",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "Broken Authentication / Workflow Bypass",
+      "count": 4
+    },
+    {
+      "agent": "business_logic",
+      "label": "Business Logic Flaw",
+      "count": 7
+    },
+    {
+      "agent": "business_logic",
+      "label": "Client-Controlled Business Logic Parameter",
+      "count": 3
+    },
+    {
+      "agent": "business_logic",
+      "label": "Lack of Rate Limiting",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "Mass Assignment",
+      "count": 5
+    },
+    {
+      "agent": "business_logic",
+      "label": "Missing Authorization",
+      "count": 4
+    },
+    {
+      "agent": "business_logic",
+      "label": "Race Condition",
+      "count": 5
+    },
+    {
+      "agent": "business_logic",
+      "label": "Rate Limit Bypass / Email Bombing",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "Rate Limit Bypass / Resource Exhaustion",
+      "count": 3
+    },
+    {
+      "agent": "business_logic",
+      "label": "Rate Limiting / Resource Exhaustion",
+      "count": 3
+    },
+    {
+      "agent": "business_logic",
+      "label": "Server-Side Request Forgery (SSRF)",
+      "count": 2
+    },
+    {
+      "agent": "business_logic",
+      "label": "Username Enumeration",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "Workflow Bypass",
+      "count": 8
+    },
+    {
+      "agent": "business_logic",
+      "label": "broken access control",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "broken_access_control",
+      "count": 27
+    },
+    {
+      "agent": "business_logic",
+      "label": "business_logic_flaw",
+      "count": 5
+    },
+    {
+      "agent": "business_logic",
+      "label": "client-controlled business logic parameter",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "missing authorization",
+      "count": 6
+    },
+    {
+      "agent": "business_logic",
+      "label": "missing_authorization",
+      "count": 6
+    },
+    {
+      "agent": "business_logic",
+      "label": "race condition",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "race_condition",
+      "count": 3
+    },
+    {
+      "agent": "business_logic",
+      "label": "workflow bypass",
+      "count": 1
+    },
+    {
+      "agent": "business_logic",
+      "label": "workflow_bypass",
+      "count": 3
+    },
+    {
+      "agent": "chain_detector",
+      "label": "potential-attack-chain:idor+rate_limit",
+      "count": 1
+    },
+    {
+      "agent": "chain_detector",
+      "label": "potential-attack-chain:second_order_idor",
+      "count": 1
+    },
+    {
+      "agent": "chain_detector",
+      "label": "potential-attack-chain:second_order_sqli",
+      "count": 1
+    },
+    {
+      "agent": "chain_detector",
+      "label": "potential-attack-chain:sqli+idor",
+      "count": 1
+    },
+    {
+      "agent": "confidential_info",
+      "label": "info_disclosure",
+      "count": 15
+    },
+    {
+      "agent": "cors",
+      "label": "CORS Misconfiguration",
+      "count": 3
+    },
+    {
+      "agent": "credential_endpoint_detector",
+      "label": "sqli",
+      "count": 24
+    },
+    {
+      "agent": "crypto",
+      "label": "Cleartext Transmission of Sensitive Data",
+      "count": 5
+    },
+    {
+      "agent": "crypto",
+      "label": "Cleartext Transmission of Sensitive Information",
+      "count": 16
+    },
+    {
+      "agent": "crypto",
+      "label": "Sensitive Data Transmitted Over HTTP",
+      "count": 2
+    },
+    {
+      "agent": "crypto",
+      "label": "Transport Layer Security",
+      "count": 2
+    },
+    {
+      "agent": "crypto",
+      "label": "Transport Layer Security (TLS) Missing",
+      "count": 3
+    },
+    {
+      "agent": "crypto",
+      "label": "Weak Token",
+      "count": 1
+    },
+    {
+      "agent": "crypto",
+      "label": "Weak/Predictable Token",
+      "count": 1
+    },
+    {
+      "agent": "crypto",
+      "label": "sensitive_data_transmitted_over_http",
+      "count": 13
+    },
+    {
+      "agent": "crypto",
+      "label": "transport-layer-security",
+      "count": 6
+    },
+    {
+      "agent": "csp",
+      "label": "Missing Content Security Policy",
+      "count": 9
+    },
+    {
+      "agent": "csp",
+      "label": "missing content security policy",
+      "count": 4
+    },
+    {
+      "agent": "csp",
+      "label": "missing_content_security_policy",
+      "count": 1
+    },
+    {
+      "agent": "file_upload",
+      "label": "Command Injection",
+      "count": 1
+    },
+    {
+      "agent": "file_upload",
+      "label": "Unrestricted File Upload",
+      "count": 7
+    },
+    {
+      "agent": "file_upload",
+      "label": "command_injection",
+      "count": 1
+    },
+    {
+      "agent": "file_upload",
+      "label": "unrestricted_file_upload",
+      "count": 5
+    },
+    {
+      "agent": "http_request_smuggling",
+      "label": "HTTP Request Smuggling",
+      "count": 67
+    },
+    {
+      "agent": "idor",
+      "label": "Broken Object Level Authorization",
+      "count": 9
+    },
+    {
+      "agent": "idor",
+      "label": "Insecure Direct Object Reference",
+      "count": 63
+    },
+    {
+      "agent": "idor",
+      "label": "broken_access_control",
+      "count": 3
+    },
+    {
+      "agent": "idor",
+      "label": "broken_object_level_access_control",
+      "count": 23
+    },
+    {
+      "agent": "idor",
+      "label": "broken_object_level_authorization",
+      "count": 3
+    },
+    {
+      "agent": "jwt",
+      "label": "Algorithm Confusion",
+      "count": 29
+    },
+    {
+      "agent": "jwt",
+      "label": "Cleartext Transmission of Sensitive Information",
+      "count": 3
+    },
+    {
+      "agent": "jwt",
+      "label": "JWT Algorithm Confusion",
+      "count": 26
+    },
+    {
+      "agent": "jwt",
+      "label": "Sensitive Data Transmitted Over HTTP",
+      "count": 1
+    },
+    {
+      "agent": "jwt",
+      "label": "Sensitive Data Transmitted over HTTP",
+      "count": 2
+    },
+    {
+      "agent": "jwt",
+      "label": "Sensitive Information Transmitted Over HTTP",
+      "count": 2
+    },
+    {
+      "agent": "jwt",
+      "label": "Token transmitted over HTTP",
+      "count": 1
+    },
+    {
+      "agent": "jwt",
+      "label": "algorithm confusion",
+      "count": 6
+    },
+    {
+      "agent": "jwt",
+      "label": "jwt_algorithm_confusion",
+      "count": 27
+    },
+    {
+      "agent": "jwt",
+      "label": "sensitive_data_transmitted_over_http",
+      "count": 5
+    },
+    {
+      "agent": "misconfig",
+      "label": "Information Exposure",
+      "count": 6
+    },
+    {
+      "agent": "misconfig",
+      "label": "Security Misconfiguration",
+      "count": 3
+    },
+    {
+      "agent": "misconfig",
+      "label": "security-misconfiguration",
+      "count": 7
+    },
+    {
+      "agent": "misconfig",
+      "label": "verbose_error_message",
+      "count": 1
+    },
+    {
+      "agent": "nosql",
+      "label": "NoSQL Injection",
+      "count": 51
+    },
+    {
+      "agent": "nosql",
+      "label": "NoSQL injection",
+      "count": 4
+    },
+    {
+      "agent": "nosql",
+      "label": "nosql_injection",
+      "count": 7
+    },
+    {
+      "agent": "rate_limit",
+      "label": "Lack of Rate Limiting",
+      "count": 10
+    },
+    {
+      "agent": "rate_limit",
+      "label": "insufficient_anti_automation",
+      "count": 1
+    },
+    {
+      "agent": "rate_limit",
+      "label": "lack of rate limiting",
+      "count": 5
+    },
+    {
+      "agent": "rate_limit",
+      "label": "missing rate limiting",
+      "count": 1
+    },
+    {
+      "agent": "rate_limit",
+      "label": "missing_rate_limiting",
+      "count": 2
+    },
+    {
+      "agent": "rate_limit",
+      "label": "rate limiting",
+      "count": 1
+    },
+    {
+      "agent": "recon",
+      "label": "Attack Surface Expansion",
+      "count": 1
+    },
+    {
+      "agent": "recon",
+      "label": "Broken Access Control",
+      "count": 5
+    },
+    {
+      "agent": "recon",
+      "label": "Endpoint Discovery",
+      "count": 3
+    },
+    {
+      "agent": "recon",
+      "label": "Information Exposure",
+      "count": 2
+    },
+    {
+      "agent": "recon",
+      "label": "Insecure Direct Object Reference",
+      "count": 1
+    },
+    {
+      "agent": "recon",
+      "label": "Parameter Discovery",
+      "count": 2
+    },
+    {
+      "agent": "recon",
+      "label": "SSRF",
+      "count": 1
+    },
+    {
+      "agent": "recon",
+      "label": "Server-Side Request Forgery (SSRF)",
+      "count": 2
+    },
+    {
+      "agent": "recon",
+      "label": "attack_surface_expansion",
+      "count": 1
+    },
+    {
+      "agent": "recon",
+      "label": "broken_object_level_authorization",
+      "count": 1
+    },
+    {
+      "agent": "recon",
+      "label": "endpoint_discovery",
+      "count": 2
+    },
+    {
+      "agent": "recon",
+      "label": "parameter_discovery",
+      "count": 2
+    },
+    {
+      "agent": "recon",
+      "label": "technology_fingerprinting",
+      "count": 1
+    },
+    {
+      "agent": "sqli",
+      "label": "SQL Injection",
+      "count": 53
+    },
+    {
+      "agent": "sqli",
+      "label": "SQL injection",
+      "count": 33
+    },
+    {
+      "agent": "sqli",
+      "label": "sql_injection",
+      "count": 21
+    },
+    {
+      "agent": "xss",
+      "label": "Cross-site Scripting",
+      "count": 10
+    },
+    {
+      "agent": "xss",
+      "label": "Cross-site scripting",
+      "count": 11
+    },
+    {
+      "agent": "xss",
+      "label": "Cross-site scripting (Stored)",
+      "count": 1
+    },
+    {
+      "agent": "xss",
+      "label": "Cross-site scripting (stored)",
+      "count": 2
+    },
+    {
+      "agent": "xss",
+      "label": "cross-site scripting",
+      "count": 1
+    }
+  ]
+}

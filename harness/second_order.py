@@ -47,6 +47,30 @@ class SecondOrderResult:
     evidence: str = ""
 
 
+async def send_through_run(run_context, method: str, url: str, *, allowed_hosts,
+                           config, capability: str, headers=None, body=None,
+                           case_ref: str = ""):
+    """ARCH-2: the one send path the second-order plant AND read use.
+
+    Routes through the OWNING run's single TargetTransport when a run_context is
+    supplied (owned_context is None -> the borrowed run is never closed here);
+    otherwise builds and closes one standalone context. This puts every
+    second-order write/read on the single policy path -- scope + gate + request
+    budget + evidence -- under the run's TLS trust, instead of a separate client
+    with an unconditional verify=False that bypassed all of it. Returns the
+    transport's ExecutionOutcome (``.ok``/``.status``/``.outcome``/``.body``).
+    """
+    from harness.run_context import transport_for
+    _tt, _owned = transport_for(run_context, allowed_hosts=allowed_hosts, config=config)
+    try:
+        return await _tt.send_creds(method, url, capability=capability,
+                                    headers=headers, body=body, case_ref=case_ref,
+                                    max_redirects=0)
+    finally:
+        if _owned is not None:
+            await _owned.aclose()
+
+
 def _similar(a: str, b: str) -> float:
     """Cheap response-similarity in [0,1] on length + shared-token overlap -- used
     to tell 'B's response changed with the planted boolean' from 'identical'."""

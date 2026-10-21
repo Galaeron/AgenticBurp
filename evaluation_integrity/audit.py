@@ -13,7 +13,7 @@ from .coverage import summarize_coverage
 from .evidence_audit import audit_findings
 from .health import assess_health
 from .metrics import diagnose_metrics
-from .provenance import load_and_check_manifest
+from .provenance import check_manifest
 
 
 def _first(records: list[dict[str, Any]], key: str) -> Any:
@@ -21,6 +21,70 @@ def _first(records: list[dict[str, Any]], key: str) -> Any:
         if record.get(key) is not None:
             return record[key]
     return None
+
+
+def _merged(records: list[dict[str, Any]], key: str, malformed: dict[str, Any]) -> list[Any] | None:
+    """Every input's list for ``key`` concatenated, so that no input's health
+    evidence is discarded because another input precedes it.  An input whose value
+    is present but not a list contributes ``malformed`` (a record the health
+    assessment cannot accept) instead of silently vanishing."""
+    merged: list[Any] | None = None
+    for record in records:
+        value = record.get(key)
+        if value is None:
+            continue
+        merged = [] if merged is None else merged
+        merged.extend(value if isinstance(value, list) else [malformed])
+    return merged
+
+
+def _unreadable_provenance(reason: str) -> dict[str, Any]:
+    return {"valid": False, "provenance": "unknown_or_mismatched", "errors": [reason],
+            "warnings": [], "checked_artifacts": []}
+
+
+def _manifest_provenance(manifest: str | Path, bundle_root: str | Path | None,
+                         sources: list[dict[str, Any]],
+                         normalized: list[dict[str, Any]]) -> dict[str, Any]:
+    """Check the manifest, then bind every audited input to it.
+
+    A manifest that is internally consistent only vouches for the artifacts it
+    hashes.  An input outside that hashed set, or one that names a different
+    invocation, must not borrow the manifest's provenance label."""
+    path = Path(manifest)
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return _unreadable_provenance(f"cannot read manifest: {exc}")
+    if not isinstance(document, dict):
+        return _unreadable_provenance("manifest root must be an object")
+    provenance = check_manifest(document, bundle_root or path.parent)
+
+    listed = document.get("artifacts")
+    declared = {item.get("sha256") for item in (listed if isinstance(listed, list) else [])
+                if isinstance(item, dict) and isinstance(item.get("sha256"), str)}
+    invocation = document.get("invocation_id")
+    bound: list[dict[str, Any]] = []
+    binding_errors: list[str] = []
+    for source, record in zip(sources, normalized):
+        name = Path(source["path"]).name
+        covered = source["sha256"] in declared
+        content_invocation = record.get("invocation_id")
+        invocation_matches = None if content_invocation is None else content_invocation == invocation
+        bound.append({"name": name, "sha256": source["sha256"], "covered_by_manifest": covered,
+                      "invocation_id_matches": invocation_matches})
+        if not covered:
+            binding_errors.append(
+                f"audited input {name} (sha256 {source['sha256'][:12]}) is not in the manifest's hashed artifact set")
+        if invocation_matches is False:
+            binding_errors.append(
+                f"audited input {name} names invocation_id {content_invocation!r}, "
+                f"but the manifest is for {invocation!r}")
+    provenance = {**provenance, "bound_inputs": bound}
+    if binding_errors:
+        provenance.update(valid=False, provenance="unknown_or_mismatched",
+                          errors=[*provenance["errors"], *binding_errors])
+    return provenance
 
 
 def build_audit(paths: list[str | Path], manifest: str | Path | None = None,
@@ -50,15 +114,20 @@ def build_audit(paths: list[str | Path], manifest: str | Path | None = None,
     artifacts = [item for record in normalized for item in record["artifacts"]]
     evidence = audit_findings(findings, proofs, cases, artifacts)
     coverage = summarize_coverage(_first(normalized, "coverage"))
+    # Health is judged over every input: a failed control on a later input must
+    # not be hidden by a passing one that happens to come first.
     health = assess_health(
-        _first(normalized, "health_controls"), _first(normalized, "logs"),
+        _merged(normalized, "health_controls",
+                {"kind": "ordinary_application", "outcome": "malformed",
+                 "control_id": "health_controls was not a list"}),
+        _merged(normalized, "logs", {"parseable": False}),
         _first(normalized, "evaluation_interval"),
     )
     process = _first(normalized, "process")
     metrics_input = _first(normalized, "metrics")
     scope = _first(normalized, "benchmark_scope")
     metrics = diagnose_metrics(findings, evidence, _first(normalized, "issues"), metrics_input, scope)
-    provenance = (load_and_check_manifest(manifest, bundle_root) if manifest else {
+    provenance = (_manifest_provenance(manifest, bundle_root, sources, normalized) if manifest else {
         "valid": False,
         "provenance": "unknown_or_mismatched",
         "errors": ["no evaluation manifest supplied"],

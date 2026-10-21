@@ -31,6 +31,8 @@ def _fake_playwright():
     browser.close = AsyncMock()
     context.new_page = AsyncMock(return_value=page)
     context.close = AsyncMock()
+    context.route = AsyncMock()  # PR-10: visit() now registers per-request interception
+    context.add_cookies = AsyncMock()
     page.goto = AsyncMock()
     page.wait_for_timeout = AsyncMock()
     page.on = MagicMock()

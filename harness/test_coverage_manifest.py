@@ -307,12 +307,50 @@ class DeclaredIdentityTests(unittest.TestCase):
                 self.assertEqual(suite.countTestCases(), 1)
                 self.assertEqual(next(iter(suite)).id(), spec.test_id)
 
+    def test_declared_specs_are_unique_per_aspect_and_evidence_file(self):
+        # Two aspects of one check must never share a (check, aspect) key or an evidence
+        # basename (the slug is truncated), or one artifact would overwrite the other.
+        automated = [s for s in cm.REQUIREMENT_TESTS if s.mode == "automated"]
+        keys = [(s.check_id, s.aspect) for s in automated]
+        self.assertEqual(len(keys), len(set(keys)), "duplicate (check_id, aspect) declaration")
+        files = [(s.check_id, s.evidence_file) for s in automated]
+        self.assertEqual(len(files), len(set(files)), "two aspects share one evidence file name")
+        tests = [s.test_id for s in automated]
+        self.assertEqual(len(tests), len(set(tests)), "one test bound to two aspects")
+
+    def test_declared_specs_match_their_decorators(self):
+        # The gate matches evidence by (check_id, aspect) AND exact test_id; a decorator
+        # that drifted from its declaration would only surface as a missing aspect at the
+        # end of a full run. Pin them statically: each declared test carries exactly the
+        # evidence metadata its spec names.
+        for spec in cm.REQUIREMENT_TESTS:
+            if spec.mode != "automated":
+                continue
+            with self.subTest(test_id=spec.test_id):
+                suite = unittest.TestLoader().loadTestsFromName(spec.test_id)
+                case = next(iter(suite))
+                meta = getattr(getattr(case, case._testMethodName), "__coverage_evidence__", None)
+                self.assertIsNotNone(meta, "declared test carries no @evidence_for")
+                self.assertEqual((meta["check_id"], meta["aspect"], meta["label"]),
+                                 (spec.check_id, spec.aspect, spec.label))
+
     def test_old_flat_module_identity_does_not_resolve(self):
+        # A pre-package flat module id must never be an accepted declared
+        # identity. Asserting an outright import error is not robust: it only
+        # held when the harness dir was not itself a sys.path entry. Under the
+        # full suite (`discover -s harness`) harness IS on sys.path, so the flat
+        # name imports -- but it loads as a DISTINCT id (no 'harness.' prefix)
+        # that matches no declared test_id, which is the guarantee that matters.
+        flat = ("test_mass_assignment_slice.MassAssignmentSliceTest."
+                "test_harness_sequence_validator_confirms_vulnerable")
+        declared = {s.test_id for s in cm.REQUIREMENT_TESTS}
+        self.assertNotIn(flat, declared, "the flat pre-package id must not be a declared identity")
         loader = unittest.TestLoader()
-        loader.loadTestsFromName(
-            "test_mass_assignment_slice.MassAssignmentSliceTest."
-            "test_harness_sequence_validator_confirms_vulnerable")
-        self.assertTrue(loader.errors, "negative control must reject the pre-package ID")
+        suite = loader.loadTestsFromName(flat)
+        loaded = set() if loader.errors else {t.id() for t in suite}
+        self.assertFalse(loaded & declared,
+                         "the flat pre-package id must not resolve to any declared "
+                         "(package-qualified) test")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from harness.orchestrator import Orchestrator
-from harness.models import HttpExchange, AgentReport, Finding
+from harness.models import HttpExchange, AgentReport, Finding, StageOutcome
 from harness.effort import EffortBudget, BudgetMode, CallKind
 
 
@@ -58,8 +58,12 @@ class MaybeAdaptiveRespinTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         pipeline = SimpleNamespace(
+            # 4-tuple (reports, n_reviewed, n_rejected, critique_outcome) since
+            # R08/PR-7 added the typed StageOutcome return -- see
+            # AnalysisPipeline.run_full_analysis.
             run_full_analysis=AsyncMock(
-                return_value=(round_reports if round_reports is not None else [], 0, 0)
+                return_value=(round_reports if round_reports is not None else [], 0, 0,
+                              StageOutcome(name="critique", status="completed"))
             )
         )
         s = SimpleNamespace(

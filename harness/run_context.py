@@ -32,16 +32,24 @@ per session, never shared across principals.
 """
 from __future__ import annotations
 
+import contextvars
+import ipaddress
+import json
+import socket
 import threading
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
+import httpcore
 import httpx
 
 from harness import evidence
+from harness import scope_lock
 from harness.safety_gate import SafetyGate, SafetyGateConfig
+from harness.tls_policy import TLSPolicy
+from harness.target_request_policy import TargetRequestPolicy
 
 # Redirect status codes and the ones that rewrite the method to GET.
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
@@ -71,49 +79,37 @@ class ScopePolicy:
     True, and the request proceeds to whatever address it resolves to at connect
     time. This policy authorizes hostnames, not resolved addresses; it is not an
     address-level rebinding defense. See harness/test_dns_resolution_boundary.py
-    for the characterization tests and IMPROVEMENT_BACKLOG.md P1-9 for the
-    follow-up (connect-time address pinning) this deliberately does not build."""
+    for the characterization tests. I05-B: the address defense lives at the
+    connect instead -- every client a run builds pins each name to its first
+    answer for the whole run and refuses special-purpose addresses (AddressPins)."""
     allowed_hosts: frozenset = frozenset()
     allowed_schemes: frozenset = frozenset({"http", "https"})
 
     @staticmethod
     def origin_of(url: str) -> str:
-        p = urlsplit(url)
-        host = (p.hostname or "").lower()
-        scheme = (p.scheme or "").lower()
-        port_value = p.port
-        port = "" if (scheme == "http" and port_value in (None, 80)) or \
-            (scheme == "https" and port_value in (None, 443)) else f":{port_value}"
-        return f"{scheme}://{host}{port}"
+        parsed = scope_lock.parse_scope_url(url)
+        return parsed.origin if parsed else ""
 
     @staticmethod
     def host_of(url: str) -> str:
-        return (urlsplit(url).hostname or "").lower()
+        return scope_lock.host_of(url)
 
     def in_scope(self, url: str) -> bool:
-        p = urlsplit(url)
-        if (p.scheme or "").lower() not in self.allowed_schemes:
-            return False
-        host = (p.hostname or "").lower()
-        if not host or not self.allowed_hosts:
-            return False
-        return host in self.allowed_hosts
+        return scope_lock.scope_matches(url, self.allowed_hosts,
+                                        allowed_schemes=self.allowed_schemes)
 
     def same_origin(self, a: str, b: str) -> bool:
-        return self.origin_of(a) == self.origin_of(b)
+        origin = self.origin_of(a)
+        return bool(origin) and origin == self.origin_of(b)
 
 
 @dataclass(frozen=True)
 class HostAllowScope(ScopePolicy):
-    """A ScopePolicy whose `in_scope` delegates to `scope_discovery.is_host_allowed`.
+    """Discovery compatibility adapter using the shared strict intersection.
 
-    W-16: when a send that was previously guarded by a raw
-    `scope_discovery.is_host_allowed(url, allowed_hosts)` check is migrated onto the
-    single TargetTransport, its reachability must not change. The strict base
-    ScopePolicy is exact-host + fail-CLOSED on an empty allow-list; is_host_allowed
-    is subdomain/CIDR/scheme/port aware and fail-OPEN on an empty list in passive
-    mode. This subclass keeps the base same_origin/origin_of but restores the
-    is_host_allowed reachability so full-closure routing is behaviour-preserving.
+    Bare hosts match exactly. Wildcard/CIDR/scheme/port forms grant no authority,
+    preserving strict ScopePolicy/gate denials across every adapter. Empty passive
+    admission remains compatible; active admission is closed. See SCOPE_POLICY.md.
 
     `hosts` is the ORIGINAL list (kept as a tuple so the dataclass stays hashable);
     the base `allowed_hosts` frozenset is left empty and unused by this subclass.
@@ -122,8 +118,9 @@ class HostAllowScope(ScopePolicy):
     active_mode: bool = False
 
     def in_scope(self, url: str) -> bool:
-        from harness import scope_discovery
-        return scope_discovery.is_host_allowed(url, list(self.hosts), active_mode=self.active_mode)
+        return scope_lock.scope_matches(url, self.hosts,
+                                        allow_unset=not self.active_mode,
+                                        allowed_schemes=self.allowed_schemes)
 
 
 # ---------------------------------------------------------------------------
@@ -189,17 +186,30 @@ class ManagedSession:
     principal: object | None = None
     generation: int = 0
     _client: httpx.AsyncClient | None = None
+    _fixture_clients: dict = field(default_factory=dict, repr=False)
 
-    def client(self, timeout: float) -> httpx.AsyncClient:
+    def client(self, timeout: float, *, http2: bool = False,
+               trust_policy: TLSPolicy | None = None, destination: str | None = None,
+               address_pins: "AddressPins | None" = None) -> httpx.AsyncClient:
+        policy = trust_policy or TLSPolicy.from_config()
+        profile = policy.profile_for(destination)
+        if profile.pool_key:
+            if profile.pool_key not in self._fixture_clients:
+                self._fixture_clients[profile.pool_key] = _target_client(
+                    verify=profile.context, timeout=timeout, http2=http2, pins=address_pins)
+            return self._fixture_clients[profile.pool_key]
         if self._client is None:
-            self._client = httpx.AsyncClient(follow_redirects=False, verify=False,
-                                             timeout=timeout, cookies=httpx.Cookies())
+            self._client = _target_client(verify=profile.context, timeout=timeout,
+                                          http2=http2, pins=address_pins)
         return self._client
 
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        for client in self._fixture_clients.values():
+            await client.aclose()
+        self._fixture_clients.clear()
 
 
 class SessionManager:
@@ -210,6 +220,8 @@ class SessionManager:
                  allowed_origins=None, role: str = "user", name: str = "",
                  principal=None) -> ManagedSession:
         normalized = frozenset(ScopePolicy.origin_of(o) for o in (allowed_origins or []))
+        if "" in normalized:
+            raise ValueError("sessions require valid HTTP(S) allowed origins")
         if headers and not normalized:
             raise ValueError("credential-bearing sessions require an explicit allowed origin")
         s = ManagedSession(session_id=session_id, principal_id=principal_id,
@@ -217,6 +229,13 @@ class SessionManager:
                            role=role, name=name or principal_id, principal=principal)
         self._by_id[session_id] = s
         return s
+
+    async def unregister(self, session_id: str) -> None:
+        """Drop and close one session (I05: a learned credential's ephemeral
+        re-crawl session must not outlive that re-crawl inside the run)."""
+        s = self._by_id.pop(session_id, None)
+        if s is not None:
+            await s.aclose()
 
     def get(self, session_id: str | None) -> ManagedSession | None:
         return self._by_id.get(session_id) if session_id else None
@@ -346,7 +365,10 @@ class TargetTransport:
                                max_redirects=max_redirects)
 
     def _artifact(self, url: str, outcome: str, session_ref: str | None,
-                  status: int | None = None, case_ref: str = "") -> "evidence.ExchangeArtifact":
+                  status: int | None = None, case_ref: str = "", *,
+                  method: str | None = None, req_headers: dict | None = None,
+                  req_body: str | None = None, resp_headers: dict | None = None,
+                  resp_body: str | None = None) -> "evidence.ExchangeArtifact":
         artifact = evidence.ExchangeArtifact.make(
             request_ref=url, response_ref="" if status is None else f"HTTP {status}",
             actual_destination=ScopePolicy.origin_of(url), transport_outcome=outcome,
@@ -368,6 +390,58 @@ class TargetTransport:
                 data = {"request": artifact.request_ref, "response": artifact.response_ref,
                         "outcome": outcome, "artifact_id": artifact.artifact_id,
                         "destination": artifact.actual_destination}
+                data['tls_trust'] = {**self.ctx.tls_policy.provenance(url),
+                                     'client_profile_applied': executed and not outcome.startswith('error:resolve:')}
+                # FR-2 (F03): a REAL, content-addressed, hash-verified evidence
+                # blob -- not just the human-readable "request"/"response"
+                # strings above -- so the P0-6 resolver can tell "we have a URL
+                # and a status code" from "a tester can actually replay this".
+                # `method` is only ever passed by the successful-send call site
+                # in execute(); every non-executed outcome (scope/gate/budget/
+                # session denial) and every transport error/cancel path never
+                # supplies it, so those correctly store no blob and stay
+                # unresolvable. MANDATORY redaction (safety requirement): the
+                # request URL and BOTH request/response headers/bodies are run
+                # through the existing harness.security redactors before
+                # anything is hashed or written -- this is a NEW persistence
+                # sink for bodies/headers that today are never durably stored
+                # at all, so it must never leak a secret. A blob-store failure
+                # here is swallowed and recorded as a degraded marker; it must
+                # never turn a good send into a transport failure.
+                if method is not None:
+                    # R01: the EXECUTION event's own `data` dict must carry
+                    # `method` too, not just the redacted request blob's
+                    # `req_record["method"]` below -- otherwise reproduction_
+                    # recipe's `e.data.get("method")` is always None even for
+                    # a real send, since a recipe reads the event data, not
+                    # the blob contents.
+                    data["method"] = method
+                    try:
+                        from harness import security, store
+                        req_record = {
+                            "method": method,
+                            "url": security.redact_secrets_in_url(url),
+                            "headers": security.redact_headers(req_headers or {}),
+                            "body": (security.redact_secrets_in_body(req_body)
+                                     if req_body is not None else None),
+                        }
+                        resp_record = {
+                            "status": status,
+                            "headers": security.redact_headers(resp_headers or {}),
+                            "body": (security.redact_secrets_in_body(resp_body)
+                                     if resp_body is not None else None),
+                        }
+                        req_bytes = json.dumps(req_record, sort_keys=True).encode("utf-8")
+                        resp_bytes = json.dumps(resp_record, sort_keys=True).encode("utf-8")
+                        data["request_blob"] = store.put_evidence_blob(req_bytes)
+                        data["response_blob"] = store.put_evidence_blob(resp_bytes)
+                    except Exception:
+                        # Durable blob write failed: never break the send (this
+                        # is a best-effort evidence enrichment). Mark the
+                        # EXECUTION event degraded so evidence health -- never
+                        # the send outcome itself -- reflects that reproducible
+                        # evidence was expected but not durably stored.
+                        data["evidence_blob_degraded"] = True
                 evidence_ledger.emit(
                     evidence_ledger.EventType.EXECUTION if executed
                     else evidence_ledger.EventType.AUTHORIZATION_DECISION,
@@ -429,6 +503,10 @@ class TargetTransport:
             if not ctx.scope.in_scope(url):
                 return ExecutionOutcome(outcome="out_of_scope", final_url=url,
                                         artifact=self._artifact(url, "out_of_scope", session_ref, case_ref=case_ref))
+            reason = ctx.target_policy.denial_reason(url)
+            if reason:
+                return ExecutionOutcome(outcome="blocked", final_url=url, error=reason,
+                                        artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref))
             # 2. Gate -- reuse the SafetyGate decision (no contradictory rules). GET is
             #    not treated as universally harmless: scope + budget still bind it, and a
             #    mutating method is gated exactly as the validators' sends are.
@@ -442,6 +520,10 @@ class TargetTransport:
             if not ctx.budget.reserve(1):
                 return ExecutionOutcome(outcome="budget_exhausted", final_url=url,
                                         artifact=self._artifact(url, "budget_exhausted", session_ref, case_ref=case_ref))
+            # 3b. I05-B: the CONNECT target is pinned by the run's clients themselves
+            #     (AddressPins, at the socket): one address per name for the whole
+            #     run, special-purpose addresses refused. Scope, gate and credential
+            #     forwarding keep keying on the name.
             # 4. Credential-forwarding rule: attach the session's auth headers ONLY
             #    when this hop is the session's own origin. Cross-origin -> no creds.
             credential_destination = bool(
@@ -452,11 +534,19 @@ class TargetTransport:
             if session and credential_destination:
                 for k, v in session.headers.items():
                     send_headers.setdefault(k, v)
-            client = (session.client(ctx.timeout)
-                      if session and credential_destination else ctx.default_client())
+            use_http2 = bool((ctx.config.get("transport", {}) or {}).get("http2", False))
+            client = (session.client(ctx.timeout, http2=use_http2,
+                                     trust_policy=ctx.tls_policy, destination=url,
+                                     address_pins=ctx.address_pins)
+                      if session and credential_destination else ctx.default_client(destination=url))
+            request_kwargs: dict = {"headers": send_headers or None,
+                                    "content": body if isinstance(body, str) else None}
             try:
-                resp = await client.request(method, url, headers=send_headers or None,
-                                            content=body if isinstance(body, str) else None)
+                resp = await client.request(method, url, **request_kwargs)
+            except DestinationBlocked as e:   # refused at connect: nothing was sent
+                return ExecutionOutcome(outcome="blocked", final_url=url, error=str(e),
+                                        artifact=self._artifact(url, "destination_blocked", session_ref,
+                                                                case_ref=case_ref))
             except Exception as e:  # transport error -> honest error artifact, never a crash
                 return ExecutionOutcome(outcome="error", final_url=url, error=str(e),
                                         artifact=self._artifact(url, f"error:{type(e).__name__}", session_ref, case_ref=case_ref))
@@ -472,7 +562,11 @@ class TargetTransport:
                 continue
             return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
                                     headers=dict(resp.headers), final_url=url,
-                                    artifact=self._artifact(url, "ok", session_ref, status=resp.status_code, case_ref=case_ref))
+                                    artifact=self._artifact(
+                                        url, "ok", session_ref, status=resp.status_code, case_ref=case_ref,
+                                        method=method, req_headers=send_headers,
+                                        req_body=body if isinstance(body, str) else None,
+                                        resp_headers=dict(resp.headers), resp_body=resp.text))
         # Redirect budget exhausted -> return the last hop as ok-ish (no further follow).
         return ExecutionOutcome(outcome="ok", status=None, final_url=url,
                                 artifact=self._artifact(url, "redirect_limit", session_ref, case_ref=case_ref))
@@ -483,6 +577,138 @@ class TargetTransport:
 Executor = TargetTransport
 
 
+# ---------------------------------------------------------------------------
+# I05-B: connect-time destination policy -- one address per name for the whole run.
+#
+# ScopePolicy authorizes HOSTNAMES, not resolved addresses (see its docstring). A
+# name whose DNS answer changes during a run (DNS rebinding) could otherwise move a
+# later request or redirect hop to another address -- an internal service, the
+# tester's own loopback services, or cloud metadata. Every client a run builds
+# therefore connects through AddressPins: each name is resolved ONCE per run and
+# that first answer holds for every later request and redirect hop. A name that
+# resolves to a special-purpose address (link-local incl. 169.254.169.254, multicast,
+# unspecified, reserved) is refused before any socket opens; an IP-literal URL is
+# connected as written (scope must already list that literal).
+#
+# The pin sits in the httpcore network backend, so the Host header, TLS SNI and
+# certificate hostname checks stay on the name, and nothing changes for clients that
+# never open a socket (mock transports). ON by default; `security.pin_connect_address:
+# false` is an explicit opt-out. Behind an HTTP(S) proxy (trust_env) the proxy
+# resolves the target, so only the connection to the proxy is pinned. A name whose
+# FIRST answer is private or loopback is accepted -- lab targets do that.
+# ---------------------------------------------------------------------------
+
+class DestinationBlocked(Exception):
+    """A connect the run's destination policy refused before any socket opened."""
+
+
+def _default_resolver(host: str) -> str:
+    """Resolve `host` to a single IP once. Prefers IPv4; raises on failure so the
+    caller records an honest error artifact rather than sending unpinned."""
+    infos = socket.getaddrinfo(host, None)
+    for family in (socket.AF_INET, socket.AF_INET6):
+        for info in infos:
+            if info[0] == family:
+                return info[4][0]
+    return infos[0][4][0]
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def special_purpose_reason(ip: str) -> str:
+    """Why `ip` is never a target reached through a NAME, or "" when it may be."""
+    addr = ipaddress.ip_address(ip)
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.is_loopback:      # ::1 sits in a "reserved" block; loopback is allowed like 127/8
+        return ""
+    for label, hit in (("link-local", addr.is_link_local), ("multicast", addr.is_multicast),
+                       ("unspecified", addr.is_unspecified), ("reserved", addr.is_reserved)):
+        if hit:
+            return f"resolved to a special-purpose ({label}) address {addr}"
+    return ""
+
+
+class AddressPins:
+    """Per-run name -> address pins; the first answer for a name holds for the run."""
+
+    def __init__(self, resolver=None):
+        self.resolver = resolver or _default_resolver
+        self._pins: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def pinned(self) -> dict:
+        with self._lock:
+            return dict(self._pins)
+
+    async def address_for(self, host: str) -> str:
+        if _is_ip_literal(host):
+            return host
+        key = host.lower()
+        with self._lock:
+            ip = self._pins.get(key)
+        if ip is None:
+            import asyncio
+            resolved = await asyncio.to_thread(self.resolver, host)   # raises on failure
+            with self._lock:
+                ip = self._pins.setdefault(key, resolved)   # a racing first answer wins
+        reason = special_purpose_reason(ip)
+        if reason:
+            raise DestinationBlocked(f"{host} {reason}; no connection was opened")
+        return ip
+
+
+class _PinnedBackend(httpcore.AsyncNetworkBackend):
+    """httpcore network backend that connects a name to its run-pinned address."""
+
+    def __init__(self, pins: AddressPins):
+        self._pins = pins
+        self._inner = httpcore.AnyIOBackend()
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None,
+                          socket_options=None):
+        ip = await self._pins.address_for(host)
+        return await self._inner.connect_tcp(ip, port, timeout=timeout,
+                                             local_address=local_address,
+                                             socket_options=socket_options)
+
+    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        return await self._inner.connect_unix_socket(path, timeout=timeout,
+                                                     socket_options=socket_options)
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def _pinned_backend(pins: "AddressPins | None"):
+    """The connect-time pin for a run's clients (None = connect by name)."""
+    return _PinnedBackend(pins) if pins is not None else None
+
+
+def _target_client(*, verify, timeout: float, http2: bool,
+                   pins: "AddressPins | None") -> httpx.AsyncClient:
+    """An httpx client for target traffic whose connections honour the run's pins."""
+    transport = httpx.AsyncHTTPTransport(verify=verify, http2=http2)
+    backend = _pinned_backend(pins)
+    if backend is not None:
+        transport._pool._network_backend = backend
+    # verify/http2 are passed to the client too, so environment-proxy mounts use the
+    # same trust as the pinned transport.
+    return httpx.AsyncClient(follow_redirects=False, verify=verify, timeout=timeout,
+                             cookies=httpx.Cookies(), http2=http2, transport=transport)
+
+
+def _address_pins_from_config(config: dict | None) -> "AddressPins | None":
+    security = (config or {}).get("security", {}) or {}
+    return AddressPins() if security.get("pin_connect_address", True) is not False else None
+
+
 def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
                        active_mode: bool = False, timeout: float = 15.0,
                        max_requests: int | None = None) -> "RunContext":
@@ -490,14 +716,15 @@ def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
     the ONE TargetTransport path instead of a raw httpx client (W-16 full closure).
 
     Its scope is a HostAllowScope, so a send previously guarded by
-    `scope_discovery.is_host_allowed(url, allowed_hosts)` keeps EXACTLY its old
-    reachability. Pass `gate` to reuse the caller's existing SafetyGate (e.g. the
+    `scope_discovery.is_host_allowed(url, allowed_hosts)` uses the same strict
+    exact-host intersection as the gate. Pass `gate` to
+    reuse the caller's existing SafetyGate (e.g. the
     iterative agent's) so mutating-method decisions are unchanged; otherwise a fresh
     per-context gate is used. The caller owns the returned context and must aclose()
     it (or use `transport_for`, which reports ownership)."""
     rc = RunContext.create(allowed_hosts=allowed_hosts, config=config, timeout=timeout,
                            max_requests=max_requests, gate=gate)
-    rc.scope = HostAllowScope(hosts=tuple((h or "") for h in (allowed_hosts or [])),
+    rc.scope = HostAllowScope(hosts=tuple(scope_lock.configured_entries(allowed_hosts)),
                               active_mode=active_mode)
     return rc
 
@@ -508,7 +735,11 @@ def transport_for(run_context, *, allowed_hosts, config: dict | None = None, gat
     run of its own. If `run_context` is provided, its TargetTransport is used and
     owned_context is None (the caller must NOT close the shared run). Otherwise a
     `standalone_context` is built and returned as owned_context, which the caller
-    must aclose() when done."""
+    must aclose() when done. I05: inside an entered run, a call site that passed no
+    run uses the enclosing one (not owned) instead of a throwaway context that
+    would escape the run's budget and cancellation."""
+    if run_context is None:
+        run_context = current_run_context()
     if run_context is not None:
         return run_context.target_transport(), None
     rc = standalone_context(allowed_hosts, config=config, gate=gate,
@@ -519,6 +750,20 @@ def transport_for(run_context, *, allowed_hosts, config: dict | None = None, gat
 # ---------------------------------------------------------------------------
 # RunContext -- the per-run bundle
 # ---------------------------------------------------------------------------
+
+# I03: the run whose `async with` block is active, so a send site with no
+# run_context wiring of its own (safety_gate.GatedAsyncClient) still spends THIS
+# run's budget under its scope, cancellation and TLS trust instead of a private
+# client. Same plain get/set discipline as safety_gate.push_gate (a run may be
+# entered in one task and closed in another).
+_ambient_run: "contextvars.ContextVar[RunContext | None]" = contextvars.ContextVar(
+    "harness_run_context_ambient", default=None)
+
+
+def current_run_context() -> "RunContext | None":
+    """The RunContext whose `async with` block encloses this call, if any."""
+    return _ambient_run.get()
+
 
 @dataclass
 class RunContext:
@@ -532,11 +777,32 @@ class RunContext:
     cache_namespace: str = ""
     timeout: float = 15.0
     _default_client: httpx.AsyncClient | None = None
+    _fixture_clients: dict = field(default_factory=dict, repr=False)
+    tls_policy: TLSPolicy = field(default_factory=TLSPolicy.from_config, repr=False)
+    # I05-B: one connect address per name for the whole run (None = opted out).
+    address_pins: "AddressPins | None" = field(default_factory=AddressPins, repr=False)
+    target_policy: TargetRequestPolicy = field(default_factory=TargetRequestPolicy, repr=False)
     # What safety_gate.push_gate returned when this run installed its gate as
     # ambient -- the gate (or None) that was ambient before it, to restore on
     # aclose(). Not a contextvars.Token: see push_gate's docstring for why.
     _gate_restore: object = field(default=None, repr=False, compare=False)
     _gate_pushed: bool = field(default=False, repr=False, compare=False)
+    # I03: the run that was ambient before this one entered (restored on aclose).
+    _run_restore: object = field(default=None, repr=False, compare=False)
+    _run_pushed: bool = field(default=False, repr=False, compare=False)
+    # AR-2 (LOOP half): a per-run Ollama circuit breaker + fail-open counter,
+    # pushed ambient alongside the gate in __aenter__ and popped in aclose(),
+    # so concurrent/sequential runs cannot poison each other's model-backend
+    # state. Lazily constructed ONLY inside __aenter__ (never at plain
+    # create()/field-default time) so the ~70 existing tests that build a
+    # RunContext directly and never `async with` it see no new object at all,
+    # matching the same guard the gate push already relies on.
+    _ollama_breaker: object = field(default=None, repr=False, compare=False)
+    _ollama_breaker_restore: object = field(default=None, repr=False, compare=False)
+    _ollama_breaker_pushed: bool = field(default=False, repr=False, compare=False)
+    fail_open_counters: object = field(default=None, repr=False, compare=False)
+    _fail_open_restore: object = field(default=None, repr=False, compare=False)
+    _fail_open_pushed: bool = field(default=False, repr=False, compare=False)
 
     @classmethod
     def create(cls, *, run_id: str | None = None, allowed_hosts=None, gate_config: dict | None = None,
@@ -548,27 +814,43 @@ class RunContext:
         # gate (e.g. the caller's own) instead of building one from gate_config.
         resolved_run_id = run_id or uuid.uuid4().hex
         config_snapshot = deepcopy(config or {})
+        target_policy = TargetRequestPolicy.from_config(config_snapshot)
+        tls_policy = TLSPolicy.from_config(config_snapshot)
+        config_snapshot['transport_tls_provenance'] = tls_policy.provenance()
         configured_namespace = str(
             ((config_snapshot.get("runs", {}) or {}).get("cache_namespace") or "")
         )
         # Safety item #12: fold this run's scope into the gate config so the gate
         # itself refuses any off-scope send (central defense-in-depth), matching
         # the ScopePolicy the transport already enforces.
-        _gate_cfg = {**(gate_config or {}), "allowed_hosts": list(allowed_hosts or [])}
+        entries = scope_lock.configured_entries(allowed_hosts)
+        _gate_cfg = {**(gate_config or {}), "allowed_hosts": list(entries)}
+        _gate_cfg['target_policy'] = target_policy
         resolved_gate = gate if gate is not None else SafetyGate(SafetyGateConfig.from_dict(_gate_cfg))
         return cls(
             run_id=resolved_run_id,
-            scope=ScopePolicy(allowed_hosts=frozenset((h or "").lower() for h in (allowed_hosts or []))),
+            scope=ScopePolicy(allowed_hosts=entries),
             gate=resolved_gate,
             budget=RequestBudget(max_requests), cancel=CancelToken(),
             sessions=SessionManager(), config=config_snapshot,
+            tls_policy=tls_policy,
+            address_pins=_address_pins_from_config(config_snapshot),
+            target_policy=target_policy,
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
                              if configured_namespace else resolved_run_id), timeout=timeout)
 
-    def default_client(self) -> httpx.AsyncClient:
+    def default_client(self, *, destination: str | None = None) -> httpx.AsyncClient:
+        profile = self.tls_policy.profile_for(destination)
+        use_http2 = bool((self.config.get("transport", {}) or {}).get("http2", False))
+        if profile.pool_key:
+            if profile.pool_key not in self._fixture_clients:
+                self._fixture_clients[profile.pool_key] = _target_client(
+                    verify=profile.context, timeout=self.timeout, http2=use_http2,
+                    pins=self.address_pins)
+            return self._fixture_clients[profile.pool_key]
         if self._default_client is None:
-            self._default_client = httpx.AsyncClient(follow_redirects=False, verify=False,
-                                                     timeout=self.timeout, cookies=httpx.Cookies())
+            self._default_client = _target_client(verify=profile.context, timeout=self.timeout,
+                                                  http2=use_http2, pins=self.address_pins)
         return self._default_client
 
     def target_transport(self) -> "TargetTransport":
@@ -581,12 +863,45 @@ class RunContext:
         if self._default_client is not None:
             await self._default_client.aclose()
             self._default_client = None
+        for client in self._fixture_clients.values():
+            await client.aclose()
+        self._fixture_clients.clear()
         await self.sessions.aclose()
         if self._gate_pushed:
             from harness.safety_gate import pop_gate
             pop_gate(self._gate_restore)
             self._gate_pushed = False
             self._gate_restore = None
+        if self._run_pushed:
+            _ambient_run.set(self._run_restore)
+            self._run_pushed = False
+            self._run_restore = None
+        if self._ollama_breaker_pushed:
+            from harness.circuit_breaker import pop_ollama_breaker
+            pop_ollama_breaker(self._ollama_breaker_restore)
+            self._ollama_breaker_pushed = False
+            self._ollama_breaker_restore = None
+        if self._fail_open_pushed:
+            from harness.coordinator import pop_fail_open_counters
+            pop_fail_open_counters(self._fail_open_restore)
+            self._fail_open_pushed = False
+            self._fail_open_restore = None
+
+    def publish(self) -> "RunContext":
+        """Make this run the enclosing one for target sends (current_run_context) and
+        its gate the ambient default gate (get_default_gate), task-locally, until
+        aclose(). `async with` does this plus the per-run model-plane state; a caller
+        that owns a run but keeps the shared Ollama breaker and fail-open counters --
+        a standalone analyze (I05) -- publishes only."""
+        if not self._gate_pushed:
+            from harness.safety_gate import push_gate
+            self._gate_restore = push_gate(self.gate)
+            self._gate_pushed = True
+        if not self._run_pushed:
+            self._run_restore = _ambient_run.get()
+            _ambient_run.set(self)
+            self._run_pushed = True
+        return self
 
     async def __aenter__(self) -> "RunContext":
         # Install this run's gate as the AMBIENT one (safety_gate.get_default_gate)
@@ -601,9 +916,48 @@ class RunContext:
         # directly and read `.gate` themselves (never through get_default_gate())
         # stay exactly as they were -- no eager global side effect at construction
         # time that a test forgetting to call aclose() could leak into another.
-        from harness.safety_gate import push_gate
-        self._gate_restore = push_gate(self.gate)
-        self._gate_pushed = True
+        self.publish()
+
+        # AR-2 (LOOP half): install this run's OWN Ollama circuit breaker and
+        # fail-open counters as ambient, alongside the gate above, so model-
+        # backend state cannot leak between concurrent/sequential runs.
+        # Constructed here (not at create()/field-default time) so a
+        # RunContext that is never `async with`-entered -- the ~70 existing
+        # tests that build one directly -- never allocates these at all,
+        # matching the gate's own lazy-push guard.
+        from harness.circuit_breaker import (
+            CircuitBreakerConfig,
+            OllamaCircuitBreaker,
+            push_ollama_breaker,
+        )
+        if self._ollama_breaker is None:
+            # Same config OllamaClient.__init__ uses (ollama_client.py:130-137),
+            # so a per-run breaker trips/heals identically to the shared
+            # singleton, including which exceptions don't count as failures.
+            from harness.ollama_client import (
+                OllamaInvalidJSONError,
+                OllamaModelNotFoundError,
+            )
+            self._ollama_breaker = OllamaCircuitBreaker(
+                "ollama",
+                CircuitBreakerConfig(
+                    failure_threshold=3,
+                    success_threshold=2,
+                    timeout_seconds=60.0,
+                    half_open_max_requests=1,
+                    excluded_exceptions=(OllamaModelNotFoundError, OllamaInvalidJSONError),
+                    enabled=True,
+                ),
+            )
+        self._ollama_breaker_restore = push_ollama_breaker(self._ollama_breaker)
+        self._ollama_breaker_pushed = True
+
+        from harness.coordinator import push_fail_open_counters
+        if self.fail_open_counters is None:
+            self.fail_open_counters = {"count": 0, "by_reason": {}}
+        self._fail_open_restore = push_fail_open_counters(self.fail_open_counters)
+        self._fail_open_pushed = True
+
         return self
 
     async def __aexit__(self, *exc) -> None:

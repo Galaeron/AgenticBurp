@@ -22,6 +22,18 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(any("allow_mutating_replay" in e for e in result.errors))
 
+    def test_active_without_mutating_replay_is_a_warning(self):
+        # The dangerous other direction, armed from the config file at startup:
+        # valid (read-only active), so a warning not an error, but it must be
+        # surfaced because mutating-proof validators silently skip.
+        cfg = {"validators": {"active_enabled": True, "allow_mutating_replay": False},
+               "server": {"allowed_hosts": ["localhost"]}}
+        result = config_schema.validate_config(cfg)
+        self.assertTrue(result.ok, result.errors)  # a heads-up, not a hard error
+        self.assertTrue(
+            any("allow_mutating_replay" in w and "active_enabled" in w for w in result.warnings),
+            f"expected an active-without-mutating-replay warning; got {result.warnings}")
+
     def test_cloud_reasoning_without_model_is_an_error(self):
         cfg = {"coordinator": {"cloud_reasoning": True, "cloud_model": None}}
         result = config_schema.validate_config(cfg)
@@ -133,6 +145,12 @@ class SafeDefaultGuardTests(unittest.TestCase):
          lambda cfg: cfg.get("coordinator", {}).get("cloud_primary", False) is False),
         ("coordinator.cloud_reasoning",
          lambda cfg: cfg.get("coordinator", {}).get("cloud_reasoning", False) is False),
+        ("business_context.enabled",
+         lambda cfg: cfg.get("business_context", {}).get("enabled", False) is False),
+        ("driver_capture.enabled",
+         lambda cfg: cfg.get("driver_capture", {}).get("enabled", False) is False),
+        ("cross_site_poc.enabled",
+         lambda cfg: cfg.get("cross_site_poc", {}).get("enabled", False) is False),
     ]
 
     # Unsafe replacement value used to flip each flag for the negative control.
@@ -148,6 +166,9 @@ class SafeDefaultGuardTests(unittest.TestCase):
         "engagement.coverage_drive_legs": True,
         "coordinator.cloud_primary": True,
         "coordinator.cloud_reasoning": True,
+        "business_context.enabled": True,
+        "driver_capture.enabled": True,
+        "cross_site_poc.enabled": True,
     }
 
     @staticmethod

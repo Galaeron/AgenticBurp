@@ -270,8 +270,11 @@ class MatrixTests(unittest.TestCase):
         nt = m.not_tested()
         self.assertGreater(len(nt), 0)
         for item in nt:
-            self.assertIn(item["status"], ("not_applicable", "skipped"))
+            # RV-O O6: an unfinalized matrix lists its still-pending cells too
+            # (the old ("not_applicable", "skipped") set hid them).
+            self.assertIn(item["status"], ("not_applicable", "skipped", "pending"))
             self.assertTrue(item["reason"])
+        self.assertIn("pending", {item["status"] for item in nt})
 
     def test_for_endpoint(self):
         m = CoverageMatrix()
@@ -338,15 +341,29 @@ class NegativeControlTests(unittest.TestCase):
         self.assertEqual(na, 0)
         self.assertEqual(len(m.cells()), 0)
 
-    def test_not_tested_lists_only_na_and_skipped(self):
+    def test_not_tested_lists_unexecuted_cells_never_an_executed_verdict(self):
+        # RV-O O7: renamed from test_not_tested_lists_only_na_and_skipped, the
+        # rule before RV-M M2 (blocked/inconclusive/error) and RV-O O6 (pending).
         m = CoverageMatrix()
         m.fill_applicability(["user"], {"GET /x": {"path": "/x", "methods": ("GET",),
                                                     "access": {}, "reachable_roles": [],
                                                     "object_scoped": False}})
         m.record("user", "GET /x", "WSTG-INPV-05",
                  status=CellStatus.CONFIRMED, reason="proven")
+        # The blocked / inconclusive / error case this fixture lacked.
+        unexecuted = (("WSTG-CONF-02", CellStatus.BLOCKED),
+                      ("WSTG-CONF-05", CellStatus.INCONCLUSIVE),
+                      ("WSTG-CONF-06", CellStatus.ERROR))
+        for check_id, status in unexecuted:
+            m.record("user", "GET /x", check_id, status=status)
         for item in m.not_tested():
-            self.assertIn(item["status"], ("not_applicable", "skipped"))
+            self.assertIn(item["status"], ("not_applicable", "skipped", "pending",
+                                           "blocked", "inconclusive", "error"))
+        listed = {item["check"]: item for item in m.not_tested()}
+        self.assertNotIn("WSTG-INPV-05", listed)
+        for check_id, status in unexecuted:
+            self.assertEqual(listed[check_id]["status"], status.value)
+            self.assertTrue(listed[check_id]["reason"])
 
     def test_predicate_reasons_are_never_empty(self):
         ep = {"path": "/api/test", "methods": ("GET",), "access": {},

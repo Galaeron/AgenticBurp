@@ -133,7 +133,9 @@ class TestSettingsEndpointExposesRedactedDiagnostics(_EnvVarSandbox):
         os.environ["OPENAI_API_KEY"] = "sk-should-never-appear"
         from harness import server
 
-        result = _asyncio.run(server.get_settings(authorization=None))
+        # /settings is a sensitive-read endpoint: it now requires the effective
+        # bearer token even when get_settings() is called directly.
+        result = _asyncio.run(server.get_settings(authorization=f"Bearer {server._mutation_token()}"))
         self.assertIn("llm_providers", result)
         self.assertIn("coordinator", result["llm_providers"])
         self.assertIn("critique", result["llm_providers"])

@@ -33,6 +33,16 @@ class StepStatus(str, Enum):
     CLEANED = "cleaned"
 
 
+# Version of THIS workflow-execution engine (step/extractor/assertion semantics
+# above). Bumped only when those semantics change in a way a data pack could
+# depend on. SC-11 workflow packs declare a supported engine range and refuse to
+# compile outside it, so a pack authored against a newer engine cannot silently
+# run on an older one.
+ENGINE_VERSION = 1
+
+_ASSERTION_KINDS = frozenset({"status", "body_contains", "json_pointer"})
+
+
 @dataclass(frozen=True)
 class Extractor:
     name: str
@@ -198,8 +208,15 @@ def extract_all(extractors: tuple[Extractor, ...], *, body: str, headers: dict,
 def _assertions_hold(assertions: tuple[Assertion, ...], *, status: int | None,
                      body: str) -> tuple[bool, str]:
     for assertion in assertions:
-        if assertion.kind == "status" and status != int(assertion.expected):
-            return False, f"expected HTTP {assertion.expected}, got {status}"
+        if assertion.kind not in _ASSERTION_KINDS:
+            return False, f"unknown assertion kind: {assertion.kind}"
+        if assertion.kind == "status":
+            try:
+                expected_status = int(assertion.expected)
+            except (TypeError, ValueError):
+                return False, f"malformed status assertion operand: {assertion.expected!r}"
+            if status != expected_status:
+                return False, f"expected HTTP {assertion.expected}, got {status}"
         if assertion.kind == "body_contains" and str(assertion.expected) not in (body or ""):
             return False, f"response omitted required marker {assertion.expected!r}"
         if assertion.kind == "json_pointer":
@@ -369,6 +386,23 @@ async def execute_misuse_variant(workflow: Workflow, variant: MisuseVariant, run
                                   capability=f"workflow:{variant.kind}")
 
 
+def _load_assertion(a: dict) -> Assertion:
+    """Validate a declarative assertion record; unknown kind/operands raise ValueError."""
+    kind = str(a["kind"])
+    if kind not in _ASSERTION_KINDS:
+        raise ValueError(f"unknown assertion kind: {kind}")
+    if kind in ("status", "body_contains") and a.get("expected") is None:
+        raise ValueError(f"assertion kind {kind!r} requires 'expected'")
+    if kind == "status":
+        try:
+            int(a.get("expected"))
+        except (TypeError, ValueError):
+            raise ValueError(f"status assertion 'expected' must be an integer, got {a.get('expected')!r}")
+    if kind == "json_pointer" and not str(a.get("expression", "")):
+        raise ValueError("json_pointer assertion requires 'expression'")
+    return Assertion(kind, str(a.get("expression", "")), a.get("expected"))
+
+
 def workflow_from_dict(data: dict) -> Workflow:
     """Parse the declarative config/API representation without accepting code."""
     steps = []
@@ -376,8 +410,7 @@ def workflow_from_dict(data: dict) -> Workflow:
         extractors = tuple(Extractor(
             str(e["name"]), ExtractorKind(str(e["kind"])), str(e.get("expression", "")),
             bool(e.get("required", True))) for e in raw.get("extractors", []))
-        assertions = tuple(Assertion(str(a["kind"]), str(a.get("expression", "")),
-                                     a.get("expected")) for a in raw.get("assertions", []))
+        assertions = tuple(_load_assertion(a) for a in raw.get("assertions", []))
         steps.append(WorkflowStep(
             id=str(raw["id"]), method=str(raw.get("method", "GET")).upper(),
             url_template=str(raw["url_template"]), session_ref=str(raw["session_ref"]),

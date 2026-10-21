@@ -167,7 +167,7 @@ class GetRunDerivedLiveMarkersTest(unittest.TestCase):
     def test_enabled_but_self_test_crashes_yields_empty_frozenset_not_none(self):
         inst = self._mixin_instance({"leg_self_test": {"enabled": True}})
 
-        def _boom():
+        def _boom(**_kwargs):  # RV-O O6: the wrapper now passes report_out
             raise RuntimeError("self-test blew up")
 
         real = leg_self_test.run_self_test
@@ -184,7 +184,7 @@ class GetRunDerivedLiveMarkersTest(unittest.TestCase):
         inst = self._mixin_instance({"leg_self_test": {"enabled": True}})
         calls = {"n": 0}
 
-        def _once():
+        def _once(**_kwargs):  # RV-O O6: the wrapper now passes report_out
             calls["n"] += 1
             return frozenset({"ssti"})
 

@@ -28,13 +28,19 @@ import json
 import logging
 from dataclasses import dataclass, field
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictBool
 
 _log = logging.getLogger("harness.config_schema")
 
 
 _SECRET_KEYS = {"auth_token", "bearer_token", "api_key", "cloud_api_key", "token", "password"}
 _VALID_FAIL_OPEN_MODES = {"all", "curated"}
+# AR-1 (LOOP half): agent-family routing mode. "agents" (default, shipped) is
+# today's per-agent fan-out. "families" collapses dispatched agents into
+# per-family composed calls (harness/agent_families.py) -- NOT a safety flag
+# (it only reduces model-call count; sends no live traffic, widens no
+# scope), so it is intentionally NOT added to SafeDefaultGuardTests.SAFE_CHECKS.
+_VALID_ROUTING_MODES = {"agents", "families"}
 
 
 @dataclass
@@ -91,12 +97,47 @@ def parse_validators_flags(cfg: dict) -> dict:
     return {"active_enabled": parsed.active_enabled, "allow_mutating_replay": parsed.allow_mutating_replay}
 
 
+class _PrivacySection(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    # StrictBool (WL-11): only a real YAML/JSON boolean is accepted. The quoted
+    # string "false" (truthy in Python), "no", 0 and null are rejected rather
+    # than coerced, so a typo can never silently turn third-party lookups on.
+    external_lookups: StrictBool = True
+
+
+def parse_privacy_flags(section) -> dict:
+    """WL-11: the ONE place the raw `privacy:` config section is turned into
+    real booleans. `privacy.external_lookups` (default true, so default
+    behaviour is unchanged) gates every outbound call the "passive" analysis
+    makes to third-party services about components seen in captured traffic
+    (GitHub advisories, npm/PyPI registries, Aikido malware feeds, CISA KEV).
+
+    Strict on purpose, like the /settings toggles (server.py `StrictBool`):
+    anything that is not a real boolean raises ValueError, so a quoted
+    `external_lookups: "false"` fails startup loudly instead of being read as
+    truthy and silently leaving lookups on. A missing or empty (`privacy:`)
+    section yields the default."""
+    if section is None:
+        section = {}
+    if not isinstance(section, dict):
+        raise ValueError(
+            f"invalid privacy config: `privacy` must be a mapping, got {type(section).__name__}")
+    try:
+        parsed = _PrivacySection.model_validate(section)
+    except Exception as e:
+        raise ValueError(
+            "invalid privacy config: privacy.external_lookups must be a real boolean "
+            f"(true or false, unquoted): {e}") from e
+    return {"external_lookups": parsed.external_lookups}
+
+
 class _CoordinatorSection(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str = ""
     cloud_reasoning: bool = False
     cloud_model: str | None = None
     fail_open_mode: str = "all"
+    routing_mode: str = "agents"
 
 
 class ConfigModel(BaseModel):
@@ -106,6 +147,7 @@ class ConfigModel(BaseModel):
     concurrency: _ConcurrencySection = _ConcurrencySection()
     validators: _ValidatorsSection = _ValidatorsSection()
     coordinator: _CoordinatorSection = _CoordinatorSection()
+    privacy: _PrivacySection | None = None
 
 
 def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResult:
@@ -134,6 +176,23 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
             "is false: mutating replay can never run, and the combination signals a "
             "misconfigured active run (enable active_enabled or clear allow_mutating_replay)."
         )
+    # The dangerous OTHER direction: active armed from the config FILE at startup
+    # (how the crAPI eval was configured) but mutating replay off. This is a VALID
+    # read-only-active config, so it's a warning not an error -- but silently every
+    # validator whose proof needs a mutating replay is blocked by the gate and
+    # skips, so a run can report "nothing found" for those classes without testing
+    # them. (ValidatorRegistry.set_active_enabled warns the runtime POST /settings
+    # path; this covers the startup-config path the same way.)
+    if v.active_enabled and not v.allow_mutating_replay:
+        warnings.append(
+            "validators.active_enabled is true but validators.allow_mutating_replay "
+            "is false: active mode is armed, but every validator whose proof needs a "
+            "mutating replay (e.g. stored_xss, csrf, file_upload, auth_sequence, "
+            "sequence, verb_tamper, command_injection, ssti, xxe, deserialization_oob) "
+            "will be blocked by the safety gate and skip -- the run can report "
+            "'nothing found' for those classes without having tested them. Set "
+            "validators.allow_mutating_replay to exercise them."
+        )
     if c.cloud_reasoning and not c.cloud_model:
         errors.append(
             "coordinator.cloud_reasoning is true but coordinator.cloud_model is unset: "
@@ -143,6 +202,11 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
         errors.append(
             f"coordinator.fail_open_mode {c.fail_open_mode!r} is not one of "
             f"{sorted(_VALID_FAIL_OPEN_MODES)}."
+        )
+    if c.routing_mode not in _VALID_ROUTING_MODES:
+        errors.append(
+            f"coordinator.routing_mode {c.routing_mode!r} is not one of "
+            f"{sorted(_VALID_ROUTING_MODES)}."
         )
 
     # --- range constraints ---
@@ -159,6 +223,11 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
             "live validators will fail closed (W-17), so nothing will be confirmed. "
             "Declare the target scope."
         )
+    # RV-S: a malformed protected-route entry is ignored, so it declares nothing
+    # protected (fail closed). A warning, not an error: the rest of the list stands.
+    from harness import protected_routes
+    for problem in protected_routes.config_problems(cfg):
+        warnings.append(f"{problem}; a malformed entry declares no route protected.")
 
     result = ConfigValidationResult(ok=(not errors), errors=errors, warnings=warnings)
     if strict and errors:
@@ -257,6 +326,14 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     "engagement.coverage_drive_legs",
     "coordinator.cloud_primary",
     "coordinator.cloud_reasoning",
+    # P2-1: the business-context planning pass re-ranks the worklist and proposes
+    # chains; passive-only ("just analyze captured traffic") forces it off too.
+    "business_context.enabled",
+    # LB-2: driver-based request capture drives a real browser against the
+    # target to observe JS-issued requests -- active target traffic, same as
+    # autonomous_discovery.enabled above; passive-only forces it off too.
+    "driver_capture.enabled",
+    "iterative_agent.enabled",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

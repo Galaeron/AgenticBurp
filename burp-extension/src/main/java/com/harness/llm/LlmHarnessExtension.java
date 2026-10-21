@@ -31,8 +31,11 @@ public class LlmHarnessExtension implements BurpExtension {
 
         panel = new HarnessPanel(() -> {
             client.setBaseUrl(panel.getBaseUrl());
-            return client.healthCheck();
+            String token = panel.consumeBearerTokenInput();
+            if (!token.isBlank()) client.setBearerToken(token);
+            return client.connectionCheck();
         }, client::getLastHealthCheckError, analysisTracker);
+        panel.setTokenClearHandler(() -> client.setBearerToken(null));
 
         ValidationExecutor validationExecutor = new ValidationExecutor(api, client);
 

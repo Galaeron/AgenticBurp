@@ -53,7 +53,10 @@ class SequenceValidatorTests(unittest.TestCase):
         safety_gate.reset_default_gate()
 
     def _run(self, vulnerable, *, allow_mutating=True):
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": allow_mutating})
+        # Seed scope so the write/verify sequence clears the fail-closed gate
+        # (3c622c3) instead of being refused out-of-scope before the leg runs.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": allow_mutating,
+                                      "allowed_hosts": ["target.test"]})
         state = {"written": False, "vulnerable": vulnerable}
         v = SequenceValidator(allowed_hosts=["target.test"])
         with patch.object(httpx.AsyncClient, "request", _fake_request(state)):

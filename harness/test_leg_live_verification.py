@@ -6,18 +6,23 @@ Skipped cases establish no evidence. This is fixture integration, not a current
 blind-target measurement; path traversal has a separate operator-driven fixture.
 """
 import asyncio
+import re
 import importlib.util
 import shutil
 import threading
 import time
 import unittest
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from werkzeug.serving import make_server
 
+import harness.coverage_manifest as cm
 from harness import global_throttle
 from harness import safety_gate
+from harness.coverage_evidence_case import EvidenceCase, evidence_for
 from harness.models import Finding, HttpExchange
 from harness.validators.ssti_validator import SstiValidator
 from harness.validators.open_redirect_validator import OpenRedirectValidator
@@ -28,8 +33,14 @@ from harness.validators.deserialization_oob_validator import DeserializationOobV
 from harness.validators.auth_sequence_validator import AuthSequenceValidator
 from harness.validators.stored_xss_validator import StoredXssValidator
 from harness.validators.jwt_forge_validator import JwtForgeValidator
+from harness.validators.file_upload_validator import FileUploadValidator
+from harness.validators.client_trust_validator import ClientTrustValidator
 from harness.validators.browser_xss_validator import BrowserXssValidator
+from harness.validators.xxe_validator import XxeValidator
+from harness.validators.csrf_validator import CsrfValidator
 from harness import browser_driver
+from harness import driver_capture
+from harness.testing_fixtures.leg_fault import bound_test_names, outcomes_with_leg_severed
 
 _FIXTURE = (Path(__file__).resolve().parent.parent
             / "testing" / "leg-verification" / "vuln_fixture.py")
@@ -42,19 +53,97 @@ def _load_make_app():
     return mod.make_app
 
 
+class _ExecSinkParser(HTMLParser):
+    """Collects what the stored-XSS payload's console.log would print -- the
+    product it computes (E2), never its source text -- from the places a
+    browser executes it: a <script> element's text and an on* handler."""
+    _LOG = re.compile(r"console\.log\((\d+)\*(\d+)\)")
+
+    def _run(self, js):
+        self.logged += [str(int(a) * int(b)) for a, b in self._LOG.findall(js)]
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.logged: list[str] = []
+        self._in_script = False
+
+    def handle_starttag(self, tag, attrs):
+        self._in_script = tag == "script"
+        for name, value in attrs:
+            if (name or "").startswith("on") and value:
+                self._run(value)
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._in_script = False
+
+    def handle_data(self, data):
+        if self._in_script:
+            self._run(data)
+
+
+class _ParsedRenderExecutionDouble:
+    """Browser-boundary double for the stored-XSS leg where CI has no Chromium
+    (requirements.lock carries no Playwright). It fetches the owned fixture's
+    rendered page and reports a console.log nonce only from an execution sink
+    (script text, on* handler); an escaped render parses as text and reports
+    nothing. Real Chromium is used instead whenever Playwright is installed,
+    and test_confirmation_soundness_rve pins Chromium on raw vs inert renders."""
+
+    async def visit(self, url, **kwargs):
+        def fetch():
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return r.read().decode("utf-8", "replace")
+        parser = _ExecSinkParser()
+        parser.feed(await asyncio.to_thread(fetch))
+        return browser_driver.ExecutionObservation(url=url, console=parser.logged)
+
+
+def _execution_driver():
+    return browser_driver.default_driver() or _ParsedRenderExecutionDouble()
+
+
 def _finding(vc):
     return Finding(vulnerability_class=vc, confidence=0.5, severity="high",
                    summary=f"{vc} hypothesis", evidence="", suggested_test="", basis="derived")
 
 
-class LiveLegVerificationTest(unittest.TestCase):
+class _RequestCounter:
+    """WSGI middleware that counts every request the fixture actually serves.
+
+    Rule 4 (a test must prove it exercised something): a leg that claims a
+    verdict without a request having reached the fixture would be vacuous
+    evidence -- exactly the silent-hollowing failure mode a scope/auth change
+    could reintroduce. Each positive/negative-control leg asserts this counter
+    advanced during validate(); the one passive-discovery leg (meant to send
+    nothing) asserts it did not.
+
+    This also supplies the exact-PORT evidence the gate scope cannot express:
+    the fixture binds exactly one ephemeral port, so a counted request is proof
+    the leg reached THIS fixture on THAT exact port. The production gate scope is
+    deliberately exact-host-only and port-agnostic -- scope_lock.parse_scope_entry
+    rejects any port-bearing entry (W-17), so '127.0.0.1:<port>' cannot be
+    configured there without exercising a non-production parse path.
+    """
+
+    def __init__(self, app):
+        self._app = app
+        self.count = 0
+
+    def __call__(self, environ, start_response):
+        self.count += 1  # incremented in the werkzeug serving thread; read after
+        return self._app(environ, start_response)  # the validate() call settles
+
+
+class LiveLegVerificationTest(EvidenceCase):
     @classmethod
     def setUpClass(cls):
         import logging
         logging.getLogger("werkzeug").setLevel(logging.ERROR)  # quiet per-request logs
         global_throttle.configure(0)
         app = _load_make_app()()
-        cls._server = make_server("127.0.0.1", 0, app, threaded=True)
+        cls._counter = _RequestCounter(app)  # Rule 4: prove each leg reached the fixture
+        cls._server = make_server("127.0.0.1", 0, cls._counter, threaded=True)
         cls._port = cls._server.server_address[1]
         cls._thread = threading.Thread(target=cls._server.serve_forever, daemon=True)
         cls._thread.start()
@@ -70,7 +159,13 @@ class LiveLegVerificationTest(unittest.TestCase):
         else:
             raise RuntimeError("leg-verification fixture did not come up")
         safety_gate.reset_default_gate()
-        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True})
+        # Seed the gate's SCOPE too, not just the mode flags: the scope lock
+        # (3c622c3) fails closed on an empty active scope, so without the
+        # fixture host here every mutating leg is refused at authorize() and
+        # skips ("not authorized") before it can confirm. The per-validator
+        # allowed_hosts is a separate check and does not arm the gate.
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": ["127.0.0.1"]})
 
     @classmethod
     def tearDownClass(cls):
@@ -78,31 +173,87 @@ class LiveLegVerificationTest(unittest.TestCase):
         cls._thread.join(timeout=5.0)
         safety_gate.reset_default_gate()
 
-    def _run(self, validator, path):
+    @classmethod
+    def _sent_count(cls):
+        return cls._counter.count
+
+    def _check_sent(self, before, expect_sent, res):
+        """Rule 4: a leg's verdict is only real evidence if it sent traffic the
+        fixture actually served. Assert the exact direction every time."""
+        sent = self._sent_count() - before
+        self._last_sent = sent
+        if expect_sent:
+            self.assertGreater(
+                sent, 0,
+                f"leg reported {getattr(res, 'status', '?')!r} without any request "
+                f"reaching the fixture -- the live evidence would be vacuous")
+        else:
+            self.assertEqual(
+                sent, 0,
+                f"a send-nothing leg unexpectedly issued {sent} request(s) to the fixture")
+
+    def _observe(self, res):
+        """Reproducible observation for the runner-written evidence artifact."""
+        self.record_observation({"validator": res.validator, "status": res.status,
+                                 "confirmed": res.confirmed,
+                                 "leg_reached_fixture": self._last_sent > 0})
+
+    def _assert_controlled_negative(self, res, *, skipped_because=None):
+        """A bound control must be a REAL negative from a leg that reached the fixture:
+        `_check_sent` already failed the test if no request was served, and a skipped,
+        errored or inconclusive leg is not a controlled negative either. The one
+        exception is a leg that probed the fixture and DELIBERATELY declined to claim a
+        bug for a stated reason (`skipped_because` must then appear in its summary).
+
+        The traffic assertion is repeated here on purpose: several legs report a clean
+        `not_confirmed` when their send fails (probed with egress cut), so the verdict
+        alone cannot tell a negative control from a leg that never reached the fixture."""
+        self.assertGreater(self._last_sent, 0,
+                           "control verdict without a request reaching the fixture is vacuous")
+        if skipped_because is not None and res.status == "skipped":
+            self.assertIn(skipped_because, res.summary,
+                          f"leg skipped for a different reason than the control: {res.summary}")
+        else:
+            self.assertEqual(res.status, "not_confirmed",
+                             f"control is not a controlled negative: {res.status!r} ({res.summary})")
+        self.assertFalse(res.confirmed)
+
+    def _run(self, validator, path, *, expect_sent=True):
         ex = HttpExchange(url=f"{self._base}{path}", method="GET",
                           request_headers={}, request_body="")
         fc = next(iter(validator.finding_classes))
-        return asyncio.run(validator.validate(_finding(fc), ex))
+        before = self._sent_count()
+        res = asyncio.run(validator.validate(_finding(fc), ex))
+        self._check_sent(before, expect_sent, res)
+        return res
 
-    def _run_ex(self, validator, exchange, fc):
-        return asyncio.run(validator.validate(_finding(fc), exchange))
+    def _run_ex(self, validator, exchange, fc, *, expect_sent=True):
+        before = self._sent_count()
+        res = asyncio.run(validator.validate(_finding(fc), exchange))
+        self._check_sent(before, expect_sent, res)
+        return res
 
     def _reset_profiles(self):
         urllib.request.urlopen(urllib.request.Request(
             f"{self._base}/account/reset", method="POST"), timeout=2).read()
 
     # --- SSTI -----------------------------------------------------------------
+    @evidence_for(**cm.caller_evidence("ssti_confirm"))
     def test_ssti_confirms_on_real_template_render(self):
         v = SstiValidator(allowed_hosts=["127.0.0.1"])
         res = self._run(v, "/ssti/render?q=seed")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"SSTI leg did not confirm against a real Jinja render endpoint: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("ssti_control"))
     def test_ssti_silent_on_escaped_echo_control(self):
         v = SstiValidator(allowed_hosts=["127.0.0.1"])
         res = self._run(v, "/ssti/echo?q=seed")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Open redirect --------------------------------------------------------
     def test_open_redirect_confirms_on_blind_redirect(self):
@@ -118,17 +269,22 @@ class LiveLegVerificationTest(unittest.TestCase):
         self.assertNotEqual(res.status, "confirmed")
 
     # --- SSRF (OOB via the real in-process collaborator) ----------------------
+    @evidence_for(**cm.caller_evidence("ssrf_confirm"))
     def test_ssrf_confirms_on_real_server_side_fetch(self):
         v = SsrfValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
         res = self._run(v, "/ssrf/fetch?url=http://example.invalid/x")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"SSRF leg did not confirm against a real server-side fetch: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("ssrf_control"))
     def test_ssrf_silent_on_no_fetch_control(self):
         v = SsrfValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
         res = self._run(v, "/ssrf/safe?url=http://example.invalid/x")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Sequence / mass assignment (write -> re-read differential) -----------
     def _profile_exchange(self, path):
@@ -195,17 +351,22 @@ class LiveLegVerificationTest(unittest.TestCase):
 
     # --- Command injection (OOB shell fetch; needs curl on the target) --------
     @unittest.skipIf(shutil.which("curl") is None, "curl not available to exercise the shell payload")
+    @evidence_for(**cm.caller_evidence("cmdi_confirm"))
     def test_command_injection_confirms_via_shell(self):
         v = CommandInjectionValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
         res = self._run(v, "/cmdi/ping?host=seed")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"command-injection leg did not confirm against a real shell endpoint: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("cmdi_control"))
     def test_command_injection_silent_on_no_shell_control(self):
         v = CommandInjectionValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
         res = self._run(v, "/cmdi/safe?host=seed")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Active deserialization (pickle OOB beacon) ---------------------------
     def _pickle_cookie_exchange(self, path):
@@ -214,17 +375,22 @@ class LiveLegVerificationTest(unittest.TestCase):
         return HttpExchange(url=f"{self._base}{path}", method="GET",
                             request_headers={"Cookie": f"session={seed}"}, request_body="")
 
+    @evidence_for(**cm.caller_evidence("deser_confirm"))
     def test_deserialization_oob_confirms_on_pickle_sink(self):
         v = DeserializationOobValidator(allowed_hosts=["127.0.0.1"], timeout=2.0)
         res = self._run_ex(v, self._pickle_cookie_exchange("/deser/load"), "deserialization")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"deserialization leg did not confirm a real pickle.loads sink: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("deser_control"))
     def test_deserialization_oob_silent_on_json_control(self):
         v = DeserializationOobValidator(allowed_hosts=["127.0.0.1"], timeout=2.0)
         res = self._run_ex(v, self._pickle_cookie_exchange("/deser/safe"), "deserialization")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Auth-mechanism legs (session fixation / weak pw / username enum) -----
     def _auth_exchange(self, path, body):
@@ -232,29 +398,39 @@ class LiveLegVerificationTest(unittest.TestCase):
                             request_headers={"Content-Type": "application/json"},
                             request_body=body)
 
+    @evidence_for(**cm.caller_evidence("fixation_confirm"))
     def test_auth_session_fixation_confirms(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/login-fixation", '{"username": "alice", "password": "x"}')
         res = self._run_ex(v, ex, "session_fixation")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed", f"session-fixation leg missed a non-rotating session: {res.summary}")
 
+    @evidence_for(**cm.caller_evidence("fixation_control"))
     def test_auth_session_fixation_silent_on_rotating_control(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/login-rotate", '{"username": "alice", "password": "x"}')
         res = self._run_ex(v, ex, "session_fixation")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
+    @evidence_for(**cm.caller_evidence("weakpw_confirm"))
     def test_auth_weak_password_confirms(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/register-weak", '{"username": "alice", "password": "alicepw123"}')
         res = self._run_ex(v, ex, "weak_password")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed", f"weak-password leg missed an unrestricted policy: {res.summary}")
 
+    @evidence_for(**cm.caller_evidence("weakpw_control"))
     def test_auth_weak_password_silent_on_policy_control(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/register-strong", '{"username": "alice", "password": "alicepw123"}')
         res = self._run_ex(v, ex, "weak_password")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     def test_auth_username_enum_confirms(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
@@ -268,7 +444,33 @@ class LiveLegVerificationTest(unittest.TestCase):
         res = self._run_ex(v, ex, "username_enumeration")
         self.assertNotEqual(res.status, "confirmed")
 
+    @evidence_for(**cm.caller_evidence("mfa_confirm"))
+    def test_auth_2fa_bypass_confirms(self):
+        # Step-1 login lands on a 2nd-factor step, yet the protected account page is
+        # reachable with that partial session (and denied with none) -> MFA bypass.
+        v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
+        ex = self._auth_exchange("/2fa/login", '{"username": "alice", "password": "alicepw"}')
+        res = self._run_ex(v, ex, "2fa_bypass")
+        self._observe(res)
+        self.assertEqual(res.status, "confirmed",
+                         f"2FA-bypass leg missed a step-1-only session reaching the account: {res.summary}")
+        self.assertTrue(res.confirmed)
+
+    @evidence_for(**cm.caller_evidence("mfa_control"))
+    def test_auth_2fa_bypass_silent_on_enforcing_control(self):
+        # NEGATIVE CONTROL: identical flow, but the account page enforces the 2nd
+        # factor (redirects a partial session back to /2fa/verify) -> must NOT confirm.
+        v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
+        ex = self._auth_exchange("/2fa/login-safe", '{"username": "alice", "password": "alicepw"}')
+        res = self._run_ex(v, ex, "2fa_bypass")
+        self._observe(res)
+        self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
+
     # --- Stored / second-order XSS (plant -> independent HTML render) ---------
+    # R19: the leg confirms only on execution of its payload's nonce, so each
+    # stored-XSS case is given a browser: real Chromium when Playwright is
+    # installed, else the parse-level boundary double below (CI has no browser).
     def _stored_reset(self):
         urllib.request.urlopen(urllib.request.Request(
             f"{self._base}/stored/reset", method="POST"), timeout=2).read()
@@ -278,19 +480,63 @@ class LiveLegVerificationTest(unittest.TestCase):
                             request_headers={"Content-Type": "application/json"},
                             request_body='{"text": "hello world"}')
 
+    @evidence_for(**cm.caller_evidence("stored_xss_confirm"))
     def test_stored_xss_confirms_on_raw_render(self):
         self._stored_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._comment_exchange("/stored/comments"), "xss")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"stored-XSS leg missed a plant->raw-render flow: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("stored_xss_control"))
     def test_stored_xss_silent_on_escaped_render_control(self):
         self._stored_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._comment_exchange("/stored/comments-safe"), "xss")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
+
+    # --- Stored XSS via a CSRF-token-bound comment FORM (PortSwigger-shaped) ---
+    def _blog_reset(self):
+        urllib.request.urlopen(urllib.request.Request(
+            f"{self._base}/blog/reset", method="POST"), timeout=2).read()
+
+    def _blog_comment_exchange(self, path):
+        # A urlencoded comment write whose captured csrf token is STALE (bound to
+        # the crawl's session, not the validator's). The leg must mint a fresh
+        # token from the source page; reusing this stale one yields 400 and stores
+        # nothing, so a pass proves the in-session token refresh actually works.
+        return HttpExchange(
+            url=f"{self._base}{path}", method="POST",
+            request_headers={"Content-Type": "application/x-www-form-urlencoded"},
+            request_body=("csrf=STALE-CAPTURED-TOKEN&postId=1&comment=seed"
+                          "&name=probe&email=probe%40example.com&website=http%3A%2F%2Fexample.com%2F"))
+
+    @evidence_for(**cm.caller_evidence("stored_xss_form_confirm"))
+    def test_stored_xss_confirms_through_csrf_bound_form(self):
+        self._blog_reset()
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
+        res = self._run_ex(v, self._blog_comment_exchange("/blog/comment"), "xss")
+        self._observe(res)
+        self.assertEqual(res.status, "confirmed",
+                         f"stored-XSS leg missed a CSRF-token-bound form plant->render: {res.summary}")
+        self.assertTrue(res.confirmed)
+
+    @evidence_for(**cm.caller_evidence("stored_xss_form_control"))
+    def test_stored_xss_silent_on_escaped_csrf_bound_form_control(self):
+        # NEGATIVE CONTROL: same CSRF-bound form flow, but the render escapes the
+        # stored value -- the plant still succeeds (token refreshed, write stored),
+        # so a non-confirm here proves the leg keys on the UNESCAPED render, not on
+        # a successful write.
+        self._blog_reset()
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
+        res = self._run_ex(v, self._blog_comment_exchange("/blog-safe/comment"), "xss")
+        self._observe(res)
+        self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- JWT kid key-confusion (jwt_forge kid variant) ------------------------
     def _jwt_exchange(self, path):
@@ -301,16 +547,90 @@ class LiveLegVerificationTest(unittest.TestCase):
         return HttpExchange(url=f"{self._base}{path}", method="GET",
                             request_headers={"Authorization": f"Bearer {seed}"}, request_body="")
 
+    @evidence_for(**cm.caller_evidence("jwt_kid_confirm"))
     def test_jwt_kid_confusion_confirms(self):
         v = JwtForgeValidator(allowed_hosts=["127.0.0.1"])
         res = self._run_ex(v, self._jwt_exchange("/jwt/kid"), "jwt")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"jwt kid key-confusion not confirmed: {res.summary}")
         self.assertIn("kid", res.summary.lower())
 
+    @evidence_for(**cm.caller_evidence("jwt_kid_control"))
     def test_jwt_kid_silent_on_fixed_secret_control(self):
         v = JwtForgeValidator(allowed_hosts=["127.0.0.1"])
         res = self._run_ex(v, self._jwt_exchange("/jwt/kid-safe"), "jwt")
+        self._observe(res)
+        self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
+
+    @evidence_for(**cm.caller_evidence("jwt_unverified_confirm"))
+    def test_jwt_unverified_signature_confirms(self):
+        # An invalid-signature token accepted for authenticated access that a
+        # tokenless request is denied -> the server does not verify the signature.
+        v = JwtForgeValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._jwt_exchange("/jwt/unverified"), "jwt")
+        self._observe(res)
+        self.assertEqual(res.status, "confirmed",
+                         f"jwt leg missed an unverified-signature endpoint: {res.summary}")
+        self.assertTrue(res.confirmed)
+        self.assertIn("signature not verified", res.summary.lower())
+
+    @evidence_for(**cm.caller_evidence("jwt_unverified_control"))
+    def test_jwt_unverified_silent_on_public_endpoint_control(self):
+        # NEGATIVE CONTROL: a truly public endpoint accepts BOTH an invalid-signature
+        # token and a tokenless request -> the token does not gate access, so the leg
+        # must NOT claim a signature-verification bug (it skips / does not confirm).
+        v = JwtForgeValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._jwt_exchange("/jwt/public"), "jwt")
+        self._observe(res)
+        self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res, skipped_because="does not gate on the token")
+
+    # --- File upload via a CSRF-bound multipart form (PortSwigger-shaped) ------
+    def _upload_exchange(self, action, referer):
+        # The captured upload request a real engagement supplies: a multipart POST
+        # to the upload endpoint, with a Referer to the page that renders the form.
+        return HttpExchange(
+            url=f"{self._base}{action}", method="POST",
+            request_headers={"Referer": f"{self._base}{referer}"},
+            request_body="user=wiener")
+
+    def test_file_upload_confirms_active_served_upload_via_form(self):
+        v = FileUploadValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._upload_exchange("/upload/avatar", "/upload/account"),
+                           "file_upload")
+        self.assertEqual(res.status, "confirmed",
+                         f"file-upload leg missed a CSRF-bound multipart upload served active: {res.summary}")
+        self.assertTrue(res.confirmed)
+
+    def test_file_upload_silent_on_attachment_served_control(self):
+        # NEGATIVE CONTROL: identical upload flow, but the stored file is served as
+        # an attachment (not an active execution context) -> must NOT confirm.
+        v = FileUploadValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._upload_exchange("/upload/avatar-safe", "/upload/account-safe"),
+                           "file_upload")
+        self.assertNotEqual(res.status, "confirmed")
+
+    # --- Excessive trust in client-side controls (client-supplied price) -------
+    def _price_exchange(self, path):
+        return HttpExchange(
+            url=f"{self._base}{path}", method="POST",
+            request_headers={"Content-Type": "application/x-www-form-urlencoded"},
+            request_body="productId=1&quantity=1&price=133700")
+
+    def test_client_trust_confirms_reflected_price(self):
+        v = ClientTrustValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._price_exchange("/shop/cart"), "business_logic")
+        self.assertEqual(res.status, "confirmed",
+                         f"client-trust leg missed a server-reflected client price: {res.summary}")
+        self.assertTrue(res.confirmed)
+
+    def test_client_trust_silent_on_server_priced_control(self):
+        # NEGATIVE CONTROL: the server ignores the client price and uses its own, so
+        # the tampered sentinel is never reflected -> must NOT confirm.
+        v = ClientTrustValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._price_exchange("/shop/cart-safe"), "business_logic")
         self.assertNotEqual(res.status, "confirmed")
 
     def test_jwt_kid_confusion_through_run_context(self):
@@ -328,6 +648,115 @@ class LiveLegVerificationTest(unittest.TestCase):
         self.assertEqual(result.status, "confirmed")
         self.assertGreaterEqual(ctx.budget.used, 2)
 
+    # --- XXE on a supplied XML POST (no browser needed) ------------------------
+    # The driver-capture pair below needs Playwright to DISCOVER the JS-built POST. The
+    # leg itself only needs the XML exchange, so this pair hands it the same request
+    # shape directly and runs wherever the fixture does; the browser-gated pair keeps
+    # covering discovery.
+    def _xml_exchange(self, path):
+        return HttpExchange(
+            url=f"{self._base}{path}", method="POST",
+            request_headers={"Content-Type": "application/xml"},
+            request_body='<?xml version="1.0"?><request><item>probe</item></request>')
+
+    @evidence_for(**cm.caller_evidence("xxe_confirm"))
+    def test_xxe_confirms_on_entity_resolving_parser(self):
+        v = XxeValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._xml_exchange("/xxe/parse"), "xxe")
+        self._observe(res)
+        self.assertEqual(res.status, "confirmed",
+                         f"xxe leg did not confirm against an entity-resolving XML parser: {res.summary}")
+        self.assertTrue(res.confirmed)
+
+    @evidence_for(**cm.caller_evidence("xxe_control"))
+    def test_xxe_silent_on_non_resolving_parser_control(self):
+        # NEGATIVE CONTROL: same XML POST shape, but the parser never resolves entities.
+        v = XxeValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._xml_exchange("/xxe/parse-safe"), "xxe")
+        self._observe(res)
+        self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
+
+    # --- Driver-based request capture -> XXE confirm (LB-2) --------------------
+    # /xxe/js-form has NO <form> and NO server-rendered link to /xxe/parse --
+    # only a fetch() call inside its inline <script> POSTs the XML body. A
+    # passive/HTML-only crawl has nothing to discover this shape from; only a
+    # real browser executing the page's JS (driver_capture, reusing the same
+    # Playwright engine/policy as browser_xss) observes the actual request.
+    class _FakeRoleCrawlResult:
+        """Minimal stand-in for RoleCrawlResult: driver_capture.discover()
+        only needs a `.captured: list` attribute (see its docstring for why
+        this module does not import harness.role_crawl)."""
+        def __init__(self):
+            self.captured: list = []
+
+    @unittest.skipUnless(browser_driver.playwright_available(),
+                         "playwright not installed")
+    def test_driver_capture_feeds_js_built_xml_post_and_xxe_leg_confirms(self):
+        rc = self._FakeRoleCrawlResult()
+        obs = asyncio.run(driver_capture.discover(rc, f"{self._base}/xxe/js-form", wait_ms=1500))
+        self.assertEqual(obs.load_error, "", f"driver capture failed to load the page: {obs.load_error}")
+        matches = [e for e in rc.captured if e["url"].endswith("/xxe/parse")]
+        self.assertEqual(len(matches), 1,
+                         f"driver capture did not land the JS-issued POST /xxe/parse "
+                         f"into RoleCrawlResult.captured: {rc.captured}")
+        captured_exchange = matches[0]
+        self.assertEqual(captured_exchange["method"], "POST")
+        self.assertTrue((captured_exchange["request_body"] or "").lstrip().startswith("<?xml"),
+                        "captured request body did not carry the real JS-built XML shape")
+
+        ex = HttpExchange(**captured_exchange)
+        v = XxeValidator(allowed_hosts=["127.0.0.1"])
+        self.assertTrue(v.applies(_finding("xxe"), ex),
+                        "xxe leg did not recognise the driver-captured exchange as XML-shaped")
+        res = self._run_ex(v, ex, "xxe")
+        self.assertEqual(res.status, "confirmed",
+                         f"xxe leg did not confirm against the driver-captured JS-built XML POST: "
+                         f"{res.summary}")
+        self.assertTrue(res.confirmed)
+
+    @unittest.skipUnless(browser_driver.playwright_available(),
+                         "playwright not installed")
+    def test_driver_capture_silent_on_js_built_xml_post_to_safe_control(self):
+        rc = self._FakeRoleCrawlResult()
+        asyncio.run(driver_capture.discover(rc, f"{self._base}/xxe/js-form-safe", wait_ms=1500))
+        matches = [e for e in rc.captured if e["url"].endswith("/xxe/parse-safe")]
+        self.assertEqual(len(matches), 1,
+                         f"driver capture did not land the control POST: {rc.captured}")
+        ex = HttpExchange(**matches[0])
+        v = XxeValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, ex, "xxe")
+        self.assertNotEqual(res.status, "confirmed",
+                            "xxe leg FALSELY confirmed against the safe (non-resolving) control endpoint")
+
+    def test_passive_only_synthesized_capture_misses_the_js_built_xxe_endpoint(self):
+        """Negative control -- NO Playwright/browser involved, always runs (not
+        skipped): builds the exchange the way role_crawl's PASSIVE discovery
+        actually would for a POST endpoint it has no captured template for
+        (_synthesize_body -- always a generic JSON guess, never XML), and with
+        a finding class driver-capture's own content-shape discovery (not a
+        pre-labelled "xxe" hypothesis) would produce. Proves the vulnerability
+        confirmed above is one passive-only discovery misses: the xxe leg does
+        not even recognise this shape as XML, let alone fire on it."""
+        from harness.role_crawl import _synthesize_body
+        body, ctype = _synthesize_body("POST", "/xxe/parse")
+        self.assertEqual(ctype, "application/json")  # sanity: definitely not XML
+        passive_exchange = HttpExchange(
+            url=f"{self._base}/xxe/parse", method="POST",
+            request_headers={"Content-Type": ctype}, request_body=body)
+        v = XxeValidator(allowed_hosts=["127.0.0.1"])
+        # A generic finding class (not "xxe") isolates applies() to the
+        # content-shape check alone -- exactly what a shape-blind passive
+        # discovery (no pre-labelled XXE hypothesis) would hand the leg.
+        self.assertFalse(v.applies(_finding("business_logic"), passive_exchange),
+                         "xxe leg incorrectly treated a passively-synthesized JSON body as XML-shaped")
+        # The ONLY send-nothing leg: applies() is False, so validate() must skip
+        # WITHOUT touching the fixture. Assert exactly zero requests (not merely
+        # "not confirmed") -- this is the negative half of the Rule 4 guard.
+        res = self._run_ex(v, passive_exchange, "xxe", expect_sent=False)
+        self.assertNotEqual(res.status, "confirmed",
+                            "a passive-only synthesized capture must NOT confirm the js-built XXE "
+                            "endpoint -- that is exactly the gap driver-capture closes")
 
     # --- Browser XSS (Playwright, real Chromium) --------------------------------
     @unittest.skipUnless(browser_driver.playwright_available(),
@@ -346,6 +775,133 @@ class LiveLegVerificationTest(unittest.TestCase):
         res = self._run(v, "/xss/safe?q=seed")
         self.assertNotEqual(res.status, "confirmed",
                             "browser_xss leg FALSELY confirmed on an escaped (safe) endpoint")
+
+    # --- Cross-site browser PoC for CSRF (LB-5) --------------------------------
+    # ONE no-defense positive + the FOUR controls (SameSite=Strict,
+    # SameSite=Lax, Origin/Referer-enforced, bearer-only). The SameSite
+    # controls are exercised directly against the PlaywrightDriver mechanism
+    # (same victim endpoints as the positive -- SameSite enforcement is
+    # entirely the browser's own job, nothing the fixture server varies on);
+    # the positive, Origin-enforced, and bearer-only cases are exercised
+    # through the full CsrfValidator.validate() leg.
+    def _csrf_poc_reset(self):
+        urllib.request.urlopen(urllib.request.Request(
+            f"{self._base}/csrf-poc/reset", method="POST"), timeout=2).read()
+
+    def _csrf_poc_exchange(self, path, cookie="csrf_sid=live-verify-session", headers=None):
+        # Origin mirrors a real capture of a legitimate same-origin
+        # submission -- the plain token-strip replay branch just forwards
+        # it (2xx), so execution falls through to the NEW cross-site-PoC
+        # branch, where the REAL browser's own unforgeable cross-origin
+        # Origin header is what the fixture's Origin-enforced control
+        # actually exercises.
+        hdrs = {"Content-Type": "application/x-www-form-urlencoded", "Origin": self._base}
+        if cookie:
+            hdrs["Cookie"] = cookie
+        if headers:
+            hdrs.update(headers)
+        return HttpExchange(url=f"{self._base}{path}", method="POST",
+                            request_headers=hdrs, request_body="note=seed")
+
+    @unittest.skipUnless(browser_driver.playwright_available(),
+                         "playwright not installed")
+    def test_csrf_cross_site_poc_confirms_no_defense_ambient_cookie(self):
+        # THE POSITIVE: no SameSite/Origin/token defense -- the ambient
+        # cookie rides along on a real cross-site auto-submit POST, and an
+        # independent GET-only readback shows the state actually changed.
+        self._csrf_poc_reset()
+        v = CsrfValidator(allowed_hosts=["127.0.0.1"], cross_site_poc_enabled=True,
+                          cross_site_readback_url=lambda u: u.replace("/transfer", "/state"))
+        res = self._run_ex(v, self._csrf_poc_exchange("/csrf-poc/transfer"), "csrf")
+        self.assertEqual(res.status, "confirmed",
+                         f"csrf leg did not confirm the real cross-site browser PoC against a "
+                         f"no-defense ambient-cookie victim: {res.summary}")
+        self.assertTrue(res.confirmed)
+
+    @unittest.skipUnless(browser_driver.playwright_available(),
+                         "playwright not installed")
+    def test_csrf_cross_site_poc_silent_on_origin_enforced_control(self):
+        # CONTROL: the ambient cookie still rides along, but the fixture
+        # rejects the browser's real, unforgeable cross-origin Origin header.
+        self._csrf_poc_reset()
+        v = CsrfValidator(allowed_hosts=["127.0.0.1"], cross_site_poc_enabled=True,
+                          cross_site_readback_url=lambda u: u.replace("/transfer", "/state"))
+        res = self._run_ex(v, self._csrf_poc_exchange("/csrf-poc/transfer-origin"), "csrf")
+        self.assertNotEqual(res.status, "confirmed",
+                            "csrf leg FALSELY confirmed against an Origin/Referer-enforced "
+                            "victim despite the ambient cookie being present")
+
+    @unittest.skipUnless(browser_driver.playwright_available(),
+                         "playwright not installed")
+    def test_csrf_cross_site_poc_silent_on_bearer_only_control(self):
+        # CONTROL: non-ambient auth -- the browser's cookie jar can never
+        # supply an Authorization header, so this must stay silent regardless
+        # of cookie delivery.
+        self._csrf_poc_reset()
+        v = CsrfValidator(allowed_hosts=["127.0.0.1"], cross_site_poc_enabled=True,
+                          cross_site_readback_url=lambda u: u.replace("/transfer", "/state"))
+        ex = self._csrf_poc_exchange(
+            "/csrf-poc/transfer-bearer", cookie=None,
+            headers={"Authorization": "Bearer csrf-poc-fixture-bearer-token"})
+        res = self._run_ex(v, ex, "csrf")
+        self.assertNotEqual(res.status, "confirmed",
+                            "csrf leg FALSELY confirmed a bearer-only (non-ambient) victim -- "
+                            "the browser's cookie jar can never supply an Authorization header")
+
+    @unittest.skipUnless(browser_driver.playwright_available(),
+                         "playwright not installed")
+    def test_cross_site_submit_silent_on_samesite_strict_control(self):
+        # CONTROL, at the PlaywrightDriver mechanism level: an EXPLICIT
+        # SameSite=Strict cookie must be blocked by the BROWSER'S OWN
+        # enforcement on this cross-site top-level POST -- nothing in
+        # cross_site_submit's own policy decides this.
+        self._csrf_poc_reset()
+        driver = browser_driver.default_driver()
+        result = asyncio.run(driver.cross_site_submit(
+            attacker_url="http://attacker.localhost/csrf-poc-attacker",
+            victim_url=f"{self._base}/csrf-poc/transfer",
+            readback_url=f"{self._base}/csrf-poc/state",
+            form_fields={"note": "strict-control-probe-value"},
+            cookie_name="csrf_sid", cookie_value="strict-session",
+            cookie_domain=urlsplit(self._base).hostname,
+            same_site="Strict"))
+        self.assertEqual(result.load_error, "", f"PoC mechanism errored: {result.load_error}")
+        self.assertNotIn("strict-control-probe-value", result.readback_body,
+                         "SameSite=Strict should have blocked ambient-cookie delivery on the "
+                         "cross-site POST, but the readback shows the state changed")
+
+    @unittest.skipUnless(browser_driver.playwright_available(),
+                         "playwright not installed")
+    def test_cross_site_submit_silent_on_samesite_lax_control(self):
+        # CONTROL, at the PlaywrightDriver mechanism level: an EXPLICIT
+        # SameSite=Lax cookie blocks a cross-site top-level POST (Lax only
+        # ever permits a cross-site top-level GET navigation).
+        self._csrf_poc_reset()
+        driver = browser_driver.default_driver()
+        result = asyncio.run(driver.cross_site_submit(
+            attacker_url="http://attacker.localhost/csrf-poc-attacker",
+            victim_url=f"{self._base}/csrf-poc/transfer",
+            readback_url=f"{self._base}/csrf-poc/state",
+            form_fields={"note": "lax-control-probe-value"},
+            cookie_name="csrf_sid", cookie_value="lax-session",
+            cookie_domain=urlsplit(self._base).hostname,
+            same_site="Lax"))
+        self.assertEqual(result.load_error, "", f"PoC mechanism errored: {result.load_error}")
+        self.assertNotIn("lax-control-probe-value", result.readback_body,
+                         "SameSite=Lax should have blocked ambient-cookie delivery on the "
+                         "cross-site POST, but the readback shows the state changed")
+
+
+    # --- Fault injection: a bound aspect must notice a disconnected leg ---------
+    def test_bound_aspects_fail_when_the_leg_is_disconnected(self):
+        # A control that stays green with the leg's egress cut only proves the validator
+        # did nothing, so no evidence-bound test may pass when every async send is refused.
+        names = bound_test_names(type(self))
+        self.assertGreaterEqual(len(names), 24, f"bound tests went missing: {names}")
+        for name, outcome in outcomes_with_leg_severed(type(self), names).items():
+            with self.subTest(test=name):
+                self.assertNotEqual(outcome, "passed",
+                                    f"{name} still passes with the leg disconnected: not evidence")
 
 
 if __name__ == "__main__":

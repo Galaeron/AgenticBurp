@@ -92,6 +92,85 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(issues.issue_id_for(a), issues.issue_id_for(b))
 
 
+class DependencyBannerDedupTests(unittest.TestCase):
+    """RB-3 (INV-4 fix): N identical dependency/banner findings (e.g. the same
+    Werkzeug advisory re-observed passively across many exchanges/phases) must
+    surface as ONE issue instead of one-per-finding_id -- while two genuinely
+    distinct components on the same host stay distinct, and R04's protection
+    for genuinely distinct UNATTRIBUTED non-dependency findings is preserved."""
+
+    def _dep(self, url, component, *, finding_id, method="GET", prefix="known-vulnerable-dependency"):
+        f = F(url, f"{prefix}:{component}", method=method)
+        f["finding_id"] = finding_id
+        return f
+
+    def test_identical_banner_findings_collapse_to_one_issue(self):
+        # POSITIVE: 3 identical Werkzeug advisories, each independently observed
+        # (distinct finding_id -- a fresh per-exchange stamp) on THREE different
+        # exchanges/endpoints and methods on the same host -- the realistic
+        # "seen across many exchanges/phases" shape INV-4 traced -- must
+        # collapse to exactly one surfaced issue.
+        fs = [
+            self._dep("https://x/login", "Werkzeug", finding_id="f1", method="GET"),
+            self._dep("https://x/api/tickets/search", "Werkzeug", finding_id="f2", method="POST"),
+            self._dep("https://x/api/admin/debug", "Werkzeug", finding_id="f3", method="GET"),
+        ]
+        grouped = issues.group_findings_into_issues(fs)
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(len(grouped[0].members), 3)
+
+    def test_identical_banner_findings_on_the_same_exchange_collapse(self):
+        # The narrower case: repeated confirmation attempts on the SAME
+        # exchange (same url), differing only by finding_id -- must also
+        # collapse to one issue.
+        fs = [self._dep("https://x/api/x", "Werkzeug", finding_id=f"f{i}") for i in range(3)]
+        grouped = issues.group_findings_into_issues(fs)
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(len(grouped[0].members), 3)
+
+    def test_distinct_components_on_same_host_stay_distinct(self):
+        # NEGATIVE CONTROL #1: two genuinely different components (Werkzeug vs
+        # Flask) on the same host must NOT be merged just because both are
+        # "known-vulnerable-dependency" findings.
+        fs = [
+            self._dep("https://x/a", "Werkzeug", finding_id="f1"),
+            self._dep("https://x/b", "Flask", finding_id="f2"),
+        ]
+        grouped = issues.group_findings_into_issues(fs)
+        self.assertEqual(len(grouped), 2)
+        classes = {g.vulnerability_class for g in grouped}
+        self.assertEqual(classes, {"known-vulnerable-dependency:werkzeug",
+                                    "known-vulnerable-dependency:flask"})
+
+    def test_recently_published_dependency_class_also_collapses(self):
+        # The registry-age check's own class prefix gets the same treatment.
+        fs = [self._dep(f"https://x/e{i}", "leftpad-evil", finding_id=f"f{i}",
+                        prefix="recently-published-dependency") for i in range(3)]
+        grouped = issues.group_findings_into_issues(fs)
+        self.assertEqual(len(grouped), 1)
+
+    def test_distinct_unattributed_non_dependency_findings_still_stay_distinct(self):
+        # NEGATIVE CONTROL #2 (R04 preservation): two genuinely distinct
+        # UNATTRIBUTED (no parameter_location/parameter_name) non-dependency
+        # findings on the same host must still surface as two issues -- the
+        # RB-3 exception must not weaken R04 for anything outside the
+        # dependency/banner class family.
+        fs = [
+            F("https://x/api/x", "information_disclosure", method="GET"),
+            F("https://x/api/x", "information_disclosure", method="GET"),
+        ]
+        fs[0]["finding_id"] = "A"
+        fs[1]["finding_id"] = "B"
+        grouped = issues.group_findings_into_issues(fs)
+        self.assertEqual(len(grouped), 2)
+
+    def test_dependency_class_helper_matches_both_known_prefixes(self):
+        self.assertTrue(issues._is_dependency_class("known-vulnerable-dependency:Werkzeug"))
+        self.assertTrue(issues._is_dependency_class("recently-published-dependency:leftpad-evil"))
+        self.assertFalse(issues._is_dependency_class("information_disclosure"))
+        self.assertFalse(issues._is_dependency_class(""))
+
+
 class MergeOverrideTests(unittest.TestCase):
     """P1.8: operator-declared, reversible root-cause merges on top of the
     automatic grouping."""

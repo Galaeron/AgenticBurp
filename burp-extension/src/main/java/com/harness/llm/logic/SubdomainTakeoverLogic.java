@@ -5,7 +5,9 @@ package com.harness.llm.logic;
  * passive -- no new request. The executor hands over the captured response's
  * status and body; this class matches them against the well-known "dangling
  * service" fingerprints third-party hosts return when a CNAME points at an
- * unclaimed resource.
+ * unclaimed resource. A fingerprint match is a lead (SUPPORTED) only:
+ * the body text alone cannot show who owns the host's DNS or the
+ * provider resource, so this class never confirms a takeover.
  *
  * NOTE: authored without a JDK (hazard #6); compiled/unit-run at gradle build.
  */
@@ -48,11 +50,16 @@ public final class SubdomainTakeoverLogic {
         String low = body.toLowerCase();
         for (String[] fp : FINGERPRINTS) {
             if (low.contains(fp[0])) {
-                return new Evidence(Verdict.CONFIRMED, 0.85, true,
-                        "The response body carries the '" + fp[1] + "' unclaimed-resource fingerprint -- the "
-                                + "host's DNS points at a dangling third-party resource that can be claimed by an "
-                                + "attacker (subdomain takeover). Verify the CNAME target is unregistered before "
-                                + "reporting.",
+                // A lead, never a confirmation: an application's own "not
+                // found" page can carry the same words (code review 02 R29).
+                // Takeover needs DNS/provider ownership evidence this passive
+                // check does not have.
+                return new Evidence(Verdict.SUPPORTED, 0.6, false,
+                        "The response body carries the '" + fp[1] + "' unclaimed-resource fingerprint -- a "
+                                + "takeover lead, not proof: an application's own not-found page can use the same "
+                                + "words. Confirming it needs DNS/provider ownership evidence: the host's CNAME "
+                                + "points at " + fp[1] + " and the target resource there is unclaimed and "
+                                + "claimable.",
                         "provider=" + fp[1] + " status=" + statusCode);
             }
         }
