@@ -35,12 +35,20 @@ Pure/deterministic; no network, no model call.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from urllib.parse import urlsplit
 
 ANON = "anonymous"
+
+# WL-04 / D1: the run segment of a DECLARED fact. An operator's declaration ("object
+# 7 belongs to alice", "the announcements are shared with every account") describes
+# the application, not one run's observation, so it is keyed run-agnostically and
+# found by `OwnershipLedger.lookup` from any run's object reference.
+ANY_RUN = "*"
+_RUN_SEGMENT = re.compile(r"^run:[^|]*\|")
 
 
 def object_reference(url: str, *, run_id: str = "", tenant: str | None = None) -> str:
@@ -60,6 +68,20 @@ def object_reference(url: str, *, run_id: str = "", tenant: str | None = None) -
     if parsed.query:
         resource += "?" + parsed.query
     return f"run:{run_id or 'legacy'}|app:{origin}|tenant:{tenant or '?'}|resource:{resource}"
+
+
+def declared_reference(url: str, *, tenant: str | None = None) -> str:
+    """The run-agnostic object reference an OPERATOR-DECLARED fact is recorded
+    under (WL-04 / D1). `OwnershipLedger.lookup` falls back to it from the
+    run-scoped reference a validator computes, so a declaration made before a run
+    starts (when its run id is not yet known) still governs that run."""
+    return object_reference(url, run_id=ANY_RUN, tenant=tenant)
+
+
+def run_agnostic(object_ref: str) -> str:
+    """The declared-reference twin of any object reference (its run segment
+    replaced by ANY_RUN)."""
+    return _RUN_SEGMENT.sub(f"run:{ANY_RUN}|", object_ref, count=1)
 
 # Coarse trust levels. Deliberately explicit integers, not a role-name lookup, so
 # modules stop disagreeing on ordering. A higher number is MORE privileged, but
@@ -201,11 +223,32 @@ class OwnershipLedger:
         self._by_ref[fact.object_ref] = fact
         return fact
 
+    def declare(self, url: str, *, owner: str = "", shared_with=(), public: bool = False,
+                tenant: str | None = None, provenance: str = "operator-declared") -> OwnershipFact:
+        """Record an OPERATOR-DECLARED fact about the object at `url` (WL-04 / D1):
+        who owns it, whom it is explicitly shared with, or that it is public. It is
+        keyed run-agnostically (`declared_reference`), so a validator in any run
+        finds it through `lookup`. Declaring nothing known (no owner, no share, not
+        public) records a fact that stays UNKNOWN -- the ledger never guesses."""
+        return self.record(OwnershipFact(
+            object_ref=declared_reference(url, tenant=tenant), owner_principal_id=owner or "",
+            tenant=tenant, shared_with=frozenset(shared_with or ()), public=bool(public),
+            provenance=provenance))
+
+    def lookup(self, object_ref: str) -> OwnershipFact | None:
+        """The fact for an object reference: an observation recorded under exactly
+        this (run-scoped) reference wins; otherwise the operator's run-agnostic
+        declaration for the same application object, if any."""
+        fact = self._by_ref.get(object_ref)
+        if fact is None:
+            fact = self._by_ref.get(run_agnostic(object_ref))
+        return fact
+
     def owner_of(self, object_ref: str) -> OwnershipFact | None:
-        return self._by_ref.get(object_ref)
+        return self.lookup(object_ref)
 
     def authorization(self, principal: Principal, object_ref: str) -> AuthzDecision:
-        fact = self._by_ref.get(object_ref)
+        fact = self.lookup(object_ref)
         if fact is None or not fact.known:
             return AuthzDecision.UNKNOWN            # ownership not established -> never a crossing
         pid = principal.id
@@ -216,8 +259,11 @@ class OwnershipLedger:
         if pid in fact.shared_with:
             return AuthzDecision.AUTHORIZED         # explicitly shared with this principal
         # An OPERATOR-DECLARED permission over this object (never inferred from role
-        # rank): the fixture states "carol may read object 7" as expected_permissions.
-        if object_ref in principal.expected_permissions or f"read:{object_ref}" in principal.expected_permissions:
+        # rank): the fixture states "carol may read object 7" as expected_permissions,
+        # under either the run-scoped or the declared (run-agnostic) reference.
+        refs = {object_ref, run_agnostic(object_ref)}
+        if any(r in principal.expected_permissions or f"read:{r}" in principal.expected_permissions
+               for r in refs):
             return AuthzDecision.AUTHORIZED
         # Known owner, and this principal is not it / not shared / no declared
         # permission -> a real boundary crossing. Same-tenant does NOT authorize

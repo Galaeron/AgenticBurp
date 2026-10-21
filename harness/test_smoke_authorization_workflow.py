@@ -152,16 +152,27 @@ class AuthorizationSliceSmokeTest(EvidenceCase):
                                   identities=(("alice", "alice-token"),))
         self.assertNotEqual(res.status, "confirmed")   # R10: you cannot IDOR against yourself
 
-    def test_3c_ownership_gate_suppresses_authorized_sharing_over_real_http(self):
+    def test_3c_ownership_declaration_decides_lead_sharing_or_crossing_over_real_http(self):
         fx = AuthorizationWorkflowFixture("vulnerable")
         self.addCleanup(fx.close)
-        # Object 5 is Alice's but shared with Bob. WITHOUT ownership info the crossing
-        # confirms; WITH the shared-fact the ownership gate suppresses it -> proving the
-        # gate (T02b) is what made the difference, over real transport.
-        _ex, res_no_owner = self._validate(fx, "5", ledger=None)
-        self.assertTrue(res_no_owner.confirmed)
+        # Object 5 is Alice's. WL-04: WITHOUT any ownership declaration the crossing is
+        # a `supported` lead, never a confirmation (a resource shared with every account
+        # would match identically); WITH the shared-with-Bob fact it is authorized
+        # sharing; WITH an owner-only fact (Bob not entitled) it confirms. The
+        # declaration, not the response similarity, decides -- over real transport.
+        _ex, res_undeclared = self._validate(fx, "5", ledger=None)
+        self.assertEqual(res_undeclared.status, "supported")
+        self.assertFalse(res_undeclared.confirmed)
+        self.assertIn("ownership", res_undeclared.manual_verification.lower())
         _ex2, res_shared = self._validate(fx, "5", ledger=self._ledger(fx))
         self.assertFalse(res_shared.confirmed)
+        self.assertIn("authorized", res_shared.summary.lower())
+        owner_only = principals.OwnershipLedger()
+        owner_only.record(principals.OwnershipFact(
+            object_ref=principals.object_reference(fx.object_url("5"), run_id="t04"),
+            owner_principal_id="alice", tenant="A", provenance="created-as:alice"))
+        _ex3, res_owner_only = self._validate(fx, "5", ledger=owner_only)
+        self.assertTrue(res_owner_only.confirmed)
 
     def test_4_target_side_counters_show_attempt_and_control(self):
         fx = AuthorizationWorkflowFixture("vulnerable")

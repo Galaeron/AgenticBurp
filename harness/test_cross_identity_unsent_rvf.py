@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import httpx
 
-from harness import cache, safety_gate, store
+from harness import cache, principals, safety_gate, store
 from harness.models import AgentReport, Finding
 from harness.orchestrator import Orchestrator
 from harness.run_context import RunContext
@@ -68,15 +68,16 @@ class CrossIdentityUnsentTests(_CallerBase):
     BFLA = ORIGIN + "/admin/settings"     # function-level (admin namespace) path
     BOLA = ORIGIN + "/orders/1"           # object-level (object identifier) path
 
-    def _check(self, url, *, max_requests, others=("other",), allow=()):
+    def _check(self, url, *, max_requests, others=("other",), allow=(), ownership=None):
         """Validate one access-control finding as the production caller does.
         Every identity in ``allow`` receives the owner's response; all else is
-        denied (403)."""
+        denied (403). ``ownership`` is the declared-ownership source (WL-04)."""
         from harness.validators.cross_identity_validator import CrossIdentityValidator
         orch = self._orch()
         orch.validator_registry.active_enabled = True
         orch.validator_registry.validators = {
-            "cross_identity": CrossIdentityValidator(allowed_hosts=["shop.invalid"])}
+            "cross_identity": CrossIdentityValidator(allowed_hosts=["shop.invalid"],
+                                                     ownership=ownership)}
         ex = _exchange(url, {"Authorization": "Bearer source"})
         sent = []
 
@@ -149,9 +150,21 @@ class CrossIdentityUnsentTests(_CallerBase):
                                  [("not_confirmed", "control_held")], _verdicts(reports))
 
     def test_executed_cross_identity_read_still_confirms(self):
-        reports, sent = self._check(self.BOLA, max_requests=20, allow=("Bearer other",))
+        # WL-04: with the object's owner declared (and "other" not entitled).
+        led = principals.OwnershipLedger()
+        led.declare(self.BOLA, owner="owner")
+        reports, sent = self._check(self.BOLA, max_requests=20, allow=("Bearer other",),
+                                    ownership=led)
         self.assertEqual(len(sent), 2)
         self.assertTrue(any(v.confirmed for v in reports), _verdicts(reports))
+
+    def test_executed_cross_identity_read_without_declaration_is_a_lead_not_a_negative(self):
+        # WL-04: the same executed read with no ownership declared is `supported`:
+        # not confirmed, and not a held control either.
+        reports, sent = self._check(self.BOLA, max_requests=20, allow=("Bearer other",))
+        self.assertEqual(len(sent), 2)
+        self._assert_not_held(reports, status="supported")
+        self.assertTrue(all(v.manual_verification for v in reports), _verdicts(reports))
 
     # fault injection
     def test_reinstating_unsent_probe_as_denial_is_detected(self):

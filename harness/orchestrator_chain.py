@@ -689,7 +689,10 @@ class ChainMixin:
             allowed_hosts=self.allowed_hosts,
             timeout=float(_xid_cfg.get("timeout", 10.0)),
             max_identities=int(_xid_cfg.get("max_identities", 3)),
-            run_context=run_context)
+            run_context=run_context,
+            # WL-04: the registry's declared-ownership source (D1 seam); None means
+            # a cross-identity match is a `supported` lead, never a confirmation.
+            ownership=getattr(self.validator_registry, "ownership", None))
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a

@@ -183,8 +183,9 @@ class OwnershipStoreTests(unittest.TestCase):
 class CrossIdentityOwnershipWiringTests(unittest.TestCase):
     """T02b production wiring: the cross-identity validator consults ownership
     before confirming, so authorized sharing / a public object is not reported as
-    BOLA, while an unknown-ownership crossing still confirms. The response-compare
-    is forced to CONFIRMED so the OWNERSHIP gate is what's under test."""
+    BOLA, a declared unentitled accessor confirms, and (WL-04) an undeclared
+    crossing is a `supported` lead, never a confirmation. The response-compare is
+    forced to CONFIRMED so the OWNERSHIP gate is what's under test."""
 
     def setUp(self):
         from harness import identity_compare
@@ -228,10 +229,20 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
                           response_status=200, response_body="SECRET owner data")
         return asyncio.run(v.validate(finding, ex))
 
-    def test_confirms_without_ownership(self):
+    def test_without_ownership_source_is_a_supported_lead(self):
+        # WL-04: no ownership source -> the response match is a lead, not a verdict.
         res = self._run(self._validator(ownership=None))
+        self.assertEqual(res.status, "supported")
+        self.assertFalse(res.confirmed)
+        self.assertIn("ownership", res.manual_verification.lower())
+
+    def test_declared_unentitled_crossing_confirms(self):
+        led = OwnershipLedger()
+        led.declare("http://t.local/api/items/7", owner="alice")   # bob is not entitled
+        res = self._run(self._validator(ownership=led))
         self.assertEqual(res.status, "confirmed")
         self.assertTrue(res.confirmed)
+        self.assertIn("declared ownership", res.evidence.lower())
 
     def test_authorized_sharing_is_not_confirmed(self):
         led = OwnershipLedger()
@@ -249,10 +260,14 @@ class CrossIdentityOwnershipWiringTests(unittest.TestCase):
             "http://t.local/api/items/7"), public=True))
         self.assertFalse(self._run(self._validator(ownership=led)).confirmed)
 
-    def test_unknown_ownership_still_confirms(self):
-        led = OwnershipLedger()  # no fact -> UNKNOWN -> must not suppress a real crossing
+    def test_unknown_ownership_is_a_lead_not_a_confirmation(self):
+        # WL-04: a fact-less ledger is UNKNOWN -> neither a confirmation (a resource
+        # shared with every account would match the same way) nor a held control.
+        led = OwnershipLedger()
         res = self._run(self._validator(ownership=led))
-        self.assertEqual(res.status, "confirmed")
+        self.assertEqual(res.status, "supported")
+        self.assertFalse(res.confirmed)
+        self.assertNotEqual(res.control_outcome, "control_held")
 
     def test_authorized_principal_does_not_suppress_later_unauthorized_case(self):
         from harness.run_context import RunContext

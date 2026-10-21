@@ -24,6 +24,7 @@ from harness import store
 from harness import cache
 from harness import evidence_ledger
 from harness import global_throttle
+from harness import principals
 from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
 from harness.ollama_client import OllamaResult
@@ -68,11 +69,24 @@ def _install_silent_model(orch: Orchestrator) -> None:
 DISCOVERY_PROBES = 80
 ALLOWED = ["127.0.0.1", "localhost"]
 
+# The principals are NAMED (WL-04): a declared owner is matched by account name,
+# and an unnamed role would only be known by a credential alias.
 ROLES = [
     RoleSession("anonymous", {}),
-    RoleSession("alice", {"Authorization": "Bearer alice-token"}),
-    RoleSession("bob", {"Authorization": "Bearer bob-token"}),
+    RoleSession("alice", {"Authorization": "Bearer alice-token"}, name="alice"),
+    RoleSession("bob", {"Authorization": "Bearer bob-token"}, name="bob"),
 ]
+
+
+def _declared_ownership(fx: DiscoveryPipelineFixture) -> principals.OwnershipLedger:
+    """WL-04: the operator's declaration of who owns the fixture's notes (note 1 is
+    alice's, note 2 is bob's). It names the application's objects, not a run, and
+    seeds no discovery: the route still has to be FOUND before the leg can read it,
+    and the leg still has to show the second principal received the owner's object."""
+    led = principals.OwnershipLedger()
+    for nid, note in fx.notes.items():
+        led.declare(fx.note_url(nid), owner=note["owner"], provenance="pipeline-gate declaration")
+    return led
 
 
 def _gate_config() -> dict:
@@ -98,10 +112,14 @@ class _PipelineRun:
     boundary stubbed and ffuf disabled. `defect` optionally patches a piece of the
     real pipeline to reintroduce a known regression."""
 
-    def __init__(self, mode: str, *, probes: int = DISCOVERY_PROBES, defect=None):
+    def __init__(self, mode: str, *, probes: int = DISCOVERY_PROBES, defect=None,
+                 declare_ownership: bool = True):
         self.mode = mode
         self.probes = probes
         self.defect = defect
+        # WL-04: a cross-identity match confirms only against declared ownership;
+        # False runs the same pipeline with nothing declared (the lead-only case).
+        self.declare_ownership = declare_ownership
 
     def run(self) -> tuple[dict, DiscoveryPipelineFixture]:
         """Run and tear down before returning: store._DB_PATH/cache._cache are
@@ -142,6 +160,8 @@ class _PipelineRun:
             orch = Orchestrator(_gate_config())
             orch.allowed_hosts = list(ALLOWED)
             _install_silent_model(orch)   # the only stubbed boundary
+            if self.declare_ownership:
+                orch.validator_registry.set_ownership(_declared_ownership(fx))
             orch.run_active_probe = AsyncMock(return_value={
                 "iterative_result": {"stop_reason": "gave_up", "findings": []},
                 "integration": {}})
@@ -231,9 +251,24 @@ def _suppress_idor_confirmation():
         yield
 
 
+@contextlib.contextmanager
+def _record_cross_identity_results(sink: list):
+    """Observe (never alter) what the REAL cross-identity leg returns on this run."""
+    from harness.validators import cross_identity_validator as civ
+    original = civ.CrossIdentityValidator.validate
+
+    async def _recording(self, finding, exchange, **kw):
+        res = await original(self, finding, exchange, **kw)
+        sink.append(res)
+        return res
+    with patch.object(civ.CrossIdentityValidator, "validate", new=_recording):
+        yield
+
+
 class RealPipelineGateTest(unittest.TestCase):
     """The positive gate: real discovery -> real confirmation, against a fixture the
-    harness has to DISCOVER on its own."""
+    harness has to DISCOVER on its own. Ownership of the fixture's notes is declared
+    (WL-04); discovery and the cross-identity read stay real."""
 
     def test_real_discovery_builds_the_get_post_and_object_surface(self):
         """Discovery liveness: with only /openapi.json advertised, the REAL discovery
@@ -279,6 +314,26 @@ class RealPipelineGateTest(unittest.TestCase):
             "object-level authorization check produced NO confirmed IDOR. Something between "
             "real discovery and the cross-identity confirmation leg is dropping it.")
         self.assertTrue(any(f.get("confirmed") for f in confirmed))
+
+    def test_undeclared_ownership_leaves_the_crossing_unconfirmed(self):
+        """WL-04 negative control through the engagement caller: the same real
+        discovery and the same real leg, but NO ownership declaration. The vulnerable
+        fixture then yields a `supported` lead from the leg and no confirmed IDOR -- a
+        resource shared with every account would produce the same cross-identity
+        match, so similarity alone must not confirm."""
+        seen: list = []
+        result, fx = _PipelineRun("vulnerable", declare_ownership=False,
+                                  defect=lambda: _record_cross_identity_results(seen)).run()
+        self.assertIsNotNone(_node(result, "GET", "/api/notes/{id}"),
+                             "precondition: the object route must still be discovered")
+        self.assertTrue(any(r.status == "supported" for r in seen),
+                        f"precondition: the real cross-identity leg must have run and produced "
+                        f"the undeclared-ownership lead: {[(r.status, r.summary) for r in seen]}")
+        self.assertFalse(any(r.confirmed for r in seen), [(r.status, r.summary) for r in seen])
+        self.assertEqual(
+            _confirmed_idor(result), [],
+            "UNDECLARED OWNERSHIP CONFIRMED AN IDOR: the engagement path confirmed a "
+            "cross-identity match with no declaration of who owns the object (WL-04).")
 
     def test_negative_control_patched_fixture_is_not_confirmed(self):
         """Proves the gate tests CONFIRMATION, not merely that the leg ran: the patched
