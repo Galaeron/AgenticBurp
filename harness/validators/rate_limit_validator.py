@@ -121,7 +121,8 @@ class RateLimitValidator(Validator):
                                 refused = result.outcome
                                 break
                             if not result.ok:
-                                errors.append(f"attempt {attempt}: {result.error or 'transport error'}")
+                                errors.append(f"attempt {attempt}: "
+                                              f"{getattr(result.artifact, 'transport_outcome', '') or result.error}")
                                 continue
                             resp = SimpleNamespace(status_code=result.status,
                                                    text=result.body, headers=result.headers)
