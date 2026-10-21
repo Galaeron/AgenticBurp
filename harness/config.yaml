@@ -369,6 +369,25 @@ agents:
   supply_chain:
     enabled: true
 
+# Third-party lookups made by "passive" analysis (audit E19 / WL-11).
+# With the three sections below enabled, a component name seen in captured
+# target traffic is looked up OUTSIDE this machine: package name + ecosystem go
+# to api.github.com (advisories) and registry.npmjs.org / pypi.org (package
+# age); the CISA KEV feed (www.cisa.gov) and the Aikido malware feeds
+# (malware-list.aikido.dev) are downloaded and matched locally. Versions are
+# not sent. Per-service request counts appear under `events` in /telemetry as
+# `external_lookup:<service>`. See docs/LIMITATIONS.md ("Model backend & data").
+#
+# external_lookups: true  = unchanged behaviour (the three lookups run).
+# external_lookups: false = none of them makes an outbound call, and their
+#   analysis stages produce no report at all (absence means "not checked",
+#   not "clean"). A github_advisories.snapshot_path / kev_check.local_file is
+#   still read locally. To switch this off, set it in the git-ignored
+#   harness/config.local.yaml, not here. Must be a real boolean: a quoted
+#   "false" is rejected at startup.
+privacy:
+  external_lookups: true
+
 # Deterministic lookup against GitHub's public Security Advisory
 # Database, used to resolve component candidates the supply_chain agent
 # extracts. This is the "known" half of "prefer a known-vulnerability

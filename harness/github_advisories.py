@@ -6,11 +6,21 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from harness import telemetry
 from harness.models import ComponentCandidate
 
 log = logging.getLogger("harness.github_advisories")
 
 _API_BASE = "https://api.github.com"
+
+# WL-11: telemetry counter label for this module's outbound calls. Service name
+# only (never component names or URLs); see telemetry.record_event.
+_SERVICE = "github_advisories"
+EXTERNAL_LOOKUP_EVENT = f"external_lookup:{_SERVICE}"
+# Status of a lookup that was NOT performed because privacy.external_lookups is
+# false. Deliberately not "no_known_advisory": nothing was checked, and callers
+# treat any status other than matched/error as "no claim".
+STATUS_SKIPPED_EXTERNAL_DISABLED = "skipped_external_lookups_disabled"
 
 # GitHub's advisory ecosystem values differ slightly from common package-
 # manager names -- this is the mapping actually documented by GitHub's
@@ -63,7 +73,10 @@ class AdvisoryMatch:
 @dataclass
 class LookupResult:
     component: ComponentCandidate
-    status: str  # "matched" | "no_known_advisory" | "error" | "skipped_no_name"
+    # "matched" | "no_known_advisory" | "error" | "skipped_no_name"
+    # | "skipped_external_lookups_disabled" (privacy.external_lookups is false
+    # and no offline snapshot could answer: no check ran, so no claim is made)
+    status: str
     matches: list[AdvisoryMatch] = field(default_factory=list)
     detail: str = ""
 
@@ -89,9 +102,14 @@ class GitHubAdvisoryClient:
     """
 
     def __init__(self, token: str | None = None, timeout_seconds: float = 15.0,
-                 snapshot=None, offline: bool = False):
+                 snapshot=None, offline: bool = False, external_lookups: bool = True):
         self.token = token or os.environ.get("GITHUB_TOKEN")
         self.timeout_seconds = timeout_seconds
+        # WL-11 (privacy.external_lookups): when not exactly True this client
+        # never opens a connection to api.github.com. `is True` (not bool())
+        # so a stray truthy string can only ever fail closed. A local offline
+        # snapshot, if any, still answers -- it involves no network call.
+        self.external_lookups = external_lookups is True
         # Optional offline advisory snapshot (Phase 3.3): duck-typed, needs a
         # .lookup(package, ecosystem, version) -> list[AdvisoryMatch] and a truthy
         # __bool__. Used as a fallback when the live lookup errors, or as the sole
@@ -118,6 +136,15 @@ class GitHubAdvisoryClient:
     async def lookup(self, component: ComponentCandidate) -> LookupResult:
         if not component.name:
             return LookupResult(component=component, status="skipped_no_name")
+        # Privacy gate (WL-11): no network. Only a local snapshot may answer;
+        # without one NO check ran, which must not read as "no known advisory".
+        if not self.external_lookups:
+            if self.snapshot:
+                return self._snapshot_result(
+                    component, source="offline snapshot (privacy.external_lookups disabled)")
+            return LookupResult(
+                component=component, status=STATUS_SKIPPED_EXTERNAL_DISABLED,
+                detail="privacy.external_lookups is false; no advisory lookup was performed")
         # Offline mode: never touch the network -- the snapshot is the source.
         if self.offline:
             return self._snapshot_result(component, source="offline snapshot (offline mode)")
@@ -132,6 +159,12 @@ class GitHubAdvisoryClient:
         return result
 
     async def _lookup_network(self, component: ComponentCandidate) -> LookupResult:
+        # Second, independent gate at the only network site (defence in depth:
+        # a caller that reaches here directly still cannot egress).
+        if not self.external_lookups:
+            return LookupResult(
+                component=component, status=STATUS_SKIPPED_EXTERNAL_DISABLED,
+                detail="privacy.external_lookups is false; no advisory lookup was performed")
         ecosystem = _ECOSYSTEM_MAP.get(component.ecosystem.lower().strip(), _FALLBACK_ECOSYSTEM)
         params = {"ecosystem": ecosystem, "affects": component.name, "per_page": "10"}
 
@@ -140,6 +173,7 @@ class GitHubAdvisoryClient:
                 resp = None
                 for attempt in range(3):
                     try:
+                        telemetry.record_event(EXTERNAL_LOOKUP_EVENT)
                         resp = await client.get(f"{_API_BASE}/advisories", params=params, headers=self._headers())
                     except httpx.RequestError as e:
                         if attempt == 2:

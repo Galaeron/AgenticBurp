@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from harness import telemetry
 from harness.models import ComponentCandidate
 
 log = logging.getLogger("harness.package_registry_checks")
@@ -37,6 +38,15 @@ _PYPI_LIKE_ECOSYSTEMS = {"pypi", "python", "pip"}
 _AIKIDO_MALWARE_FEED = "https://malware-list.aikido.dev/malware_predictions.json"
 _AIKIDO_PYPI_FEED = "https://malware-list.aikido.dev/malware_pypi.json"
 
+# WL-11: telemetry counter labels, one per external service this module reaches.
+# Service names only (never package names or URLs); see telemetry.record_event.
+EVENT_NPM = "external_lookup:npm_registry"
+EVENT_PYPI = "external_lookup:pypi_registry"
+EVENT_AIKIDO = "external_lookup:aikido_malware_feed"
+# Status of a check NOT performed because privacy.external_lookups is false.
+# Not "checked"/"not_found": nothing was looked up, so no claim is made.
+STATUS_SKIPPED_EXTERNAL_DISABLED = "skipped_external_lookups_disabled"
+
 # Cache for malware feeds (loaded once per session)
 _malware_feed_cache: dict[str, list] = {}
 _malware_feed_last_load: datetime | None = None
@@ -46,7 +56,9 @@ _MALWARE_FEED_CACHE_TTL = 3600  # 1 hour
 @dataclass
 class RegistryAgeResult:
     component: ComponentCandidate
-    status: str  # "checked" | "not_found" | "unsupported_ecosystem" | "error"
+    # "checked" | "not_found" | "unsupported_ecosystem" | "error"
+    # | "skipped_external_lookups_disabled"
+    status: str
     published_at: datetime | None = None
     age_days: float | None = None
     detail: str = ""
@@ -55,7 +67,8 @@ class RegistryAgeResult:
 @dataclass
 class MalwareCheckResult:
     component: ComponentCandidate
-    status: str  # "checked" | "malware_detected" | "error"
+    # "checked" | "malware_detected" | "error" | "skipped_external_lookups_disabled"
+    status: str
     is_malicious: bool = False
     reason: str = ""
     aikido_id: str | None = None
@@ -63,8 +76,14 @@ class MalwareCheckResult:
 
 
 class PackageRegistryClient:
-    def __init__(self, timeout_seconds: float = 15.0, minimum_age_days: float = 2.0):
+    def __init__(self, timeout_seconds: float = 15.0, minimum_age_days: float = 2.0,
+                 external_lookups: bool = True):
         self.timeout_seconds = timeout_seconds
+        # WL-11 (privacy.external_lookups): when not exactly True this client
+        # never contacts registry.npmjs.org, pypi.org or malware-list.aikido.dev
+        # (`is True` so a stray truthy string fails closed). Every method that
+        # opens a connection checks it independently.
+        self.external_lookups = external_lookups is True
         # Safe Chain's default is 48 hours; matched here as the default,
         # configurable the same way github_advisories' behavior is.
         self.minimum_age_days = minimum_age_days
@@ -72,7 +91,10 @@ class PackageRegistryClient:
     async def _load_malware_feeds(self) -> None:
         """Load Aikido malware intelligence feeds into cache."""
         global _malware_feed_cache, _malware_feed_last_load
-        
+
+        if not self.external_lookups:
+            return
+
         now = datetime.now(timezone.utc)
         if _malware_feed_cache and _malware_feed_last_load:
             if (now - _malware_feed_last_load).total_seconds() < _MALWARE_FEED_CACHE_TTL:
@@ -81,6 +103,7 @@ class PackageRegistryClient:
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 # Load cross-ecosystem malware predictions
+                telemetry.record_event(EVENT_AIKIDO)
                 resp = await client.get(_AIKIDO_MALWARE_FEED)
                 if resp.status_code == 200:
                     _malware_feed_cache['cross_ecosystem'] = resp.json()
@@ -90,6 +113,7 @@ class PackageRegistryClient:
                     _malware_feed_cache['cross_ecosystem'] = []
                 
                 # Load PyPI-specific malware predictions
+                telemetry.record_event(EVENT_AIKIDO)
                 resp = await client.get(_AIKIDO_PYPI_FEED)
                 if resp.status_code == 200:
                     _malware_feed_cache['pypi'] = resp.json()
@@ -116,7 +140,16 @@ class PackageRegistryClient:
                 status="error",
                 detail="no package name"
             )
-        
+
+        # Privacy gate (WL-11): without feeds loaded the final "checked / No
+        # malware detected" result below would be a false clean claim.
+        if not self.external_lookups:
+            return MalwareCheckResult(
+                component=component,
+                status=STATUS_SKIPPED_EXTERNAL_DISABLED,
+                detail="privacy.external_lookups is false; no malware-feed check was performed"
+            )
+
         # Load feeds if not cached
         if not _malware_feed_cache:
             await self._load_malware_feeds()
@@ -198,6 +231,8 @@ class PackageRegistryClient:
         eco = component.ecosystem.lower().strip()
         if not component.name:
             return RegistryAgeResult(component=component, status="error", detail="no package name")
+        if not self.external_lookups:
+            return self._skipped_external_disabled(component)
 
         if eco in _NPM_LIKE_ECOSYSTEMS:
             return await self._check_npm(component)
@@ -206,12 +241,22 @@ class PackageRegistryClient:
         return RegistryAgeResult(component=component, status="unsupported_ecosystem",
                                    detail=f"registry-age check only covers npm/PyPI, got '{component.ecosystem}'")
 
+    @staticmethod
+    def _skipped_external_disabled(component: ComponentCandidate) -> RegistryAgeResult:
+        return RegistryAgeResult(
+            component=component, status=STATUS_SKIPPED_EXTERNAL_DISABLED,
+            detail="privacy.external_lookups is false; no registry lookup was performed")
+
     async def _check_npm(self, component: ComponentCandidate) -> RegistryAgeResult:
+        # Independent gate at the network site (defence in depth for direct callers).
+        if not self.external_lookups:
+            return self._skipped_external_disabled(component)
         url = f"{_NPM_REGISTRY}/{quote(component.name, safe='')}"
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             resp = None
             for attempt in range(3):
                 try:
+                    telemetry.record_event(EVENT_NPM)
                     resp = await client.get(url)
                 except httpx.RequestError as e:
                     if attempt == 2:
@@ -244,11 +289,15 @@ class PackageRegistryClient:
                                    published_at=published, age_days=age_days)
 
     async def _check_pypi(self, component: ComponentCandidate) -> RegistryAgeResult:
+        # Independent gate at the network site (defence in depth for direct callers).
+        if not self.external_lookups:
+            return self._skipped_external_disabled(component)
         url = f"{_PYPI_REGISTRY}/{quote(component.name, safe='')}/json"
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             resp = None
             for attempt in range(3):
                 try:
+                    telemetry.record_event(EVENT_PYPI)
                     resp = await client.get(url)
                 except httpx.RequestError as e:
                     if attempt == 2:
