@@ -595,6 +595,32 @@ class X2InvestigateEngagementTests(_MatrixAssertions):
                          if f.get("confirmed") and "idor" in (f.get("vulnerability_class") or "")]
             self.assertEqual(confirmed, [], path)
 
+    def _confirmed_idor(self, result: dict, path: str) -> list:
+        return [f for f in self._node(result, path)["findings"]
+                if f.get("confirmed") and "idor" in (f.get("vulnerability_class") or "")]
+
+    def test_shared_and_undeclared_objects_stay_unconfirmed_end_to_end(self):
+        """WL-02 + WL-04 together, through the engagement caller: with no ownership
+        declared, neither the announcement shared with every account nor the invoice
+        bob can read is a confirmed IDOR. The same-role lead above is the result."""
+        result = self._investigate()
+        for path in (SHARED, INVOICES):
+            self.assertEqual(self._confirmed_idor(result, path), [], path)
+
+    def test_fault_bypassing_the_ownership_gate_confirms_again(self):
+        """Fault injection for the test above: treat missing ownership as proof of a
+        crossing, and the engagement path confirms an object-level IDOR again."""
+        from harness import principals
+        from harness.validators import cross_identity_validator as civ
+
+        def bypass():
+            return patch.object(civ.CrossIdentityValidator, "_ownership_decision",
+                                lambda self, principal, url: principals.AuthzDecision.UNAUTHORIZED)
+        result = self._investigate(faults=(bypass,))
+        self.assertNotEqual(self._confirmed_idor(result, SHARED)
+                            + self._confirmed_idor(result, INVOICES), [],
+                            "the bypass must restore a similarity-only confirmation")
+
     def test_investigation_fault_collapsing_principals_loses_the_lead(self):
         result = self._investigate(faults=(_collapse_principals_to_role_labels,))
         self.assertEqual(_leads(result["idor_findings"], INVOICES), [],
