@@ -1,13 +1,13 @@
-# Current state — 2026-10-20
+# Current state — 2026-10-21
 
 ## Checkout
 - Branch `reconciliation-backlog`; base `474ad511`; head of
   [Galaeron/AgenticBurp#1](https://github.com/Galaeron/AgenticBurp/pull/1) after today's push.
   Auto-fix is on for PR #1.
 - Commits: `git log --oneline 474ad511..HEAD` (each batch is followed by a docs commit).
-  Latest: code review 02 RV-C (`63876e9`..`ca2ffe3`), RV-J (`3991a58`..`69e5fcb`), RV-D2
-  (`e84cacc`..`473c252`) and RV-E2 (`ab63dd4`..`7a97e6e`), after RV-A, RV-G, RV-B, RV-H, RV-D,
-  RV-E, RV-F and RV-I. All pushed to PR #1.
+  Latest: code review 02 follow-ups RV-L (`e75827c`..`a28d6dd`), RV-M (`399ea5d`..`a584384`)
+  and RV-N (`2efec4c`..`b8e8057`), after batches RV-A to RV-J, RV-D2 and RV-E2. All pushed to
+  PR #1.
 - The owner approved I03 (including two writes) and I04 (with operator guidance), and I09
   as evidence only.
 - Uncommitted WIP remains, dispositioned in docs/I01_CANDIDATE_MANIFEST_2026-10-17.md: W1 cache
@@ -37,16 +37,16 @@
   `file_upload_agent.py` / `FileUploadLogic.java` from worktrees under %TEMP%. Block the
   venv's editable-install leak (it imports modules missing from a worktree from the main
   checkout) with an untracked `sitecustomize.py` there plus `PYTHONPATH=<worktree>`.
-- CI runs Python 3.14. Last full verification: `7a97e6e` exactly (isolated worktree
-  `.test-work/wt-land-rvcjde`, unchanged during the run).
+- CI runs Python 3.14. Last full verification: `b8e8057` exactly (isolated worktree
+  `.test-work/wt-land-rvlmn`, unchanged during the run).
   - Interpreters: system Python 3.14.7 and venv 3.12.14, with the same results on both.
   - Results: precondition 74 OK, smoke 146 OK, full exit 0.
-  - Full breakdown: 3637 harness, 381 evaluation (17 skips), 59 integrity.
+  - Full breakdown: 3700 harness, 381 evaluation (17 skips), 59 integrity.
   - 0 ResourceWarnings; the coverage gate reports 25 gaps.
-  - Java: `gradle clean test shadowJar` exit 0, 293 tests. Run Gradle 8.7 offline on the
+  - Java: `gradle clean test shadowJar` exit 0, 335 tests. Run Gradle 8.7 offline on the
     in-repo JDK 17 (`.audit-external/toolchains/jdk17`) with `GRADLE_RO_DEP_CACHE` set to
     `.audit-external/gradle-cache/caches`; Gradle 8.7 cannot run on the host's JDK 27.
-  - Logs: `.test-work/land-rv-cjde-20261020/`.
+  - Logs: `.test-work/land-rv-lmn-20261021/`.
 - Stopping a background run with TaskStop leaves its process tree running. End it by
   exact PID tree, and never by a pattern that could match another session's processes.
 
@@ -61,15 +61,26 @@
 - 2026-10-20: stored SSTI stays opt-in (no built-in `ssti` write allowance). Under the default
   gate it reports `blocked`; `validators.mutating_ceiling_by_check: {ssti: 2}` in
   config.local.yaml enables it.
-- Needed (from RV-D2, RV-E2 and RV-J, 2026-10-20; the strict interim behaviour has landed):
+- Needed (from RV-D2, RV-E2, RV-J, RV-L, RV-M and RV-N, 2026-10-20 and 21; the strict interim
+  behaviour has landed):
   - IDOR read never confirms alone, so a single-principal IDOR needs a registered second
     identity. Should its candidate carry `manual_verification` guidance, and may an
     operator-declared victim id count as ownership evidence?
   - Mass assignment: a confirmation is medium severity (the probe field is invented metadata),
     and a value seen only on a new object's Location is a candidate.
   - A 302 to a non-login page is not a denial (IDOR and session fixation). Should an MFA
-    step-up redirect (e.g. `/2fa/verify`) count as one? RV-L records a reproduction.
-  - CORS origin reflection without credentials still confirms; RV-L records a reproduction.
+    step-up redirect (e.g. `/2fa/verify`) count as one? Today it still does
+    (`test_step_up_redirect_is_unchanged`).
+  - CORS origin reflection without credentials still confirms (`cors_validator.py:411`; RV-L
+    reproduced it through the production caller).
+  - api_security's unbounded-limit probe confirms only from 1000 items counted in the parsed
+    body (`_UNBOUNDED_MIN_ITEMS`). Is that threshold right?
+  - Browser and DOM XSS no longer confirm on a dialog or page error, so a sink that only runs
+    `alert()` ends `not_confirmed` (recall loss).
+  - The chain cannot confirm missing auth until protected routes can be declared (engagement or
+    operator config). That needs `engagement.py` or `server.py`.
+  - The Burp CSRF check writes a marker into one free-text field of the target account and
+    sends up to 6 requests.
   - RV-J changed five `*Logic` classes outside its file list (used only by
     `ValidationExecutor`, no WIP) and built on JDK 17. Review on PR #1.
 
@@ -99,7 +110,12 @@
     - RV-J: Burp executors (upload fetch-back, CSRF, JWT, mass assignment, XSS, takeover,
       OAuth, CSP);
     - RV-D2 and RV-E2: the six P1 residuals the two independent verifications found (V1 to V3,
-      E1 to E3).
+      E1 to E3);
+    - RV-L: failed or unsent sends in SSRF, open redirect, SSTI and api_security are not
+      negatives; api_security's size heuristic; browser and DOM XSS; the MFA control;
+    - RV-M: chain missing-auth confirmation, coverage records, manifest, leg_self_test;
+    - RV-N: Burp executors (CSRF read-back and headers, JWT carriers, create-style read-back,
+      XSS handler contexts).
     - Status and follow-ups: docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md "Status".
 
   Next:
@@ -109,24 +125,27 @@
     - The two independent verifications (`reviews/2026-10-20-rv-implementation-verification/`
       and `reviews/2026-10-20-rvei-implementation-verification/`, untracked) found six P1
       residuals, none a regression. RV-D2 and RV-E2 fixed them.
-    - RV-L (unsent or failed sends are not negatives; the SafetyGate accessor; the browser/DOM
-      XSS and MFA residuals) and RV-M (chain missing-auth confirmation, coverage records, the
-      manifest, leg_self_test, stale IDOR comments) are next. Briefs:
-      `.test-work/rv-l-unsentnotnegative-20261020/BATCH.md`,
-      `.test-work/rv-m-chaincoverage-20261020/BATCH.md`.
-    - RV-N (RV-J's Burp executor follow-ups: CSRF state change, controls that strip only
-      `Authorization`, create-style read-back, XSS contexts) is running from base `7a97e6e`;
-      handoff due at `.test-work/rv-n-burpresiduals-20261020/HANDOFF.md`.
+    - RV-O (failed sends in header injection, command injection, stored XSS and cache
+      poisoning; the SSRF late callback; coverage records and stale test names), RV-P
+      (validators that swallow a failed send) and RV-Q (Burp: CSRF Origin/Referer and
+      preflight, JWT cookies, mass-assignment ids, XSS script types) start after this landing.
+      Briefs: `.test-work/rv-o-unsentround2-20261021/BATCH.md`,
+      `.test-work/rv-p-swallowedsends-20261021/BATCH.md`,
+      `.test-work/rv-q-burpround3-20261021/BATCH.md`.
     - At most three batch sessions run at once.
+    - Blocked on the I01 W-split (`store.py` carries WIP): api_security confirmations are not
+      persisted, because `store.persist_validation_submission` refuses a capability outside
+      `confirmation_capabilities` (pre-existing; RV-L found it).
     - Owner decision open from RV-F: whether cleanup runs after cancellation.
     - Owner decision needed: `testing/run_web_objective_smoke.py`, the efficacy runner's
       default, is untracked, so a clean checkout cannot run it.
     - RV-A, RV-G and RV-H have landed, so the review's live-target gate is met. Any live
       target still needs the owner's authorization.
-  - I05 batch D (browser credential isolation; brief at
-    `.test-work/i05d-browsercreds-20261020/BATCH.md`) is next, when a session slot frees; the owner
-    reviews it before it lands (containment change). A real-container proof of C is still
-    missing (Docker Desktop was off);
+  - I05 batch D (browser credential isolation) has committed fixes on branch
+    `i05d-browser-credentials` (handoff `.test-work/i05d-browsercreds-20261020/HANDOFF.md`). Its
+    gates pass at `78ebfef` on 3.14 and 3.12 (full 3660 harness; 23 isolation tests on real
+    Chromium). It lands only after the owner's review (containment change). A real-container
+    proof of C is still missing (Docker Desktop was off);
   - I11: WSTG-ATHZ-02, SESS-01 and INPV-01 are still unwired (blockers in the plan);
   - I16: issue export and SARIF lack `suggested_test` (API and Markdown have it).
 - Owner decisions (2026-10-19, I05), now implemented:

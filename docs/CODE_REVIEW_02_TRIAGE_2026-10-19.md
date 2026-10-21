@@ -330,20 +330,82 @@ caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-c-ev
     - owner decisions: a value seen only on a new object's Location is a candidate; a
       mass-assignment confirmation is medium severity; a 302 to a non-login page is
       inconclusive.
+- **RV-L** (`e75827c`..`a28d6dd`, 9 commits; follow-ups of RV-D, RV-E, RV-F and RV-E2):
+  - L1 to L3: in SSRF, open redirect and SSTI, a send refused by scope, gate or budget is
+    `blocked` and a transport failure is inconclusive, naming the failed sends. A partial
+    failure that leaves a confirming probe unsent is inconclusive.
+  - L4: api_security probes that were blocked or never sent are `blocked`, never passed.
+  - L5: the unbounded-limit probe confirms only when a large requested limit returns at least
+    1000 items counted in the parsed body, more than a small limit and any declared cap. Bytes
+    alone stay a candidate.
+  - L6: `SafetyGate.mutating_headroom` is a public read-only accessor. SSTI uses it and still
+    fails closed.
+  - L7: browser and DOM XSS confirm only on a console message exactly equal to a computed
+    product (RV-E2's rule). A dialog or page error never confirms.
+  - L8: in the MFA-bypass anonymous control, a 5xx, a 404 or a transport error is never a
+    denial. A step-up redirect still counts as one (owner decision).
+  - Existing tests changed: the browser and DOM XSS doubles compute the product, and
+    `test_confirms_on_dialog_execution` became `test_dialog_alone_does_not_confirm`. The
+    evaluation score is unchanged.
+  - Follow-ups:
+    - a record-only sweep found header_injection, command_injection, stored_xss and
+      web_cache_poisoning ending `not_confirmed` when every send failed (batch RV-O), and eight
+      validators it could not reach that swallow a failed send (batch RV-P);
+    - SSRF: a timed-out out-of-band send does not wait for a late callback (batch RV-O);
+    - api_security confirmations are not persisted: `store.persist_validation_submission`
+      refuses a capability outside `confirmation_capabilities`. This is pre-existing, and
+      `store.py` carries WIP;
+    - owner decisions: the MFA step-up redirect, CORS reflection without credentials
+      (reproduced through the production caller) and the 1000-item threshold.
+- **RV-M** (`399ea5d`..`a584384`, 6 commits; follow-ups of RV-G, RV-D2, RV-E and RV-F):
+  - M1: the chain no longer takes `expected_protected` from a model label. It passes `False`,
+    so it cannot confirm missing auth until protected routes can be declared; the probe still
+    reports an unconfirmed candidate.
+  - M2: `CoverageMatrix.not_tested()` lists blocked, inconclusive and errored cells too.
+  - M3: the manifest describes the current session-fixation and stored-XSS rules.
+  - M4: leg_self_test's xss case reports "needs Playwright" when Playwright is absent, through
+    `run_self_test(report_out=...)`.
+  - M5: comments no longer say the single-principal IDOR read confirms.
+  - Follow-ups:
+    - a declaration source for protected routes (engagement or operator config) needs
+      `engagement.py` or `server.py`;
+    - `not_tested()` omits PENDING and RUNNING cells, and the self-test's reasons reach the log
+      but not the run report (batch RV-O);
+    - three test names and a `LEG_VERIFICATION.md` line still state the old rules (batch RV-O);
+    - `playwright_available()` checks only the import (`browser_driver.py` belongs to I05 batch
+      D).
+- **RV-N** (`2efec4c`..`b8e8057`, 5 commits; RV-J's follow-ups):
+  - N1: CSRF confirms only a change read back: the marker is absent before the forged request
+    and present in two reads after. A 2xx alone is SUPPORTED.
+  - N2: the CSRF forged request keeps only headers a cross-site form can make a browser send,
+    and invalidates every token carrier. The JWT probes find the token in any carrier
+    (Authorization, another header, a cookie) and remove every other credential. A refused
+    forged token counts as REJECTED only when the original token alone is accepted.
+  - N3: mass assignment reads a created object back through a same-origin Location or a
+    top-level `id`.
+  - N4: XSS recognises a quote breakout in an event handler or a `javascript:` URL.
+  - Gradle: 335 tests (293 before); each commit passes on its own. Existing tests changed:
+    `ValidationExecutorSoundnessTest.cookieGatedTokenIgnored` is store-backed and
+    `CsrfLogicTest` passes a shown read-back; none was loosened.
+  - Follow-ups (batch RV-Q unless noted):
+    - CSRF keeps the captured Origin and Referer, so a server defended only by an Origin or
+      Referer check is confirmed (pre-existing false confirmation);
+    - a JSON Content-Type, which needs a preflight cross-site, is treated as form-sendable;
+    - JWT: a needed non-credential cookie gives INCONCLUSIVE;
+    - N3 finds only `Location` or a top-level `id`;
+    - XSS: a non-JavaScript `<script type>` and `<template>` content count as executable;
+    - owner decision: the CSRF marker is a real write to one free-text field, and a run sends
+      up to 6 requests.
 
-Next: RV-L, RV-M and I05 batch D, at most three sessions at a time (RV-N is already running).
-- RV-L (brief `.test-work/rv-l-unsentnotnegative-20261020/BATCH.md`) takes these follow-ups:
-  all-failed sends in SSRF, open redirect and SSTI; api_security's blocked or unsent probes and
-  its size heuristic; the `SafetyGate` headroom accessor; the browser and DOM XSS substring
-  checks; the MFA control. It also records the CORS reflection-without-credentials question.
-- RV-M (brief `.test-work/rv-m-chaincoverage-20261020/BATCH.md`) takes the chain's
-  `expected_protected` from a model label, `CoverageMatrix.not_tested()`, the two manifest
-  descriptions, leg_self_test's xss case and the stale IDOR comments.
-- RV-N (running from `7a97e6e`; handoff due at `.test-work/rv-n-burpresiduals-20261020/`) takes
-  RV-J's follow-ups: CSRF counting any 2xx as a state change, CSRF and JWT controls that strip
-  only `Authorization`, the create-style mass-assignment read-back and XSS contexts beyond
-  `<script>`.
-- I05 batch D (brief `.test-work/i05d-browsercreds-20261020/BATCH.md`) is not a code review 02
-  batch.
+Next: RV-O, RV-P and RV-Q, as three sessions.
+- RV-O (brief `.test-work/rv-o-unsentround2-20261021/BATCH.md`): failed sends in
+  header_injection, command_injection, stored_xss and web_cache_poisoning; the SSRF late
+  callback; RV-M's coverage-record gaps and stale names.
+- RV-P (brief `.test-work/rv-p-swallowedsends-20261021/BATCH.md`): the validators whose broad
+  `except` swallows a failed send, each first reached through an exchange that passes its
+  preconditions.
+- RV-Q (brief `.test-work/rv-q-burpround3-20261021/BATCH.md`): RV-N's residuals.
+- I05 batch D (branch `i05d-browser-credentials`) is not a code review 02 batch. It waits for
+  the owner's review.
 
 RV-K waits for the I01 W-split, because `HarnessPanel.java` carries WIP.
