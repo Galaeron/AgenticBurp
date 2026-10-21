@@ -1,5 +1,6 @@
 package com.harness.llm.logic;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -56,6 +57,13 @@ public final class XssPayloadLogic {
             new Payload("\"onmouseover=\"__C__", "onmouseover=", Context.DOUBLE_QUOTED_ATTRIBUTE), // event-handler injection, no new tag
             new Payload("__C__", "", Context.ECHO)                                                  // plain echo probe -- proves nothing about escaping, kept last
     );
+
+    /** The JavaScript MIME type essences (MIME Sniffing): a script of one of these types runs as a classic script. */
+    private static final Set<String> JAVASCRIPT_MIME_TYPES = Set.of(
+            "application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript",
+            "text/ecmascript", "text/javascript", "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+            "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript", "text/livescript",
+            "text/x-ecmascript", "text/x-javascript");
 
     /** Elements whose content the HTML parser reads as text up to the matching end tag. */
     private static final Set<String> RAW_TEXT_ELEMENTS = Set.of(
@@ -136,7 +144,9 @@ public final class XssPayloadLogic {
 
     /**
      * True if a payload of the given context, {@code length} characters long
-     * and reflected raw at offset {@code at}, executes there.
+     * and reflected raw at offset {@code at}, executes there. Nothing inside
+     * {@code <template>} content executes: the parser puts it in an inert
+     * fragment (batch RV-Q item Q5).
      */
     static boolean executesAt(Context context, String body, int at, int length) {
         switch (context) {
@@ -144,18 +154,19 @@ public final class XssPayloadLogic {
                 // The payload is "><script>...: scanning through its own "> must
                 // leave the parser in HTML text, so its <script> opens a script.
                 HtmlState s = HtmlState.scan(body, at + 2);
-                return s.mode == Mode.TEXT;
+                return s.mode == Mode.TEXT && s.templateDepth == 0;
             }
             case JS_SINGLE_QUOTED_STRING: {
                 HtmlState s = HtmlState.scan(body, at);
+                if (s.templateDepth > 0) return false;
                 if (s.mode == Mode.RAW_TEXT && "script".equals(s.element)) {
-                    return insideSingleQuotedJsString(body, s.rawTextStart, at);
+                    return s.scriptRuns && insideSingleQuotedJsString(body, s.rawTextStart, at);
                 }
                 return insideSingleQuotedStringOfAttributeScript(s, body, at, length);
             }
             case DOUBLE_QUOTED_ATTRIBUTE: {
                 HtmlState s = HtmlState.scan(body, at);
-                return s.mode == Mode.TAG && !s.closingTag && s.attributeQuote == '"';
+                return s.mode == Mode.TAG && !s.closingTag && s.attributeQuote == '"' && s.templateDepth == 0;
             }
             default:
                 return false;
@@ -180,9 +191,12 @@ public final class XssPayloadLogic {
         String attributeName;    // lower-case name of the attribute whose value is being read, else null
         int valueStart = -1;     // offset where that value starts
         private boolean unquotedValue;   // that value is unquoted (ends at whitespace or '>')
+        int templateDepth;       // <template> elements open around this point: their content is inert
+        boolean scriptRuns;      // the RAW_TEXT element is a <script> of a type the browser runs
         private boolean expectingValue;  // after "name =", before the value
         private String pendingName;      // last complete attribute name in this tag
         private int nameStart = -1;      // start of the attribute name being read, else -1
+        private final Map<String, String> attributes = new HashMap<>();  // this tag's values as written, first wins
 
         private void enterTag() {
             mode = Mode.TAG;
@@ -193,9 +207,11 @@ public final class XssPayloadLogic {
             expectingValue = false;
             pendingName = null;
             nameStart = -1;
+            attributes.clear();
         }
 
-        private void endAttributeValue() {
+        private void endAttributeValue(String body, int end) {
+            if (attributeName != null && valueStart >= 0) attributes.putIfAbsent(attributeName, body.substring(valueStart, end));
             attributeQuote = 0;
             attributeName = null;
             valueStart = -1;
@@ -238,20 +254,25 @@ public final class XssPayloadLogic {
                     }
                     case TAG -> {
                         if (s.attributeQuote != 0) {
-                            if (c == s.attributeQuote) s.endAttributeValue();
+                            if (c == s.attributeQuote) s.endAttributeValue(body, i);
                             i++;
                             continue;
                         }
                         if (s.unquotedValue) {
-                            if (Character.isWhitespace(c)) { s.endAttributeValue(); i++; continue; }
+                            if (Character.isWhitespace(c)) { s.endAttributeValue(body, i); i++; continue; }
                             if (c != '>') { i++; continue; }
-                            s.endAttributeValue();  // '>' ends the value and the tag, below
+                            s.endAttributeValue(body, i);  // '>' ends the value and the tag, below
                         }
                         if (c == '>') {
                             s.endName(body, i);
+                            if ("template".equals(s.element)) {
+                                if (!s.closingTag) s.templateDepth++;
+                                else if (s.templateDepth > 0) s.templateDepth--;
+                            }
                             if (!s.closingTag && RAW_TEXT_ELEMENTS.contains(s.element)) {
                                 s.mode = Mode.RAW_TEXT;
                                 s.rawTextStart = i + 1;
+                                s.scriptRuns = "script".equals(s.element) && runsAsScript(s.attributes);
                             } else {
                                 s.mode = Mode.TEXT;
                                 s.element = null;
@@ -298,6 +319,40 @@ public final class XssPayloadLogic {
         private static boolean isTagNameChar(char c) {
             return Character.isLetterOrDigit(c) || c == '-' || c == ':' || c == '_';
         }
+    }
+
+    /**
+     * True if a {@code <script>} start tag with these attribute values (as
+     * written, by lower-case name) holds script the browser runs (batch RV-Q
+     * item Q5), as the HTML spec's "prepare the script element" decides: an
+     * empty or absent type, with no language or an empty one, is JavaScript;
+     * otherwise the type, else "text/" plus the language, with references
+     * decoded and ASCII whitespace trimmed, must be a JavaScript MIME type or
+     * "module", ignoring ASCII case. Any other type -- a template, JSON, an
+     * import map, a type with parameters -- is a data block, never run.
+     */
+    static boolean runsAsScript(Map<String, String> attributes) {
+        String type = attributes.get("type");
+        String language = attributes.get("language");
+        String typeString;
+        if (type != null) {
+            if (type.isEmpty()) return true;
+            typeString = decodeCharacterReferences(type);
+        } else if (language != null && !language.isEmpty()) {
+            typeString = "text/" + decodeCharacterReferences(language);
+        } else {
+            return true;
+        }
+        int from = 0, to = typeString.length();
+        while (from < to && " \t\n\f\r".indexOf(typeString.charAt(from)) >= 0) from++;
+        while (to > from && " \t\n\f\r".indexOf(typeString.charAt(to - 1)) >= 0) to--;
+        StringBuilder lower = new StringBuilder(to - from);
+        for (int i = from; i < to; i++) {
+            char c = typeString.charAt(i);
+            lower.append(c >= 'A' && c <= 'Z' ? (char) (c + ('a' - 'A')) : c);
+        }
+        String t = lower.toString();
+        return JAVASCRIPT_MIME_TYPES.contains(t) || t.equals("module");
     }
 
     /**

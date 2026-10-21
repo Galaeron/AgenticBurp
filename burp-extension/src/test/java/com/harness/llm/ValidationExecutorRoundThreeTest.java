@@ -431,4 +431,72 @@ final class ValidationExecutorRoundThreeTest {
         assertTrue(run.sent().stream().noneMatch(r -> r.path().startsWith("/users/")), "sent " + describe(run));
     }
 
+    // ------------------------------------------------------------------ Q5
+    /** HTML-encodes & < > " but not the single quote, as many templates do. */
+    private static String encodeNoApostrophe(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    private static Run xss(String before, String after) throws Exception {
+        return execute("reflection_context_validation",
+                request("GET", "/search", "", Map.of(), Map.of("q", "ordinary")),
+                Reply.of(200, "<html></html>"),
+                r -> Reply.of(200, "<html><body>" + before + encodeNoApostrophe(paramOf(r, "q")) + after + "</body></html>"));
+    }
+
+    @Test
+    @DisplayName("Q5 repro: a <script> with a non-JavaScript type is a data block, not script -> not confirmed")
+    void xssTemplateScriptTypeIsNotConfirmed() throws Exception {
+        Run run = xss("<script type=\"text/template\">var q='", "';</script>");
+        assertFalse(run.confirmed(), run.status() + " " + run.submission().summary);
+    }
+
+    @Test
+    @DisplayName("Q5 repro: a <script type=application/json> data block is not script -> not confirmed")
+    void xssJsonScriptTypeIsNotConfirmed() throws Exception {
+        Run run = xss("<script type='application/json'>{\"q\": '", "'}</script>");
+        assertFalse(run.confirmed(), run.status() + " " + run.submission().summary);
+    }
+
+    @Test
+    @DisplayName("Q5 repro: a <script> inside <template> content is inert -> not confirmed")
+    void xssScriptInsideTemplateIsNotConfirmed() throws Exception {
+        Run run = xss("<template><script>var q='", "';</script></template>");
+        assertFalse(run.confirmed(), run.status() + " " + run.submission().summary);
+    }
+
+    @Test
+    @DisplayName("Q5 repro: an event handler inside <template> content is inert -> not confirmed")
+    void xssHandlerInsideTemplateIsNotConfirmed() throws Exception {
+        Run run = xss("<template><button onclick=\"track('", "')\">Go</button></template>");
+        assertFalse(run.confirmed(), run.status() + " " + run.submission().summary);
+    }
+
+    @Test
+    @DisplayName("Q5 positive control: a plain <script> still confirms")
+    void xssPlainScriptIsConfirmed() throws Exception {
+        Run run = xss("<script>var q='", "';</script>");
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary);
+    }
+
+    @Test
+    @DisplayName("Q5 positive control: type=text/javascript still confirms")
+    void xssTextJavascriptTypeIsConfirmed() throws Exception {
+        Run run = xss("<script type=\"text/javascript\">var q='", "';</script>");
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary);
+    }
+
+    @Test
+    @DisplayName("Q5 positive control: type=module still confirms")
+    void xssModuleTypeIsConfirmed() throws Exception {
+        Run run = xss("<script type=module>var q='", "';</script>");
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary);
+    }
+
+    @Test
+    @DisplayName("Q5 positive control: a <script> after a closed <template> is live again")
+    void xssScriptAfterTemplateIsConfirmed() throws Exception {
+        Run run = xss("<template><p>row</p></template><script>var q='", "';</script>");
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary);
+    }
 }
