@@ -15,6 +15,7 @@ unchanged, no scan was launched, and no dependency was installed.
 | [PRACTITIONER_AND_ALTERNATIVES.md](PRACTITIONER_AND_ALTERNATIVES.md) | Enterprise-pentester and bug-bounty assessments per mode; eight-alternative comparison (provisional) |
 | [ALTERNATIVES_RESEARCH_PROVISIONAL.md](ALTERNATIVES_RESEARCH_PROVISIONAL.md) | Full delegated research record with source URLs |
 | [artifacts/](artifacts/) | Verification run summary; the two benign traces (scripts and JSON outputs) |
+| [FIX_BATCH_1.md](FIX_BATCH_1.md) | First fix batch (WL-02, WL-04, WL-05, WL-11, WL-12): commits, verification, behaviour changes, owner decisions |
 
 ## Reproducing the traces
 
