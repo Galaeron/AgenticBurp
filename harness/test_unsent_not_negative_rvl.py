@@ -726,11 +726,11 @@ class MfaAnonymousControlTests(_RvlBase):
                 reports = self._run((status, {}, "login required"))
                 self.assertEqual([r.status for r in reports], ["confirmed"], _text(reports))
 
-    def test_step_up_redirect_is_unchanged(self):
-        # Owner decision recorded in the RV-L handoff: a 302 to the 2FA step is
-        # still read as a denial, as the leg fixture's /my-account does.
-        reports = self._run((302, {"Location": "/2fa/verify"}, ""))
-        self.assertEqual([r.status for r in reports], ["confirmed"], _text(reports))
+    def test_step_up_redirect_is_not_a_denial(self):
+        # Owner decision 2026-10-21 (batch RV-R, R1): a 302 to the 2FA step is
+        # not a denial. Until then this test asserted it confirmed.
+        self._assert_candidate(self._run((302, {"Location": "/2fa/verify"}, "")),
+                               "HTTP 302, a redirect to the second-factor step /2fa/verify")
 
     def test_public_page_is_negative(self):
         reports = self._run((200, {}, "<html>Account of alice. <a href='/logout'>Log out</a></html>"))

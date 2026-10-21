@@ -380,7 +380,8 @@ class AuthSequenceValidator(Validator):
         """A step-1 (username+password) login that lands on a SECOND-factor step but
         whose resulting session already reaches a protected resource -- the 2nd factor
         is not enforced on the session. Confirmation is safe (GET-only reads): the
-        protected page is reachable with the partial session yet denied with none.
+        protected page is reachable with the partial session yet denied with none
+        (a healthy denial, as for session fixation; never a redirect to the 2FA step).
         Control (enforcing MFA): the protected page redirects back to the 2FA step,
         so it is non-substantive and this stays un-confirmed."""
         fc = "2fa_bypass"
@@ -440,7 +441,7 @@ class AuthSequenceValidator(Validator):
                     continue
                 # Control: the same resource with NO session must be denied, else it is
                 # simply public (not a bypass).
-                anon_answer = ""
+                anon_answer, denial = "", ""
                 async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                             follow_redirects=False, verify=False) as anon:
                     try:
@@ -450,16 +451,28 @@ class AuthSequenceValidator(Validator):
                 if anon_got is not None:
                     if _substantive(anon_got.status_code, anon_got.text or ""):
                         continue
-                    # RV-L L8: a server error or a missing page says nothing about
-                    # whether an anonymous caller is denied.
-                    if anon_got.status_code >= 500 or anon_got.status_code == 404:
-                        anon_answer = f"HTTP {anon_got.status_code}"
-                if anon_answer:
+                    # RV-R R1 (owner decision 2026-10-21): only a healthy denial
+                    # counts, the rule session fixation uses (E3). A redirect to the
+                    # second-factor step is not "log in first", even under a
+                    # login-looking path, and any other answer (a 5xx, a 404, a 429,
+                    # another redirect) says nothing about whether the page is
+                    # protected.
+                    status = anon_got.status_code
+                    location = anon_got.headers.get("location") or ""
+                    if 300 <= status < 400 and _MFA_MARKERS.search(location):
+                        anon_answer = f"HTTP {status}, a redirect to the second-factor step {location}"
+                    else:
+                        denial = _anonymous_denial(status, anon_got.text or "", location)
+                        if not denial:
+                            anon_answer = f"HTTP {status}" + (
+                                f" (redirect to {location})" if 300 <= status < 400 and location else "")
+                if not denial:
                     unproven = unproven or (
                         f"GET {url} returned authenticated content (HTTP {got.status_code}) to the "
                         f"step-1-only session, but the same path with no session answered "
-                        f"{anon_answer}, which is not a denial, so the page may be public or "
-                        f"broken rather than protected.")
+                        f"{anon_answer}, which is not an authorization denial (only 401/403, a redirect "
+                        f"to a login page or a login page is), so the page may be public or broken "
+                        f"rather than protected.")
                     continue
                 return ValidationResult(
                     self.name, "confirmed", fc, confidence=0.9, confirmed=True,
@@ -467,8 +480,8 @@ class AuthSequenceValidator(Validator):
                             f"that only completed step 1 (username+password), before the second factor.",
                     evidence=f"Login required a second factor (marker in the login response/redirect), yet "
                              f"GET {url} returned authenticated content (HTTP {got.status_code}) while the same "
-                             f"path with no session was denied. The protected page is reachable without the "
-                             f"2FA code -- the second factor is not enforced on the session.")
+                             f"path with no session was denied ({denial}). The protected page is reachable "
+                             f"without the 2FA code -- the second factor is not enforced on the session.")
         if unproven:
             return self._candidate("a page is reachable before the second factor, but the "
                                    "anonymous control did not deny it", unproven, fc)
