@@ -574,17 +574,23 @@ class ChainMixin:
                 pass
 
         # Emit findings for sensitive files discovered during active probing
-        # (/.env, /backup/, etc.). These are confirmed by their mere existence
-        # at a web-accessible path.
-        for sf_path in getattr(rc, "sensitive_file_hits", []):
-            state.ingest_findings(
-                f"{base_url}{sf_path}", "GET",
-                [{"vulnerability_class": "sensitive_file_exposure",
-                  "severity": "high", "confidence": 0.95,
-                  "summary": f"Sensitive file accessible: {sf_path}",
-                  "evidence": f"HTTP 200 at {sf_path}",
-                  "confirmed": True,
-                  "confirmation_method": "sensitive_file_probe"}])
+        # (/.env, /backup/, etc.). WL-05 (E39): a status code alone is only an
+        # existence signal. A finding is confirmed only when discovery's record
+        # says the 2xx body carried the artifact's content signature; a redirect,
+        # an empty or HTML body or an unrecognised type stays an existence-only
+        # candidate quoting the real status. A hit with no record (an older
+        # producer) is never confirmed.
+        from harness.api_surface_discovery import sensitive_file_finding
+        _sf_recorded: set[str] = set()
+        for sf_record in getattr(rc, "sensitive_file_evidence", None) or []:
+            sf_path = str(sf_record.get("path") or "")
+            _sf_recorded.add(sf_path)
+            state.ingest_findings(f"{base_url}{sf_path}", "GET",
+                                  [sensitive_file_finding(sf_record)])
+        for sf_path in getattr(rc, "sensitive_file_hits", None) or []:
+            if sf_path not in _sf_recorded:
+                state.ingest_findings(f"{base_url}{sf_path}", "GET",
+                                      [sensitive_file_finding({"path": sf_path})])
 
         # Stateful agent-role feature crawling (default off). Drive each role
         # through the app's real workflows and fold the captured, session-bearing
