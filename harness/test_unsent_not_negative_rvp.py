@@ -579,11 +579,20 @@ class PathTraversalUnsentTests(_RvpBase):
         reports = self._run_in("path_traversal", PathTraversalValidator(allowed_hosts=_HOSTS, timeout=1.0),
                                _finding("path_traversal"), ex, _files(sent))
         self._assert_negative(reports)
-        self.assertGreater(len(sent), 34, "the leg stopped at the first refused payload")
+        # 2 injection points x 8 encodings x 2 files = 32 probes; only the two
+        # backslash path-segment payloads cannot be sent. Before the fix the
+        # leg stopped at the first of them and reported "declined".
+        self.assertEqual(len(sent), 30, "the leg stopped at the first refused payload")
+        self.assertIn("could not be sent", reports[0].evidence)
 
-    def test_every_probe_refused_is_blocked(self):
+    def test_every_probe_refused_is_skipped(self):
+        # Kept as the declined-leg skip: test_traversal_redirect_legs pins
+        # "skipped" for a leg the run refused before anything was sent, and a
+        # skip is not a negative.
         reports = self._run(_files([]), max_requests=0)
-        self._assert_not_negative(reports, "blocked")
+        self.assertEqual([r.status for r in reports], ["skipped"], _verdicts(reports))
+        self.assertFalse(any(r.confirmed for r in reports))
+        self.assertIn("budget_exhausted", _text(reports))
 
     def test_probes_failing_after_answered_ones_are_not_a_negative(self):
         sent = []
