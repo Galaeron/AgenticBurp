@@ -1,6 +1,8 @@
 package com.harness.llm.logic;
 
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -43,6 +45,16 @@ public final class CsrfLogic {
             "referer", "cache-control", "pragma", "upgrade-insecure-requests", "dnt", "te", "priority");
 
     /**
+     * The host of the foreign page a forged request is sent from: a reserved
+     * name (RFC 6761: .invalid never resolves), so it is no real site's origin.
+     */
+    public static final String CROSS_SITE_PAGE_HOST = "csrf-probe.invalid";
+
+    /** The enctypes a form can submit; a body of any other type is not a CORS simple request. */
+    private static final Set<String> FORM_ENCTYPES = Set.of(
+            "application/x-www-form-urlencoded", "multipart/form-data", "text/plain");
+
+    /**
      * Fields the change marker is never appended to: credentials, contact
      * details and links the account depends on, and identifiers. Matched
      * anywhere in the name, so it errs towards not marking.
@@ -73,6 +85,90 @@ public final class CsrfLogic {
         String n = name.trim().toLowerCase(Locale.ROOT);
         return n.startsWith(":") || n.startsWith("sec-fetch-") || n.startsWith("sec-ch-") || n.equals("sec-gpc")
                 || CROSS_SITE_SENDABLE_HEADERS.contains(n);
+    }
+
+    /**
+     * The browser-set headers of the forged request (batch RV-Q item Q1). The
+     * captured request carries the application's own Origin, Referer and
+     * Sec-Fetch-Site; the browser sets those from the page that sends the
+     * request, so a cross-site page cannot keep them, and a server that checks
+     * them refuses the real attack. The forged request is modelled as a POST
+     * form with rel="noreferrer" on a foreign page of the target's scheme --
+     * a request a browser does send: Origin is that page's origin, Referer is
+     * absent (so a Referer check that only applies when the header is present
+     * does not stop it), and Fetch Metadata says cross-site navigation with no
+     * user activation. Browsers send Fetch Metadata to an https target; to an
+     * http one only where they did so on the captured request.
+     *
+     * @param targetUrl the captured request's URL (its scheme is the foreign page's)
+     * @param capturedFetchMetadata true if the captured request carried a Sec-Fetch-* header
+     * @return header name to value, in order; a null value means the header is removed
+     */
+    public static Map<String, String> crossSiteBrowserHeaders(String targetUrl, boolean capturedFetchMetadata) {
+        boolean http = targetUrl != null && targetUrl.regionMatches(true, 0, "http://", 0, 7);
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Origin", (http ? "http://" : "https://") + CROSS_SITE_PAGE_HOST);
+        headers.put("Referer", null);
+        boolean fetchMetadata = !http || capturedFetchMetadata;
+        headers.put("Sec-Fetch-Site", fetchMetadata ? "cross-site" : null);
+        headers.put("Sec-Fetch-Mode", fetchMetadata ? "navigate" : null);
+        headers.put("Sec-Fetch-Dest", fetchMetadata ? "document" : null);
+        headers.put("Sec-Fetch-User", null);
+        return headers;
+    }
+
+    /**
+     * Why a cross-site page cannot make the browser send this request without
+     * a CORS preflight (batch RV-Q item Q2), or null if it can. A form sends
+     * only GET and POST, with a form enctype; a fetch() with any other method
+     * or Content-Type is not a CORS simple request, so the browser first asks
+     * the target with an OPTIONS preflight and sends nothing unless the
+     * target's CORS policy approves the foreign origin with credentials. A
+     * header a page cannot set is never sent (see isCrossSiteSendableHeader),
+     * so it is not a reason here.
+     */
+    public static String preflightReason(String method, String contentType) {
+        String m = method == null ? "" : method.trim().toUpperCase(Locale.ROOT);
+        if (isSafeMethod(m)) return null;
+        if (!m.isEmpty() && !m.equals("POST")) {
+            return "a form cannot send " + m + ", and a cross-site fetch() with it needs a CORS preflight";
+        }
+        String essence = contentTypeEssence(contentType);
+        if (essence == null || FORM_ENCTYPES.contains(essence)) return null;
+        return "a form cannot send Content-Type " + essence + ", and a cross-site fetch() with it needs a CORS preflight";
+    }
+
+    private static String contentTypeEssence(String contentType) {
+        if (contentType == null) return null;
+        int semi = contentType.indexOf(';');
+        String essence = (semi < 0 ? contentType : contentType.substring(0, semi)).trim().toLowerCase(Locale.ROOT);
+        return essence.isEmpty() ? null : essence;
+    }
+
+    /**
+     * True if the request needs a preflight only for its Content-Type, so the
+     * same body can go as text/plain: a no-cors fetch() sends that cross-site
+     * with the victim's cookies and no preflight, and a server that reads the
+     * body whatever its declared type is exposed to it.
+     */
+    public static boolean canSendAsTextPlain(String method, String contentType) {
+        return method != null && method.trim().equalsIgnoreCase("POST") && preflightReason(method, contentType) != null;
+    }
+
+    /**
+     * The headers that make the forged request that no-cors fetch(): the body
+     * as text/plain and, where Fetch Metadata is sent (see
+     * {@link #crossSiteBrowserHeaders}), a no-cors request for no document.
+     * Sent with referrer "" the fetch keeps the foreign Origin and no Referer.
+     */
+    public static Map<String, String> textPlainFetchHeaders(Map<String, String> crossSite) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "text/plain;charset=UTF-8");
+        if (crossSite != null && crossSite.get("Sec-Fetch-Mode") != null) {
+            headers.put("Sec-Fetch-Mode", "no-cors");
+            headers.put("Sec-Fetch-Dest", "empty");
+        }
+        return headers;
     }
 
     /**
@@ -146,7 +242,9 @@ public final class CsrfLogic {
      * one credential a browser attaches to a cross-site request by itself);
      * the captured request succeeded; the forged request -- token removed or
      * invalidated, every header a cross-site page cannot send removed (so
-     * no Authorization or custom credential header), cookie kept -- still
+     * no Authorization or custom credential header), Origin, Referer and
+     * Fetch Metadata those of a foreign page (see
+     * {@link #crossSiteBrowserHeaders}), cookie kept -- still
      * succeeded; the same forged request with no cookie either was refused,
      * so that success is owed to the session cookie and not to the action
      * being open to anyone; and an independent read-back shows the forged
@@ -203,8 +301,9 @@ public final class CsrfLogic {
         if (!isSuccess(forgedStatus)) {
             return new Evidence(Verdict.REJECTED, 0.85, false,
                     "The request was refused (status " + forgedStatus + ", was " + originalStatus
-                            + " with the real token) once the CSRF token was removed and only the session "
-                            + "cookie was left -- the token appears to be genuinely validated.", detail);
+                            + " with the real token) once the CSRF token was removed, only the session "
+                            + "cookie was left and it was sent as a foreign page would send it -- the token "
+                            + "or the request's cross-site origin is checked.", detail);
         }
         if (anonymousStatus < 0) {
             return new Evidence(Verdict.SUPPORTED, 0.5, false,
@@ -241,6 +340,26 @@ public final class CsrfLogic {
                         + "reads of the state show the marker the forged request submitted -- the token is not "
                         + "enforced and the session cookie alone performs the action.",
                 detail);
+    }
+
+    /**
+     * As above, for a request sent as it needs a CORS preflight from a foreign
+     * page ({@code preflightReason} non-null, see {@link #preflightReason}):
+     * at most SUPPORTED, naming the preflight, since a forged request that
+     * succeeds from Burp shows nothing about what a browser sends from a
+     * foreign page before the target approves it.
+     */
+    public static Evidence evaluate(String method, boolean cookieAuthPresent, boolean tokenFound,
+                                     int originalStatus, int forgedStatus, int anonymousStatus, ReadBack readBack,
+                                     String preflightReason) {
+        Evidence ev = evaluate(method, cookieAuthPresent, tokenFound, originalStatus, forgedStatus, anonymousStatus, readBack);
+        if (preflightReason == null || (ev.verdict() != Verdict.CONFIRMED && ev.verdict() != Verdict.SUPPORTED)) return ev;
+        String note = "preflight needed: " + preflightReason;
+        return new Evidence(Verdict.SUPPORTED, Math.min(ev.confidence(), 0.5), false,
+                "Not CSRF as sent: " + preflightReason + " -- the browser sends it only if the target's CORS "
+                        + "policy approves the foreign origin with credentials (cors_misconfiguration_detection's "
+                        + "question). What the probe saw: " + ev.summary(),
+                ev.detail() == null || ev.detail().isEmpty() ? note : ev.detail() + " | " + note);
     }
 
     /** As above with no read-back made, so it can never confirm. */

@@ -135,6 +135,44 @@ public final class MassAssignmentLogicTest {
     }
 
     @Test
+    @DisplayName("Q4: a small fixed set of id keys, top level or under data, names the created object; ambiguity names none")
+    void createdObjectIdKeys() {
+        assertEquals("43", createdObjectId("{\"id\":43}", "/users"), "the base rule first");
+        assertEquals("43", createdObjectId("{\"name\":\"x\",\"userId\":43}", "/users"));
+        assertEquals("u-1", createdObjectId("{\"user_id\":\"u-1\"}", "/api/users/"));
+        assertEquals("a-b", createdObjectId("{\"UUID\":\"a-b\"}", "/users"), "keys ignore case");
+        assertEquals("5f", createdObjectId("{\"_id\":\"5f\"}", "/things"));
+        assertEquals("g1", createdObjectId("{\"guid\":\"g1\"}", null), "the fixed keys need no path");
+        assertEquals("43", createdObjectId("{\"data\":{\"type\":\"users\",\"id\":\"43\",\"attributes\":{\"id\":9}}}", "/users"));
+        assertEquals("7", createdObjectId("{\"data\":{\"userId\":7}}", "/users"));
+        assertEquals("43", createdObjectId("{\"userId\":43,\"data\":{\"id\":\"43\"}}", "/users"), "one distinct value");
+        assertEquals("43", createdObjectId("{\"id\":43,\"userId\":7}", "/users"), "a top-level id keeps its priority");
+        assertEquals("3", createdObjectId("{\"categoryId\":3}", "/categories"));
+        assertEquals("3", createdObjectId("{\"addressId\":3}", "/addresses"));
+        assertEquals("3", createdObjectId("{\"noteId\":3}", "/notes"));
+        assertEquals("3", createdObjectId("{\"user_group_id\":3}", "/user_groups"));
+
+        assertNull(createdObjectId("{\"userId\":43,\"uuid\":\"u-9\"}", "/users"), "two candidates are ambiguous");
+        assertNull(createdObjectId("{\"ownerId\":5}", "/users"), "another resource's id is not this one's");
+        assertNull(createdObjectId("{\"user\":{\"id\":5}}", "/users"), "nested only under data");
+        assertNull(createdObjectId("{\"data\":{\"attributes\":{\"id\":5}}}", "/users"), "one level under data only");
+        assertNull(createdObjectId("{\"data\":[{\"id\":5}]}", "/users"));
+        assertNull(createdObjectId("{\"uuid\":\"../x\"}", "/users"), "not a safe id");
+        assertNull(createdObjectId("{\"id\":\"../admin\",\"userId\":5}", "/users"), "an unsafe top-level id is not skipped");
+        assertNull(createdObjectId("{\"userId\":true}", "/users"));
+        assertNull(createdObjectId("{\"userId\":4.5}", "/users"));
+        assertNull(createdObjectId("{\"userId\":5", "/users"), "not well-formed");
+        assertNull(createdObjectId("[{\"userId\":5}]", "/users"));
+        assertNull(createdObjectId("{\"note\":\"\\\"userId\\\":9\"}", "/users"), "inside a string");
+        assertNull(createdObjectId("{\"v1id\":3}", "/v1"), "a version segment is no resource");
+        assertNull(createdObjectId(null, "/users"));
+
+        assertEquals("/users/43", createdObjectReference("/users", null, "{\"userId\":43}"));
+        assertEquals("https://other.example/users/43", createdObjectReference("/users", "https://other.example/users/43",
+                "{\"id\":43}"), "a Location always wins, so a cross-origin one leaves nothing to fall back to");
+    }
+
+    @Test
     @DisplayName("N3: the detail says which resources the before and after reads fetched")
     void readTargetsInDetail() {
         Evidence e = evaluate("role", "\"admin\"", false, "{\"id\":43}", 201, "{\"id\":44,\"role\":\"admin\"}",

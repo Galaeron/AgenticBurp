@@ -188,6 +188,11 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
             "live validators will fail closed (W-17), so nothing will be confirmed. "
             "Declare the target scope."
         )
+    # RV-S: a malformed protected-route entry is ignored, so it declares nothing
+    # protected (fail closed). A warning, not an error: the rest of the list stands.
+    from harness import protected_routes
+    for problem in protected_routes.config_problems(cfg):
+        warnings.append(f"{problem}; a malformed entry declares no route protected.")
 
     result = ConfigValidationResult(ok=(not errors), errors=errors, warnings=warnings)
     if strict and errors:

@@ -113,7 +113,9 @@ class CommandInjectionTests(_GateAllowsMutating):
         responder = CountingResponder(_noop_request)
         with patch("httpx.AsyncClient.request", responder):
             r = asyncio.run(v.validate(_f("command injection"), self._exchange()))
-        self.assertEqual(r.status, "skipped")
+        # RV-O O2: a send the run refused is `blocked` (RV-L rule), no longer
+        # `skipped`; neither is a negative.
+        self.assertEqual(r.status, "blocked")
         self.assertEqual(ctx.budget.used, 0)
         self.assertEqual(responder.count, 0, responder.why())  # zero budget => nothing reaches the wire
 

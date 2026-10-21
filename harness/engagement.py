@@ -502,6 +502,11 @@ class EngagementState:
     # replacing the old flat queue. Never holds a credential value -- only the
     # fact one was learned and where.
     graph: "object" = None
+    # RV-S: operator-declared protected path patterns for this engagement's target
+    # (protected_routes.py has the syntax). Only an operator sets it; nothing
+    # derived from target content or a model writes here. The missing-auth leg
+    # confirms only a route listed here or in config authz.protected_paths.
+    protected_paths: list = field(default_factory=list)
 
     def __post_init__(self):
         from harness import task_graph
@@ -556,6 +561,9 @@ class EngagementState:
         for ident in getattr(other, "identities", []) or []:
             if not any(i.get("name") == ident.get("name") for i in self.identities):
                 self.identities.append(ident)
+        theirs = getattr(other, "protected_paths", None)
+        if isinstance(theirs, list) and isinstance(self.protected_paths, list):
+            self.protected_paths.extend(p for p in theirs if p not in self.protected_paths)
         return added
 
     def ingest_role_crawl(self, result: dict) -> int:
@@ -774,10 +782,13 @@ class EngagementState:
                 "blocked_task_count": len(self.graph.blocked())}
 
     def to_dict(self) -> dict:
-        return {"host": self.host,
-                "endpoints": {k: v.to_dict() for k, v in self.endpoints.items()},
-                "identities": self.identities,
-                "task_graph": self.graph.to_dict()}
+        d = {"host": self.host,
+             "endpoints": {k: v.to_dict() for k, v in self.endpoints.items()},
+             "identities": self.identities,
+             "task_graph": self.graph.to_dict()}
+        if self.protected_paths:
+            d["protected_paths"] = self.protected_paths
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "EngagementState":
@@ -788,6 +799,10 @@ class EngagementState:
         st.identities = d.get("identities", []) or []
         if d.get("task_graph"):
             st.graph = task_graph.TaskGraph.from_dict(d["task_graph"])
+        # Kept as stored, whatever its type: protected_routes ignores a malformed
+        # value with a warning instead of this load guessing at it.
+        if d.get("protected_paths") is not None:
+            st.protected_paths = d["protected_paths"]
         return st
 
 

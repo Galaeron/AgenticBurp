@@ -14,6 +14,7 @@ _NONCE = re.compile(r"HARNESSXSS[0-9a-f]+")
 # RV-L L7: a payload that runs logs the product a*b; that product, never the
 # payload text, is what a computing double puts in the console.
 _LOGGED = re.compile(r"console\.log\((\d+)\*(\d+)\)")
+_ALERTED = re.compile(r"alert\((\d+)\*(\d+)\)")
 
 
 def _executed(text: str) -> list[str]:
@@ -24,7 +25,8 @@ def _executed(text: str) -> list[str]:
 class _VulnDriver:
     """Simulates a page that EXECUTES a reflected payload: the console carries
     the product the payload computes (as real execution would). Any other `sink`
-    instead receives the alert payload's nonce text, which is not execution proof."""
+    instead receives the page's own text, not the product, which is not
+    execution proof (RV-O O8: the payload no longer carries a nonce)."""
     def __init__(self, sink="console"):
         self.sink = sink
         self.visited = []
@@ -35,10 +37,20 @@ class _VulnDriver:
         if self.sink == "console":
             obs.console.extend(_executed(url))
             return obs
-        m = _NONCE.search(url)
-        if m:
-            getattr(obs, self.sink).append(f"fired {m.group(0)}")
+        getattr(obs, self.sink).append("alert:Welcome back!" if self.sink == "dialogs" else "fired")
         return obs
+
+
+class _DialogProductDriver:
+    """Simulates a sink that lets only alert() run: the dialog shows the product
+    the payload computes, and the console stays silent (RV-O O8)."""
+    def __init__(self):
+        self.visited = []
+
+    async def visit(self, url, *, wait_ms=1500, headers=None):
+        self.visited.append(url)
+        return ExecutionObservation(url=url, dialogs=[
+            f"alert:{int(a) * int(b)}" for a, b in _ALERTED.findall(unquote_plus(url))])
 
 
 class _SafeDriver:
@@ -95,19 +107,33 @@ class BrowserXssValidatorTests(unittest.TestCase):
         self.assertEqual(drv.seen[0].get("Authorization"), "Bearer alice")
         self.assertEqual(drv.seen[0].get("Cookie"), "session=abc")
 
-    def test_dialog_alone_does_not_confirm(self):
-        # RV-L L7 (was test_confirms_on_dialog_execution): a dialog showing the
-        # nonce is what a page that alerts its own input shows too, so only the
-        # console's computed product confirms.
+    def test_dialog_without_the_product_is_a_candidate_not_a_confirm(self):
+        # RV-O O8, owner decision 2026-10-21 (was test_dialog_alone_does_not_confirm,
+        # RV-L L7, which wanted not_confirmed): a dialog that does not show the
+        # computed product is what a page that alerts its own text shows too, so
+        # it never confirms, but it is a candidate to check by hand, never a
+        # negative.
         r = self._validate(_VulnDriver("dialogs"))
-        self.assertEqual(r.status, "not_confirmed")
+        self.assertEqual(r.status, "inconclusive")
         self.assertFalse(r.confirmed)
+        self.assertIn("a dialog fired, but not with the computed value; check manually", r.summary)
+
+    def test_dialog_with_the_product_confirms_and_says_so(self):
+        # RV-O O8: a sink that lets only alert() run is not missed.
+        r = self._validate(_DialogProductDriver())
+        self.assertEqual(r.status, "confirmed")
+        self.assertTrue(r.confirmed)
+        self.assertIn("dialog only", r.summary)
+        self.assertIn("not by the console", r.evidence)
 
     def test_first_payload_uses_dialog_for_external_completion_oracle(self):
+        # RV-O O8: the dialog now shows the computed product a*b (was a nonce
+        # string literal, alert('HARNESSXSS...')), and the console logs it.
         driver = _SafeDriver()
         self._validate(driver, max_visits=1)
         self.assertEqual(len(driver.visited), 1)
-        self.assertIn("<script>alert('", unquote(driver.visited[0]))
+        self.assertRegex(unquote(driver.visited[0]),
+                         r"<script>alert\((\d+)\*(\d+)\);console\.log\(\1\*\2\)</script>")
 
     def test_not_confirmed_when_nothing_executes(self):
         r = self._validate(_SafeDriver())

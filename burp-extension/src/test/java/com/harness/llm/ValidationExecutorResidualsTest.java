@@ -213,7 +213,11 @@ final class ValidationExecutorResidualsTest {
         assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
         HttpRequest forged = posts(run).get(0);
         assertNull(headerOf(forged, "X-Requested-With"), "a script-set header is not sent cross-site");
-        assertEquals(FakeMontoya.ORIGIN + "/profile", headerOf(forged, "Referer"), "browser-set headers are kept");
+        // RV-Q item Q1: this asserted the captured same-origin Referer was kept,
+        // which a cross-site page cannot send; the browser sets its own.
+        assertNull(headerOf(forged, "Referer"), "a cross-site form sent with rel=noreferrer carries no Referer");
+        assertEquals("https://" + com.harness.llm.logic.CsrfLogic.CROSS_SITE_PAGE_HOST, headerOf(forged, "Origin"),
+                "the browser sets the foreign page's Origin");
     }
 
     // ------------------------------------------------------------------ N2 (JWT)

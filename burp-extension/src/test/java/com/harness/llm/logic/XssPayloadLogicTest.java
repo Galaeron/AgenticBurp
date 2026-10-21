@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static com.harness.llm.logic.XssPayloadLogic.*;
 import static org.junit.jupiter.api.Assertions.*;
@@ -226,5 +227,69 @@ public final class XssPayloadLogicTest {
         assertNull(javascriptUrlSource("javascript go"));
         assertNull(javascriptUrlSource("%6Aavascript:x"));
         assertNull(javascriptUrlSource(null));
+    }
+
+    // ---------------------------------------------------------------- RV-Q Q5
+    @Test
+    @DisplayName("Q5: only a script type the browser runs makes a script block script")
+    void scriptTypesTheBrowserRuns() {
+        assertTrue(runsAsScript(Map.of()));
+        assertTrue(runsAsScript(Map.of("type", "")));
+        assertTrue(runsAsScript(Map.of("type", "text/javascript")));
+        assertTrue(runsAsScript(Map.of("type", " \tText/JavaScript\n")), "ASCII case and whitespace ignored");
+        assertTrue(runsAsScript(Map.of("type", "application/ecmascript")));
+        assertTrue(runsAsScript(Map.of("type", "text/javascript1.5")));
+        assertTrue(runsAsScript(Map.of("type", "MODULE")));
+        assertTrue(runsAsScript(Map.of("type", "text&#47;javascript")), "the parser decodes the value");
+        assertTrue(runsAsScript(Map.of("language", "")));
+        assertTrue(runsAsScript(Map.of("language", "JavaScript")));
+        assertTrue(runsAsScript(Map.of("type", "", "language", "vbscript")), "an empty type wins");
+
+        assertFalse(runsAsScript(Map.of("type", "text/template")));
+        assertFalse(runsAsScript(Map.of("type", "application/json")));
+        assertFalse(runsAsScript(Map.of("type", "application/ld+json")));
+        assertFalse(runsAsScript(Map.of("type", "importmap")));
+        assertFalse(runsAsScript(Map.of("type", "speculationrules")));
+        assertFalse(runsAsScript(Map.of("type", "text/babel")));
+        assertFalse(runsAsScript(Map.of("type", "text/javascript; charset=utf-8")), "an essence match, no parameters");
+        assertFalse(runsAsScript(Map.of("type", " ")), "whitespace only is not empty");
+        assertFalse(runsAsScript(Map.of("type", "text/java\u017Fcript")), "only ASCII case is ignored");
+        assertFalse(runsAsScript(Map.of("type", "text/template", "language", "javascript")), "the type wins");
+        assertFalse(runsAsScript(Map.of("language", "vbscript")));
+    }
+
+    @Test
+    @DisplayName("Q5: a script block of a non-JavaScript type is a data block -> not CONFIRMED")
+    void dataBlockScriptIsNotConfirmed() {
+        assertNotEquals(Verdict.CONFIRMED, js("<script type=\"text/template\">var q=''-ABC123-'';</script>"));
+        assertNotEquals(Verdict.CONFIRMED, js("<script type=text/template>var q=''-ABC123-'';</script>"));
+        assertNotEquals(Verdict.CONFIRMED, js("<SCRIPT TYPE='application/json'>{\"q\":''-ABC123-''}</SCRIPT>"));
+        assertNotEquals(Verdict.CONFIRMED, js("<script type=\"text/template\" type=\"text/javascript\">var q=''-ABC123-'';</script>"),
+                "the first of two type attributes counts");
+        assertEquals(Verdict.CONFIRMED, js("<script type=\"module\">var q=''-ABC123-'';</script>"));
+        assertEquals(Verdict.CONFIRMED, js("<script type=\"text/template\"></script><script>var q=''-ABC123-'';</script>"),
+                "the next script block is typed afresh");
+    }
+
+    @Test
+    @DisplayName("Q5: nothing inside <template> content executes, until the template closes")
+    void templateContentIsInert() {
+        assertNotEquals(Verdict.CONFIRMED, js("<template><script>var q=''-ABC123-'';</script></template>"));
+        assertNotEquals(Verdict.CONFIRMED, js("<template><button onclick=\"track(''-ABC123-'')\">Go</button></template>"));
+        assertNotEquals(Verdict.CONFIRMED, js("<template><a href=\"javascript:go(''-ABC123-'')\">x</a></template>"));
+        assertNotEquals(Verdict.CONFIRMED, js("<TEMPLATE id=t><template></template><script>var q=''-ABC123-'';</script></TEMPLATE>"),
+                "still inside the outer template");
+        assertNotEquals(Verdict.CONFIRMED, classify(PAYLOADS.get(0), "ABC123",
+                "<template><div title=\"\"><script>ABC123</script>\"></div></template>"));
+        assertNotEquals(Verdict.CONFIRMED, classify(PAYLOADS.get(2), "ABC123",
+                "<template><div title=\"\"onmouseover=\"ABC123\"></div></template>"));
+
+        assertEquals(Verdict.CONFIRMED, js("<template><p>row</p></template><script>var q=''-ABC123-'';</script>"));
+        assertEquals(Verdict.CONFIRMED, js("</template><template></template><script>var q=''-ABC123-'';</script>"),
+                "a stray end tag closes nothing");
+        assertEquals(Verdict.CONFIRMED, js("<script>var t='<template>';var q=''-ABC123-'';</script>"),
+                "a <template> inside script text is no element");
+        assertEquals(Verdict.CONFIRMED, classify(PAYLOADS.get(0), "ABC123",
+                "<template></template><div title=\"\"><script>ABC123</script>\"></div>"));
     }
 }

@@ -212,4 +212,48 @@ public final class JwtForgeryLogicTest {
         Evidence confirmed = new Evidence(Verdict.CONFIRMED, 0.9, true, "s", "d");
         assertEquals(confirmed, requireTokenAloneAccepted(confirmed, 401), "only a rejection is qualified");
     }
+
+    @Test
+    @DisplayName("Q3: only cookies that are neither the carrier nor credential- or session-like are kept")
+    void nonCredentialCookiesKept() {
+        Carrier header = new Carrier(false, "Authorization", "Bearer ", RVN_JWT);
+        Carrier cookie = new Carrier(true, "jwt_cookie", "", RVN_JWT);
+        assertEquals("tenant=acme; lang=en", nonCredentialCookies("tenant=acme; lang=en", header));
+        assertEquals("tenant=acme", nonCredentialCookies("tenant=acme; jwt_cookie=" + RVN_JWT, cookie), "never the carrier");
+        for (String credential : new String[] {"session=x", "auth_state=x", "csrf_token=x", "api_key=x", "PHPSESSID=x",
+                "connect.sid=x", "sid=x", "remember_me=x", "login=x", "refresh=x", "other=" + RVN_JWT, "x=Bearer abc"}) {
+            assertNull(nonCredentialCookies(credential, header), credential);
+        }
+        assertEquals("theme=dark", nonCredentialCookies("PHPSESSID=x; theme=dark; ; =y; noeq", header));
+        assertNull(nonCredentialCookies(null, header));
+
+        assertEquals("tenant=acme; jwt_cookie=T", cookieHeaderWith("tenant=acme", cookie, "T"));
+        assertEquals("tenant=acme", cookieHeaderWith("tenant=acme", header, "T"), "a header carrier goes in its header");
+    }
+
+    @Test
+    @DisplayName("Q3: with the kept cookies, a refused forgery is rejected; an accepted one is at most a lead")
+    void keptCookiesVerdict() {
+        Evidence alone = requireTokenAloneAccepted(evaluate("garbled signature", 200, 401, 100, 20, -1), 401);
+        assertEquals(Verdict.INCONCLUSIVE, alone.verdict());
+
+        Evidence refused = withKeptCookies(evaluate("garbled signature, with the kept cookies", 200, 401, 100, 20, -1),
+                "tenant=acme", 200, alone);
+        assertEquals(Verdict.REJECTED, refused.verdict(), "the token is the only difference");
+        assertTrue(refused.detail().contains("cookies kept (not credential-like): tenant"), refused.detail());
+
+        Evidence accepted = withKeptCookies(evaluate("alg:none, with the kept cookies", 200, 200, 100, 100, 401),
+                "tenant=acme", 200, alone);
+        assertEquals(Verdict.SUPPORTED, accepted.verdict(), "never confirmed: a kept cookie may authenticate");
+        assertFalse(accepted.confirmed());
+
+        Evidence open = withKeptCookies(evaluate("alg:none, with the kept cookies", 200, 200, 100, 100, 200),
+                "tenant=acme", 200, alone);
+        assertEquals(Verdict.REJECTED, open.verdict(), "the kept cookies alone are accepted: not token-gated");
+
+        Evidence stillRefused = withKeptCookies(null, "tenant=acme", 401, alone);
+        assertEquals(Verdict.INCONCLUSIVE, stillRefused.verdict());
+        assertTrue(stillRefused.detail().contains("original token with them status=401"), stillRefused.detail());
+        assertEquals(Verdict.INCONCLUSIVE, withKeptCookies(null, "tenant=acme", 200, alone).verdict(), "no forged probe answered");
+    }
 }

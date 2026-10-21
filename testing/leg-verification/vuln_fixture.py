@@ -602,7 +602,9 @@ def make_app(file_base: str | None = None) -> Flask:
     def mfa_account():
         s = mfa["sessions"].get(request.cookies.get("session", ""))
         if not s:
-            return redirect("/2fa/verify", code=302)  # no session -> denied
+            # No session -> the login wall. A redirect to the 2FA step is not a
+            # denial for the MFA-bypass control (owner decision 2026-10-21, RV-R R1).
+            return redirect("/login", code=302)
         if s["mode"] == "safe" and not s["verified"]:
             return redirect("/2fa/verify", code=302)  # ENFORCING: 2nd factor required
         # VULNERABLE mode: the partial (step-1-only) session already reaches the account.

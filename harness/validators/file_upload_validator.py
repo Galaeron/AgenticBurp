@@ -71,11 +71,13 @@ class FileUploadValidator(Validator):
                 seen.add(u); out.append(u)
         return out
 
-    async def _upload_form_from_source(self, client, exchange: HttpExchange, headers: dict):
+    async def _upload_form_from_source(self, client, exchange: HttpExchange, headers: dict,
+                                       failures: list[str] | None = None):
         """GET the source page in THIS session and return the multipart upload form
         whose action targets this endpoint: (action_url, file_field, extra_fields
         with a FRESH csrf). None when no matching file form is discoverable, so the
-        caller falls back to a bare single-field upload."""
+        caller falls back to a bare single-field upload. A candidate page that
+        never answered is recorded in `failures`."""
         from harness.validators.source_form import fetch_source_form
         action_path = urlsplit(exchange.url).path
 
@@ -84,8 +86,14 @@ class FileUploadValidator(Validator):
             match = [f for f in file_forms if urlsplit(f.action).path == action_path] or file_forms
             return match[0] if match else None
 
-        found = await fetch_source_form(client, self._source_page_candidates(exchange),
-                                        headers, select)
+        try:
+            found = await fetch_source_form(client, self._source_page_candidates(exchange),
+                                            headers, select, failures=failures)
+        except SafetyGateBlocked as e:
+            if failures is None:
+                raise
+            failures.append(f"source page: refused ({e.decision.reason})")
+            return None
         if found is None:
             return None
         f = found.form
@@ -124,7 +132,9 @@ class FileUploadValidator(Validator):
                 # user). Replaying a bare `file` part with no token is rejected, so
                 # discover the real form in-session first; the captured token would
                 # belong to another session and be refused.
-                found = await self._upload_form_from_source(client, exchange, headers)
+                source_failures: list[str] = []
+                found = await self._upload_form_from_source(client, exchange, headers,
+                                                             source_failures)
                 if found is not None:
                     url, file_field, extra_fields = found
                 read_headers = {k: v for k, v in (headers or {}).items()
@@ -134,14 +144,27 @@ class FileUploadValidator(Validator):
                 # raised AttributeError before any request was ever sent.
                 resp = await client.request(method, url, headers=read_headers or None,
                                             data=extra_fields or None, files=files_data)
-                return await self._after_upload(client, resp, url, read_headers, marker, filename)
+                return await self._after_upload(client, resp, url, read_headers, marker, filename,
+                                                source_failures)
         except SafetyGateBlocked:
             return self._skip("mutating file upload not authorized (set validators.allow_mutating_replay)")
         except httpx.HTTPError as e:
             return ValidationResult(
                 self.name, "error", "file_upload", summary=f"upload HTTP error: {e}")
 
-    async def _after_upload(self, client, resp, url, headers, marker, filename):
+    async def _after_upload(self, client, resp, url, headers, marker, filename,
+                            source_failures: list[str] | None = None):
+        # A send that got no response is not part of a negative (RV-P P9): a
+        # rejection may be the token the unread source page would have minted,
+        # and a stored copy may sit behind a fetch-back that never answered.
+        if resp.status_code >= 400 and source_failures:
+            return ValidationResult(
+                self.name, "inconclusive", "file_upload", confidence=0.0, confirmed=False,
+                summary=f"File-upload check incomplete: the in-session upload form could not be read "
+                        f"({'; '.join(source_failures[:3])}), so the rejection (HTTP "
+                        f"{resp.status_code}) may be a missing token or field; not a negative result",
+                evidence=f"POST {url} with {filename} (text/html) → {resp.status_code} without the "
+                         f"source page's fresh form fields.")
         if resp.status_code >= 400:
             return ValidationResult(
                 self.name, "not_confirmed", "file_upload", confidence=0.0, confirmed=False,
@@ -189,15 +212,32 @@ class FileUploadValidator(Validator):
                 seen.add(u); ordered.append(u)
 
         retrieve, upload_url = None, None
+        refused, errors, answered = "", [], 0
         for cand in ordered:
             try:
                 await global_throttle.acquire()
                 r = await client.request("GET", cand, headers=headers or None)
-            except httpx.HTTPError:
+            except SafetyGateBlocked as e:
+                # Nothing more can send once the gate refuses (budget, scope).
+                refused = e.decision.reason
+                break
+            except httpx.HTTPError as e:
+                errors.append(f"GET {cand}: {e.__class__.__name__}")
                 continue
+            answered += 1
             if r.status_code < 400 and marker in (r.text or ""):
                 retrieve, upload_url = r, cand
                 break
+
+        if retrieve is None and (refused or errors):
+            why = "; ".join(([f"refused by the safety gate ({refused})"] if refused else []) + errors[:3])
+            return ValidationResult(
+                self.name, "inconclusive", "file_upload", confidence=0.0, confirmed=False,
+                summary=f"File-upload check incomplete: {len(ordered) - answered} of {len(ordered)} "
+                        f"fetch-back(s) got no response ({why}); not a negative result",
+                evidence=f"Upload succeeded ({resp.status_code}); {answered} answered candidate "
+                         f"serving URL(s) did not return the marker, but a URL that never answered "
+                         f"cannot show it.")
 
         if retrieve is None:
             return ValidationResult(

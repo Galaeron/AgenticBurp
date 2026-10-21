@@ -34,6 +34,12 @@ _URL_PARAM_NAMES = {"url", "uri", "target", "callback", "webhook", "dest", "dest
                     "remote", "address", "upstream", "site", "domain", "server", "u", "hook"}
 _URL_VALUE = re.compile(r"^https?://", re.IGNORECASE)
 
+# Transport failures after the request was written: the response was lost, but
+# the server may still have fetched the callback URL, so an out-of-band send
+# that fails this way still waits for its callback (RV-O O5). A send that never
+# connected (ConnectError, ConnectTimeout, a refusal) is not waited on.
+_DELIVERED = ("ReadTimeout", "ReadError", "RemoteProtocolError")
+
 # Connection-failure signatures a server-side fetcher surfaces when its target is
 # unreachable. Their presence/absence across two loopback targets is one candidate
 # signal that the response depended on the fetch outcome (never proof on its own).
@@ -134,10 +140,15 @@ class SsrfValidator(Validator):
                     unsent: list | None = None, label: str = ""):
         """Send one replay through the safety gate; return (status, text) or None
         when the gate blocks it or the request errors, recording why in `unsent`
-        as ("blocked" | "error", description). Read-only from the target's
+        as ("blocked" | "delivered" | "error", description), "delivered" being a
+        failure after the request was written. Read-only from the target's
         perspective -- it never posts to a destructive path, only swaps a URL value."""
         try:
             await global_throttle.acquire()
+            from harness.run_context import current_run_context
+            run = current_run_context()
+            if run is not None:
+                return await self._send_in_run(run, method, url, headers, body, unsent, label)
             async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                         follow_redirects=False, verify=False) as client:
                 resp = await client.request(method, url, headers=headers or None,
@@ -148,9 +159,41 @@ class SsrfValidator(Validator):
                 unsent.append(("blocked", f"{label}: refused ({e.decision.reason})"))
             return None
         except httpx.HTTPError as e:
-            if unsent is not None:
-                unsent.append(("error", f"{label}: {e.__class__.__name__}"))
+            self._record_failure(unsent, label, e.__class__.__name__)
             return None
+
+    @staticmethod
+    def _record_failure(unsent: list | None, label: str, failure: str) -> None:
+        if unsent is not None:
+            unsent.append(("delivered" if failure in _DELIVERED else "error", f"{label}: {failure}"))
+
+    async def _send_in_run(self, run, method: str, url: str, headers: dict, body: str,
+                           unsent: list | None, label: str):
+        """The path GatedAsyncClient takes inside an entered run, taken here
+        because GatedAsyncClient reports every run transport failure as a
+        ConnectError, and a lost response must be told apart from a refused
+        connection. Same policy: the default gate when it is not the run's own,
+        then the run transport's scope, gate and budget."""
+        url = str(httpx.URL(url))
+        gate = get_default_gate()
+        if gate is not run.gate:
+            decision = gate.authorize(validator_name=self.name, method=method, url=url,
+                                      body=body or None)
+            if not decision.allowed:
+                raise SafetyGateBlocked(decision)
+        outcome = await run.target_transport().send_creds(
+            method, url, capability=self.name, headers=dict(headers or {}), body=body or None,
+            max_redirects=0)
+        if outcome.ok:
+            return outcome.status or 0, (outcome.body or "")
+        if outcome.outcome == "error":
+            failure = getattr(outcome.artifact, "transport_outcome", "").partition(":")[2]
+            self._record_failure(unsent, label, failure or "transport error")
+        elif unsent is not None:
+            unsent.append(("blocked", f"{label}: refused (run transport refused the send: "
+                                      f"{outcome.outcome}"
+                                      + (f" ({outcome.error})" if outcome.error else "") + ")"))
+        return None
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
@@ -181,16 +224,24 @@ class SsrfValidator(Validator):
             sends += 1
             # Routes the (possibly mutating) replay through the safety gate --
             # a non-GET send needs the allow_mutating_replay opt-in.
-            if await self._send(method, url, headers, body, unsent,
-                                f"out-of-band send via {loc} {param!r}") is None:
-                continue
+            reply = await self._send(method, url, headers, body, unsent,
+                                     f"out-of-band send via {loc} {param!r}")
+            if reply is None and unsent[-1][0] != "delivered":
+                continue  # never reached the target: no callback to wait for
             if await collab.wait_for_hit(token, timeout=self.timeout):
+                lost = (f" The send itself got no response ({unsent[-1][1].rpartition(': ')[2]}), "
+                        f"but the callback shows the request was delivered." if reply is None else "")
                 return ValidationResult(
                     self.name, "confirmed", "ssrf", confidence=0.95, confirmed=True,
                     summary=f"SSRF confirmed: the server fetched an attacker-controlled URL placed in "
                             f"the {loc} parameter {param!r}.",
                     evidence=f"Set {loc} param {param!r} to a unique collaborator URL; the target called "
-                             f"back to it out-of-band, proving server-side request forgery (blind-safe).")
+                             f"back to it out-of-band, proving server-side request forgery (blind-safe)."
+                             + lost)
+            if reply is None:
+                kind, why = unsent[-1]
+                unsent[-1] = (kind, f"{why} after the request was sent; no callback within "
+                                    f"{self.timeout:g}s")
         failed = "; ".join(w for _, w in unsent[:4])
         if inband is not None:
             return ValidationResult(

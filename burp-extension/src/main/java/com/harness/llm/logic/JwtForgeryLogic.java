@@ -1,6 +1,7 @@
 package com.harness.llm.logic;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +33,8 @@ public final class JwtForgeryLogic {
     private static final Pattern CREDENTIAL_HEADER_NAME = Pattern.compile(
             "(?i)^(authorization|proxy-authorization|cookie)$|auth|token|api[-_]?key|session|secret|credential|jwt|bearer");
     private static final Pattern SCHEME_CREDENTIAL_VALUE = Pattern.compile("(?i)^\\s*(bearer|basic|digest|token)\\s+\\S");
+    /** Session and login cookie names CREDENTIAL_HEADER_NAME misses: PHPSESSID, connect.sid, remember_me. */
+    private static final Pattern SESSION_COOKIE_NAME = Pattern.compile("(?i)sess|sid$|remember|login|identity|refresh");
 
     private JwtForgeryLogic() {}
 
@@ -267,5 +270,83 @@ public final class JwtForgeryLogic {
                         + ") once the request's other credentials were removed -- the request needs more than "
                         + "the token, so the refusal does not show that the signature is verified.",
                 refused.detail() + " | original token alone status=" + tokenAloneStatus);
+    }
+
+    /**
+     * The request's cookies that the probes may keep when the token alone is
+     * refused (batch RV-Q item Q3): neither the carrier nor credential-like
+     * by name or value (see {@link #isCredentialHeader}), nor a session or
+     * login name such as PHPSESSID or connect.sid -- a tenant, a locale, a
+     * theme. Returns them as a Cookie header value, or null if there are none.
+     *
+     * @param cookieHeader the request's Cookie header values joined with "; ", or null
+     * @param carrier where the token under test is carried
+     */
+    public static String nonCredentialCookies(String cookieHeader, Carrier carrier) {
+        if (cookieHeader == null) return null;
+        List<String> kept = new ArrayList<>();
+        for (String pair : cookieHeader.split(";")) {
+            int eq = pair.indexOf('=');
+            if (eq <= 0) continue;
+            String name = pair.substring(0, eq).trim();
+            String value = pair.substring(eq + 1).trim();
+            if (name.isEmpty() || (carrier != null && carrier.cookie() && carrier.name().equals(name))) continue;
+            if (isCredentialHeader(name, value) || SESSION_COOKIE_NAME.matcher(name).find()) continue;
+            kept.add(name + "=" + value);
+        }
+        return kept.isEmpty() ? null : String.join("; ", kept);
+    }
+
+    /** The Cookie header a probe sends: the kept cookies, and the token if the carrier is a cookie. */
+    public static String cookieHeaderWith(String keptCookies, Carrier carrier, String token) {
+        return carrier.cookie() ? keptCookies + "; " + carrier.headerValue(token) : keptCookies;
+    }
+
+    /**
+     * The verdict once the probes were repeated with the non-credential
+     * cookies kept (see {@link #nonCredentialCookies}), the token alone having
+     * been refused. A forged token refused where the original token with the
+     * same cookies is accepted shows the signature is checked: the token is
+     * the only difference. A forged token accepted there is never confirmed:
+     * a kept cookie may still be what authenticates (a name rule cannot know),
+     * so it is a lead at most.
+     *
+     * @param forged the evaluation of the forged token sent with the kept cookies (the
+     *               no-token control being the kept cookies alone), or null if no forged probe was answered
+     * @param keptCookies the cookies kept, as sent
+     * @param tokenWithKeptStatus status of the original token sent with the kept cookies
+     * @param tokenAloneRefused the inconclusive verdict from {@link #requireTokenAloneAccepted}
+     */
+    public static Evidence withKeptCookies(Evidence forged, String keptCookies, int tokenWithKeptStatus,
+                                           Evidence tokenAloneRefused) {
+        String note = "cookies kept (not credential-like): " + cookieNames(keptCookies)
+                + " | original token with them status=" + tokenWithKeptStatus;
+        if (!isSuccess(tokenWithKeptStatus)) {
+            return new Evidence(Verdict.INCONCLUSIVE, 0.3, false, tokenAloneRefused.summary()
+                    + " With the cookies that do not look like credentials kept, the original token was refused "
+                    + "too (status " + tokenWithKeptStatus + ").", tokenAloneRefused.detail() + " | " + note);
+        }
+        if (forged == null) {
+            return new Evidence(Verdict.INCONCLUSIVE, 0.3, false, "The original token was accepted with the "
+                    + "non-credential cookies kept, but no forged probe with them was answered.",
+                    tokenAloneRefused.detail() + " | " + note);
+        }
+        String detail = forged.detail() + " | " + note;
+        if (forged.verdict() == Verdict.CONFIRMED) {
+            return new Evidence(Verdict.SUPPORTED, 0.6, false,
+                    forged.summary() + " But the probes kept cookies the request needs, and one of them may still "
+                            + "be what authenticates it (a session cookie whose name a rule does not recognise), "
+                            + "so this is a lead to check by hand, not a confirmed signature bypass.", detail);
+        }
+        return new Evidence(forged.verdict(), forged.confidence(), false, forged.summary(), detail);
+    }
+
+    private static String cookieNames(String cookies) {
+        List<String> names = new ArrayList<>();
+        for (String pair : cookies.split(";")) {
+            int eq = pair.indexOf('=');
+            names.add((eq < 0 ? pair : pair.substring(0, eq)).trim());
+        }
+        return String.join(", ", names);
     }
 }

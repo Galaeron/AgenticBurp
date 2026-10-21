@@ -1,5 +1,10 @@
 package com.harness.llm.logic;
 
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -59,16 +64,21 @@ public final class MassAssignmentLogic {
     private static final Pattern SAFE_ID = Pattern.compile("[A-Za-z0-9_-]{1,64}");
     private static final Pattern NUMERIC_ID = Pattern.compile("[0-9]{1,19}");
 
+    /** Id keys besides "id" that may name a created object; see {@link #createdObjectId}. */
+    private static final Set<String> ID_KEYS = Set.of("_id", "uuid", "guid");
+    private static final Pattern RESOURCE_SEGMENT = Pattern.compile("[a-z][a-z_-]*");
+
     /**
      * Where a create-style write's response says the created object lives
      * (code review 02 RV-J residual N3): its Location header, else the write
-     * path (query dropped) joined with a top-level "id" of the JSON body.
-     * The caller still has to check the reference is same-origin. Returns
-     * null if the response names no object.
+     * path (query dropped) joined with the id of the JSON body (see
+     * {@link #createdObjectId}). A Location always wins, so one the caller
+     * finds cross-origin names no object. The caller still has to check the
+     * reference is same-origin. Returns null if the response names no object.
      */
     public static String createdObjectReference(String writePath, String location, String responseBody) {
         if (location != null && !location.isBlank()) return location.trim();
-        String id = topLevelId(responseBody);
+        String id = createdObjectId(responseBody, writePath);
         if (id == null || writePath == null) return null;
         String path = writePath;
         int query = path.indexOf('?');
@@ -115,6 +125,134 @@ public final class MassAssignmentLogic {
             else if (c == '}' || c == ']') depth--;
         }
         return null;
+    }
+
+    /**
+     * The created object's id in a create-style write's JSON response (batch
+     * RV-Q item Q4): the top-level "id", as before, if it is one; else exactly
+     * one distinct id among a small fixed set of keys, matched ignoring case --
+     * "_id", "uuid", "guid" and the resource's own "userId" or "user_id" (for
+     * a write to /users) -- at the top level, or those and "id" one level
+     * under a top-level "data" object (JSON:API). An id is a string of safe
+     * path characters or a plain integer. Two different candidates, a
+     * candidate key whose value is not an id (a top-level "id" included), or
+     * a body that is not one well-formed object name no object: null.
+     */
+    public static String createdObjectId(String body, String writePath) {
+        String id = topLevelId(body);
+        if (id != null || body == null) return id;
+        String b = body.trim();
+        List<Member> top = members(b, 0);
+        if (top == null) return null;
+        Set<String> keys = idKeys(writePath);
+        Set<String> found = new LinkedHashSet<>();
+        for (Member m : top) {
+            if (m.key().equals("id")) return null;
+            if (keys.contains(m.key().toLowerCase(Locale.ROOT)) && !addId(found, b, m)) return null;
+            if (m.key().equals("data") && b.charAt(m.valueStart()) == '{') {
+                List<Member> data = members(b, m.valueStart());
+                if (data == null) return null;
+                for (Member d : data) {
+                    String key = d.key().toLowerCase(Locale.ROOT);
+                    if ((key.equals("id") || keys.contains(key)) && !addId(found, b, d)) return null;
+                }
+            }
+        }
+        return found.size() == 1 ? found.iterator().next() : null;
+    }
+
+    /** The fixed id keys plus "&lt;resource&gt;id" and "&lt;resource&gt;_id" for the write path's last segment, singular or plural. */
+    private static Set<String> idKeys(String writePath) {
+        Set<String> keys = new LinkedHashSet<>(ID_KEYS);
+        String path = writePath == null ? "" : writePath;
+        int query = path.indexOf('?');
+        if (query >= 0) path = path.substring(0, query);
+        while (path.endsWith("/")) path = path.substring(0, path.length() - 1);
+        String segment = path.substring(path.lastIndexOf('/') + 1).toLowerCase(Locale.ROOT);
+        if (!RESOURCE_SEGMENT.matcher(segment).matches()) return keys;
+        Set<String> names = new LinkedHashSet<>();
+        names.add(segment);
+        int n = segment.length();
+        if (segment.endsWith("ies")) names.add(segment.substring(0, n - 3) + "y");
+        if (segment.endsWith("es")) names.add(segment.substring(0, n - 2));
+        if (segment.endsWith("s")) names.add(segment.substring(0, n - 1));
+        for (String name : names) {
+            if (name.isEmpty()) continue;
+            keys.add(name + "id");
+            keys.add(name + "_id");
+        }
+        return keys;
+    }
+
+    private static boolean addId(Set<String> found, String b, Member m) {
+        String id = idValue(b, m);
+        if (id == null) return false;
+        found.add(id);
+        return true;
+    }
+
+    private record Member(String key, int valueStart) {}
+
+    /** The members of the JSON object opening at {@code open}, or null if it is not one well-formed object. */
+    private static List<Member> members(String b, int open) {
+        if (open >= b.length() || b.charAt(open) != '{') return null;
+        List<Member> members = new ArrayList<>();
+        int i = skipSpace(b, open + 1);
+        if (i < b.length() && b.charAt(i) == '}') return members;
+        while (i < b.length() && b.charAt(i) == '"') {
+            int keyEnd = endOfString(b, i);
+            if (keyEnd < 0) return null;
+            int colon = skipSpace(b, keyEnd + 1);
+            if (colon >= b.length() || b.charAt(colon) != ':') return null;
+            int value = skipSpace(b, colon + 1);
+            int valueEnd = endOfValue(b, value);
+            if (valueEnd < 0) return null;
+            members.add(new Member(b.substring(i + 1, keyEnd), value));
+            int next = skipSpace(b, valueEnd);
+            if (next < b.length() && b.charAt(next) == '}') return members;
+            if (next >= b.length() || b.charAt(next) != ',') return null;
+            i = skipSpace(b, next + 1);
+        }
+        return null;
+    }
+
+    /** The index just past the JSON value starting at {@code i}, or -1. */
+    private static int endOfValue(String b, int i) {
+        if (i >= b.length()) return -1;
+        char c = b.charAt(i);
+        if (c == '"') {
+            int end = endOfString(b, i);
+            return end < 0 ? -1 : end + 1;
+        }
+        if (c == '{' || c == '[') {
+            int depth = 0;
+            for (int k = i; k < b.length(); k++) {
+                char d = b.charAt(k);
+                if (d == '"') {
+                    k = endOfString(b, k);
+                    if (k < 0) return -1;
+                } else if (d == '{' || d == '[') {
+                    depth++;
+                } else if ((d == '}' || d == ']') && --depth == 0) {
+                    return k + 1;
+                }
+            }
+            return -1;
+        }
+        int k = i;
+        while (k < b.length() && ",}] \t\r\n".indexOf(b.charAt(k)) < 0) k++;
+        return k == i ? -1 : k;
+    }
+
+    /** The member's value if it is an id: a string of safe path characters or a plain integer; else null. */
+    private static String idValue(String b, Member m) {
+        int i = m.valueStart();
+        if (b.charAt(i) == '"') {
+            String value = b.substring(i + 1, endOfString(b, i));
+            return SAFE_ID.matcher(value).matches() ? value : null;
+        }
+        String value = b.substring(i, endOfValue(b, i));
+        return NUMERIC_ID.matcher(value).matches() ? value : null;
     }
 
     private static int endOfString(String s, int openQuote) {

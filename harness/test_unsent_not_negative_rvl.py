@@ -504,12 +504,14 @@ class _SourceEchoDriver:
 
 
 class _DialogOnlyDriver(_SourceEchoDriver):
-    """A page whose alert fired with the nonce, but whose console stayed silent."""
+    """A page whose alert fired with the computed product, but whose console
+    stayed silent (RV-O O8: was an alert of the nonce, which the payloads no
+    longer carry)."""
 
     async def visit(self, url, **kwargs):
         self.visits.append(url)
-        m = re.search(r"alert\('([^']+)'\)", _injected(url, self.part))
-        return ExecutionObservation(url=url, dialogs=[m[1]] if m else [])
+        products = re.findall(r"alert\((\d+)\*(\d+)\)", _injected(url, self.part))
+        return ExecutionObservation(url=url, dialogs=[f"alert:{int(a) * int(b)}" for a, b in products])
 
 
 class _ComputingDriver(_SourceEchoDriver):
@@ -521,8 +523,9 @@ class _ComputingDriver(_SourceEchoDriver):
 
 
 class ExecutionChallengeTests(_RvlBase):
-    """L7: only an exact console event equal to the product a*b confirms. The
-    payload carries the operands, never the product, so an echo cannot match."""
+    """L7: only an exact console event equal to the product a*b confirms (RV-O
+    O8 added an exact dialog). The payload carries the operands, never the
+    product, so an echo cannot match."""
 
     def _browser(self, driver):
         return self._validate("browser_xss", BrowserXssValidator(allowed_hosts=["shop.invalid"], driver=driver),
@@ -532,26 +535,37 @@ class ExecutionChallengeTests(_RvlBase):
         return self._validate("dom_xss", DomXssValidator(allowed_hosts=["shop.invalid"], driver=driver),
                               _finding("dom_xss"), _exchange("http://shop.invalid/page?ref=1"))
 
-    def _assert_unconfirmed(self, reports, driver):
+    # RV-O O8, owner decision 2026-10-21: an echo in a dialog, or a page error,
+    # is a candidate to check by hand (inconclusive), no longer not_confirmed.
+    # A console echo keeps its verdict, and no echo ever confirms.
+    _ECHO = {"console": "not_confirmed", "dialogs": "inconclusive", "page_errors": "inconclusive"}
+
+    def _assert_unconfirmed(self, reports, driver, status="not_confirmed"):
         self.assertTrue(driver.visits, "no page was visited -- vacuous")
         self.assertFalse(any(r.confirmed for r in reports), _text(reports))
-        self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
+        self.assertEqual([r.status for r in reports], [status], _verdicts(reports))
 
     def test_browser_xss_echo_of_payload_source_is_not_execution(self):
         for sinks in (("console",), ("dialogs",), ("page_errors",)):
             with self.subTest(sinks=sinks):
                 d = _SourceEchoDriver("query", sinks)
-                self._assert_unconfirmed(self._browser(d), d)
+                self._assert_unconfirmed(self._browser(d), d, self._ECHO[sinks[0]])
 
     def test_dom_xss_echo_of_payload_source_is_not_execution(self):
         for sinks in (("console",), ("dialogs",), ("page_errors",)):
             with self.subTest(sinks=sinks):
                 d = _SourceEchoDriver("fragment", sinks)
-                self._assert_unconfirmed(self._dom(d), d)
+                self._assert_unconfirmed(self._dom(d), d, self._ECHO[sinks[0]])
 
-    def test_browser_xss_dialog_alone_does_not_confirm(self):
+    def test_browser_xss_dialog_alone_with_the_product_confirms(self):
+        # RV-O O8, owner decision 2026-10-21 (was
+        # test_browser_xss_dialog_alone_does_not_confirm, which wanted
+        # not_confirmed): a dialog showing exactly the computed product is
+        # execution, and the report says it was shown by the dialog only.
         d = _DialogOnlyDriver("query")
-        self._assert_unconfirmed(self._browser(d), d)
+        reports = self._browser(d)
+        self.assertEqual([r.status for r in reports], ["confirmed"], _text(reports))
+        self.assertIn("dialog only", reports[0].summary)
 
     def test_browser_xss_computed_product_confirms(self):
         reports = self._browser(_ComputingDriver("query"))
@@ -566,7 +580,7 @@ class ExecutionChallengeTests(_RvlBase):
             for mod in (browser_xss_validator, dom_xss_validator):
                 a, b, expected = mod._challenge()
                 self.assertEqual(expected, str(a * b))
-                payloads = (mod._payloads("HARNESSXSS0", a, b) if mod is browser_xss_validator
+                payloads = (mod._payloads(a, b) if mod is browser_xss_validator  # RV-O O8: no nonce
                             else mod._fragment_payloads(a, b))
                 for payload in payloads:
                     self.assertNotIn(expected, payload)
@@ -726,11 +740,11 @@ class MfaAnonymousControlTests(_RvlBase):
                 reports = self._run((status, {}, "login required"))
                 self.assertEqual([r.status for r in reports], ["confirmed"], _text(reports))
 
-    def test_step_up_redirect_is_unchanged(self):
-        # Owner decision recorded in the RV-L handoff: a 302 to the 2FA step is
-        # still read as a denial, as the leg fixture's /my-account does.
-        reports = self._run((302, {"Location": "/2fa/verify"}, ""))
-        self.assertEqual([r.status for r in reports], ["confirmed"], _text(reports))
+    def test_step_up_redirect_is_not_a_denial(self):
+        # Owner decision 2026-10-21 (batch RV-R, R1): a 302 to the 2FA step is
+        # not a denial. Until then this test asserted it confirmed.
+        self._assert_candidate(self._run((302, {"Location": "/2fa/verify"}, "")),
+                               "HTTP 302, a redirect to the second-factor step /2fa/verify")
 
     def test_public_page_is_negative(self):
         reports = self._run((200, {}, "<html>Account of alice. <a href='/logout'>Log out</a></html>"))
