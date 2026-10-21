@@ -894,6 +894,8 @@ class ChainMixin:
                            evidence=finding.get("evidence") or "",
                            suggested_test=finding.get("suggested_test") or "", basis="derived")
 
+        _protected: list = []   # RV-S: this target's declared routes, built on first use
+
         async def _confirm(finding, exchange):
             """Dispatch a finding to the deterministic confirmation leg for its class:
             access-control -> cross-identity replay; xss -> headless-browser execution.
@@ -903,27 +905,52 @@ class ChainMixin:
             if low in ("auth_bypass", "missing_authentication", "missing authentication"):
                 # Replay the captured read with every credential stripped. This is
                 # not an IDOR/BFLA comparison and needs no second user. An anonymous
-                # payload confirms only for a route declared protected (RV-G R15);
-                # a model label or a privileged-looking path is a hypothesis, not
-                # that declaration, and no operator or engagement declaration
-                # reaches this caller, so the probe reports an unconfirmed
-                # `unauthenticated_access` candidate (RV-M M1). A future declaration
-                # must also pass the authenticated baseline, as /probe-missing-auth does.
+                # payload confirms only for a route declared protected (RV-G R15).
+                # A model label or a privileged-looking path is a hypothesis, not
+                # that declaration (RV-M M1); the operator's list of protected path
+                # patterns is (RV-S: authz.protected_paths in config, plus the
+                # engagement's protected_paths). A listed route must also return
+                # the authenticated baseline's payload to the anonymous replay; an
+                # unlisted route stays an unconfirmed `unauthenticated_access`
+                # candidate.
                 try:
+                    from harness import protected_routes
                     parts = urlsplit(exchange.url)
                     path = parts.path or "/"
                     if parts.query:
                         path += "?" + parts.query
+                    method = (exchange.method or "GET").upper()
+                    if not _protected:
+                        _protected.append(protected_routes.ProtectedRoutes.for_target(
+                            self.config, base_url,
+                            engagement_paths=getattr(state, "protected_paths", None)))
+                    declared = _protected[0].match(method, exchange.url)
+                    baseline = exchange.request_headers
+                    if declared is not None and not any(
+                            k.lower() in missing_auth_probe._AUTH_HEADERS for k in (baseline or {})):
+                        # The probe identity of an anonymously reached node is
+                        # anonymous, so the baseline borrows the highest-trust
+                        # supplied identity's credentials: only the headers the
+                        # probe strips, so none can reach the anonymous replay.
+                        authed = [r for r in roles if any(
+                            k.lower() in missing_auth_probe._AUTH_HEADERS for k in (r.headers or {}))]
+                        if authed:
+                            top = max(authed, key=lambda r: role_crawl._trust(r.role))
+                            baseline = {**(baseline or {}), **{
+                                k: v for k, v in top.headers.items()
+                                if k.lower() in missing_auth_probe._AUTH_HEADERS}}
                     outcome = await missing_auth_probe.probe(
-                        base_url, ((exchange.method or "GET").upper(), path),
+                        base_url, (method, path),
                         allowed_hosts=self.allowed_hosts,
-                        baseline_headers=exchange.request_headers,
+                        baseline_headers=baseline,
                         send_garbage_token=False,
-                        expected_protected=False,
+                        expected_protected=declared is not None,
                         protected_baseline=True,
                         run_context=run_context)
                     if outcome.finding is not None:
                         proof = outcome.finding
+                        why = (f" Route declared protected by {declared.describe()}."
+                               if declared is not None else "")
                         await _apply(
                             finding,
                             ValidationResult(
@@ -931,8 +958,10 @@ class ChainMixin:
                                 status="confirmed" if proof.confirmed else "inconclusive",
                                 finding_class="missing_authentication",
                                 confidence=proof.confidence, confirmed=bool(proof.confirmed),
-                                summary=proof.summary, evidence=proof.evidence),
+                                summary=proof.summary + why, evidence=proof.evidence + why),
                             "missing-auth", 0.85, exchange)
+                        if proof.confirmed and declared is not None:
+                            finding["protected_route"] = declared.to_dict()
                 except Exception:
                     return
             elif access_control_gate._is_access_control_class(vc):

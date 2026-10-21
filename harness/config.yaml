@@ -296,6 +296,22 @@ engagement:
   coverage_drive_legs: false
   coverage_leg_budget: 80
 
+# RV-S: operator-declared protected routes (harness/protected_routes.py). The
+# engagement chain confirms missing authentication ONLY on a route listed here
+# (or in the engagement's own protected_paths), and only when the anonymous
+# replay returns the same payload as an authenticated baseline. An unlisted
+# route stays an unconfirmed `unauthenticated_access` candidate. Keys are the
+# target's host, or host:port when the port is not the scheme's default.
+# Patterns: optional method, then a path matched against the whole normalized
+# path (query dropped, numeric ids as {id}); `*` stays within one segment, `**`
+# spans segments. A malformed entry is ignored with a warning.
+# SAFE DEFAULT: absent (no route is declared protected). Declare routes in the
+# git-ignored config.local.yaml, never here. Example:
+# authz:
+#   protected_paths:
+#     "app.example.test": ["/admin/**", "GET /api/account/*"]
+#     "127.0.0.1:8080": ["/reports/*"]
+
 # P2-1: business-context planning agent. When on, investigate_engagement runs
 # ONE application-context pass that builds an Application Semantic Model (apparent
 # roles + privilege order, business objects, ordered value-bearing workflows,
