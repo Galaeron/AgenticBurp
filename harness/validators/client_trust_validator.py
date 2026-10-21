@@ -122,6 +122,10 @@ class ClientTrustValidator(Validator):
         p = urlsplit(exchange.url)
         origin = f"{p.scheme}://{p.netloc}"
 
+        # A read-back or token refresh that got no response is not a negative
+        # (RV-P P1): the confirming page may be the one that never answered.
+        refresh_failures: list[str] = []
+        refused, errors = "", []
         try:
             async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                         follow_redirects=True, verify=False) as client:
@@ -130,9 +134,19 @@ class ClientTrustValidator(Validator):
                 # Refresh an in-session CSRF token if the write is token-bound.
                 ckey = next((k for k in fields if _CSRF_KEYS.search(str(k))), None)
                 if ckey is not None:
-                    tampered = await self._refresh_csrf(client, exchange, tampered, ckey, kind)
+                    tampered = await self._refresh_csrf(client, exchange, tampered, ckey, kind,
+                                                        refresh_failures)
                 resp = await self._send(client, method, exchange.url,
                                         self._headers(exchange), _encode(tampered, kind))
+                if resp.status_code >= 400 and refresh_failures:
+                    return ValidationResult(
+                        self.name, "inconclusive", "business_logic", confidence=0.0, confirmed=False,
+                        summary=f"Client-trust check incomplete: the in-session CSRF token could not be "
+                                f"refreshed ({'; '.join(refresh_failures[:3])}), so the rejected write "
+                                f"(HTTP {resp.status_code}) may be the stale token; not a negative result",
+                        evidence=f"POST {exchange.url} with {vkey}={sentinel} and the captured {ckey} "
+                                 f"→ {resp.status_code}; the source page that mints a fresh {ckey} "
+                                 f"never answered.")
                 if resp.status_code >= 400:
                     return ValidationResult(
                         self.name, "not_confirmed", "business_logic", confidence=0.0, confirmed=False,
@@ -143,40 +157,57 @@ class ClientTrustValidator(Validator):
                 read_headers = {k: v for k, v in self._headers(exchange).items()
                                 if k.lower() != "content-type"}
                 pages = [resp.text or ""]
-                targets = [str(resp.url)] + [origin + sp for sp in _SUMMARY_PATHS]
-                seen = set()
+                targets = list(dict.fromkeys([str(resp.url)] + [origin + sp for sp in _SUMMARY_PATHS]))
                 for t in targets:
-                    if t in seen:
-                        continue
-                    seen.add(t)
                     try:
                         rr = await self._send(client, "GET", t, read_headers, None)
                         pages.append(rr.text or "")
-                    except httpx.HTTPError:
+                    except SafetyGateBlocked as e:
+                        # Nothing more can send once the gate refuses (budget, scope).
+                        refused = e.decision.reason
+                        break
+                    except httpx.HTTPError as e:
+                        errors.append(f"GET {t}: {e.__class__.__name__}")
                         continue
-                for body in pages:
-                    if wanted[0] in body:  # the $DDD.CC rendering of the sentinel
-                        return ValidationResult(
-                            self.name, "confirmed", "business_logic", confidence=0.9, confirmed=True,
-                            summary=(f"Excessive trust in client-side controls confirmed: the server accepted a "
-                                     f"client-supplied {vkey} and reflected it back on an independent read."),
-                            evidence=(f"The captured request set {vkey}={original}; replaying it with "
-                                      f"{vkey}={sentinel} caused the summary to show the attacker-chosen amount "
-                                      f"(${wanted[0]}). The server trusts the client value instead of its own "
-                                      f"authoritative price. No checkout/purchase was performed."))
-                return ValidationResult(
-                    self.name, "not_confirmed", "business_logic", confidence=0.0, confirmed=False,
-                    summary=f"Server did not reflect the tampered {vkey}; it appears to own the value.",
-                    evidence=f"Set {vkey}={sentinel} but ${wanted[0]} was not shown on re-read -- the server "
-                             f"likely re-derives its own authoritative amount.")
-        except SafetyGateBlocked:
-            return self._skip("mutating client-trust tamper not authorized (validators.allow_mutating_replay)")
+        except SafetyGateBlocked as e:
+            return ValidationResult(
+                self.name, "blocked", "business_logic", confidence=0.0, confirmed=False,
+                summary=f"Client-trust check incomplete: the tampered write was refused by the "
+                        f"safety gate ({e.decision.reason}); not a negative result",
+                evidence=f"No tampered {vkey} write reached {exchange.url}.")
         except httpx.HTTPError as e:
             return ValidationResult(self.name, "error", "business_logic",
                                     summary=f"request failed: {e.__class__.__name__}")
+        for body in pages:
+            if wanted[0] in body:  # the $DDD.CC rendering of the sentinel
+                return ValidationResult(
+                    self.name, "confirmed", "business_logic", confidence=0.9, confirmed=True,
+                    summary=(f"Excessive trust in client-side controls confirmed: the server accepted a "
+                             f"client-supplied {vkey} and reflected it back on an independent read."),
+                    evidence=(f"The captured request set {vkey}={original}; replaying it with "
+                              f"{vkey}={sentinel} caused the summary to show the attacker-chosen amount "
+                              f"(${wanted[0]}). The server trusts the client value instead of its own "
+                              f"authoritative price. No checkout/purchase was performed."))
+        answered = len(pages) - 1
+        if refused or errors:
+            why = "; ".join(([f"refused by the safety gate ({refused})"] if refused else []) + errors[:3])
+            return ValidationResult(
+                self.name, "inconclusive", "business_logic", confidence=0.0, confirmed=False,
+                summary=f"Client-trust check incomplete: {len(targets) - answered} of {len(targets)} "
+                        f"read-back(s) got no response ({why}); not a negative result",
+                evidence=f"The write with {vkey}={sentinel} was accepted (HTTP {resp.status_code}); "
+                         f"{answered} answered read-back(s) did not show ${wanted[0]}, but a page "
+                         f"that never answered cannot show it.")
+        return ValidationResult(
+            self.name, "not_confirmed", "business_logic", confidence=0.0, confirmed=False,
+            summary=f"Server did not reflect the tampered {vkey}; it appears to own the value.",
+            evidence=f"Set {vkey}={sentinel} but ${wanted[0]} was not shown on re-read -- the server "
+                     f"likely re-derives its own authoritative amount.")
 
-    async def _refresh_csrf(self, client, exchange, fields: dict, ckey: str, kind: str) -> dict:
-        """Mint a fresh CSRF token in THIS session from the write's source page."""
+    async def _refresh_csrf(self, client, exchange, fields: dict, ckey: str, kind: str,
+                            failures: list[str]) -> dict:
+        """Mint a fresh CSRF token in THIS session from the write's source page.
+        A source page that never answered is recorded in `failures`."""
         from harness.validators.source_form import fetch_source_form
 
         def select(forms):
@@ -188,13 +219,16 @@ class ClientTrustValidator(Validator):
             return None
 
         try:
-            found = await fetch_source_form(client, [exchange.url], self._headers(exchange), select)
+            found = await fetch_source_form(client, [exchange.url], self._headers(exchange), select,
+                                            failures=failures)
             if found is not None:
                 tok = next((fld.value for fld in found.form.fields
                             if _CSRF_KEYS.search(fld.name or "") and fld.value), None)
                 if tok:
                     out = dict(fields); out[ckey] = tok
                     return out
-        except (httpx.HTTPError, Exception):
-            pass
+        except SafetyGateBlocked as e:
+            failures.append(f"GET {exchange.url}: refused ({e.decision.reason})")
+        except Exception as e:
+            failures.append(f"GET {exchange.url}: {e.__class__.__name__}")
         return fields
