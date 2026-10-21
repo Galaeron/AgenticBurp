@@ -47,7 +47,11 @@ class ConfirmMixin:
         start, an import failed, anything) is swallowed and produces an
         EMPTY frozenset -- "could not measure" demotes every confirmable
         class to provisional this run, it never falls back to trusting the
-        static table while claiming to be run-derived."""
+        static table while claiming to be run-derived.
+
+        The per-case report (`run_self_test(report_out=...)`) is kept on
+        `self.leg_self_test_report`, so a class left out because its tool is
+        unavailable says so (RV-O O6); it never changes the markers."""
         cfg = (getattr(self, "config", {}) or {}).get("leg_self_test", {}) or {}
         if not cfg.get("enabled", False):
             return None  # override absent -- confirmation_gate uses its static offline default
@@ -55,13 +59,19 @@ class ConfirmMixin:
         if cached is not None:
             return cached
         from harness import leg_self_test
+        report: dict = {}
         try:
-            markers = await asyncio.to_thread(leg_self_test.run_self_test)
+            markers = await asyncio.to_thread(leg_self_test.run_self_test, report_out=report)
         except Exception:
             log.warning(
                 "leg self-test crashed this run -- every confirmable class "
                 "falls back to provisional (fail-safe)", exc_info=True)
             markers = frozenset()
+        self.leg_self_test_report = report
+        for marker, entry in sorted(report.items()):
+            if entry.get("status") == "unavailable":
+                log.info("leg self-test: %s left provisional this run -- %s",
+                         marker, entry.get("reason") or "unavailable")
         self._leg_self_test_cache = markers
         return markers
 

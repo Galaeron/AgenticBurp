@@ -22,7 +22,12 @@ from urllib.parse import parse_qs, unquote, unquote_plus
 
 import httpx
 
+from harness import leg_self_test
 from harness.browser_driver import ExecutionObservation
+from harness.coverage_model import CellStatus, derive_input_cases
+from harness.coverage_tracker import CoverageTracker, build_coverage, endpoint_view
+from harness.orchestrator_confirm import log as confirm_log
+from harness.test_coverage_tracker import _state_with
 from harness.test_confirmation_soundness_rve import _finding, _json_exchange, _verdicts
 from harness.test_default_history_caller import _exchange
 from harness.test_unsent_not_negative_rvl import (_Collaborator, _RvlBase, _refuse_all, _response,
@@ -475,6 +480,107 @@ class SsrfLateCallbackTests(_RvoBase):
                 self.assertEqual(collab.waited, [], "a send that never connected was waited on")
                 self._assert_not_negative(reports, "inconclusive")
                 self.assertIn("ConnectError", _text(reports))
+
+
+# ------------------------------------------------------ O6 coverage records
+_TICKETS = "GET /api/tickets/{id}"
+_IDOR = "WSTG-ATHZ-04"
+# The statuses not_tested() listed before O6: a finalized report keeps exactly these.
+_PRE_O6 = ("not_applicable", "skipped", "blocked", "inconclusive", "error")
+
+
+def _tickets_state():
+    return _state_with([("GET", "/api/tickets/{id}", {"reachable_roles": ["user"]})])
+
+
+class CoverageNotTestedTests(unittest.TestCase):
+    """CoverageTracker.report() is the not_tested reader every build_coverage*
+    run returns; build() leaves applicable cells PENDING until finalize."""
+
+    def test_unfinalized_report_lists_pending_and_running_cells(self):
+        tracker = CoverageTracker()
+        tracker.build(endpoint_view(_tickets_state()), ["anonymous", "user"])
+        tracker.matrix.record("user", _TICKETS, _IDOR, status=CellStatus.RUNNING)
+        pending = [(ident, check) for (ident, _ep, check), cell in tracker.matrix.cells().items()
+                   if cell.status == CellStatus.PENDING]
+        self.assertTrue(pending)
+        listed = {(item["identity"], item["check"]): item for item in tracker.report()["not_tested"]}
+        for key in pending:
+            self.assertEqual(listed[key]["status"], "pending")
+            self.assertTrue(listed[key]["reason"])
+        self.assertEqual(listed[("user", _IDOR)]["status"], "running")
+        self.assertIn("still running", listed[("user", _IDOR)]["reason"])
+
+    def test_finalized_report_is_unchanged(self):
+        # Control: finalize turns every case-free PENDING cell SKIPPED, so the
+        # production report lists the same cells as before O6.
+        report = build_coverage(_tickets_state(), [type("R", (), {"role": "user"})()],
+                                investigated_keys={_TICKETS})
+        self.assertTrue(report["not_tested"])
+        for item in report["not_tested"]:
+            self.assertIn(item["status"], _PRE_O6)
+        listed = sum(1 for item in report["not_tested"])
+        self.assertEqual(listed, sum(report["by_status"].get(s, 0) for s in _PRE_O6))
+
+    def test_case_bearing_parent_is_left_to_cases_not_tested(self):
+        # Control: a parent whose cases are still open stays PENDING after
+        # finalize; its open cases are already named in cases_not_tested, so
+        # the finalized not_tested list is unchanged for it too.
+        tracker = CoverageTracker()
+        tracker.build(endpoint_view(_tickets_state()), ["user"])
+        tracker.matrix.expand_cases("user", _TICKETS, _IDOR, derive_input_cases(query="id=7"))
+        tracker.finalize_pending_reasons(investigated_keys={_TICKETS})
+        self.assertEqual(tracker.matrix.get("user", _TICKETS, _IDOR).status, CellStatus.PENDING)
+        report = tracker.report()
+        self.assertNotIn(_IDOR, {item["check"] for item in report["not_tested"]})
+        self.assertIn(_IDOR, {item["check"] for item in report["cases_not_tested"]})
+
+
+class LiveMarkerReportTests(_RvoBase):
+    """get_run_derived_live_markers on a real Orchestrator (the
+    _analyze_inner caller reads only its return value)."""
+
+    def _markers(self, fake):
+        orch = self._orch()
+        orch.config["leg_self_test"] = {"enabled": True}
+        with patch.object(leg_self_test, "run_self_test", fake):
+            return orch, asyncio.run(orch.get_run_derived_live_markers())
+
+    def test_unavailable_reason_is_kept_on_the_orchestrator(self):
+        seen = []
+
+        def fake(report_out=None):
+            seen.append(report_out)
+            report_out.update({
+                "xss": {"status": "unavailable", "reason": "needs Playwright"},
+                "ssti": {"status": "live", "reason": "confirmed and refuted"}})
+            return frozenset({"ssti"})
+
+        with self.assertLogs(confirm_log, "INFO") as logs:
+            orch, markers = self._markers(fake)
+        self.assertEqual(markers, frozenset({"ssti"}))
+        self.assertIs(seen[0], orch.leg_self_test_report)
+        self.assertEqual(orch.leg_self_test_report["xss"],
+                         {"status": "unavailable", "reason": "needs Playwright"})
+        self.assertTrue(any("xss" in line and "needs Playwright" in line for line in logs.output))
+
+    def test_markers_are_unchanged_by_the_report(self):
+        # Control: the report never adds or removes a marker.
+        def fake(report_out=None):
+            report_out["xss"] = {"status": "unavailable", "reason": "needs Playwright"}
+            return frozenset()
+
+        _orch, markers = self._markers(fake)
+        self.assertEqual(markers, frozenset())
+
+    def test_crash_still_demotes_everything(self):
+        # Control: the fail-safe is unchanged; the report is whatever was reached.
+        def fake(report_out=None):
+            raise RuntimeError("fixture would not start")
+
+        orch, markers = self._markers(fake)
+        self.assertEqual(markers, frozenset())
+        self.assertEqual(orch.leg_self_test_report, {})
 
 
 if __name__ == "__main__":
