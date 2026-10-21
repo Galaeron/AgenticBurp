@@ -164,7 +164,7 @@ class CoverageTracker:
             if not reach:
                 continue  # reachability unknown -> leave applicable cells pending
             for ident in identities:
-                if identity_roles.get(ident, ident) in reach:
+                if _reaches(ident, ep, identity_roles):
                     continue
                 # this identity never reached this endpoint -> not attemptable as it
                 for check in self.checks:
@@ -180,8 +180,7 @@ class CoverageTracker:
     def _probe_identity(self, ep: dict, identities: list[str],
                         identity_roles: dict[str, str] | None = None) -> str:
         identity_roles = identity_roles or {}
-        reach = [str(r) for r in (ep.get("reachable_roles") or [])]
-        pool = [i for i in identities if identity_roles.get(i, i) in reach] or list(identities)
+        pool = [i for i in identities if _reaches(i, ep, identity_roles)] or list(identities)
         return (min(pool, key=lambda i: _trust(identity_roles.get(i, i))) if pool
                 else (identities[0] if identities else "anonymous"))
 
@@ -486,6 +485,8 @@ def endpoint_view(state) -> dict[str, dict]:
             "methods": (ep.method,),
             "access": ep.access,
             "reachable_roles": ep.reachable_roles,
+            # WL-02 principal cells: reachability is decided per principal.
+            "access_by_principal": getattr(ep, "access_by_principal", None) or {},
             "object_scoped": ep.object_scoped,
             "findings": ep.findings,
             # T05: the captured request template, so the case layer can derive the
@@ -493,6 +494,16 @@ def endpoint_view(state) -> dict[str, dict]:
             "template": getattr(ep, "template", None),
         }
     return out
+
+
+def _reaches(ident: str, ep: dict, identity_roles: dict[str, str]) -> bool:
+    """Whether coverage identity `ident` (a principal id) reached endpoint `ep`:
+    its own access cell decides, so a principal denied with 403 is not counted
+    as reaching because another principal of its role did (or one NAMED like
+    its role); without a cell, its role in the role view (engagement.principal_reached)."""
+    from harness.engagement import principal_reached
+    return principal_reached(ep.get("access_by_principal"), ep.get("reachable_roles"),
+                             ident, identity_roles.get(ident, ident))
 
 
 def _identities_of(roles) -> tuple[list[str], dict[str, str]]:

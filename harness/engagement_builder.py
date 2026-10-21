@@ -164,7 +164,7 @@ async def build_engagement(
             access.record(principal_id, **observation)
         state.record_template(ex.url, ex.method, ex)
     for r in roles:
-        state.ingest_identity(f"rolecrawl:{r.role}", r.role, source="seed")
+        state.ingest_identity(f"rolecrawl:{r.name or r.role}", r.role, source="seed")
 
     log.info("build_engagement: %s -- %d endpoints, %d idor candidates, %d idor findings",
              base_url, len(result.endpoints), len(result.idor_candidates), len(result.idor_findings))

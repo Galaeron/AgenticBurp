@@ -389,12 +389,43 @@ def _cross_role_finding(method: str, url: str, owner_role: str, requester_role: 
     )
 
 
+def _cross_role_addresses(roles: list[RoleSession]) -> dict:
+    """The principals the active cross-role probe pairs up, as {address:
+    (index, session)}: one entry per principal (_matrix_principal_id), so two
+    same-role users are probed against each other and a renewed credential is
+    never probed against itself. A principal is addressed by its name; an
+    unnamed one by its role label while that label names exactly one supplied
+    principal (the historical role-keyed address), else by its principal id."""
+    first: dict[str, tuple[int, RoleSession]] = {}
+    for i, r in enumerate(roles):
+        first.setdefault(_matrix_principal_id(r), (i, r))
+    per_role: dict[str, int] = {}
+    for _i, r in first.values():
+        per_role[r.role] = per_role.get(r.role, 0) + 1
+    out: dict = {}
+    for pid, (i, r) in first.items():
+        address = r.name or (r.role if per_role[r.role] == 1 else pid)
+        out.setdefault(address, (i, r))
+    return out
+
+
+def _cross_role_owner(key: str, roles: list[RoleSession], addresses: dict) -> str:
+    """An owned_object_ids key -> its probe address; a key that is a principal id
+    (e.g. "user#1a2b3c4d") resolves to that principal's address."""
+    if key in addresses:
+        return key
+    for address, (_i, r) in addresses.items():
+        if _matrix_principal_id(r) == key:
+            return address
+    return key
+
+
 async def probe_cross_role_objects(
     base_url: str,
     roles: list[RoleSession],
     method: str,
     path: str,
-    owned_object_ids: dict,        # owner role -> the real object id that role owns
+    owned_object_ids: dict,        # owner principal (see _cross_role_addresses) -> the real object id it owns
     *,
     allowed_hosts: list[str] | None = None,
     timeout: float = 15.0,
@@ -414,9 +445,10 @@ async def probe_cross_role_objects(
 
     `session_refs`, when supplied, must align 1:1 with `roles` (same contract
     as `crawl_roles`)."""
-    role_by_name = {r.role: (i, r) for i, r in enumerate(roles)}
+    role_by_name = _cross_role_addresses(roles)
     outcomes: list[CrossRoleOutcome] = []
     for owner_role, obj_id in owned_object_ids.items():
+        owner_role = _cross_role_owner(owner_role, roles, role_by_name)
         if not obj_id or owner_role not in role_by_name:
             continue
         url = map_._build_url(base_url, path, str(obj_id))
@@ -446,7 +478,7 @@ async def probe_cross_role_objects(
 async def probe_cross_role_matrix(
     result: RoleCrawlResult,
     roles: list[RoleSession],
-    owned_object_ids: dict,        # role -> {normalized path: object id owned by that role}
+    owned_object_ids: dict,        # owner principal -> {normalized path: object id it owns}
     *,
     allowed_hosts: list[str] | None = None,
     timeout: float = 15.0,
