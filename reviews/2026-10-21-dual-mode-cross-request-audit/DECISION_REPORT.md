@@ -63,7 +63,7 @@ implementation files were not opened. The `git fetch --unshallow` added history 
 5. **The operator cannot see or steer cross-request evidence, and the two modes do not share it.**
    - **Burp contract:** Burp's client model omits `degraded`, `agent_errors`, `stage_outcomes`, `observation_context`, `validation_reports` and `proof_records`. It sends no capture time, completeness, pile or attribution, and fans a multi-selection out into unrelated analyses. It cannot start or read an investigation (E21, E22).
    - **Mode separation:** investigation results never become observations. The job's state, matrix and coverage live only in the job record and manifest (E30, E31). Advisory and automated modes therefore cannot cite each other's evidence (X7).
-   - **Privacy:** "passive" analysis also sends component names to five third-party services by default, and the docs do not say so (E19).
+   - **Privacy:** "passive" analysis also contacts third-party services by default, and the docs do not say so (E19). It sends component names (not versions) to GitHub, npm and PyPI, and downloads the CISA KEV feed. This was corrected in fix batch 1; see [FIX_BATCH_1.md](FIX_BATCH_1.md).
 
 ## 2. Architecture and mode map
 
