@@ -322,4 +322,113 @@ final class ValidationExecutorRoundThreeTest {
         assertTrue(run.sent().size() <= 3 + 4, "at most four requests more than RV-N's three: " + run.sent().size());
     }
 
+    // ------------------------------------------------------------------ Q4
+    private static final Pattern ROLE_ADMIN = Pattern.compile("\"role\"\\s*:\\s*\"admin\"");
+
+    /**
+     * POST /users creates a user (ids prefix+44 onwards) and answers 201 with
+     * the body {@code created} builds from the new id and the request body;
+     * GET /users lists ids only; GET /users/{id} shows the user.
+     */
+    private static Function<HttpRequest, Reply> usersServer(Map<String, String> roles, String prefix,
+                                                            java.util.function.BiFunction<String, String, String> created,
+                                                            Map<String, String> createdHeaders) {
+        int[] next = {44};
+        return r -> {
+            if (r.method().equals("POST") && r.path().equals("/users")) {
+                String id = prefix + next[0]++;
+                roles.put(id, ROLE_ADMIN.matcher(r.bodyToString()).find() ? "admin" : "user");
+                return new Reply(201, created.apply(id, r.bodyToString()), createdHeaders);
+            }
+            if (r.method().equals("GET") && r.path().equals("/users")) {
+                return Reply.of(200, "[" + String.join(",", roles.keySet().stream().map(k -> "{\"ref\":\"" + k + "\"}").toList()) + "]");
+            }
+            if (r.method().equals("GET") && r.path().startsWith("/users/")) {
+                String id = r.path().substring("/users/".length());
+                String role = roles.get(id);
+                return role == null ? Reply.of(404, "no such user")
+                        : Reply.of(200, "{\"ref\":\"" + id + "\",\"name\":\"sample\",\"role\":\"" + role + "\"}");
+            }
+            return Reply.of(404, "not found");
+        };
+    }
+
+    /** The request body echoed with {@code "key": id} added (a string id quoted, a number not). */
+    private static String echoWith(String key, String id, String requestBody) {
+        String value = id.chars().allMatch(Character::isDigit) ? id : "\"" + id + "\"";
+        return requestBody.substring(0, requestBody.lastIndexOf('}')) + ",\"" + key + "\":" + value + "}";
+    }
+
+    private static Run createUser(Map<String, String> roles, String prefix, String capturedBody,
+                                  java.util.function.BiFunction<String, String, String> created) throws Exception {
+        return createUser(roles, prefix, capturedBody, created, Map.of());
+    }
+
+    private static Run createUser(Map<String, String> roles, String prefix, String capturedBody,
+                                  java.util.function.BiFunction<String, String, String> created,
+                                  Map<String, String> createdHeaders) throws Exception {
+        return execute("api_security_validation",
+                request("POST", "/users", "{\"name\":\"sample\"}", headers("Content-Type", "application/json", "Cookie", "session=synthetic")),
+                new Reply(201, capturedBody, createdHeaders), usersServer(roles, prefix, created, createdHeaders));
+    }
+
+    @Test
+    @DisplayName("Q4 repro (recall): a created object named by \"userId\" is read back -> confirmed")
+    void massAssignmentUserIdIsConfirmed() throws Exception {
+        Map<String, String> roles = new java.util.concurrent.ConcurrentHashMap<>(Map.of("43", "user"));
+        Run run = createUser(roles, "", "{\"name\":\"sample\",\"userId\":43}", (id, body) -> echoWith("userId", id, body));
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
+        assertEquals("GET /users/43; POST /users; GET /users/44; ", describe(run));
+    }
+
+    @Test
+    @DisplayName("Q4 repro (recall): a created object named by a nested data.id is read back -> confirmed")
+    void massAssignmentNestedDataIdIsConfirmed() throws Exception {
+        Map<String, String> roles = new java.util.concurrent.ConcurrentHashMap<>(Map.of("43", "user"));
+        Run run = createUser(roles, "", "{\"data\":{\"type\":\"users\",\"id\":\"43\"}}",
+                (id, body) -> "{\"data\":{\"type\":\"users\",\"id\":\"" + id + "\",\"attributes\":" + body + "}}");
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
+        assertEquals("GET /users/43; POST /users; GET /users/44; ", describe(run));
+    }
+
+    @Test
+    @DisplayName("Q4 repro (recall): a created object named by \"uuid\" is read back -> confirmed")
+    void massAssignmentUuidIsConfirmed() throws Exception {
+        Map<String, String> roles = new java.util.concurrent.ConcurrentHashMap<>(Map.of("u-43", "user"));
+        Run run = createUser(roles, "u-", "{\"uuid\":\"u-43\",\"name\":\"sample\"}", (id, body) -> echoWith("uuid", id, body));
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
+        assertEquals("GET /users/u-43; POST /users; GET /users/u-44; ", describe(run));
+    }
+
+    @Test
+    @DisplayName("Q4 control: two candidate ids are ambiguous, so no object is read and the result stays supported")
+    void massAssignmentAmbiguousIdsStaySupported() throws Exception {
+        Map<String, String> roles = new java.util.concurrent.ConcurrentHashMap<>(Map.of("43", "user", "u-9", "user"));
+        Run run = createUser(roles, "", "{\"userId\":43,\"uuid\":\"u-9\",\"name\":\"sample\"}",
+                (id, body) -> echoWith("uuid", "u-9", echoWith("userId", id, body)));
+        assertFalse(run.confirmed(), run.status() + " " + run.submission().summary);
+        assertEquals("supported", run.status(), run.submission().summary);
+        assertTrue(run.sent().stream().noneMatch(r -> r.path().startsWith("/users/")), "no object read: " + describe(run));
+    }
+
+    @Test
+    @DisplayName("Q4 control: a top-level \"id\" keeps its priority (the base rule), even beside another candidate")
+    void massAssignmentTopLevelIdKeepsPriority() throws Exception {
+        Map<String, String> roles = new java.util.concurrent.ConcurrentHashMap<>(Map.of("43", "user", "7", "user"));
+        Run run = createUser(roles, "", "{\"id\":43,\"userId\":7,\"name\":\"sample\"}",
+                (id, body) -> echoWith("userId", "7", echoWith("id", id, body)));
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
+        assertEquals("GET /users/43; POST /users; GET /users/44; ", describe(run));
+    }
+
+    @Test
+    @DisplayName("Q4 control: a cross-origin Location is never read, even when the body also carries an id")
+    void massAssignmentCrossOriginLocationWithBodyIdIsNotRead() throws Exception {
+        Map<String, String> roles = new java.util.concurrent.ConcurrentHashMap<>(Map.of("43", "user"));
+        Run run = createUser(roles, "", "{\"id\":43,\"name\":\"sample\"}", (id, body) -> echoWith("id", id, body),
+                Map.of("Location", "https://other.example/users/43"));
+        assertFalse(run.confirmed(), run.status() + " " + run.submission().summary);
+        assertTrue(run.sent().stream().noneMatch(r -> r.path().startsWith("/users/")), "sent " + describe(run));
+    }
+
 }
