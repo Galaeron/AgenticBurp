@@ -166,4 +166,90 @@ final class ValidationExecutorRoundThreeTest {
         assertTrue(run.submission().evidence.contains("cross-site"), "the evidence says how it was sent: " + run.submission().evidence);
     }
 
+    // ------------------------------------------------------------------ Q2
+    // The fakes model a JSON body's fields as request parameters, as Burp lists them.
+
+    private static final String JSON_PROFILE = "{\"display_name\":\"Alice\",\"csrf_token\":\"real\"}";
+
+    private static HttpRequest jsonProfileUpdate() {
+        return request("POST", PROFILE_FORM, JSON_PROFILE,
+                session("Content-Type", "application/json", "Referer", SAME_ORIGIN_REFERER),
+                Map.of("display_name", "Alice", "csrf_token", "real"));
+    }
+
+    private static boolean jsonContentType(HttpRequest r) {
+        String ct = headerOf(r, "Content-Type");
+        return ct != null && ct.toLowerCase(java.util.Locale.ROOT).startsWith("application/json");
+    }
+
+    @Test
+    @DisplayName("Q2 repro: a JSON request needs a CORS preflight cross-site, so it is not confirmed as CSRF")
+    void csrfJsonRequestIsNotConfirmed() throws Exception {
+        AtomicReference<String> name = new AtomicReference<>("Alice");
+        Run run = csrf(jsonProfileUpdate(), name, r -> hasSession(r) && jsonContentType(r));
+        assertFalse(run.confirmed(), "JSON request: " + run.status() + " " + run.submission().summary);
+        assertEquals("supported", run.status(), "the token is still not enforced, a lead: " + run.submission().summary);
+        assertTrue(run.submission().summary.contains("preflight"), "names the preflight: " + run.submission().summary);
+        assertTrue(run.submission().summary.contains("application/json"), run.submission().summary);
+        assertEquals("GET /profile; POST /profile/update; POST /profile/update; POST /profile/update; ", describe(run),
+                "read before, the text/plain variant (refused), the request as captured, then the no-cookie control");
+        assertEquals("text/plain;charset=UTF-8", headerOf(writes(run).get(0), "Content-Type"));
+        assertEquals("application/json", headerOf(writes(run).get(1), "Content-Type"));
+        assertTrue(run.sent().size() <= 6, "RV-N's request ceiling: " + describe(run));
+    }
+
+    @Test
+    @DisplayName("Q2 positive control: a JSON body the server reads whatever its type goes as text/plain -> confirmed")
+    void csrfJsonBodyReadAsTextPlainIsConfirmed() throws Exception {
+        AtomicReference<String> name = new AtomicReference<>("Alice");
+        Run run = csrf(jsonProfileUpdate(), name, ValidationExecutorRoundThreeTest::hasSession);
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
+        assertEquals("GET /profile; POST /profile/update; GET /profile; GET /profile; POST /profile/update; ", describe(run));
+        HttpRequest forged = writes(run).get(0);
+        assertEquals("text/plain;charset=UTF-8", headerOf(forged, "Content-Type"), "a no-cors fetch() can send it");
+        assertEquals("no-cors", headerOf(forged, "Sec-Fetch-Mode"));
+        assertEquals("empty", headerOf(forged, "Sec-Fetch-Dest"));
+        assertTrue(run.submission().evidence.contains("text/plain"), run.submission().evidence);
+    }
+
+    @Test
+    @DisplayName("Q2 repro: a PUT needs a CORS preflight cross-site, so it is not confirmed as CSRF")
+    void csrfPutRequestIsNotConfirmed() throws Exception {
+        AtomicReference<String> name = new AtomicReference<>("Alice");
+        Run run = csrf(profileUpdate("PUT", session("Referer", SAME_ORIGIN_REFERER)), name, ValidationExecutorRoundThreeTest::hasSession);
+        assertFalse(run.confirmed(), "PUT: " + run.status() + " " + run.submission().summary);
+        assertEquals("supported", run.status());
+        assertTrue(run.submission().summary.contains("preflight") && run.submission().summary.contains("PUT"),
+                run.submission().summary);
+        assertTrue(run.sent().size() <= 6, "RV-N's request ceiling: " + describe(run));
+    }
+
+    @Test
+    @DisplayName("Q2 control: a JSON request whose token is enforced is still rejected")
+    void csrfJsonRequestWithEnforcedTokenIsRejected() throws Exception {
+        AtomicReference<String> name = new AtomicReference<>("Alice");
+        Run run = csrf(jsonProfileUpdate(), name, r -> hasSession(r) && "real".equals(paramOf(r, "csrf_token")));
+        assertFalse(run.confirmed());
+        assertEquals("rejected", run.status(), run.submission().summary);
+        assertTrue(run.sent().size() <= 6, "RV-N's request ceiling: " + describe(run));
+    }
+
+    @Test
+    @DisplayName("Q2 positive control: an urlencoded form request is still confirmed")
+    void csrfFormEncodedRequestIsConfirmed() throws Exception {
+        AtomicReference<String> name = new AtomicReference<>("Alice");
+        Run run = csrf(profileUpdate("POST", session("Content-Type", "application/x-www-form-urlencoded",
+                "Referer", SAME_ORIGIN_REFERER)), name, ValidationExecutorRoundThreeTest::hasSession);
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
+    }
+
+    @Test
+    @DisplayName("Q2 positive control: a text/plain request (a form or a no-cors fetch can send it) is still confirmed")
+    void csrfTextPlainRequestIsConfirmed() throws Exception {
+        AtomicReference<String> name = new AtomicReference<>("Alice");
+        Run run = csrf(profileUpdate("POST", session("Content-Type", "text/plain;charset=UTF-8",
+                "Referer", SAME_ORIGIN_REFERER)), name, ValidationExecutorRoundThreeTest::hasSession);
+        assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
+    }
+
 }

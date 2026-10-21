@@ -1453,6 +1453,14 @@ public final class ValidationExecutor {
             }
         }
         boolean tokenFound = !tokenCarriers.isEmpty();
+        // A form sends only POST with a form enctype; any other request reaches
+        // the target from a foreign page only after a CORS preflight (RV-Q item
+        // Q2), so it is at most SUPPORTED -- unless the same body sent as
+        // text/plain, which a no-cors fetch() can send, is accepted.
+        String contentType = reqHeader(req, "Content-Type");
+        String preflight = CsrfLogic.preflightReason(req.method(), contentType);
+        boolean textPlainFirst = CsrfLogic.canSendAsTextPlain(req.method(), contentType);
+        String variantNote = null;
         int originalStatus = status(source);
         int forgedStatus = -1;
         int anonymousStatus = -1;
@@ -1473,9 +1481,32 @@ public final class ValidationExecutor {
                     if (CsrfLogic.isSuccess(status(before))) { readTarget = candidate; break; }
                 }
             }
+            HttpRequest asCaptured = forged;
+            if (textPlainFirst) {
+                for (Map.Entry<String, String> h : CsrfLogic.textPlainFetchHeaders(crossSite).entrySet()) {
+                    forged = forged.withRemovedHeader(h.getKey()).withAddedHeader(h.getKey(), h.getValue());
+                }
+            }
             forgedStatus = status(api.http().sendRequest(forged));
+            boolean preflighted = false;
+            if (textPlainFirst && CsrfLogic.isSuccess(forgedStatus)) {
+                preflight = null;
+                variantNote = "the body was sent as text/plain (" + String.join(", ", CsrfLogic.textPlainFetchHeaders(crossSite).values())
+                        + "), as a cross-site no-cors fetch() can send it";
+            } else if (textPlainFirst) {
+                // Refused as text/plain: send it as captured. That can only be
+                // SUPPORTED, so its effect is not read back, which keeps the
+                // probe within six requests.
+                variantNote = "the body sent as text/plain was refused (status " + forgedStatus
+                        + "), so it was sent as captured (Content-Type " + contentType + ")";
+                forged = asCaptured;
+                forgedStatus = status(api.http().sendRequest(forged));
+                preflighted = true;
+            }
             if (CsrfLogic.isSuccess(forgedStatus)) {
-                if (readTarget != null) {
+                if (preflighted && readTarget != null) {
+                    readBack = CsrfLogic.ReadBack.notRun("only the request as captured, which needs a CORS preflight, succeeded");
+                } else if (readTarget != null) {
                     var after = api.http().sendRequest(readRequest(req, readTarget));
                     var again = api.http().sendRequest(readRequest(req, readTarget));
                     readBack = CsrfLogic.readBack(readTarget, markable.name(), marker,
@@ -1492,12 +1523,13 @@ public final class ValidationExecutor {
             }
         }
         CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, tokenFound,
-                originalStatus, forgedStatus, anonymousStatus, readBack);
+                originalStatus, forgedStatus, anonymousStatus, readBack, preflight);
         String probe = "token carriers: " + (tokenCarriers.isEmpty() ? "none" : String.join(", ", tokenCarriers))
                 + " | removed (a cross-site page cannot send them): "
                 + (removedHeaders.isEmpty() ? "none" : String.join(", ", removedHeaders))
                 + " | sent as a cross-site form from " + crossSite.get("Origin") + ": " + String.join(", ", sentAs)
                 + ", no Referer"
+                + (variantNote == null ? "" : " | " + variantNote)
                 + (markable == null ? "" : " | change marker appended to field '" + markable.name() + "'");
         String detail = ev.detail() == null || ev.detail().isEmpty() ? probe : ev.detail() + " | " + probe;
         statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), detail);

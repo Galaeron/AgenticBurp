@@ -194,6 +194,59 @@ public final class CsrfLogicTest {
     }
 
     @Test
+    @DisplayName("Q2: only POST with a form enctype (or no body type) is sent cross-site without a preflight")
+    void preflightReasons() {
+        assertNull(preflightReason("POST", null));
+        assertNull(preflightReason("POST", "application/x-www-form-urlencoded"));
+        assertNull(preflightReason("post", "multipart/form-data; boundary=----x"));
+        assertNull(preflightReason("POST", "Text/Plain;charset=UTF-8"));
+        assertNull(preflightReason("GET", "application/json"), "a safe method is INVALID, not a preflight case");
+        String json = preflightReason("POST", "application/json; charset=utf-8");
+        assertTrue(json != null && json.contains("application/json") && json.contains("preflight"), json);
+        assertNotNull(preflightReason("POST", "application/xml"));
+        assertNotNull(preflightReason("POST", "text/plainx"), "an essence match, not a prefix");
+        for (String m : new String[] {"PUT", "PATCH", "DELETE"}) {
+            String reason = preflightReason(m, "application/x-www-form-urlencoded");
+            assertTrue(reason != null && reason.contains(m) && reason.contains("preflight"), m + ": " + reason);
+        }
+        assertTrue(canSendAsTextPlain("POST", "application/json"));
+        assertFalse(canSendAsTextPlain("PUT", "application/json"), "no-cors fetch() sends only GET, HEAD and POST");
+        assertFalse(canSendAsTextPlain("POST", "application/x-www-form-urlencoded"), "already a simple request");
+        assertFalse(canSendAsTextPlain(null, "application/json"));
+
+        var fetch = textPlainFetchHeaders(crossSiteBrowserHeaders("https://shop.example/x", false));
+        assertEquals("text/plain;charset=UTF-8", fetch.get("Content-Type"));
+        assertEquals("no-cors", fetch.get("Sec-Fetch-Mode"));
+        assertEquals("empty", fetch.get("Sec-Fetch-Dest"));
+        assertEquals(java.util.Set.of("Content-Type"),
+                textPlainFetchHeaders(crossSiteBrowserHeaders("http://shop.example/x", false)).keySet(),
+                "no Fetch Metadata to add where the browser sends none");
+    }
+
+    @Test
+    @DisplayName("Q2: a request that needs a preflight is at most SUPPORTED, naming it; refusals are unchanged")
+    void preflightCapsTheVerdict() {
+        String reason = preflightReason("POST", "application/json");
+        Evidence capped = evaluate("POST", true, true, 200, 200, 403, SHOWN, reason);
+        assertEquals(Verdict.SUPPORTED, capped.verdict());
+        assertFalse(capped.confirmed());
+        assertTrue(capped.confidence() <= 0.5);
+        assertTrue(capped.summary().contains("preflight") && capped.summary().contains("application/json"), capped.summary());
+        assertTrue(capped.detail().contains("preflight needed"), capped.detail());
+
+        assertEquals(Verdict.CONFIRMED, evaluate("POST", true, true, 200, 200, 403, SHOWN, null).verdict(),
+                "no preflight: the same as the seven-argument evaluate");
+        assertEquals(Verdict.REJECTED, evaluate("POST", true, true, 200, 403, -1, null, reason).verdict(),
+                "a refusal stays a refusal");
+        assertEquals(Verdict.REJECTED, evaluate("POST", true, true, 200, 200, 200, SHOWN, reason).verdict(),
+                "an action open to anyone stays REJECTED");
+        assertEquals(Verdict.INVALID, evaluate("GET", true, true, 200, 200, 403, SHOWN, reason).verdict());
+        Evidence passive = evaluate("PUT", true, false, 200, -1, -1, null, preflightReason("PUT", null));
+        assertEquals(Verdict.SUPPORTED, passive.verdict());
+        assertTrue(passive.summary().contains("PUT") && passive.detail().contains("preflight needed"), passive.detail());
+    }
+
+    @Test
     @DisplayName("N1: the change marker goes only on free-text fields, never credentials, contacts, links or ids")
     void markableFields() {
         assertTrue(isMarkableField("display_name", "Alice"));
