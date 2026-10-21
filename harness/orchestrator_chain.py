@@ -9,6 +9,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
+import contextlib
 import uuid
 
 from harness import identity_compare
@@ -226,7 +227,18 @@ class ChainMixin:
         driver adapts to what each round reveals rather than planning once.
 
         Plan-only unless `execute` is asked AND engagement.driver_execute is
-        enabled in config (double-gated -- never tests automatically)."""
+        enabled in config (double-gated -- never tests automatically).
+
+        WL-12 (E40): an executing call owns ONE run for all its rounds (or borrows
+        the run that already encloses it). Every target GET and every page
+        analysis (which borrows the run instead of creating its own) spends that
+        run's single request ceiling under its scope, gate, TLS policy and
+        cancellation. The owned run mirrors the RV-G route run
+        (server._crawl_route_run): runs.max_requests -- falling back to the
+        standalone-analysis ceiling, analyze.max_requests (1000), so the call is
+        never unbounded -- runs.request_timeout_seconds, the live validator gate
+        with mutating replay forced off, and server.allowed_hosts as a
+        fail-closed scope. It is closed on every exit."""
         if not execute:
             plan = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
             plan["note"] = "plan only -- pass execute=true (and enable engagement.driver_execute) to run these"
@@ -236,27 +248,48 @@ class ChainMixin:
             plan["note"] = "execution refused: engagement.driver_execute is disabled in config.yaml"
             return plan
 
+        enclosing = _run_context_mod.current_run_context()
+        owned = None
+        if enclosing is None:
+            cfg = self.config if isinstance(self.config, dict) else {}
+            runs_cfg = cfg.get("runs", {}) or {}
+            ceiling = runs_cfg.get("max_requests")
+            if ceiling is None:
+                ceiling = (cfg.get("analyze", {}) or {}).get("max_requests")
+            ceiling = 1000 if ceiling is None else ceiling
+            if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+                raise ValueError("the engagement run ceiling (runs.max_requests, else "
+                                 "analyze.max_requests) must be a nonnegative integer")
+            owned = _run_context_mod.RunContext.create(
+                allowed_hosts=self.allowed_hosts, config=cfg, max_requests=ceiling,
+                gate_config={**per_run_gate_config(cfg, getattr(self, "validator_registry", None)),
+                             "allow_mutating_replay": False},
+                timeout=float(runs_cfg.get("request_timeout_seconds", 15.0)))
+
         p = urlsplit(base_url)
         origin = f"{p.scheme}://{p.netloc}"
         rounds: list[dict] = []
         seen_urls: set[str] = set()   # don't re-fetch the same target across rounds
 
-        for rnd in range(1, max(1, max_rounds) + 1):
-            allowed, _ = self.effort_budget.allow()
-            if not allowed:
-                rounds.append({"round": rnd, "stopped": "effort budget exhausted"})
-                break
-            plan = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
-            funded = [t for t in plan["targets"]
-                      if t["action"] != "deferred" and t["method"].upper() == "GET"]
-            analyzed: list[dict] = []
-            # W-16: the driver's target GETs go through the single TargetTransport.
-            # No run of its own, so a standalone context (scope == is_host_allowed,
-            # so reachability is unchanged); one transport reused across the round.
-            _tt, _owned = transport_for(
-                None, allowed_hosts=self.allowed_hosts, config=self.config)
-            try:
+        async with (owned if owned is not None else contextlib.nullcontext(enclosing)) as run:
+            _tt = run.target_transport()
+            for rnd in range(1, max(1, max_rounds) + 1):
+                stop = ("run cancelled" if run.cancel.cancelled else
+                        "run request ceiling reached" if run.budget.remaining == 0 else "")
+                if stop:
+                    rounds.append({"round": rnd, "stopped": stop})
+                    break
+                allowed, _ = self.effort_budget.allow()
+                if not allowed:
+                    rounds.append({"round": rnd, "stopped": "effort budget exhausted"})
+                    break
+                plan = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
+                funded = [t for t in plan["targets"]
+                          if t["action"] != "deferred" and t["method"].upper() == "GET"]
+                analyzed: list[dict] = []
                 for t in funded:
+                    if run.cancel.cancelled or run.budget.remaining == 0:
+                        break
                     url = origin + t["path"].replace("{id}", "1")
                     if url in seen_urls or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
                         continue
@@ -272,22 +305,25 @@ class ChainMixin:
                             url=url, method="GET", request_headers={}, request_body="",
                             response_status=out.status, response_headers=dict(out.headers),
                             response_body=(out.body or "")[: self.max_body_chars])
-                        # Harness-fetched traffic, not a supplied capture (I02-C).
-                        result = await self.analyze(exchange, retain_observation=False)
+                        # Harness-fetched traffic, not a supplied capture (I02-C); the
+                        # page analysis borrows this run rather than owning another.
+                        result = await self.analyze(exchange, retain_observation=False,
+                                                    run_context=run)
                         n = len([f for r in result.agent_reports for f in r.findings])
                         analyzed.append({"url": url, "findings": n})
                     except Exception as e:
                         analyzed.append({"url": url, "error": e.__class__.__name__})
-            finally:
-                if _owned is not None:
-                    await _owned.aclose()
-            # SUMMARIZE this round (the condensed feedback the next plan reacts to).
-            rounds.append(self._summarize_round(rnd, host, analyzed))
-            if not analyzed:  # nothing new was funded/runnable -> converged
-                break
+                # SUMMARIZE this round (the condensed feedback the next plan reacts to).
+                rounds.append(self._summarize_round(rnd, host, analyzed))
+                if not analyzed:  # nothing new was funded/runnable -> converged
+                    break
+            remaining = run.budget.remaining
+            run_info = {"run_id": run.run_id, "owned": owned is not None,
+                        "max_requests": None if remaining is None else run.budget.used + remaining,
+                        "requests_used": run.budget.used, "cancelled": run.cancel.cancelled}
 
         after = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
-        return {"host": host, "executed": True, "rounds": rounds,
+        return {"host": host, "executed": True, "rounds": rounds, "run": run_info,
                 "targets_after": after["targets"], "guidance": after["guidance"],
                 "summary": (await self._engagement_summary(host))}
 
