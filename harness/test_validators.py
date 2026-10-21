@@ -474,6 +474,8 @@ class CorsWildcardGateTests(unittest.TestCase):
             {"Access-Control-Allow-Origin": "https://evil-attacker.com"}
         )
         self.assertTrue(result.vulnerable)
+        # RV-R R2: without credentials it still confirms, noting the limited impact.
+        self.assertIn("without the user's cookies", result.detail)
 
     def _run_vary(self, headers):
         async def fake_send(*args, **kwargs):

@@ -47,6 +47,16 @@ _WILDCARD_CREDENTIALS_DETAIL = (
     "Access-Control-Allow-Credentials: true. Browsers refuse this combination for credentialed "
     "requests (Fetch standard, CORS check), so it grants no credentialed cross-origin read: an "
     "informational misconfiguration, not exploitable on its own")
+# Origin reflection confirms either way (RV-R R2, owner decision 2026-10-21);
+# Allow-Credentials decides what the attacker's page can read.
+_REFLECTION_CREDENTIALED_DETAIL = (
+    "Server reflects arbitrary Origin header with Access-Control-Allow-Credentials: true: the "
+    "authenticated response, sent with the user's cookies, is readable cross-origin")
+_REFLECTION_UNCREDENTIALED_DETAIL = (
+    "Server reflects arbitrary Origin header, without Access-Control-Allow-Credentials: true. "
+    "Limited impact: a cross-origin page can read the response only as a visitor without the "
+    "user's cookies, so the impact is limited to data the server returns without credentials "
+    "(for example on an intranet or IP-allowlisted host)")
 # Per-validate() record of each probe's fate ("ok", "blocked", "error"), so a
 # probe that never ran is not read as a pass (R08). A ContextVar rather than
 # instance state: one validator instance serves concurrent validations.
@@ -407,14 +417,25 @@ class CorsValidator(Validator):
                     vulnerable=False,
                 )
 
-            # Check if our origin is reflected
+            # Check if our origin is reflected. RV-R R2 (owner decision
+            # 2026-10-21): it confirms with or without Allow-Credentials, but the
+            # wording says which: without it the browser sends no cookies, so a
+            # cross-origin page reads only what an anonymous visitor could.
             if acao.lower() == test_origin.lower():
+                grant = f"Origin: {test_origin} -> Access-Control-Allow-Origin: {acao}"
+                if acac.strip().lower() == "true":
+                    detail = _REFLECTION_CREDENTIALED_DETAIL
+                    evidence = f"{grant}, Access-Control-Allow-Credentials: {acac}"
+                else:
+                    detail = _REFLECTION_UNCREDENTIALED_DETAIL
+                    evidence = (f"{grant}, no Access-Control-Allow-Credentials: true (a cross-origin "
+                                f"read is without the user's cookies)")
                 return CorsTestResult(
                     test_name="Origin Reflection",
                     passed=False,
                     severity="medium",
-                    detail=f"Server reflects arbitrary Origin header",
-                    evidence=f"Origin: {test_origin} -> Access-Control-Allow-Origin: {acao}",
+                    detail=detail,
+                    evidence=evidence,
                     vulnerable=True,
                 )
         
