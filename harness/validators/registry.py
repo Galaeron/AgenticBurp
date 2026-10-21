@@ -352,6 +352,13 @@ class ValidatorRegistry:
         # identities it needs are supplied (identity_headers.py).
         self._xid_cfg = cfg.get("cross_identity", {})
         self._allowed_hosts = config.get("server", {}).get("allowed_hosts", [])
+        # WL-04 / owner decision D1: the ownership source every cross-identity
+        # validator this registry builds consults before confirming (a
+        # principals.OwnershipLedger). None -- the production default until D1
+        # settles where declarations come from (operator API, engagement config,
+        # fixture) -- means no cross-identity confirmation: a response match with
+        # anonymous denied is then a `supported` lead. set_ownership() injects one.
+        self.ownership = None
         if self._xid_cfg.get("enabled", False):
             self.validators["cross_identity"] = self._build_cross_identity()
 
@@ -360,7 +367,18 @@ class ValidatorRegistry:
             allowed_hosts=self._allowed_hosts,
             timeout=float(self._xid_cfg.get("timeout", 10.0)),
             max_identities=int(self._xid_cfg.get("max_identities", 3)),
+            ownership=self.ownership,
         )
+
+    def set_ownership(self, ledger) -> None:
+        """Inject the declared-ownership source (WL-04 / D1 seam). Applies to the
+        registered and the auto-armed cross-identity validator alike; the cached
+        auto-armed instance is rebuilt so a declaration made after arming counts."""
+        self.ownership = ledger
+        xid = self.validators.get("cross_identity")
+        if xid is not None:
+            xid.ownership = ledger
+        self._auto_xid = None
 
     def set_active_enabled(self, enabled: bool) -> None:
         """Runtime toggle for the active-validator gate (validators.active_enabled).
