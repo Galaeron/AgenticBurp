@@ -38,6 +38,7 @@ import json
 import re
 import secrets
 from dataclasses import dataclass, field
+from typing import NamedTuple
 from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit, urlencode
 
 import httpx
@@ -176,9 +177,14 @@ class SurfaceResult:
     spec_found: str | None = None
     probes_sent: int = 0
     errors: list[str] = field(default_factory=list)
+    # Paths of the sensitive-file wordlist that answered 2xx/3xx (existence only).
     sensitive_file_hits: list[str] = field(default_factory=list)
     wildcard_prefixes: list[str] = field(default_factory=list)
     wildcard_candidates_suppressed: int = 0
+    # WL-05: one record per sensitive_file_hits entry -- the real status, content
+    # type, body length and fingerprint, and whether the body carries the
+    # artifact's content signature (see sensitive_file_verdict). Never the body.
+    sensitive_file_evidence: list[dict] = field(default_factory=list)
 
     def paths(self) -> list[str]:
         return sorted({r.path for r in self.routes})
@@ -257,6 +263,14 @@ class SurfaceDiscovery:
         self._bodies: dict[str, str] = {}
         self._mined: set[str] = set()
         self._sensitive_hits: list[str] = []
+        self._sensitive_evidence: list[dict] = []
+        # GET response Content-Type per path, and the target path of a redirect the
+        # run transport followed (evidence only; both filled by _probe).
+        self._content_types: dict[str, str] = {}
+        self._redirected_to: dict[str, str] = {}
+        # The run transport follows redirects; the sensitive-file phase turns this
+        # off so it sees each file's own status, as the raw-client path always did.
+        self._follow_redirects = True
         # Soft-404 signature (Phase 5): (status, normalized-body-hash) that a
         # KNOWN-BOGUS path returns, so a catch-all that answers non-404 for
         # everything (404->500, a 200 "not found" page, an SPA index) is
@@ -280,9 +294,15 @@ class SurfaceDiscovery:
                                if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
             outcome = await self.run_context.executor().execute(
                 TypedRequest(method, url, headers=request_headers),
-                capability="surface_discovery", session_ref=self.session_ref)
+                capability="surface_discovery", session_ref=self.session_ref,
+                **({} if self._follow_redirects else {"max_redirects": 0}))
             if not outcome.ok:
                 return None
+            if method == "GET":
+                self._content_types[path] = _header_value(outcome.headers, "Content-Type")
+                if outcome.final_url and outcome.final_url != url:
+                    # The status and body are the redirect target's, not this path's.
+                    self._redirected_to[path] = urlsplit(outcome.final_url).path or "/"
             return outcome.status or 0, outcome.body or "", _header_value(outcome.headers, "Allow")
         from harness import global_throttle
         await global_throttle.acquire()
@@ -291,6 +311,8 @@ class SurfaceDiscovery:
                 resp = await client.request(method, url, headers=self.headers or None)
         except Exception:
             return None
+        if method == "GET":
+            self._content_types[path] = _header_value(resp.headers, "Content-Type")
         return resp.status_code, (resp.text or ""), _header_value(resp.headers, "Allow")
 
     def _budget_left(self) -> bool:
@@ -544,6 +566,7 @@ class SurfaceDiscovery:
         result.routes = list(self._seen.values())
         result.probes_sent = self._probes
         result.sensitive_file_hits = list(self._sensitive_hits)
+        result.sensitive_file_evidence = [dict(r) for r in self._sensitive_evidence]
         result.wildcard_prefixes = sorted(self._wildcard_prefixes)
         result.wildcard_candidates_suppressed = self._wildcard_suppressed
         if self._wildcard_prefixes:
@@ -614,25 +637,67 @@ class SurfaceDiscovery:
         generate backup-suffix variants (.bak/~/.old/...) of common source files
         and of any discovered file-like route (a route whose last segment has an
         extension). The existence oracle is unchanged: only non-404s are kept.
-        Hits are tracked in _sensitive_hits for downstream finding emission."""
-        for f in self.sensitive_files:
-            if not self._budget_left():
-                return
-            path = "/" + f.lstrip("/")
-            route = await self._check(path, "sensitive_file")
-            if route is not None and 200 <= route.status < 400:
-                self._sensitive_hits.append(path)
+        Hits are tracked in _sensitive_hits for downstream finding emission.
 
-        file_like = set(_COMMON_BACKUP_BASES)
-        for p in list(self._seen):
-            seg = p.rsplit("/", 1)[-1]
-            if "." in seg and not seg.startswith("."):   # looks like <name>.<ext>
-                file_like.add(p.lstrip("/"))
-        for base in sorted(file_like):
-            for suf in _BACKUP_SUFFIXES:
+        WL-05 (E39): a 2xx/3xx is an EXISTENCE signal only. Each hit also gets an
+        evidence record (_sensitive_record) whose `confirmed` flag is set only when
+        the 2xx body carries the artifact's content signature. Redirects are not
+        followed here, so a 302 to a login page is recorded as the 302 it is."""
+        self._follow_redirects = False
+        try:
+            for f in self.sensitive_files:
                 if not self._budget_left():
                     return
-                await self._check("/" + base.lstrip("/") + suf, "sensitive_file")
+                path = "/" + f.lstrip("/")
+                route = await self._check(path, "sensitive_file")
+                if route is not None and 200 <= route.status < 400:
+                    self._sensitive_hits.append(path)
+                    self._sensitive_evidence.append(self._sensitive_record(path, route))
+
+            file_like = set(_COMMON_BACKUP_BASES)
+            for p in list(self._seen):
+                seg = p.rsplit("/", 1)[-1]
+                if "." in seg and not seg.startswith("."):   # looks like <name>.<ext>
+                    file_like.add(p.lstrip("/"))
+            for base in sorted(file_like):
+                for suf in _BACKUP_SUFFIXES:
+                    if not self._budget_left():
+                        return
+                    await self._check("/" + base.lstrip("/") + suf, "sensitive_file")
+        finally:
+            self._follow_redirects = True
+
+    def _sensitive_record(self, path: str, route: Route) -> dict:
+        """The evidence record for one sensitive-file hit: the real status, content
+        type, body length and fingerprint, and the content verdict. It never holds
+        the body or any value from it."""
+        status = int(route.status or 0)
+        redirected_to = self._redirected_to.get(path)
+        if redirected_to is not None:
+            # Seen in an earlier phase whose transport followed a redirect: the
+            # status and body belong to the target page, never to this path.
+            return {"path": path, "status": None, "final_status": status,
+                    "redirected_to": redirected_to,
+                    "content_type": (self._content_types.get(path) or "")[:100],
+                    "length": route.length, "fingerprint": "",
+                    "expected_structure": sensitive_artifact_class(path) or "",
+                    "structure": "", "confirmed": False, "outcome": "redirect",
+                    "reason": (f"a redirect was followed to {redirected_to}, which answered "
+                               f"HTTP {status}; not the file itself")}
+        body = self._bodies.get(path, "") if 200 <= status < 300 else ""
+        verdict = sensitive_file_verdict(path, status, body)
+        return {
+            "path": path, "status": status,
+            "content_type": (self._content_types.get(path) or "")[:100],
+            "length": route.length,
+            "fingerprint": (hashlib.sha256(body.encode("utf-8", "ignore")).hexdigest()[:16]
+                            if body else ""),
+            "expected_structure": sensitive_artifact_class(path) or "",
+            "structure": verdict.structure or "",
+            "confirmed": verdict.structure is not None,
+            "outcome": verdict.outcome,
+            "reason": verdict.reason,
+        }
 
     async def _mine_responses(self) -> None:
         """Mine each 2xx body once for three candidate sources:
@@ -845,3 +910,422 @@ def _paths_from_spec(body: str) -> list[str]:
         return [p for p in paths.keys() if isinstance(p, str) and p.startswith("/")]
     except (ValueError, TypeError, AttributeError):
         return []
+
+
+# ---------------------------------------------------------------------------
+# WL-05 (E39): sensitive-file content signatures.
+#
+# A status code alone never proves a sensitive file is exposed: a redirect to a
+# login page, a catch-all HTML shell, an empty 200 or an error page all answer
+# 2xx/3xx at /.env. A hit is CONFIRMED only when a 2xx body carries the structure
+# specific to its artifact class. The classes below are derived from
+# DEFAULT_SENSITIVE_FILES. Entries with no specific structure (config.json/.yaml/
+# .yml, secrets.json, .gitignore, .well-known/security.txt) are never confirmed
+# by this probe: they stay existence-only candidates for content review.
+# Evidence names the class and counts lines; it never quotes a value.
+# ---------------------------------------------------------------------------
+
+_SIG_SCAN = 65536  # characters of body any signature looks at
+
+# Exact relative paths (lowercased) first, then basenames.
+_SENSITIVE_CLASS_BY_PATH = {
+    ".git/config": "git_config", ".git/head": "git_head", ".svn/entries": "svn_entries",
+    ".aws/credentials": "aws_credentials",
+}
+_SENSITIVE_CLASS_BY_NAME = {
+    "application.properties": "java_properties", "id_rsa": "private_key",
+    ".htpasswd": "htpasswd", ".htaccess": "htaccess", ".npmrc": "npmrc", ".pypirc": "pypirc",
+    "web.config": "web_config", ".ds_store": "ds_store",
+    "phpinfo.php": "phpinfo", "info.php": "phpinfo", "server-status": "server_status",
+    "package.json": "npm_manifest", "composer.json": "composer_manifest",
+    "composer.lock": "composer_lock", "requirements.txt": "pip_requirements",
+    "dockerfile": "dockerfile", "docker-compose.yml": "compose_file",
+    "docker-compose.yaml": "compose_file", "settings.py": "django_settings",
+    "credentials.json": "cloud_credentials_json", "appsettings.json": "dotnet_appsettings",
+}
+_SENSITIVE_CLASS_BY_SUFFIX = (
+    (".sql", "sql_dump"), (".sqlite", "sqlite_db"), (".sqlite3", "sqlite_db"),
+    (".zip", "zip_archive"), (".tar.gz", "gzip_archive"), (".tgz", "gzip_archive"),
+    (".log", "log_file"),
+)
+# Classes whose genuine artifact IS an HTML page (so an HTML body is not a veto).
+_HTML_ARTIFACT_CLASSES = frozenset({"phpinfo", "server_status", "directory_listing"})
+
+
+def sensitive_artifact_class(path: str) -> str | None:
+    """The artifact class a sensitive-file path names, or None when the wordlist
+    entry has no content signature specific enough to confirm it."""
+    rel = (path or "").split("?", 1)[0].split("#", 1)[0].lstrip("/")
+    if not rel:
+        return None
+    if rel.endswith("/"):
+        return "directory_listing"
+    low = rel.lower()
+    name = low.rsplit("/", 1)[-1]
+    if low in _SENSITIVE_CLASS_BY_PATH:
+        return _SENSITIVE_CLASS_BY_PATH[low]
+    if name == ".env" or name.startswith(".env."):
+        return "dotenv"
+    if name in _SENSITIVE_CLASS_BY_NAME:
+        return _SENSITIVE_CLASS_BY_NAME[name]
+    for suffix, cls in _SENSITIVE_CLASS_BY_SUFFIX:
+        if name.endswith(suffix):
+            return cls
+    return None
+
+
+def _content_lines(body: str, comments=("#",)) -> list[str]:
+    lines = (ln.strip() for ln in body[:_SIG_SCAN].splitlines())
+    return [ln for ln in lines if ln and not ln.startswith(comments)]
+
+
+def _matching_lines(lines: list[str], rx, min_ratio: float = 0.8, min_count: int = 1) -> int:
+    """How many lines fully match rx; 0 unless there are at least min_count of
+    them and they are at least min_ratio of all lines."""
+    n = sum(1 for ln in lines if rx.fullmatch(ln))
+    return n if lines and n >= max(1, min_count) and n >= min_ratio * len(lines) else 0
+
+
+def _json_object(body: str) -> dict | None:
+    try:
+        doc = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+_DOTENV_LINE = re.compile(r"(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=.*")
+_PROPERTIES_LINE = re.compile(r"[A-Za-z_][\w.\-]*\s*[=:].*")
+_GIT_HEAD = re.compile(r"\s*(?:ref:\s*refs/[\w./-]+|[0-9a-f]{40}|[0-9a-f]{64})\s*")
+_SQL_DUMP_HEADER = re.compile(
+    r"^\s*--\s*(?:MySQL dump|MariaDB dump|PostgreSQL database dump|phpMyAdmin SQL Dump)",
+    re.M | re.I)
+_SQL_STATEMENT = re.compile(
+    r"^\s*(?:CREATE\s+TABLE|INSERT\s+INTO|DROP\s+TABLE|ALTER\s+TABLE|CREATE\s+DATABASE"
+    r"|LOCK\s+TABLES|COPY\s+[\w.\"]+\s*\([^)\n]*\)\s+FROM\s+stdin)\b", re.M | re.I)
+_PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
+_INI_SECTION = re.compile(r"^\s*\[[^\]\n]+\]\s*$", re.M)
+_HTPASSWD_LINE = re.compile(r"[^:\s#]+:(?:\$apr1\$\S+|\$2[abxy]?\$\S+|\{SHA\}\S+|\$[156]\$\S+"
+                            r"|[./0-9A-Za-z]{13})")
+_HTACCESS_DIRECTIVES = frozenset((
+    "rewriteengine rewriterule rewritecond rewritebase options directoryindex errordocument "
+    "authtype authname authuserfile authgroupfile require order deny allow satisfy header "
+    "setenv setenvif redirect redirectmatch addtype addhandler adddefaultcharset php_value "
+    "php_flag expiresactive expiresbytype fileetag <ifmodule </ifmodule <files </files "
+    "<filesmatch </filesmatch <limit </limit"
+).split())
+_NPMRC_LINE = re.compile(r"[^\s=<>\[\]]+\s*=\s*\S.*")
+_NPMRC_KEYS = frozenset(("registry", "always-auth", "email", "strict-ssl", "save-exact",
+                         "engine-strict", "package-lock", "_auth", "_authtoken", "_password"))
+_REQ_LINE = re.compile(
+    r"-[rcei]\s+\S+|--[\w-]+(?:[ =]\S+)?"
+    r"|[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[\w,.\s-]*\])?\s*"
+    r"(?:(?:===|==|>=|<=|~=|!=|>|<)\s*[\w.*+!-]+(?:\s*,\s*(?:==|>=|<=|~=|!=|>|<)\s*[\w.*+!-]+)*)?"
+    r"\s*(?:;.*)?")
+_REQ_PIN = re.compile(r"===|==|>=|<=|~=|!=")
+_DJANGO_SETTING = re.compile(
+    r"^(SECRET_KEY|INSTALLED_APPS|DATABASES|ALLOWED_HOSTS|MIDDLEWARE|ROOT_URLCONF)\s*=", re.M)
+_LOG_LINE = re.compile(
+    r"\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}"                     # ISO-8601 timestamp
+    r"|\[\w{3} \w{3} [ \d]?\d \d{2}:\d{2}:\d{2}"               # Apache error log
+    r"|\S+ \S+ \S+ \[\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}"      # common/combined log
+    r"|\w{3} [ \d]\d \d{2}:\d{2}:\d{2} ")                      # syslog
+
+
+def _sig_dotenv(body):
+    # Two or more assignments: a lone "status=ok" line is not a dotenv file.
+    n = _matching_lines(_content_lines(body), _DOTENV_LINE, min_count=2)
+    return f"{n} KEY=VALUE assignments" if n else None
+
+
+def _sig_java_properties(body):
+    lines = _content_lines(body, ("#", "!"))
+    n = _matching_lines(lines, _PROPERTIES_LINE, min_count=2)
+    if n and any("." in re.split(r"\s*[=:]", ln, maxsplit=1)[0] for ln in lines):
+        return f"{n} dotted key=value propert(ies)"
+    return None
+
+
+def _sig_git_config(body):
+    head = body[:_SIG_SCAN]
+    if (re.search(r"^\s*\[core\]\s*$", head, re.M)
+            and re.search(r"^\s*repositoryformatversion\s*=", head, re.M)):
+        return "a [core] section with repositoryformatversion"
+    return None
+
+
+def _sig_git_head(body):
+    return "a ref or object id" if len(body) <= 300 and _GIT_HEAD.fullmatch(body) else None
+
+
+def _sig_svn_entries(body):
+    lines = [ln.strip() for ln in body[:4000].splitlines()[:6]]
+    if lines and lines[0].isdigit() and "dir" in lines[1:]:
+        return "an entries format number followed by a dir record"
+    return "a wc-entries document" if "<wc-entries" in body[:4000] else None
+
+
+def _sig_sql_dump(body):
+    if _SQL_DUMP_HEADER.search(body[:4000]):
+        return "a SQL dump header comment"
+    n = len(_SQL_STATEMENT.findall(body[:_SIG_SCAN]))
+    return f"{n} DDL/DML statement(s) at line start" if n else None
+
+
+def _sig_sqlite_db(body):
+    return "the SQLite 3 database header" if body.startswith("SQLite format 3\x00") else None
+
+
+def _sig_zip_archive(body):
+    return "a ZIP archive header" if body.startswith(("PK\x03\x04", "PK\x05\x06")) else None
+
+
+def _sig_gzip_archive(body):
+    # Bodies arrive decoded as text: 0x8b survives as itself (latin-1) or U+FFFD (utf-8).
+    return "a gzip member header" if body[:3] in ("\x1f\x8b\x08", "\x1f�\x08") else None
+
+
+def _sig_private_key(body):
+    return "a PEM private-key header" if _PRIVATE_KEY.search(body[:4000]) else None
+
+
+def _sig_aws_credentials(body):
+    head = body[:_SIG_SCAN]
+    if _INI_SECTION.search(head) and re.search(r"^\s*aws_access_key_id\s*=", head, re.M | re.I):
+        return "a profile section with aws_access_key_id"
+    return None
+
+
+def _sig_htpasswd(body):
+    n = _matching_lines(_content_lines(body), _HTPASSWD_LINE)
+    return f"{n} user:hash entr(ies)" if n else None
+
+
+def _sig_htaccess(body):
+    lines = _content_lines(body)
+    n = sum(1 for ln in lines if ln.split(None, 1)[0].lower().rstrip(">") in _HTACCESS_DIRECTIVES)
+    return f"{n} Apache directive line(s)" if lines and n and n >= 0.8 * len(lines) else None
+
+
+def _sig_npmrc(body):
+    lines = _content_lines(body, ("#", ";"))
+    n = _matching_lines(lines, _NPMRC_LINE)
+    if not n:
+        return None
+    keys = [ln.split("=", 1)[0].strip().lower() for ln in lines]
+    if any(k in _NPMRC_KEYS or k.endswith((":_authtoken", ":_auth", ":_password", ":registry"))
+           for k in keys):
+        return f"{n} npm config setting(s)"
+    return None
+
+
+def _sig_pypirc(body):
+    head = body[:_SIG_SCAN]
+    if (re.search(r"^\s*\[(?:distutils|pypi|testpypi)\]\s*$", head, re.M)
+            and re.search(r"^\s*(?:index-servers|repository|username|password)\s*[=:]", head, re.M)):
+        return "a distutils/pypi section with repository settings"
+    return None
+
+
+def _sig_web_config(body):
+    head = body[:_SIG_SCAN]
+    if (re.search(r"<configuration[\s>]", head)
+            and re.search(r"<(?:system\.web(?:Server)?|appSettings|connectionStrings)[\s>/]", head)):
+        return "an ASP.NET <configuration> document"
+    return None
+
+
+def _sig_ds_store(body):
+    return "the .DS_Store Bud1 header" if body.startswith("\x00\x00\x00\x01Bud1") else None
+
+
+def _sig_phpinfo(body):
+    head = body[:_SIG_SCAN]
+    return "a phpinfo() page" if "phpinfo()" in head and re.search(r"PHP Version\s*\d", head) else None
+
+
+def _sig_server_status(body):
+    head = body[:_SIG_SCAN]
+    if "Apache Server Status for" in head and "Server Version:" in head:
+        return "an Apache mod_status page"
+    if re.search(r"^Active connections:\s*\d+", head, re.M) and "server accepts handled requests" in head:
+        return "an nginx stub_status page"
+    return None
+
+
+def _sig_npm_manifest(body):
+    d = _json_object(body)
+    if d and isinstance(d.get("name"), str) and any(
+            isinstance(d.get(k), dict) for k in ("dependencies", "devDependencies", "scripts")):
+        return "an npm manifest (name with dependencies/scripts)"
+    return None
+
+
+def _sig_composer_manifest(body):
+    d = _json_object(body)
+    if d and any(isinstance(d.get(k), dict) for k in ("require", "require-dev", "autoload")):
+        return "a composer manifest (require/autoload)"
+    return None
+
+
+def _sig_composer_lock(body):
+    d = _json_object(body)
+    if d and isinstance(d.get("packages"), list) and ("content-hash" in d or "_readme" in d):
+        return "a composer lock (packages with content-hash)"
+    return None
+
+
+def _sig_pip_requirements(body):
+    lines = _content_lines(body)
+    n = _matching_lines(lines, _REQ_LINE)
+    if n and any(_REQ_PIN.search(ln) for ln in lines):
+        return f"{n} requirement line(s) with version specifiers"
+    return None
+
+
+def _sig_dockerfile(body):
+    lines = _content_lines(body)
+    if (lines and re.match(r"(?:FROM|ARG)\s+\S", lines[0], re.I)
+            and any(re.match(r"FROM\s+\S", ln, re.I) for ln in lines)):
+        return "a Dockerfile FROM instruction"
+    return None
+
+
+def _sig_compose_file(body):
+    head = body[:_SIG_SCAN]
+    if re.search(r"^services:\s*$", head, re.M) and re.search(r"^\s+(?:image|build)\s*:", head, re.M):
+        return "compose services with image/build"
+    return None
+
+
+def _sig_django_settings(body):
+    names = set(_DJANGO_SETTING.findall(body[:_SIG_SCAN]))
+    return f"{len(names)} Django settings assignment(s)" if len(names) >= 2 else None
+
+
+def _sig_cloud_credentials_json(body):
+    d = _json_object(body)
+    if not d:
+        return None
+    for k in ("installed", "web"):
+        v = d.get(k)
+        if isinstance(v, dict) and "client_id" in v and "client_secret" in v:
+            return f"an OAuth client secret ({k})"
+    if d.get("type") == "service_account" and "private_key" in d:
+        return "a service-account key"
+    if "client_id" in d and "client_secret" in d:
+        return "a client_id with client_secret"
+    return None
+
+
+def _sig_dotnet_appsettings(body):
+    d = _json_object(body)
+    if d and (isinstance(d.get("ConnectionStrings"), dict) or isinstance(d.get("Kestrel"), dict)
+              or (isinstance(d.get("Logging"), dict) and "AllowedHosts" in d)):
+        return "ASP.NET appsettings (ConnectionStrings/Kestrel/Logging)"
+    return None
+
+
+def _sig_log_file(body):
+    lines = [ln for ln in body[:_SIG_SCAN].splitlines()[:500] if ln.strip()]
+    n = sum(1 for ln in lines if _LOG_LINE.match(ln))
+    return f"{n} timestamped log line(s)" if n and n >= 0.3 * len(lines) else None
+
+
+def _sig_directory_listing(body):
+    if re.search(r"<title>\s*(?:Index of /|Directory listing for /)", body[:4000], re.I):
+        return "a web-server directory index"
+    return None
+
+
+_SENSITIVE_SIGNATURES = {
+    "dotenv": _sig_dotenv, "java_properties": _sig_java_properties,
+    "git_config": _sig_git_config, "git_head": _sig_git_head, "svn_entries": _sig_svn_entries,
+    "sql_dump": _sig_sql_dump, "sqlite_db": _sig_sqlite_db, "zip_archive": _sig_zip_archive,
+    "gzip_archive": _sig_gzip_archive, "private_key": _sig_private_key,
+    "aws_credentials": _sig_aws_credentials, "htpasswd": _sig_htpasswd,
+    "htaccess": _sig_htaccess, "npmrc": _sig_npmrc, "pypirc": _sig_pypirc,
+    "web_config": _sig_web_config, "ds_store": _sig_ds_store, "phpinfo": _sig_phpinfo,
+    "server_status": _sig_server_status, "npm_manifest": _sig_npm_manifest,
+    "composer_manifest": _sig_composer_manifest, "composer_lock": _sig_composer_lock,
+    "pip_requirements": _sig_pip_requirements, "dockerfile": _sig_dockerfile,
+    "compose_file": _sig_compose_file, "django_settings": _sig_django_settings,
+    "cloud_credentials_json": _sig_cloud_credentials_json,
+    "dotnet_appsettings": _sig_dotnet_appsettings, "log_file": _sig_log_file,
+    "directory_listing": _sig_directory_listing,
+}
+
+
+def _is_html_document(body: str) -> bool:
+    head = (body or "").lstrip("﻿ \t\r\n")[:1024].lower()
+    if head.startswith(("<!doctype html", "<html")):
+        return True
+    return head.startswith("<") and any(
+        tag in head for tag in ("<html", "<head", "<body", "<title", "<meta", "<div", "<script"))
+
+
+class SensitiveFileVerdict(NamedTuple):
+    """`structure` is the matched artifact class (None = not confirmed); `outcome`
+    is a short code; `reason` is evidence text that never quotes the body."""
+    structure: str | None
+    outcome: str
+    reason: str
+
+
+def sensitive_file_verdict(path: str, status: int, body: str) -> SensitiveFileVerdict:
+    """The single confirmation decision for a sensitive-file hit (WL-05). Only a
+    2xx whose body carries its artifact class's content signature confirms."""
+    if 300 <= status < 400:
+        return SensitiveFileVerdict(None, "redirect", f"HTTP {status} redirect, not the file itself")
+    if not 200 <= status < 300:
+        return SensitiveFileVerdict(None, "non_success", f"HTTP {status} is not a success response")
+    if not (body or "").strip():
+        return SensitiveFileVerdict(None, "empty_body", "empty body")
+    cls = sensitive_artifact_class(path)
+    if cls is None:
+        return SensitiveFileVerdict(None, "unknown_type",
+                                    "no content signature is defined for this file type")
+    if cls not in _HTML_ARTIFACT_CLASSES and _is_html_document(body):
+        return SensitiveFileVerdict(None, "html_page",
+                                    f"an HTML page, not a {cls} file (catch-all, login or error page)")
+    detail = _SENSITIVE_SIGNATURES[cls](body)
+    if not detail:
+        return SensitiveFileVerdict(None, "signature_mismatch",
+                                    f"body does not match the {cls} structure")
+    return SensitiveFileVerdict(cls, "content_signature",
+                                f"body matches the {cls} structure: {detail}")
+
+
+def sensitive_file_finding(record: dict) -> dict:
+    """The engagement finding for one sensitive-file evidence record. Confirmed
+    only when the record says its body matched the artifact's content signature;
+    otherwise an existence-only candidate quoting the real status. Never carries
+    a value from the file."""
+    path = str(record.get("path") or "")
+    status = record.get("status")
+    status_text = (f"HTTP {status}" if status else
+                   "an HTTP redirect" if record.get("redirected_to") else "HTTP status not recorded")
+    content_type = record.get("content_type") or "unspecified"
+    size = f"{int(record.get('length') or 0)} bytes"
+    if record.get("fingerprint"):
+        size += f", sha256 {record['fingerprint']}"
+    if record.get("confirmed") and record.get("structure"):
+        return {"vulnerability_class": "sensitive_file_exposure", "severity": "high",
+                "confidence": 0.95,
+                "summary": f"Sensitive file exposed: {path} ({record['structure']})",
+                "evidence": (f"{status_text} at {path}; "
+                             f"{record.get('reason') or 'content signature matched'}; "
+                             f"content-type {content_type}; {size}; file values redacted"),
+                "confirmed": True, "confirmation_method": "sensitive_file_probe"}
+    # A served, non-empty, non-HTML body that matched no signature still deserves
+    # review; a redirect, an empty body or an HTML page is weaker.
+    served = record.get("outcome") in ("unknown_type", "signature_mismatch")
+    return {"vulnerability_class": "sensitive_file_exposure",
+            "severity": "medium" if served else "low",
+            "confidence": 0.4 if served else 0.2,
+            "summary": f"Possible sensitive file (existence only): {path}",
+            "evidence": (f"existence only: {status_text} at {path}; "
+                         f"{record.get('reason') or 'content not examined'}; "
+                         f"content-type {content_type}; {size}; not confirmed -- a status "
+                         f"code alone does not prove the file is exposed"),
+            "confirmed": False}

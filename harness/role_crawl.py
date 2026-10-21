@@ -416,6 +416,7 @@ class RoleCrawlResult:
     # the "denied" negative controls, which idor_findings (a findings-only sink)
     # has no slot for.
     cross_role_outcomes: list = field(default_factory=list)
+    sensitive_file_evidence: list = field(default_factory=list)  # WL-05: SurfaceResult records
 
     def to_dict(self) -> dict:
         return {
@@ -598,6 +599,7 @@ async def crawl_roles(
                                 m.upper() for m in rt.methods if m.upper() != "OPTIONS")
                     total_routes += len(sres.routes); total_probes += sres.probes_sent
                     result.sensitive_file_hits.extend(sres.sensitive_file_hits)
+                    result.sensitive_file_evidence.extend(sres.sensitive_file_evidence)
                     if sres.spec_found:
                         result.errors.append(f"[discovery] used spec {sres.spec_found}")
                 except Exception as e:
