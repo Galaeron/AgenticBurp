@@ -62,13 +62,18 @@ class _PolicyAwareDriver:
     async def visit(self, url, *, wait_ms=1200, headers=None,
                      scope=None, cancel=None, gate=None, budget=None):
         self.calls.append(dict(scope=scope, cancel=cancel, gate=gate, budget=budget))
-        return ExecutionObservation(url=url, console=["fired"])
+        return ExecutionObservation(url=url, console=[_NONCE])
 
 
 class _LegacyDriver:
     """No scope/gate/budget/cancel in its signature -- the pre-R7 contract."""
     async def visit(self, url, *, wait_ms=1200, headers=None):
-        return ExecutionObservation(url=url, console=["fired"])
+        return ExecutionObservation(url=url, console=[_NONCE])
+
+
+# R19: execution is the planted payload's own nonce in an execution sink, not
+# any console output, so these doubles log the nonce the confirm is asked for.
+_NONCE = "a1b2c3d4e5f6"
 
 
 class StoredXssBrowserConfirmWiringTests(unittest.TestCase):
@@ -80,8 +85,8 @@ class StoredXssBrowserConfirmWiringTests(unittest.TestCase):
         rc = RunContext.create(allowed_hosts=["shop.test"])
         driver = _PolicyAwareDriver()
         v = StoredXssValidator(allowed_hosts=["shop.test"], driver=driver, run_context=rc)
-        note = asyncio.run(v._browser_confirm("https://shop.test/comments"))
-        self.assertIn("confirmed", note.lower())
+        executed, note = asyncio.run(v._browser_confirm("https://shop.test/comments", _NONCE))
+        self.assertIs(executed, True, note)
         self.assertTrue(driver.calls)
         call = driver.calls[0]
         self.assertIs(call["scope"], rc.scope)
@@ -93,8 +98,14 @@ class StoredXssBrowserConfirmWiringTests(unittest.TestCase):
         """NEGATIVE CONTROL: no RunContext bound -> legacy call shape, so a
         driver that doesn't accept the new kwargs keeps working unchanged."""
         v = StoredXssValidator(allowed_hosts=["shop.test"], driver=_LegacyDriver())
-        note = asyncio.run(v._browser_confirm("https://shop.test/comments"))
-        self.assertIn("confirmed", note.lower())
+        executed, note = asyncio.run(v._browser_confirm("https://shop.test/comments", _NONCE))
+        self.assertIs(executed, True, note)
+
+    def test_console_output_without_the_nonce_is_not_execution(self):
+        """R19: the page's own console output is not the payload running."""
+        v = StoredXssValidator(allowed_hosts=["shop.test"], driver=_LegacyDriver())
+        executed, note = asyncio.run(v._browser_confirm("https://shop.test/comments", "0f0f0f0f0f0f"))
+        self.assertIs(executed, False, note)
 
 
 class PlantMappingTests(unittest.TestCase):

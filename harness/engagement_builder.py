@@ -106,17 +106,14 @@ async def build_engagement(
     def credentials(headers):
         return {k.lower(): v for k, v in (headers or {}).items()
                 if k.lower() in identity_header_names}
-    # Captures are attributed to the matrix column of the PRINCIPAL whose
-    # credentials they carry, not to its role label (X03).
-    principal_keys = role_crawl.principal_keys(roles)
     for item in supplied:
         try:
             ex = item if isinstance(item, HttpExchange) else HttpExchange(**item)
             if ScopePolicy.origin_of(ex.url) != origin or not scope.in_scope(ex.url):
                 seed_errors.append("capture ignored: outside engagement origin/scope")
                 continue
-            owners = {key: r for key, r in zip(principal_keys, roles)
-                      if credentials(r.headers) == credentials(ex.request_headers)}
+            owners = [(index, r) for index, r in enumerate(roles)
+                      if credentials(r.headers) == credentials(ex.request_headers)]
             if not owners:
                 seed_errors.append("capture ignored: no matching supplied identity")
                 continue
@@ -149,19 +146,25 @@ async def build_engagement(
         if access is None:
             access = role_crawl.EndpointAccess(method=ex.method, path=ep.path)
             result.endpoints.append(access)
-        for key, owner in owners.items():
-            ep.access[key] = ex.response_status
-            ep.access_roles[key] = owner.role
-            access.by_role[key] = ex.response_status
-            access.principal_roles[key] = owner.role
-            if ex.response_status is not None and 200 <= ex.response_status < 300:
-                if key not in ep.reachable_roles:
-                    ep.reachable_roles.append(key)
-                if key not in access.reachable_roles:
-                    access.reachable_roles.append(key)
+        # The matrix row's template decides object-scoping, as ingest_role_crawl does.
+        ep.object_scoped = ep.object_scoped or access.object_scoped
+        # WL-02: a supplied capture is ONE principal's observation of this
+        # operation. Record it per principal and MERGE it with the crawl's cells
+        # (another principal's cell is never overwritten); the role view is
+        # re-derived. Its time is the capture's own `captured_at` (unknown stays
+        # None, never fabricated).
+        reached = ex.response_status is not None and 200 <= ex.response_status < 300
+        for index, owner in owners:
+            observation = dict(
+                role=owner.role, status=ex.response_status, reachable=reached,
+                session_ref=session_refs[index] if session_refs is not None else None,
+                observed_at=ex.captured_at, source="seed_capture")
+            principal_id = role_crawl._matrix_principal_id(owner)
+            ep.record_principal_observation(principal_id, **observation)
+            access.record(principal_id, **observation)
         state.record_template(ex.url, ex.method, ex)
-    for key, r in zip(principal_keys, roles):
-        state.ingest_identity(f"rolecrawl:{key}", r.role, source="seed")
+    for r in roles:
+        state.ingest_identity(f"rolecrawl:{r.name or r.role}", r.role, source="seed")
 
     log.info("build_engagement: %s -- %d endpoints, %d idor candidates, %d idor findings",
              base_url, len(result.endpoints), len(result.idor_candidates), len(result.idor_findings))

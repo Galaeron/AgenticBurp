@@ -273,30 +273,62 @@ def _ensure_harness_importable() -> None:
         sys.path.insert(0, repo_root)
 
 
+# What a cache rescore records as the revision of the inference it reads. The
+# fixture cache (testing/*/detection_fixture.json) stores no revision, so the
+# revision that produced it is unknown -- say so, never substitute the current one.
+UNRECORDED_CACHE_REVISION = "unrecorded-historical-cache"
+
+
 def _score_provenance(*, corpus: str, conf: float, min_severity: str,
                       n_exchanges: int, cache_path: Path | None, refresh: bool) -> dict:
-    """R01/R05: bind this score artifact to an auditable ScoreProvenance
+    """R01/R05/R45: bind this score artifact to an auditable ScoreProvenance
     record -- the actual production consumer of harness.score_provenance,
     replacing "a score file exists" with an explicit fresh/historical/invalid
     label. `complete` is n_exchanges > 0 (the run actually scored something);
     `inputs_hash` is over the fixture's own real cache file when resolvable,
     "" (an id field score_provenance.py then classifies as invalid) when not
-    -- never a fabricated hash for a file that wasn't actually read."""
+    -- never a fabricated hash for a file that wasn't actually read.
+
+    What the record binds to depends on where the inference came from:
+
+    * `refresh=True`: every label was re-run through the real agents in THIS
+      invocation, so the invocation id and the current revision ARE the
+      inference's provenance (`provenance_basis` = "live_refresh").
+    * `refresh=False`: no inference ran here. The numbers are read from a cache
+      written by an earlier run, so the record binds to that cache: its content
+      hash, a run id derived from that hash (the same cache is the same "run";
+      no invocation is invented), and an explicitly unrecorded inference
+      revision. The revision that merely did the rescoring is kept under
+      `rescore_revision`, never as `git_revision`. Because the inference is not
+      from the current code, the label can only be "historical" (or "invalid"
+      when there is no readable cache or nothing was scored) -- stamping the
+      rescore's own identity on it and comparing that to itself used to yield a
+      nested "fresh" beside the outer historical-cache label."""
     import uuid
     _ensure_harness_importable()
     from harness.score_provenance import ScoreProvenance, freshness_label as _score_freshness
 
-    run_id = uuid.uuid4().hex
     inputs_hash = ""
     if cache_path is not None and cache_path.exists():
         inputs_hash = compute_inputs_hash([cache_path])
-    revision = _git_revision()
+    current_revision = _git_revision()
     corpus_id = f"{corpus}@conf{conf}_sev{min_severity}"
+    if refresh:
+        basis, revision = "live_refresh", current_revision
+        run_id = uuid.uuid4().hex
+        expected_run_id = run_id
+    else:
+        basis, revision = "historical_cache", UNRECORDED_CACHE_REVISION
+        run_id = f"cache:{inputs_hash}" if inputs_hash else ""
+        expected_run_id = None  # no independent invocation to match against
     prov = ScoreProvenance(git_revision=revision, run_id=run_id, corpus_id=corpus_id,
                            inputs_hash=inputs_hash, complete=n_exchanges > 0)
-    label = _score_freshness(prov, revision, corpus_id, expected_run_id=run_id,
+    label = _score_freshness(prov, current_revision, corpus_id, expected_run_id=expected_run_id,
                              expected_inputs_hash=inputs_hash)
-    return {**prov.to_dict(), "evaluation_integrity_label": label}
+    out = {**prov.to_dict(), "evaluation_integrity_label": label, "provenance_basis": basis}
+    if not refresh:
+        out["rescore_revision"] = current_revision
+    return out
 
 
 def compute_inputs_hash(paths):
@@ -362,7 +394,8 @@ def main() -> int:
 
     print(format_table(report, args.corpus, f"{model} @conf>={args.conf},sev>={args.min_severity}"))
     if args.json:
-        json.dump(report, open(args.json, "w"), indent=2)
+        with open(args.json, "w") as fh:
+            json.dump(report, fh, indent=2)
         print(f"\n(wrote {args.json})")
 
     failed = False

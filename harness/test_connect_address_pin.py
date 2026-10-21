@@ -1,143 +1,118 @@
-"""Caller-level tests for connect-time address pinning (P1-10, DNS-rebinding).
+"""Connect-time address pinning (P1-10, superseded by I05-B's per-run pin).
 
-OFF by default. When `security.pin_connect_address` is set, TargetTransport.execute
-resolves each hop's host ONCE and directs the connection to that pinned address
-while preserving the Host header and TLS SNI, so a later/alternate resolution can
-never redirect the connect. A MockTransport records the address each request was
-actually sent to; an injected resolver drives the rebinding scenarios without DNS.
-
-The live two-origin/real-HTTPS proof stays OWNER; these tests prove the pin logic:
-the connect targets the resolved IP (not the hostname, not a second resolution),
-redirects are re-pinned, IP literals are left alone, and default-off is unchanged.
+P1-10 pinned each request hop to a fresh resolution by rewriting the URL; the next
+request or redirect hop resolved again, so a rebinding name could still move
+later traffic. I05-B pins at the socket instead: every client a run builds
+connects through `AddressPins`, which resolves a name ONCE per run and refuses
+special-purpose addresses. These are the unit-level properties; the real-socket
+and real-TLS caller tests are in test_destination_policy_callers.py.
 """
 from __future__ import annotations
 
+import asyncio
 import unittest
 
-import httpx
-
-from harness.run_context import RunContext
-
-
-def _recording_transport(record: list, *, redirect_from: str | None = None,
-                         redirect_to: str = ""):
-    def handler(request: httpx.Request) -> httpx.Response:
-        record.append({
-            "connect_host": request.url.host,
-            "host_header": request.headers.get("host"),
-            "sni": request.extensions.get("sni_hostname"),
-        })
-        if redirect_from and request.headers.get("host", "").split(":")[0] == redirect_from:
-            return httpx.Response(302, headers={"location": redirect_to})
-        return httpx.Response(200, text="ok")
-    return httpx.MockTransport(handler)
+from harness import run_context
+from harness.run_context import AddressPins, DestinationBlocked, RunContext
 
 
-class _ResolverSpy:
-    """Maps host -> ip; records every call. `sequence` (if given) is returned in
-    order regardless of host, to model a resolution that changes over time."""
-    def __init__(self, mapping=None, sequence=None):
-        self.mapping = dict(mapping or {})
-        self.sequence = list(sequence or [])
-        self.calls: list[str] = []
+class _Resolver:
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = 0
 
-    def __call__(self, host: str) -> str:
-        self.calls.append(host)
-        if self.sequence:
-            return self.sequence.pop(0)
-        return self.mapping[host]
+    def __call__(self, host):
+        self.calls += 1
+        if isinstance(self.answers[0], Exception):
+            raise self.answers[0]
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
 
 
-def _ctx(pin: bool, hosts, record, **kw):
-    cfg = {"security": {"pin_connect_address": True}} if pin else {}
-    rc = RunContext.create(allowed_hosts=hosts, config=cfg)
-    rc._default_client = httpx.AsyncClient(transport=_recording_transport(record, **kw),
-                                           follow_redirects=False, verify=False)
-    return rc
+class AddressPinTests(unittest.TestCase):
+    def test_first_answer_holds_for_the_run(self):
+        resolver = _Resolver("10.0.0.5", "10.0.0.9")
+        pins = AddressPins(resolver)
+
+        async def go():
+            return [await pins.address_for("App.Test") for _ in range(3)]
+
+        self.assertEqual(asyncio.run(go()), ["10.0.0.5"] * 3)
+        self.assertEqual(resolver.calls, 1)
+        self.assertEqual(pins.pinned(), {"app.test": "10.0.0.5"})
+
+    def test_ip_literal_is_not_resolved(self):
+        resolver = _Resolver("10.0.0.5")
+        pins = AddressPins(resolver)
+        self.assertEqual(asyncio.run(pins.address_for("127.0.0.1")), "127.0.0.1")
+        self.assertEqual(resolver.calls, 0)
+
+    def test_resolver_failure_raises_and_pins_nothing(self):
+        pins = AddressPins(_Resolver(OSError("no such name")))
+        with self.assertRaises(OSError):
+            asyncio.run(pins.address_for("nx.test"))
+        self.assertEqual(pins.pinned(), {})
+
+    def test_special_purpose_addresses_are_refused_through_a_name(self):
+        for ip in ("169.254.169.254", "fe80::1", "224.0.0.1", "0.0.0.0", "::",
+                   "::ffff:169.254.169.254", "240.0.0.1"):
+            with self.subTest(ip=ip):
+                with self.assertRaises(DestinationBlocked):
+                    asyncio.run(AddressPins(_Resolver(ip)).address_for("meta.test"))
+        for ip in ("127.0.0.1", "10.0.0.5", "192.168.1.20", "8.8.8.8", "::1"):
+            with self.subTest(ip=ip):
+                self.assertEqual(asyncio.run(AddressPins(_Resolver(ip)).address_for("lab.test")), ip)
 
 
-class ConnectPinTests(unittest.IsolatedAsyncioTestCase):
-    async def _send(self, rc, resolver, method="GET", url="http://app.test/x"):
-        t = rc.target_transport()
-        if resolver is not None:
-            t._resolver = resolver
-        try:
-            return await t.send(method, url, capability="test")
-        finally:
-            await rc.aclose()
+class RunClientPinTests(unittest.TestCase):
+    def _backend(self, client):
+        return client._transport._pool._network_backend
 
-    async def test_pin_directs_connect_to_resolved_ip_preserving_host(self):
-        rec = []
-        rc = _ctx(True, ["app.test"], rec)
-        r = _ResolverSpy({"app.test": "10.0.0.1"})
-        out = await self._send(rc, r)
-        self.assertEqual(out.outcome, "ok")
-        self.assertEqual(rec[0]["connect_host"], "10.0.0.1")   # connected to the IP
-        self.assertEqual(rec[0]["host_header"], "app.test")    # Host preserved
-        self.assertEqual(r.calls, ["app.test"])                # resolved exactly once
+    def test_run_clients_connect_through_the_pin_by_default(self):
+        ctx = RunContext.create(allowed_hosts=["app.test"])
+        session = ctx.sessions.register("s", "s", allowed_origins=["https://app.test"])
+        default = ctx.default_client(destination="https://app.test/a")
+        scoped = session.client(ctx.timeout, trust_policy=ctx.tls_policy,
+                                destination="https://app.test/a", address_pins=ctx.address_pins)
+        self.assertIsInstance(self._backend(default), run_context._PinnedBackend)
+        self.assertIsInstance(self._backend(scoped), run_context._PinnedBackend)
+        asyncio.run(ctx.aclose())
 
-    async def test_uses_pinned_ip_not_a_later_resolution(self):
-        # resolver would return A then B; the connect must use A, never B.
-        rec = []
-        rc = _ctx(True, ["app.test"], rec)
-        r = _ResolverSpy(sequence=["10.0.0.1", "10.9.9.9"])
-        await self._send(rc, r)
-        connects = [e["connect_host"] for e in rec]
-        self.assertIn("10.0.0.1", connects)
-        self.assertNotIn("10.9.9.9", connects, "a later resolution's address was contacted")
+    def test_explicit_opt_out_connects_by_name(self):
+        ctx = RunContext.create(allowed_hosts=["app.test"],
+                                config={"security": {"pin_connect_address": False}})
+        self.assertIsNone(ctx.address_pins)
+        client = ctx.default_client(destination="https://app.test/a")
+        self.assertNotIsInstance(self._backend(client), run_context._PinnedBackend)
+        asyncio.run(ctx.aclose())
 
-    async def test_https_sets_sni_hostname_extension(self):
-        rec = []
-        rc = _ctx(True, ["app.test"], rec)
-        out = await self._send(rc, _ResolverSpy({"app.test": "10.0.0.1"}),
-                               url="https://app.test/x")
-        self.assertEqual(out.outcome, "ok")
-        self.assertEqual(rec[0]["connect_host"], "10.0.0.1")
-        self.assertEqual(rec[0]["sni"], "app.test")            # TLS SNI preserved
+    def test_resolver_failure_is_an_honest_error_not_a_send(self):
+        ctx = RunContext.create(allowed_hosts=["nx.test"], max_requests=5)
+        ctx.address_pins.resolver = _Resolver(OSError("no such name"))
 
-    async def test_ip_literal_host_is_not_resolved(self):
-        rec = []
-        rc = _ctx(True, ["127.0.0.1"], rec)
-        r = _ResolverSpy({})
-        out = await self._send(rc, r, url="http://127.0.0.1/x")
-        self.assertEqual(out.outcome, "ok")
-        self.assertEqual(r.calls, [], "an IP literal must not be resolved")
-        self.assertEqual(rec[0]["connect_host"], "127.0.0.1")
+        async def go():
+            try:
+                return await ctx.target_transport().send("GET", "http://nx.test:9/a", capability="t")
+            finally:
+                await ctx.aclose()
 
-    async def test_redirect_hop_is_repinned(self):
-        rec = []
-        rc = _ctx(True, ["app.test", "app2.test"], rec,
-                  redirect_from="app.test", redirect_to="http://app2.test/y")
-        r = _ResolverSpy({"app.test": "10.0.0.1", "app2.test": "10.0.0.2"})
-        out = await self._send(rc, r)
-        self.assertEqual(out.outcome, "ok")
-        self.assertEqual([e["connect_host"] for e in rec], ["10.0.0.1", "10.0.0.2"])
-        self.assertEqual([e["host_header"] for e in rec], ["app.test", "app2.test"])
-
-    async def test_resolver_failure_is_an_honest_error_not_a_send(self):
-        rec = []
-        rc = _ctx(True, ["app.test"], rec)
-        def boom(host):
-            raise OSError("no such host")
-        out = await self._send(rc, boom)
+        out = asyncio.run(go())
         self.assertEqual(out.outcome, "error")
-        self.assertEqual(rec, [], "nothing may be sent when resolution fails")
+        self.assertIn("no such name", out.error)
 
+    def test_special_purpose_answer_is_blocked_not_sent(self):
+        ctx = RunContext.create(allowed_hosts=["meta.test"], max_requests=5)
+        ctx.address_pins.resolver = _Resolver("169.254.169.254")
 
-class DefaultOffTests(unittest.IsolatedAsyncioTestCase):
-    async def test_off_by_default_connects_to_hostname_and_never_resolves(self):
-        rec = []
-        rc = _ctx(False, ["app.test"], rec)            # no pin toggle
-        r = _ResolverSpy({"app.test": "10.0.0.1"})
-        t = rc.target_transport()
-        t._resolver = r
-        try:
-            out = await t.send("GET", "http://app.test/x", capability="test")
-        finally:
-            await rc.aclose()
-        self.assertEqual(out.outcome, "ok")
-        self.assertEqual(rec[0]["connect_host"], "app.test")   # unchanged default path
-        self.assertEqual(r.calls, [], "resolver must not run when pinning is off")
+        async def go():
+            try:
+                return await ctx.target_transport().send("GET", "http://meta.test/latest", capability="t")
+            finally:
+                await ctx.aclose()
+
+        out = asyncio.run(go())
+        self.assertEqual(out.outcome, "blocked")
+        self.assertFalse(out.executed)
+        self.assertIn("special-purpose", out.error)
 
 
 if __name__ == "__main__":

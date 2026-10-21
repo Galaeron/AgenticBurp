@@ -22,6 +22,7 @@ integrate loop.
 from __future__ import annotations
 
 import logging
+import re
 from urllib.parse import urlsplit
 
 from harness.models import HttpExchange
@@ -125,6 +126,21 @@ def _parent_template_object_id(state, node: dict) -> str | None:
     return None
 
 
+def _fill_path_ids(path: str, template: dict | None, id_val: str) -> str:
+    """Fill the `{id}` slots of a node path.
+
+    A captured template records every path id in order (`path_ids`), so each slot
+    gets ITS OWN captured value: /accounts/{id}/orders/{id} replays as
+    /accounts/17/orders/42, not /accounts/42/orders/42. Without a recorded list
+    that matches the slot count -- a template stored before `path_ids` existed,
+    or no template at all -- every slot takes `id_val`, as before."""
+    ids = (template or {}).get("path_ids") or []
+    if ids and len(ids) == path.count("{id}"):
+        values = iter(str(i) for i in ids)
+        return re.sub(r"\{id\}", lambda _m: next(values), path)
+    return path.replace("{id}", id_val)
+
+
 def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
                    template: dict | None = None) -> HttpExchange:
     """Build the probe exchange for a node. When a captured request TEMPLATE exists
@@ -138,7 +154,7 @@ def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
     query = (template.get("query", "") if template else "") or ""
     ctype = (template.get("content_type", "") if template else "") or ""
 
-    path = node.get("path", "/").replace("{id}", id_val)
+    path = _fill_path_ids(node.get("path", "/"), template, id_val)
     url = base_url.rstrip("/") + path
     if query and "?" not in url:
         url = f"{url}?{query}"
@@ -250,12 +266,9 @@ async def investigate_worklist(
     budget with eligible work still on the table.
 
     Returns a per-node outcome list; findings are folded back into `state`."""
-    # X03: reachable_roles holds access-matrix principal keys, so credentials
-    # are looked up by principal and trust by that principal's role.
-    from harness.role_crawl import principal_keys
-    keys = principal_keys(roles)
-    role_headers = {key: dict(r.headers or {}) for key, r in zip(keys, roles)}
-    key_roles = {key: r.role for key, r in zip(keys, roles)}
+    from harness.coverage_tracker import _principal_of
+    from harness.engagement import principal_reached
+    role_headers = {r.role: dict(r.headers or {}) for r in roles}
     outcomes: list[dict] = []
     investigated = 0
     precondition_run = 0
@@ -292,13 +305,15 @@ async def investigate_worklist(
             continue  # no agent hypothesis AND no shape-driven leg to run -- skip
 
         reach = node.get("reachable_roles", []) or []
-        access_roles = node.get("access_roles") or {}
         # probe from the lowest-trust identity that can reach it (strongest proof).
-        probe_role = (min(reach, key=lambda k: _trust(access_roles.get(k) or key_roles.get(k) or k))
-                      if reach else (keys[0] if roles else "anonymous"))
-        headers = role_headers.get(probe_role)
-        if headers is None:  # a state whose matrix still names a role label
-            headers = next((dict(r.headers or {}) for r in roles if r.role == probe_role), {})
+        probe_role = min(reach, key=_trust) if reach else (roles[0].role if roles else "anonymous")
+        # WL-02: within that role, probe as a principal whose OWN cell reached the
+        # node, so a same-role principal that was denied is never the one used.
+        cells = node.get("access_by_principal") or {}
+        probe_session = next((r for r in roles if r.role == probe_role
+                              and principal_reached(cells, reach, _principal_of(r), r.role)), None)
+        headers = (dict(probe_session.headers or {}) if probe_session is not None
+                   else role_headers.get(probe_role, {}))
         parent_id = _parent_template_object_id(state, node)
         exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
 
@@ -376,6 +391,7 @@ async def investigate_worklist(
             "path": node.get("path"),
             "specialty": derived[0] if derived else None,
             "probe_role": probe_role,
+            "probe_principal": _principal_of(probe_session) if probe_session is not None else None,
             "findings": len(node_findings),
             "findings_detail": node_findings,
             "precondition_findings": len(precond_findings),

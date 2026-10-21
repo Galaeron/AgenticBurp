@@ -47,6 +47,13 @@ invocation binding, paths, and artifact hashes. A clean-tree
 build. A `historical_rescore` remains usable but is never labelled a fresh
 end-to-end validation. Dirty or mismatched provenance is unknown.
 
+The audit also binds every `--input` to the manifest: an input whose SHA-256 is not
+among the manifest's hashed artifacts, or that names another `invocation_id`, makes
+the provenance `unknown_or_mismatched` (`provenance.bound_inputs` lists each input), so
+a valid manifest for one run cannot certify a different run's file. Health controls and
+logs are merged across all inputs; a failed control on any input invalidates the
+evaluation whatever the input order.
+
 Hashes establish that the supplied files are internally consistent with the
 manifest. They do **not** independently authenticate who created the files, how
 they were produced, or whether the producer was trustworthy. Credential values

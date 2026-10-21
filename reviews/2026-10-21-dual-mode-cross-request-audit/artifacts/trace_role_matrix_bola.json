@@ -1,0 +1,99 @@
+{
+  "mode": "bola",
+  "principal_ids": [
+    "alice",
+    "bob",
+    "anonymous"
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/orders/{id}",
+      "by_role": {
+        "user": 200,
+        "anonymous": 403
+      },
+      "reachable_roles": [
+        "user",
+        "user"
+      ],
+      "object_scoped": true,
+      "fingerprints": {
+        "user": {
+          "len": 75,
+          "hash": "68cd0e9122c0fbe7"
+        },
+        "anonymous": {
+          "len": 6,
+          "hash": null
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/shared/announcements/{id}",
+      "by_role": {
+        "user": 200,
+        "anonymous": 401
+      },
+      "reachable_roles": [
+        "user",
+        "user"
+      ],
+      "object_scoped": true,
+      "fingerprints": {
+        "user": {
+          "len": 57,
+          "hash": "e273c4bb4f4ba84c"
+        },
+        "anonymous": {
+          "len": 5,
+          "hash": null
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/vehicle/0f6c1a52-1111-4a1a-9a1a-aaaaaaaaaaaa/location",
+      "by_role": {
+        "user": 200,
+        "anonymous": 401
+      },
+      "reachable_roles": [
+        "user",
+        "user"
+      ],
+      "object_scoped": false,
+      "fingerprints": {}
+    }
+  ],
+  "fingerprint_keys": {
+    "/orders/{id}": [
+      "anonymous",
+      "user"
+    ],
+    "/shared/announcements/{id}": [
+      "anonymous",
+      "user"
+    ],
+    "/vehicle/0f6c1a52-1111-4a1a-9a1a-aaaaaaaaaaaa/location": []
+  },
+  "idor_findings": [],
+  "idor_candidates": [
+    [
+      "GET",
+      "/orders/{id}",
+      [
+        "user"
+      ]
+    ],
+    [
+      "GET",
+      "/shared/announcements/{id}",
+      [
+        "user"
+      ]
+    ]
+  ],
+  "auth_bypass_candidates": []
+}

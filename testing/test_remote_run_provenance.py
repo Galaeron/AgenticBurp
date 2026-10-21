@@ -10,6 +10,13 @@ import yaml
 from testing import run_captured_analysis as driver
 from testing.remote_run_provenance import checked_provenance
 
+# A structurally healthy /analyze answer. These tests are about provenance
+# stamping and drift, so the analysis responses must be valid on their own: the
+# driver (R44) no longer treats an empty `{}` body as a valid analysis, and a
+# test whose only analysis response is `{}` could not tell drift from a bad payload.
+HEALTHY_ANALYSIS = {"degraded": False,
+                    "agent_reports": [{"agent": "sqli", "findings": [], "raw_error": None}]}
+
 
 class RemoteDriverTests(unittest.TestCase):
     def setUp(self):
@@ -40,7 +47,7 @@ class RemoteDriverTests(unittest.TestCase):
             seen.append(url)
             if url.endswith("run-provenance"):
                 return 200, self.state
-            return 200, {}
+            return 200, HEALTHY_ANALYSIS
         with patch.dict(os.environ, {"HARNESS_TOKEN": "synthetic"}), patch.object(driver, "http_json", side_effect=http):
             self.assertEqual(driver.main(self.argv), 0)
         result = json.loads(self.out.read_text())
@@ -70,7 +77,7 @@ class RemoteDriverTests(unittest.TestCase):
                 if calls > 1:
                     state["source_matches_disk"] = False
                 return 200, state
-            return 200, {}
+            return 200, HEALTHY_ANALYSIS
         with patch.dict(os.environ, {"HARNESS_TOKEN": "synthetic"}), patch.object(driver, "http_json", side_effect=http):
             self.assertEqual(driver.main(self.argv), 2)
         result = json.loads(self.out.read_text())

@@ -66,14 +66,19 @@ def relabel_confirmed_finding(finding) -> bool:
     """If a finding was CONFIRMED by a deterministic leg, set its class from the
     leg (the authoritative source for what was actually proven), overriding a
     wrong or variant agent label. No-op unless the finding is confirmed, names a
-    known leg in its evidence, and that leg's class differs from the current one.
+    known executed leg (confirmed_by_leg, an evidence stamp or proactive_leg --
+    never a validation hint), and that leg's class differs from the current one.
     Accepts a Finding object or a dict. Returns whether it relabelled."""
     if not _get(finding, "confirmed"):
         return False
-    # confirmation_leg_of reads evidence/proactive_leg/validation_hints.
-    probe = {"evidence": _get(finding, "evidence") or "",
-             "proactive_leg": _get(finding, "proactive_leg"),
-             "validation_hints": _get(finding, "validation_hints") or []}
+    # R33: the class comes from the leg that EXECUTED the confirmation -- the
+    # structured confirmed_by_leg stamp first, then a legacy evidence stamp or
+    # proactive_leg. validation_hints are the model's unexecuted suggestions, so
+    # they never relabel a proven finding (a sqlmap-confirmed sqli with an
+    # "ssrf:url" hint stays sqli).
+    probe = {"confirmed_by_leg": _get(finding, "confirmed_by_leg"),
+             "evidence": _get(finding, "evidence") or "",
+             "proactive_leg": _get(finding, "proactive_leg")}
     canon = _LEG_CLASS.get(confirmation_leg_of(probe))
     if not canon:
         return False

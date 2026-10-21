@@ -6,6 +6,7 @@
 | Install/use the copilot | [README.md](../README.md) |
 | Run it safely (first run, scope, speed, data handling, benchmark) | [USER_MANUAL.md](USER_MANUAL.md) |
 | Known issues, gaps and roadmap (read before trusting results) | [LIMITATIONS.md](LIMITATIONS.md) |
+| Declare protected routes for missing-auth confirmation | [PROTECTED_ROUTES.md](PROTECTED_ROUTES.md) |
 | Find the production owner of a behavior | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Choose tests and interpret their evidence | [TESTING.md](TESTING.md) |
 | Do the live/owner work after the loop reports `LOOP_DONE` | [OWNER_RUNBOOK.md](OWNER_RUNBOOK.md) — turnkey steps + offline-verified instruments for the 4 live priorities |
@@ -15,6 +16,7 @@
 | Configure the optional safety proxy | [PROXY_SETUP.md](../PROXY_SETUP.md) |
 | Run the `improve-loop` skill (per-iteration coding loop) | [IMPROVEMENT_BACKLOG.md](../IMPROVEMENT_BACKLOG.md) — the skill's actual task source (`.claude/commands/improve-loop.md`, local/untracked); it does not read the file below |
 | Historical positioning | [COMPETITIVE_LANDSCAPE.md](../COMPETITIVE_LANDSCAPE.md) |
+| Retained observations (supplied captures with or without findings) | [OBSERVATION_MEMORY.md](OBSERVATION_MEMORY.md) |
 
 Historical measurements, plans and reviews describe their named revisions, not
 current capability. Code is authoritative for routing/configuration; executed

@@ -52,9 +52,28 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   `store.persist_findings` (principal always recorded; default-pile fingerprint unchanged).
   `harness/test_default_history_caller.py` drives `analyze()` twice with real storage: same
   identity sees it; another identity, another named pile and a severed reader do not; zero
-  target sends. Batches A (proof binding through storage/export) and C (non-finding
-  observations) remain open. Legacy default-pile rows (empty principal) stay out of prior
-  context, as before.
+  target sends. Legacy default-pile rows (empty principal) stay out of prior context, as before.
+- **Status 2026-10-19 — batch A (proof binding through storage/export) done:** implemented +
+  caller-verified (commits `8edf5a9`, `04b3dea`). Class binding already held at the decision
+  seam: claim B, reached only through the agent fallback, never borrowed claim A's sqli proof,
+  confidence or confirmation on the API, stored rows, issue export, SARIF or Markdown.
+  Reproduced defect: after a restart, a confirmed row whose proof was deleted, stale (verdict no
+  longer confirmed), unresolvable or re-pointed to another case still exported as confirmed.
+  `store.all_host_findings` now resolves the (proof_id, case_id) pair against confirmed proof
+  records; an unresolved row is downgraded and marked `proof_status: unavailable`, and
+  pointer-only issue references are marked unavailable rather than counted as proof.
+  `harness/test_proof_binding_storage_export.py` drives `analyze()` with real SQLite storage
+  (7 tests). Disabling the extracted `_fallback_result_binds` seam or the verdict filter is
+  detected.
+- **Status 2026-10-19 — batch C (non-finding observations) done:** implemented +
+  caller-verified (commits `f846e36`, `aacc35a`; owner-approved option C in
+  `.test-work/i02c-observations-20261019/DESIGN.md`). Reproduced on `a7d03b5`: a supplied
+  capture with no finding left no row, and the next analysis had no trace of it. Such
+  captures are now kept (`exchange_observations` + `observation_attributions`, an additive
+  migration marked in `state_metadata`) and wiped with their data. A later analysis of the same
+  pile gets them as bounded prior context. Tests: `test_observation_store.py`,
+  `test_observation_migration.py`, `test_observation_memory_caller.py`. Not live-validated;
+  model usefulness is I14 and the Burp fields are I07/I16. See docs/OBSERVATION_MEMORY.md.
 - **Type:** implementation if reproduced + integration verification. **Depends on:** I01.
 - Trace original finding identity/class, validator result, proof/case reference,
   stored finding and API/Markdown/SARIF output. Define explicit supported class
@@ -91,7 +110,12 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   cookie-authenticated candidates now show as low-severity "NEEDS MANUAL CHECK" items with
   copy-ready steps and a test form (analyze caller test). Validator-level controls and a fault
   injection restoring the retired decision are in `harness/test_csrf_reflection_control.py`.
-  Open: caller -> storage -> export label check (with I02).
+  2026-10-19: the caller -> storage -> export label check is done (commit `14747a9`,
+  `harness/test_csrf_label_storage_export.py`, 8 tests). The candidate stays unconfirmed,
+  low severity and manual-verification in the stored row, issue export, SARIF and Markdown.
+  A SameSite=Lax control and a fault injection that reinstates the old decision are included.
+  The steps reach the API (Burp "Next step") and Markdown. Issue export and SARIF carry no
+  `suggested_test` for any finding; that parity gap is I16 work.
 - **Type:** reproduce historical issue, then correct or close with evidence.
   **Depends on:** I01; coordinate confirmation expectations with I02.
 - Inspect the current WIP branch named by LB-CSRF-REPLAY. Use a benign reflecting
@@ -104,7 +128,62 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
   credential-delivery evidence appropriate to the claim, through the real caller.
 - **Maps to:** LB-CSRF-REPLAY. Treat as a release blocker until dispositioned.
 
-### [ ] I05 — Close remaining network and external-tool containment gaps
+### [~] I05 — Close remaining network and external-tool containment gaps
+- **Status 2026-10-19 — batch A (sends escaping their run) done:** implemented +
+  caller-verified (commit `2ba91da`, local; push awaits owner review per the guide).
+  Reproduced and fixed three escapes:
+  - the coverage drive's unbound registry sqlmap preflight (opt-in `coverage_drive_legs`);
+  - auto-escalation's credential probe and re-crawl outside `analyze()`'s run (opt-in
+    `auto_escalate`);
+  - `api_security`'s raw-client limit probe.
+
+  Guards: an unbound validator, or `transport_for(None)`, inside an entered run now uses
+  that run. `harness/test_run_escape_callers.py` (14 tests) includes two fault injections.
+- **Status 2026-10-19 — batches C, C2 and A2 done** (implemented + caller-verified; local
+  commits `ae8f287`, `934c3e1`, `f7d1321`; pushed after owner review):
+  - **C, external-process lifecycle:** every tool (sqlmap host/container, ffuf) runs as an
+    owned process tree (Windows Job Object, created suspended; POSIX process group).
+    Output is bounded while it is read. Cancel or timeout stops the whole tree and removes
+    the exact container before the caller (validator, task, server job) may finish; failed
+    cleanup is a distinct error. sqlmap refuses to launch for a cancelled, exhausted or
+    out-of-scope run. `harness/test_tool_process_lifecycle.py` (13 tests).
+  - **C2, tool traffic accounting** (owner decision: counting proxy): inside a run sqlmap is
+    pointed at `tool_proxy`, a loopback reverse proxy that replays each request through the
+    run. The target's count equals `budget.used`, the budget caps the tool exactly and stops
+    it, and handing the tool the real URL is detected.
+    `harness/test_tool_traffic_accounting.py` (9 tests).
+  - **A2, standalone analyze** (owner decision): `analyze()` publishes the run it owns, so
+    gated validators spend `analyze.max_requests` and use the run's TLS policy (self-signed
+    targets are trusted via `transport.tls`). The shared model plane (Ollama breaker,
+    fail-open stats) is kept. `harness/test_standalone_analyze_run.py` (6 tests).
+
+  Not live-validated: no real container run (Docker Desktop off); POSIX paths are unexercised.
+  ffuf still refuses to launch inside a run (it could now use the proxy).
+- **Status 2026-10-19 — batch B (redirect and DNS-rebinding destination policy) done**
+  (implemented + caller-verified; pushed with the owner's approval of the default):
+  - Reproduced with owned servers on 127.0.0.1 and 127.0.0.2 and a controlled resolver for
+    `.test` names. A rebound in-scope name moved later traffic to the second address
+    between requests, on redirect hops, over real HTTPS, for gated validators, and with the
+    old opt-in P1-10 pin. A name answering 169.254.169.254 was connected to.
+  - Fix: every run client connects through `AddressPins` (an httpcore network backend).
+    Each name is resolved once per run and that first answer holds for the whole run; the
+    Host header, SNI and certificate checks stay on the name. Link-local, multicast,
+    unspecified and reserved answers are refused before any socket opens (outcome
+    `blocked`). This replaces P1-10's per-hop URL rewrite. It is ON by default;
+    `security.pin_connect_address: false` is an explicit opt-out.
+  - Out-of-scope redirect targets (zero requests) and cross-origin credential dropping were
+    already correct and are now covered. `harness/test_destination_policy_callers.py`
+    (10 tests, real sockets and TLS, one fault injection) and the rewritten
+    `harness/test_connect_address_pin.py` (8 tests).
+  - Limits: behind an HTTP(S) proxy only the connection to the proxy is pinned; a name whose
+    first answer is private or loopback is accepted (lab targets); no failover to another A
+    record within a run. Not live-validated against an external rebinding service.
+  - The no-run routes `/crawl`, `/crawl-roles` and `/engagement/{host}/advance` now own a run
+    and are pinned (code review 02 RV-G, `9d76c5d`). RV-A (`aa97fc2`..`cf4a264`) fixed tool
+    proxy close, Job Object fail-closed, container redirects and the egress probe count. See
+    docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md "Status".
+
+  Next: batch D (browser credential isolation).
 - **Type:** implementation + isolated environment proof. **Depends on:** I01/I03.
 - Reconcile connect-time address pinning with redirect handling and approved
   destination policy. Verify browser credential isolation across two origins.
@@ -183,8 +262,12 @@ The historical crAPI no-go remains unresolved until new adjudicated evidence exi
 ### [~] I11 — Remove test flakiness and reconcile requirement evidence
 - **Status 2026-10-17:** LB-FLAKE closed (fixed clock committed; controls added). The audit
   logger file-handle leak is fixed. The 36 gaps are classified in
-  `docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md`. Remaining: wire evidence for the 14
-  caller-tested requirements, and trace the 3 unclosed loopback sockets.
+  `docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md`. 2026-10-19: the 3 unclosed loopback
+  sockets are traced and closed in their owners (`Collaborator.stop`/`stop_shared`, the
+  `test_driver_capture` fixture); 11 of the 14 caller-tested requirements are wired to
+  confirmation + control evidence (gap count 36 -> 25). Remaining: WSTG-ATHZ-02 (no caller
+  test), WSTG-SESS-01 (shares the SESS-03 fixation pair), WSTG-INPV-01 (needs Playwright in
+  CI), plus the unit-only rows.
 - **Type:** verification infrastructure. **Depends on:** I01; can start alongside I02.
 - Reproduce LB-FLAKE and reconcile it with the existing deterministic report-clock
   work before changing it. Inject a fixed clock; retain a content-change negative control.
@@ -296,3 +379,12 @@ Run I13 only when its acceptance prerequisites and authorized environment exist.
 Use I14 to justify subsequent model/architecture/performance changes. Finish I16
 and make the scoped release decision in I17. No new agents, validators or competitor
 features are needed merely to begin this sequence.
+
+Code review 02 (2026-10-19) has 52 findings. They are mapped to I02, I05, I06/I07, I10,
+I12 and I16 as batches RV-A to RV-K in docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md, which also
+sets their order. RV-A to RV-J (47 findings) have landed; the 5 in RV-K remain open.
+Independent verifications found three P1 false confirmations RV-D left (V1 to V3) and three
+RV-E left (E1 to E3); batches RV-D2 and RV-E2 fixed them. Follow-up batches RV-L to RV-S (no
+new findings) have landed. The cross-request audit's fix batch 1 (I05, I06, I10;
+reviews/2026-10-21-dual-mode-cross-request-audit/FIX_BATCH_1.md) has landed too, and RV-T takes
+its owner decisions. Status is in that document's "Status" section.

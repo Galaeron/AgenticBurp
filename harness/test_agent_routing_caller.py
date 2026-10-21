@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import unittest
 from contextlib import ExitStack
+from urllib.parse import urlsplit
 from unittest.mock import AsyncMock, patch
 from harness.models import AgentReport, Finding, HttpExchange
 from harness.orchestrator_confirm import ConfirmMixin
@@ -31,7 +32,11 @@ class AgentRoutingCallerTests(unittest.TestCase):
             commands = []
             def fake_run(command, **kwargs):
                 self.assertEqual(command[0], "sqlmap")
-                self.assertEqual(command[command.index("-u") + 1], exchange.url)
+                # I05: inside a run sqlmap is pointed at the run's loopback tool proxy
+                # for this exchange (same path), never at the target itself.
+                launched = urlsplit(command[command.index("-u") + 1])
+                self.assertEqual(launched.hostname, "127.0.0.1")
+                self.assertEqual(launched.path, urlsplit(exchange.url).path)
                 commands.append(command)
                 return subprocess.CompletedProcess(command, 0, "[INFO] no injectable parameter identified", "")
             try:
@@ -39,7 +44,7 @@ class AgentRoutingCallerTests(unittest.TestCase):
                     for target in ("subprocess.Popen", "socket.create_connection",
                                    "httpx.AsyncClient.send", "httpx.Client.send"):
                         stack.enter_context(patch(target, side_effect=AssertionError("unexpected external execution")))
-                    stack.enter_context(patch("subprocess.run", side_effect=fake_run))
+                    stack.enter_context(patch("harness.tool_runner.run_process", side_effect=fake_run))
                     stack.enter_context(patch.object(caller, "_persist_confirmation_proof", AsyncMock(
                         return_value=(True, {"proof_id": "synthetic-negative"}, ""))))
                     plans = stack.enter_context(patch("harness.store.persist_test_plans"))

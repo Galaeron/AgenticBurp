@@ -98,6 +98,13 @@ for separation. The uncommitted W2 `server.py` hunk that defaulted `/analyze` to
 Within a pile, the captured principal still isolates history (I02 batch B). A Burp field to
 set the optional named pile belongs to I16.
 
+**W2 unavailable-proof marking — adopted in I02 batch A (2026-10-19):** the idea from W2's
+`issues.py` hunk (mark a pointer-only proof reference `availability: unavailable`) is now
+committed in `8edf5a9`, together with store-level resolution of each confirmation's proof.
+The remaining W2 `issues.py` hunks (engagement-scoped issue identity) are still uncommitted.
+When W2 is split into commits, rebase its `issues.py` and `store.py` hunks on `8edf5a9`, and
+drop the duplicate availability lines.
+
 ### Untracked files
 
 | Group | Contents | Disposition |

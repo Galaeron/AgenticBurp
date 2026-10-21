@@ -10,6 +10,7 @@ import unittest
 
 from harness import identity_headers
 from harness import identity_compare
+from harness import principals
 from harness.validators.cross_identity_validator import CrossIdentityValidator
 from harness.models import Finding, HttpExchange
 
@@ -42,20 +43,71 @@ class CrossIdentityValidatorTest(unittest.TestCase):
     def tearDown(self):
         identity_headers.clear()
 
+    @staticmethod
+    def _bob_reads_owner_data(headers):
+        if headers.get("Authorization") == "Bearer bob":
+            return (200, "OWNER-SECRET-DATA-12345")   # bob sees the owner's data
+        return (403, "Forbidden")                     # anon denied
+
     def test_confirms_real_idor(self):
-        # bob (another identity) reaches the owner's protected data; anon is denied.
+        # bob (another identity) reaches the owner's protected data; anon is denied;
+        # and the DECLARED owner is alice, so bob is not entitled to it (WL-04).
         identity_headers.set_identity("localhost", "bob", {"Authorization": "Bearer bob"})
+        led = principals.OwnershipLedger()
+        led.declare("http://localhost/api/tickets/1", owner="alice")
 
-        def responder(headers):
-            if headers.get("Authorization") == "Bearer bob":
-                return (200, "OWNER-SECRET-DATA-12345")   # bob sees the owner's data
-            return (403, "Forbidden")                     # anon denied
-
-        v = _StubbedValidator(responder, allowed_hosts=["localhost"])
+        v = _StubbedValidator(self._bob_reads_owner_data, allowed_hosts=["localhost"], ownership=led)
         r = asyncio.run(v.validate(_finding(), _exchange()))
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
         self.assertIn("bob", r.summary)
+        self.assertIn("declared ownership", r.evidence.lower())
+
+    def test_undeclared_ownership_is_a_supported_lead_not_a_confirmation(self):
+        """WL-04 (RETIRED similarity-only verdict): the same response match with no
+        ownership declared is a lead carrying the analyst's next step -- never a
+        confirmation (a resource shared with every logged-in user matches the same
+        way) and never a negative (no held control)."""
+        identity_headers.set_identity("localhost", "bob", {"Authorization": "Bearer bob"})
+        for ownership in (None, principals.OwnershipLedger()):   # no source / nothing declared
+            with self.subTest(ownership=type(ownership).__name__):
+                v = _StubbedValidator(self._bob_reads_owner_data, allowed_hosts=["localhost"],
+                                      ownership=ownership)
+                r = asyncio.run(v.validate(_finding(), _exchange()))
+                self.assertEqual(r.status, "supported")
+                self.assertFalse(r.confirmed)
+                self.assertNotEqual(r.control_outcome, "control_held")
+                self.assertIn("not declared", r.evidence.lower())
+                self.assertIn("ownership", r.manual_verification.lower())
+
+    def test_declared_shared_resource_is_authorized_sharing_not_bola(self):
+        # The team-announcement case: declared shared with bob -> an observation.
+        identity_headers.set_identity("localhost", "bob", {"Authorization": "Bearer bob"})
+        led = principals.OwnershipLedger()
+        led.declare("http://localhost/api/tickets/1", owner="alice", shared_with={"bob"})
+        v = _StubbedValidator(self._bob_reads_owner_data, allowed_hosts=["localhost"], ownership=led)
+        r = asyncio.run(v.validate(_finding(), _exchange()))
+        self.assertEqual(r.status, "not_confirmed")
+        self.assertFalse(r.confirmed)
+        self.assertEqual(r.control_outcome, "inconclusive")
+        self.assertIn("authorized", r.summary.lower())
+
+    def test_credential_alias_accessor_cannot_be_declared_unentitled(self):
+        # An identity known only by a credential-derived alias -- role_crawl's
+        # "<role>#<hash>" for an unnamed account, or the R05 captured session's
+        # "captured:<hmac>" -- could be the owner under another session, so a
+        # declared owner cannot make it "not entitled": the result stays a lead.
+        led = principals.OwnershipLedger()
+        led.declare("http://localhost/api/tickets/1", owner="alice")
+        for alias in ("user#1a2b3c4d", "captured:" + "ab" * 32):
+            with self.subTest(alias=alias):
+                identity_headers.clear()
+                identity_headers.set_identity("localhost", alias, {"Authorization": "Bearer bob"})
+                v = _StubbedValidator(self._bob_reads_owner_data, allowed_hosts=["localhost"],
+                                      ownership=led)
+                r = asyncio.run(v.validate(_finding(), _exchange()))
+                self.assertEqual(r.status, "supported")
+                self.assertFalse(r.confirmed)
 
     def test_rejects_secure_endpoint(self):
         # Every other identity AND anon are denied -> the control held.
@@ -168,9 +220,12 @@ class CrossIdentityValidatorTest(unittest.TestCase):
     def test_rejects_self_comparison_but_tests_distinct_same_role_user(self):
         """R10: the captured request was made by alice (role user). alice must be
         EXCLUDED (self-comparison), but bob -- a DIFFERENT account with the SAME
-        role -- is a distinct principal and IS tested, confirming the real IDOR."""
+        role -- is a distinct principal and IS tested, confirming the real IDOR
+        (with alice declared as the owner, WL-04)."""
         identity_headers.set_identity("localhost", "alice", {"Authorization": "Bearer alice"}, role="user")
         identity_headers.set_identity("localhost", "bob", {"Authorization": "Bearer bob"}, role="user")
+        led = principals.OwnershipLedger()
+        led.declare("http://localhost/api/tickets/1", owner="alice")
 
         probed = []
 
@@ -182,7 +237,7 @@ class CrossIdentityValidatorTest(unittest.TestCase):
                 return (200, "OWNER-SECRET-DATA-12345")   # alice reaching her own -> must NOT be tested
             return (403, "Forbidden")                     # anon denied
 
-        v = _StubbedValidator(responder, allowed_hosts=["localhost"])
+        v = _StubbedValidator(responder, allowed_hosts=["localhost"], ownership=led)
         # the captured exchange was made BY alice (source principal)
         ex = _exchange()
         ex.request_headers = {"Authorization": "Bearer alice"}
@@ -226,25 +281,52 @@ class CrossIdentityValidatorTest(unittest.TestCase):
 
     # --- V13: function-level authorization (BFLA) on an admin-namespaced route ---
 
-    def test_confirms_bfla_when_nonadmin_sees_the_admin_data(self):
-        # R11: BFLA confirms only via a privileged-DATA oracle -- carol (non-admin)
-        # gets the SAME response an admin (root) sees, while anon is denied.
+    ADMIN_DATA = "ADMIN USER LIST: alice, bob, carol, dave, eve, frank ..."
+
+    def _carol_sees_admin_data(self, headers):
+        auth = headers.get("Authorization")
+        if auth in ("Bearer carol", "Bearer root"):
+            return (200, self.ADMIN_DATA)      # carol sees exactly what root sees
+        return (401, "Unauthorized")           # anon denied
+
+    def _bfla(self, ownership):
         identity_headers.set_identity("localhost", "carol", {"Authorization": "Bearer carol"}, role="user")
         identity_headers.set_identity("localhost", "root", {"Authorization": "Bearer root"}, role="admin")
-        ADMIN_DATA = "ADMIN USER LIST: alice, bob, carol, dave, eve, frank ..."
-
-        def responder(headers):
-            auth = headers.get("Authorization")
-            if auth in ("Bearer carol", "Bearer root"):
-                return (200, ADMIN_DATA)       # carol sees exactly what root sees
-            return (401, "Unauthorized")       # anon denied
-
-        v = _StubbedValidator(responder, allowed_hosts=["localhost"])
+        v = _StubbedValidator(self._carol_sees_admin_data, allowed_hosts=["localhost"], ownership=ownership)
         ex = _exchange(url="http://localhost/api/admin/users", body="")
-        r = asyncio.run(v.validate(_finding("broken_access_control"), ex))
+        return asyncio.run(v.validate(_finding("broken_access_control"), ex))
+
+    def test_confirms_bfla_when_nonadmin_sees_the_admin_data(self):
+        # R11: BFLA confirms only via a privileged-DATA oracle -- carol (non-admin)
+        # gets the SAME response an admin (root) sees, while anon is denied -- AND
+        # (WL-04) a declaration says only root may reach the function, so carol is
+        # not entitled. The admin namespace alone is a path-name lead.
+        led = principals.OwnershipLedger()
+        led.declare("http://localhost/api/admin/users", shared_with={"root"})
+        r = self._bfla(led)
         self.assertEqual(r.status, "confirmed")
         self.assertTrue(r.confirmed)
         self.assertIn("privileged", r.summary.lower())
+        self.assertIn("declared entitlement", r.evidence.lower())
+
+    def test_bfla_without_declared_entitlement_is_a_supported_lead(self):
+        # WL-04: a management view shared with all staff matches the admin's
+        # response identically; without a declaration the match is a lead.
+        r = self._bfla(None)
+        self.assertEqual(r.status, "supported")
+        self.assertFalse(r.confirmed)
+        self.assertNotEqual(r.control_outcome, "control_held")
+        self.assertIn("function", r.evidence.lower())
+        self.assertIn("ownership", r.manual_verification.lower())
+
+    def test_bfla_declared_shared_with_the_user_is_not_confirmed(self):
+        led = principals.OwnershipLedger()
+        led.declare("http://localhost/api/admin/users", shared_with={"root", "carol"})
+        r = self._bfla(led)
+        self.assertEqual(r.status, "not_confirmed")
+        self.assertFalse(r.confirmed)
+        self.assertEqual(r.control_outcome, "inconclusive")
+        self.assertIn("entitled", r.summary.lower())
 
     def test_bfla_reached_without_admin_baseline_is_observation(self):
         # R11: a non-admin reaching the admin namespace with NO admin baseline to

@@ -79,13 +79,18 @@ class AvailableTests(unittest.TestCase):
         self.assertIn("did not respond", reason)
 
 
+def _result(rc, out, err, args=()):
+    """A finished owned-process result, as tool_runner.run_process returns it."""
+    return tr.ProcessResult(list(args), rc, out, err, "exit", "not_needed", "job")
+
+
 class RunTests(unittest.TestCase):
     def test_run_invokes_docker_and_returns_streams(self):
         captured = {}
-        def fake_run(cmd, capture_output, text, timeout):
+        def fake_run(cmd, **kw):
             captured["cmd"] = cmd
-            return subprocess.CompletedProcess(cmd, 0, "found injectable", "")
-        with patch("subprocess.run", fake_run):
+            return _result(0, "found injectable", "", cmd)
+        with patch.object(tr, "run_process", fake_run):
             rc, out, err = tr.run("harness/sqlmap:1.10.9", ["-u", "http://host.docker.internal/x"])
         self.assertEqual(rc, 0)
         self.assertEqual(out, "found injectable")
@@ -99,14 +104,18 @@ class ContainerCleanupTests(unittest.TestCase):
     def test_timeout_force_removes_named_container(self):
         runs = []
 
-        def fake_run(cmd, **kw):
+        def fake_launch(cmd, **kw):
             runs.append(cmd)
-            if cmd[:3] == [tr.DOCKER, "run", "--rm"] or (len(cmd) > 1 and cmd[1] == "run"):
-                raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
-            class _R: returncode = 0; stdout = ""; stderr = ""
-            return _R()
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
 
-        with patch("subprocess.run", side_effect=fake_run):
+        def fake_docker(cmd, **kw):
+            runs.append(cmd)
+            gone = cmd[1:3] == ["container", "inspect"]
+            return subprocess.CompletedProcess(cmd, 1 if gone else 0, "",
+                                               "Error: No such container" if gone else "")
+
+        with patch.object(tr, "run_process", side_effect=fake_launch), \
+                patch("subprocess.run", side_effect=fake_docker):
             with self.assertRaises(subprocess.TimeoutExpired):
                 tr.run("img", ["-x"], timeout=1)
         # the run cmd carried a unique --name, and a `docker rm -f <name>` followed
@@ -145,14 +154,14 @@ class EgressPolicyArgvTests(unittest.TestCase):
 class RunEgressEnforcementTests(unittest.TestCase):
     def test_fails_closed_without_egress_when_enforced(self):
         # NEGATIVE CONTROL: an uncontrolled-egress tool run is refused, never launched.
-        with patch("subprocess.run") as m:
+        with patch.object(tr, "run_process") as m:
             with self.assertRaises(tr.EgressPolicyRequired):
                 tr.run("img:1", ["x"], enforce_egress=True)
             m.assert_not_called()
 
     def test_with_egress_launches(self):
-        with patch("subprocess.run",
-                   return_value=subprocess.CompletedProcess([], 0, "ok", "")) as m, \
+        with patch.object(tr, "run_process",
+                   return_value=_result(0, "ok", "")) as m, \
                 patch.object(tr, "_force_remove") as fr:
             rc, out, err = tr.run("img:1", ["x"], egress=tr.EgressPolicy(),
                                   enforce_egress=True)
@@ -162,8 +171,8 @@ class RunEgressEnforcementTests(unittest.TestCase):
 
     def test_receipt_populated_with_egress(self):
         receipt: dict = {}
-        with patch("subprocess.run",
-                   return_value=subprocess.CompletedProcess([], 3, "", "")), \
+        with patch.object(tr, "run_process",
+                   return_value=_result(3, "", "")), \
                 patch.object(tr, "_force_remove"):
             tr.run("img:1", ["x"], egress=tr.EgressPolicy(proxy_url="http://p"),
                    enforce_egress=True, receipt=receipt)
@@ -174,8 +183,8 @@ class RunEgressEnforcementTests(unittest.TestCase):
 
     def test_receipt_marks_no_egress(self):
         receipt: dict = {}
-        with patch("subprocess.run",
-                   return_value=subprocess.CompletedProcess([], 0, "", "")), \
+        with patch.object(tr, "run_process",
+                   return_value=_result(0, "", "")), \
                 patch.object(tr, "_force_remove"):
             tr.run("img:1", ["x"], receipt=receipt)
         self.assertFalse(receipt["egress_applied"])
@@ -184,7 +193,7 @@ class RunEgressEnforcementTests(unittest.TestCase):
 
 class RunCleanupTests(unittest.TestCase):
     def test_cleanup_in_finally_on_timeout(self):
-        with patch("subprocess.run",
+        with patch.object(tr, "run_process",
                    side_effect=subprocess.TimeoutExpired(cmd="x", timeout=1)), \
                 patch.object(tr, "_force_remove") as fr:
             with self.assertRaises(subprocess.TimeoutExpired):
@@ -192,15 +201,15 @@ class RunCleanupTests(unittest.TestCase):
             fr.assert_called_once()
 
     def test_cleanup_in_finally_on_generic_exception(self):
-        with patch("subprocess.run", side_effect=RuntimeError("boom")), \
+        with patch.object(tr, "run_process", side_effect=RuntimeError("boom")), \
                 patch.object(tr, "_force_remove") as fr:
             with self.assertRaises(RuntimeError):
                 tr.run("img:1", ["x"])
             fr.assert_called_once()
 
     def test_no_force_remove_on_clean_exit(self):
-        with patch("subprocess.run",
-                   return_value=subprocess.CompletedProcess([], 0, "", "")), \
+        with patch.object(tr, "run_process",
+                   return_value=_result(0, "", "")), \
                 patch.object(tr, "_force_remove") as fr:
             tr.run("img:1", ["x"])
             fr.assert_not_called()
@@ -211,21 +220,21 @@ class RunCancellationTests(unittest.TestCase):
         import asyncio
         ev = asyncio.Event()
         ev.set()
-        with patch("subprocess.run") as m, patch.object(tr, "_force_remove") as fr:
+        with patch.object(tr, "run_process") as m, patch.object(tr, "_force_remove") as fr:
             with self.assertRaises(tr.ToolRunCancelled):
                 tr.run("img:1", ["x"], cancel=ev)
             m.assert_not_called()
             fr.assert_called_once()  # safety cleanup even though nothing launched
 
     def test_callable_cancel_signal(self):
-        with patch("subprocess.run") as m, patch.object(tr, "_force_remove"):
+        with patch.object(tr, "run_process") as m, patch.object(tr, "_force_remove"):
             with self.assertRaises(tr.ToolRunCancelled):
                 tr.run("img:1", ["x"], cancel=lambda: True)
             m.assert_not_called()
 
     def test_not_cancelled_runs_normally(self):
-        with patch("subprocess.run",
-                   return_value=subprocess.CompletedProcess([], 0, "ok", "")), \
+        with patch.object(tr, "run_process",
+                   return_value=_result(0, "ok", "")), \
                 patch.object(tr, "_force_remove"):
             rc, out, err = tr.run("img:1", ["x"], cancel=lambda: False)
         self.assertEqual(out, "ok")

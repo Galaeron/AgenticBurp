@@ -29,10 +29,31 @@ class ValidationResult:
     manual_verification: str = ""
 
 
+def _enclosing_run():
+    """The entered RunContext enclosing this call, if any (I05)."""
+    from harness.run_context import current_run_context
+    return current_run_context()
+
+
 class Validator(ABC):
     name: str = "base"
     finding_classes: set[str] = set()
     active: bool = False
+    _bound_run = None
+
+    @property
+    def run_context(self):
+        """I05: the run this validator sends under. An explicitly bound run wins;
+        an unbound validator dispatched inside an entered run uses that run, so its
+        plain-client fallback cannot escape the run's budget, scope, cancellation
+        and TLS policy (the same rule as I03's GatedAsyncClient routing)."""
+        if self._bound_run is not None:
+            return self._bound_run
+        return _enclosing_run()
+
+    @run_context.setter
+    def run_context(self, value) -> None:
+        self._bound_run = value
 
     def plan(self, finding: Finding, exchange: HttpExchange) -> TestPlan | None:
         """Return a declarative plan when this capability can be executed by Burp."""

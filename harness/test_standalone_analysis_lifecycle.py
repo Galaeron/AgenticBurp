@@ -33,7 +33,7 @@ class StandaloneAnalyzeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.created = {}
 
         def _fake_create(**kwargs):
-            ctx = SimpleNamespace(aclose=AsyncMock(), kwargs=kwargs)
+            ctx = SimpleNamespace(aclose=AsyncMock(), publish=Mock(), kwargs=kwargs)
             self.created["kwargs"] = kwargs
             self.created["ctx"] = ctx
             return ctx
@@ -56,7 +56,8 @@ class StandaloneAnalyzeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # created exactly one context, with an EXPLICIT request ceiling
         self.assertIn("max_requests", self.created["kwargs"])
         self.assertEqual(self.created["kwargs"]["max_requests"], 1000)
-        # and it was closed after the analysis
+        # I05: it was published as the enclosing run, and closed after the analysis
+        self.created["ctx"].publish.assert_called_once_with()
         self.created["ctx"].aclose.assert_awaited_once()
         # the inner body was told it owns the run, and got the created context
         _, kw = host._analyze_inner.call_args

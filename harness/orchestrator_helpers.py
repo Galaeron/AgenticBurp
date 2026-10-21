@@ -221,15 +221,14 @@ def _jwt_identity(node: dict, roles):
     from the weakest role is the stronger result), or None. Falls back to any
     JWT-carrying identity when the node lists no reachable roles."""
     from harness import worklist_investigator
-    from harness.role_crawl import principal_keys
+    from harness.engagement import principal_reached
+    from harness.coverage_tracker import _principal_of
+    # Each session is matched by its own principal cell (WL-02), so a same-role
+    # principal that was denied is not chosen because another one reached.
+    cells = node.get("access_by_principal") or {}
     reach = node.get("reachable_roles") or []
-    # reachable_roles holds principal keys (X03): match each session's own
-    # column. Only a role-keyed matrix (none of these columns present) is
-    # matched by role label.
-    keys = principal_keys(roles)
-    by_column = any(key in reach for key in keys)
-    reachable = sorted((r for key, r in zip(keys, roles)
-                        if (key if by_column else r.role) in reach),
+    reachable = sorted((r for r in roles
+                        if principal_reached(cells, reach, _principal_of(r), r.role)),
                        key=lambda r: worklist_investigator._trust(r.role))
     for r in (reachable or list(roles)):
         if _carries_jwt(r.headers):

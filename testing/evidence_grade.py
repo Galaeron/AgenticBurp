@@ -40,7 +40,9 @@ rule ``grade_findings`` implements:
     already-"supported" grade):
       - ``differential_reproduced`` when the proof records an executed
         BEFORE/AFTER comparison, i.e. it carries BOTH a
-        ``baseline_artifact_id`` AND an ``attack_artifact_id`` (the schema
+        ``baseline_artifact_id`` AND an ``attack_artifact_id`` that name
+        DISTINCT artifacts (one exchange listed on both sides is a single
+        observation and grades ``captured``) (the schema
         ``evidence_audit.py`` and its tests already use for a differential
         proof). This is the stronger tier: it says the confirmation
         rests on a reproduced before/after diff, not just one captured
@@ -155,7 +157,12 @@ def _is_differential(proof: dict[str, Any] | None) -> bool:
     resolved by `proof_id`; never re-derives support itself."""
     if not proof:
         return False
-    return bool(proof.get("baseline_artifact_id")) and bool(proof.get("attack_artifact_id"))
+    baseline = str(proof.get("baseline_artifact_id") or "").strip()
+    attack = str(proof.get("attack_artifact_id") or "").strip()
+    # One exchange recorded as both sides is a single observation, not a
+    # reproduced before/after comparison: the two ids must name different
+    # artifacts.
+    return bool(baseline) and bool(attack) and baseline != attack
 
 
 def grade_findings(findings: list[dict[str, Any]], proofs: list[dict[str, Any]],

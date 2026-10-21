@@ -6,9 +6,11 @@ single-request replay-and-diff shape -- each needs a multi-request FLOW with a
 state boundary. This leg confirms the three that have a clean, deterministic
 oracle, dispatched by the finding's class:
 
-  - session_fixation      -- the session identifier does NOT change across the
-                             login boundary (a pre-auth session id is still valid
-                             / re-issued unchanged after authenticating).
+  - session_fixation      -- the session identifier does NOT change across a
+                             SUCCESSFUL login and that pre-auth id alone then
+                             reaches an authenticated page an anonymous request
+                             cannot (an unrotated id without that proof, or after
+                             a failed login, is only a candidate).
   - weak_password_policy   -- a trivially weak password is ACCEPTED at registration
                              (throwaway account), i.e. no strength policy.
   - username_enumeration   -- a login/reset response DISCRIMINATES a valid account
@@ -52,6 +54,27 @@ _MFA_MARKERS = re.compile(
     r"one[\s-]*time\s*(?:code|password)|\botp\b|two[\s-]*factor|multi[\s-]*factor|2fa", re.I)
 # Post-authentication resources to probe for reachability before the 2nd factor.
 _PROTECTED_CANDIDATES = ("/my-account", "/account", "/dashboard", "/profile", "/home", "/settings")
+# A redirect path segment that names a login page (login, sign-in, logon, login.php, ...).
+_LOGIN_SEGMENT = re.compile(r"^(?:log[-_]?in|sign[-_]?in|log[-_]?on)\b", re.I)
+
+
+def _anonymous_denial(status: int, body: str, location: str) -> str:
+    """Describe the anonymous control as an authorization denial, or "" when it
+    is not one (E3). Only an answer that says "log in first" counts: 401/403, a
+    redirect to a login page, or a 2xx login page. A 5xx, a 404, a rate limit or
+    a page that is neither the account nor a login wall says nothing about
+    whether the page needs the session (the rule RV-D2 applies to IDOR)."""
+    from harness.missing_auth_probe import _LOGIN_PAGE
+    if status in (401, 403):
+        return f"HTTP {status}"
+    if 300 <= status < 400:
+        path = urlsplit(location or "").path
+        if any(_LOGIN_SEGMENT.match(seg) for seg in path.split("/") if seg):
+            return f"HTTP {status} redirect to the login page {location}"
+        return ""
+    if 200 <= status < 300 and _LOGIN_PAGE.search(body or ""):
+        return f"HTTP {status} login page"
+    return ""
 
 
 def _parse_body(exchange: HttpExchange):
@@ -221,6 +244,12 @@ class AuthSequenceValidator(Validator):
 
     # --- session fixation -----------------------------------------------------
     async def _check_session_fixation(self, exchange) -> ValidationResult:
+        """R20: a pre-login cookie that was not rotated is only a candidate. The
+        login must succeed, and the fixed identifier ALONE (no other cookie, no
+        captured credential header) must then reach an authenticated page that
+        an anonymous request is denied (E3: a healthy denial, not a 5xx or a
+        timeout) -- the planted id is now a logged-in session. Rotation of
+        every pre-login cookie is the negative."""
         fc = "session_fixation"
         method = (exchange.method or "POST").upper()
         async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
@@ -241,29 +270,118 @@ class AuthSequenceValidator(Validator):
             post_cookies = _session_cookies(resp.headers.get_list("set-cookie"))
         if not pre_cookies and not post_cookies:
             return self._not("no session cookie issued (token-based auth?) -- fixation N/A", fc)
-        # Fixation: a pre-auth session id survives login unchanged, OR login issues
-        # NO fresh session cookie at all despite one existing pre-auth.
-        for n, v in pre_cookies.items():
-            if post_cookies.get(n) == v:
-                return ValidationResult(
-                    self.name, "confirmed", fc, confidence=0.85, confirmed=True,
-                    summary=f"Session fixation confirmed: cookie {n!r} was not rotated across login.",
-                    evidence=f"Pre-auth {n} == post-auth {n}; an attacker-fixed session id survives "
-                             f"authentication, so a planted session becomes an authenticated one.")
-        if pre_cookies and not post_cookies:
-            return ValidationResult(
-                self.name, "confirmed", fc, confidence=0.7, confirmed=True,
-                summary="Session fixation confirmed: login issued no fresh session cookie.",
-                evidence=f"A pre-auth session cookie {list(pre_cookies)} existed but login set no new "
-                         f"session cookie, so the pre-auth id remains in force post-authentication.")
-        return self._not("session id rotated on login (no fixation)", fc)
+        # Pre-auth cookies that survive login: re-issued unchanged, or not replaced.
+        fixed = {n: v for n, v in pre_cookies.items() if post_cookies.get(n, v) == v}
+        if not fixed:
+            return self._not("session id rotated on login (no fixation)", fc)
+        names = ", ".join(sorted(fixed))
+        if resp.status_code >= 400:
+            return self._candidate(
+                f"pre-login session cookie ({names}) was not rotated, but the login itself failed "
+                f"(HTTP {resp.status_code})",
+                f"No authenticated session was established, so an unrotated pre-login id proves "
+                f"nothing about fixation. Retry with working credentials.")
+        proof, failed_control = await self._fixed_id_authenticates(exchange, resp, fixed)
+        if proof is None and failed_control:
+            return self._candidate(
+                f"pre-login session cookie ({names}) survived login and alone reached an authenticated "
+                f"page, but the anonymous control was not a healthy denial",
+                f"Login answered HTTP {resp.status_code}. Presenting only the fixed {names} reached a page "
+                f"showing an authenticated session, but {failed_control}, so the page was not shown to "
+                f"need the session. A 5xx, a timeout or a transport error is not an authorization "
+                f"denial; retry when the target answers normally.")
+        if proof is None:
+            return self._candidate(
+                f"pre-login session cookie ({names}) was not rotated across login, but that id alone "
+                f"never reached an authenticated page",
+                f"Login answered HTTP {resp.status_code}. Presenting only the fixed {names} reached no "
+                f"page showing an authenticated session (a logout control or the account's username) "
+                f"that an anonymous request is denied, so the fixed id is not shown to carry the login.")
+        url, status, denial = proof
+        return ValidationResult(
+            self.name, "confirmed", fc, confidence=0.9, confirmed=True,
+            summary=f"Session fixation confirmed: the pre-login {names} survived login and alone "
+                    f"reaches the authenticated {urlsplit(url).path}.",
+            evidence=f"Pre-auth {names} was not rotated by a successful login (HTTP {resp.status_code}). "
+                     f"GET {url} with only that cookie returned an authenticated page (HTTP {status}, a "
+                     f"logout control or the account's username), while the same request with no session "
+                     f"was denied ({denial}): an attacker-planted id becomes a logged-in session.")
+
+    def _candidate(self, why: str, evidence: str, fc: str = "session_fixation") -> ValidationResult:
+        return ValidationResult(self.name, "inconclusive", fc, confidence=0.4, confirmed=False,
+                                summary=f"Candidate only, not confirmed: {why}.", evidence=evidence)
+
+    async def _fixed_id_authenticates(self, exchange, login_resp, fixed: dict
+                                      ) -> tuple[tuple[str, int, str] | None, str]:
+        """GET-only proof that the fixed cookie(s) carry the login: the login's
+        same-origin redirect target, then common account pages, each fetched in
+        a fresh client with only the fixed cookie, and an anonymous control.
+        Returns ((url, status, denial), "") on proof, else (None, why the first
+        failed anonymous control did not count, or "")."""
+        from urllib.parse import urljoin
+        from harness.missing_auth_probe import _AUTH_HEADERS, _substantive
+        fields, _ = _parse_body(exchange)
+        ukey = _find_key(fields, _USER_KEYS)
+        username = str(fields.get(ukey) or "").strip().lower() if ukey else ""
+        p = urlsplit(exchange.url)
+        origin = f"{p.scheme}://{p.netloc}"
+        targets = []
+        loc = login_resp.headers.get("location") or ""
+        if loc:
+            target = urljoin(exchange.url, loc)
+            if urlsplit(target).netloc == p.netloc and urlsplit(target).scheme == p.scheme:
+                targets.append(target)
+        targets += [origin + path for path in _PROTECTED_CANDIDATES]
+        headers = {k: v for k, v in self._headers(exchange).items()
+                   if k.lower() not in _AUTH_HEADERS and k.lower() != "content-type"}
+
+        def authed(status, body):
+            low = (body or "").lower()
+            return _substantive(status, body or "") and (
+                "log out" in low or "logout" in low or bool(username and username in low))
+
+        seen, failed = set(), ""
+        for url in targets:
+            if url in seen:
+                continue
+            seen.add(url)
+            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                        follow_redirects=False, verify=False) as fixed_client:
+                try:
+                    got = await self._send(fixed_client, "GET", url, dict(
+                        headers, Cookie="; ".join(f"{n}={v}" for n, v in fixed.items())), None)
+                except httpx.HTTPError:
+                    continue
+            if not authed(got.status_code, got.text):
+                continue
+            # E3: a timeout or an HTTP 500 is not the anonymous request being
+            # denied. Only a completed, interpretable denial shows the page needs
+            # the session.
+            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                        follow_redirects=False, verify=False) as anon:
+                try:
+                    anon_got = await self._send(anon, "GET", url, dict(headers), None)
+                except httpx.HTTPError as e:
+                    failed = failed or f"the anonymous control GET {url} failed ({type(e).__name__})"
+                    continue
+            if authed(anon_got.status_code, anon_got.text):
+                continue  # the same page with no session: public, not the fixed id
+            denial = _anonymous_denial(anon_got.status_code, anon_got.text or "",
+                                       anon_got.headers.get("location") or "")
+            if denial:
+                return (url, got.status_code, denial), ""
+            failed = failed or (
+                f"the anonymous control GET {url} answered HTTP {anon_got.status_code}, which is not an "
+                f"authorization denial (only 401/403, a redirect to a login page or a login page is)")
+        return None, failed
 
     # --- 2FA / MFA bypass -----------------------------------------------------
     async def _check_mfa_bypass(self, exchange) -> ValidationResult:
         """A step-1 (username+password) login that lands on a SECOND-factor step but
         whose resulting session already reaches a protected resource -- the 2nd factor
         is not enforced on the session. Confirmation is safe (GET-only reads): the
-        protected page is reachable with the partial session yet denied with none.
+        protected page is reachable with the partial session yet denied with none
+        (a healthy denial, as for session fixation; never a redirect to the 2FA step).
         Control (enforcing MFA): the protected page redirects back to the 2FA step,
         so it is non-substantive and this stays un-confirmed."""
         fc = "2fa_bypass"
@@ -300,6 +418,7 @@ class AuthSequenceValidator(Validator):
             # with the partial, step-1-only session.
             candidates = ([f"/my-account?id={username}"] if username else []) + list(_PROTECTED_CANDIDATES)
             seen = set()
+            unproven = ""  # RV-L L8: a reachable page whose anonymous control did not deny
             for path in candidates:
                 if path in seen:
                     continue
@@ -322,14 +441,38 @@ class AuthSequenceValidator(Validator):
                     continue
                 # Control: the same resource with NO session must be denied, else it is
                 # simply public (not a bypass).
+                anon_answer, denial = "", ""
                 async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                             follow_redirects=False, verify=False) as anon:
                     try:
                         anon_got = await self._send(anon, "GET", url, self._headers(exchange), None)
-                        anon_ok = _substantive(anon_got.status_code, anon_got.text or "")
-                    except httpx.HTTPError:
-                        anon_ok = False
-                if anon_ok:
+                    except httpx.HTTPError as e:
+                        anon_got, anon_answer = None, f"a transport error ({type(e).__name__})"
+                if anon_got is not None:
+                    if _substantive(anon_got.status_code, anon_got.text or ""):
+                        continue
+                    # RV-R R1 (owner decision 2026-10-21): only a healthy denial
+                    # counts, the rule session fixation uses (E3). A redirect to the
+                    # second-factor step is not "log in first", even under a
+                    # login-looking path, and any other answer (a 5xx, a 404, a 429,
+                    # another redirect) says nothing about whether the page is
+                    # protected.
+                    status = anon_got.status_code
+                    location = anon_got.headers.get("location") or ""
+                    if 300 <= status < 400 and _MFA_MARKERS.search(location):
+                        anon_answer = f"HTTP {status}, a redirect to the second-factor step {location}"
+                    else:
+                        denial = _anonymous_denial(status, anon_got.text or "", location)
+                        if not denial:
+                            anon_answer = f"HTTP {status}" + (
+                                f" (redirect to {location})" if 300 <= status < 400 and location else "")
+                if not denial:
+                    unproven = unproven or (
+                        f"GET {url} returned authenticated content (HTTP {got.status_code}) to the "
+                        f"step-1-only session, but the same path with no session answered "
+                        f"{anon_answer}, which is not an authorization denial (only 401/403, a redirect "
+                        f"to a login page or a login page is), so the page may be public or broken "
+                        f"rather than protected.")
                     continue
                 return ValidationResult(
                     self.name, "confirmed", fc, confidence=0.9, confirmed=True,
@@ -337,8 +480,11 @@ class AuthSequenceValidator(Validator):
                             f"that only completed step 1 (username+password), before the second factor.",
                     evidence=f"Login required a second factor (marker in the login response/redirect), yet "
                              f"GET {url} returned authenticated content (HTTP {got.status_code}) while the same "
-                             f"path with no session was denied. The protected page is reachable without the "
-                             f"2FA code -- the second factor is not enforced on the session.")
+                             f"path with no session was denied ({denial}). The protected page is reachable "
+                             f"without the 2FA code -- the second factor is not enforced on the session.")
+        if unproven:
+            return self._candidate("a page is reachable before the second factor, but the "
+                                   "anonymous control did not deny it", unproven, fc)
         return self._not("no protected resource reachable before the second factor", fc)
 
     async def _refresh_login_body(self, client, exchange) -> str:

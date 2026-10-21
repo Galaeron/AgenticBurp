@@ -37,7 +37,7 @@ if str(_TESTING_DIR) not in sys.path:
 
 import strict_score  # noqa: E402
 import eval_adapter  # noqa: E402
-from labels.manifest import Manifest, load_manifest  # noqa: E402
+from labels.manifest import Manifest, ManifestError, load_manifest  # noqa: E402
 
 # Default gate thresholds. The point of a gate is a bar a real detector should be
 # able to clear and an indiscriminate baseline must not. 0.5 is a deliberately
@@ -130,7 +130,11 @@ def apply_strict_scorecard(
 ) -> dict[str, Any]:
     """Recompute the strict scorecard for a saved run and certify it against the
     mandatory baselines. Raises `StrictScorecardError` if the baselines do not all
-    fail their gates on this manifest. Read-only; calls no model/target/store."""
+    fail their gates on this manifest. Raises `ManifestError` first if the
+    manifest's declared content hash does not match its records (R42): ground
+    truth that was edited after it was hashed is not ground truth to score
+    against. Read-only; calls no model/target/store."""
+    manifest.validate()
     controls = baseline_controls(manifest, precision_gate=precision_gate,
                                  recall_gate=recall_gate)
     if not controls["discriminating"]:
@@ -164,7 +168,8 @@ def run_from_files(
     recall_gate: float = DEFAULT_RECALL_GATE,
 ) -> dict[str, Any]:
     """Load a saved-run JSON artifact and a label manifest from disk, then
-    `apply_strict_scorecard`. Neither file is written; nothing else is read."""
+    `apply_strict_scorecard` (which validates the manifest, hash included,
+    before scoring anything). Neither file is written; nothing else is read."""
     saved = json.loads(Path(saved_path).read_text(encoding="utf-8"))
     manifest = load_manifest(manifest_path)
     return apply_strict_scorecard(
@@ -222,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         scorecard = run_from_files(
             args.saved_run, args.manifest, git_revision=args.git_revision,
             precision_gate=args.precision_gate, recall_gate=args.recall_gate)
-    except StrictScorecardError as e:
+    except (StrictScorecardError, ManifestError) as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 2
     print(format_scorecard(scorecard))

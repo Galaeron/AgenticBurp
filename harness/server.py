@@ -17,7 +17,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from harness.models import (AnalysisRequest, AnalysisResponse, ValidationSubmission, EstimateRequest, EffortStatus,
                      IdentityCreateRequest, SessionCreateRequest, SuppressFindingRequest,
-                     PrioritizeRequest, PrioritizeResponse, PrioritizeResultItem, HttpExchange)
+                     PrioritizeRequest, PrioritizeResponse, PrioritizeResultItem, HttpExchange,
+                     ObservationAttributionCorrection)
 import harness.identity as identity_mod
 from harness.orchestrator import Orchestrator
 
@@ -158,6 +159,47 @@ def _require_active_crawl(url: str) -> None:
                    "requests to the target, so it requires validators.active_enabled "
                    "(set it in config.local.yaml, or arm active mode via POST /settings "
                    "/ the Burp 'Active testing' toggle), on top of a configured scope.")
+
+
+def _crawl_route_run():
+    """The run a /crawl, /crawl-roles or /engagement/{host}/advance call owns
+    (RV-G, I05's no-run routes), as a standalone analyze() owns one (I05-A2).
+
+    Their raw clients followed redirects internally, so only the starting URL
+    was scope-checked and the caller's headers went to every hop. Inside this
+    run each hop goes through TargetTransport: scope and endpoint exclusions are
+    checked before every redirect hop (an out-of-scope Location is never
+    contacted), the caller's headers are a session only its own origin
+    receives, and the clients use the configured connect-time pin and TLS policy.
+
+    The routes stay read-only, as they were: mutating replay is forced off for
+    this run whatever the operator configured. The request ceiling is
+    runs.max_requests (unset = none beyond the route's own page/endpoint caps),
+    the knob the investigate job uses; a dedicated default is an owner decision
+    (RV-G handoff)."""
+    from harness.run_context import RunContext
+    runs_cfg = orchestrator.config.get("runs", {}) or {}
+    gate_config = {**_live_validators_gate_config(), "allow_mutating_replay": False}
+    return RunContext.create(
+        allowed_hosts=orchestrator.allowed_hosts, gate_config=gate_config,
+        config=orchestrator.config, max_requests=runs_cfg.get("max_requests"),
+        timeout=float(runs_cfg.get("request_timeout_seconds", 15.0)))
+
+
+def _route_session(run_context, session_id: str, headers: dict | None, base_url: str,
+                   role: str = "user") -> str:
+    """Register the caller's headers as a run session bound to base_url's origin."""
+    from harness.run_context import ScopePolicy
+    run_context.sessions.register(session_id, session_id, dict(headers or {}),
+                                  allowed_origins=[ScopePolicy.origin_of(base_url)], role=role)
+    return session_id
+
+
+def _role_route_sessions(run_context, prefix: str, roles, base_url: str) -> list[str]:
+    """One session per role, aligned with `roles` (role_crawl's run contract)."""
+    return [_route_session(run_context, f"{prefix}:{index}:{role.role}", role.headers,
+                           base_url, role=role.role)
+            for index, role in enumerate(roles)]
 
 
 def _is_loopback(host: str) -> bool:
@@ -573,8 +615,15 @@ async def validation_result(submission: ValidationSubmission, authorization: str
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(req: AnalysisRequest, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
+    attribution = req.observation_attribution.model_dump() if req.observation_attribution else None
+    try:
+        attribution = store.clean_observation_attribution(attribution) if attribution else None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     try:
         partition = {"engagement_id": req.engagement_id} if req.engagement_id else {}
+        if attribution:
+            partition["observation_attribution"] = attribution
         return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery,
                                           **partition)
     except Exception as e:
@@ -642,7 +691,7 @@ async def prioritize(req: PrioritizeRequest, authorization: str | None = Header(
     return PrioritizeResponse(results=results, engagement_id=engagement_partition)
 
 
-from pydantic import BaseModel as _BaseModel
+from pydantic import BaseModel as _BaseModel, ConfigDict, StrictBool
 
 
 class CrawlRequest(_BaseModel):
@@ -666,13 +715,17 @@ async def crawl_endpoint(req: CrawlRequest, authorization: str | None = Header(d
     _require_target_fetch(req.base_url, bulk=True)
     _require_active_crawl(req.base_url)
     from harness import crawler
-    result = await crawler.crawl(
-        req.base_url,
-        headers=req.headers or {},
-        allowed_hosts=orchestrator.allowed_hosts,
-        max_pages=max(1, min(req.max_pages, 200)),
-        max_depth=max(0, min(req.max_depth, 4)),
-    )
+    async with _crawl_route_run() as run_context:
+        session_ref = (_route_session(run_context, "crawl:source", req.headers, req.base_url)
+                       if req.headers else None)
+        result = await crawler.crawl(
+            req.base_url,
+            headers=req.headers or {},
+            allowed_hosts=orchestrator.allowed_hosts,
+            max_pages=max(1, min(req.max_pages, 200)),
+            max_depth=max(0, min(req.max_depth, 4)),
+            run_context=run_context, session_ref=session_ref,
+        )
     out = result.to_dict()
     await __import__("asyncio").to_thread(
         _update_engagement, store.host_of(req.base_url),
@@ -700,7 +753,10 @@ class MissingAuthRequest(_BaseModel):
     # are enabled in config.yaml. Left off, mutating shapes are skipped.
     include_mutating: bool = False
     # The caller knows these endpoints are meant to be authenticated (e.g. they
-    # were only referenced in authenticated JS) -- nudges confidence up.
+    # were only referenced in authenticated JS). Required for a CONFIRMED
+    # missing-auth finding, together with an authenticated baseline from
+    # `headers` that returns the same payload (RV-G R15). Without both, data
+    # served anonymously is reported as an unconfirmed candidate.
     expected_protected: bool = False
 
 
@@ -741,16 +797,15 @@ def _role_sessions(raw_roles) -> list:
 
 
 def _register_role_identities(roles) -> list[dict]:
-    """Register an Identity per distinct principal (idempotent by name), so a role
-    crawl's reachable identities feed the existing identity/cross-identity-compare
-    system. Named by the access-matrix principal key (X03), which is the role
-    label for a sole principal of that role. Never stores credentials -- only
-    the label + role."""
-    from harness.role_crawl import principal_keys
+    """Register an Identity per distinct principal label (idempotent by name), so
+    a role crawl's reachable identities feed the existing identity/cross-identity-
+    compare system. The label is the principal's declared name, else its role, so
+    two named same-role principals stay two identities. Never stores credentials
+    -- only the label + role."""
     existing = {i["name"] for i in store.list_identities()}
     registered: list[dict] = []
-    for key, r in zip(principal_keys(roles), roles):
-        name = f"rolecrawl:{key}"
+    for r in roles:
+        name = f"rolecrawl:{r.name or r.role}"
         if name in existing:
             continue
         existing.add(name)
@@ -804,15 +859,18 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
     roles = _role_sessions(req.roles)
     if not roles:
         raise HTTPException(status_code=400, detail="roles must be non-empty")
-    result = await role_crawl.crawl_roles(
-        req.base_url, roles,
-        allowed_hosts=orchestrator.allowed_hosts,
-        max_pages=max(1, min(req.max_pages, 200)),
-        max_endpoints=max(1, min(req.max_endpoints, 500)),
-        id_fill=req.id_fill or "1",
-        active_discovery=bool(req.active_discovery),
-        discovery_max_probes=max(1, min(req.discovery_max_probes, 20000)),
-    )
+    async with _crawl_route_run() as run_context:
+        result = await role_crawl.crawl_roles(
+            req.base_url, roles,
+            allowed_hosts=orchestrator.allowed_hosts,
+            max_pages=max(1, min(req.max_pages, 200)),
+            max_endpoints=max(1, min(req.max_endpoints, 500)),
+            id_fill=req.id_fill or "1",
+            active_discovery=bool(req.active_discovery),
+            discovery_max_probes=max(1, min(req.discovery_max_probes, 20000)),
+            run_context=run_context,
+            session_refs=_role_route_sessions(run_context, "crawl-roles", roles, req.base_url),
+        )
     out = result.to_dict()
     registered: list[dict] = []
     if req.register_identities:
@@ -828,8 +886,8 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
 
     def _ingest(st):
         st.ingest_role_crawl(out)
-        for key, r in zip(role_crawl.principal_keys(roles), roles):
-            st.ingest_identity(f"rolecrawl:{key}", r.role, source="seed")
+        for r in roles:
+            st.ingest_identity(f"rolecrawl:{r.name or r.role}", r.role, source="seed")
         for ri in registered:
             st.ingest_identity(ri["name"], ri["role"], source="seed")
     await __import__("asyncio").to_thread(_update_engagement, store.host_of(req.base_url), _ingest)
@@ -882,11 +940,16 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
         raise HTTPException(status_code=400, detail="no call_shapes, paths, or discoverable endpoints to probe")
 
     from harness.run_context import RunContext
-    sends_per_shape = 2 if req.send_garbage_token else 1
+    # One anonymous send per shape, then at most one more: the garbage token
+    # (after a denial) or the authenticated baseline (after an anonymous payload).
+    sends_per_shape = 2 if (req.send_garbage_token or req.expected_protected) else 1
     async with RunContext.create(
             allowed_hosts=orchestrator.allowed_hosts,
             gate_config=_live_validators_gate_config(),
             max_requests=max(1, len(shapes) * sends_per_shape)) as probe_context:
+        # RV-G R15: a missing-auth finding is confirmed only for an endpoint the
+        # caller declared protected AND whose payload the caller's own
+        # credentials also fetch; otherwise it stays an unconfirmed candidate.
         outcomes = await missing_auth_probe.probe_call_shapes(
             req.base_url, shapes,
             allowed_hosts=orchestrator.allowed_hosts,
@@ -894,6 +957,7 @@ async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: st
             send_garbage_token=req.send_garbage_token,
             include_mutating=req.include_mutating,
             expected_protected=req.expected_protected,
+            protected_baseline=True,
             run_context=probe_context,
         )
     findings = missing_auth_probe.findings_from(outcomes)
@@ -1042,6 +1106,21 @@ async def get_settings(authorization: str | None = Header(default=None)):
     }
 
 
+class _ValidatorToggles(_BaseModel):
+    # RV-G R01: JSON booleans only. A plain `bool(value)` turned the string
+    # "false" into True, so a caller disabling active testing armed it. StrictBool
+    # rejects strings, numbers and null with a 422. Unknown keys are ignored.
+    model_config = ConfigDict(extra="allow")
+    active_enabled: StrictBool = False
+    cross_identity: StrictBool = False
+
+
+class _CoordinatorToggles(_BaseModel):
+    # Same strict rule: "false" must not start sending exchanges to the cloud.
+    model_config = ConfigDict(extra="allow")
+    cloud_reasoning: StrictBool = False
+
+
 class SettingsRequest(_BaseModel):
     # Global outbound throttle ceiling (requests/sec; 0 = unlimited). None -> leave as-is.
     throttle_rps: float | None = None
@@ -1049,11 +1128,11 @@ class SettingsRequest(_BaseModel):
     retry_budget: dict | None = None
     # Runtime validator toggles (in-memory only, never persisted): recognized keys
     # are `active_enabled` and `cross_identity` (both bool). Any omitted -> unchanged.
-    validators: dict | None = None
+    validators: _ValidatorToggles | None = None
     # Cloud-coordinator seam toggle (in-memory): recognized key `cloud_reasoning`
     # (bool). Enabling sends real exchange content to the cloud model -- see the
     # config.yaml note. Any omitted -> unchanged.
-    coordinator: dict | None = None
+    coordinator: _CoordinatorToggles | None = None
 
 
 @app.post("/settings")
@@ -1071,20 +1150,20 @@ async def update_settings(req: SettingsRequest, authorization: str | None = Head
         p = orchestrator.retry_budget_policy
         changed["retry_budget"] = {"max_retries": p.max_retries, "max_agents": p.max_agents,
                                    "max_tokens_per_vuln": p.max_tokens_per_vuln}
-    if req.validators:
+    v = req.validators
+    if v is not None and (v.model_fields_set or v.model_extra):
         # Runtime, in-memory validator toggles (Burp "Cross-Identity" panel).
         # Never persisted -- gone on restart, by design. Unknown keys are ignored.
+        # Only keys the caller sent are applied (an omitted toggle is unchanged).
         vr = orchestrator.validator_registry
-        v = req.validators
-        if "active_enabled" in v:
-            vr.set_active_enabled(bool(v["active_enabled"]))
-        if "cross_identity" in v:
-            vr.set_cross_identity_enabled(bool(v["cross_identity"]))
+        if "active_enabled" in v.model_fields_set:
+            vr.set_active_enabled(v.active_enabled)
+        if "cross_identity" in v.model_fields_set:
+            vr.set_cross_identity_enabled(v.cross_identity)
         changed["validators"] = vr.state()
-    if req.coordinator and "cloud_reasoning" in req.coordinator:
+    if req.coordinator is not None and "cloud_reasoning" in req.coordinator.model_fields_set:
         # Cloud-coordinator reasoning seam (Phase 4). In-memory, not persisted.
-        changed["coordinator"] = orchestrator.set_cloud_reasoning(
-            bool(req.coordinator["cloud_reasoning"]))
+        changed["coordinator"] = orchestrator.set_cloud_reasoning(req.coordinator.cloud_reasoning)
     if not changed:
         raise HTTPException(status_code=400,
                             detail="nothing to set: provide throttle_rps, retry_budget, "
@@ -1291,13 +1370,19 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
     obtained identity and the new surface it can reach re-enters the ranking."""
     _require_auth(authorization)
     _require_target_fetch(req.base_url, bulk=True)
+    # RV-G R03: a re-crawl is active traffic, so it obeys the same scope and
+    # active-mode admission as /crawl-roles, before any discovery or probing.
+    _require_active_crawl(req.base_url)
     from harness import role_crawl, engagement
     roles = _role_sessions(req.roles)
     if not roles:
         raise HTTPException(status_code=400, detail="roles must be non-empty")
-    result = await role_crawl.crawl_roles(
-        req.base_url, roles, allowed_hosts=orchestrator.allowed_hosts,
-        max_pages=max(1, min(req.max_pages, 200)), max_endpoints=max(1, min(req.max_endpoints, 500)))
+    async with _crawl_route_run() as run_context:
+        result = await role_crawl.crawl_roles(
+            req.base_url, roles, allowed_hosts=orchestrator.allowed_hosts,
+            max_pages=max(1, min(req.max_pages, 200)), max_endpoints=max(1, min(req.max_endpoints, 500)),
+            run_context=run_context,
+            session_refs=_role_route_sessions(run_context, "advance", roles, req.base_url))
     out = result.to_dict()
 
     await __import__("asyncio").to_thread(
@@ -1797,6 +1882,55 @@ async def finding_evidence(finding_ref: str, authorization: str | None = Header(
     if not reconstruction.get("event_count"):
         raise HTTPException(status_code=404, detail="no evidence-ledger events for this finding_ref")
     return {"reconstruction": reconstruction, "reproduction_recipe": recipe}
+
+
+# I02-C: analyst actions on retained observations (supplied captures that later
+# analyses of the same endpoint are given). Each acts within one pile:
+# engagement_id '' is the site's shared pile. Nothing here sends traffic.
+@app.get("/observations/{observation_id}")
+async def get_observation(observation_id: str, authorization: str | None = Header(default=None),
+                          engagement_id: str = Query(default="", max_length=128)):
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    found = await __import__("asyncio").to_thread(store.get_observation, observation_id,
+                                                  engagement_id=engagement_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="no such observation in this pile")
+    return found
+
+
+@app.post("/observations/{observation_id}/attribution")
+async def correct_observation_attribution(observation_id: str, req: ObservationAttributionCorrection,
+                                          authorization: str | None = Header(default=None)):
+    """Append a complete new attribution revision. `expected_revision` must be
+    the current one (409 otherwise); later analyses use the new revision."""
+    _require_auth(authorization)
+    attribution = {name: getattr(req, name) for name in ("principal_ref", "role", "tenant", "session_ref")}
+    try:
+        return await __import__("asyncio").to_thread(
+            store.correct_observation_attribution, observation_id, engagement_id=req.engagement_id,
+            expected_revision=req.expected_revision, attribution=attribution, reason=req.reason)
+    except store.ObservationRevisionConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except store.ObservationDeleted as e:
+        raise HTTPException(status_code=410, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/observations/{observation_id}")
+async def delete_observation(observation_id: str, authorization: str | None = Header(default=None),
+                             engagement_id: str = Query(default="", max_length=128)):
+    """Delete one observation: a tombstone stays, its content and evidence go,
+    and later analyses see it as unavailable rather than as evidence."""
+    _require_auth(authorization)
+    try:
+        return await __import__("asyncio").to_thread(store.delete_observation, observation_id,
+                                                     engagement_id=engagement_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 class MergeIssuesRequest(_BaseModel):

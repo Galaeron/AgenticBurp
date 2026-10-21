@@ -1,5 +1,12 @@
 package com.harness.llm.logic;
 
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.regex.Pattern;
+
 /**
  * Classification logic for api_security_validation's mass-assignment
  * probe. Montoya-free.
@@ -9,10 +16,15 @@ package com.harness.llm.logic;
  * "Resend a create/update request with an extra unexpected field (e.g.
  * 'role': 'admin') added to the JSON body and check whether the
  * response reflects it back as accepted." The probe adds a field the
- * ORIGINAL request never sent; if the mutated response reflects that
- * exact field/value back and the baseline (unmodified) response didn't
- * already show it, that's evidence the server blindly binds request
- * JSON onto an internal object without an allowlist of settable fields.
+ * ORIGINAL request never sent. A reflection alone is not enough (code
+ * review 02 R27): the write must succeed and a read of the resource
+ * after it must show the field at the injected value where a read
+ * before it did not -- only then has the server bound request JSON onto
+ * the stored object without an allowlist of settable fields. For a
+ * create-style write (POST to a collection) the resource is the created
+ * object, which the response names (RV-J residual N3): the "before" read
+ * is of the object the captured request created, the "after" read of the
+ * one the probe created.
  *
  * Deliberately string-based, not a full JSON parse/serialize round
  * trip: injectField() only ever needs to insert one flat key before the
@@ -44,8 +56,256 @@ public final class MassAssignmentLogic {
         return withoutClosingBrace + separator + "\"" + fieldName + "\":" + fieldValueJson + "}";
     }
 
+    /** True for a 2xx status: the server performed the request. */
+    public static boolean isSuccess(int status) {
+        return status >= 200 && status < 300;
+    }
+
+    private static final Pattern SAFE_ID = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+    private static final Pattern NUMERIC_ID = Pattern.compile("[0-9]{1,19}");
+
+    /** Id keys besides "id" that may name a created object; see {@link #createdObjectId}. */
+    private static final Set<String> ID_KEYS = Set.of("_id", "uuid", "guid");
+    private static final Pattern RESOURCE_SEGMENT = Pattern.compile("[a-z][a-z_-]*");
+
+    /**
+     * Where a create-style write's response says the created object lives
+     * (code review 02 RV-J residual N3): its Location header, else the write
+     * path (query dropped) joined with the id of the JSON body (see
+     * {@link #createdObjectId}). A Location always wins, so one the caller
+     * finds cross-origin names no object. The caller still has to check the
+     * reference is same-origin. Returns null if the response names no object.
+     */
+    public static String createdObjectReference(String writePath, String location, String responseBody) {
+        if (location != null && !location.isBlank()) return location.trim();
+        String id = createdObjectId(responseBody, writePath);
+        if (id == null || writePath == null) return null;
+        String path = writePath;
+        int query = path.indexOf('?');
+        if (query >= 0) path = path.substring(0, query);
+        while (path.endsWith("/")) path = path.substring(0, path.length() - 1);
+        return path + "/" + id;
+    }
+
+    /**
+     * The value of the top-level "id" key of a JSON object body, if it is a
+     * string of safe path characters or a plain integer; null otherwise. An
+     * "id" nested in another object or an array is not the created object's.
+     */
+    static String topLevelId(String body) {
+        if (body == null) return null;
+        String b = body.trim();
+        if (!b.startsWith("{")) return null;
+        int depth = 0;
+        for (int i = 0; i < b.length(); i++) {
+            char c = b.charAt(i);
+            if (c == '"') {
+                int end = endOfString(b, i);
+                if (end < 0) return null;
+                if (depth == 1 && b.substring(i + 1, end).equals("id")) {
+                    int j = skipSpace(b, end + 1);
+                    if (j < b.length() && b.charAt(j) == ':') {
+                        j = skipSpace(b, j + 1);
+                        if (j < b.length() && b.charAt(j) == '"') {
+                            int valueEnd = endOfString(b, j);
+                            if (valueEnd < 0) return null;
+                            String value = b.substring(j + 1, valueEnd);
+                            return SAFE_ID.matcher(value).matches() ? value : null;
+                        }
+                        int valueEnd = j;
+                        while (valueEnd < b.length() && Character.isDigit(b.charAt(valueEnd))) valueEnd++;
+                        String value = b.substring(j, valueEnd);
+                        return NUMERIC_ID.matcher(value).matches() ? value : null;
+                    }
+                }
+                i = end;
+                continue;
+            }
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') depth--;
+        }
+        return null;
+    }
+
+    /**
+     * The created object's id in a create-style write's JSON response (batch
+     * RV-Q item Q4): the top-level "id", as before, if it is one; else exactly
+     * one distinct id among a small fixed set of keys, matched ignoring case --
+     * "_id", "uuid", "guid" and the resource's own "userId" or "user_id" (for
+     * a write to /users) -- at the top level, or those and "id" one level
+     * under a top-level "data" object (JSON:API). An id is a string of safe
+     * path characters or a plain integer. Two different candidates, a
+     * candidate key whose value is not an id (a top-level "id" included), or
+     * a body that is not one well-formed object name no object: null.
+     */
+    public static String createdObjectId(String body, String writePath) {
+        String id = topLevelId(body);
+        if (id != null || body == null) return id;
+        String b = body.trim();
+        List<Member> top = members(b, 0);
+        if (top == null) return null;
+        Set<String> keys = idKeys(writePath);
+        Set<String> found = new LinkedHashSet<>();
+        for (Member m : top) {
+            if (m.key().equals("id")) return null;
+            if (keys.contains(m.key().toLowerCase(Locale.ROOT)) && !addId(found, b, m)) return null;
+            if (m.key().equals("data") && b.charAt(m.valueStart()) == '{') {
+                List<Member> data = members(b, m.valueStart());
+                if (data == null) return null;
+                for (Member d : data) {
+                    String key = d.key().toLowerCase(Locale.ROOT);
+                    if ((key.equals("id") || keys.contains(key)) && !addId(found, b, d)) return null;
+                }
+            }
+        }
+        return found.size() == 1 ? found.iterator().next() : null;
+    }
+
+    /** The fixed id keys plus "&lt;resource&gt;id" and "&lt;resource&gt;_id" for the write path's last segment, singular or plural. */
+    private static Set<String> idKeys(String writePath) {
+        Set<String> keys = new LinkedHashSet<>(ID_KEYS);
+        String path = writePath == null ? "" : writePath;
+        int query = path.indexOf('?');
+        if (query >= 0) path = path.substring(0, query);
+        while (path.endsWith("/")) path = path.substring(0, path.length() - 1);
+        String segment = path.substring(path.lastIndexOf('/') + 1).toLowerCase(Locale.ROOT);
+        if (!RESOURCE_SEGMENT.matcher(segment).matches()) return keys;
+        Set<String> names = new LinkedHashSet<>();
+        names.add(segment);
+        int n = segment.length();
+        if (segment.endsWith("ies")) names.add(segment.substring(0, n - 3) + "y");
+        if (segment.endsWith("es")) names.add(segment.substring(0, n - 2));
+        if (segment.endsWith("s")) names.add(segment.substring(0, n - 1));
+        for (String name : names) {
+            if (name.isEmpty()) continue;
+            keys.add(name + "id");
+            keys.add(name + "_id");
+        }
+        return keys;
+    }
+
+    private static boolean addId(Set<String> found, String b, Member m) {
+        String id = idValue(b, m);
+        if (id == null) return false;
+        found.add(id);
+        return true;
+    }
+
+    private record Member(String key, int valueStart) {}
+
+    /** The members of the JSON object opening at {@code open}, or null if it is not one well-formed object. */
+    private static List<Member> members(String b, int open) {
+        if (open >= b.length() || b.charAt(open) != '{') return null;
+        List<Member> members = new ArrayList<>();
+        int i = skipSpace(b, open + 1);
+        if (i < b.length() && b.charAt(i) == '}') return members;
+        while (i < b.length() && b.charAt(i) == '"') {
+            int keyEnd = endOfString(b, i);
+            if (keyEnd < 0) return null;
+            int colon = skipSpace(b, keyEnd + 1);
+            if (colon >= b.length() || b.charAt(colon) != ':') return null;
+            int value = skipSpace(b, colon + 1);
+            int valueEnd = endOfValue(b, value);
+            if (valueEnd < 0) return null;
+            members.add(new Member(b.substring(i + 1, keyEnd), value));
+            int next = skipSpace(b, valueEnd);
+            if (next < b.length() && b.charAt(next) == '}') return members;
+            if (next >= b.length() || b.charAt(next) != ',') return null;
+            i = skipSpace(b, next + 1);
+        }
+        return null;
+    }
+
+    /** The index just past the JSON value starting at {@code i}, or -1. */
+    private static int endOfValue(String b, int i) {
+        if (i >= b.length()) return -1;
+        char c = b.charAt(i);
+        if (c == '"') {
+            int end = endOfString(b, i);
+            return end < 0 ? -1 : end + 1;
+        }
+        if (c == '{' || c == '[') {
+            int depth = 0;
+            for (int k = i; k < b.length(); k++) {
+                char d = b.charAt(k);
+                if (d == '"') {
+                    k = endOfString(b, k);
+                    if (k < 0) return -1;
+                } else if (d == '{' || d == '[') {
+                    depth++;
+                } else if ((d == '}' || d == ']') && --depth == 0) {
+                    return k + 1;
+                }
+            }
+            return -1;
+        }
+        int k = i;
+        while (k < b.length() && ",}] \t\r\n".indexOf(b.charAt(k)) < 0) k++;
+        return k == i ? -1 : k;
+    }
+
+    /** The member's value if it is an id: a string of safe path characters or a plain integer; else null. */
+    private static String idValue(String b, Member m) {
+        int i = m.valueStart();
+        if (b.charAt(i) == '"') {
+            String value = b.substring(i + 1, endOfString(b, i));
+            return SAFE_ID.matcher(value).matches() ? value : null;
+        }
+        String value = b.substring(i, endOfValue(b, i));
+        return NUMERIC_ID.matcher(value).matches() ? value : null;
+    }
+
+    private static int endOfString(String s, int openQuote) {
+        for (int i = openQuote + 1; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\') { i++; continue; }
+            if (c == '"') return i;
+        }
+        return -1;
+    }
+
+    private static int skipSpace(String s, int i) {
+        while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
+        return i;
+    }
+
+    /**
+     * True if `body` carries `"fieldName": fieldValueJson` as one key/value
+     * pair. The key and the value must be bound to each other: the key in
+     * one place and the value elsewhere ({"role":"user","title":"admin"})
+     * is not the field set to the value.
+     */
+    public static boolean carriesField(String body, String fieldName, String fieldValueJson) {
+        if (body == null || fieldName == null || fieldValueJson == null) return false;
+        return Pattern.compile("\"" + Pattern.quote(fieldName) + "\"\\s*:\\s*" + Pattern.quote(fieldValueJson))
+                .matcher(body).find();
+    }
+
+    /**
+     * Mass assignment is confirmed only by a successful change of the
+     * protected field: the write carrying the injected field succeeded
+     * (2xx), a read of the resource before the write did not show the field
+     * at the injected value, and a read after it does. A response that only
+     * echoes the request -- or names the field to reject it, as a 400 that
+     * lists "rejected":{"role":"admin"} does -- proves nothing about what
+     * was stored.
+     *
+     * @param fieldName the injected field
+     * @param fieldValueJson the injected value, as JSON (e.g. "\"admin\"")
+     * @param fieldAlreadyInRequestBody true if the original request already set the field
+     * @param baselineResponseBody the captured (unmodified) response body, or null
+     * @param mutatedStatus status of the write carrying the injected field
+     * @param mutatedResponseBody body of that write's response, or null
+     * @param beforeReadStatus status of a read of the resource before the write, or -1 if not sent
+     * @param beforeReadBody body of that read, or null
+     * @param afterReadStatus status of a read of the resource after the write, or -1 if not sent
+     * @param afterReadBody body of that read, or null
+     * @param readTargets which resources the two reads fetched, for the detail; null if not stated
+     */
     public static Evidence evaluate(String fieldName, String fieldValueJson, boolean fieldAlreadyInRequestBody,
-                                     String baselineResponseBody, String mutatedResponseBody) {
+                                     String baselineResponseBody, int mutatedStatus, String mutatedResponseBody,
+                                     int beforeReadStatus, String beforeReadBody,
+                                     int afterReadStatus, String afterReadBody, String readTargets) {
         if (fieldAlreadyInRequestBody) {
             return new Evidence(Verdict.INVALID, 0.0, false,
                     "The field '" + fieldName + "' was already present in the original request body -- not a "
@@ -53,32 +313,55 @@ public final class MassAssignmentLogic {
                             + "intentionally or not, by the request's own author).",
                     "");
         }
-
-        String keyNeedle = "\"" + fieldName + "\"";
-        boolean mutatedReflects = mutatedResponseBody != null
-                && mutatedResponseBody.contains(keyNeedle) && mutatedResponseBody.contains(fieldValueJson);
-        boolean baselineAlreadyHadValue = baselineResponseBody != null
-                && baselineResponseBody.contains(keyNeedle) && baselineResponseBody.contains(fieldValueJson);
-
-        if (mutatedReflects && !baselineAlreadyHadValue) {
+        String detail = "write status=" + mutatedStatus + " | read before status=" + beforeReadStatus
+                + " | read after status=" + afterReadStatus + (readTargets == null ? "" : " | " + readTargets);
+        if (!isSuccess(mutatedStatus)) {
+            return new Evidence(Verdict.REJECTED, 0.75, false,
+                    "The server refused the write carrying the injected field ('" + fieldName + "': "
+                            + fieldValueJson + ") with status " + mutatedStatus + " -- a refusal, even one that "
+                            + "names the field, is the field allowlist working, not mass assignment.",
+                    detail);
+        }
+        boolean shownBefore = (isSuccess(beforeReadStatus) && carriesField(beforeReadBody, fieldName, fieldValueJson))
+                || carriesField(baselineResponseBody, fieldName, fieldValueJson);
+        if (shownBefore) {
+            return new Evidence(Verdict.SUPPORTED, 0.4, false,
+                    "The resource already showed '" + fieldName + "': " + fieldValueJson + " before the "
+                            + "write -- the probe cannot show that the injected value was newly accepted.",
+                    detail);
+        }
+        boolean persisted = isSuccess(beforeReadStatus) && isSuccess(afterReadStatus)
+                && carriesField(afterReadBody, fieldName, fieldValueJson);
+        if (persisted) {
             return new Evidence(Verdict.CONFIRMED, 0.85, true,
                     "Adding an unrequested field ('" + fieldName + "': " + fieldValueJson + ") to the request "
-                            + "body caused the response to reflect that exact field/value back, and the baseline "
-                            + "(unmodified) response did not already show it -- consistent with the server blindly "
-                            + "binding request JSON onto an internal object with no allowlist of settable fields "
+                            + "body was accepted (status " + mutatedStatus + "), and a fresh read of the resource "
+                            + "now shows that value where the read before the write did not -- the server binds "
+                            + "request JSON onto the stored object with no allowlist of settable fields "
                             + "(mass assignment / excessive data binding).",
-                    "");
+                    detail);
         }
-        if (mutatedReflects) {
-            return new Evidence(Verdict.SUPPORTED, 0.4, false,
-                    "The mutated response reflects the injected field, but the baseline (unmodified) response "
-                            + "already showed that same field/value -- this alone doesn't prove the injected "
-                            + "value was newly accepted rather than already present.",
-                    "");
+        if (carriesField(mutatedResponseBody, fieldName, fieldValueJson)
+                || carriesField(afterReadBody, fieldName, fieldValueJson)) {
+            return new Evidence(Verdict.SUPPORTED, 0.45, false,
+                    "The write carrying '" + fieldName + "': " + fieldValueJson + " was accepted and the "
+                            + "value appears in a response, but no before/after read of the resource shows it "
+                            + "was stored -- an echo of request input is not a changed protected field.",
+                    detail);
         }
         return new Evidence(Verdict.REJECTED, 0.7, false,
-                "The server did not reflect the injected field ('" + fieldName + "') back in its response -- "
-                        + "no evidence of unvalidated mass assignment for this field.",
-                "");
+                "The write was accepted but neither its response nor a read of the resource afterwards shows "
+                        + "'" + fieldName + "': " + fieldValueJson + " -- no evidence of mass assignment for "
+                        + "this field.",
+                detail);
+    }
+
+    /** As above, with no statement of which resources were read. */
+    public static Evidence evaluate(String fieldName, String fieldValueJson, boolean fieldAlreadyInRequestBody,
+                                     String baselineResponseBody, int mutatedStatus, String mutatedResponseBody,
+                                     int beforeReadStatus, String beforeReadBody,
+                                     int afterReadStatus, String afterReadBody) {
+        return evaluate(fieldName, fieldValueJson, fieldAlreadyInRequestBody, baselineResponseBody, mutatedStatus,
+                mutatedResponseBody, beforeReadStatus, beforeReadBody, afterReadStatus, afterReadBody, null);
     }
 }

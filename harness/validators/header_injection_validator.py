@@ -41,12 +41,15 @@ class HeaderInjectionTestResult:
     evidence: str
     vulnerable: bool = False
     checked: bool = True
+    # RV-O O1: why the probe got no response, as "blocked" (refused by scope,
+    # gate or budget) or "error" (transport failure); empty when it was answered.
+    unsent: str = ""
 
     def to_dict(self) -> dict:
         return {
             "test": self.test_name, "passed": self.passed, "severity": self.severity,
             "detail": self.detail, "evidence": self.evidence,
-            "vulnerable": self.vulnerable, "checked": self.checked,
+            "vulnerable": self.vulnerable, "checked": self.checked, "unsent": self.unsent,
         }
 
 
@@ -139,6 +142,22 @@ class HeaderInjectionValidator(Validator):
 
             vulnerable_tests = [t for t in tests if t.vulnerable]
             vulnerable = bool(vulnerable_tests)
+            # A probe that never reached the target is not a negative (RV-L rule).
+            unsent = [t for t in tests if t.unsent]
+            if unsent and not vulnerable:
+                answered = len(tests) - len(unsent)
+                refused = any(t.unsent == "blocked" for t in unsent)
+                why = "; ".join(t.detail for t in unsent[:4])
+                return ValidationResult(
+                    validator=self.get_name(),
+                    status="blocked" if refused and not answered else "inconclusive",
+                    finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
+                    summary=f"Header-injection check incomplete: {len(unsent)} of {len(tests)} "
+                            f"probe(s) got no response ({why}); not a negative result",
+                    evidence=f"{answered} answered probe(s) showed no injected header, but a probe "
+                             f"that never reached the target cannot show one.",
+                    raw_output=self._build_raw_output(tests),
+                )
             summary_parts = []
             if vulnerable_tests:
                 summary_parts.append(f"Header injection CONFIRMED via {len(vulnerable_tests)} parameter(s)")
@@ -193,7 +212,12 @@ class HeaderInjectionValidator(Validator):
                     TypedRequest("GET", probe_url, headers={"User-Agent": self.user_agent}),
                     capability=self.get_name(), max_redirects=self.max_redirects)
                 if not outcome.ok:
-                    raise httpx.TransportError(outcome.error or outcome.outcome)
+                    if outcome.outcome == "error":
+                        failure = (getattr(outcome.artifact, "transport_outcome", "")
+                                   .partition(":")[2] or outcome.error or "transport error")
+                        return self._unsent(param, "error", failure)
+                    return self._unsent(param, "blocked", f"refused ({outcome.outcome}"
+                                        + (f": {outcome.error})" if outcome.error else ")"))
                 response = SimpleNamespace(status_code=outcome.status,
                                            headers=outcome.headers)
             else:
@@ -208,8 +232,7 @@ class HeaderInjectionValidator(Validator):
                     )
         except Exception as e:
             log.debug(f"Header injection probe failed for param {param}: {e}")
-            return HeaderInjectionTestResult(f"Probe: {param}", True, "low",
-                                              f"Could not send probe: {e}", "", checked=True, vulnerable=False)
+            return self._unsent(param, "error", e.__class__.__name__)
 
         injected = any(k.lower() == _MARKER_HEADER.lower() and v == _MARKER_VALUE
                         for k, v in response.headers.items())
@@ -225,6 +248,12 @@ class HeaderInjectionValidator(Validator):
             f"'{param}' does not appear to allow CRLF injection into response headers",
             f"Status: {response.status_code}", vulnerable=False,
         )
+
+    def _unsent(self, param: str, kind: str, why: str) -> HeaderInjectionTestResult:
+        """A probe that got no response: unchecked, and never a pass."""
+        return HeaderInjectionTestResult(f"Probe: {param}", False, "low",
+                                          f"probe of {param!r}: {why}", "", checked=False,
+                                          vulnerable=False, unsent=kind)
 
     def _build_evidence(self, tests: list[HeaderInjectionTestResult]) -> str:
         vulnerable = [t for t in tests if t.vulnerable]

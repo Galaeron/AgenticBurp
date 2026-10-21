@@ -1,5 +1,10 @@
 package com.harness.llm.logic;
 
+import java.net.URI;
+import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 /**
  * Classification logic for oauth_flow_validation. Montoya-free. Targets the two
  * highest-value, testable OAuth authorization-request weaknesses: a missing
@@ -16,13 +21,46 @@ public final class OAuthFlowLogic {
 
     public record Evidence(Verdict verdict, double confidence, boolean confirmed, String summary, String detail) {}
 
+    /** Authority of an absolute or scheme-relative URI reference; a relative path has none. */
+    private static final Pattern AUTHORITY = Pattern.compile("^(?:[A-Za-z][A-Za-z0-9+.-]*:)?//([^/?#]*)");
+
     private OAuthFlowLogic() {}
 
-    private static boolean redirectsTo(String location, String attackerUri) {
+    /**
+     * True if the Location sends the browser to the attacker's host. The
+     * Location is parsed, not searched (code review 02 R31): a same-origin
+     * path that merely names the rejected URI, such as
+     * /error?rejected_redirect_uri=https://attacker.example/cb, keeps the
+     * browser on the authorization server and exfiltrates nothing.
+     */
+    static boolean redirectsTo(String location, String attackerUri) {
         if (location == null || attackerUri == null) return false;
-        String loc = location.trim().toLowerCase();
-        String host = attackerUri.trim().toLowerCase();
-        return loc.startsWith(host) || loc.contains(host);
+        String attackerHost = hostOf(attackerUri.trim());
+        String destinationHost = hostOf(location.trim());
+        return attackerHost != null && attackerHost.equals(destinationHost);
+    }
+
+    /** The lower-cased host a URI reference points at, or null for a relative or unparseable one. */
+    private static String hostOf(String uriReference) {
+        String host = null;
+        try {
+            host = new URI(uriReference).getHost();
+        } catch (Exception e) {
+            // e.g. an unencoded space in the query, which a browser still follows
+        }
+        if (host == null) {
+            // Authority java.net.URI would not split (underscore in the host,
+            // illegal characters elsewhere): drop userinfo and port by hand.
+            Matcher m = AUTHORITY.matcher(uriReference);
+            if (!m.find()) return null;
+            String authority = m.group(1);
+            authority = authority.substring(authority.lastIndexOf('@') + 1);
+            int colon = authority.lastIndexOf(':');
+            host = colon >= 0 && !authority.endsWith("]") ? authority.substring(0, colon) : authority;
+        }
+        if (host.isEmpty()) return null;
+        host = host.toLowerCase(Locale.ROOT);
+        return host.endsWith(".") ? host.substring(0, host.length() - 1) : host;
     }
 
     /**

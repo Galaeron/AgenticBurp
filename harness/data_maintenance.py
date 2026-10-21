@@ -64,6 +64,13 @@ def inspect_database(conn: sqlite3.Connection) -> dict:
                     if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
                         raise ValueError("Malformed evidence reference")
                     references.add(digest)
+    if "exchange_observations" in tables:
+        # I02-C: an observation's sanitized-capture blob is a registered reference too.
+        for (digest,) in conn.execute(
+                "SELECT evidence_sha256 FROM exchange_observations WHERE evidence_sha256 != ''"):
+            if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("Malformed evidence reference")
+            references.add(digest)
     return {"tables": counts, "blob_count": len(hashes), "referenced_blob_count": len(references),
             "unavailable_reference_count": len(references - hashes),
             "scope": "one SQLite database; no caches/logs/exports/token files"}
@@ -135,7 +142,8 @@ def wipe_context(source: Path, engagement_id: str) -> dict:
     try:
         conn.execute("BEGIN IMMEDIATE")
         inventory = inspect_database(conn)
-        owned = ("findings", "ledger_events", "scoped_engagement_state", "knowledge_notes", "work_items")
+        owned = ("findings", "ledger_events", "scoped_engagement_state", "knowledge_notes", "work_items",
+                 "exchange_observations", "observation_attributions")
         columns = {name: {row[1] for row in conn.execute(f'PRAGMA table_info("{name}")')}
                    for name in owned if name in inventory["tables"]}
         if "engagement_id" not in columns.get("findings", set()) or "engagement_id" not in columns.get("ledger_events", set()):
@@ -147,6 +155,10 @@ def wipe_context(source: Path, engagement_id: str) -> dict:
                 digest = event.get(key)
                 if digest:
                     (candidate if owner == engagement_id else surviving).add(digest)
+        if "engagement_id" in columns.get("exchange_observations", set()):
+            for owner, digest in conn.execute(
+                    "SELECT engagement_id, evidence_sha256 FROM exchange_observations WHERE evidence_sha256 != ''"):
+                (candidate if owner == engagement_id else surviving).add(digest)
         counts = {}
         for name in owned:
             if "engagement_id" in columns.get(name, set()):

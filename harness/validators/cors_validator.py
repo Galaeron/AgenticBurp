@@ -16,6 +16,7 @@ Tests performed:
 
 from __future__ import annotations
 import asyncio
+import contextvars
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,42 @@ if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.cors")
+
+# The attacker origin every probe sends. Confirmation compares the returned
+# Access-Control-Allow-Origin with THIS origin (R09).
+_PROBE_ORIGIN = "https://evil-attacker.com"
+# Tests whose vulnerable result means the browser grants the attacker origin
+# itself (or "null") access. The other tests are weaknesses that only matter
+# once that is true, so they never confirm on their own (R09).
+# `Access-Control-Allow-Origin: *` is not a credentialed grant whatever
+# Allow-Credentials says: the Fetch standard's CORS check (section 3.3.5) fails
+# a credentialed request whose response carries `*` (RV-D2 V3).
+_ORIGIN_GRANT_TESTS = {"Origin Reflection", "Null Origin"}
+_WILDCARD_CREDENTIALS_DETAIL = (
+    "Server returns Access-Control-Allow-Origin: * together with "
+    "Access-Control-Allow-Credentials: true. Browsers refuse this combination for credentialed "
+    "requests (Fetch standard, CORS check), so it grants no credentialed cross-origin read: an "
+    "informational misconfiguration, not exploitable on its own")
+# Origin reflection confirms either way (RV-R R2, owner decision 2026-10-21);
+# Allow-Credentials decides what the attacker's page can read.
+_REFLECTION_CREDENTIALED_DETAIL = (
+    "Server reflects arbitrary Origin header with Access-Control-Allow-Credentials: true: the "
+    "authenticated response, sent with the user's cookies, is readable cross-origin")
+_REFLECTION_UNCREDENTIALED_DETAIL = (
+    "Server reflects arbitrary Origin header, without Access-Control-Allow-Credentials: true. "
+    "Limited impact: a cross-origin page can read the response only as a visitor without the "
+    "user's cookies, so the impact is limited to data the server returns without credentials "
+    "(for example on an intranet or IP-allowlisted host)")
+# Per-validate() record of each probe's fate ("ok", "blocked", "error"), so a
+# probe that never ran is not read as a pass (R08). A ContextVar rather than
+# instance state: one validator instance serves concurrent validations.
+_PROBES: contextvars.ContextVar[list | None] = contextvars.ContextVar("cors_probes", default=None)
+
+
+def _note_probe(outcome: str) -> None:
+    probes = _PROBES.get()
+    if probes is not None:
+        probes.append(outcome)
 
 
 @dataclass
@@ -160,6 +197,8 @@ class CorsValidator(Validator):
             )
         
         # Run all CORS tests
+        probes: list[str] = []
+        probe_scope = _PROBES.set(probes)
         try:
             tests.append(await self._test_wildcard_origin(base_url, exchange))
             tests.append(await self._test_null_origin(base_url, exchange))
@@ -169,10 +208,42 @@ class CorsValidator(Validator):
             tests.append(await self._test_allow_headers_wildcard(base_url, exchange))
             tests.append(await self._test_expose_headers(base_url, exchange))
             tests.append(await self._test_max_age(base_url, exchange))
-            
+
+            # R09: confirm only when the browser would grant the attacker origin
+            # access. Header weaknesses (Allow-Headers *, exposed headers, a long
+            # Max-Age, ...) matter only then; on their own they are informational.
+            origin_granted = any(t.vulnerable and t.test_name in _ORIGIN_GRANT_TESTS
+                                 for t in tests)
+            if not origin_granted:
+                for t in tests:
+                    if t.vulnerable:
+                        t.vulnerable = False
+                        t.severity = "info"
+                        t.detail += (f" (informational: the probe origin {_PROBE_ORIGIN} is not "
+                                     f"granted access, so this is not exploitable on its own)")
+
             # Check if any test found a vulnerability
             vulnerable = any(t.vulnerable for t in tests)
-            
+
+            # R08: a probe that was blocked (budget, gate, scope) or failed is not a
+            # pass. Without every probe answered, a negative is incomplete.
+            unanswered = [p for p in probes if p != "ok"]
+            if not vulnerable and (unanswered or not probes):
+                blocked = "blocked" in unanswered
+                answered = len(probes) - len(unanswered)
+                return ValidationResult(
+                    validator=self.get_name(),
+                    status="blocked" if blocked and not answered else "inconclusive",
+                    finding_class=finding.vulnerability_class,
+                    confidence=0.0,
+                    confirmed=False,
+                    summary=(f"CORS check incomplete: {len(unanswered)} of {len(probes)} probe(s) "
+                             f"got no response ({', '.join(sorted(set(unanswered))) or 'none sent'}); "
+                             f"not a negative result"),
+                    evidence=self._build_evidence(tests),
+                    raw_output=self._build_raw_output(tests),
+                )
+
             # Determine severity
             if vulnerable:
                 severities = [t.severity for t in tests if t.vulnerable]
@@ -186,15 +257,23 @@ class CorsValidator(Validator):
             # Build summary
             vulnerable_tests = [t for t in tests if t.vulnerable]
             passed_tests = [t for t in tests if t.passed and not t.vulnerable]
-            
+            # Misconfigurations that grant the probe origin nothing (unconfirmed).
+            informational = [t for t in tests if not t.passed and not t.vulnerable]
+
             summary_parts = []
             if vulnerable_tests:
                 summary_parts.append(f"CORS misconfiguration CONFIRMED: {len(vulnerable_tests)} vulnerability(ies) found")
                 for t in vulnerable_tests:
                     summary_parts.append(f"  - {t.test_name}: {t.detail}")
+            elif informational:
+                summary_parts.append("No exploitable CORS misconfiguration: the probe origin is "
+                                     "not granted access")
             else:
                 summary_parts.append("CORS configuration appears secure")
-            
+            if informational:
+                summary_parts.append("  Informational, unconfirmed: "
+                                     + ", ".join(t.test_name for t in informational))
+
             if passed_tests:
                 summary_parts.append(f"  Passed: {len(passed_tests)} tests")
             
@@ -221,7 +300,9 @@ class CorsValidator(Validator):
                 evidence="",
                 raw_output=str(e),
             )
-    
+        finally:
+            _PROBES.reset(probe_scope)
+
     def _get_base_url(self, url: str) -> str:
         """Extract base URL from a full URL."""
         from urllib.parse import urlparse
@@ -249,7 +330,9 @@ class CorsValidator(Validator):
                     capability=self.get_name(),
                     max_redirects=self.max_redirects if follow_redirects else 0)
                 if not outcome.ok:
+                    _note_probe("error" if outcome.outcome == "error" else "blocked")
                     return None
+                _note_probe("ok")
                 return httpx.Response(
                     outcome.status or 0, content=(outcome.body or "").encode(),
                     headers=outcome.headers, request=httpx.Request(method, url))
@@ -266,18 +349,22 @@ class CorsValidator(Validator):
                 follow_redirects=follow_redirects,
                 max_redirects=self.max_redirects,
             ) as client:
-                return await client.request(method, url, headers=headers)
+                response = await client.request(method, url, headers=headers)
+            _note_probe("ok")
+            return response
         except SafetyGateBlocked as e:
             log.debug(f"CORS request blocked by safety gate: {e}")
+            _note_probe("blocked")
             return None
         except Exception as e:
             log.debug(f"Request failed: {e}")
+            _note_probe("error")
             return None
     
     async def _test_wildcard_origin(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if server reflects wildcard origin."""
         # Test with arbitrary origin
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         
         headers = {
             "Origin": test_origin,
@@ -307,18 +394,19 @@ class CorsValidator(Validator):
                 # was the single largest source of false "confirmed" findings
                 # in the Juice Shop run (58 of 60 confirmations traced to this
                 # check firing on secure and vulnerable endpoints alike). The
-                # genuinely dangerous combination -- wildcard AND credentials
-                # -- is caught, gated correctly, by _test_credentials_wildcard
-                # below; the bare case is reported as informational only so it
-                # never flips the finding's `confirmed` flag.
+                # bare case is reported as informational only so it never flips
+                # the finding's `confirmed` flag. Wildcard WITH credentials is no
+                # different for an attacker (RV-D2 V3): browsers fail the CORS
+                # check for a credentialed request answered with `*`, so it is a
+                # misconfiguration, reported informational too.
                 if acac.lower() == "true":
                     return CorsTestResult(
                         test_name="Wildcard Origin + Credentials",
                         passed=False,
-                        severity="critical",
-                        detail="Server returns Access-Control-Allow-Origin: * together with Access-Control-Allow-Credentials: true (spec violation, credentialed cross-origin reads possible)",
+                        severity="info",
+                        detail=_WILDCARD_CREDENTIALS_DETAIL,
                         evidence="Access-Control-Allow-Origin: *, Access-Control-Allow-Credentials: true",
-                        vulnerable=True,
+                        vulnerable=False,
                     )
                 return CorsTestResult(
                     test_name="Wildcard Origin",
@@ -329,14 +417,25 @@ class CorsValidator(Validator):
                     vulnerable=False,
                 )
 
-            # Check if our origin is reflected
+            # Check if our origin is reflected. RV-R R2 (owner decision
+            # 2026-10-21): it confirms with or without Allow-Credentials, but the
+            # wording says which: without it the browser sends no cookies, so a
+            # cross-origin page reads only what an anonymous visitor could.
             if acao.lower() == test_origin.lower():
+                grant = f"Origin: {test_origin} -> Access-Control-Allow-Origin: {acao}"
+                if acac.strip().lower() == "true":
+                    detail = _REFLECTION_CREDENTIALED_DETAIL
+                    evidence = f"{grant}, Access-Control-Allow-Credentials: {acac}"
+                else:
+                    detail = _REFLECTION_UNCREDENTIALED_DETAIL
+                    evidence = (f"{grant}, no Access-Control-Allow-Credentials: true (a cross-origin "
+                                f"read is without the user's cookies)")
                 return CorsTestResult(
                     test_name="Origin Reflection",
                     passed=False,
                     severity="medium",
-                    detail=f"Server reflects arbitrary Origin header",
-                    evidence=f"Origin: {test_origin} -> Access-Control-Allow-Origin: {acao}",
+                    detail=detail,
+                    evidence=evidence,
                     vulnerable=True,
                 )
         
@@ -388,8 +487,9 @@ class CorsValidator(Validator):
     
     async def _test_credentials_wildcard(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if server allows credentials with wildcard origin."""
-        # This is a spec violation but some browsers allow it
-        test_origin = "https://evil-attacker.com"
+        # A spec violation that browsers refuse for credentialed requests, so it
+        # is reported as an informational misconfiguration (RV-D2 V3).
+        test_origin = _PROBE_ORIGIN
         
         headers = {
             "Origin": test_origin,
@@ -413,10 +513,10 @@ class CorsValidator(Validator):
                 return CorsTestResult(
                     test_name="Credentials + Wildcard",
                     passed=False,
-                    severity="critical",
-                    detail="Server allows credentials with wildcard origin (spec violation, critical vulnerability)",
+                    severity="info",
+                    detail=_WILDCARD_CREDENTIALS_DETAIL,
                     evidence=f"Access-Control-Allow-Origin: {acao}, Access-Control-Allow-Credentials: {acac}",
-                    vulnerable=True,
+                    vulnerable=False,
                 )
         
         return CorsTestResult(
@@ -436,7 +536,7 @@ class CorsValidator(Validator):
         # never send a mutating method (a POST here was an ungated state-changing
         # request to the target; see W-1). The OPTIONS preflight below is also
         # non-mutating.
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -460,16 +560,19 @@ class CorsValidator(Validator):
         
         # Check if CORS headers are present without preflight
         acao = response.headers.get("Access-Control-Allow-Origin", "")
-        
+
         if acao and acao != "*" and acao.lower() != test_origin.lower():
-            # Server returns CORS headers without proper preflight
+            # R09: one fixed allowed origin that is NOT the probe origin is the
+            # secure allow-list pattern -- the browser refuses the attacker origin
+            # whatever Allow-Credentials says. It is not a bypass.
             return CorsTestResult(
                 test_name="Preflight Bypass",
-                passed=False,
-                severity="medium",
-                detail="Server returns CORS headers without proper preflight validation",
+                passed=True,
+                severity="info",
+                detail=f"Server allows a fixed origin ({acao}) that is not the probe origin; "
+                       f"the browser refuses {test_origin}",
                 evidence=f"Simple GET with attacker Origin returned Access-Control-Allow-Origin: {acao}",
-                vulnerable=True,
+                vulnerable=False,
             )
         
         # Test actual preflight
@@ -516,7 +619,7 @@ class CorsValidator(Validator):
     
     async def _test_vary_origin(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if Vary: Origin header is present."""
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -582,7 +685,7 @@ class CorsValidator(Validator):
     
     async def _test_allow_headers_wildcard(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if Access-Control-Allow-Headers: * is present."""
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -625,7 +728,7 @@ class CorsValidator(Validator):
     
     async def _test_expose_headers(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if sensitive headers are exposed."""
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -681,7 +784,7 @@ class CorsValidator(Validator):
     
     async def _test_max_age(self, base_url: str, exchange: HttpExchange) -> CorsTestResult:
         """Test if Access-Control-Max-Age is too high."""
-        test_origin = "https://evil-attacker.com"
+        test_origin = _PROBE_ORIGIN
         headers = {
             "Origin": test_origin,
         }
@@ -732,6 +835,10 @@ class CorsValidator(Validator):
         """Build evidence string from test results."""
         vulnerable = [t for t in tests if t.vulnerable]
         if not vulnerable:
+            informational = [f"{t.test_name}: {t.detail} (info)" for t in tests if not t.passed]
+            if informational:
+                return " | ".join(["No exploitable CORS vulnerability detected; informational, "
+                                   "unconfirmed:", *informational])
             return "No CORS vulnerabilities detected"
         
         parts = []

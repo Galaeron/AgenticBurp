@@ -88,11 +88,15 @@ class ProbeOutcome:
     """The result of probing one (method, path) for missing authentication."""
     method: str
     url: str
-    classification: str          # missing_auth | any_token_accepted | protected | inconclusive | skipped | error
+    # missing_auth | unauthenticated_access | any_token_accepted | protected
+    # | inconclusive | skipped | error. unauthenticated_access: data was served
+    # without credentials, but the endpoint was not shown to be protected.
+    classification: str
     unauth_status: int | None = None
     unauth_len: int = 0
     garbage_status: int | None = None
     garbage_len: int = 0
+    baseline_status: int | None = None   # authenticated baseline, when one was sent
     note: str = ""
     finding: Finding | None = None
 
@@ -105,6 +109,7 @@ class ProbeOutcome:
             "unauth_len": self.unauth_len,
             "garbage_status": self.garbage_status,
             "garbage_len": self.garbage_len,
+            "baseline_status": self.baseline_status,
             "note": self.note,
             "finding": self.finding.model_dump() if self.finding else None,
         }
@@ -170,12 +175,14 @@ async def _send(method: str, url: str, headers: dict[str, str], timeout: float, 
 
 
 def _finding(kind: str, method: str, url: str, outcome: ProbeOutcome,
-             expected_protected: bool) -> Finding:
+             expected_protected: bool, *, unconfirmed_reason: str = "") -> Finding:
     if kind == "missing_auth":
         conf = 0.85 if expected_protected else 0.75
         summary = (f"{method} {url} returns data with no authentication -- the endpoint "
                    f"served a {outcome.unauth_status} response ({outcome.unauth_len} bytes) "
                    f"to a request with all credentials stripped.")
+        if unconfirmed_reason:
+            summary += f" Not confirmed as missing authentication: {unconfirmed_reason}."
         evidence = (f"Unauthenticated {method} (no Authorization/Cookie/API-key) -> "
                     f"HTTP {outcome.unauth_status}, {outcome.unauth_len} bytes of substantive body.")
         suggested = ("Confirm the response contains protected data (not a public resource), then "
@@ -199,9 +206,54 @@ def _finding(kind: str, method: str, url: str, outcome: ProbeOutcome,
         basis="derived",
         severity="high",
         owasp_category="A07:2021-Identification and Authentication Failures",
-        confirmed=True,  # this IS the active confirmation -- we sent it and observed the leak
-        validation_hints=[f"{method} {url} with no credentials returned {outcome.unauth_status}"],
+        # The anonymous send IS the active confirmation, but only of a protected
+        # endpoint (RV-G R15): a public resource served anonymously is not a leak.
+        confirmed=not unconfirmed_reason,
+        validation_hints=[f"{method} {url} with no credentials returned {outcome.unauth_status}"]
+                         + ([unconfirmed_reason] if unconfirmed_reason else []),
     )
+
+
+async def _unconfirmed_reason(method: str, url: str, unauth_body: str, outcome: ProbeOutcome, *,
+                              baseline_headers: dict[str, str] | None, expected_protected: bool,
+                              protected_baseline: bool, timeout: float, run_context=None) -> str:
+    """Why an anonymous substantive response does NOT confirm missing
+    authentication, or "" when it does (RV-G R15).
+
+    The caller must declare the endpoint protected (`expected_protected`): an
+    anonymous 200 alone cannot tell a public catalogue from a leaked report.
+    With `protected_baseline`, the caller's own credentials must also fetch a
+    substantive payload, and the anonymous body must be that same payload."""
+    if not expected_protected:
+        return "the endpoint was not declared protected (expected_protected is false)"
+    if not protected_baseline:
+        return ""
+    credentials = {k: v for k, v in (baseline_headers or {}).items() if k.lower() in _AUTH_HEADERS}
+    if not credentials:
+        return "no credentials were supplied for an authenticated baseline"
+    plain = {k: v for k, v in (baseline_headers or {}).items() if k.lower() not in _AUTH_HEADERS}
+    baseline_ref = None
+    if run_context is not None:
+        from harness.run_context import ScopePolicy
+        baseline_ref = "missing-auth:baseline"
+        run_context.sessions.register(
+            baseline_ref, baseline_ref, credentials,
+            allowed_origins=[ScopePolicy.origin_of(url)], role="baseline")
+        send_headers = plain
+    else:
+        send_headers = dict(baseline_headers or {})
+    try:
+        b_status, b_body = await _send(method, url, send_headers, timeout,
+                                       run_context=run_context, session_ref=baseline_ref)
+    finally:
+        if baseline_ref is not None:
+            await run_context.sessions.unregister(baseline_ref)
+    outcome.baseline_status = b_status
+    if not _substantive(b_status, b_body):
+        return "the authenticated baseline returned no protected payload"
+    if (b_body or "").strip() != (unauth_body or "").strip():
+        return "the anonymous response differs from the authenticated baseline"
+    return ""
 
 
 async def probe(
@@ -217,6 +269,7 @@ async def probe(
     timeout: float = 15.0,
     gate: SafetyGate | None = None,
     run_context=None,
+    protected_baseline: bool = False,
 ) -> ProbeOutcome:
     """Probe one endpoint for missing authentication.
 
@@ -226,8 +279,12 @@ async def probe(
     ones stripped*, so non-auth headers (Accept, content negotiation) are
     preserved. `expected_protected=True` (caller knows the endpoint is meant to
     be authenticated, e.g. it was only found in authenticated JS) nudges the
-    confidence up. Read-only unless `include_mutating` and the safety gate allow
-    the method.
+    confidence up, and is required for a CONFIRMED missing-auth finding;
+    without it an anonymous payload is an unconfirmed `unauthenticated_access`
+    candidate. `protected_baseline=True` additionally requires the same payload
+    from an authenticated baseline request (one extra send, only after an
+    anonymous payload). Read-only unless `include_mutating` and the safety gate
+    allow the method.
     """
     method = (shape.method if isinstance(shape, CallShape) else shape[0]).upper()
     path = shape.path if isinstance(shape, CallShape) else shape[1]
@@ -261,8 +318,14 @@ async def probe(
     outcome.unauth_len = len((body or "").strip())
 
     if _substantive(status, body):
-        outcome.classification = "missing_auth"
-        outcome.finding = _finding("missing_auth", method, url, outcome, expected_protected)
+        reason = await _unconfirmed_reason(
+            method, url, body, outcome, baseline_headers=baseline_headers,
+            expected_protected=expected_protected, protected_baseline=protected_baseline,
+            timeout=timeout, run_context=run_context)
+        outcome.classification = "unauthenticated_access" if reason else "missing_auth"
+        outcome.note = reason
+        outcome.finding = _finding("missing_auth", method, url, outcome, expected_protected,
+                                   unconfirmed_reason=reason)
         return outcome
 
     # Not served anonymously. Optionally check whether ANY token is accepted --

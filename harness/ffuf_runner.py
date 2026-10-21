@@ -141,13 +141,16 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
              wordlist: str = DEFAULT_WORDLIST, threads: int = DEFAULT_THREADS,
              headers: dict[str, str] | None = None, timeout: float = DEFAULT_TIMEOUT,
              match_codes: str = "all", filter_codes: str = "404",
-             auto_calibrate: bool = True) -> FfufResult:
-    """Run ffuf in a container and return parsed routes.  Synchronous (blocks)."""
+             auto_calibrate: bool = True, cancel=None) -> FfufResult:
+    """Run ffuf in a container and return parsed routes.  Synchronous (blocks).
+    I05-C: `cancel` stops a running container (see tool_runner.run)."""
     args = build_args(target_url, wordlist=wordlist, threads=threads,
                       headers=headers, match_codes=match_codes,
                       filter_codes=filter_codes, auto_calibrate=auto_calibrate)
     try:
-        rc, stdout, stderr = tool_runner.run(image, args, timeout=timeout)
+        rc, stdout, stderr = tool_runner.run(image, args, timeout=timeout, cancel=cancel)
+    except tool_runner.ToolCleanupFailed:
+        raise   # a container that may still run is not an ordinary ffuf error
     except Exception as e:
         return FfufResult(error=f"ffuf container failed: {e}")
 
@@ -167,7 +170,8 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
 async def ffuf_discover(target_url: str, *, image: str = DEFAULT_IMAGE,
                         headers: dict[str, str] | None = None,
                         timeout: float = DEFAULT_TIMEOUT) -> FfufResult:
-    """Async wrapper: run ffuf in a thread so it doesn't block the event loop."""
-    import asyncio
-    return await asyncio.to_thread(
+    """Async wrapper: run ffuf in a thread so it doesn't block the event loop.
+    I05-C: if the awaiting task is cancelled, the container is stopped and removed
+    before the cancellation propagates."""
+    return await tool_runner.call_cancellable(
         run_sync, target_url, image=image, headers=headers, timeout=timeout)

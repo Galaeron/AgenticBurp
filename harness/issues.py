@@ -400,8 +400,10 @@ def _proof_references(issue: Issue, proofs_by_case: dict) -> list[dict]:
             pid = m.get("proof_id") or ""
             if (cid or pid) and (cid, pid) not in seen:
                 seen.add((cid, pid))
-                # no ledger attempt -> reference the pointer WITHOUT a verdict
-                refs.append({"case_id": cid, "proof_id": pid, "verdict": None})
+                # no recorded attempt -> reference the pointer WITHOUT a verdict and
+                # mark it unavailable: a dangling pointer is not replayable evidence (I02-A)
+                refs.append({"case_id": cid, "proof_id": pid, "verdict": None,
+                             "availability": "unavailable"})
     return refs
 
 
@@ -448,6 +450,7 @@ def _member_evidence(issue: Issue) -> list[dict]:
             "case_id": m.get("case_id") or "",
             "proof_id": m.get("proof_id") or "",
             "confirmed": bool(m.get("confirmed")),
+            "proof_status": m.get("proof_status") or "none",
             "evidence": redact((m.get("evidence") or "")[:400]),
         })
     return out
@@ -462,7 +465,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
     best = issue.best_member
     aliases = _principal_aliases(issue)
     proof_refs = _proof_references(issue, proofs_by_case)
-    has_proof = any(r.get("proof_id") for r in proof_refs)
+    has_proof = any(r.get("proof_id") and r.get("availability") != "unavailable" for r in proof_refs)
     audited_verified, audited_verification_state, audited_capsule_ids = \
         _audited_oracle_state(issue, proofs_by_case)
 

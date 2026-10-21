@@ -9,6 +9,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
+import contextlib
 import uuid
 
 from harness import identity_compare
@@ -35,8 +36,8 @@ import re as _re
 
 # Foreign object identifiers to try in a single-principal IDOR read (usernames of
 # OTHER people mentioned in public content, numeric ids seen in links). Purely a
-# seed list: the IDOR read validator's three-way differential rejects any id that
-# is not a real, distinct, unauthorised object, so a stray candidate is harmless.
+# seed list: the IDOR read validator never confirms (RV-D2), so its best result
+# for any id is an inconclusive candidate and a stray id cannot confirm anything.
 _ID_QUERY_KEYS = {"id", "user", "user_id", "userid", "uid", "account", "account_id",
                   "customer", "customer_id", "profile", "pid", "oid", "owner"}
 _AUTHOR_MENTION = _re.compile(
@@ -226,7 +227,18 @@ class ChainMixin:
         driver adapts to what each round reveals rather than planning once.
 
         Plan-only unless `execute` is asked AND engagement.driver_execute is
-        enabled in config (double-gated -- never tests automatically)."""
+        enabled in config (double-gated -- never tests automatically).
+
+        WL-12 (E40): an executing call owns ONE run for all its rounds (or borrows
+        the run that already encloses it). Every target GET and every page
+        analysis (which borrows the run instead of creating its own) spends that
+        run's single request ceiling under its scope, gate, TLS policy and
+        cancellation. The owned run mirrors the RV-G route run
+        (server._crawl_route_run): runs.max_requests -- falling back to the
+        standalone-analysis ceiling, analyze.max_requests (1000), so the call is
+        never unbounded -- runs.request_timeout_seconds, the live validator gate
+        with mutating replay forced off, and server.allowed_hosts as a
+        fail-closed scope. It is closed on every exit."""
         if not execute:
             plan = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
             plan["note"] = "plan only -- pass execute=true (and enable engagement.driver_execute) to run these"
@@ -236,27 +248,48 @@ class ChainMixin:
             plan["note"] = "execution refused: engagement.driver_execute is disabled in config.yaml"
             return plan
 
+        enclosing = _run_context_mod.current_run_context()
+        owned = None
+        if enclosing is None:
+            cfg = self.config if isinstance(self.config, dict) else {}
+            runs_cfg = cfg.get("runs", {}) or {}
+            ceiling = runs_cfg.get("max_requests")
+            if ceiling is None:
+                ceiling = (cfg.get("analyze", {}) or {}).get("max_requests")
+            ceiling = 1000 if ceiling is None else ceiling
+            if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+                raise ValueError("the engagement run ceiling (runs.max_requests, else "
+                                 "analyze.max_requests) must be a nonnegative integer")
+            owned = _run_context_mod.RunContext.create(
+                allowed_hosts=self.allowed_hosts, config=cfg, max_requests=ceiling,
+                gate_config={**per_run_gate_config(cfg, getattr(self, "validator_registry", None)),
+                             "allow_mutating_replay": False},
+                timeout=float(runs_cfg.get("request_timeout_seconds", 15.0)))
+
         p = urlsplit(base_url)
         origin = f"{p.scheme}://{p.netloc}"
         rounds: list[dict] = []
         seen_urls: set[str] = set()   # don't re-fetch the same target across rounds
 
-        for rnd in range(1, max(1, max_rounds) + 1):
-            allowed, _ = self.effort_budget.allow()
-            if not allowed:
-                rounds.append({"round": rnd, "stopped": "effort budget exhausted"})
-                break
-            plan = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
-            funded = [t for t in plan["targets"]
-                      if t["action"] != "deferred" and t["method"].upper() == "GET"]
-            analyzed: list[dict] = []
-            # W-16: the driver's target GETs go through the single TargetTransport.
-            # No run of its own, so a standalone context (scope == is_host_allowed,
-            # so reachability is unchanged); one transport reused across the round.
-            _tt, _owned = transport_for(
-                None, allowed_hosts=self.allowed_hosts, config=self.config)
-            try:
+        async with (owned if owned is not None else contextlib.nullcontext(enclosing)) as run:
+            _tt = run.target_transport()
+            for rnd in range(1, max(1, max_rounds) + 1):
+                stop = ("run cancelled" if run.cancel.cancelled else
+                        "run request ceiling reached" if run.budget.remaining == 0 else "")
+                if stop:
+                    rounds.append({"round": rnd, "stopped": stop})
+                    break
+                allowed, _ = self.effort_budget.allow()
+                if not allowed:
+                    rounds.append({"round": rnd, "stopped": "effort budget exhausted"})
+                    break
+                plan = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
+                funded = [t for t in plan["targets"]
+                          if t["action"] != "deferred" and t["method"].upper() == "GET"]
+                analyzed: list[dict] = []
                 for t in funded:
+                    if run.cancel.cancelled or run.budget.remaining == 0:
+                        break
                     url = origin + t["path"].replace("{id}", "1")
                     if url in seen_urls or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
                         continue
@@ -272,21 +305,25 @@ class ChainMixin:
                             url=url, method="GET", request_headers={}, request_body="",
                             response_status=out.status, response_headers=dict(out.headers),
                             response_body=(out.body or "")[: self.max_body_chars])
-                        result = await self.analyze(exchange)
+                        # Harness-fetched traffic, not a supplied capture (I02-C); the
+                        # page analysis borrows this run rather than owning another.
+                        result = await self.analyze(exchange, retain_observation=False,
+                                                    run_context=run)
                         n = len([f for r in result.agent_reports for f in r.findings])
                         analyzed.append({"url": url, "findings": n})
                     except Exception as e:
                         analyzed.append({"url": url, "error": e.__class__.__name__})
-            finally:
-                if _owned is not None:
-                    await _owned.aclose()
-            # SUMMARIZE this round (the condensed feedback the next plan reacts to).
-            rounds.append(self._summarize_round(rnd, host, analyzed))
-            if not analyzed:  # nothing new was funded/runnable -> converged
-                break
+                # SUMMARIZE this round (the condensed feedback the next plan reacts to).
+                rounds.append(self._summarize_round(rnd, host, analyzed))
+                if not analyzed:  # nothing new was funded/runnable -> converged
+                    break
+            remaining = run.budget.remaining
+            run_info = {"run_id": run.run_id, "owned": owned is not None,
+                        "max_requests": None if remaining is None else run.budget.used + remaining,
+                        "requests_used": run.budget.used, "cancelled": run.cancel.cancelled}
 
         after = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
-        return {"host": host, "executed": True, "rounds": rounds,
+        return {"host": host, "executed": True, "rounds": rounds, "run": run_info,
                 "targets_after": after["targets"], "guidance": after["guidance"],
                 "summary": (await self._engagement_summary(host))}
 
@@ -301,10 +338,16 @@ class ChainMixin:
         snap = await asyncio.to_thread(store.load_engagement, host)
         return engagement.EngagementState.from_dict(snap or {"host": host}).summary()
 
-    async def _auto_escalate(self, host: str, source_url: str, credential_caps: list, st) -> None:
+    async def _auto_escalate(self, host: str, source_url: str, credential_caps: list, st,
+                             run_context=None) -> None:
         """Re-crawl the origin as each learned (derived) identity and fold the new
         surface into the engagement state. The credential headers are used here
         and discarded -- never persisted.
+
+        I05: every probe and crawl request spends `run_context` (the analysis run
+        that learned the credential) -- its budget, scope, gate and cancellation.
+        The learned identity gets an escalation-only session in that run, removed
+        again after the crawl, so it never joins the run's other checks.
 
         Blast-radius guards (this is active traffic fired as a side effect of
         analysis, so it is bounded three independent ways):
@@ -346,7 +389,8 @@ class ChainMixin:
         # Guard 2: verify each credential actually grants access before crawling.
         verified: list = []
         for cap in fresh:
-            if await self._credential_grants_access(source_url, cap.get("headers", {})):
+            if await self._credential_grants_access(source_url, cap.get("headers", {}),
+                                                    run_context=run_context):
                 verified.append(cap)
             else:
                 log.info("engagement auto-escalate: learned credential did not verify -- discarding")
@@ -356,9 +400,20 @@ class ChainMixin:
         roles = [role_crawl.RoleSession(role="anonymous", headers={})]
         for cap in verified:
             roles.append(role_crawl.RoleSession(role="derived", headers=cap.get("headers", {})))
+        session_refs = None
+        if run_context is not None:
+            from harness.run_context import ScopePolicy
+            session_refs = []
+            for index, role in enumerate(roles):
+                ref = f"auto-escalate:{index}:{role.principal_id()}"
+                run_context.sessions.register(
+                    ref, role.principal_id(), dict(role.headers or {}),
+                    allowed_origins=[ScopePolicy.origin_of(origin)], role=role.role)
+                session_refs.append(ref)
         try:
             result = await role_crawl.crawl_roles(
-                origin, roles, allowed_hosts=self.allowed_hosts, max_pages=20, max_endpoints=80)
+                origin, roles, allowed_hosts=self.allowed_hosts, max_pages=20, max_endpoints=80,
+                run_context=run_context, session_refs=session_refs)
             st.ingest_role_crawl(result.to_dict())
             for cap in verified:
                 st.resolve_action("recrawl_as_derived",
@@ -368,8 +423,12 @@ class ChainMixin:
                      origin, len(result.endpoints), self._escalation_counts[host])
         except Exception as e:
             log.warning("engagement auto-escalate failed: %s", e)
+        finally:
+            for ref in session_refs or ():
+                await run_context.sessions.unregister(ref)
 
-    async def _credential_grants_access(self, url: str, headers: dict) -> bool:
+    async def _credential_grants_access(self, url: str, headers: dict, *,
+                                        run_context=None) -> bool:
         """FR-6 (F10): a learned credential "grants access" only when it produces
         a response DISTINGUISHABLE from both an anonymous control and an
         invalid-token control on the same URL -- not merely a non-error (<400)
@@ -399,12 +458,12 @@ class ChainMixin:
         risk exactly the false grant this fix targets."""
         if not headers or not scope_discovery.is_host_allowed(url, self.allowed_hosts):
             return False
-        # W-16: the credential probe goes through the single TargetTransport. It is a
-        # one-off throwaway send, so a standalone context; send_creds forwards the
-        # learned credential (ephemeral session scoped to the URL's origin), matching
-        # a raw client that just sent it to `url`.
+        # W-16: the credential probe goes through the single TargetTransport;
+        # send_creds forwards the learned credential (ephemeral session scoped to the
+        # URL's origin), matching a raw client that just sent it to `url`. I05: it
+        # spends the analysis run when there is one; a standalone context otherwise.
         _tt, _owned = transport_for(
-            None, allowed_hosts=self.allowed_hosts, config=self.config)
+            run_context, allowed_hosts=self.allowed_hosts, config=self.config)
         try:
             await global_throttle.acquire()
             cred = await _tt.send_creds("GET", url, capability="credential_probe",
@@ -551,17 +610,23 @@ class ChainMixin:
                 pass
 
         # Emit findings for sensitive files discovered during active probing
-        # (/.env, /backup/, etc.). These are confirmed by their mere existence
-        # at a web-accessible path.
-        for sf_path in getattr(rc, "sensitive_file_hits", []):
-            state.ingest_findings(
-                f"{base_url}{sf_path}", "GET",
-                [{"vulnerability_class": "sensitive_file_exposure",
-                  "severity": "high", "confidence": 0.95,
-                  "summary": f"Sensitive file accessible: {sf_path}",
-                  "evidence": f"HTTP 200 at {sf_path}",
-                  "confirmed": True,
-                  "confirmation_method": "sensitive_file_probe"}])
+        # (/.env, /backup/, etc.). WL-05 (E39): a status code alone is only an
+        # existence signal. A finding is confirmed only when discovery's record
+        # says the 2xx body carried the artifact's content signature; a redirect,
+        # an empty or HTML body or an unrecognised type stays an existence-only
+        # candidate quoting the real status. A hit with no record (an older
+        # producer) is never confirmed.
+        from harness.api_surface_discovery import sensitive_file_finding
+        _sf_recorded: set[str] = set()
+        for sf_record in getattr(rc, "sensitive_file_evidence", None) or []:
+            sf_path = str(sf_record.get("path") or "")
+            _sf_recorded.add(sf_path)
+            state.ingest_findings(f"{base_url}{sf_path}", "GET",
+                                  [sensitive_file_finding(sf_record)])
+        for sf_path in getattr(rc, "sensitive_file_hits", None) or []:
+            if sf_path not in _sf_recorded:
+                state.ingest_findings(f"{base_url}{sf_path}", "GET",
+                                      [sensitive_file_finding({"path": sf_path})])
 
         # Stateful agent-role feature crawling (default off). Drive each role
         # through the app's real workflows and fold the captured, session-bearing
@@ -666,12 +731,17 @@ class ChainMixin:
             allowed_hosts=self.allowed_hosts,
             timeout=float(_xid_cfg.get("timeout", 10.0)),
             max_identities=int(_xid_cfg.get("max_identities", 3)),
-            run_context=run_context)
+            run_context=run_context,
+            # WL-04: the registry's declared-ownership source (D1 seam); None means
+            # a cross-identity match is a `supported` lead, never a confirmation.
+            ownership=getattr(self.validator_registry, "ownership", None))
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a
-        # username-keyed IDOR is reachable, not just numeric neighbours. Bad
-        # candidates are harmless -- the three-way differential rejects them.
+        # username-keyed IDOR is reachable, not just numeric neighbours. It never
+        # confirms (RV-D2): one principal cannot show the object is unauthorised,
+        # so its best result is an inconclusive candidate; only cross_identity
+        # confirms IDOR.
         _idor_cfg = (self.config.get("validators", {}) or {}).get("idor_read", {}) or {}
         _idor_read = IdorReadValidator(
             allowed_hosts=self.allowed_hosts,
@@ -869,6 +939,8 @@ class ChainMixin:
                            evidence=finding.get("evidence") or "",
                            suggested_test=finding.get("suggested_test") or "", basis="derived")
 
+        _protected: list = []   # RV-S: this target's declared routes, built on first use
+
         async def _confirm(finding, exchange):
             """Dispatch a finding to the deterministic confirmation leg for its class:
             access-control -> cross-identity replay; xss -> headless-browser execution.
@@ -876,31 +948,75 @@ class ChainMixin:
             vc = (finding.get("vulnerability_class") or "")
             low = vc.lower()
             if low in ("auth_bypass", "missing_authentication", "missing authentication"):
-                # Anonymous access to a privileged-looking route is confirmed by
-                # replaying the captured read with every credential stripped.
-                # This is not an IDOR/BFLA comparison and needs no second user.
+                # Replay the captured read with every credential stripped. This is
+                # not an IDOR/BFLA comparison and needs no second user. An anonymous
+                # payload confirms only for a route declared protected (RV-G R15).
+                # A model label or a privileged-looking path is a hypothesis, not
+                # that declaration (RV-M M1); the operator's list of protected path
+                # patterns is (RV-S: authz.protected_paths in config, plus the
+                # engagement's protected_paths). A listed route must also return
+                # the authenticated baseline's payload to the anonymous replay; an
+                # unlisted route stays an unconfirmed `unauthenticated_access`
+                # candidate.
                 try:
+                    from harness import protected_routes
                     parts = urlsplit(exchange.url)
                     path = parts.path or "/"
                     if parts.query:
                         path += "?" + parts.query
+                    method = (exchange.method or "GET").upper()
+                    if not _protected:
+                        _protected.append(protected_routes.ProtectedRoutes.for_target(
+                            self.config, base_url,
+                            engagement_paths=getattr(state, "protected_paths", None)))
+                    declared = _protected[0].match(method, exchange.url)
+                    baseline = exchange.request_headers
+                    if declared is not None:
+                        # The probe strips only the credential headers it knows by
+                        # name; any other header a supplied identity sets (a custom
+                        # session header) would ride along on the "anonymous"
+                        # replay. Drop those, so a listed route is replayed with no
+                        # identity at all (fail closed: the baseline may then fail).
+                        supplied = {k.lower() for r in roles for k in (r.headers or {})}
+                        baseline = {k: v for k, v in (baseline or {}).items()
+                                    if k.lower() in missing_auth_probe._AUTH_HEADERS
+                                    or k.lower() not in supplied}
+                    if declared is not None and not any(
+                            k.lower() in missing_auth_probe._AUTH_HEADERS for k in (baseline or {})):
+                        # The probe identity of an anonymously reached node is
+                        # anonymous, so the baseline borrows the highest-trust
+                        # supplied identity's credentials: only the headers the
+                        # probe strips, so none can reach the anonymous replay.
+                        authed = [r for r in roles if any(
+                            k.lower() in missing_auth_probe._AUTH_HEADERS for k in (r.headers or {}))]
+                        if authed:
+                            top = max(authed, key=lambda r: role_crawl._trust(r.role))
+                            baseline = {**(baseline or {}), **{
+                                k: v for k, v in top.headers.items()
+                                if k.lower() in missing_auth_probe._AUTH_HEADERS}}
                     outcome = await missing_auth_probe.probe(
-                        base_url, ((exchange.method or "GET").upper(), path),
+                        base_url, (method, path),
                         allowed_hosts=self.allowed_hosts,
-                        baseline_headers=exchange.request_headers,
+                        baseline_headers=baseline,
                         send_garbage_token=False,
-                        expected_protected=True,
+                        expected_protected=declared is not None,
+                        protected_baseline=True,
                         run_context=run_context)
                     if outcome.finding is not None:
                         proof = outcome.finding
+                        why = (f" Route declared protected by {declared.describe()}."
+                               if declared is not None else "")
                         await _apply(
                             finding,
                             ValidationResult(
-                                validator="missing_auth_probe", status="confirmed",
+                                validator="missing_auth_probe",
+                                status="confirmed" if proof.confirmed else "inconclusive",
                                 finding_class="missing_authentication",
-                                confidence=proof.confidence, confirmed=True,
-                                summary=proof.summary, evidence=proof.evidence),
+                                confidence=proof.confidence, confirmed=bool(proof.confirmed),
+                                summary=proof.summary + why, evidence=proof.evidence + why),
                             "missing-auth", 0.85, exchange)
+                        if proof.confirmed and declared is not None:
+                            finding["protected_route"] = declared.to_dict()
                 except Exception:
                     return
             elif access_control_gate._is_access_control_class(vc):
@@ -926,9 +1042,11 @@ class ChainMixin:
                             await _owned.aclose()
                 try:
                     await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9, exchange)
-                    # Single-principal fallback: if no second identity confirmed a
-                    # cross-identity breach, try the object-id read differential
-                    # (own vs foreign vs absent) as the captured principal.
+                    # Single-principal follow-up: if no second identity confirmed a
+                    # cross-identity breach, run the object-id read differential
+                    # (own vs foreign vs absent) as the captured principal. It never
+                    # confirms (RV-D2), so `_apply` leaves the finding unconfirmed
+                    # and keeps only any manual-verification guidance it carries.
                     if not finding.get("confirmed"):
                         await _apply(finding, await _cached_validate(_idor_read, _as_finding(finding, "idor"), exchange), "idor-read", 0.75, exchange)
                 except Exception:

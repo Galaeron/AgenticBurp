@@ -42,12 +42,25 @@ class _Handler(socketserver.BaseRequestHandler):
         except OSError:
             pass
         # server.probe is attached in EgressProbe.start()
-        self.server.probe._record(self.client_address, data)  # type: ignore[attr-defined]
+        self.server.probe._record(self.request, self.client_address, data)  # type: ignore[attr-defined]
 
 
 class _Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    block_on_close = False      # EgressProbe.stop() drains handlers itself, within a bound
+
+    def process_request(self, request, client_address):
+        # Recorded on the accepting thread, before a handler reads anything: an
+        # accepted connection is a leak however its handler fares (R37).
+        self.probe._record_accept(request, client_address)  # type: ignore[attr-defined]
+        super().process_request(request, client_address)
+
+    def finish_request(self, request, client_address):
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            self.probe._handler_done(request)  # type: ignore[attr-defined]
 
 
 class EgressProbe:
@@ -62,7 +75,10 @@ class EgressProbe:
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
         self._connections: list[dict[str, Any]] = []
+        self._open: dict[int, dict[str, Any]] = {}     # handler still running, by id(request)
         self._lock = threading.Lock()
+        self._drained = threading.Condition(self._lock)
+        self._stopped = False
 
     def start(self) -> "EgressProbe":
         self._server = _Server((self._host, self._port), _Handler)
@@ -78,18 +94,37 @@ class EgressProbe:
         host, port = self._server.server_address[:2]
         return str(host), int(port)
 
-    def _record(self, peer: Any, data: bytes) -> None:
+    def _record_accept(self, request: Any, peer: Any) -> None:
+        entry = {
+            "peer": f"{peer[0]}:{peer[1]}" if isinstance(peer, tuple) else str(peer),
+            "bytes": 0,
+            "preview": "",
+            "at": round(time.time(), 3),
+        }
         with self._lock:
-            self._connections.append({
-                "peer": f"{peer[0]}:{peer[1]}" if isinstance(peer, tuple) else str(peer),
-                "bytes": len(data),
-                "preview": data[:64].decode("latin-1", "replace"),
-                "at": round(time.time(), 3),
-            })
+            self._connections.append(entry)
+            if request is not None:
+                self._open[id(request)] = entry
+
+    def _record(self, request: Any, peer: Any, data: bytes) -> None:
+        """What an accepted connection sent (a handler whose accept went unrecorded still counts)."""
+        with self._lock:
+            entry = self._open.get(id(request))
+            if entry is None:
+                entry = {"peer": f"{peer[0]}:{peer[1]}" if isinstance(peer, tuple) else str(peer),
+                         "at": round(time.time(), 3)}
+                self._connections.append(entry)
+            entry["bytes"] = len(data)
+            entry["preview"] = data[:64].decode("latin-1", "replace")
+
+    def _handler_done(self, request: Any) -> None:
+        with self._drained:
+            self._open.pop(id(request), None)
+            self._drained.notify_all()
 
     def connections(self) -> list[dict[str, Any]]:
         with self._lock:
-            return list(self._connections)
+            return [dict(c) for c in self._connections]
 
     def wait_for_connection(self, timeout: float = 2.0) -> bool:
         """Block up to ``timeout`` for at least one connection (test/CLI helper)."""
@@ -118,12 +153,33 @@ class EgressProbe:
             "connections": conns,
         }
 
-    def stop(self) -> None:
-        if self._server is not None:
+    def stop(self, drain_timeout: float = 2.0) -> None:
+        """Stop listening and finalize the record: every connection the serve loop
+        accepted is already recorded; connections the kernel completed but nobody
+        accepted are accepted and recorded here; running handlers get up to
+        `drain_timeout` to record what they read."""
+        if self._server is not None and not self._stopped:
+            self._stopped = True
             self._server.shutdown()
+            self._accept_backlog()
             self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=2)
+        deadline = time.monotonic() + drain_timeout
+        with self._drained:
+            while self._open and (left := deadline - time.monotonic()) > 0:
+                self._drained.wait(left)
+
+    def _accept_backlog(self) -> None:
+        sock = self._server.socket
+        try:
+            sock.setblocking(False)
+            while True:
+                conn, peer = sock.accept()
+                conn.close()
+                self._record_accept(None, peer)
+        except OSError:          # BlockingIOError: the backlog is empty
+            pass
 
     def __enter__(self) -> "EgressProbe":
         return self.start()

@@ -74,6 +74,22 @@ _OPEN_STATUSES = frozenset({
     CellStatus.PENDING, CellStatus.RUNNING, CellStatus.SKIPPED,
     CellStatus.BLOCKED, CellStatus.INCONCLUSIVE,
 })
+# Cells `CoverageMatrix.not_tested()` lists: never attempted (not applicable,
+# skipped, still pending), attempted without an executed verdict (blocked,
+# inconclusive, errored) or still running when the report was taken (RV-O O6).
+# The fallback reasons cover a cell recorded without one.
+_NOT_TESTED_STATUSES = frozenset({
+    CellStatus.NOT_APPLICABLE, CellStatus.SKIPPED,
+    CellStatus.PENDING, CellStatus.RUNNING,
+    CellStatus.BLOCKED, CellStatus.INCONCLUSIVE, CellStatus.ERROR,
+})
+_NOT_TESTED_REASONS = {
+    CellStatus.PENDING: "the check has not been attempted yet",
+    CellStatus.RUNNING: "the check was still running when the report was taken",
+    CellStatus.BLOCKED: "the send was refused, so the check did not execute",
+    CellStatus.INCONCLUSIVE: "the check gave no usable verdict",
+    CellStatus.ERROR: "the attempt errored before a verdict",
+}
 
 
 @dataclass
@@ -994,16 +1010,24 @@ class CoverageMatrix:
         return out
 
     def not_tested(self) -> list[dict]:
-        """Cells that were NOT tested, with the reason (I2/I5)."""
+        """Cells that were NOT tested, with the reason (I2/I5). A leg that was
+        blocked, gave no verdict or errored is listed too (RV-M M2, after R11),
+        and so is a cell still pending or running (RV-O O6): only an executed
+        verdict is tested, so the list must name those cells. A pending parent
+        whose detail lives in child cases (T05) is left to `cases_not_tested`,
+        which names each open case, as finalize_pending_reasons leaves it."""
         result = []
         for (identity, ep_key, check_id), cell in self._cells.items():
-            if cell.status in (CellStatus.NOT_APPLICABLE, CellStatus.SKIPPED):
+            if cell.status in (CellStatus.PENDING, CellStatus.RUNNING) \
+                    and self._cases.get((identity, ep_key, check_id)):
+                continue
+            if cell.status in _NOT_TESTED_STATUSES:
                 result.append({
                     "identity": identity,
                     "endpoint": ep_key,
                     "check": check_id,
                     "status": cell.status.value,
-                    "reason": cell.reason,
+                    "reason": cell.reason or _NOT_TESTED_REASONS.get(cell.status, ""),
                 })
         return result
 

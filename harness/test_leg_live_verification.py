@@ -6,19 +6,23 @@ Skipped cases establish no evidence. This is fixture integration, not a current
 blind-target measurement; path traversal has a separate operator-driven fixture.
 """
 import asyncio
+import re
 import importlib.util
 import shutil
 import threading
 import time
 import unittest
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from werkzeug.serving import make_server
 
+import harness.coverage_manifest as cm
 from harness import global_throttle
 from harness import safety_gate
+from harness.coverage_evidence_case import EvidenceCase, evidence_for
 from harness.models import Finding, HttpExchange
 from harness.validators.ssti_validator import SstiValidator
 from harness.validators.open_redirect_validator import OpenRedirectValidator
@@ -36,6 +40,7 @@ from harness.validators.xxe_validator import XxeValidator
 from harness.validators.csrf_validator import CsrfValidator
 from harness import browser_driver
 from harness import driver_capture
+from harness.testing_fixtures.leg_fault import bound_test_names, outcomes_with_leg_severed
 
 _FIXTURE = (Path(__file__).resolve().parent.parent
             / "testing" / "leg-verification" / "vuln_fixture.py")
@@ -46,6 +51,56 @@ def _load_make_app():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.make_app
+
+
+class _ExecSinkParser(HTMLParser):
+    """Collects what the stored-XSS payload's console.log would print -- the
+    product it computes (E2), never its source text -- from the places a
+    browser executes it: a <script> element's text and an on* handler."""
+    _LOG = re.compile(r"console\.log\((\d+)\*(\d+)\)")
+
+    def _run(self, js):
+        self.logged += [str(int(a) * int(b)) for a, b in self._LOG.findall(js)]
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.logged: list[str] = []
+        self._in_script = False
+
+    def handle_starttag(self, tag, attrs):
+        self._in_script = tag == "script"
+        for name, value in attrs:
+            if (name or "").startswith("on") and value:
+                self._run(value)
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._in_script = False
+
+    def handle_data(self, data):
+        if self._in_script:
+            self._run(data)
+
+
+class _ParsedRenderExecutionDouble:
+    """Browser-boundary double for the stored-XSS leg where CI has no Chromium
+    (requirements.lock carries no Playwright). It fetches the owned fixture's
+    rendered page and reports a console.log nonce only from an execution sink
+    (script text, on* handler); an escaped render parses as text and reports
+    nothing. Real Chromium is used instead whenever Playwright is installed,
+    and test_confirmation_soundness_rve pins Chromium on raw vs inert renders."""
+
+    async def visit(self, url, **kwargs):
+        def fetch():
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return r.read().decode("utf-8", "replace")
+        parser = _ExecSinkParser()
+        parser.feed(await asyncio.to_thread(fetch))
+        return browser_driver.ExecutionObservation(url=url, console=parser.logged)
+
+
+def _execution_driver():
+    return browser_driver.default_driver() or _ParsedRenderExecutionDouble()
 
 
 def _finding(vc):
@@ -80,7 +135,7 @@ class _RequestCounter:
         return self._app(environ, start_response)  # the validate() call settles
 
 
-class LiveLegVerificationTest(unittest.TestCase):
+class LiveLegVerificationTest(EvidenceCase):
     @classmethod
     def setUpClass(cls):
         import logging
@@ -126,6 +181,7 @@ class LiveLegVerificationTest(unittest.TestCase):
         """Rule 4: a leg's verdict is only real evidence if it sent traffic the
         fixture actually served. Assert the exact direction every time."""
         sent = self._sent_count() - before
+        self._last_sent = sent
         if expect_sent:
             self.assertGreater(
                 sent, 0,
@@ -135,6 +191,32 @@ class LiveLegVerificationTest(unittest.TestCase):
             self.assertEqual(
                 sent, 0,
                 f"a send-nothing leg unexpectedly issued {sent} request(s) to the fixture")
+
+    def _observe(self, res):
+        """Reproducible observation for the runner-written evidence artifact."""
+        self.record_observation({"validator": res.validator, "status": res.status,
+                                 "confirmed": res.confirmed,
+                                 "leg_reached_fixture": self._last_sent > 0})
+
+    def _assert_controlled_negative(self, res, *, skipped_because=None):
+        """A bound control must be a REAL negative from a leg that reached the fixture:
+        `_check_sent` already failed the test if no request was served, and a skipped,
+        errored or inconclusive leg is not a controlled negative either. The one
+        exception is a leg that probed the fixture and DELIBERATELY declined to claim a
+        bug for a stated reason (`skipped_because` must then appear in its summary).
+
+        The traffic assertion is repeated here on purpose: several legs report a clean
+        `not_confirmed` when their send fails (probed with egress cut), so the verdict
+        alone cannot tell a negative control from a leg that never reached the fixture."""
+        self.assertGreater(self._last_sent, 0,
+                           "control verdict without a request reaching the fixture is vacuous")
+        if skipped_because is not None and res.status == "skipped":
+            self.assertIn(skipped_because, res.summary,
+                          f"leg skipped for a different reason than the control: {res.summary}")
+        else:
+            self.assertEqual(res.status, "not_confirmed",
+                             f"control is not a controlled negative: {res.status!r} ({res.summary})")
+        self.assertFalse(res.confirmed)
 
     def _run(self, validator, path, *, expect_sent=True):
         ex = HttpExchange(url=f"{self._base}{path}", method="GET",
@@ -156,17 +238,22 @@ class LiveLegVerificationTest(unittest.TestCase):
             f"{self._base}/account/reset", method="POST"), timeout=2).read()
 
     # --- SSTI -----------------------------------------------------------------
+    @evidence_for(**cm.caller_evidence("ssti_confirm"))
     def test_ssti_confirms_on_real_template_render(self):
         v = SstiValidator(allowed_hosts=["127.0.0.1"])
         res = self._run(v, "/ssti/render?q=seed")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"SSTI leg did not confirm against a real Jinja render endpoint: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("ssti_control"))
     def test_ssti_silent_on_escaped_echo_control(self):
         v = SstiValidator(allowed_hosts=["127.0.0.1"])
         res = self._run(v, "/ssti/echo?q=seed")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Open redirect --------------------------------------------------------
     def test_open_redirect_confirms_on_blind_redirect(self):
@@ -182,17 +269,22 @@ class LiveLegVerificationTest(unittest.TestCase):
         self.assertNotEqual(res.status, "confirmed")
 
     # --- SSRF (OOB via the real in-process collaborator) ----------------------
+    @evidence_for(**cm.caller_evidence("ssrf_confirm"))
     def test_ssrf_confirms_on_real_server_side_fetch(self):
         v = SsrfValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
         res = self._run(v, "/ssrf/fetch?url=http://example.invalid/x")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"SSRF leg did not confirm against a real server-side fetch: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("ssrf_control"))
     def test_ssrf_silent_on_no_fetch_control(self):
         v = SsrfValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
         res = self._run(v, "/ssrf/safe?url=http://example.invalid/x")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Sequence / mass assignment (write -> re-read differential) -----------
     def _profile_exchange(self, path):
@@ -259,17 +351,22 @@ class LiveLegVerificationTest(unittest.TestCase):
 
     # --- Command injection (OOB shell fetch; needs curl on the target) --------
     @unittest.skipIf(shutil.which("curl") is None, "curl not available to exercise the shell payload")
+    @evidence_for(**cm.caller_evidence("cmdi_confirm"))
     def test_command_injection_confirms_via_shell(self):
         v = CommandInjectionValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
         res = self._run(v, "/cmdi/ping?host=seed")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"command-injection leg did not confirm against a real shell endpoint: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("cmdi_control"))
     def test_command_injection_silent_on_no_shell_control(self):
         v = CommandInjectionValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
         res = self._run(v, "/cmdi/safe?host=seed")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Active deserialization (pickle OOB beacon) ---------------------------
     def _pickle_cookie_exchange(self, path):
@@ -278,17 +375,22 @@ class LiveLegVerificationTest(unittest.TestCase):
         return HttpExchange(url=f"{self._base}{path}", method="GET",
                             request_headers={"Cookie": f"session={seed}"}, request_body="")
 
+    @evidence_for(**cm.caller_evidence("deser_confirm"))
     def test_deserialization_oob_confirms_on_pickle_sink(self):
         v = DeserializationOobValidator(allowed_hosts=["127.0.0.1"], timeout=2.0)
         res = self._run_ex(v, self._pickle_cookie_exchange("/deser/load"), "deserialization")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"deserialization leg did not confirm a real pickle.loads sink: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("deser_control"))
     def test_deserialization_oob_silent_on_json_control(self):
         v = DeserializationOobValidator(allowed_hosts=["127.0.0.1"], timeout=2.0)
         res = self._run_ex(v, self._pickle_cookie_exchange("/deser/safe"), "deserialization")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Auth-mechanism legs (session fixation / weak pw / username enum) -----
     def _auth_exchange(self, path, body):
@@ -296,29 +398,39 @@ class LiveLegVerificationTest(unittest.TestCase):
                             request_headers={"Content-Type": "application/json"},
                             request_body=body)
 
+    @evidence_for(**cm.caller_evidence("fixation_confirm"))
     def test_auth_session_fixation_confirms(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/login-fixation", '{"username": "alice", "password": "x"}')
         res = self._run_ex(v, ex, "session_fixation")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed", f"session-fixation leg missed a non-rotating session: {res.summary}")
 
+    @evidence_for(**cm.caller_evidence("fixation_control"))
     def test_auth_session_fixation_silent_on_rotating_control(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/login-rotate", '{"username": "alice", "password": "x"}')
         res = self._run_ex(v, ex, "session_fixation")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
+    @evidence_for(**cm.caller_evidence("weakpw_confirm"))
     def test_auth_weak_password_confirms(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/register-weak", '{"username": "alice", "password": "alicepw123"}')
         res = self._run_ex(v, ex, "weak_password")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed", f"weak-password leg missed an unrestricted policy: {res.summary}")
 
+    @evidence_for(**cm.caller_evidence("weakpw_control"))
     def test_auth_weak_password_silent_on_policy_control(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/register-strong", '{"username": "alice", "password": "alicepw123"}')
         res = self._run_ex(v, ex, "weak_password")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     def test_auth_username_enum_confirms(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
@@ -332,25 +444,33 @@ class LiveLegVerificationTest(unittest.TestCase):
         res = self._run_ex(v, ex, "username_enumeration")
         self.assertNotEqual(res.status, "confirmed")
 
+    @evidence_for(**cm.caller_evidence("mfa_confirm"))
     def test_auth_2fa_bypass_confirms(self):
         # Step-1 login lands on a 2nd-factor step, yet the protected account page is
         # reachable with that partial session (and denied with none) -> MFA bypass.
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/2fa/login", '{"username": "alice", "password": "alicepw"}')
         res = self._run_ex(v, ex, "2fa_bypass")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"2FA-bypass leg missed a step-1-only session reaching the account: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("mfa_control"))
     def test_auth_2fa_bypass_silent_on_enforcing_control(self):
         # NEGATIVE CONTROL: identical flow, but the account page enforces the 2nd
         # factor (redirects a partial session back to /2fa/verify) -> must NOT confirm.
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/2fa/login-safe", '{"username": "alice", "password": "alicepw"}')
         res = self._run_ex(v, ex, "2fa_bypass")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Stored / second-order XSS (plant -> independent HTML render) ---------
+    # R19: the leg confirms only on execution of its payload's nonce, so each
+    # stored-XSS case is given a browser: real Chromium when Playwright is
+    # installed, else the parse-level boundary double below (CI has no browser).
     def _stored_reset(self):
         urllib.request.urlopen(urllib.request.Request(
             f"{self._base}/stored/reset", method="POST"), timeout=2).read()
@@ -360,19 +480,24 @@ class LiveLegVerificationTest(unittest.TestCase):
                             request_headers={"Content-Type": "application/json"},
                             request_body='{"text": "hello world"}')
 
+    @evidence_for(**cm.caller_evidence("stored_xss_confirm"))
     def test_stored_xss_confirms_on_raw_render(self):
         self._stored_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._comment_exchange("/stored/comments"), "xss")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"stored-XSS leg missed a plant->raw-render flow: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("stored_xss_control"))
     def test_stored_xss_silent_on_escaped_render_control(self):
         self._stored_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._comment_exchange("/stored/comments-safe"), "xss")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Stored XSS via a CSRF-token-bound comment FORM (PortSwigger-shaped) ---
     def _blog_reset(self):
@@ -390,23 +515,28 @@ class LiveLegVerificationTest(unittest.TestCase):
             request_body=("csrf=STALE-CAPTURED-TOKEN&postId=1&comment=seed"
                           "&name=probe&email=probe%40example.com&website=http%3A%2F%2Fexample.com%2F"))
 
+    @evidence_for(**cm.caller_evidence("stored_xss_form_confirm"))
     def test_stored_xss_confirms_through_csrf_bound_form(self):
         self._blog_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._blog_comment_exchange("/blog/comment"), "xss")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"stored-XSS leg missed a CSRF-token-bound form plant->render: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("stored_xss_form_control"))
     def test_stored_xss_silent_on_escaped_csrf_bound_form_control(self):
         # NEGATIVE CONTROL: same CSRF-bound form flow, but the render escapes the
         # stored value -- the plant still succeeds (token refreshed, write stored),
         # so a non-confirm here proves the leg keys on the UNESCAPED render, not on
         # a successful write.
         self._blog_reset()
-        v = StoredXssValidator(allowed_hosts=["127.0.0.1"])
+        v = StoredXssValidator(allowed_hosts=["127.0.0.1"], driver=_execution_driver())
         res = self._run_ex(v, self._blog_comment_exchange("/blog-safe/comment"), "xss")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- JWT kid key-confusion (jwt_forge kid variant) ------------------------
     def _jwt_exchange(self, path):
@@ -417,35 +547,45 @@ class LiveLegVerificationTest(unittest.TestCase):
         return HttpExchange(url=f"{self._base}{path}", method="GET",
                             request_headers={"Authorization": f"Bearer {seed}"}, request_body="")
 
+    @evidence_for(**cm.caller_evidence("jwt_kid_confirm"))
     def test_jwt_kid_confusion_confirms(self):
         v = JwtForgeValidator(allowed_hosts=["127.0.0.1"])
         res = self._run_ex(v, self._jwt_exchange("/jwt/kid"), "jwt")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"jwt kid key-confusion not confirmed: {res.summary}")
         self.assertIn("kid", res.summary.lower())
 
+    @evidence_for(**cm.caller_evidence("jwt_kid_control"))
     def test_jwt_kid_silent_on_fixed_secret_control(self):
         v = JwtForgeValidator(allowed_hosts=["127.0.0.1"])
         res = self._run_ex(v, self._jwt_exchange("/jwt/kid-safe"), "jwt")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
+    @evidence_for(**cm.caller_evidence("jwt_unverified_confirm"))
     def test_jwt_unverified_signature_confirms(self):
         # An invalid-signature token accepted for authenticated access that a
         # tokenless request is denied -> the server does not verify the signature.
         v = JwtForgeValidator(allowed_hosts=["127.0.0.1"])
         res = self._run_ex(v, self._jwt_exchange("/jwt/unverified"), "jwt")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"jwt leg missed an unverified-signature endpoint: {res.summary}")
         self.assertTrue(res.confirmed)
         self.assertIn("signature not verified", res.summary.lower())
 
+    @evidence_for(**cm.caller_evidence("jwt_unverified_control"))
     def test_jwt_unverified_silent_on_public_endpoint_control(self):
         # NEGATIVE CONTROL: a truly public endpoint accepts BOTH an invalid-signature
         # token and a tokenless request -> the token does not gate access, so the leg
         # must NOT claim a signature-verification bug (it skips / does not confirm).
         v = JwtForgeValidator(allowed_hosts=["127.0.0.1"])
         res = self._run_ex(v, self._jwt_exchange("/jwt/public"), "jwt")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res, skipped_because="does not gate on the token")
 
     # --- File upload via a CSRF-bound multipart form (PortSwigger-shaped) ------
     def _upload_exchange(self, action, referer):
@@ -507,6 +647,35 @@ class LiveLegVerificationTest(unittest.TestCase):
         result = asyncio.run(scenario())
         self.assertEqual(result.status, "confirmed")
         self.assertGreaterEqual(ctx.budget.used, 2)
+
+    # --- XXE on a supplied XML POST (no browser needed) ------------------------
+    # The driver-capture pair below needs Playwright to DISCOVER the JS-built POST. The
+    # leg itself only needs the XML exchange, so this pair hands it the same request
+    # shape directly and runs wherever the fixture does; the browser-gated pair keeps
+    # covering discovery.
+    def _xml_exchange(self, path):
+        return HttpExchange(
+            url=f"{self._base}{path}", method="POST",
+            request_headers={"Content-Type": "application/xml"},
+            request_body='<?xml version="1.0"?><request><item>probe</item></request>')
+
+    @evidence_for(**cm.caller_evidence("xxe_confirm"))
+    def test_xxe_confirms_on_entity_resolving_parser(self):
+        v = XxeValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._xml_exchange("/xxe/parse"), "xxe")
+        self._observe(res)
+        self.assertEqual(res.status, "confirmed",
+                         f"xxe leg did not confirm against an entity-resolving XML parser: {res.summary}")
+        self.assertTrue(res.confirmed)
+
+    @evidence_for(**cm.caller_evidence("xxe_control"))
+    def test_xxe_silent_on_non_resolving_parser_control(self):
+        # NEGATIVE CONTROL: same XML POST shape, but the parser never resolves entities.
+        v = XxeValidator(allowed_hosts=["127.0.0.1"])
+        res = self._run_ex(v, self._xml_exchange("/xxe/parse-safe"), "xxe")
+        self._observe(res)
+        self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     # --- Driver-based request capture -> XXE confirm (LB-2) --------------------
     # /xxe/js-form has NO <form> and NO server-rendered link to /xxe/parse --
@@ -721,6 +890,18 @@ class LiveLegVerificationTest(unittest.TestCase):
         self.assertNotIn("lax-control-probe-value", result.readback_body,
                          "SameSite=Lax should have blocked ambient-cookie delivery on the "
                          "cross-site POST, but the readback shows the state changed")
+
+
+    # --- Fault injection: a bound aspect must notice a disconnected leg ---------
+    def test_bound_aspects_fail_when_the_leg_is_disconnected(self):
+        # A control that stays green with the leg's egress cut only proves the validator
+        # did nothing, so no evidence-bound test may pass when every async send is refused.
+        names = bound_test_names(type(self))
+        self.assertGreaterEqual(len(names), 24, f"bound tests went missing: {names}")
+        for name, outcome in outcomes_with_leg_severed(type(self), names).items():
+            with self.subTest(test=name):
+                self.assertNotEqual(outcome, "passed",
+                                    f"{name} still passes with the leg disconnected: not evidence")
 
 
 if __name__ == "__main__":

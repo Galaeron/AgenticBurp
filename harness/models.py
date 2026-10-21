@@ -19,6 +19,20 @@ class HttpExchange(BaseModel):
     # back-compat: empty for older callers, which fall back to a content
     # hash of the exchange (see cache.ExchangeCache.compute_exchange_hash).
     capture_id: str = ""
+    # I02-C / I07 shared capture contract. All optional: an absent value means
+    # unknown and is never fabricated. `captured_at` is when the exchange was
+    # captured (epoch seconds), kept apart from when the harness ingested it;
+    # `state_version` is a supplied application state/version label, never
+    # inferred from the body; `completeness` says whether the bodies are whole.
+    # Unset values are left out of model_dump(), so an exchange without them
+    # dumps exactly as before (several plan ids hash the dump).
+    captured_at: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False,
+                                         exclude_if=lambda v: v is None)
+    capture_source: str = Field(default="", max_length=128, exclude_if=lambda v: v == "")
+    completeness: Literal["complete", "truncated", "binary_unsupported", "unknown"] = Field(
+        default="unknown", exclude_if=lambda v: v == "unknown")
+    state_version: Optional[str] = Field(default=None, max_length=128,
+                                         exclude_if=lambda v: v is None)
 
 
 class ComponentCandidate(BaseModel):
@@ -184,6 +198,16 @@ class AgentReport(BaseModel):
     guide_version: str = ""
 
 
+class ObservationAttribution(BaseModel):
+    """Analyst-declared labels for a supplied capture (I02-C). An unverified
+    operator assertion, never derived from credentials; an absent field stays
+    unknown. Labels that look like credentials are rejected by the store."""
+    principal_ref: Optional[str] = Field(default=None, max_length=64)
+    role: Optional[str] = Field(default=None, max_length=64)
+    tenant: Optional[str] = Field(default=None, max_length=64)
+    session_ref: Optional[str] = Field(default=None, max_length=64)
+
+
 class AnalysisRequest(BaseModel):
     exchange: HttpExchange
     # Explicit snapshot partition. Omitted calls use their fresh run identity.
@@ -200,6 +224,17 @@ class AnalysisRequest(BaseModel):
     # exploitability evidence beyond the generic advisory text. This is
     # the analyst's call to make, not a default the harness assumes.
     attempt_rediscovery: bool = False
+    # I02-C: optional analyst-declared attribution for this capture (who/which
+    # tenant it belongs to). Stored as revision 1 of the observation's
+    # attribution; correct it later with POST /observations/{id}/attribution.
+    observation_attribution: Optional[ObservationAttribution] = None
+
+
+class ObservationAttributionCorrection(ObservationAttribution):
+    """Body of POST /observations/{id}/attribution: a complete new revision."""
+    engagement_id: str = Field(default="", max_length=128)
+    expected_revision: int = Field(ge=1)
+    reason: str = Field(default="", max_length=200)
 
 
 class TestPlan(BaseModel):
@@ -404,6 +439,11 @@ class AnalysisResponse(BaseModel):
     # dispatched model agent errored, `degraded` is also True and the summary
     # leads with an explicit warning (all failed, or `partial_inference`).
     agent_errors: list[str] = Field(default_factory=list)
+    # I02-C: what earlier observations this analysis was given and whether this
+    # capture was retained: {status, write, selected [{observation_id, reason,
+    # order_basis}], unavailable, excluded_counts, digest}. Empty for callers
+    # that do not retain observations (engagement- and discovery-driven runs).
+    observation_context: dict = Field(default_factory=dict)
 
 
 class UrlEstimateItem(BaseModel):

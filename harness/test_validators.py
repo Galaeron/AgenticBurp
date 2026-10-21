@@ -194,7 +194,7 @@ class ValidatorTests(unittest.TestCase):
 
     def test_sqlmap_confirmation_promotes_only_on_explicit_tool_result(self):
         validator = SqlmapValidator()
-        with patch("subprocess.run", return_value=FakeProc()):
+        with patch("harness.tool_runner.run_process", return_value=FakeProc()):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertTrue(result.confirmed)
         self.assertEqual(result.status, "confirmed")
@@ -208,8 +208,10 @@ class ValidatorTests(unittest.TestCase):
         captured = {}
         def fake_run(cmd, *a, **k):
             captured["cmd"] = cmd
-            return FakeProc()
-        with patch("subprocess.run", fake_run), \
+            proc = FakeProc()
+            return tool_runner.ProcessResult(cmd, proc.returncode, proc.stdout, proc.stderr,
+                                             "exit", "not_needed", "job")
+        with patch("harness.tool_runner.run_process", fake_run), \
              patch("harness.tool_runner.available", return_value=(True, "ok")):
             asyncio.run(validator.validate(self.finding, loopback_ex))
         cmd = captured["cmd"]
@@ -226,7 +228,7 @@ class ValidatorTests(unittest.TestCase):
         def fake_run(cmd, *a, **k):
             captured["cmd"] = cmd
             return FakeProc()
-        with patch("subprocess.run", fake_run):
+        with patch("harness.tool_runner.run_process", fake_run):
             asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertEqual(captured["cmd"][0], "sqlmap")  # host binary, no docker wrapping
 
@@ -236,7 +238,7 @@ class ValidatorTests(unittest.TestCase):
             stdout = "[INFO] testing parameter id"
             stderr = ""
         validator = SqlmapValidator()
-        with patch("subprocess.run", return_value=NoHit()):
+        with patch("harness.tool_runner.run_process", return_value=NoHit()):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertFalse(result.confirmed)
         self.assertEqual(result.status, "not_confirmed")
@@ -261,7 +263,7 @@ class ValidatorTests(unittest.TestCase):
             output=b"[INFO] testing parameter id\npartial output",
             stderr=b"some stderr bytes",
         )
-        with patch("subprocess.run", side_effect=timeout_exc):
+        with patch("harness.tool_runner.run_process", side_effect=timeout_exc):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertEqual(result.status, "error")
         self.assertIn("timed out", result.summary)
@@ -278,7 +280,7 @@ class ValidatorTests(unittest.TestCase):
             cmd=["sqlmap"], timeout=90,
             output="already a str", stderr="also already a str",
         )
-        with patch("subprocess.run", side_effect=timeout_exc):
+        with patch("harness.tool_runner.run_process", side_effect=timeout_exc):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertEqual(result.status, "error")
         self.assertIn("already a str", result.evidence)
@@ -290,7 +292,7 @@ class ValidatorTests(unittest.TestCase):
         import subprocess
         validator = SqlmapValidator()
         timeout_exc = subprocess.TimeoutExpired(cmd=["sqlmap"], timeout=90)
-        with patch("subprocess.run", side_effect=timeout_exc):
+        with patch("harness.tool_runner.run_process", side_effect=timeout_exc):
             result = asyncio.run(validator.validate(self.finding, self.exchange))
         self.assertEqual(result.status, "error")
         self.assertEqual(result.evidence, "\n")
@@ -417,8 +419,10 @@ class _FakeResponse:
 class CorsWildcardGateTests(unittest.TestCase):
     """A bare `Access-Control-Allow-Origin: *` without credentials must NOT
     be reported as a vulnerability (Juice Shop full-run: this was 58 of 60
-    false 'confirmed' findings). The dangerous wildcard+credentials
-    combination MUST still confirm."""
+    false 'confirmed' findings). Wildcard with credentials is no exploit
+    either (RV-D2 V3): browsers fail the CORS check for a credentialed request
+    answered with `*` (Fetch standard), so it is an informational
+    misconfiguration, never a confirmation."""
 
     def setUp(self):
         from harness.validators.cors_validator import CorsValidator
@@ -444,19 +448,34 @@ class CorsWildcardGateTests(unittest.TestCase):
         self.assertFalse(result.vulnerable)
         self.assertEqual(result.severity, "info")
 
-    def test_wildcard_with_credentials_is_vulnerable(self):
+    def test_wildcard_with_credentials_is_informational_not_vulnerable(self):
         result = self._run_wildcard({
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Credentials": "true",
         })
-        self.assertTrue(result.vulnerable)
-        self.assertEqual(result.severity, "critical")
+        self.assertFalse(result.vulnerable)
+        self.assertFalse(result.passed)  # still reported as a misconfiguration
+        self.assertEqual(result.severity, "info")
+        self.assertIn("Fetch standard", result.detail)
+
+    def test_credentials_wildcard_test_is_informational_not_vulnerable(self):
+        async def fake_send(*args, **kwargs):
+            return _FakeResponse({"Access-Control-Allow-Origin": "*",
+                                  "Access-Control-Allow-Credentials": "true"})
+        with patch.object(self.validator, "_send_request", side_effect=fake_send):
+            result = asyncio.run(self.validator._test_credentials_wildcard(
+                "https://example.test", self.exchange))
+        self.assertFalse(result.vulnerable)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.severity, "info")
 
     def test_arbitrary_origin_reflection_still_vulnerable(self):
         result = self._run_wildcard(
             {"Access-Control-Allow-Origin": "https://evil-attacker.com"}
         )
         self.assertTrue(result.vulnerable)
+        # RV-R R2: without credentials it still confirms, noting the limited impact.
+        self.assertIn("without the user's cookies", result.detail)
 
     def _run_vary(self, headers):
         async def fake_send(*args, **kwargs):

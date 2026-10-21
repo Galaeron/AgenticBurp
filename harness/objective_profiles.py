@@ -55,9 +55,11 @@ SSTI_FILE_DELETE = ObjectiveProfile(
 # IDOR/access-control's declared NON-destructive objective: reach a
 # caller-declared protected resource with a plain GET and have an
 # independent oracle GET confirm its content is reachable. Confirmation
-# itself stays the existing read differential in
-# `validators/idor_read_validator.py` and never changes; this profile only
-# governs what happens *after* that proof already succeeded. Unlike
+# itself comes from the chain's confirmation preflight, where only the
+# cross_identity leg (a second identity) confirms IDOR: the single-principal
+# read differential in `validators/idor_read_validator.py` never confirms
+# (RV-D2), so it cannot open this objective. This profile only governs what
+# happens *after* that proof already succeeded. Unlike
 # SSTI_FILE_DELETE the action is a read (GET), never a mutation, so it needs
 # no `allow_mutating_replay` opt-in -- GET is always the safety gate's SAFE
 # risk tier (see `safety_gate.SafetyGate.classify`).

@@ -588,6 +588,151 @@ class RescoreSavedRunTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# R41: a rescore carries the SOURCE run's completion status; it never promotes
+# an incomplete capture to complete. Synthetic saved runs only.
+# ---------------------------------------------------------------------------
+
+def _saved_for_rescore(provenance):
+    saved = {"kind": "eval_artifact", "host": "rescore.invalid", "stages": {"raw": []},
+             "exchanges": [], "attribution": {"by_exchange": {}, "unresolved": []},
+             "evidence_inputs": {"proofs": [], "cases": [], "artifacts": []}}
+    if provenance is not _ABSENT:
+        saved["provenance"] = provenance
+    return saved
+
+
+_ABSENT = object()
+
+
+def _source_provenance(**over):
+    base = {"git_revision": "original", "run_id": "r", "corpus_id": "synthetic",
+            "inputs_hash": "synthetic-hash", "complete": True}
+    base.update(over)
+    return base
+
+
+class RescorePreservesCompletionTests(unittest.TestCase):
+    """R41. `rescore_saved_run` used to pass complete=True unconditionally."""
+
+    def _rescore(self, provenance):
+        manifest = _manifest([_record("ex-0", expected=("idor",))])
+        return rescore_saved_run(_saved_for_rescore(provenance), manifest, git_revision="current")
+
+    def test_incomplete_capture_stays_incomplete_after_rescore(self):
+        result = self._rescore(_source_provenance(complete=False))
+        self.assertIs(result["provenance"]["complete"], False)
+        # the original provenance is still carried verbatim beside it
+        self.assertIs(result["rescored_from"]["original_provenance"]["complete"], False)
+
+    def test_completed_capture_control(self):
+        result = self._rescore(_source_provenance(complete=True))
+        self.assertIs(result["provenance"]["complete"], True)
+        self.assertEqual(result["kind"], "historical_rescore")
+
+    def test_unknown_completion_fails_closed(self):
+        """Completion that the source does not state as a real boolean is not
+        something a rescore may assert: missing key, no provenance block, null,
+        a stray non-boolean, or a quoted string other than true/false all
+        come out incomplete rather than raising or being coerced to True."""
+        no_key = _source_provenance()
+        del no_key["complete"]
+        for label, provenance in (("missing key", no_key), ("no provenance block", _ABSENT),
+                                  ("null", _source_provenance(complete=None)),
+                                  ("integer", _source_provenance(complete=1)),
+                                  ("garbage string", _source_provenance(complete="yes"))):
+            with self.subTest(label):
+                self.assertIs(self._rescore(provenance)["provenance"]["complete"], False)
+
+    def test_quoted_booleans_follow_the_provenance_contract(self):
+        """R05's ScoreProvenance contract: the exact strings 'true'/'false'
+        are accepted, and the string 'false' is never truthy."""
+        self.assertIs(self._rescore(_source_provenance(complete="false"))["provenance"]["complete"], False)
+        self.assertIs(self._rescore(_source_provenance(complete="true"))["provenance"]["complete"], True)
+
+
+# ---------------------------------------------------------------------------
+# R43: one case record per case identity, every proof attempt retained. The
+# adapter used to emit one (identical) case record per proof attempt, which the
+# evidence auditor then rejected as an ambiguous duplicate case id.
+# ---------------------------------------------------------------------------
+
+def _evidence_build(proofs, *, case_finding_ref="f"):
+    """Drive the real `build_eval_artifact` over synthetic store-boundary
+    responses (`all_host_findings` / `proofs_for_case`), as a real run does."""
+    record = _record("one", expected=("sqli",))
+    manifest = _manifest([record])
+    finding = dict(finding_id="f", fingerprint="fp", vulnerability_class="sqli",
+                   url="http://review.invalid/item?id=1", method="GET", exchange_id="one",
+                   basis="derived", confirmed=True, confidence=.99, severity="high",
+                   summary="Synthetic", evidence="Synthetic", suggested_test="Synthetic",
+                   proof_id="p", case_id="c")
+    artifacts = [dict(artifact_id=name, transport_outcome="ok") for name in ("baseline", "attack")]
+    exchanges = [dict(id="one", method="GET", url=finding["url"])]
+    with mock.patch("harness.store.all_host_findings", return_value=[finding]), \
+         mock.patch("harness.store.proofs_for_case", return_value=proofs):
+        return build_eval_artifact(
+            host="review.invalid", stored_findings=[finding], exchanges=exchanges,
+            manifest=manifest, git_revision="synthetic", run_id="r", corpus_id="synthetic",
+            inputs_hash="synthetic", complete=True, artifacts=artifacts,
+            observations={"fp": ["one"]})
+
+
+def _proof(proof_id="p", verdict="confirmed", case=None):
+    return dict(proof_id=proof_id, case=case or {"case_id": "c", "finding_ref": "f"},
+                verdict=verdict, executed=True, validator="sqlmap",
+                expected_invariant="synthetic", observed_result="synthetic",
+                baseline_artifact_id="baseline", attack_artifact_id="attack")
+
+
+def _tp(result):
+    return result["metrics"]["evidence_supported"]["overall"]["tp"]
+
+
+class RetestHistoryEvidenceTests(unittest.TestCase):
+    def test_retest_history_does_not_make_same_case_ambiguous(self):
+        result = _evidence_build([_proof("old", "inconclusive"), _proof("p")])
+        self.assertEqual(_tp(result), 1)
+        evidence = result["evidence_inputs"]
+        self.assertEqual([c["case_id"] for c in evidence["cases"]], ["c"])
+        self.assertEqual(sorted(p["proof_id"] for p in evidence["proofs"]), ["old", "p"],
+                         "every proof attempt must stay in the evidence set")
+
+    def test_one_attempt_control(self):
+        result = _evidence_build([_proof("p")])
+        self.assertEqual(_tp(result), 1)
+        self.assertEqual(len(result["evidence_inputs"]["cases"]), 1)
+        self.assertEqual(len(result["evidence_inputs"]["proofs"]), 1)
+
+    def test_conflicting_case_records_for_one_id_stay_ambiguous(self):
+        """Dedup is for IDENTICAL records only. Two different records claiming
+        the same case id are a real conflict and must still be rejected."""
+        result = _evidence_build([
+            _proof("old", "inconclusive", case={"case_id": "c", "finding_ref": "other-finding"}),
+            _proof("p")])
+        self.assertEqual(_tp(result), 0)
+        self.assertEqual(len(result["evidence_inputs"]["cases"]), 2)
+
+    def test_duplicate_proof_ids_stay_ambiguous(self):
+        """Attempts that share a proof id are not distinct attempts; the
+        auditor's duplicate-proof guard is untouched by the case dedup."""
+        result = _evidence_build([_proof("p", "inconclusive"), _proof("p")])
+        self.assertEqual(_tp(result), 0)
+
+    def test_rescoring_a_pre_fix_artifact_with_duplicate_cases_also_dedupes(self):
+        """Saved runs written before the fix carry one case record per attempt.
+        A rescore goes through the same shared core, so they score the same
+        as a freshly built artifact (recorded as an evaluation-score change)."""
+        built = _evidence_build([_proof("old", "inconclusive"), _proof("p")])
+        saved = dict(built)
+        saved["evidence_inputs"] = dict(built["evidence_inputs"])
+        saved["evidence_inputs"]["cases"] = [dict(c) for c in (
+            {"case_id": "c", "finding_ref": "f"}, {"case_id": "c", "finding_ref": "f"})]
+        rescored = rescore_saved_run(saved, _manifest([_record("one", expected=("sqli",))]),
+                                     git_revision="current")
+        self.assertEqual(_tp(rescored), 1)
+
+
+# ---------------------------------------------------------------------------
 # compute_stages: pure-function shape checks (no orchestrator needed).
 # ---------------------------------------------------------------------------
 

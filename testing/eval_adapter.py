@@ -120,6 +120,34 @@ def _slim(f: dict) -> dict:
     return {k: f.get(k) for k in _SLIM_FIELDS}
 
 
+def _dedupe_cases(cases: list[dict]) -> list[dict]:
+    """One case record per case identity (R43), preserving first-seen order.
+
+    `build_eval_artifact` gathers `cases` from the proof rows, and every proof
+    row embeds its own copy of its case -- so a case with a retest history
+    (an old inconclusive attempt plus the current confirmed one) arrived here
+    as several IDENTICAL records. The evidence auditor treats a duplicated
+    case id as ambiguous and refuses to credit the current proof. Only
+    byte-for-byte identical records are collapsed: they carry no information
+    a second copy could add. Records that share a case id but DIFFER are a
+    real conflict, so all of them are kept and the auditor still rejects the
+    reference as ambiguous. A record without a case id is never merged. Every
+    proof attempt is untouched -- this function never sees `proofs`."""
+    out: list[dict] = []
+    seen: dict[Any, list[dict]] = {}
+    for case in cases:
+        case_id = case.get("case_id") if isinstance(case, dict) else None
+        if not case_id:
+            out.append(case)
+            continue
+        kept = seen.setdefault(case_id, [])
+        if any(case == earlier for earlier in kept):
+            continue
+        kept.append(case)
+        out.append(case)
+    return out
+
+
 def exchange_descriptor(id_: str, method: str, url: str) -> dict:
     """One exchange's identity, as `attribute_findings`/`compute_stages`'
     callers describe it: the SAME id used as HttpExchange.capture_id when the
@@ -383,6 +411,7 @@ def _finalize_artifact(
     """Shared core: pure over its arguments (no store/model/network access
     of its own -- `build_eval_artifact` and `rescore_saved_run` each gather
     their inputs differently, then both funnel here)."""
+    cases = _dedupe_cases(cases)
     raw, individual, surfaced, lead = compute_stages(
         stored_findings, quarantine_leads=quarantine_leads,
         gate_low_confidence_generic=gate_low_confidence_generic,
@@ -438,6 +467,26 @@ def _finalize_artifact(
 # disk, as produced by build_eval_artifact or carrying the same shape).
 # ---------------------------------------------------------------------------
 
+def _source_complete(saved: dict) -> bool:
+    """Completion status of the SOURCE run, exactly as it recorded it (R41).
+
+    A rescore recomputes numbers; it cannot make an interrupted capture
+    complete, so it carries this forward. Anything the source does not state
+    as a real boolean (no provenance block, no `complete` key, null, a number,
+    a quoted string other than "true"/"false") is treated as NOT complete --
+    a rescore may only assert completion the source itself asserted. The
+    parsing is `ScoreProvenance`'s own, so the R05 rule that the string
+    "false" is never truthy holds here too."""
+    provenance = saved.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    try:
+        return ScoreProvenance(git_revision="", run_id="", corpus_id="", inputs_hash="",
+                               complete=provenance.get("complete", False)).complete
+    except ValueError:
+        return False
+
+
 def rescore_saved_run(
     saved: dict, manifest: Manifest, *,
     git_revision: str,
@@ -459,7 +508,8 @@ def rescore_saved_run(
     policy" without re-running anything.
 
     Marked `historical`/rescored in the return value's `kind` and
-    `provenance` -- never presented as a fresh run. Invokes no model, no
+    `provenance` -- never presented as a fresh run. `provenance.complete` is
+    the source run's own completion status (R41), never promoted. Invokes no model, no
     target, no network -- and, unlike `build_eval_artifact`, no
     `harness.store` either: everything comes out of `saved` and `manifest`.
     """
@@ -502,7 +552,7 @@ def rescore_saved_run(
         generic_confidence_floor=floor, gate_uncorroborated_catchall=guc,
         git_revision=git_revision, run_id=saved_run_id,
         corpus_id=manifest.corpus, inputs_hash=saved.get("provenance", {}).get("inputs_hash", ""),
-        complete=True, instrumentation=saved.get("instrumentation"),
+        complete=_source_complete(saved), instrumentation=saved.get("instrumentation"),
         proofs=proofs, cases=cases, artifacts=artifacts, observations=observations,
     )
     artifact["rescored_from"] = {

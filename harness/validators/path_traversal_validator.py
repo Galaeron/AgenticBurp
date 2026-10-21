@@ -163,10 +163,25 @@ class PathTraversalValidator(Validator):
         if self.run_context is not None:
             from .transport import bind_session
             session_ref, request_headers = bind_session(self.run_context, headers)
+        # Probes that got no response (RV-P P7). A payload the scope lock or the
+        # session's origin check cannot send (e.g. a backslash path segment) is
+        # refused on its own and the rest still run; a refusal that ends the
+        # run (budget, cancellation, mutating replay) stops the leg. A probe
+        # that never answered is not part of a negative.
+        planned = len(targets) * len(_PREFIXES) * len(_TARGETS)
+        answered = 0
+        unsendable: list[str] = []
+        errors: list[str] = []
+        refused = ""
         for loc, param in targets:
+            if refused:
+                break
             for prefix in _PREFIXES:
+                if refused:
+                    break
                 for target, marker in _TARGETS.items():
                     url, body = self._mutated(exchange, loc, param, prefix + target)
+                    label = f"{'path segment' if loc == _PATHSEG else param} <- {prefix + target}"
                     try:
                         if self.run_context is not None:
                             from harness.run_context import TypedRequest
@@ -176,9 +191,15 @@ class PathTraversalValidator(Validator):
                                 capability=self.name, session_ref=session_ref,
                                 case_ref=finding.finding_id or "", max_redirects=0)
                             if not outcome.executed:
-                                return self._skip(
-                                    f"path-traversal replay declined: {outcome.outcome}")
+                                if outcome.outcome in ("out_of_scope", "blocked"):
+                                    unsendable.append(f"{label}: {outcome.outcome}")
+                                    continue
+                                refused = f"path-traversal replay declined: {outcome.outcome}"
+                                break
                             if not outcome.ok:
+                                art = getattr(outcome, "artifact", None)
+                                errors.append(f"{label}: "
+                                              f"{getattr(art, 'transport_outcome', '') or outcome.error}")
                                 continue
                             text = outcome.body or ""
                         else:
@@ -199,11 +220,15 @@ class PathTraversalValidator(Validator):
                         # out-of-scope: skip that payload and try the rest. A genuine
                         # mutating-replay denial still terminates -- nothing more can send.
                         if blocked.decision.tier == ActionRiskTier.OUT_OF_SCOPE:
+                            unsendable.append(f"{label}: out_of_scope")
                             continue
-                        return self._skip("mutating path-traversal replay not authorized "
-                                          "(set validators.allow_mutating_replay)")
-                    except httpx.HTTPError:
+                        refused = (f"path-traversal replay not authorized by the safety gate "
+                                   f"({blocked.decision.reason})")
+                        break
+                    except httpx.HTTPError as e:
+                        errors.append(f"{label}: {e.__class__.__name__}")
                         continue
+                    answered += 1
                     if marker.search(text):
                         where = "path segment" if loc == _PATHSEG else f"{loc} parameter {param!r}"
                         return ValidationResult(
@@ -212,8 +237,23 @@ class PathTraversalValidator(Validator):
                                     f"outside the intended directory.",
                             evidence=f"Injected `{prefix + target}` into the {where}; the response contained "
                                      f"the canonical contents of {target} (matched /{marker.pattern}/).")
+        if not answered and not errors:
+            # Nothing reached the target: a declined leg, as before.
+            return self._skip(refused or f"path-traversal replay declined: every payload was "
+                                         f"refused ({unsendable[0] if unsendable else 'none sent'})")
+        if refused or errors:
+            unanswered = planned - answered - len(unsendable)
+            why = "; ".join(([refused] if refused else []) + errors[:3])
+            return ValidationResult(
+                self.name, "inconclusive", "path_traversal", confidence=0.0, confirmed=False,
+                summary=f"Path-traversal check incomplete: {unanswered} of {planned} probe(s) got no "
+                        f"response ({why}); not a negative result",
+                evidence=f"{answered} answered probe(s) returned no system-file contents, but a "
+                         f"probe that never answered cannot show them.")
+        skipped = (f" {len(unsendable)} payload(s) could not be sent at all (e.g. {unsendable[0]})."
+                   if unsendable else "")
         return ValidationResult(
             self.name, "not_confirmed", "path_traversal", confidence=0.0, confirmed=False,
             summary="No system-file contents returned -- traversal appears blocked or not a file read",
             evidence=f"Tried {len(targets)} injection point(s) across {len(_PREFIXES)} traversal encodings; "
-                     f"neither /etc/passwd nor win.ini contents appeared.")
+                     f"neither /etc/passwd nor win.ini contents appeared.{skipped}")

@@ -78,6 +78,7 @@ class DriverCaptureTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls._srv.shutdown()
+        cls._srv.server_close()   # shutdown() only ends the serve loop; release the socket too
         cls._thread.join(timeout=5.0)
 
     def test_captures_js_issued_fetch_as_http_exchange_dict(self):

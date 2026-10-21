@@ -28,7 +28,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictBool
 
 _log = logging.getLogger("harness.config_schema")
 
@@ -97,6 +97,40 @@ def parse_validators_flags(cfg: dict) -> dict:
     return {"active_enabled": parsed.active_enabled, "allow_mutating_replay": parsed.allow_mutating_replay}
 
 
+class _PrivacySection(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    # StrictBool (WL-11): only a real YAML/JSON boolean is accepted. The quoted
+    # string "false" (truthy in Python), "no", 0 and null are rejected rather
+    # than coerced, so a typo can never silently turn third-party lookups on.
+    external_lookups: StrictBool = True
+
+
+def parse_privacy_flags(section) -> dict:
+    """WL-11: the ONE place the raw `privacy:` config section is turned into
+    real booleans. `privacy.external_lookups` (default true, so default
+    behaviour is unchanged) gates every outbound call the "passive" analysis
+    makes to third-party services about components seen in captured traffic
+    (GitHub advisories, npm/PyPI registries, Aikido malware feeds, CISA KEV).
+
+    Strict on purpose, like the /settings toggles (server.py `StrictBool`):
+    anything that is not a real boolean raises ValueError, so a quoted
+    `external_lookups: "false"` fails startup loudly instead of being read as
+    truthy and silently leaving lookups on. A missing or empty (`privacy:`)
+    section yields the default."""
+    if section is None:
+        section = {}
+    if not isinstance(section, dict):
+        raise ValueError(
+            f"invalid privacy config: `privacy` must be a mapping, got {type(section).__name__}")
+    try:
+        parsed = _PrivacySection.model_validate(section)
+    except Exception as e:
+        raise ValueError(
+            "invalid privacy config: privacy.external_lookups must be a real boolean "
+            f"(true or false, unquoted): {e}") from e
+    return {"external_lookups": parsed.external_lookups}
+
+
 class _CoordinatorSection(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str = ""
@@ -113,6 +147,7 @@ class ConfigModel(BaseModel):
     concurrency: _ConcurrencySection = _ConcurrencySection()
     validators: _ValidatorsSection = _ValidatorsSection()
     coordinator: _CoordinatorSection = _CoordinatorSection()
+    privacy: _PrivacySection | None = None
 
 
 def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResult:
@@ -188,6 +223,11 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
             "live validators will fail closed (W-17), so nothing will be confirmed. "
             "Declare the target scope."
         )
+    # RV-S: a malformed protected-route entry is ignored, so it declares nothing
+    # protected (fail closed). A warning, not an error: the rest of the list stands.
+    from harness import protected_routes
+    for problem in protected_routes.config_problems(cfg):
+        warnings.append(f"{problem}; a malformed entry declares no route protected.")
 
     result = ConfigValidationResult(ok=(not errors), errors=errors, warnings=warnings)
     if strict and errors:

@@ -202,11 +202,12 @@ public final class ValidationExecutor {
 
         switch (best) {
             case CONFIRMED -> statusFor(plan, source, "confirmed", 0.9, true,
-                    "A breakout payload survived unescaped in the response for parameter '" + bestParam.name() + "'.",
+                    "The injected payload, unique canary included, came back unescaped where it executes ("
+                            + bestPayload.context() + ") for parameter '" + bestParam.name() + "'.",
                     bestDetail);
             case SUPPORTED -> statusFor(plan, source, "supported", 0.6, false,
-                    "Content was reflected for parameter '" + bestParam.name() + "' but no breakout payload survived "
-                            + "unescaped across " + XssPayloadLogic.PAYLOADS.size() + " tried -- this does not by itself "
+                    "Content was reflected for parameter '" + bestParam.name() + "' but no breakout payload came back "
+                            + "unescaped in an executable context across " + XssPayloadLogic.PAYLOADS.size() + " tried -- this does not by itself "
                             + "prove executable XSS.", bestDetail);
             default -> statusFor(plan, source, "rejected", 0.72, false,
                     "No reflection was observed for any of " + XssPayloadLogic.PAYLOADS.size()
@@ -918,8 +919,8 @@ public final class ValidationExecutor {
     // api_security_validation -- mass-assignment probe. Directly
     // implements the api_security agent's own suggested_test: resend a
     // create/update request with an extra unrequested field ("role":
-    // "admin") added to the JSON body and check whether the response
-    // reflects it back as accepted. See MassAssignmentLogic.
+    // "admin") added to the JSON body, then read the resource back to
+    // see whether the field was stored. See MassAssignmentLogic.
     // ---------------------------------------------------------------
     private static final String MASS_ASSIGNMENT_FIELD_NAME = "role";
     private static final String MASS_ASSIGNMENT_FIELD_VALUE_JSON = "\"admin\"";
@@ -942,16 +943,52 @@ public final class ValidationExecutor {
                             + "probe requires an object-shaped body to inject a field into.", "");
             return;
         }
+        // Persistence evidence: read the resource before and after the write.
+        // An echo of the request in the write's own response proves nothing
+        // about what was stored. A create-style write (a POST whose captured
+        // response names the object it created, same-origin and not the
+        // write path itself) is read back from the created object, not from
+        // the collection it was posted to (RV-J residual N3): before, the
+        // object the captured request created; after, the one the probe did.
+        String writePath = pathOnly(req.path());
+        String capturedObject = null;
+        if ("POST".equalsIgnoreCase(method) && source.response() != null
+                && MassAssignmentLogic.isSuccess(source.response().statusCode())) {
+            capturedObject = sameOriginPath(req.url(), MassAssignmentLogic.createdObjectReference(
+                    writePath, source.response().headerValue("Location"), source.response().bodyToString()));
+            if (capturedObject != null && pathOnly(capturedObject).equals(writePath)) capturedObject = null;
+        }
+        HttpRequestResponse before = null;
+        boolean createStyle = false;
+        if (capturedObject != null) {
+            before = api.http().sendRequest(readRequest(req, capturedObject));
+            createStyle = MassAssignmentLogic.isSuccess(status(before));
+        }
+        if (!createStyle) before = api.http().sendRequest(readRequest(req, req.path()));
         var rr = api.http().sendRequest(req.withBody(mutatedBody));
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the mass-assignment probe request.", "");
             return;
         }
+        String afterPath = null;
+        if (MassAssignmentLogic.isSuccess(resp.statusCode())) {
+            afterPath = createStyle
+                    ? sameOriginPath(req.url(), MassAssignmentLogic.createdObjectReference(
+                            writePath, resp.headerValue("Location"), resp.bodyToString()))
+                    : req.path();
+        }
+        var after = afterPath == null ? null : api.http().sendRequest(readRequest(req, afterPath));
+        String readTargets = createStyle
+                ? "create-style: read before GET " + capturedObject + " (object the captured request created), read after "
+                        + (afterPath == null ? "not sent (the probe's response named no same-origin object)"
+                                             : "GET " + afterPath + " (object the probe created)")
+                : "read before/after GET " + req.path();
         String baselineResponseBody = source.response() == null ? null : source.response().bodyToString();
         MassAssignmentLogic.Evidence ev = MassAssignmentLogic.evaluate(
                 MASS_ASSIGNMENT_FIELD_NAME, MASS_ASSIGNMENT_FIELD_VALUE_JSON, fieldAlreadyPresent,
-                baselineResponseBody, resp.bodyToString());
+                baselineResponseBody, resp.statusCode(), resp.bodyToString(),
+                status(before), responseBody(before), status(after), responseBody(after), readTargets);
         statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
     }
 
@@ -974,6 +1011,49 @@ public final class ValidationExecutor {
         return null;
     }
 
+    /** A plain GET of {@code path} with the original request's session
+     * headers but none of its body or body-describing headers -- for
+     * reading back what a write stored, without repeating the write. */
+    private static HttpRequest readRequest(HttpRequest base, String path) {
+        return base.withMethod("GET").withPath(path).withBody("")
+                .withRemovedHeader("Content-Type").withRemovedHeader("Content-Length");
+    }
+
+    /**
+     * The path (and query) {@code candidate} names, resolved against
+     * {@code requestUrl}, if it is on the same origin -- scheme, host and
+     * effective port -- else null. Keeps every read-back on the target the
+     * captured request went to.
+     */
+    static String sameOriginPath(String requestUrl, String candidate) {
+        if (requestUrl == null || candidate == null || candidate.isBlank()) return null;
+        try {
+            URI base = new URI(requestUrl);
+            URI target = base.resolve(new URI(candidate.trim()));
+            if (base.getHost() == null || target.getHost() == null || target.getScheme() == null) return null;
+            if (!target.getScheme().equalsIgnoreCase(base.getScheme())
+                    || !target.getHost().equalsIgnoreCase(base.getHost())
+                    || effectivePort(target) != effectivePort(base)) return null;
+            String path = target.getRawPath() == null || target.getRawPath().isEmpty() ? "/" : target.getRawPath();
+            return target.getRawQuery() == null ? path : path + "?" + target.getRawQuery();
+        } catch (java.net.URISyntaxException | IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private static int effectivePort(URI uri) {
+        if (uri.getPort() >= 0) return uri.getPort();
+        if ("https".equalsIgnoreCase(uri.getScheme())) return 443;
+        if ("http".equalsIgnoreCase(uri.getScheme())) return 80;
+        return -1;
+    }
+
+    private static String pathOnly(String path) {
+        if (path == null) return "";
+        int query = path.indexOf('?');
+        return query < 0 ? path : path.substring(0, query);
+    }
+
     private static int bodyLen(HttpRequestResponse rr) {
         if (rr == null || rr.response() == null) return 0;
         String b = rr.response().bodyToString();
@@ -982,6 +1062,10 @@ public final class ValidationExecutor {
 
     private static int status(HttpRequestResponse rr) {
         return (rr == null || rr.response() == null) ? -1 : rr.response().statusCode();
+    }
+
+    private static String responseBody(HttpRequestResponse rr) {
+        return (rr == null || rr.response() == null) ? null : rr.response().bodyToString();
     }
 
     // crypto_transport_validation -- passive; classifies the captured exchange's
@@ -1183,49 +1267,140 @@ public final class ValidationExecutor {
     // ---------------------------------------------------------------
     private void jwtForgery(TestPlan plan, HttpRequestResponse source) {
         HttpRequest req = source.request();
-        String authHeader = null;
+        List<Map.Entry<String, String>> headerList = new ArrayList<>();
+        for (HttpHeader h : req.headers()) headerList.add(Map.entry(h.name(), h.value() == null ? "" : h.value()));
+        JwtForgeryLogic.Carrier carrier = JwtForgeryLogic.findCarrier(headerList);
+        if (carrier == null) {
+            statusFor(plan, source, "invalid", 0, false,
+                    "No JWT was found on this request for jwt_validation to target -- not as an Authorization "
+                            + "bearer token, in another header, or in a cookie. jwt_validation only applies to "
+                            + "JWTs, not opaque tokens.", "");
+            return;
+        }
+        String originalToken = carrier.token();
+
+        // The probes carry no credential but the token under test, in the
+        // carrier it came in (RV-J residual N2): every credential header and
+        // the cookie are removed first. Otherwise a session cookie or a
+        // second token authenticates the request, and a "forged token
+        // accepted" or a "no token" control says nothing about the JWT.
+        HttpRequest bare = req;
+        Set<String> removed = new LinkedHashSet<>();
         for (HttpHeader h : req.headers()) {
-            if (h.name().equalsIgnoreCase("Authorization")) { authHeader = h.value(); break; }
+            if (JwtForgeryLogic.isCredentialHeader(h.name(), h.value()) && removed.add(h.name().toLowerCase(Locale.ROOT))) {
+                bare = bare.withRemovedHeader(h.name());
+            }
         }
-        if (authHeader == null || !authHeader.regionMatches(true, 0, "Bearer ", 0, 7)) {
-            statusFor(plan, source, "invalid", 0, false,
-                    "No Bearer Authorization header was present on this request for jwt_validation to target.", "");
-            return;
-        }
-        String originalToken = authHeader.substring(7).trim();
-        if (!JwtForgeryLogic.looksLikeJwt(originalToken)) {
-            statusFor(plan, source, "invalid", 0, false,
-                    "The Authorization bearer value is not JWT-shaped (three dot-separated segments) -- "
-                            + "jwt_validation only applies to JWTs, not opaque tokens.", "");
-            return;
-        }
+        String carried = "token carrier=" + carrier.describe() + " | removed from the probes: "
+                + (removed.isEmpty() ? "none" : String.join(", ", removed));
 
         var originalResp = source.response();
         int originalStatus = originalResp == null ? 0 : originalResp.statusCode();
         int originalLen = originalResp == null ? 0 : originalResp.bodyToString().length();
 
+        // Control, sent at most once and only after a forged token got a 2xx:
+        // the same request with no credential at all. If that is answered
+        // too, the resource is public and a forged token proves nothing.
+        int unauthenticatedStatus = -1;
+        boolean controlSent = false;
+
         String algNone = JwtForgeryLogic.forgeAlgNone(originalToken);
         if (algNone != null) {
-            var rr = api.http().sendRequest(req.withUpdatedHeader("Authorization", "Bearer " + algNone));
+            var rr = api.http().sendRequest(bare.withAddedHeader(carrier.headerName(), carrier.headerValue(algNone)));
             var resp = rr.response();
             if (resp != null) {
-                JwtForgeryLogic.Evidence ev = JwtForgeryLogic.evaluate("alg:none", originalStatus, resp.statusCode(), originalLen, resp.bodyToString().length());
-                if (ev.verdict() == JwtForgeryLogic.Verdict.CONFIRMED || ev.verdict() == JwtForgeryLogic.Verdict.SUPPORTED) {
-                    statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
+                if (JwtForgeryLogic.isSuccess(resp.statusCode())) {
+                    unauthenticatedStatus = status(api.http().sendRequest(bare));
+                    controlSent = true;
+                }
+                JwtForgeryLogic.Evidence ev = JwtForgeryLogic.evaluate("alg:none", originalStatus, resp.statusCode(), originalLen, resp.bodyToString().length(), unauthenticatedStatus);
+                if (ev.verdict() == JwtForgeryLogic.Verdict.CONFIRMED || ev.verdict() == JwtForgeryLogic.Verdict.SUPPORTED
+                        || JwtForgeryLogic.isSuccess(unauthenticatedStatus)) {
+                    statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail() + " | " + carried);
                     return;
                 }
             }
         }
 
         String garbled = JwtForgeryLogic.forgeGarbledSignature(originalToken);
-        var rr2 = api.http().sendRequest(req.withUpdatedHeader("Authorization", "Bearer " + garbled));
+        var rr2 = api.http().sendRequest(bare.withAddedHeader(carrier.headerName(), carrier.headerValue(garbled)));
         var resp2 = rr2.response();
         if (resp2 == null) {
-            statusFor(plan, source, "inconclusive", 0, false, "No response was received for the garbled-signature probe.", "");
+            statusFor(plan, source, "inconclusive", 0, false, "No response was received for the garbled-signature probe.", carried);
             return;
         }
-        JwtForgeryLogic.Evidence ev2 = JwtForgeryLogic.evaluate("garbled signature", originalStatus, resp2.statusCode(), originalLen, resp2.bodyToString().length());
-        statusFor(plan, source, ev2.verdict().name().toLowerCase(Locale.ROOT), ev2.confidence(), ev2.confirmed(), ev2.summary(), ev2.detail());
+        if (JwtForgeryLogic.isSuccess(resp2.statusCode()) && !controlSent) {
+            unauthenticatedStatus = status(api.http().sendRequest(bare));
+        }
+        JwtForgeryLogic.Evidence ev2 = JwtForgeryLogic.evaluate("garbled signature", originalStatus, resp2.statusCode(), originalLen, resp2.bodyToString().length(), unauthenticatedStatus);
+        if (!JwtForgeryLogic.isSuccess(resp2.statusCode())) {
+            // The probes carried no other credential, so a refusal is about
+            // the token only if the original token alone is accepted. That
+            // request is the captured one unless other credentials were removed.
+            HttpRequest tokenAlone = bare.withAddedHeader(carrier.headerName(), carrier.headerValue(originalToken));
+            int tokenAloneStatus = sameHeaders(tokenAlone, req) ? originalStatus : status(api.http().sendRequest(tokenAlone));
+            ev2 = JwtForgeryLogic.requireTokenAloneAccepted(ev2, tokenAloneStatus);
+            // Refused alone, the token may need a cookie that is no credential
+            // (a tenant, a locale): probe again with only those kept (RV-Q item Q3).
+            String kept = JwtForgeryLogic.nonCredentialCookies(cookieHeaders(req), carrier);
+            if (ev2.verdict() == JwtForgeryLogic.Verdict.INCONCLUSIVE && kept != null) {
+                ev2 = jwtWithKeptCookies(bare, carrier, kept, originalStatus, originalLen, ev2);
+            }
+        }
+        statusFor(plan, source, ev2.verdict().name().toLowerCase(Locale.ROOT), ev2.confidence(), ev2.confirmed(), ev2.summary(), ev2.detail() + " | " + carried);
+    }
+
+    /**
+     * The original token, then each forged token, sent with the request's
+     * non-credential cookies kept; the no-token control, sent only after a
+     * forged token got a 2xx, is the kept cookies alone. At most four
+     * requests. See JwtForgeryLogic.withKeptCookies.
+     */
+    private JwtForgeryLogic.Evidence jwtWithKeptCookies(HttpRequest bare, JwtForgeryLogic.Carrier carrier, String kept,
+                                                        int originalStatus, int originalLen,
+                                                        JwtForgeryLogic.Evidence tokenAloneRefused) {
+        String token = carrier.token();
+        int tokenWithKept = status(api.http().sendRequest(withKeptCookies(bare, carrier, kept, token)));
+        JwtForgeryLogic.Evidence forged = null;
+        if (JwtForgeryLogic.isSuccess(tokenWithKept)) {
+            String[][] variants = {{"alg:none", JwtForgeryLogic.forgeAlgNone(token)},
+                    {"garbled signature", JwtForgeryLogic.forgeGarbledSignature(token)}};
+            for (String[] variant : variants) {
+                if (variant[1] == null) continue;
+                var resp = api.http().sendRequest(withKeptCookies(bare, carrier, kept, variant[1])).response();
+                if (resp == null) continue;
+                boolean accepted = JwtForgeryLogic.isSuccess(resp.statusCode());
+                int keptAloneStatus = accepted ? status(api.http().sendRequest(bare.withAddedHeader("Cookie", kept))) : -1;
+                forged = JwtForgeryLogic.evaluate(variant[0] + ", with the kept cookies", originalStatus, resp.statusCode(),
+                        originalLen, resp.bodyToString().length(), keptAloneStatus);
+                if (accepted) break;
+            }
+        }
+        return JwtForgeryLogic.withKeptCookies(forged, kept, tokenWithKept, tokenAloneRefused);
+    }
+
+    private static HttpRequest withKeptCookies(HttpRequest bare, JwtForgeryLogic.Carrier carrier, String kept, String token) {
+        HttpRequest probe = bare.withAddedHeader("Cookie", JwtForgeryLogic.cookieHeaderWith(kept, carrier, token));
+        return carrier.cookie() ? probe : probe.withAddedHeader(carrier.headerName(), carrier.headerValue(token));
+    }
+
+    /** Every Cookie header's value, joined as one (HTTP/2 may split them), or null if there is none. */
+    private static String cookieHeaders(HttpRequest req) {
+        List<String> values = new ArrayList<>();
+        for (HttpHeader h : req.headers()) if (h.name().equalsIgnoreCase("Cookie") && h.value() != null) values.add(h.value());
+        return values.isEmpty() ? null : String.join("; ", values);
+    }
+
+    /** True if both requests carry the same headers and values, in any order and any name case. */
+    private static boolean sameHeaders(HttpRequest a, HttpRequest b) {
+        return headerSet(a).equals(headerSet(b));
+    }
+
+    private static List<String> headerSet(HttpRequest r) {
+        List<String> out = new ArrayList<>();
+        for (HttpHeader h : r.headers()) out.add(h.name().toLowerCase(Locale.ROOT) + ": " + h.value());
+        java.util.Collections.sort(out);
+        return out;
     }
 
     // ---------------------------------------------------------------
@@ -1269,50 +1444,156 @@ public final class ValidationExecutor {
 
     // ---------------------------------------------------------------
     // csrf_validation -- if a CSRF-token-shaped header or body/form
-    // parameter is found, removes it and resends once, comparing
-    // status codes; if none is found, reports the passive signal
-    // without an extra request. See CsrfLogic for the full scope note
-    // (this only evaluates classic cookie-based session CSRF).
+    // parameter is found, sends what a cross-site page could make the
+    // browser send (session cookie kept, token removed or invalidated,
+    // no header such a page cannot set), a no-cookie control, and reads
+    // the state back to see whether the forged request changed it; if
+    // no token is found, reports the passive signal without an extra
+    // request. See CsrfLogic for the full scope note (this only
+    // evaluates classic cookie-based session CSRF).
     // ---------------------------------------------------------------
+    private static final String CSRF_INVALIDATED_TOKEN = "invalidated-by-harness";
+
     private void csrfValidation(TestPlan plan, HttpRequestResponse source) {
         HttpRequest req = source.request();
-        boolean cookieAuthPresent = false;
-        for (HttpHeader h : req.headers()) {
-            if (h.name().equalsIgnoreCase("Cookie")) { cookieAuthPresent = true; break; }
-        }
+        // Only the cookie is ambient: a browser attaches it to a cross-site
+        // request by itself, but never an Authorization header.
+        String cookie = reqHeader(req, "Cookie");
+        boolean cookieAuthPresent = cookie != null && !cookie.isBlank();
 
-        HttpParameter tokenParam = null;
+        // The forged request is what a cross-site page can make the browser
+        // send: every header such a page cannot set is removed -- a token
+        // header, and a credential in Authorization or a custom header such
+        // as X-Auth-Token (RV-J residual N2) -- and every token parameter is
+        // invalidated. The cookie stays.
+        HttpRequest forged = req;
+        List<String> tokenCarriers = new ArrayList<>();
+        Set<String> removedHeaders = new LinkedHashSet<>();
         for (HttpHeader h : req.headers()) {
-            if (CsrfLogic.looksLikeCsrfTokenName(h.name())) {
-                // Header-based token: remove the header itself and resend.
-                var resp0 = source.response();
-                int originalStatus0 = resp0 == null ? 0 : resp0.statusCode();
-                var rr0 = api.http().sendRequest(req.withRemovedHeader(h.name()));
-                var mutatedResp0 = rr0.response();
-                int mutatedStatus0 = mutatedResp0 == null ? -1 : mutatedResp0.statusCode();
-                CsrfLogic.Evidence ev0 = CsrfLogic.evaluate(req.method(), true, true, originalStatus0, mutatedStatus0);
-                statusFor(plan, source, ev0.verdict().name().toLowerCase(Locale.ROOT), ev0.confidence(), ev0.confirmed(), ev0.summary(), ev0.detail());
-                return;
+            if (CsrfLogic.looksLikeCsrfTokenName(h.name())) tokenCarriers.add("header " + h.name());
+            if (!CsrfLogic.isCrossSiteSendableHeader(h.name()) && removedHeaders.add(h.name().toLowerCase(Locale.ROOT))) {
+                forged = forged.withRemovedHeader(h.name());
             }
         }
+        // The browser sets Origin, Referer and Fetch Metadata from the page
+        // that sends the request, so the forged request carries a foreign
+        // page's (RV-Q item Q1): a server that checks them refuses the attack.
+        boolean capturedFetchMetadata = req.headers().stream()
+                .anyMatch(h -> h.name().toLowerCase(Locale.ROOT).startsWith("sec-fetch-"));
+        Map<String, String> crossSite = CsrfLogic.crossSiteBrowserHeaders(req.url(), capturedFetchMetadata);
+        List<String> sentAs = new ArrayList<>();
+        for (Map.Entry<String, String> h : crossSite.entrySet()) {
+            forged = forged.withRemovedHeader(h.getKey());
+            if (h.getValue() != null) {
+                forged = forged.withAddedHeader(h.getKey(), h.getValue());
+                sentAs.add(h.getKey() + ": " + h.getValue());
+            }
+        }
+        HttpParameter markable = null;
         for (var p : req.parameters()) {
             if (p.type() == HttpParameterType.COOKIE) continue;
-            if (CsrfLogic.looksLikeCsrfTokenName(p.name())) { tokenParam = p; break; }
+            if (CsrfLogic.looksLikeCsrfTokenName(p.name())) {
+                forged = forged.withParameter(HttpParameter.parameter(p.name(), CSRF_INVALIDATED_TOKEN, p.type()));
+                tokenCarriers.add(p.type().name().toLowerCase(Locale.ROOT) + " parameter " + p.name());
+            } else if (markable == null && CsrfLogic.isMarkableField(p.name(), p.value())) {
+                markable = p;
+            }
         }
-
-        if (tokenParam != null) {
-            var resp = source.response();
-            int originalStatus = resp == null ? 0 : resp.statusCode();
-            var rr = api.http().sendRequest(req.withParameter(HttpParameter.parameter(tokenParam.name(), "invalidated-by-harness", tokenParam.type())));
-            var mutatedResp = rr.response();
-            int mutatedStatus = mutatedResp == null ? -1 : mutatedResp.statusCode();
-            CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, true, originalStatus, mutatedStatus);
-            statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
-            return;
+        boolean tokenFound = !tokenCarriers.isEmpty();
+        // A form sends only POST with a form enctype; any other request reaches
+        // the target from a foreign page only after a CORS preflight (RV-Q item
+        // Q2), so it is at most SUPPORTED -- unless the same body sent as
+        // text/plain, which a no-cors fetch() can send, is accepted.
+        String contentType = reqHeader(req, "Content-Type");
+        String preflight = CsrfLogic.preflightReason(req.method(), contentType);
+        boolean textPlainFirst = CsrfLogic.canSendAsTextPlain(req.method(), contentType);
+        String variantNote = null;
+        int originalStatus = status(source);
+        int forgedStatus = -1;
+        int anonymousStatus = -1;
+        CsrfLogic.ReadBack readBack = CsrfLogic.ReadBack.notRun("the forged request was not sent or not answered with a 2xx");
+        if (tokenFound && cookieAuthPresent && !CsrfLogic.isSafeMethod(req.method())
+                && CsrfLogic.isSuccess(originalStatus)) {
+            // A 2xx is not a state change (RV-J residual N1): the forged
+            // request appends a unique marker to one submitted field, and the
+            // page that shows that state is read once before it and twice after.
+            String marker = null;
+            String readTarget = null;
+            HttpRequestResponse before = null;
+            if (markable != null) {
+                marker = CsrfLogic.newChangeMarker(java.util.concurrent.ThreadLocalRandom.current());
+                forged = forged.withParameter(HttpParameter.parameter(markable.name(), markable.value() + marker, markable.type()));
+                for (String candidate : csrfReadTargets(req)) {
+                    before = api.http().sendRequest(readRequest(req, candidate));
+                    if (CsrfLogic.isSuccess(status(before))) { readTarget = candidate; break; }
+                }
+            }
+            HttpRequest asCaptured = forged;
+            if (textPlainFirst) {
+                for (Map.Entry<String, String> h : CsrfLogic.textPlainFetchHeaders(crossSite).entrySet()) {
+                    forged = forged.withRemovedHeader(h.getKey()).withAddedHeader(h.getKey(), h.getValue());
+                }
+            }
+            forgedStatus = status(api.http().sendRequest(forged));
+            boolean preflighted = false;
+            if (textPlainFirst && CsrfLogic.isSuccess(forgedStatus)) {
+                preflight = null;
+                variantNote = "the body was sent as text/plain (" + String.join(", ", CsrfLogic.textPlainFetchHeaders(crossSite).values())
+                        + "), as a cross-site no-cors fetch() can send it";
+            } else if (textPlainFirst) {
+                // Refused as text/plain: send it as captured. That can only be
+                // SUPPORTED, so its effect is not read back, which keeps the
+                // probe within six requests.
+                variantNote = "the body sent as text/plain was refused (status " + forgedStatus
+                        + "), so it was sent as captured (Content-Type " + contentType + ")";
+                forged = asCaptured;
+                forgedStatus = status(api.http().sendRequest(forged));
+                preflighted = true;
+            }
+            if (CsrfLogic.isSuccess(forgedStatus)) {
+                if (preflighted && readTarget != null) {
+                    readBack = CsrfLogic.ReadBack.notRun("only the request as captured, which needs a CORS preflight, succeeded");
+                } else if (readTarget != null) {
+                    var after = api.http().sendRequest(readRequest(req, readTarget));
+                    var again = api.http().sendRequest(readRequest(req, readTarget));
+                    readBack = CsrfLogic.readBack(readTarget, markable.name(), marker,
+                            status(before), responseBody(before), status(after), responseBody(after),
+                            status(again), responseBody(again));
+                } else {
+                    readBack = CsrfLogic.ReadBack.notRun(markable == null
+                            ? "no submitted field could carry a change marker"
+                            : "no page showing the state could be read (tried " + String.join(", ", csrfReadTargets(req)) + ")");
+                }
+                // Control: the same request without the cookie either. If it
+                // also succeeds, the action is not gated on the session.
+                anonymousStatus = status(api.http().sendRequest(forged.withRemovedHeader("Cookie")));
+            }
         }
+        CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, tokenFound,
+                originalStatus, forgedStatus, anonymousStatus, readBack, preflight);
+        String probe = "token carriers: " + (tokenCarriers.isEmpty() ? "none" : String.join(", ", tokenCarriers))
+                + " | removed (a cross-site page cannot send them): "
+                + (removedHeaders.isEmpty() ? "none" : String.join(", ", removedHeaders))
+                + " | sent as a cross-site form from " + crossSite.get("Origin") + ": " + String.join(", ", sentAs)
+                + ", no Referer"
+                + (variantNote == null ? "" : " | " + variantNote)
+                + (markable == null ? "" : " | change marker appended to field '" + markable.name() + "'");
+        String detail = ev.detail() == null || ev.detail().isEmpty() ? probe : ev.detail() + " | " + probe;
+        statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), detail);
+    }
 
-        CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, false, 0, -1);
-        statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
+    /**
+     * Pages that may show the state a CSRF-able write changes, in order: the
+     * page the form was submitted from (a same-origin Referer), then the
+     * action's own path without its query.
+     */
+    private static List<String> csrfReadTargets(HttpRequest req) {
+        List<String> targets = new ArrayList<>();
+        String referer = sameOriginPath(req.url(), reqHeader(req, "Referer"));
+        if (referer != null) targets.add(referer);
+        String action = pathOnly(req.path());
+        if (!action.isEmpty() && !targets.contains(action)) targets.add(action);
+        return targets;
     }
 
     // ---------------------------------------------------------------
@@ -1551,7 +1832,7 @@ public final class ValidationExecutor {
                         ? java.net.URI.create(extractedUrl).getRawPath()
                         : extractedUrl;
                 if (path != null && !path.isEmpty()) {
-                    var fetchRr = api.http().sendRequest(req.withPath(path).withBody(""));
+                    var fetchRr = api.http().sendRequest(readRequest(req, path));
                     if (fetchRr.response() != null) {
                         fetchStatus = fetchRr.response().statusCode();
                         fetchedContainsEicar = fetchRr.response().bodyToString().contains(FileUploadLogic.EICAR_STRING);

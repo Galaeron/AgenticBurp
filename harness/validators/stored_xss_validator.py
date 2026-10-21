@@ -11,14 +11,22 @@ data-flow confirmation (#5): the value provably crosses requests.
   1. PLANT   -- send the write with a script-executable, nonce-tagged payload in
                 its text fields.
   2. RENDER  -- independently GET the resource (and its collection) again.
-  3. CONFIRM -- stored XSS only when the executable payload comes back UNESCAPED
-                in a text/html response (angle brackets + handler intact) on that
-                independent read. A JSON API that stores-and-returns the string
-                escaped, or in a non-HTML content type, is NOT confirmed -- the
+  3. CONFIRM -- stored XSS only when the payload comes back UNESCAPED in a
+                text/html response on that independent read AND a headless
+                browser loading that page logs a console message, or raises an
+                alert/confirm/prompt dialog, EXACTLY equal to the value THIS
+                attempt's payload computes at run time (R19, E2; the dialog is
+                RV-O O8, an owner decision of 2026-10-21). The payload alerts
+                and logs a product of two random operands, so the stored text
+                holds the operands but never the result: a page that logs the
+                stored source (a textarea's value) shows the operands, not the
+                product. Any other dialog, or a page error, is noted as a
+                candidate to check by hand. The unescaped string alone is a
+                candidate (inconclusive): an inert context (<textarea>, a comment,
+                a CSP) stores it without running it, and with no browser there is
+                no execution proof. A JSON API that stores-and-returns the string
+                escaped, or in a non-HTML content type, is NOT a candidate -- the
                 same precision line browser_xss draws (no HTML sink, no confirm).
-                When a headless browser is available the rendered page is also
-                loaded for execution-grade proof; otherwise the unescaped-in-HTML
-                reflection stands as the deterministic signal.
 
 Scope-gated; the plant is a mutating write, so it self-gates on
 validators.allow_mutating_replay and routes through the safety gate.
@@ -38,9 +46,80 @@ from .base import Validator, ValidationResult
 from harness.validators.sqlmap import _looks_like_json, _content_type_of
 
 
-def _payloads(nonce: str) -> list[str]:
-    js = f"console.log('{nonce}')"
+def _challenge() -> tuple[int, int, str]:
+    """Two random six-digit operands and the product the payload logs when it
+    runs. The product (under 2**53, so exact in JavaScript) never appears in
+    the payload text, so only execution can produce it (E2)."""
+    a, b = (100000 + secrets.randbelow(900000) for _ in range(2))
+    return a, b, str(a * b)
+
+
+def _payloads(a: int, b: int) -> list[str]:
+    # Alert first: a sink that lets only alert() run still shows the product (RV-O O8).
+    js = f"alert({a}*{b});console.log({a}*{b})"
     return [f"<svg/onload={js}>", f"<script>{js}</script>", f"<img src=x onerror={js}>"]
+
+
+_DIALOG_TYPES = ("alert", "confirm", "prompt")
+
+
+def _dialog_messages(obs) -> list[str]:
+    """The message of each alert/confirm/prompt dialog the page raised (the
+    driver records one as "type:message")."""
+    out = []
+    for entry in getattr(obs, "dialogs", None) or []:
+        kind, sep, message = str(entry).partition(":")
+        if sep and kind in _DIALOG_TYPES:
+            out.append(message.strip())
+    return out
+
+
+def _unmatched_signal(obs) -> tuple[str, str]:
+    """(note, detail) for a page that raised a dialog or a page error without
+    the computed product -- a candidate to check by hand, never a negative
+    (RV-O O8) -- or ("", "") when it raised neither."""
+    if getattr(obs, "dialogs", None):
+        return ("a dialog fired, but not with the computed value; check manually",
+                f"dialog {str(obs.dialogs[0])[:120]!r}")
+    if getattr(obs, "page_errors", None):
+        return ("a page error was raised, but no computed value was shown; check manually",
+                f"error {str(obs.page_errors[0])[:120]!r}")
+    return "", ""
+
+
+# The closing sentence of a confirm shown by a dialog alone, and the marker of a
+# candidate note that asks for a manual check (RV-O O8).
+_DIALOG_ONLY = "Execution was shown by a dialog only, not by the console."
+_CHECK_MANUALLY = "check manually"
+
+
+def _keep(candidate, payload: str, rurl: str, note: str):
+    """The candidate to report: the first one, unless a later one raised a
+    dialog or a page error and it did not."""
+    if candidate is None or (_CHECK_MANUALLY in note and _CHECK_MANUALLY not in candidate[2]):
+        return payload, rurl, note
+    return candidate
+
+
+class _Recorded:
+    """A client whose sends are recorded in `attempts`, for a helper that
+    swallows its own transport errors (fetch_source_form skips a page it could
+    not read)."""
+
+    def __init__(self, client, attempts: list, stage: str):
+        self._client, self._attempts, self._stage = client, attempts, stage
+
+    async def request(self, method: str, url: str, **kwargs):
+        try:
+            resp = await self._client.request(method, url, **kwargs)
+        except SafetyGateBlocked as e:
+            self._attempts.append(("blocked", f"{self._stage} {url}: refused ({e.decision.reason})"))
+            raise
+        except httpx.HTTPError as e:
+            self._attempts.append(("error", f"{self._stage} {url}: {e.__class__.__name__}"))
+            raise
+        self._attempts.append(("ok", self._stage))
+        return resp
 
 
 def _text_fieldish(v) -> bool:
@@ -68,6 +147,38 @@ class StoredXssValidator(Validator):
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "xss", summary=why)
+
+    async def _request(self, client, method: str, url: str, attempts: list, stage: str, **kwargs):
+        """One throttled send, recorded in `attempts` as ("ok" | "blocked" |
+        "error", description). Returns the response, or None when it got none.
+        A gate or run refusal is recorded and re-raised: it refuses the rest too."""
+        await global_throttle.acquire()
+        try:
+            resp = await client.request(method, url, **kwargs)
+        except SafetyGateBlocked as e:
+            attempts.append(("blocked", f"{stage}: refused ({e.decision.reason})"))
+            raise
+        except httpx.HTTPError as e:
+            attempts.append(("error", f"{stage}: {e.__class__.__name__}"))
+            return None
+        attempts.append(("ok", stage))
+        return resp
+
+    def _incomplete(self, attempts: list, method: str, write_path: str,
+                    via: str = "") -> ValidationResult:
+        """A plant or render that got no response is not a negative (RV-L rule)."""
+        unsent = [(kind, why) for kind, why in attempts if kind != "ok"]
+        answered = len(attempts) - len(unsent)
+        refused = any(kind == "blocked" for kind, _ in unsent)
+        failed = "; ".join(why for _, why in unsent[:4])
+        return ValidationResult(
+            self.name, "blocked" if refused and not answered else "inconclusive", "xss",
+            confidence=0.0, confirmed=False,
+            summary=f"Stored-XSS check incomplete: {len(unsent)} of {len(attempts)} send(s) got no "
+                    f"response ({failed}); not a negative result",
+            evidence=(f"Planted script-executable payloads via {method} {write_path}{via}; no "
+                      f"unescaped render was seen, but a plant or render that never got a response "
+                      f"cannot show one."))
 
     def _json_object(self, body: str):
         try:
@@ -178,11 +289,12 @@ class StoredXssValidator(Validator):
         return urlencode(pairs)
 
     async def _plant_via_source_form(self, exchange: HttpExchange, gate, headers: dict,
-                                     method: str, render_urls: list[str]):
+                                     method: str, render_urls: list[str], attempts: list):
         """Session-aware plant: GET the source page in THIS client's session to
         obtain a fresh CSRF-bound form, plant into it, then read it back. Returns
-        a ValidationResult when a matching source form was found (confirmed or
-        not), or None to let the caller fall back to the captured-body plant."""
+        a ValidationResult when a matching source form was found (confirmed,
+        candidate, incomplete or not), or None to let the caller fall back to the
+        captured-body plant. Every send is recorded in `attempts`."""
         from harness.validators.source_form import fetch_source_form
         action_path = urlsplit(exchange.url).path
         read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
@@ -192,41 +304,55 @@ class StoredXssValidator(Validator):
                         if urlsplit(f.action).path == action_path
                         and (f.method or "POST").upper() == method), None)
 
+        candidate, via = None, ""
         try:
             async with GatedAsyncClient(gate, self.name, timeout=self.timeout,
                                         follow_redirects=False, verify=False) as client:
-                found = await fetch_source_form(client, self._source_page_candidates(exchange),
+                found = await fetch_source_form(_Recorded(client, attempts, "source page GET"),
+                                                self._source_page_candidates(exchange),
                                                 read_headers, select)
                 if found is None:
                     return None  # no discoverable source form -> caller falls back
                 fresh, source_url = found.form, found.source_url
-                for payload in _payloads(secrets.token_hex(6)):
+                via = f" through a fresh CSRF-bound form from {source_url}"
+                a, b, expected = _challenge()
+                for payload in _payloads(a, b):
                     plant_body = self._form_plant_body(fresh, payload)
                     planted_headers = dict(headers)
                     planted_headers["Content-Type"] = "application/x-www-form-urlencoded"
-                    await global_throttle.acquire()
-                    await client.request(method, fresh.action, headers=planted_headers, content=plant_body)
+                    if await self._request(client, method, fresh.action, attempts,
+                                           f"plant {method} {urlsplit(fresh.action).path}",
+                                           headers=planted_headers, content=plant_body) is None:
+                        continue  # this payload never landed; try the next shape
                     for rurl in [source_url, *render_urls]:
-                        await global_throttle.acquire()
-                        rr = await client.request("GET", rurl, headers=read_headers or None)
+                        rr = await self._request(client, "GET", rurl, attempts,
+                                                 f"render GET {urlsplit(rurl).path}",
+                                                 headers=read_headers or None)
+                        if rr is None:
+                            continue
                         if ("html" in (rr.headers.get("content-type") or "").lower()
                                 and payload in (rr.text or "")):
-                            browser_note = await self._browser_confirm(rurl)
-                            conf = 0.95 if browser_note else 0.85
-                            return ValidationResult(
-                                self.name, "confirmed", "xss", confidence=conf, confirmed=True,
-                                summary=f"Stored XSS confirmed: a payload written via {method} {action_path} "
-                                        f"is reflected UNESCAPED in the HTML of {urlsplit(rurl).path} on an independent read.",
-                                evidence=(f"Planted {payload!r} through a fresh CSRF-bound form from {source_url}; "
-                                          f"an independent GET of {rurl} returned it intact (angle brackets + handler) "
-                                          f"in a text/html response -- stored, not just reflected. {browser_note}").strip())
+                            executed, note = await self._browser_confirm(rurl, expected)
+                            if executed:
+                                return self._executed(method, action_path, payload, rurl, note, via)
+                            candidate = _keep(candidate, payload, rurl, note)
+                            if executed is None:
+                                return self._unproven(method, action_path, *candidate, via)
+                            break  # inert here; try the next payload shape
+                if candidate:
+                    return self._unproven(method, action_path, *candidate, via)
+                if any(kind != "ok" for kind, _ in attempts):
+                    return self._incomplete(attempts, method, action_path, via)
                 return ValidationResult(
                     self.name, "not_confirmed", "xss", confidence=0.0, confirmed=False,
                     summary="No stored XSS: planted payloads were not reflected unescaped in an HTML render",
                     evidence=(f"Submitted a fresh CSRF-bound form at {action_path} and re-read the "
                               f"rendered page; the payload never returned unescaped in a text/html response."))
         except SafetyGateBlocked:
-            return self._skip("mutating stored-XSS plant not authorized (validators.allow_mutating_replay)")
+            # recorded where it was raised; it refuses every further send
+            if candidate:
+                return self._unproven(method, action_path, *candidate, via)
+            return self._incomplete(attempts, method, action_path, via)
         except httpx.HTTPError:
             return None
 
@@ -242,6 +368,9 @@ class StoredXssValidator(Validator):
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("content-length", "host")}
         render_urls = self._render_urls(exchange.url)
+        # Every send, as ("ok" | "blocked" | "error", description): a plant that
+        # never landed, or a render never read back, is not a negative (RV-L rule).
+        attempts: list[tuple[str, str]] = []
 
         # Form (urlencoded) writes are commonly CSRF-token-bound: the captured
         # token belongs to the crawl's session, so a fresh client is rejected
@@ -249,62 +378,113 @@ class StoredXssValidator(Validator):
         # session from the source page first; only fall back to replaying the
         # captured body when no source form is discoverable (e.g. a JSON API).
         if self._json_object(exchange.request_body or "") is None and "=" in (exchange.request_body or ""):
-            via_source = await self._plant_via_source_form(exchange, gate, headers, method, render_urls)
+            via_source = await self._plant_via_source_form(exchange, gate, headers, method,
+                                                           render_urls, attempts)
             if via_source is not None:
                 return via_source
 
-        for payload in _payloads(secrets.token_hex(6)):
+        write_path = urlsplit(exchange.url).path
+        a, b, expected = _challenge()
+        candidate = None
+        read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+        for payload in _payloads(a, b):
             body, ctype = self._plant_body(exchange, payload)
             planted_headers = dict(headers); planted_headers["Content-Type"] = ctype
             try:
                 async with GatedAsyncClient(gate, self.name, timeout=self.timeout,
                                             follow_redirects=False, verify=False) as client:
-                    await global_throttle.acquire()
-                    await client.request(method, exchange.url, headers=planted_headers, content=body)
-                    read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+                    if await self._request(client, method, exchange.url, attempts,
+                                           f"plant {method} {write_path}",
+                                           headers=planted_headers, content=body) is None:
+                        continue  # this payload never landed; try the next shape
                     for rurl in render_urls:
-                        await global_throttle.acquire()
-                        r = await client.request("GET", rurl, headers=read_headers or None)
+                        r = await self._request(client, "GET", rurl, attempts,
+                                                f"render GET {urlsplit(rurl).path}",
+                                                headers=read_headers or None)
+                        if r is None:
+                            continue
                         ct = (r.headers.get("content-type") or "").lower()
                         if "html" in ct and payload in (r.text or ""):
-                            # optional execution-grade proof if a browser is present
-                            browser_note = await self._browser_confirm(rurl)
-                            conf = 0.95 if browser_note else 0.85
-                            return ValidationResult(
-                                self.name, "confirmed", "xss", confidence=conf, confirmed=True,
-                                summary=f"Stored XSS confirmed: a payload written via {method} {urlsplit(exchange.url).path} "
-                                        f"is reflected UNESCAPED in the HTML of {urlsplit(rurl).path} on an independent read.",
-                                evidence=(f"Planted {payload!r}; an independent GET of {rurl} returned it intact "
-                                          f"(angle brackets + handler) in a text/html response -- stored, not just "
-                                          f"reflected. {browser_note}").strip())
+                            # R19: an unescaped string is not execution (an inert
+                            # <textarea>, a comment, a CSP). Only the payload's
+                            # computed value, logged or shown in a dialog by a
+                            # browser, confirms.
+                            executed, note = await self._browser_confirm(rurl, expected)
+                            if executed:
+                                return self._executed(method, write_path, payload, rurl, note)
+                            candidate = _keep(candidate, payload, rurl, note)
+                            if executed is None:
+                                return self._unproven(method, write_path, *candidate)
+                            break  # inert here; try the next payload shape
             except SafetyGateBlocked:
-                return self._skip("mutating stored-XSS plant not authorized (validators.allow_mutating_replay)")
-            except httpx.HTTPError:
-                continue
+                break  # recorded by _request; the gate or run refuses every further send
+        if candidate:
+            return self._unproven(method, write_path, *candidate)
+        if any(kind != "ok" for kind, _ in attempts):
+            return self._incomplete(attempts, method, write_path)
         return ValidationResult(
             self.name, "not_confirmed", "xss", confidence=0.0, confirmed=False,
             summary="No stored XSS: planted payloads were not reflected unescaped in an HTML render",
             evidence=f"Planted script-executable payloads via {method} and re-read {len(render_urls)} "
                      f"endpoint(s); none returned the payload unescaped in a text/html response.")
 
-    async def _browser_confirm(self, url: str) -> str:
-        """If a headless browser is available, load the rendered page and look for
-        execution. Best-effort: returns a note on success, '' otherwise (the
-        deterministic unescaped-in-HTML signal already stands)."""
+    def _executed(self, method: str, write_path: str, payload: str, rurl: str, note: str,
+                  via: str = "") -> ValidationResult:
+        shown = " (shown by a dialog only)" if note.endswith(_DIALOG_ONLY) else ""
+        return ValidationResult(
+            self.name, "confirmed", "xss", confidence=0.95, confirmed=True,
+            summary=f"Stored XSS confirmed{shown}: a payload written via {method} {write_path} "
+                    f"executed when {urlsplit(rurl).path} was rendered on an independent read.",
+            evidence=(f"Planted {payload!r}{via}; an independent GET of {rurl} returned it intact "
+                      f"(angle brackets + handler) in a text/html response -- stored, not just "
+                      f"reflected. {note}"))
+
+    def _unproven(self, method: str, write_path: str, payload: str, rurl: str, note: str,
+                  via: str = "") -> ValidationResult:
+        return ValidationResult(
+            self.name, "inconclusive", "xss", confidence=0.5, confirmed=False,
+            summary=f"Stored XSS candidate, not confirmed: a payload written via {method} {write_path} "
+                    f"comes back unescaped in the HTML of {urlsplit(rurl).path}, but execution was not "
+                    f"observed.",
+            evidence=(f"Planted {payload!r}{via}; an independent GET of {rurl} returned it intact in a "
+                      f"text/html response. A raw string match is not execution (an inert context such "
+                      f"as <textarea>, or a CSP, stops it). {note}"))
+
+    async def _browser_confirm(self, url: str, expected: str) -> tuple[bool | None, str]:
+        """Load the rendered page in a headless browser and look for a console
+        message, or an alert/confirm/prompt dialog, exactly equal to
+        ``expected``, the value THIS attempt's payload computes when it runs
+        (RV-O O8 added the dialog). Returns (executed, note): True only for
+        that exact event; False when the page loaded and the payload did not
+        run, the note saying so when a dialog or page error fired; None when no
+        browser could check. Any other output, including a message that merely
+        contains the payload's text, is the page's own (E2: a page that logs
+        the stored source echoes it without running it)."""
         driver = self._driver
         try:
             if driver is None:
                 from harness import browser_driver
                 driver = browser_driver.default_driver()
                 if driver is None:
-                    return ""
+                    return None, "No browser available to prove execution."
             rc = self.run_context
             visit_kw = (dict(scope=rc.scope, gate=rc.gate, budget=rc.budget, cancel=rc.cancel)
                         if rc is not None else {})
             obs = await driver.visit(url, wait_ms=1200, **visit_kw)
-            # the payload's console.log nonce is inside the payload string; if the
-            # page executed it, the nonce shows up in an execution sink.
-            return ("Execution also confirmed in a headless browser."
-                    if getattr(obs, "console", None) else "")
-        except Exception:
-            return ""
+        except Exception as e:
+            return None, f"The browser check of {url} failed ({type(e).__name__}); execution unproven."
+        if getattr(obs, "load_error", None):
+            return None, f"The browser could not load {url} ({obs.load_error}); execution unproven."
+        if any(str(m).strip() == expected for m in (getattr(obs, "console", None) or [])):
+            return True, (f"Execution confirmed: the payload executed in a headless browser "
+                          f"(it logged {expected}, a value computed at run time that the stored "
+                          f"text does not contain).")
+        if expected in _dialog_messages(obs):
+            return True, (f"Execution confirmed: the payload executed in a headless browser "
+                          f"(a dialog showed {expected}, a value computed at run time that the "
+                          f"stored text does not contain). {_DIALOG_ONLY}")
+        signal, detail = _unmatched_signal(obs)
+        if signal:
+            return False, (f"A headless browser loaded {url}: {signal} ({detail}); the computed "
+                           f"value was not shown.")
+        return False, f"A headless browser loaded {url} and the payload did not execute."

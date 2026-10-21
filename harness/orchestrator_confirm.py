@@ -13,6 +13,16 @@ from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/h
 from harness.validators.base import ValidationResult
 
 
+def _fallback_result_binds(result, routed) -> bool:
+    """The agent-fallback class binding: a confirmation reached only through the
+    producing-agent routing token binds to the finding only when the validator
+    reports that same token back (see _validate_findings). A named seam so a
+    caller test can prove its removal is detected; there is no bypass flag."""
+    tested_class = (result.finding_class or "").strip().lower()
+    fallback_label = (routed.vulnerability_class or "").strip().lower()
+    return tested_class == fallback_label
+
+
 class ConfirmMixin:
     async def get_run_derived_live_markers(self):
         """P0-2: the run-derived confirmation-trust-tier override.
@@ -37,7 +47,11 @@ class ConfirmMixin:
         start, an import failed, anything) is swallowed and produces an
         EMPTY frozenset -- "could not measure" demotes every confirmable
         class to provisional this run, it never falls back to trusting the
-        static table while claiming to be run-derived."""
+        static table while claiming to be run-derived.
+
+        The per-case report (`run_self_test(report_out=...)`) is kept on
+        `self.leg_self_test_report`, so a class left out because its tool is
+        unavailable says so (RV-O O6); it never changes the markers."""
         cfg = (getattr(self, "config", {}) or {}).get("leg_self_test", {}) or {}
         if not cfg.get("enabled", False):
             return None  # override absent -- confirmation_gate uses its static offline default
@@ -45,13 +59,19 @@ class ConfirmMixin:
         if cached is not None:
             return cached
         from harness import leg_self_test
+        report: dict = {}
         try:
-            markers = await asyncio.to_thread(leg_self_test.run_self_test)
+            markers = await asyncio.to_thread(leg_self_test.run_self_test, report_out=report)
         except Exception:
             log.warning(
                 "leg self-test crashed this run -- every confirmable class "
                 "falls back to provisional (fail-safe)", exc_info=True)
             markers = frozenset()
+        self.leg_self_test_report = report
+        for marker, entry in sorted(report.items()):
+            if entry.get("status") == "unavailable":
+                log.info("leg self-test: %s left provisional this run -- %s",
+                         marker, entry.get("reason") or "unavailable")
         self._leg_self_test_cache = markers
         return markers
 
@@ -538,6 +558,7 @@ class ConfirmMixin:
                 # Preserve the operational failure as an ERROR proof (R30/T01): a
                 # crashed leg is recorded honestly, never dropped and never read as
                 # a boundary that held.
+                summary = f"validator failed: {type(result).__name__}: {result}"[:300]
                 try:
                     ep = evidence.ProofRecord.from_validation_result(
                         case=case,
@@ -549,20 +570,19 @@ class ConfirmMixin:
                         proofs.append(ep.to_dict())
                     else:
                         log.warning("failed to persist validator error proof: %s", reason)
-                        output.append(ValidationReport(
-                            validator=getattr(validator, "name", "validator"), status="error",
-                            finding_class=finding.vulnerability_class, confirmed=False,
-                            summary=f"proof persistence failed: {reason}", evidence=str(result)[:300],
-                            url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
-                            parameter=getattr(finding, "parameter_name", "")))
+                        summary = f"proof persistence failed: {reason}"
                 except Exception as e:  # proof bookkeeping must never break analysis
                     log.warning("proof bookkeeping failed for errored validator: %s", e)
-                    output.append(ValidationReport(
-                        validator=getattr(validator, "name", "validator"), status="error",
-                        finding_class=finding.vulnerability_class, confirmed=False,
-                        summary=f"proof persistence failed: {e}", evidence=str(result)[:300],
-                        url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
-                        parameter=getattr(finding, "parameter_name", "")))
+                    summary = f"proof persistence failed: {e}"
+                # R06: return the failed attempt on the same path that records it,
+                # so the operator sees why confirmation did not run.
+                output.append(ValidationReport(
+                    validator=getattr(validator, "name", "validator"), status="error",
+                    finding_class=finding.vulnerability_class, confirmed=False,
+                    summary=summary, evidence=str(result)[:300],
+                    url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
+                    parameter=getattr(finding, "parameter_name", ""),
+                    principal_id=getattr(finding, "principal_id", "")))
                 continue
             # Results may come from a cache; never mutate the shared value.
             if routed is not finding:
@@ -589,9 +609,7 @@ class ConfirmMixin:
                 # AuthSequenceValidator._which_checks) so it declines to run
                 # an unrelated check at all, rather than running it and
                 # relying on this catch after the fact.
-                tested_class = (result.finding_class or "").strip().lower()
-                fallback_label = (routed.vulnerability_class or "").strip().lower()
-                if result.confirmed and tested_class != fallback_label:
+                if result.confirmed and not _fallback_result_binds(result, routed):
                     result = replace(
                         result, confirmed=False, status="skipped",
                         finding_class=finding.vulnerability_class,

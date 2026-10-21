@@ -115,6 +115,18 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             config, config.get("operating_profile"), explicit_keys=explicit_keys)
         self.config = config
 
+        # WL-11 (audit E19): privacy.external_lookups gates every outbound call
+        # the "passive" analysis makes to third-party services about components
+        # seen in captured traffic (GitHub advisories, npm/PyPI, Aikido, CISA
+        # KEV). Default true = today's behaviour unchanged. Parsed strictly and
+        # EARLY so a non-boolean (e.g. the string "false") raises at startup
+        # instead of being read as truthy and silently leaving lookups on.
+        self.external_lookups_enabled = config_schema.parse_privacy_flags(
+            config.get("privacy"))["external_lookups"]
+        if not self.external_lookups_enabled:
+            log.info("privacy.external_lookups is false: no calls to api.github.com, "
+                     "registry.npmjs.org, pypi.org, malware-list.aikido.dev or www.cisa.gov")
+
         # Initialize Ollama client
         self.ollama = OllamaClient(
             base_url=config["ollama"]["base_url"],
@@ -165,14 +177,26 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
                 log.warning("Could not load advisory snapshot %s: %s", _snap_path, e)
         self.gha_client = GitHubAdvisoryClient(
             token=gha_cfg.get("token"), snapshot=_snapshot,
-            offline=bool(gha_cfg.get("offline", False)))
+            offline=bool(gha_cfg.get("offline", False)),
+            external_lookups=self.external_lookups_enabled)
+        if not self.external_lookups_enabled:
+            # WL-11: with lookups off only a local snapshot can answer (it makes
+            # no network call). Without one the stage is OFF, so
+            # _resolve_known_vulnerabilities returns None -- no report at all,
+            # never an empty "checked, nothing found" one.
+            self.gha_enabled = bool(self.gha_enabled) and bool(_snapshot)
 
         # Initialize registry checks
         registry_cfg = config.get("package_registry_checks", {})
         self.registry_checks_enabled = registry_cfg.get("enabled", True)
         self.registry_client = PackageRegistryClient(
-            minimum_age_days=registry_cfg.get("minimum_age_days", 2.0)
+            minimum_age_days=registry_cfg.get("minimum_age_days", 2.0),
+            external_lookups=self.external_lookups_enabled,
         )
+        if not self.external_lookups_enabled:
+            # WL-11: no local alternative exists for registry age, so the stage
+            # is OFF (_check_registry_ages returns None: no claim).
+            self.registry_checks_enabled = False
 
         # Session-scoped de-dup: a real, GHSA-verified advisory match for a
         # given host must not be reported again on every subsequent exchange
@@ -190,7 +214,13 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         self.kev_client = KevClient(
             local_file=kev_cfg.get("local_file"),
             cache_ttl_hours=kev_cfg.get("cache_ttl_hours", 24.0),
+            external_lookups=self.external_lookups_enabled,
         )
+        if not self.external_lookups_enabled and not kev_cfg.get("local_file"):
+            # WL-11: the CISA feed would have to be downloaded, so the KEV
+            # escalation is OFF. A configured local_file is read locally and
+            # stays on (no egress).
+            self.kev_enabled = False
 
         # Configure the global outbound-request throttle (global_throttle.py)
         # from config. Default 0 = unlimited, so this is a no-op unless the

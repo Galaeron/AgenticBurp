@@ -288,19 +288,38 @@ def make_app(file_base: str | None = None) -> Flask:
         return resp
 
     # session fixation: TP reuses the presented sid across login; control rotates it.
+    # A real login (alice / x) that binds a sid to the account, and an account
+    # page that only an authenticated sid can read (R20: the leg must prove the
+    # fixed id is USED authenticated, not just that it was not rotated).
+    fixation_sessions: dict[str, str] = {}
+
+    def _fixation_login(rotate: bool):
+        body = request.get_json(silent=True, force=True) or {}
+        if body.get("username") != "alice" or body.get("password") != "x":
+            return jsonify({"ok": False, "error": "invalid credentials"}), 401
+        presented = request.cookies.get("sid")
+        sid = _secrets.token_hex(8) if (rotate or not presented) else presented
+        fixation_sessions[sid] = "alice"
+        resp = make_response("", 302)
+        resp.headers["Location"] = "/auth/account"
+        resp.set_cookie("sid", sid)  # TP: the presented sid, now authenticated
+        return resp
+
     @app.route("/auth/login-fixation", methods=["POST"])
     def login_fixation():
-        resp = make_response(jsonify({"ok": True}))
-        sid = request.cookies.get("sid")
-        if sid:
-            resp.set_cookie("sid", sid)  # VULNERABLE: no rotation on auth
-        return resp
+        return _fixation_login(rotate=False)  # VULNERABLE: no rotation on auth
 
     @app.route("/auth/login-rotate", methods=["POST"])
     def login_rotate():
-        resp = make_response(jsonify({"ok": True}))
-        resp.set_cookie("sid", _secrets.token_hex(8))  # rotates -> safe
-        return resp
+        return _fixation_login(rotate=True)  # rotates -> safe
+
+    @app.get("/auth/account")
+    def fixation_account():
+        user = fixation_sessions.get(request.cookies.get("sid") or "")
+        if not user:
+            return jsonify({"ok": False, "error": "login required"}), 401
+        return Response(f"<html><body><h1>Account</h1><p>Signed in as {user}</p>"
+                        f"<a href='/auth/logout'>Log out</a></body></html>", mimetype="text/html")
 
     # weak password policy: TP accepts anything; control enforces a minimum.
     @app.route("/auth/register-weak", methods=["POST"])
@@ -583,7 +602,9 @@ def make_app(file_base: str | None = None) -> Flask:
     def mfa_account():
         s = mfa["sessions"].get(request.cookies.get("session", ""))
         if not s:
-            return redirect("/2fa/verify", code=302)  # no session -> denied
+            # No session -> the login wall. A redirect to the 2FA step is not a
+            # denial for the MFA-bypass control (owner decision 2026-10-21, RV-R R1).
+            return redirect("/login", code=302)
         if s["mode"] == "safe" and not s["verified"]:
             return redirect("/2fa/verify", code=302)  # ENFORCING: 2nd factor required
         # VULNERABLE mode: the partial (step-1-only) session already reaches the account.
