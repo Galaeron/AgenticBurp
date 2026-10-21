@@ -89,7 +89,18 @@ class CommandInjectionValidator(Validator):
             from .transport import bind_session
             session_ref, request_headers = bind_session(self.run_context, headers)
 
-        async def send(url: str, body: str) -> tuple[str, str]:
+        # Every send that got no response, as ("blocked" | "error", description):
+        # a check that never reached the target is not a negative (RV-L rule).
+        unsent: list[tuple[str, str]] = []
+        sends = 0
+
+        async def send(url: str, body: str, label: str) -> tuple[str, str]:
+            """("ok", text) when answered. Otherwise the send is recorded in
+            `unsent` and the state is "refused" (scope, gate or budget), "error"
+            (an in-run transport failure: the request may have been delivered,
+            so the out-of-band wait still runs) or "failed" (a standalone one)."""
+            nonlocal sends
+            sends += 1
             if self.run_context is not None:
                 from harness.run_context import TypedRequest
                 outcome = await self.run_context.executor().execute(
@@ -97,14 +108,41 @@ class CommandInjectionValidator(Validator):
                     capability=self.name, session_ref=session_ref,
                     case_ref=finding.finding_id or "", max_redirects=0)
                 if not outcome.executed:
-                    return outcome.outcome, ""
-                return outcome.outcome, outcome.body or ""
-            await global_throttle.acquire()
-            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
-                                        follow_redirects=False, verify=False) as client:
-                resp = await client.request(method, url, headers=headers or None,
-                                            content=body or None)
+                    unsent.append(("blocked", f"{label}: refused ({outcome.outcome}"
+                                   + (f": {outcome.error})" if outcome.error else ")")))
+                    return "refused", ""
+                if outcome.outcome == "error":
+                    failure = (getattr(outcome.artifact, "transport_outcome", "")
+                               .partition(":")[2] or outcome.error or "transport error")
+                    unsent.append(("error", f"{label}: {failure}"))
+                    return "error", ""
+                return "ok", outcome.body or ""
+            try:
+                await global_throttle.acquire()
+                async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                            follow_redirects=False, verify=False) as client:
+                    resp = await client.request(method, url, headers=headers or None,
+                                                content=body or None)
+            except SafetyGateBlocked as e:
+                unsent.append(("blocked", f"{label}: refused ({e.decision.reason})"))
+                return "refused", ""
+            except httpx.HTTPError as e:
+                unsent.append(("error", f"{label}: {e.__class__.__name__}"))
+                return "failed", ""
             return "ok", resp.text
+
+        def incomplete() -> ValidationResult:
+            answered = sends - len(unsent)
+            refused = any(kind == "blocked" for kind, _ in unsent)
+            failed = "; ".join(w for _, w in unsent[:4])
+            return ValidationResult(
+                self.name, "blocked" if refused and not answered else "inconclusive",
+                "command_injection", confidence=0.0, confirmed=False,
+                summary=f"Command-injection check incomplete: {len(unsent)} of {sends} send(s) got "
+                        f"no response ({failed}); not a negative result",
+                evidence=f"Tried {len(targets)} parameter(s); {answered} answered send(s) showed no "
+                         f"command-output marker and no callback, but a send that never reached "
+                         f"the target cannot show one.")
 
         # Prefer an in-band unique marker. Including `whoami` keeps the probe
         # read-only while exercising a real command and works on the canonical
@@ -117,15 +155,9 @@ class CommandInjectionValidator(Validator):
             for tmpl in _INBAND:
                 payload = tmpl.format(a=marker_a, b=marker_b)
                 url, body = mutate(exchange, loc, param, payload)
-                try:
-                    state, text = await send(url, body)
-                except SafetyGateBlocked:
-                    return self._skip("mutating command-injection replay not authorized "
-                                      "(set validators.allow_mutating_replay)")
-                except httpx.HTTPError:
-                    continue
-                if state not in ("ok", "error"):
-                    return self._skip(f"command-injection replay declined: {state}")
+                state, text = await send(url, body, f"in-band probe via {loc} {param!r}")
+                if state == "refused":
+                    return incomplete()  # the run or the gate refuses the remaining sends too
                 if marker in text:
                     return ValidationResult(
                         self.name, "confirmed", "command_injection", confidence=0.95,
@@ -144,27 +176,23 @@ class CommandInjectionValidator(Validator):
         target_host = urlsplit(exchange.url).hostname or ""
         if collab_host in {"127.0.0.1", "localhost", "::1"} and target_host not in {
                 "127.0.0.1", "localhost", "::1"}:
+            if unsent:
+                return incomplete()
             return ValidationResult(
                 self.name, "not_confirmed", "command_injection", confidence=0.0,
                 confirmed=False,
                 summary="No in-band command-output marker observed",
                 evidence=f"Tried {len(targets)} parameter(s) across {len(_INBAND)} "
                          "in-band shell forms; loopback collaborator was not reachable from the target.")
-        blocked = False
         for loc, param in targets:
             for tmpl in _TEMPLATES:
                 token = collab.token()
                 payload = tmpl.format(u=collab.url(token))
                 url, body = mutate(exchange, loc, param, payload)
-                try:
-                    state, _ = await send(url, body)
-                    if state not in ("ok", "error"):
-                        blocked = True
-                        break
-                except SafetyGateBlocked:
-                    blocked = True
-                    break  # mutating replay not authorized -- no point trying more templates
-                except httpx.HTTPError:
+                state, _ = await send(url, body, f"out-of-band probe via {loc} {param!r}")
+                if state == "refused":
+                    return incomplete()  # no point trying more templates
+                if state == "failed":
                     continue
                 if await collab.wait_for_hit(token, timeout=self.timeout):
                     return ValidationResult(
@@ -173,11 +201,8 @@ class CommandInjectionValidator(Validator):
                                 f"parameter {param!r} executed on the server.",
                         evidence=f"Injected a metacharacter-prefixed fetch (`{tmpl.format(u='<collaborator>')}`) "
                                  f"into {param!r}; the target ran it and called back out-of-band (blind-safe).")
-            if blocked:
-                break
-        if blocked:
-            return self._skip("mutating command-injection replay not authorized "
-                              "(set validators.allow_mutating_replay)")
+        if unsent:
+            return incomplete()
         return ValidationResult(
             self.name, "not_confirmed", "command_injection", confidence=0.0, confirmed=False,
             summary="No out-of-band callback observed -- parameters do not appear to reach a shell",
