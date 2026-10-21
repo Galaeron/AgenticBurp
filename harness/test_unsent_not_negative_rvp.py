@@ -180,6 +180,15 @@ class ClientTrustUnsentTests(_RvpBase):
         self.assertTrue(sent)
         self.assertEqual([r.status for r in reports], ["error"], _verdicts(reports))
 
+    def test_tampered_write_refused_is_blocked(self):
+        # Before the fix: skipped with a hard-coded allow_mutating_replay text,
+        # whatever the gate's actual reason was.
+        sent = []
+        reports = self._run(_shop(sent), max_requests=0)
+        self.assertEqual(sent, [])
+        self.assertEqual([r.status for r in reports], ["blocked"], _verdicts(reports))
+        self.assertIn("not a negative", _text(reports))
+
     # -- controls
     def test_stored_client_price_still_confirms(self):
         self._assert_confirmed(self._run(_shop([])))
@@ -199,6 +208,39 @@ class ClientTrustUnsentTests(_RvpBase):
             return _response(method, str(url), text="<p>no form</p>", headers={"content-type": "text/html"})
         reports = self._run(fake, self._ex("csrf=stale&productId=1&price=1999"))
         self._assert_negative(reports)
+
+
+# -------------------------------------------------------------- P8 source_form
+class SourceFormFailuresTests(unittest.TestCase):
+    """P8: fetch_source_form names the candidate pages that got no response."""
+
+    def setUp(self):
+        from harness import global_throttle
+        global_throttle.configure(0)
+
+    def _fetch(self, failures):
+        from harness.validators.source_form import fetch_source_form
+
+        class _Client:
+            async def request(self, method, url, **kwargs):
+                if url.endswith("/down"):
+                    raise _connect_error(method, url)
+                return _response(method, url, text='<form action="/x" method="post">'
+                                 '<input type="hidden" name="csrf" value="t"></form>',
+                                 headers={"content-type": "text/html"})
+        return asyncio.run(fetch_source_form(
+            _Client(), ["http://shop.invalid/down", "http://shop.invalid/up"], {},
+            lambda forms: forms[0] if forms else None, failures=failures))
+
+    def test_a_candidate_that_raised_is_recorded(self):
+        failures = []
+        found = self._fetch(failures)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.source_url, "http://shop.invalid/up")
+        self.assertEqual(failures, ["GET http://shop.invalid/down: ConnectError"])
+
+    def test_without_failures_the_behaviour_is_unchanged(self):
+        self.assertEqual(self._fetch(None).source_url, "http://shop.invalid/up")
 
 
 # --------------------------------------------------------------------- P2 csrf
