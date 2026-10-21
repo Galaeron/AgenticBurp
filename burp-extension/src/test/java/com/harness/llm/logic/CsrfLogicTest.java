@@ -174,6 +174,26 @@ public final class CsrfLogicTest {
     }
 
     @Test
+    @DisplayName("Q1: the forged request carries a foreign page's Origin, no Referer and cross-site Fetch Metadata")
+    void crossSiteBrowserHeadersAreAForeignPagesOwn() {
+        var https = crossSiteBrowserHeaders("https://shop.example/profile/update", false);
+        assertEquals("https://" + CROSS_SITE_PAGE_HOST, https.get("Origin"));
+        assertTrue(https.containsKey("Referer") && https.get("Referer") == null, "Referer removed");
+        assertEquals("cross-site", https.get("Sec-Fetch-Site"), "browsers send Fetch Metadata to https");
+        assertEquals("navigate", https.get("Sec-Fetch-Mode"));
+        assertEquals("document", https.get("Sec-Fetch-Dest"));
+        assertTrue(https.containsKey("Sec-Fetch-User") && https.get("Sec-Fetch-User") == null, "no user activation");
+        assertTrue(CROSS_SITE_PAGE_HOST.endsWith(".invalid"), "a reserved name, never a real site");
+
+        var http = crossSiteBrowserHeaders("HTTP://shop.example/x", false);
+        assertEquals("http://" + CROSS_SITE_PAGE_HOST, http.get("Origin"), "same scheme as the target");
+        assertNull(http.get("Sec-Fetch-Site"), "no Fetch Metadata to plain http unless the capture had it");
+        assertTrue(http.containsKey("Sec-Fetch-Site"), "a captured value is still removed");
+        assertEquals("cross-site", crossSiteBrowserHeaders("http://localhost:8080/x", true).get("Sec-Fetch-Site"));
+        assertEquals("https://" + CROSS_SITE_PAGE_HOST, crossSiteBrowserHeaders(null, false).get("Origin"));
+    }
+
+    @Test
     @DisplayName("N1: the change marker goes only on free-text fields, never credentials, contacts, links or ids")
     void markableFields() {
         assertTrue(isMarkableField("display_name", "Alice"));

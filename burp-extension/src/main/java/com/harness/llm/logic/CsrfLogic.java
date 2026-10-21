@@ -1,6 +1,8 @@
 package com.harness.llm.logic;
 
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -43,6 +45,12 @@ public final class CsrfLogic {
             "referer", "cache-control", "pragma", "upgrade-insecure-requests", "dnt", "te", "priority");
 
     /**
+     * The host of the foreign page a forged request is sent from: a reserved
+     * name (RFC 6761: .invalid never resolves), so it is no real site's origin.
+     */
+    public static final String CROSS_SITE_PAGE_HOST = "csrf-probe.invalid";
+
+    /**
      * Fields the change marker is never appended to: credentials, contact
      * details and links the account depends on, and identifiers. Matched
      * anywhere in the name, so it errs towards not marking.
@@ -73,6 +81,36 @@ public final class CsrfLogic {
         String n = name.trim().toLowerCase(Locale.ROOT);
         return n.startsWith(":") || n.startsWith("sec-fetch-") || n.startsWith("sec-ch-") || n.equals("sec-gpc")
                 || CROSS_SITE_SENDABLE_HEADERS.contains(n);
+    }
+
+    /**
+     * The browser-set headers of the forged request (batch RV-Q item Q1). The
+     * captured request carries the application's own Origin, Referer and
+     * Sec-Fetch-Site; the browser sets those from the page that sends the
+     * request, so a cross-site page cannot keep them, and a server that checks
+     * them refuses the real attack. The forged request is modelled as a POST
+     * form with rel="noreferrer" on a foreign page of the target's scheme --
+     * a request a browser does send: Origin is that page's origin, Referer is
+     * absent (so a Referer check that only applies when the header is present
+     * does not stop it), and Fetch Metadata says cross-site navigation with no
+     * user activation. Browsers send Fetch Metadata to an https target; to an
+     * http one only where they did so on the captured request.
+     *
+     * @param targetUrl the captured request's URL (its scheme is the foreign page's)
+     * @param capturedFetchMetadata true if the captured request carried a Sec-Fetch-* header
+     * @return header name to value, in order; a null value means the header is removed
+     */
+    public static Map<String, String> crossSiteBrowserHeaders(String targetUrl, boolean capturedFetchMetadata) {
+        boolean http = targetUrl != null && targetUrl.regionMatches(true, 0, "http://", 0, 7);
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Origin", (http ? "http://" : "https://") + CROSS_SITE_PAGE_HOST);
+        headers.put("Referer", null);
+        boolean fetchMetadata = !http || capturedFetchMetadata;
+        headers.put("Sec-Fetch-Site", fetchMetadata ? "cross-site" : null);
+        headers.put("Sec-Fetch-Mode", fetchMetadata ? "navigate" : null);
+        headers.put("Sec-Fetch-Dest", fetchMetadata ? "document" : null);
+        headers.put("Sec-Fetch-User", null);
+        return headers;
     }
 
     /**
@@ -146,7 +184,9 @@ public final class CsrfLogic {
      * one credential a browser attaches to a cross-site request by itself);
      * the captured request succeeded; the forged request -- token removed or
      * invalidated, every header a cross-site page cannot send removed (so
-     * no Authorization or custom credential header), cookie kept -- still
+     * no Authorization or custom credential header), Origin, Referer and
+     * Fetch Metadata those of a foreign page (see
+     * {@link #crossSiteBrowserHeaders}), cookie kept -- still
      * succeeded; the same forged request with no cookie either was refused,
      * so that success is owed to the session cookie and not to the action
      * being open to anyone; and an independent read-back shows the forged
@@ -203,8 +243,9 @@ public final class CsrfLogic {
         if (!isSuccess(forgedStatus)) {
             return new Evidence(Verdict.REJECTED, 0.85, false,
                     "The request was refused (status " + forgedStatus + ", was " + originalStatus
-                            + " with the real token) once the CSRF token was removed and only the session "
-                            + "cookie was left -- the token appears to be genuinely validated.", detail);
+                            + " with the real token) once the CSRF token was removed, only the session "
+                            + "cookie was left and it was sent as a foreign page would send it -- the token "
+                            + "or the request's cross-site origin is checked.", detail);
         }
         if (anonymousStatus < 0) {
             return new Evidence(Verdict.SUPPORTED, 0.5, false,

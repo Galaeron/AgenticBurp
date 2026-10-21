@@ -1428,6 +1428,20 @@ public final class ValidationExecutor {
                 forged = forged.withRemovedHeader(h.name());
             }
         }
+        // The browser sets Origin, Referer and Fetch Metadata from the page
+        // that sends the request, so the forged request carries a foreign
+        // page's (RV-Q item Q1): a server that checks them refuses the attack.
+        boolean capturedFetchMetadata = req.headers().stream()
+                .anyMatch(h -> h.name().toLowerCase(Locale.ROOT).startsWith("sec-fetch-"));
+        Map<String, String> crossSite = CsrfLogic.crossSiteBrowserHeaders(req.url(), capturedFetchMetadata);
+        List<String> sentAs = new ArrayList<>();
+        for (Map.Entry<String, String> h : crossSite.entrySet()) {
+            forged = forged.withRemovedHeader(h.getKey());
+            if (h.getValue() != null) {
+                forged = forged.withAddedHeader(h.getKey(), h.getValue());
+                sentAs.add(h.getKey() + ": " + h.getValue());
+            }
+        }
         HttpParameter markable = null;
         for (var p : req.parameters()) {
             if (p.type() == HttpParameterType.COOKIE) continue;
@@ -1482,6 +1496,8 @@ public final class ValidationExecutor {
         String probe = "token carriers: " + (tokenCarriers.isEmpty() ? "none" : String.join(", ", tokenCarriers))
                 + " | removed (a cross-site page cannot send them): "
                 + (removedHeaders.isEmpty() ? "none" : String.join(", ", removedHeaders))
+                + " | sent as a cross-site form from " + crossSite.get("Origin") + ": " + String.join(", ", sentAs)
+                + ", no Referer"
                 + (markable == null ? "" : " | change marker appended to field '" + markable.name() + "'");
         String detail = ev.detail() == null || ev.detail().isEmpty() ? probe : ev.detail() + " | " + probe;
         statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), detail);
