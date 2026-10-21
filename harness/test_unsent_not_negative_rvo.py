@@ -205,5 +205,133 @@ class CommandInjectionUnsentTests(_RvoBase):
         self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
 
 
+# ---------------------------------------------------------------- O3 stored XSS
+def _note_api(state, sent, *, render=lambda note: "<div>" + html.escape(note) + "</div>",
+              fail=lambda method, url: False):
+    """POST stores {"note": ...}; GET renders it as HTML (escaped by default)."""
+    async def request(client, method, url, **kwargs):
+        sent.append((method, str(url)))
+        if fail(method, str(url)):
+            raise _connect_error(method, url)
+        if method == "POST":
+            state.update(json.loads(kwargs["content"]))
+            state["posted"] = True
+            return _response(method, url, 201, "{}")
+        return httpx.Response(200, text=render(state["note"]), headers={"Content-Type": "text/html"},
+                              request=httpx.Request(method, url))
+    return request
+
+
+_FORM = ('<form method="POST" action="/post/comment">'
+         '<input type="hidden" name="csrf" value="fresh-token">'
+         '<input type="hidden" name="postId" value="1">'
+         '<input type="text" name="comment"></form>')
+
+
+def _blog(state, sent, *, fail=lambda method, url: False):
+    """A blog post page carrying a CSRF-bound comment form; POST /post/comment
+    stores the comment, rendered escaped under the form."""
+    async def request(client, method, url, **kwargs):
+        sent.append((method, str(url)))
+        if fail(method, str(url)):
+            raise _connect_error(method, url)
+        if method == "POST":
+            state["comment"] = parse_qs(kwargs.get("content") or "").get("comment", [""])[0]
+            state["posted"] = True
+            return _response(method, url, 302, "")
+        return httpx.Response(200, text=_FORM + "<div>" + html.escape(state["comment"]) + "</div>",
+                              headers={"Content-Type": "text/html"}, request=httpx.Request(method, url))
+    return request
+
+
+class _ExecutingDriver:
+    """Boundary double for the browser: it logs what the planted payload's
+    console.log computes (the product, E2), as an executing browser does."""
+
+    def __init__(self, state):
+        self.state, self.visits = state, []
+
+    async def visit(self, url, **kwargs):
+        self.visits.append(url)
+        m = re.search(r"console\.log\((\d+)\*(\d+)\)", self.state["note"])
+        return ExecutionObservation(url=url, console=[str(int(m[1]) * int(m[2]))] if m else [])
+
+
+class StoredXssUnsentTests(_RvoBase):
+    """O3: a plant that never landed, or a render that was never read back, is
+    not a negative. RV-E2's execution rule is unchanged."""
+
+    URL = "http://shop.invalid/note"
+
+    def _run(self, fake, *, driver=None, max_requests=None):
+        v = StoredXssValidator(allowed_hosts=["shop.invalid"], timeout=1.0, driver=driver)
+        ex = _json_exchange(self.URL, "POST", '{"note":"original"}')
+        if max_requests is not None:
+            return self._in_run("stored_xss", v, _finding("xss"), ex,
+                                max_requests=max_requests, fake_request=fake)
+        return self._validate("stored_xss", v, _finding("xss"), ex, fake)
+
+    def _form_run(self, fake):
+        ex = _json_exchange("http://shop.invalid/post/comment", "POST",
+                            "postId=1&comment=hello&csrf=stale")
+        ex.request_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        v = StoredXssValidator(allowed_hosts=["shop.invalid"], timeout=1.0)
+        return self._validate("stored_xss", v, _finding("xss"), ex, fake)
+
+    def test_every_plant_failing_is_not_a_negative(self):
+        sent = []
+        reports = self._run(_refuse_all(sent))
+        self.assertEqual([m for m, _ in sent], ["POST"] * 3, "each payload's plant should be tried")
+        self._assert_not_negative(reports, "inconclusive")
+        self.assertIn("ConnectError", _text(reports))
+
+    def test_every_plant_refused_by_the_budget_reads_as_blocked(self):
+        sent = []
+        reports = self._run(_refuse_all(sent), max_requests=0)
+        self.assertEqual(sent, [], "a refused send reached the target")
+        self._assert_not_negative(reports, "blocked")
+        self.assertIn("budget_exhausted", _text(reports))
+
+    def test_failed_render_after_a_successful_plant_is_not_a_negative(self):
+        state, sent = {"note": "original"}, []
+        reports = self._run(_note_api(state, sent, fail=lambda m, u: m == "GET"),
+                            driver=_ExecutingDriver(state))
+        self.assertTrue(state.get("posted"), "no plant landed -- vacuous")
+        self._assert_not_negative(reports, "inconclusive")
+        self.assertIn("render", _text(reports))
+
+    def test_failed_render_through_a_fresh_source_form_is_not_a_negative(self):
+        state, sent = {"comment": ""}, []
+        reports = self._form_run(_blog(state, sent,
+                                       fail=lambda m, u: m == "GET" and state.get("posted")))
+        self.assertTrue(state.get("posted"), "no plant landed -- vacuous")
+        self._assert_not_negative(reports, "inconclusive")
+
+    def test_failed_plants_through_a_fresh_source_form_are_not_a_negative(self):
+        state, sent = {"comment": ""}, []
+        reports = self._form_run(_blog(state, sent, fail=lambda m, u: m == "POST"))
+        self.assertIn(("GET", "http://shop.invalid/post?postId=1"), sent,
+                      "the source form was never fetched")
+        self._assert_not_negative(reports, "inconclusive")
+
+    def test_executed_payload_still_confirms(self):
+        state = {"note": "original"}
+        reports = self._run(_note_api(state, [], render=lambda note: "<div>" + note + "</div>"),
+                            driver=_ExecutingDriver(state))
+        self.assertEqual([r.status for r in reports], ["confirmed"], _verdicts(reports))
+
+    def test_completed_plants_and_renders_without_execution_stay_negative(self):
+        state, sent = {"note": "original"}, []
+        reports = self._run(_note_api(state, sent), driver=_ExecutingDriver(state))
+        self.assertIn("GET", [m for m, _ in sent])
+        self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
+
+    def test_completed_source_form_plants_stay_negative(self):
+        state, sent = {"comment": ""}, []
+        reports = self._form_run(_blog(state, sent))
+        self.assertTrue(state.get("posted"))
+        self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
+
+
 if __name__ == "__main__":
     unittest.main()

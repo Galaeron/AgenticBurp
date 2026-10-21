@@ -56,6 +56,27 @@ def _payloads(a: int, b: int) -> list[str]:
     return [f"<svg/onload={js}>", f"<script>{js}</script>", f"<img src=x onerror={js}>"]
 
 
+class _Recorded:
+    """A client whose sends are recorded in `attempts`, for a helper that
+    swallows its own transport errors (fetch_source_form skips a page it could
+    not read)."""
+
+    def __init__(self, client, attempts: list, stage: str):
+        self._client, self._attempts, self._stage = client, attempts, stage
+
+    async def request(self, method: str, url: str, **kwargs):
+        try:
+            resp = await self._client.request(method, url, **kwargs)
+        except SafetyGateBlocked as e:
+            self._attempts.append(("blocked", f"{self._stage} {url}: refused ({e.decision.reason})"))
+            raise
+        except httpx.HTTPError as e:
+            self._attempts.append(("error", f"{self._stage} {url}: {e.__class__.__name__}"))
+            raise
+        self._attempts.append(("ok", self._stage))
+        return resp
+
+
 def _text_fieldish(v) -> bool:
     return isinstance(v, str)
 
@@ -81,6 +102,38 @@ class StoredXssValidator(Validator):
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "xss", summary=why)
+
+    async def _request(self, client, method: str, url: str, attempts: list, stage: str, **kwargs):
+        """One throttled send, recorded in `attempts` as ("ok" | "blocked" |
+        "error", description). Returns the response, or None when it got none.
+        A gate or run refusal is recorded and re-raised: it refuses the rest too."""
+        await global_throttle.acquire()
+        try:
+            resp = await client.request(method, url, **kwargs)
+        except SafetyGateBlocked as e:
+            attempts.append(("blocked", f"{stage}: refused ({e.decision.reason})"))
+            raise
+        except httpx.HTTPError as e:
+            attempts.append(("error", f"{stage}: {e.__class__.__name__}"))
+            return None
+        attempts.append(("ok", stage))
+        return resp
+
+    def _incomplete(self, attempts: list, method: str, write_path: str,
+                    via: str = "") -> ValidationResult:
+        """A plant or render that got no response is not a negative (RV-L rule)."""
+        unsent = [(kind, why) for kind, why in attempts if kind != "ok"]
+        answered = len(attempts) - len(unsent)
+        refused = any(kind == "blocked" for kind, _ in unsent)
+        failed = "; ".join(why for _, why in unsent[:4])
+        return ValidationResult(
+            self.name, "blocked" if refused and not answered else "inconclusive", "xss",
+            confidence=0.0, confirmed=False,
+            summary=f"Stored-XSS check incomplete: {len(unsent)} of {len(attempts)} send(s) got no "
+                    f"response ({failed}); not a negative result",
+            evidence=(f"Planted script-executable payloads via {method} {write_path}{via}; no "
+                      f"unescaped render was seen, but a plant or render that never got a response "
+                      f"cannot show one."))
 
     def _json_object(self, body: str):
         try:
@@ -191,11 +244,12 @@ class StoredXssValidator(Validator):
         return urlencode(pairs)
 
     async def _plant_via_source_form(self, exchange: HttpExchange, gate, headers: dict,
-                                     method: str, render_urls: list[str]):
+                                     method: str, render_urls: list[str], attempts: list):
         """Session-aware plant: GET the source page in THIS client's session to
         obtain a fresh CSRF-bound form, plant into it, then read it back. Returns
-        a ValidationResult when a matching source form was found (confirmed or
-        not), or None to let the caller fall back to the captured-body plant."""
+        a ValidationResult when a matching source form was found (confirmed,
+        candidate, incomplete or not), or None to let the caller fall back to the
+        captured-body plant. Every send is recorded in `attempts`."""
         from harness.validators.source_form import fetch_source_form
         action_path = urlsplit(exchange.url).path
         read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
@@ -205,26 +259,32 @@ class StoredXssValidator(Validator):
                         if urlsplit(f.action).path == action_path
                         and (f.method or "POST").upper() == method), None)
 
+        candidate, via = None, ""
         try:
             async with GatedAsyncClient(gate, self.name, timeout=self.timeout,
                                         follow_redirects=False, verify=False) as client:
-                found = await fetch_source_form(client, self._source_page_candidates(exchange),
+                found = await fetch_source_form(_Recorded(client, attempts, "source page GET"),
+                                                self._source_page_candidates(exchange),
                                                 read_headers, select)
                 if found is None:
                     return None  # no discoverable source form -> caller falls back
                 fresh, source_url = found.form, found.source_url
                 via = f" through a fresh CSRF-bound form from {source_url}"
                 a, b, expected = _challenge()
-                candidate = None
                 for payload in _payloads(a, b):
                     plant_body = self._form_plant_body(fresh, payload)
                     planted_headers = dict(headers)
                     planted_headers["Content-Type"] = "application/x-www-form-urlencoded"
-                    await global_throttle.acquire()
-                    await client.request(method, fresh.action, headers=planted_headers, content=plant_body)
+                    if await self._request(client, method, fresh.action, attempts,
+                                           f"plant {method} {urlsplit(fresh.action).path}",
+                                           headers=planted_headers, content=plant_body) is None:
+                        continue  # this payload never landed; try the next shape
                     for rurl in [source_url, *render_urls]:
-                        await global_throttle.acquire()
-                        rr = await client.request("GET", rurl, headers=read_headers or None)
+                        rr = await self._request(client, "GET", rurl, attempts,
+                                                 f"render GET {urlsplit(rurl).path}",
+                                                 headers=read_headers or None)
+                        if rr is None:
+                            continue
                         if ("html" in (rr.headers.get("content-type") or "").lower()
                                 and payload in (rr.text or "")):
                             executed, note = await self._browser_confirm(rurl, expected)
@@ -236,13 +296,18 @@ class StoredXssValidator(Validator):
                             break  # inert here; try the next payload shape
                 if candidate:
                     return self._unproven(method, action_path, *candidate, via)
+                if any(kind != "ok" for kind, _ in attempts):
+                    return self._incomplete(attempts, method, action_path, via)
                 return ValidationResult(
                     self.name, "not_confirmed", "xss", confidence=0.0, confirmed=False,
                     summary="No stored XSS: planted payloads were not reflected unescaped in an HTML render",
                     evidence=(f"Submitted a fresh CSRF-bound form at {action_path} and re-read the "
                               f"rendered page; the payload never returned unescaped in a text/html response."))
         except SafetyGateBlocked:
-            return self._skip("mutating stored-XSS plant not authorized (validators.allow_mutating_replay)")
+            # recorded where it was raised; it refuses every further send
+            if candidate:
+                return self._unproven(method, action_path, *candidate, via)
+            return self._incomplete(attempts, method, action_path, via)
         except httpx.HTTPError:
             return None
 
@@ -258,6 +323,9 @@ class StoredXssValidator(Validator):
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("content-length", "host")}
         render_urls = self._render_urls(exchange.url)
+        # Every send, as ("ok" | "blocked" | "error", description): a plant that
+        # never landed, or a render never read back, is not a negative (RV-L rule).
+        attempts: list[tuple[str, str]] = []
 
         # Form (urlencoded) writes are commonly CSRF-token-bound: the captured
         # token belongs to the crawl's session, so a fresh client is rejected
@@ -265,25 +333,31 @@ class StoredXssValidator(Validator):
         # session from the source page first; only fall back to replaying the
         # captured body when no source form is discoverable (e.g. a JSON API).
         if self._json_object(exchange.request_body or "") is None and "=" in (exchange.request_body or ""):
-            via_source = await self._plant_via_source_form(exchange, gate, headers, method, render_urls)
+            via_source = await self._plant_via_source_form(exchange, gate, headers, method,
+                                                           render_urls, attempts)
             if via_source is not None:
                 return via_source
 
         write_path = urlsplit(exchange.url).path
         a, b, expected = _challenge()
         candidate = None
+        read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
         for payload in _payloads(a, b):
             body, ctype = self._plant_body(exchange, payload)
             planted_headers = dict(headers); planted_headers["Content-Type"] = ctype
             try:
                 async with GatedAsyncClient(gate, self.name, timeout=self.timeout,
                                             follow_redirects=False, verify=False) as client:
-                    await global_throttle.acquire()
-                    await client.request(method, exchange.url, headers=planted_headers, content=body)
-                    read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+                    if await self._request(client, method, exchange.url, attempts,
+                                           f"plant {method} {write_path}",
+                                           headers=planted_headers, content=body) is None:
+                        continue  # this payload never landed; try the next shape
                     for rurl in render_urls:
-                        await global_throttle.acquire()
-                        r = await client.request("GET", rurl, headers=read_headers or None)
+                        r = await self._request(client, "GET", rurl, attempts,
+                                                f"render GET {urlsplit(rurl).path}",
+                                                headers=read_headers or None)
+                        if r is None:
+                            continue
                         ct = (r.headers.get("content-type") or "").lower()
                         if "html" in ct and payload in (r.text or ""):
                             # R19: an unescaped string is not execution (an inert
@@ -297,11 +371,11 @@ class StoredXssValidator(Validator):
                                 return self._unproven(method, write_path, *candidate)
                             break  # inert here; try the next payload shape
             except SafetyGateBlocked:
-                return self._skip("mutating stored-XSS plant not authorized (validators.allow_mutating_replay)")
-            except httpx.HTTPError:
-                continue
+                break  # recorded by _request; the gate or run refuses every further send
         if candidate:
             return self._unproven(method, write_path, *candidate)
+        if any(kind != "ok" for kind, _ in attempts):
+            return self._incomplete(attempts, method, write_path)
         return ValidationResult(
             self.name, "not_confirmed", "xss", confidence=0.0, confirmed=False,
             summary="No stored XSS: planted payloads were not reflected unescaped in an HTML render",
