@@ -65,6 +65,8 @@ async def fetch_source_form(
     candidates: list[str],
     headers: dict | None,
     select: Callable[[list[FormAction]], FormAction | None],
+    *,
+    failures: list[str] | None = None,
 ) -> SourceForm | None:
     """GET each of `candidates` in turn, in THIS client's session, and return
     the first form a caller's `select` accepts.
@@ -75,7 +77,11 @@ async def fetch_source_form(
     form on this page", which moves on to the next candidate. A candidate
     whose GET raises an httpx error, or whose response isn't HTML, is skipped
     the same way. Returns None when no candidate yields a match, so the
-    caller can fall back to its own captured-body behavior.
+    caller can fall back to its own captured-body behavior. A caller passing
+    `failures` gets one entry per candidate GET that raised, so it can tell
+    "no source page answered" from "no form matched" (RV-P P8): a fallback
+    after a failed fetch is not the same evidence as one after a page with
+    no matching form.
 
     Each GET is throttled exactly like the write-side requests (one
     `global_throttle.acquire()` per attempt) and is not itself gated here --
@@ -86,7 +92,9 @@ async def fetch_source_form(
         await global_throttle.acquire()
         try:
             resp = await client.request("GET", url, headers=headers or None)
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            if failures is not None:
+                failures.append(f"GET {url}: {e.__class__.__name__}")
             continue
         if "html" not in (resp.headers.get("content-type") or "").lower():
             continue
