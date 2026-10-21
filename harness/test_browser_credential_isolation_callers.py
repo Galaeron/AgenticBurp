@@ -167,6 +167,16 @@ class _BrowserFixture(unittest.TestCase):
                 f'<iframe src="{a}/redir-host"></iframe><iframe src="{a}/redir-out"></iframe>'
                 f'<img src="{a}/redir-port"><img src="{a}/redir-same">'
                 f'<script>fetch("{a}/redir-host", {{credentials: "include"}}).catch(() => 0)</script>'),
+            "/cross-cookies": _html(
+                '<script>const load = src => new Promise(r => {'
+                ' const i = new Image(); i.onload = i.onerror = r; i.src = src; });'
+                f'Promise.all([load("{h}/to-a"), load("{a}/to-h"), load("/hop-same")])'
+                f'.then(() => Promise.all([fetch("/after-a"), load("{h}/after-h")]))'
+                '.then(() => console.log("cross-cookies done"))</script>'),
+            "/to-h": _redirect(f"{h}/set-h"),
+            "/hop-same": _redirect("/set-same"),
+            "/set-a": (200, {"Set-Cookie": "fromA=A-ONLY; Path=/"}, "a"),
+            "/set-same": (200, {"Set-Cookie": "same=SAME-OK; Path=/"}, "same"),
             "/chain": _redirect(f"{b}/bounce"),
             "/back": _html("back on A"),
             "/rotate": (200, [("Content-Type", "text/html"),
@@ -184,7 +194,9 @@ class _BrowserFixture(unittest.TestCase):
         }.get(path)
 
     def _pages_b(self, path):
-        return {"/bounce": _redirect(f"{self.a.origin}/back")}.get(path)
+        return {"/bounce": _redirect(f"{self.a.origin}/back"),
+                "/to-a": _redirect(f"{self.a.origin}/set-a"),
+                "/set-h": (200, {"Set-Cookie": "hc=H-ONLY; Path=/"}, "h")}.get(path)
 
     def _visit(self, path, *, mode="visit", headers=IDENTITY, scope=SCOPE, wait_ms=1500):
         driver = PlaywrightDriver()
@@ -292,6 +304,28 @@ class RedirectHopTests(_BrowserFixture):
             self._visit("/redir-port")
         self.assertTrue(self.b.credentialed(),
                         "a natively followed hop no longer carries the identity -- vacuous")
+
+    def test_a_redirect_files_cookies_only_under_the_host_that_set_them(self):
+        obs = self._visit("/cross-cookies")
+        self.assertIn("cross-cookies done", obs.console)
+        self.assertCredentialed("/after-a")
+        _, a_cookie = self.a.received("/after-a")[0]
+        self.assertIn("same=SAME-OK", a_cookie, "a same-host hop's cookie was lost")
+        self.assertNotIn("hc=H-ONLY", a_cookie, "H's cookie was filed under A")
+        # Chromium refuses a SameSite=Lax cookie from a cross-site image anyway,
+        # so this direction is a guard only; the A direction above is the probe.
+        _, h_cookie = self.h.received("/after-h")[0]
+        self.assertNotIn("fromA=A-ONLY", h_cookie, "A's cookie was filed under H")
+        self.assertOnlyRunOriginCredentialed()
+
+    def test_filing_another_hosts_cookies_is_detected(self):
+        """Fault injection: the host check on a followed redirect's cookies is
+        dropped, so the final answer from H is filed under A."""
+        with patch("harness.browser_driver._same_cookie_host", return_value=True):
+            self._visit("/cross-cookies")
+        _, a_cookie = self.a.received("/after-a")[0]
+        self.assertIn("hc=H-ONLY", a_cookie,
+                      "another host's cookie no longer lands under A -- vacuous")
 
     def test_allowing_service_workers_is_detected(self):
         """Fault injection: the context lets service workers run (their traffic is

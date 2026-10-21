@@ -437,6 +437,12 @@ def _cookie_pair(set_cookie: str) -> tuple[str, str, bool]:
     return name.strip(), value.strip(), not value.strip() or "max-age=0" in attrs_l
 
 
+def _same_cookie_host(url: str, other: str) -> bool:
+    """Cookies are filed by host (any port), so fulfill() may hand the browser a
+    Set-Cookie only from the requested URL's own host."""
+    return ScopePolicy.host_of(url) == ScopePolicy.host_of(other)
+
+
 async def _quietly(awaitable) -> None:
     try:
         await awaitable
@@ -544,10 +550,10 @@ class _IdentityRouter:
         resource_type = request.resource_type
         headers = dict(request.headers)
         body = request.post_data_buffer
-        # Cookies set by the hops of a subresource redirect this router follows:
-        # sent on later hops to the same host, and handed to the browser only
-        # when set by the requested URL's own host (fulfill() files every
-        # Set-Cookie under that host).
+        # Cookies set along a subresource redirect this router follows: sent on
+        # later hops to the same host, and handed to the browser only when set
+        # by the requested URL's own host, the final answer's included
+        # (fulfill() files every Set-Cookie under that host).
         hop_cookies: dict = {}
         hop_set_cookies: list = []
         for _ in range(_MAX_REDIRECT_HOPS + 1):
@@ -555,9 +561,11 @@ class _IdentityRouter:
             fulfilled = self._response_headers(response, url)
             location = response.headers.get("location")
             if response.status_code not in _REDIRECT_STATUSES or not location:
-                if hop_set_cookies:
-                    fulfilled["set-cookie"] = "\n".join(
-                        hop_set_cookies + ([fulfilled["set-cookie"]] if "set-cookie" in fulfilled else []))
+                final = fulfilled.pop("set-cookie", "")
+                if not _same_cookie_host(url, request.url):
+                    final = ""
+                if hop_set_cookies or final:
+                    fulfilled["set-cookie"] = "\n".join(hop_set_cookies + ([final] if final else []))
                 await route.fulfill(status=response.status_code, headers=fulfilled,
                                     body=response.content)
                 return
@@ -585,7 +593,7 @@ class _IdentityRouter:
                 name, cookie_value, deletes = _cookie_pair(value)
                 jar = hop_cookies.setdefault(host, {})
                 jar.pop(name, None) if deletes else jar.__setitem__(name, cookie_value)
-                if host == ScopePolicy.host_of(request.url):
+                if _same_cookie_host(url, request.url):
                     hop_set_cookies.append(value)
             if next_method != method:
                 body = None
