@@ -13,12 +13,15 @@ data-flow confirmation (#5): the value provably crosses requests.
   2. RENDER  -- independently GET the resource (and its collection) again.
   3. CONFIRM -- stored XSS only when the payload comes back UNESCAPED in a
                 text/html response on that independent read AND a headless
-                browser loading that page logs a console message EXACTLY equal
-                to the value THIS attempt's payload computes at run time (R19,
-                E2). The payload logs a product of two random operands, so the
-                stored text holds the operands but never the result: a page
-                that logs the stored source (a textarea's value) shows the
-                operands, not the product. The unescaped string alone is a
+                browser loading that page logs a console message, or raises an
+                alert/confirm/prompt dialog, EXACTLY equal to the value THIS
+                attempt's payload computes at run time (R19, E2; the dialog is
+                RV-O O8, an owner decision of 2026-10-21). The payload alerts
+                and logs a product of two random operands, so the stored text
+                holds the operands but never the result: a page that logs the
+                stored source (a textarea's value) shows the operands, not the
+                product. Any other dialog, or a page error, is noted as a
+                candidate to check by hand. The unescaped string alone is a
                 candidate (inconclusive): an inert context (<textarea>, a comment,
                 a CSP) stores it without running it, and with no browser there is
                 no execution proof. A JSON API that stores-and-returns the string
@@ -52,8 +55,50 @@ def _challenge() -> tuple[int, int, str]:
 
 
 def _payloads(a: int, b: int) -> list[str]:
-    js = f"console.log({a}*{b})"
+    # Alert first: a sink that lets only alert() run still shows the product (RV-O O8).
+    js = f"alert({a}*{b});console.log({a}*{b})"
     return [f"<svg/onload={js}>", f"<script>{js}</script>", f"<img src=x onerror={js}>"]
+
+
+_DIALOG_TYPES = ("alert", "confirm", "prompt")
+
+
+def _dialog_messages(obs) -> list[str]:
+    """The message of each alert/confirm/prompt dialog the page raised (the
+    driver records one as "type:message")."""
+    out = []
+    for entry in getattr(obs, "dialogs", None) or []:
+        kind, sep, message = str(entry).partition(":")
+        if sep and kind in _DIALOG_TYPES:
+            out.append(message.strip())
+    return out
+
+
+def _unmatched_signal(obs) -> tuple[str, str]:
+    """(note, detail) for a page that raised a dialog or a page error without
+    the computed product -- a candidate to check by hand, never a negative
+    (RV-O O8) -- or ("", "") when it raised neither."""
+    if getattr(obs, "dialogs", None):
+        return ("a dialog fired, but not with the computed value; check manually",
+                f"dialog {str(obs.dialogs[0])[:120]!r}")
+    if getattr(obs, "page_errors", None):
+        return ("a page error was raised, but no computed value was shown; check manually",
+                f"error {str(obs.page_errors[0])[:120]!r}")
+    return "", ""
+
+
+# The closing sentence of a confirm shown by a dialog alone, and the marker of a
+# candidate note that asks for a manual check (RV-O O8).
+_DIALOG_ONLY = "Execution was shown by a dialog only, not by the console."
+_CHECK_MANUALLY = "check manually"
+
+
+def _keep(candidate, payload: str, rurl: str, note: str):
+    """The candidate to report: the first one, unless a later one raised a
+    dialog or a page error and it did not."""
+    if candidate is None or (_CHECK_MANUALLY in note and _CHECK_MANUALLY not in candidate[2]):
+        return payload, rurl, note
+    return candidate
 
 
 class _Recorded:
@@ -290,7 +335,7 @@ class StoredXssValidator(Validator):
                             executed, note = await self._browser_confirm(rurl, expected)
                             if executed:
                                 return self._executed(method, action_path, payload, rurl, note, via)
-                            candidate = candidate or (payload, rurl, note)
+                            candidate = _keep(candidate, payload, rurl, note)
                             if executed is None:
                                 return self._unproven(method, action_path, *candidate, via)
                             break  # inert here; try the next payload shape
@@ -362,11 +407,12 @@ class StoredXssValidator(Validator):
                         if "html" in ct and payload in (r.text or ""):
                             # R19: an unescaped string is not execution (an inert
                             # <textarea>, a comment, a CSP). Only the payload's
-                            # computed value, logged by a browser, confirms.
+                            # computed value, logged or shown in a dialog by a
+                            # browser, confirms.
                             executed, note = await self._browser_confirm(rurl, expected)
                             if executed:
                                 return self._executed(method, write_path, payload, rurl, note)
-                            candidate = candidate or (payload, rurl, note)
+                            candidate = _keep(candidate, payload, rurl, note)
                             if executed is None:
                                 return self._unproven(method, write_path, *candidate)
                             break  # inert here; try the next payload shape
@@ -384,10 +430,11 @@ class StoredXssValidator(Validator):
 
     def _executed(self, method: str, write_path: str, payload: str, rurl: str, note: str,
                   via: str = "") -> ValidationResult:
+        shown = " (shown by a dialog only)" if note.endswith(_DIALOG_ONLY) else ""
         return ValidationResult(
             self.name, "confirmed", "xss", confidence=0.95, confirmed=True,
-            summary=f"Stored XSS confirmed: a payload written via {method} {write_path} executed when "
-                    f"{urlsplit(rurl).path} was rendered on an independent read.",
+            summary=f"Stored XSS confirmed{shown}: a payload written via {method} {write_path} "
+                    f"executed when {urlsplit(rurl).path} was rendered on an independent read.",
             evidence=(f"Planted {payload!r}{via}; an independent GET of {rurl} returned it intact "
                       f"(angle brackets + handler) in a text/html response -- stored, not just "
                       f"reflected. {note}"))
@@ -405,12 +452,14 @@ class StoredXssValidator(Validator):
 
     async def _browser_confirm(self, url: str, expected: str) -> tuple[bool | None, str]:
         """Load the rendered page in a headless browser and look for a console
-        message exactly equal to ``expected``, the value THIS attempt's payload
-        computes when it runs. Returns (executed, note): True only for that
-        exact event; False when the page loaded and the payload did not run;
-        None when no browser could check. Any other console output, including
-        a message that merely contains the payload's text, is the page's own
-        (E2: a page that logs the stored source echoes it without running it)."""
+        message, or an alert/confirm/prompt dialog, exactly equal to
+        ``expected``, the value THIS attempt's payload computes when it runs
+        (RV-O O8 added the dialog). Returns (executed, note): True only for
+        that exact event; False when the page loaded and the payload did not
+        run, the note saying so when a dialog or page error fired; None when no
+        browser could check. Any other output, including a message that merely
+        contains the payload's text, is the page's own (E2: a page that logs
+        the stored source echoes it without running it)."""
         driver = self._driver
         try:
             if driver is None:
@@ -430,4 +479,12 @@ class StoredXssValidator(Validator):
             return True, (f"Execution confirmed: the payload executed in a headless browser "
                           f"(it logged {expected}, a value computed at run time that the stored "
                           f"text does not contain).")
+        if expected in _dialog_messages(obs):
+            return True, (f"Execution confirmed: the payload executed in a headless browser "
+                          f"(a dialog showed {expected}, a value computed at run time that the "
+                          f"stored text does not contain). {_DIALOG_ONLY}")
+        signal, detail = _unmatched_signal(obs)
+        if signal:
+            return False, (f"A headless browser loaded {url}: {signal} ({detail}); the computed "
+                           f"value was not shown.")
         return False, f"A headless browser loaded {url} and the payload did not execute."

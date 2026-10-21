@@ -1,11 +1,13 @@
 """Code review 02, batch RV-O: RV-L's rule for four more validators, SSRF's late
-callback, and RV-M's coverage-record residuals.
+callback, RV-M's coverage-record residuals, and the owner's XSS dialog rule.
 
 O1 header_injection, O2 command_injection, O3 stored_xss and O4
 web_cache_poisoning returned a negative when no probe was answered. O5 lets an
 SSRF out-of-band send that may have been delivered (the request was written,
 the response was lost) wait for its callback. O6 lists unfinished coverage
-cells and keeps unavailable live-leg reasons where the run can show them.
+cells and keeps unavailable live-leg reasons where the run can show them. O8
+(owner decision, 2026-10-21) lets a dialog showing the computed product confirm
+XSS, and makes any other dialog or a page error a labelled candidate.
 
 Each test drives the production caller, ``Orchestrator._validate_findings``,
 with the transport faked below the gated client and the run transport (so the
@@ -28,10 +30,14 @@ from harness.coverage_model import CellStatus, derive_input_cases
 from harness.coverage_tracker import CoverageTracker, build_coverage, endpoint_view
 from harness.orchestrator_confirm import log as confirm_log
 from harness.test_coverage_tracker import _state_with
-from harness.test_confirmation_soundness_rve import _finding, _json_exchange, _verdicts
+from harness.test_confirmation_soundness_rve import (_finding, _json_exchange, _note_server,
+                                                     _verdicts)
 from harness.test_default_history_caller import _exchange
-from harness.test_unsent_not_negative_rvl import (_Collaborator, _RvlBase, _refuse_all, _response,
-                                                  _text)
+from harness.test_unsent_not_negative_rvl import (_Collaborator, _RvlBase, _evaluate_logged,
+                                                  _injected, _refuse_all, _response, _text)
+from harness.validators import browser_xss_validator, dom_xss_validator, stored_xss_validator
+from harness.validators.browser_xss_validator import BrowserXssValidator
+from harness.validators.dom_xss_validator import DomXssValidator
 from harness.validators.command_injection_validator import CommandInjectionValidator
 from harness.validators.header_injection_validator import HeaderInjectionValidator
 from harness.validators.ssrf_validator import SsrfValidator
@@ -581,6 +587,144 @@ class LiveMarkerReportTests(_RvoBase):
         orch, markers = self._markers(fake)
         self.assertEqual(markers, frozenset())
         self.assertEqual(orch.leg_self_test_report, {})
+
+
+# ------------------------------------------------------ O8 XSS dialog rule
+def _alerted(source: str) -> list[str]:
+    """What a browser's alert dialog shows when an alert(a*b) payload runs."""
+    return [f"alert:{int(a) * int(b)}" for a, b in re.findall(r"alert\((\d+)\*(\d+)\)", source)]
+
+
+class _Page:
+    """A browser double: `run(source)` maps the injected or stored text to the
+    observation the page produces. A stored page reads the stored note."""
+
+    def __init__(self, run, part="query", state=None):
+        self.run, self.part, self.state, self.visits = run, part, state, []
+
+    async def visit(self, url, **kwargs):
+        self.visits.append(url)
+        source = self.state["note"] if self.state is not None else _injected(url, self.part)
+        return ExecutionObservation(url=url, **self.run(source))
+
+
+def _console(src):
+    return {"console": _evaluate_logged(src)}
+
+
+def _dialog_only(src):
+    return {"dialogs": _alerted(src)}
+
+
+def _own_alert(src):
+    return {"dialogs": ["alert:Welcome back!"]}
+
+
+def _page_error(src):
+    return {"page_errors": ["TypeError: widget is undefined"]}
+
+
+def _echo_console(src):
+    return {"console": [src]}
+
+
+def _echo_dialog(src):
+    return {"dialogs": [f"alert:{src}"]}
+
+
+class XssDialogRuleTests(_RvoBase):
+    """O8 (owner decision, 2026-10-21): a console message or an alert/confirm/
+    prompt dialog exactly equal to str(a*b) confirms; any other dialog or a page
+    error is a labelled candidate, never not_confirmed; an echo never confirms."""
+
+    def _browser(self, run):
+        page = _Page(run, "query")
+        return page, self._validate(
+            "browser_xss", BrowserXssValidator(allowed_hosts=["shop.invalid"], driver=page),
+            _finding("xss"), _exchange("http://shop.invalid/search?q=hello"))
+
+    def _dom(self, run):
+        page = _Page(run, "fragment")
+        return page, self._validate(
+            "dom_xss", DomXssValidator(allowed_hosts=["shop.invalid"], driver=page),
+            _finding("dom_xss"), _exchange("http://shop.invalid/page?ref=1"))
+
+    def _stored(self, run):
+        state = {"note": "original"}
+        page = _Page(run, state=state)
+        return page, self._validate(
+            "stored_xss", StoredXssValidator(allowed_hosts=["shop.invalid"], driver=page),
+            _finding("xss"), _json_exchange("http://shop.invalid/note", "POST", '{"note":"original"}'),
+            _note_server(state, lambda note: "<div>" + note + "</div>"))
+
+    def _each(self):
+        return (("browser_xss", self._browser), ("dom_xss", self._dom), ("stored_xss", self._stored))
+
+    def test_console_execution_confirms(self):
+        for key, run in self._each():
+            with self.subTest(key):
+                _page, reports = run(_console)
+                self.assertEqual([r.status for r in reports], ["confirmed"], _text(reports))
+                self.assertIn("console", _text(reports))
+                self.assertNotIn("dialog only", _text(reports))
+
+    def test_dialog_only_execution_with_the_product_confirms_and_says_so(self):
+        for key, run in self._each():
+            with self.subTest(key):
+                _page, reports = run(_dialog_only)
+                self.assertEqual([r.status for r in reports], ["confirmed"], _text(reports))
+                self.assertTrue(reports[0].confirmed)
+                self.assertIn("dialog only", reports[0].summary)
+                self.assertIn("not by the console", reports[0].evidence)
+
+    def test_page_alerting_something_else_is_a_labelled_candidate(self):
+        for key, run in self._each():
+            with self.subTest(key):
+                page, reports = run(_own_alert)
+                self.assertTrue(page.visits, "no page was loaded -- vacuous")
+                self.assertFalse(any(r.confirmed for r in reports), _text(reports))
+                self.assertEqual([r.status for r in reports], ["inconclusive"], _verdicts(reports))
+                self.assertIn("a dialog fired, but not with the computed value; check manually",
+                              _text(reports))
+
+    def test_page_error_is_a_labelled_candidate(self):
+        for key, run in self._each():
+            with self.subTest(key):
+                page, reports = run(_page_error)
+                self.assertTrue(page.visits, "no page was loaded -- vacuous")
+                self.assertEqual([r.status for r in reports], ["inconclusive"], _verdicts(reports))
+                self.assertIn("a page error was raised, but no computed value was shown; "
+                              "check manually", _text(reports))
+
+    def test_echoed_payload_never_confirms(self):
+        # Control: the payload's source, logged or shown in a dialog, holds the
+        # operands, not the product. A console echo keeps its old verdict
+        # (stored XSS: the raw render is a candidate); a dialog echo is a
+        # labelled candidate (O8), never a confirm.
+        old = {"browser_xss": "not_confirmed", "dom_xss": "not_confirmed", "stored_xss": "inconclusive"}
+        for key, run in self._each():
+            with self.subTest(key, echo="console"):
+                page, reports = run(_echo_console)
+                self.assertTrue(page.visits, "no page was loaded -- vacuous")
+                self.assertFalse(any(r.confirmed for r in reports), _text(reports))
+                self.assertEqual([r.status for r in reports], [old[key]], _verdicts(reports))
+            with self.subTest(key, echo="dialog"):
+                _page, reports = run(_echo_dialog)
+                self.assertFalse(any(r.confirmed for r in reports), _text(reports))
+                self.assertEqual([r.status for r in reports], ["inconclusive"], _verdicts(reports))
+                self.assertIn("not with the computed value", _text(reports))
+
+    def test_every_payload_alerts_and_logs_the_product_it_never_contains(self):
+        payload_sets = (browser_xss_validator._payloads, dom_xss_validator._fragment_payloads,
+                        stored_xss_validator._payloads)
+        for _ in range(20):
+            a, b, expected = stored_xss_validator._challenge()
+            for make in payload_sets:
+                for payload in make(a, b):
+                    with self.subTest(payload=payload):
+                        self.assertNotIn(expected, payload)
+                        self.assertEqual(_evaluate_logged(payload), [expected])
+                        self.assertEqual(_alerted(payload), [f"alert:{expected}"])
 
 
 if __name__ == "__main__":
