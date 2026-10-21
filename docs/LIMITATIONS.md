@@ -122,6 +122,28 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
 - **[open] Bodies sent to the model unredacted; cloud egress needs a policy.**
   Only auth headers are masked. `cloud_reasoning` sends real content off-host.
   See USER_MANUAL §5. Redaction before cloud is not implemented.
+- **[open] "Passive" analysis looks up components at third-party services.**
+  With the shipped config (`github_advisories`, `package_registry_checks` and
+  `kev_check` all enabled), a component that an agent names and that is literally
+  present in the captured exchange (a `Server`/`X-Powered-By` banner, a library
+  banner, a manifest in a response body) is looked up off-host. The package name
+  and ecosystem are sent to `api.github.com` (advisory search) and, for npm/PyPI
+  names, to `registry.npmjs.org` or `pypi.org` (package age); any
+  `GITHUB_TOKEN` or `github_advisories.token` goes to GitHub as well. The
+  version is compared locally and is not sent. The CISA KEV catalog
+  (`www.cisa.gov`) is downloaded whole and matched locally, and the Aikido
+  malware-feed loader (`malware-list.aikido.dev`, same switch) is not called by
+  the analysis path today. These services can still infer which technologies a
+  client's target runs, and see the analyst's IP. To stop all of it, set
+  `privacy: {external_lookups: false}` in git-ignored `harness/config.local.yaml`
+  and restart; the value must be an unquoted boolean (a quoted `"false"` is
+  rejected at startup). With it off, those analysis stages produce no report
+  at all, so absence means "not checked", not "clean"; a local
+  `github_advisories.snapshot_path` or `kev_check.local_file` still works because
+  it makes no network call. Requests per service are counted under `events` in
+  `/telemetry` as `external_lookup:<service>` (service names only). The default
+  stays on, matching earlier behaviour; whether it should default off is an open
+  owner decision. The `passive-only` operating profile does not change it.
 - **[open] Data on disk is unencrypted** with no per-engagement separation; a
   wipe endpoint exists (`enable_wipe_endpoint`) but is not automatic.
 
