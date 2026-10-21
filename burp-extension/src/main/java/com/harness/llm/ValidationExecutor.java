@@ -1340,8 +1340,55 @@ public final class ValidationExecutor {
             HttpRequest tokenAlone = bare.withAddedHeader(carrier.headerName(), carrier.headerValue(originalToken));
             int tokenAloneStatus = sameHeaders(tokenAlone, req) ? originalStatus : status(api.http().sendRequest(tokenAlone));
             ev2 = JwtForgeryLogic.requireTokenAloneAccepted(ev2, tokenAloneStatus);
+            // Refused alone, the token may need a cookie that is no credential
+            // (a tenant, a locale): probe again with only those kept (RV-Q item Q3).
+            String kept = JwtForgeryLogic.nonCredentialCookies(cookieHeaders(req), carrier);
+            if (ev2.verdict() == JwtForgeryLogic.Verdict.INCONCLUSIVE && kept != null) {
+                ev2 = jwtWithKeptCookies(bare, carrier, kept, originalStatus, originalLen, ev2);
+            }
         }
         statusFor(plan, source, ev2.verdict().name().toLowerCase(Locale.ROOT), ev2.confidence(), ev2.confirmed(), ev2.summary(), ev2.detail() + " | " + carried);
+    }
+
+    /**
+     * The original token, then each forged token, sent with the request's
+     * non-credential cookies kept; the no-token control, sent only after a
+     * forged token got a 2xx, is the kept cookies alone. At most four
+     * requests. See JwtForgeryLogic.withKeptCookies.
+     */
+    private JwtForgeryLogic.Evidence jwtWithKeptCookies(HttpRequest bare, JwtForgeryLogic.Carrier carrier, String kept,
+                                                        int originalStatus, int originalLen,
+                                                        JwtForgeryLogic.Evidence tokenAloneRefused) {
+        String token = carrier.token();
+        int tokenWithKept = status(api.http().sendRequest(withKeptCookies(bare, carrier, kept, token)));
+        JwtForgeryLogic.Evidence forged = null;
+        if (JwtForgeryLogic.isSuccess(tokenWithKept)) {
+            String[][] variants = {{"alg:none", JwtForgeryLogic.forgeAlgNone(token)},
+                    {"garbled signature", JwtForgeryLogic.forgeGarbledSignature(token)}};
+            for (String[] variant : variants) {
+                if (variant[1] == null) continue;
+                var resp = api.http().sendRequest(withKeptCookies(bare, carrier, kept, variant[1])).response();
+                if (resp == null) continue;
+                boolean accepted = JwtForgeryLogic.isSuccess(resp.statusCode());
+                int keptAloneStatus = accepted ? status(api.http().sendRequest(bare.withAddedHeader("Cookie", kept))) : -1;
+                forged = JwtForgeryLogic.evaluate(variant[0] + ", with the kept cookies", originalStatus, resp.statusCode(),
+                        originalLen, resp.bodyToString().length(), keptAloneStatus);
+                if (accepted) break;
+            }
+        }
+        return JwtForgeryLogic.withKeptCookies(forged, kept, tokenWithKept, tokenAloneRefused);
+    }
+
+    private static HttpRequest withKeptCookies(HttpRequest bare, JwtForgeryLogic.Carrier carrier, String kept, String token) {
+        HttpRequest probe = bare.withAddedHeader("Cookie", JwtForgeryLogic.cookieHeaderWith(kept, carrier, token));
+        return carrier.cookie() ? probe : probe.withAddedHeader(carrier.headerName(), carrier.headerValue(token));
+    }
+
+    /** Every Cookie header's value, joined as one (HTTP/2 may split them), or null if there is none. */
+    private static String cookieHeaders(HttpRequest req) {
+        List<String> values = new ArrayList<>();
+        for (HttpHeader h : req.headers()) if (h.name().equalsIgnoreCase("Cookie") && h.value() != null) values.add(h.value());
+        return values.isEmpty() ? null : String.join("; ", values);
     }
 
     /** True if both requests carry the same headers and values, in any order and any name case. */

@@ -252,4 +252,74 @@ final class ValidationExecutorRoundThreeTest {
         assertTrue(run.confirmed(), run.status() + " " + run.submission().summary + " | " + run.submission().evidence);
     }
 
+    // ------------------------------------------------------------------ Q3
+    private static final String JWT = "eyJhbGciOiJIUzI1NiJ9.e30.c2ln";
+    private static final String ACCOUNT = "{\"account\":\"synthetic\"}";
+
+    private static String cookieValue(HttpRequest r, String name) {
+        String cookie = headerOf(r, "Cookie");
+        if (cookie == null) return null;
+        Matcher m = Pattern.compile("(?:^|;\\s*)" + Pattern.quote(name) + "=([^;]*)").matcher(cookie);
+        return m.find() ? m.group(1) : null;
+    }
+
+    private static String bearer(HttpRequest r) {
+        String auth = headerOf(r, "Authorization");
+        return auth != null && auth.startsWith("Bearer ") ? auth.substring(7) : null;
+    }
+
+    private static Run jwt(Map<String, String> headers, Predicate<HttpRequest> accepted) throws Exception {
+        return execute("jwt_validation", request("GET", "/account", "", headers), Reply.of(200, ACCOUNT),
+                r -> accepted.test(r) ? Reply.of(200, ACCOUNT) : Reply.of(401, "unauthorized"));
+    }
+
+    @Test
+    @DisplayName("Q3 repro (precision): a verified bearer JWT that also needs a non-credential cookie is rejected")
+    void jwtVerifiedWithRequiredTenantCookieIsRejected() throws Exception {
+        Run run = jwt(headers("Authorization", "Bearer " + JWT, "Cookie", "tenant=acme"),
+                r -> "acme".equals(cookieValue(r, "tenant")) && JWT.equals(bearer(r)));
+        assertFalse(run.confirmed(), run.status() + " " + run.submission().summary);
+        assertEquals("rejected", run.status(), run.submission().summary + " | " + run.submission().evidence);
+        assertTrue(run.submission().evidence.contains("tenant"), "the kept cookie is named: " + run.submission().evidence);
+    }
+
+    @Test
+    @DisplayName("Q3 repro (precision): a verified cookie JWT next to a required non-credential cookie is rejected")
+    void jwtCookieVerifiedWithRequiredTenantCookieIsRejected() throws Exception {
+        Run run = jwt(headers("Cookie", "tenant=acme; token=" + JWT),
+                r -> "acme".equals(cookieValue(r, "tenant")) && JWT.equals(cookieValue(r, "token")));
+        assertFalse(run.confirmed(), run.status() + " " + run.submission().summary);
+        assertEquals("rejected", run.status(), run.submission().summary + " | " + run.submission().evidence);
+    }
+
+    @Test
+    @DisplayName("Q3 control: an unverified JWT accepted only beside a kept cookie is a lead, never a confirmation")
+    void jwtUnverifiedWithRequiredTenantCookieIsNotConfirmed() throws Exception {
+        Run run = jwt(headers("Authorization", "Bearer " + JWT, "Cookie", "tenant=acme"),
+                r -> "acme".equals(cookieValue(r, "tenant")) && com.harness.llm.logic.JwtForgeryLogic.looksLikeJwt(bearer(r)));
+        assertFalse(run.confirmed(), "a kept cookie could be what authenticates: " + run.status() + " " + run.submission().summary);
+        assertNotEquals("rejected", run.status(), "a forged token was accepted: " + run.submission().summary);
+    }
+
+    @Test
+    @DisplayName("Q3 control: a credential-like cookie is never kept, so a session plus a verified token stays inconclusive")
+    void jwtCredentialCookieIsNeverKept() throws Exception {
+        Run run = jwt(headers("Authorization", "Bearer " + JWT, "Cookie", "session=valid; tenant=acme"),
+                r -> "valid".equals(cookieValue(r, "session")) && "acme".equals(cookieValue(r, "tenant")) && JWT.equals(bearer(r)));
+        assertFalse(run.confirmed());
+        assertEquals("inconclusive", run.status(), run.submission().summary);
+        for (HttpRequest r : run.sent()) assertNull(cookieValue(r, "session"), "no probe carries the session cookie");
+    }
+
+    @Test
+    @DisplayName("Q3 control: a session cookie the credential name rule misses (PHPSESSID) is not kept either")
+    void jwtPhpSessionCookieIsNeverKept() throws Exception {
+        Run run = jwt(headers("Authorization", "Bearer " + JWT, "Cookie", "PHPSESSID=abc; tenant=acme"),
+                r -> "abc".equals(cookieValue(r, "PHPSESSID")) && JWT.equals(bearer(r)));
+        assertFalse(run.confirmed());
+        assertEquals("inconclusive", run.status(), run.submission().summary);
+        for (HttpRequest r : run.sent()) assertNull(cookieValue(r, "PHPSESSID"), "no probe carries the session cookie");
+        assertTrue(run.sent().size() <= 3 + 4, "at most four requests more than RV-N's three: " + run.sent().size());
+    }
+
 }
