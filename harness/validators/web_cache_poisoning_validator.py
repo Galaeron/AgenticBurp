@@ -123,11 +123,14 @@ class WebCachePoisoningValidator(Validator):
                 finding_class=finding.vulnerability_class,
                 summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts))
         tests: list[CacheTestResult] = []
+        # Every send, as ("ok" | "blocked" | "error", description): a probe that
+        # never reached the target is not a negative (RV-L rule).
+        attempts: list[tuple[str, str]] = []
 
         try:
-            tests.append(await self._test_cacheability_signals(exchange))
-            tests.append(await self._test_unkeyed_host_header(exchange))
-            tests.append(await self._test_cache_deception(exchange))
+            tests.append(await self._test_cacheability_signals(exchange, attempts))
+            tests.append(await self._test_unkeyed_host_header(exchange, attempts))
+            tests.append(await self._test_cache_deception(exchange, attempts))
 
             vulnerable = any(t.vulnerable for t in tests)
             if vulnerable:
@@ -137,6 +140,21 @@ class WebCachePoisoningValidator(Validator):
                 severity = "low"
 
             vulnerable_tests = [t for t in tests if t.vulnerable]
+            unsent = [(kind, why) for kind, why in attempts if kind != "ok"]
+            if unsent and not vulnerable_tests:
+                answered = len(attempts) - len(unsent)
+                refused = any(kind == "blocked" for kind, _ in unsent)
+                failed = "; ".join(why for _, why in unsent[:4])
+                return ValidationResult(
+                    validator=self.get_name(),
+                    status="blocked" if refused and not answered else "inconclusive",
+                    finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
+                    summary=f"Web cache poisoning check incomplete: {len(unsent)} of {len(attempts)} "
+                            f"send(s) got no response ({failed}); not a negative result",
+                    evidence=f"{answered} answered probe(s) showed no unkeyed-input primitive, but a "
+                             f"probe that never reached the target cannot show one.",
+                    raw_output=self._build_raw_output(tests),
+                )
             # RETIRED (review 2026-09-09): reflection of an unkeyed input or a
             # cache-friendly response is NOT a confirmed poisoning -- it does not
             # show the attacker's influence (or private data) is CACHED and served
@@ -177,9 +195,13 @@ class WebCachePoisoningValidator(Validator):
                 raw_output=str(e),
             )
 
-    async def _send(self, url: str, method: str = "GET", headers: dict | None = None) -> httpx.Response | None:
+    async def _send(self, url: str, method: str = "GET", headers: dict | None = None,
+                    attempts: list | None = None, label: str = "") -> httpx.Response | None:
+        """The response, or None when the send got none. With `attempts`, each
+        send is recorded there as ("ok" | "blocked" | "error", description)."""
         headers = dict(headers or {})
         headers.setdefault("User-Agent", self.user_agent)
+        record = attempts.append if attempts is not None else (lambda _entry: None)
         try:
             if self.run_context is not None:
                 from harness.run_context import TypedRequest
@@ -187,7 +209,15 @@ class WebCachePoisoningValidator(Validator):
                     TypedRequest(method, url, headers=headers),
                     capability=self.get_name(), max_redirects=self.max_redirects)
                 if not outcome.ok:
+                    if outcome.outcome == "error":
+                        failure = (getattr(outcome.artifact, "transport_outcome", "")
+                                   .partition(":")[2] or outcome.error or "transport error")
+                        record(("error", f"{label}: {failure}"))
+                    else:
+                        record(("blocked", f"{label}: refused ({outcome.outcome}"
+                                + (f": {outcome.error})" if outcome.error else ")")))
                     return None
+                record(("ok", label))
                 return httpx.Response(
                     outcome.status or 0, content=(outcome.body or "").encode(),
                     headers=outcome.headers, request=httpx.Request(method, url))
@@ -196,14 +226,19 @@ class WebCachePoisoningValidator(Validator):
             ) as client:
                 from harness import global_throttle
                 await global_throttle.acquire()
-                return await client.request(method, url, headers=headers)
+                resp = await client.request(method, url, headers=headers)
+            record(("ok", label))
+            return resp
         except Exception as e:
             log.debug(f"Request failed: {e}")
+            record(("error", f"{label}: {e.__class__.__name__}"))
             return None
 
-    async def _test_cacheability_signals(self, exchange: HttpExchange) -> CacheTestResult:
+    async def _test_cacheability_signals(self, exchange: HttpExchange,
+                                         attempts: list | None = None) -> CacheTestResult:
         """Passive-ish check on a fresh fetch of the original URL: is this endpoint cached at all?"""
-        response = await self._send(exchange.url, method="GET")  # cacheability testing is GET-based; never replay the captured method
+        response = await self._send(exchange.url, method="GET",  # cacheability testing is GET-based; never replay the captured method
+                                    attempts=attempts, label="cacheability GET")
         if response is None:
             return CacheTestResult("Cacheability Signals", True, "low", "Could not fetch original URL", "", False)
 
@@ -218,14 +253,15 @@ class WebCachePoisoningValidator(Validator):
         return CacheTestResult("Cacheability Signals", True, "low",
                                 "No shared-cache indicators observed on this response", "", vulnerable=False)
 
-    async def _test_unkeyed_host_header(self, exchange: HttpExchange) -> CacheTestResult:
+    async def _test_unkeyed_host_header(self, exchange: HttpExchange,
+                                        attempts: list | None = None) -> CacheTestResult:
         """Classic unkeyed-input probe: inject X-Forwarded-Host, check reflection, then re-request clean."""
         marker = "cache-poison-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10)) + ".example"
 
         poisoned = await self._send(exchange.url, method="GET", headers={  # never replay the captured method
             "X-Forwarded-Host": marker,
             "X-Forwarded-Scheme": "https",
-        })
+        }, attempts=attempts, label="poisoning probe GET")
         if poisoned is None:
             return CacheTestResult("Unkeyed Host Header", True, "low", "Could not send poisoning probe", "", False)
 
@@ -238,7 +274,8 @@ class WebCachePoisoningValidator(Validator):
         # If the marker still comes back, this specific response is actually cached
         # and poisoned, not just reflected per-request.
         await asyncio.sleep(0.5)
-        followup = await self._send(exchange.url, method="GET")  # never replay the captured method
+        followup = await self._send(exchange.url, method="GET",  # never replay the captured method
+                                    attempts=attempts, label="follow-up GET")
         if followup is not None and marker in (followup.text or ""):
             return CacheTestResult(
                 "Unkeyed Host Header", False, "critical",
@@ -258,7 +295,8 @@ class WebCachePoisoningValidator(Validator):
             vulnerable=True,
         )
 
-    async def _test_cache_deception(self, exchange: HttpExchange) -> CacheTestResult:
+    async def _test_cache_deception(self, exchange: HttpExchange,
+                                    attempts: list | None = None) -> CacheTestResult:
         """Append a static-looking suffix to the path and compare to the original response."""
         from urllib.parse import urlparse, urlunparse
 
@@ -269,7 +307,8 @@ class WebCachePoisoningValidator(Validator):
         deceptive_path = parsed.path.rstrip("/") + "/nonexistent-cache-deception-probe.css"
         deceptive_url = urlunparse(parsed._replace(path=deceptive_path))
 
-        response = await self._send(deceptive_url, method="GET")
+        response = await self._send(deceptive_url, method="GET", attempts=attempts,
+                                    label="deception probe GET")
         if response is None:
             return CacheTestResult("Web Cache Deception", True, "low", "Could not fetch deceptive path", "", False)
 

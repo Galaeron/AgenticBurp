@@ -333,5 +333,69 @@ class StoredXssUnsentTests(_RvoBase):
         self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
 
 
+# -------------------------------------------------------- O4 web cache poisoning
+def _cache_front(sent, *, reflect=False, fail=lambda url, headers: False):
+    """An origin behind a shared cache. reflect=True echoes X-Forwarded-Host
+    into the body, the unkeyed-input primitive."""
+    async def request(client, method, url, **kwargs):
+        headers = kwargs.get("headers") or {}
+        sent.append((method, str(url)))
+        if fail(str(url), headers):
+            raise _connect_error(method, url)
+        xfh = headers.get("X-Forwarded-Host", "")
+        body = f"<p>account</p>{xfh if reflect else ''}"
+        return _response(method, url, text=body, headers={"Cache-Control": "public, max-age=60"})
+    return request
+
+
+class WebCachePoisoningUnsentTests(_RvoBase):
+    """O4: no primitive observed after probes that never reached the target is
+    not a negative. The candidate output (confirmation is retired) is unchanged."""
+
+    URL = "http://shop.invalid/account/profile"
+
+    def _run(self, fake, *, max_requests=None):
+        v = WebCachePoisoningValidator(allowed_hosts=["shop.invalid"], timeout=1.0)
+        if max_requests is not None:
+            return self._in_run("web_cache_poisoning", v, _finding("web_cache_poisoning"),
+                                _exchange(self.URL), max_requests=max_requests, fake_request=fake)
+        return self._validate("web_cache_poisoning", v, _finding("web_cache_poisoning"),
+                              _exchange(self.URL), fake)
+
+    def test_every_probe_failing_is_not_a_negative(self):
+        sent = []
+        reports = self._run(_refuse_all(sent))
+        self.assertEqual(len(sent), 3)
+        self._assert_not_negative(reports, "inconclusive")
+        self.assertIn("ConnectError", _text(reports))
+
+    def test_every_probe_refused_by_the_budget_reads_as_blocked(self):
+        sent = []
+        reports = self._run(_refuse_all(sent), max_requests=0)
+        self.assertEqual(sent, [], "a refused send reached the target")
+        self._assert_not_negative(reports, "blocked")
+        self.assertIn("budget_exhausted", _text(reports))
+
+    def test_failed_poisoning_probe_leaves_the_check_inconclusive(self):
+        sent = []
+        reports = self._run(_cache_front(sent, fail=lambda u, h: "X-Forwarded-Host" in h))
+        self.assertEqual(len(sent), 3)
+        self._assert_not_negative(reports, "inconclusive")
+        self.assertIn("poisoning probe", _text(reports))
+
+    def test_unkeyed_reflection_keeps_the_candidate_output(self):
+        reports = self._run(_cache_front([], reflect=True))
+        self.assertEqual([(r.status, r.confidence) for r in reports], [("not_confirmed", 0.4)],
+                         _verdicts(reports))
+        self.assertIn("CANDIDATE", reports[0].summary)
+
+    def test_answered_probes_without_a_primitive_stay_negative(self):
+        sent = []
+        reports = self._run(_cache_front(sent))
+        self.assertEqual(len(sent), 3)
+        self.assertEqual([(r.status, r.confidence) for r in reports], [("not_confirmed", 0.1)],
+                         _verdicts(reports))
+
+
 if __name__ == "__main__":
     unittest.main()
