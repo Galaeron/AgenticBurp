@@ -6,6 +6,7 @@
 | Install/use the copilot | [README.md](../README.md) |
 | Run it safely (first run, scope, speed, data handling, benchmark) | [USER_MANUAL.md](USER_MANUAL.md) |
 | Known issues, gaps and roadmap (read before trusting results) | [LIMITATIONS.md](LIMITATIONS.md) |
+| Declare protected routes for missing-auth confirmation | [PROTECTED_ROUTES.md](PROTECTED_ROUTES.md) |
 | Find the production owner of a behavior | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Choose tests and interpret their evidence | [TESTING.md](TESTING.md) |
 | Do the live/owner work after the loop reports `LOOP_DONE` | [OWNER_RUNBOOK.md](OWNER_RUNBOOK.md) — turnkey steps + offline-verified instruments for the 4 live priorities |

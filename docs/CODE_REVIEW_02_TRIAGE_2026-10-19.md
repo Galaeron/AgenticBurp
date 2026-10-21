@@ -397,14 +397,76 @@ caller-verified offline, not live-validated. Handoffs are in `.test-work/rv-c-ev
     - owner decision: the CSRF marker is a real write to one free-text field, and a run sends
       up to 6 requests.
 
-Next: RV-O, RV-P and RV-Q, as three sessions.
-- RV-O (brief `.test-work/rv-o-unsentround2-20261021/BATCH.md`): failed sends in
-  header_injection, command_injection, stored_xss and web_cache_poisoning; the SSRF late
-  callback; RV-M's coverage-record gaps and stale names.
-- RV-P (brief `.test-work/rv-p-swallowedsends-20261021/BATCH.md`): the validators whose broad
-  `except` swallows a failed send, each first reached through an exchange that passes its
-  preconditions.
-- RV-Q (brief `.test-work/rv-q-burpround3-20261021/BATCH.md`): RV-N's residuals.
+RV-O to RV-S landed together through the owner's merge `49be218` (handoffs in
+`.test-work/rv-{o-unsentround2,p-swallowedsends,q-burpround3,r-ownerdecisions,s-protectedroutes}-20261021/`).
+- **RV-O** (`375e88f`..`ada7372`, O1 to O8; RV-L's and RV-M's follow-ups):
+  - O1 to O4: header injection, command injection, stored XSS and cache poisoning report a
+    failed or refused send as blocked or inconclusive, not a negative. O5: SSRF waits out the
+    callback window before a negative.
+  - O6 and O7: `not_tested` lists pending and running checks, and blocked, inconclusive and
+    error rows with their reasons; `Orchestrator.leg_self_test_report`; stale test names.
+  - O8 (owner decision): a dialog showing the payload's computed value confirms XSS and says
+    so; any other dialog or page error is a labelled candidate.
+  - Existing tests changed, each encoding a rule this batch changed (none loosens a
+    non-confirm): the coverage-model `not_tested` tests, the leg self-test stubs, command
+    injection's zero-budget test (`blocked`) and the browser XSS dialog tests.
+  - Follow-ups: `store.coverage_report` says tested_clean despite blocked or inconclusive
+    rows; `active_verification._STATUS_MAP` maps an unknown status to not confirmed; a partial
+    browser or DOM XSS visit error is still `not_confirmed`; SSTI is skipped on refusal;
+    `GatedAsyncClient` loses a ConnectError's class.
+- **RV-P** (`11faec0`..`7a6108f`, 13 commits, P1 to P9):
+  - Validators whose broad `except` swallowed a failed send, each reached first through an
+    exchange that passes its preconditions: client trust (P1), deserialization OOB (P3), rate
+    limit (P4), TOCTOU (P5), verb tampering (P6), path traversal (P7), the source form (P8),
+    file upload, JWT forging and reset token (P9). P2 (CSRF) was already sound.
+  - No existing test changed.
+  - Follow-ups (the sweep): idor_read, http_request_smuggling, race_condition, oauth,
+    subdomain_takeover and crypto (partly) still swallow a failed send.
+- **RV-Q** (`c3c8cba`..`cc8ddef`, Q1 to Q5; RV-N's follow-ups; Burp only):
+  - Q1: the CSRF forged request carries a foreign Origin and Referer. Q2: a request a form
+    cannot send is at most SUPPORTED. Q3: the JWT retry keeps non-credential cookies. Q4: mass
+    assignment finds created-object id keys. Q5: XSS models script types and `<template>`.
+  - Gradle: 374 tests. One existing assertion changed:
+    `ValidationExecutorResidualsTest.csrfCookieOnlyWithHeaderTokenIsConfirmed` asserted the
+    captured Referer was kept, the behaviour Q1 fixes.
+  - Follow-ups: `Origin: null` and method override are not tried; SameSite cookies are not
+    modelled; JS regex literals and a prefix that is already a syntax error are not modelled;
+    a `<script src>` or `nomodule` script still counts; declarative shadow DOM content counts
+    as inert.
+- **RV-R** (`82abc91`..`811b973`; owner decisions of 2026-10-21):
+  - R1: an MFA step-up redirect is not a denial; the anonymous control takes IDOR's rule.
+    R2: a confirmed CORS origin reflection says what the attacker's page can read.
+  - Tests changed: `test_step_up_redirect_is_unchanged` became
+    `test_step_up_redirect_is_not_a_denial` (the rule the owner changed). The owner chose to
+    change the vulnerable fixture's no-session MFA redirect to `/login` rather than the leg
+    test (`vuln_fixture.py`, `82abc91`).
+  - Follow-ups: a validator's text does not reach a stored finding that has its own evidence;
+    a null-origin grant does not check credentials; the CORS result drops its computed
+    severity; an anonymous 2xx step-up page with a password field still confirms (owner
+    decision if wanted).
+- **RV-S** (`7b98fad`, `516643e`; RV-M M1's follow-up, owner decision of 2026-10-21):
+  - S1 to S6: the chain confirms missing auth only on a route that matches an operator pattern
+    in `authz.protected_paths` (config.local.yaml, per target) or the engagement's list, and
+    only when the anonymous replay returns the authenticated baseline's payload. The evidence
+    names the pattern and its source. An unlisted route stays a candidate; a malformed entry is
+    ignored with a warning. Operator guide: docs/PROTECTED_ROUTES.md.
+  - S3b (found in the batch): on a listed route the anonymous replay drops every header a
+    supplied identity sets, not only known credential names. A custom session header had made
+    a false confirmation.
+  - Follow-ups: nothing sets the engagement's list yet (I16); an app that authenticates only
+    through a custom header cannot confirm (fail closed); the probe's own `_strip_auth` keeps
+    unknown credential headers for its other callers; an unlisted route's candidate does not
+    say how to declare it.
+- The cross-request audit's fix batch 1 (`823ff4e`..`7a05995`; not a code review 02 batch;
+  reviews/2026-10-21-dual-mode-cross-request-audit/FIX_BATCH_1.md) landed after RV-S. Batch RV-T
+  implements its owner decisions.
+
+Next: RV-T, then a batch for RV-P's sweep.
+- RV-T (brief `.test-work/rv-t-crossrequestdecisions-20261021/BATCH.md`): `authz.owners`,
+  passive-only lookups, sensitive-file severity by class and the driver's own ceiling.
+- RV-P's sweep: the validators above that still swallow a failed send.
+- The other follow-ups above wait for a batch or the I01 W-split (`store.py`, `issues.py` and
+  `HarnessPanel.java` carry WIP).
 - I05 batch D (branch `i05d-browser-credentials`) is not a code review 02 batch. It waits for
   the owner's review.
 
