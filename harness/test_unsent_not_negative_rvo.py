@@ -397,5 +397,85 @@ class WebCachePoisoningUnsentTests(_RvoBase):
                          _verdicts(reports))
 
 
+# ------------------------------------------------------- O5 SSRF late callback
+class _WaitingCollaborator(_Collaborator):
+    """Records every token the validator waited on, and for how long."""
+
+    def __init__(self):
+        super().__init__()
+        self.waited = []
+
+    async def wait_for_hit(self, token, timeout=0.0):
+        self.waited.append((token, timeout))
+        return token in self.hits
+
+
+def _slow_fetcher(collab, sent, exc, *, fetches):
+    """The in-band reads are answered. An out-of-band send fails with `exc`;
+    with fetches=True the server fetched the callback URL first (a late callback
+    from a request that did reach it)."""
+    async def request(client, method, url, **kwargs):
+        u = unquote_plus(str(url))
+        sent.append((method, u))
+        if "oob.collab.invalid" in u:
+            if fetches:
+                collab.hits.update(t for t in collab.issued if t in u)
+            raise exc("synthetic: no response to the out-of-band send",
+                      request=httpx.Request(method, url))
+        return _response(method, url, text="<p>preview unavailable</p>")
+    return request
+
+
+class SsrfLateCallbackTests(_RvoBase):
+    """O5: an out-of-band send whose response was lost after the request was
+    written may still have been fetched; it waits the normal callback window.
+    A send that never connected is not waited on."""
+
+    URL = "http://shop.invalid/fetch?url=http%3A%2F%2Fexample.com%2Fa"
+
+    def _run(self, fake, collab, *, in_run=False):
+        v = SsrfValidator(allowed_hosts=["shop.invalid"], timeout=1.0, collaborator=collab)
+        if in_run:
+            return self._in_run("ssrf", v, _finding("ssrf"), _exchange(self.URL),
+                                max_requests=200, fake_request=fake)
+        return self._validate("ssrf", v, _finding("ssrf"), _exchange(self.URL), fake)
+
+    def _late(self, exc, *, fetches, in_run):
+        collab, sent = _WaitingCollaborator(), []
+        reports = self._run(_slow_fetcher(collab, sent, exc, fetches=fetches), collab, in_run=in_run)
+        self.assertTrue(any("oob.collab.invalid" in u for _, u in sent), "no out-of-band send")
+        return reports, collab
+
+    def test_late_callback_after_a_read_timeout_confirms(self):
+        reports, collab = self._late(httpx.ReadTimeout, fetches=True, in_run=False)
+        self.assertEqual([r.status for r in reports], ["confirmed"], _verdicts(reports))
+
+    def test_late_callback_after_a_read_timeout_confirms_inside_a_run(self):
+        reports, collab = self._late(httpx.ReadTimeout, fetches=True, in_run=True)
+        self.assertEqual([r.status for r in reports], ["confirmed"], _verdicts(reports))
+
+    def test_late_callback_after_the_server_dropped_the_reply_confirms(self):
+        reports, collab = self._late(httpx.RemoteProtocolError, fetches=True, in_run=True)
+        self.assertEqual([r.status for r in reports], ["confirmed"], _verdicts(reports))
+
+    def test_read_timeout_without_a_callback_waits_and_stays_inconclusive(self):
+        for in_run in (False, True):
+            with self.subTest(in_run=in_run):
+                reports, collab = self._late(httpx.ReadTimeout, fetches=False, in_run=in_run)
+                self.assertEqual(collab.waited, [(collab.issued[0], 1.0)],
+                                 "the delivered send's callback window was not waited")
+                self._assert_not_negative(reports, "inconclusive")
+                self.assertIn("ReadTimeout", _text(reports))
+                self.assertIn("callback", reports[0].summary)
+
+    def test_refused_connection_is_not_waited_on(self):
+        for in_run in (False, True):
+            with self.subTest(in_run=in_run):
+                reports, collab = self._late(httpx.ConnectError, fetches=True, in_run=in_run)
+                self.assertEqual(collab.waited, [], "a send that never connected was waited on")
+                self._assert_not_negative(reports, "inconclusive")
+                self.assertIn("ConnectError", _text(reports))
+
+
 if __name__ == "__main__":
     unittest.main()
