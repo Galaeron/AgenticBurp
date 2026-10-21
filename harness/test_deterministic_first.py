@@ -132,7 +132,9 @@ class DeterministicFirstCallerTest(unittest.TestCase):
         self.assertFalse(result["stopped_on_confirmation"])
         self.assertEqual(result["outcomes"][0]["findings_detail"], [])
 
-    def test_anonymous_admin_route_reaches_missing_auth_probe_and_confirms(self):
+    def test_anonymous_admin_route_is_routed_to_missing_auth_probe(self):
+        # RV-O O7: renamed from ..._reaches_missing_auth_probe_and_confirms; the
+        # probe outcome is mocked, so this pins only the routing to the probe.
         admin_exchange = HttpExchange(
             method="GET", url=f"{BASE}administrator-panel",
             request_headers={}, response_status=200,
