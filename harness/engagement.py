@@ -49,9 +49,32 @@ _PRIVILEGED = re.compile(
     re.IGNORECASE,
 )
 
-_NUM_SEG = re.compile(r"/\d+(?=/|$)")
-_HEXISH = re.compile(r"/[0-9a-fA-F]{12,}(?=/|$)")
-_ID_SEG = re.compile(r"\d+|[0-9a-fA-F]{12,}")   # one path segment normalize_path turns into {id}
+# WL-02: the ONE object-id path-segment rule shared by role_crawl's matrix rows
+# and this module's endpoint keys (normalize_path / path_id_values). A whole
+# segment is an object id when it is all digits, 12+ contiguous hex characters
+# (a Mongo ObjectId, a hex digest), or a canonical hyphenated UUID. Before this,
+# role_crawl templated digits only and normalize_path digits plus long hex, and
+# neither recognized a UUID, so one object mapped to different keys and a
+# UUID-addressed object was never object-scoped. Kept free of other imports so
+# role_crawl can use it without a cycle. (allocation_prioritizer and store keep
+# their own, separately-owned rules.)
+_UUID_SEGMENT = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+_OBJECT_ID_SEGMENT = re.compile(rf"\d+|[0-9a-fA-F]{{12,}}|{_UUID_SEGMENT}")
+
+
+def is_object_id_segment(segment: str) -> bool:
+    """True when one path segment is an object id under the shared rule."""
+    return bool(_OBJECT_ID_SEGMENT.fullmatch(segment or ""))
+
+
+def template_object_ids(path: str) -> str:
+    """Replace every object-id path segment with `{id}` (/orders/42 ->
+    /orders/{id}, /vehicles/<uuid>/location -> /vehicles/{id}/location). Only a
+    segment that follows a "/" is a candidate, and anything else (an existing
+    `{id}`, a route word, a query glued to the last segment) is left as is."""
+    segments = (path or "").split("/")
+    return "/".join(seg if i == 0 or not is_object_id_segment(seg) else "{id}"
+                    for i, seg in enumerate(segments))
 
 # 2026-09-17 coverage-recovery plan, Step 2: a percent-encoded byte surviving
 # INTO the normalized path is a discovery artifact (an encoded traversal probe,
@@ -69,16 +92,16 @@ def _looks_malformed_or_encoded(path: str) -> bool:
 
 def normalize_path(url_or_path: str) -> str:
     """A stable key that aligns a crawl's normalized path with a finding's
-    concrete URL: strip scheme/host/query, collapse numeric and long-hex
-    segments to {id} (so /orders/42 and /orders/{id} map together)."""
+    concrete URL: strip scheme/host/query, collapse object-id segments (digits,
+    long hex, UUIDs -- the shared rule above) to {id} (so /orders/42 and
+    /orders/{id} map together)."""
     s = url_or_path or ""
     if "://" in s:
         parts = urlsplit(s)
         s = parts.path or "/"
     else:
         s = s.split("?", 1)[0].split("#", 1)[0]
-    s = _HEXISH.sub("/{id}", s)
-    s = _NUM_SEG.sub("/{id}", s)
+    s = template_object_ids(s)
     if len(s) > 1 and s.endswith("/"):
         s = s[:-1]
     return s or "/"
@@ -87,14 +110,14 @@ def normalize_path(url_or_path: str) -> str:
 def path_id_values(url_or_path: str) -> list[str]:
     """The concrete value at each `{id}` slot that normalize_path() produces for
     this URL, in path order. /accounts/17/orders/42 -> ["17", "42"]. Matches the
-    same segments normalize_path collapses (all-digit, or 12+ hex characters), so
-    the n-th value belongs to the n-th `{id}` of the normalized path."""
+    same segments normalize_path collapses (the shared object-id rule), so the
+    n-th value belongs to the n-th `{id}` of the normalized path."""
     s = url_or_path or ""
     if "://" in s:
         s = urlsplit(s).path or "/"
     else:
         s = s.split("?", 1)[0].split("#", 1)[0]
-    return [seg for seg in s.split("/") if _ID_SEG.fullmatch(seg)]
+    return [seg for i, seg in enumerate(s.split("/")) if i > 0 and is_object_id_segment(seg)]
 
 
 def _looks_privileged(path: str) -> bool:
@@ -128,6 +151,105 @@ def template_from_exchange(ex) -> dict:
             "path_ids": path_id_values(url)}
 
 
+# --- WL-02: principal-keyed access cells and the derived role view -----------
+#
+# The AUTHORITATIVE access record is per principal (RoleSession.principal_id()):
+# one cell per (endpoint operation, principal) holding
+#   {"status": int|None, "role": str, "reachable": bool,
+#    "session_ref": str|None, "observed_at": float|None, "source": str}.
+# Two accounts with the same role are two cells, never one column.
+#
+# The role-keyed `access`/`by_role` and `reachable_roles` fields are a DERIVED,
+# backward-compatible view for existing readers (fused_score, coverage, the
+# /crawl-roles JSON, the Burp tools panel). Derivation rule, per role R with
+# at least one principal cell:
+#   - access[R] is the status when every principal of R observed the same one,
+#     otherwise the SORTED LIST of the distinct statuses (None last), e.g.
+#     alice 200 + bob 403 -> [200, 403]. A single status is never claimed for a
+#     role whose principals disagree.
+#   - R is in reachable_roles iff at least one principal of R reached the
+#     operation (substantive 2xx); reachable_roles has no duplicates.
+# So a role cell can never read "403" while the same role is listed reachable.
+# A role with NO principal cell (a legacy role-only snapshot, a pseudo-role such
+# as burp_sitemap's "imported:burp") keeps whatever role-view entry it had.
+
+PRINCIPAL_CELL_SOURCE_ROLE_VIEW = "role_view"   # adopted from a role-only record
+
+
+def principal_cell(*, role: str, status, reachable: bool, session_ref: str | None = None,
+                   observed_at: float | None = None, source: str = "") -> dict:
+    """One principal's observation of one endpoint operation (WL-02)."""
+    return {"status": status, "role": role or "", "reachable": bool(reachable),
+            "session_ref": session_ref, "observed_at": observed_at, "source": source or ""}
+
+
+def merge_principal_cell(cells: dict, principal_id: str, cell: dict) -> bool:
+    """Merge one observation into `cells` (principal_id -> cell) in place.
+
+    A different principal's cell is never touched (merge, not replace). For the
+    SAME principal the incoming observation replaces the stored one unless both
+    carry an `observed_at` and the incoming one is strictly older -- a stale
+    import cannot overwrite a newer observation, and an observation with an
+    unknown time is ordered by arrival. Returns whether the cell was applied."""
+    if not principal_id:
+        return False
+    current = cells.get(principal_id)
+    if current is not None:
+        old_t, new_t = current.get("observed_at"), cell.get("observed_at")
+        if old_t is not None and new_t is not None and new_t < old_t:
+            return False
+    cells[principal_id] = dict(cell)
+    return True
+
+
+def role_status_view(statuses: list):
+    """The role-view status for one role: the status itself when its principals
+    agree, else the sorted list of the distinct statuses (None last)."""
+    distinct: list = []
+    for s in statuses:
+        if s not in distinct:
+            distinct.append(s)
+    if len(distinct) == 1:
+        return distinct[0]
+    return sorted(distinct, key=lambda s: (s is None, s if isinstance(s, int) else 0))
+
+
+def role_view_from_cells(cells: dict, prior_access: dict | None = None,
+                         prior_reachable: list | None = None) -> tuple[dict, list]:
+    """Derive (role -> status view, reachable roles) from principal cells.
+
+    Roles with at least one cell are derived from the cells only (see the rule
+    above); roles without one keep their prior role-view entry, so a legacy or
+    pseudo-role record is not erased. Order is stable: prior roles first, then
+    newly seen roles in cell order."""
+    prior_access = dict(prior_access or {})
+    prior_reachable = list(prior_reachable or [])
+    grouped: dict[str, list[dict]] = {}
+    for pid, cell in (cells or {}).items():
+        grouped.setdefault(cell.get("role") or pid, []).append(cell)
+    order = list(prior_access) + [r for r in grouped if r not in prior_access]
+    access: dict = {}
+    for role in order:
+        if role in grouped:
+            access[role] = role_status_view([c.get("status") for c in grouped[role]])
+        else:
+            access[role] = prior_access[role]
+    reachable: list = []
+    for role in prior_reachable + list(grouped):
+        if role in reachable:
+            continue
+        if role in grouped:
+            if any(c.get("reachable") for c in grouped[role]):
+                reachable.append(role)
+        elif role in prior_reachable:
+            reachable.append(role)
+    return access, reachable
+
+
+def _status_values(v) -> list:
+    return list(v) if isinstance(v, (list, tuple)) else [v]
+
+
 @dataclass
 class SurfaceEndpoint:
     method: str
@@ -135,8 +257,11 @@ class SurfaceEndpoint:
     path_tier: str | None = None      # PathScorer tier (from Burp)
     llm_priority: str | None = None   # surface_prioritizer ai_priority
     llm_score: float | None = None    # surface_prioritizer ai_score 0..1
-    access: dict = field(default_factory=dict)          # role -> status
-    reachable_roles: list = field(default_factory=list)  # substantive 2xx
+    # Role view (derived from access_by_principal when that has cells -- see
+    # role_view_from_cells): role -> status, or the sorted distinct statuses
+    # when principals sharing the role disagree.
+    access: dict = field(default_factory=dict)
+    reachable_roles: list = field(default_factory=list)  # roles with a principal that got substantive 2xx
     object_scoped: bool = False
     findings: list = field(default_factory=list)         # [{class, severity, confidence, confirmed}]
     status: str = "discovered"        # discovered | analyzed | validated
@@ -152,10 +277,90 @@ class SurfaceEndpoint:
     # negative control). Never a confirmation; only re-ranking.
     business_score: float | None = None
     business_reasons: list = field(default_factory=list)
+    # WL-02: the authoritative per-principal access record (principal_id ->
+    # principal_cell) and the principals that reached this operation. The role
+    # view above is derived from these.
+    access_by_principal: dict = field(default_factory=dict)
+    reachable_principals: list = field(default_factory=list)
 
     @property
     def key(self) -> str:
         return f"{self.method.upper()} {self.path}"
+
+    def record_principal_observation(self, principal_id: str, *, role: str, status,
+                                     reachable: bool, session_ref: str | None = None,
+                                     observed_at: float | None = None,
+                                     source: str = "") -> bool:
+        """Merge one principal's observation of this operation (WL-02) and
+        re-derive the role view. Other principals' cells are kept; see
+        merge_principal_cell for the same-principal time rule."""
+        self._adopt_role_only_entries()
+        applied = merge_principal_cell(self.access_by_principal, principal_id, principal_cell(
+            role=role, status=status, reachable=reachable, session_ref=session_ref,
+            observed_at=observed_at, source=source))
+        self._refresh_role_view()
+        return applied
+
+    def _adopt_role_only_entries(self) -> None:
+        """Before the first principal cell lands for a role, keep that role's
+        role-only status (a legacy snapshot or a role-only ingest) as a cell keyed
+        by the role label, so merging principal data never silently erases it.
+        A role listed only in reachable_roles with no status (a pseudo-role such
+        as "imported:burp") is left in the role view untouched."""
+        roles_with_cells = {c.get("role") for c in self.access_by_principal.values()}
+        for role, status in list(self.access.items()):
+            if role in roles_with_cells or role in self.access_by_principal:
+                continue
+            values = _status_values(status)
+            for value in values:
+                # a role-only list value has no per-principal split to recover;
+                # keep one cell per distinct value under the role label.
+                pid = role if len(values) == 1 else f"{role}#{value}"
+                reached = role in self.reachable_roles and (
+                    len(values) == 1 or (isinstance(value, int) and 200 <= value < 300))
+                self.access_by_principal[pid] = principal_cell(
+                    role=role, status=value, reachable=reached,
+                    source=PRINCIPAL_CELL_SOURCE_ROLE_VIEW)
+
+    def _refresh_role_view(self) -> None:
+        self.access, self.reachable_roles = role_view_from_cells(
+            self.access_by_principal, self.access, self.reachable_roles)
+        self.reachable_principals = [pid for pid, c in self.access_by_principal.items()
+                                     if c.get("reachable")]
+
+    def merge_access_record(self, by_principal=None, by_role=None, reachable_roles=None) -> None:
+        """Merge one matrix record (an EndpointAccess.to_dict(), another state's
+        endpoint, or a legacy role-only record) into this endpoint (WL-02).
+
+        Principal cells merge per principal. Roles of the record that no cell
+        covers (role-only data) are kept as cells keyed by the role label; a role
+        listed reachable with no status at all (a pseudo-role label) is unioned
+        into reachable_roles as before. Nothing already recorded is dropped."""
+        cells = by_principal if isinstance(by_principal, dict) else {}
+        covered = set()
+        for pid, cell in cells.items():
+            if not isinstance(cell, dict):
+                continue
+            role = str(cell.get("role") or pid)
+            covered.update((str(pid), role))
+            self.record_principal_observation(
+                str(pid), role=role, status=cell.get("status"),
+                reachable=bool(cell.get("reachable")), session_ref=cell.get("session_ref"),
+                observed_at=cell.get("observed_at"), source=cell.get("source") or "")
+        by_role = by_role if isinstance(by_role, dict) else {}
+        reach = [str(r) for r in (reachable_roles or [])]
+        for role, value in by_role.items():
+            if role in covered:
+                continue
+            values = _status_values(value)
+            for v in values:
+                pid = role if len(values) == 1 else f"{role}#{v}"
+                reached = role in reach and (len(values) == 1 or (isinstance(v, int) and 200 <= v < 300))
+                self.record_principal_observation(pid, role=role, status=v, reachable=reached,
+                                                  source=PRINCIPAL_CELL_SOURCE_ROLE_VIEW)
+        for role in reach:
+            if role not in covered and role not in by_role and role not in self.reachable_roles:
+                self.reachable_roles.append(role)
 
     def is_malformed_or_encoded(self) -> bool:
         """A discovery artifact (residual percent-encoding), not a distinct
@@ -168,7 +373,10 @@ class SurfaceEndpoint:
         artifact, not a real endpoint worth a bounded agent investigation."""
         if not self.access or self.reachable_roles:
             return False
-        return all(v is None or (isinstance(v, int) and v >= 500) for v in self.access.values())
+        # a role-view value is a status, or the list of distinct statuses its
+        # principals observed (WL-02); every one must be an error for "dead".
+        return all(v is None or (isinstance(v, int) and v >= 500)
+                   for value in self.access.values() for v in _status_values(value))
 
     def is_input_bearing(self) -> bool:
         """A concrete, replayable shape exists to probe with -- a captured
@@ -338,6 +546,10 @@ class SurfaceEndpoint:
             # dict consumer / the report can see WHY an endpoint was re-ranked.
             "business_score": self.business_score,
             "business_reasons": self.business_reasons,
+            # WL-02: the authoritative per-principal access record; `access` and
+            # `reachable_roles` above are the role view derived from it.
+            "access_by_principal": self.access_by_principal,
+            "reachable_principals": self.reachable_principals,
         }
 
     @classmethod
@@ -350,6 +562,9 @@ class SurfaceEndpoint:
             status=d.get("status", "discovered"), template=d.get("template"),
             business_score=d.get("business_score"),
             business_reasons=d.get("business_reasons", []) or [],
+            access_by_principal={str(k): dict(v) for k, v in
+                                 (d.get("access_by_principal") or {}).items() if isinstance(v, dict)},
+            reachable_principals=list(d.get("reachable_principals", []) or []),
         )
 
 
@@ -545,9 +760,9 @@ class EngagementState:
                 continue
             for f in ep.findings or []:
                 mine.add_finding(f)
-            for r in ep.reachable_roles or []:
-                if r not in mine.reachable_roles:
-                    mine.reachable_roles.append(r)
+            # WL-02: merge per principal (and any role-only entries), never
+            # replacing another principal's observation.
+            mine.merge_access_record(ep.access_by_principal, ep.access, ep.reachable_roles)
             if ep.template and not mine.template:
                 mine.template = ep.template
             # a proven endpoint status propagates upward, never downward
@@ -560,13 +775,20 @@ class EngagementState:
 
     def ingest_role_crawl(self, result: dict) -> int:
         """From /crawl-roles: the access matrix + object-scoping per endpoint,
-        plus the derived IDOR findings."""
+        plus the derived IDOR findings.
+
+        WL-02: the matrix is MERGED per principal (`by_principal` cells), not
+        replaced: a later crawl that saw only bob never erases alice's cell, and a
+        newer observation of the same principal/operation updates it (see
+        merge_principal_cell). A role-only record (no `by_principal`, e.g. an
+        older client or snapshot) is kept as cells keyed by the role label. The
+        role view (`access`, `reachable_roles`) is re-derived from the cells."""
         n = 0
         for e in result.get("endpoints", []) or []:
             ep = self._ep(e.get("method", "GET"), normalize_path(e.get("path", "/")))
-            ep.access = e.get("by_role", {}) or {}
-            ep.reachable_roles = e.get("reachable_roles", []) or []
-            ep.object_scoped = bool(e.get("object_scoped", False))
+            ep.merge_access_record(e.get("by_principal"), e.get("by_role"),
+                                   e.get("reachable_roles"))
+            ep.object_scoped = ep.object_scoped or bool(e.get("object_scoped", False))
             n += 1
         for f in result.get("idor_findings", []) or []:
             # idor_findings carry a validation_hint "cross_identity_compare:<path>"

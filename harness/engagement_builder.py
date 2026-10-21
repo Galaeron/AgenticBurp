@@ -112,7 +112,8 @@ async def build_engagement(
             if ScopePolicy.origin_of(ex.url) != origin or not scope.in_scope(ex.url):
                 seed_errors.append("capture ignored: outside engagement origin/scope")
                 continue
-            owners = [r for r in roles if credentials(r.headers) == credentials(ex.request_headers)]
+            owners = [(index, r) for index, r in enumerate(roles)
+                      if credentials(r.headers) == credentials(ex.request_headers)]
             if not owners:
                 seed_errors.append("capture ignored: no matching supplied identity")
                 continue
@@ -145,14 +146,22 @@ async def build_engagement(
         if access is None:
             access = role_crawl.EndpointAccess(method=ex.method, path=ep.path)
             result.endpoints.append(access)
-        for owner in owners:
-            ep.access[owner.role] = ex.response_status
-            access.by_role[owner.role] = ex.response_status
-            if ex.response_status is not None and 200 <= ex.response_status < 300:
-                if owner.role not in ep.reachable_roles:
-                    ep.reachable_roles.append(owner.role)
-                if owner.role not in access.reachable_roles:
-                    access.reachable_roles.append(owner.role)
+        # The matrix row's template decides object-scoping, as ingest_role_crawl does.
+        ep.object_scoped = ep.object_scoped or access.object_scoped
+        # WL-02: a supplied capture is ONE principal's observation of this
+        # operation. Record it per principal and MERGE it with the crawl's cells
+        # (another principal's cell is never overwritten); the role view is
+        # re-derived. Its time is the capture's own `captured_at` (unknown stays
+        # None, never fabricated).
+        reached = ex.response_status is not None and 200 <= ex.response_status < 300
+        for index, owner in owners:
+            observation = dict(
+                role=owner.role, status=ex.response_status, reachable=reached,
+                session_ref=session_refs[index] if session_refs is not None else None,
+                observed_at=ex.captured_at, source="seed_capture")
+            principal_id = role_crawl._matrix_principal_id(owner)
+            ep.record_principal_observation(principal_id, **observation)
+            access.record(principal_id, **observation)
         state.record_template(ex.url, ex.method, ex)
     for r in roles:
         state.ingest_identity(f"rolecrawl:{r.role}", r.role, source="seed")

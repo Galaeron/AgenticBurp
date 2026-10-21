@@ -6,8 +6,11 @@ can reach each endpoint -- and that is exactly the question broken-access-contro
 testing turns on. This module crawls the same target once per supplied role
 (using that role's real captured session headers), unions the discovered
 surface, then probes every endpoint with every role and records the result as an
-ACCESS MATRIX: endpoint -> {role: status}. From that matrix two high-value
-candidate sets fall out deterministically:
+ACCESS MATRIX keyed by PRINCIPAL (WL-02): endpoint -> {principal: {status, role,
+session ref, observed time}}, with the role-keyed `by_role`/`reachable_roles`
+kept as a derived view (see engagement.role_view_from_cells). Two accounts that
+share a role are two columns. From that matrix two high-value candidate sets
+fall out deterministically:
 
   - auth-bypass / missing-auth: an endpoint the ANONYMOUS role reaches with
     substantive 2xx content, or one a lower-trust role reaches that a
@@ -26,26 +29,68 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 import httpx
 
 from harness import crawler
+from harness import engagement as _engagement
 from harness import global_throttle
 import harness.missing_auth_probe as map_
 from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.role_crawl")
 
-# A pure-digit path segment is an object id -> template it to {id} so the same
-# object-scoped endpoint (tickets/1, tickets/2 ...) collapses to one row the
-# access matrix probes once per role and the IDOR machinery recognises.
-_NUM_SEG = re.compile(r"/\d+(?=/|$)")
 
-
+# An object-id path segment -> {id}, so the same object-scoped endpoint
+# (tickets/1, tickets/2 ...) collapses to one row the access matrix probes once
+# per principal and the IDOR machinery recognises. WL-02: this is the ONE rule
+# engagement.normalize_path also uses (digits, 12+ hex, hyphenated UUIDs), so a
+# matrix row and its engagement endpoint always share a key.
 def _template_ids(path: str) -> str:
-    return _NUM_SEG.sub("/{id}", path)
+    return _engagement.template_object_ids(path)
+
+
+def _observed_slot_values(raw_path: str) -> list:
+    """For each `{id}` slot of _template_ids(raw_path), in order: the concrete
+    OPAQUE id observed there (a UUID or long-hex value), else None. A numeric
+    slot or an already-templated `{id}` is None, so it keeps the `id_fill`
+    probe value exactly as before WL-02; an opaque id keeps the concrete value
+    the route was discovered with -- before WL-02 such a path was not templated
+    and was probed with that value, and `id_fill` ("1") can never address it."""
+    out: list = []
+    for i, seg in enumerate((raw_path or "").split("/")):
+        if seg == "{id}":
+            out.append(None)
+        elif i > 0 and _engagement.is_object_id_segment(seg):
+            out.append(None if seg.isdigit() else seg)
+    return out
+
+
+def _fill_observed_ids(path: str, values: list | None) -> str:
+    """Put the observed opaque ids back into a templated path's `{id}` slots;
+    slots without one stay `{id}` for map_._build_url's id_fill."""
+    if not values or not any(values):
+        return path
+    slots = iter(values)
+    out = []
+    for seg in path.split("/"):
+        if seg == "{id}":
+            value = next(slots, None)
+            out.append(value if value else seg)
+        else:
+            out.append(seg)
+    return "/".join(out)
+
+
+def _matrix_principal_id(r: "RoleSession") -> str:
+    """The key of a principal's column in the access matrix (WL-02). Two
+    sessions with the same role but different credentials are different
+    principals (RoleSession.principal_id), so they never collapse into one
+    role-labelled column."""
+    return r.principal_id()
 
 
 def _split_discovered_endpoint(endpoint: str) -> tuple[str, str]:
@@ -234,20 +279,67 @@ class RoleSession:
 class EndpointAccess:
     method: str
     path: str                 # normalized (may contain {id})
-    by_role: dict = field(default_factory=dict)   # role -> status (int) or None on error
-    reachable_roles: list = field(default_factory=list)  # roles that got substantive 2xx
-    # role -> {"len": int, "hash": str|None} for the SAME probed object id, so
-    # the same object's response can be compared ACROSS identities (BOLA test).
+    # ROLE VIEW (backward compatible, derived from by_principal -- WL-02):
+    # role -> status (int, or None on error); when principals sharing a role
+    # observed different statuses, the sorted list of those statuses (e.g.
+    # [200, 403]) instead of one status that would contradict reachability.
+    by_role: dict = field(default_factory=dict)
+    reachable_roles: list = field(default_factory=list)  # unique roles with a principal that got substantive 2xx
+    # role view of principal_fingerprints: role -> {"len": int, "hash": str|None}
+    # (a list of the distinct fingerprints when the role's principals differ).
     fingerprints: dict = field(default_factory=dict)
+    # AUTHORITATIVE (WL-02): principal_id -> engagement.principal_cell(...)
+    # {status, role, reachable, session_ref, observed_at, source}.
+    by_principal: dict = field(default_factory=dict)
+    reachable_principals: list = field(default_factory=list)
+    # principal_id -> {"len", "hash"} for the SAME probed object id, so the same
+    # object's response can be compared ACROSS principals (BOLA test).
+    principal_fingerprints: dict = field(default_factory=dict)
+    # The concrete path the matrix actually requested ("" when nothing was
+    # probed, e.g. a row created from a supplied capture).
+    probed_path: str = ""
 
     @property
     def object_scoped(self) -> bool:
         return "{id}" in self.path
 
+    def record(self, principal_id: str, *, role: str, status, reachable: bool,
+               fingerprint: dict | None = None, session_ref: str | None = None,
+               observed_at: float | None = None, source: str = "role_crawl") -> bool:
+        """Merge one principal's observation of this operation and re-derive the
+        role view. Returns whether it was applied (an older observation of the
+        same principal does not overwrite a newer one)."""
+        applied = _engagement.merge_principal_cell(self.by_principal, principal_id,
+                                                  _engagement.principal_cell(
+                                                      role=role, status=status, reachable=reachable,
+                                                      session_ref=session_ref, observed_at=observed_at,
+                                                      source=source))
+        if applied and fingerprint is not None:
+            self.principal_fingerprints[principal_id] = dict(fingerprint)
+        self._refresh_views()
+        return applied
+
+    def _refresh_views(self) -> None:
+        self.by_role, self.reachable_roles = _engagement.role_view_from_cells(
+            self.by_principal, self.by_role, self.reachable_roles)
+        self.reachable_principals = [pid for pid, c in self.by_principal.items() if c.get("reachable")]
+        grouped: dict[str, list] = {}
+        for pid, fp in self.principal_fingerprints.items():
+            role = (self.by_principal.get(pid) or {}).get("role") or pid
+            if fp not in grouped.setdefault(role, []):
+                grouped[role].append(fp)
+        fingerprints = {role: fp for role, fp in self.fingerprints.items() if role not in grouped}
+        fingerprints.update({role: (fps[0] if len(fps) == 1 else fps) for role, fps in grouped.items()})
+        self.fingerprints = fingerprints
+
     def to_dict(self) -> dict:
         return {"method": self.method, "path": self.path, "by_role": self.by_role,
                 "reachable_roles": self.reachable_roles, "object_scoped": self.object_scoped,
-                "fingerprints": self.fingerprints}
+                "fingerprints": self.fingerprints,
+                "by_principal": self.by_principal,
+                "reachable_principals": self.reachable_principals,
+                "principal_fingerprints": self.principal_fingerprints,
+                "probed_path": self.probed_path}
 
 
 @dataclass
@@ -526,6 +618,16 @@ async def crawl_roles(
     # for every principal. GET fields become a query string at replay time;
     # only write methods carry a request body.
     form_templates: dict[tuple[str, str, int], tuple[str, str, str]] = {}
+    # WL-02: templated path -> the opaque ids (UUID / long hex) it was discovered
+    # with, so templating such a path does not change the URL the matrix probes
+    # (see _observed_slot_values). First observation wins, deterministically.
+    observed_ids: dict[str, list] = {}
+
+    def _remember_observed_ids(raw_path: str, templated: str) -> None:
+        values = _observed_slot_values(raw_path)
+        if any(values):
+            observed_ids.setdefault(templated, values)
+
     for role_index, r in enumerate(roles):
         try:
             cr = await crawler.crawl(base_url, headers=r.norm_headers(),
@@ -535,16 +637,19 @@ async def crawl_roles(
                                                   if session_refs is not None else None))
             for endpoint in sorted(cr.endpoints):
                 discovered_path, observed_query = _split_discovered_endpoint(endpoint)
+                _remember_observed_ids(urlsplit(endpoint).path or "/", discovered_path)
                 discovered.add(discovered_path)
                 if observed_query:
                     observed_queries.setdefault(discovered_path, observed_query)
             for shape in getattr(cr, "call_shapes", []):
                 shape_path, _ = _split_discovered_endpoint(shape.path)
+                _remember_observed_ids(urlsplit(shape.path).path or "/", shape_path)
                 discovered.add(shape_path)
                 path_methods.setdefault(shape_path, set()).add(shape.method.upper())
             for form in getattr(cr, "forms", []):
                 parts = urlsplit(form.action)
                 form_path = _template_ids(parts.path or "/")
+                _remember_observed_ids(parts.path or "/", form_path)
                 form_method = (form.method or "GET").upper()
                 discovered.add(form_path)
                 path_methods.setdefault(form_path, set()).add(form_method)
@@ -593,6 +698,7 @@ async def crawl_roles(
                     sres = await disc.discover()
                     for rt in sres.routes:
                         tp = _template_ids(rt.path)
+                        _remember_observed_ids(rt.path, tp)
                         discovered.add(tp)
                         if rt.methods:
                             path_methods.setdefault(tp, set()).update(
@@ -628,7 +734,10 @@ async def crawl_roles(
         result.errors.append(f"surface truncated to {max_endpoints} of {len(operations)} "
                              "endpoint operations for probing")
 
-    # 2. Probe each endpoint with each role -> access matrix.
+    # 2. Probe each endpoint with each principal -> access matrix. WL-02: every
+    # cell is keyed by the PRINCIPAL (two same-role accounts are two cells) and
+    # records status, role, session ref and observation time; by_role /
+    # reachable_roles / fingerprints are the role view derived from the cells.
     captured_keys: set[tuple] = set()   # (method, path, body-fp) -> dedup captures
     for path, probe_method in operations[:max_endpoints]:
         # Use the endpoint's REAL accepted method (from discovery's Allow-header
@@ -637,6 +746,7 @@ async def crawl_roles(
         # and is misread as unreachable/dead, never exercising the endpoint's
         # actual logic. No method info (passive JS/HTML crawl only) -> GET.
         access = EndpointAccess(method=probe_method, path=path)
+        probe_path = _fill_observed_ids(path, observed_ids.get(path))
         for role_index, r in enumerate(roles):
             form_template = form_templates.get((path, probe_method, role_index))
             if form_template:
@@ -653,19 +763,26 @@ async def crawl_roles(
                 req_body, req_ctype = _synthesize_body(probe_method, path)
                 query = ((observed_queries.get(path) or _synthesize_query(path))
                          if probe_method == "GET" else "")
-            url = map_._build_url(base_url, path, id_fill)
+            url = map_._build_url(base_url, probe_path, id_fill)
             if query:
                 url = f"{url}?{query}"
             if not map_._host_allowed(url, allowed_hosts):
                 continue
+            access.probed_path = urlsplit(url).path
+            session_ref = session_refs[role_index] if session_refs is not None else None
             status, body, resp_headers = await _probe(
                 probe_method, url, r.norm_headers(), timeout, run_context=run_context,
-                session_ref=session_refs[role_index] if session_refs is not None else None,
-                body=req_body, content_type=req_ctype)
-            access.by_role[r.role] = status
+                session_ref=session_ref, body=req_body, content_type=req_ctype)
             substantive = map_._substantive(status, body)
+            # For object-scoped endpoints also record a body fingerprint, so the
+            # SAME object's response can be compared across principals below.
+            access.record(
+                _matrix_principal_id(r), role=r.role, status=status, reachable=substantive,
+                fingerprint=({"len": len((body or "").strip()),
+                              "hash": _body_fp(body) if substantive else None}
+                             if access.object_scoped else None),
+                session_ref=session_ref, observed_at=time.time())
             if substantive:
-                access.reachable_roles.append(r.role)
                 # Phase 0.1: retain the substantive 2xx as an analyzable exchange
                 # so full content-level review reaches it, AND (R05) so the
                 # request body/query the harness actually used to reach it
@@ -688,13 +805,6 @@ async def crawl_roles(
                         response_body=body,
                         analyst_note=f"role_crawl discovery capture as '{r.role}' (HTTP {status})",
                     ).model_dump())
-            # Record a body fingerprint for object-scoped endpoints so the SAME
-            # object's response can be compared across identities below.
-            if access.object_scoped:
-                access.fingerprints[r.role] = {
-                    "len": len((body or "").strip()),
-                    "hash": _body_fp(body) if substantive else None,
-                }
         result.endpoints.append(access)
 
     _derive_candidates(result, roles)
@@ -722,32 +832,41 @@ def _compare_identities(result: RoleCrawlResult, roles: list[RoleSession], id_fi
     scoping the object per-identity -- either it's a shared/public object or it's
     a broken object-level authorization (BOLA/IDOR). That distinction needs a
     human (is object {id} meant to be private?), so this ships as an unconfirmed,
-    moderate-confidence finding, not a confirmation."""
-    authed = {r.role for r in roles if _trust(r.role) > 0}
+    moderate-confidence finding, not a confirmation.
+
+    WL-02: identities are PRINCIPALS (RoleSession.principal_id) that are
+    authenticated by role (trust > 0), not role labels -- so two accounts with
+    the same role (alice and bob, both `user`) are compared, which a role-keyed
+    matrix collapsed into one column and never could be."""
+    authed = {_matrix_principal_id(r): r.role for r in roles if _trust(r.role) > 0}
     for e in result.endpoints:
         if not e.object_scoped:
             continue
         by_hash: dict[str, list[str]] = {}
-        for role in e.reachable_roles:
-            if role not in authed:
+        for pid in e.reachable_principals:
+            if pid not in authed:
                 continue
-            h = e.fingerprints.get(role, {}).get("hash")
+            h = (e.principal_fingerprints.get(pid) or {}).get("hash")
             if h:
-                by_hash.setdefault(h, []).append(role)
+                by_hash.setdefault(h, []).append(pid)
         for _hash, sharing in by_hash.items():
             distinct = sorted(set(sharing))
             if len(distinct) < 2:
                 continue
-            url_shown = e.path.replace("{id}", id_fill)
-            result.idor_findings.append(Finding(
+            url_shown = e.probed_path or e.path.replace("{id}", id_fill)
+            object_ref = ", ".join(_engagement.path_id_values(url_shown)) or id_fill
+            principal_roles = {pid: (e.by_principal.get(pid) or {}).get("role") or authed[pid]
+                               for pid in distinct}
+            shown = ", ".join(_principal_label(pid, principal_roles[pid]) for pid in distinct)
+            finding = Finding(
                 vulnerability_class="idor",
                 confidence=0.65,
                 summary=(f"Object-scoped endpoint {e.method} {e.path} returns identical content "
-                         f"for object id={id_fill} to distinct identities ({', '.join(distinct)}) "
+                         f"for object id={object_ref} to distinct identities ({shown}) "
                          f"-- object-level authorization is not enforced per-identity."),
                 evidence=(f"Same request ({e.method} {url_shown}) sent as each identity returned "
-                          f"byte-identical substantive responses across {', '.join(distinct)}. "
-                          f"If object id={id_fill} is meant to be private to one identity, this is "
+                          f"byte-identical substantive responses across {shown}. "
+                          f"If object id={object_ref} is meant to be private to one identity, this is "
                           f"BOLA/IDOR; if it is a shared/public object it is benign -- confirm ownership."),
                 suggested_test=(f"Fetch an object that belongs to one identity, then request the SAME "
                                 f"object id as another identity; a proper control returns 403/404 or that "
@@ -757,15 +876,39 @@ def _compare_identities(result: RoleCrawlResult, roles: list[RoleSession], id_fi
                 owasp_category="A01:2021-Broken Access Control",
                 confirmed=False,
                 validation_hints=[f"cross_identity_compare:{e.path}"],
-            ).model_dump())
+            ).model_dump()
+            # WL-02: which principals were compared, and their roles.
+            finding["principals"] = distinct
+            finding["principal_roles"] = principal_roles
+            result.idor_findings.append(finding)
+
+
+def _principal_label(principal_id: str, role: str) -> str:
+    """A principal as shown in a lead: its id, plus the role when the id does
+    not already carry it (alice [user]; user#1a2b3c4d stays as is)."""
+    if not role or principal_id == role or principal_id.startswith(f"{role}#"):
+        return principal_id
+    return f"{principal_id} [{role}]"
+
+
+def _principal_summary(e: EndpointAccess, principal_ids) -> dict:
+    """principal_id -> {role, status} for a candidate row (WL-02)."""
+    return {pid: {"role": (e.by_principal.get(pid) or {}).get("role"),
+                  "status": (e.by_principal.get(pid) or {}).get("status")}
+            for pid in principal_ids}
 
 
 def _derive_candidates(result: RoleCrawlResult, roles: list[RoleSession]) -> None:
+    """Auth-bypass, function-level and IDOR candidates from the matrix. Roles
+    decide the privilege direction (that is a role-level question); every
+    candidate also names the PRINCIPALS behind it (`reached_by_principals`,
+    `by_principal`, WL-02) next to the existing role keys."""
     anon_roles = {r.role for r in roles if _trust(r.role) == 0}
     for e in result.endpoints:
         reachable = set(e.reachable_roles)
         if not reachable:
             continue
+        reached_principals = list(e.reachable_principals)
 
         # Auth bypass: reachable anonymously at all -> served without credentials.
         anon_reach = reachable & anon_roles
@@ -775,14 +918,16 @@ def _derive_candidates(result: RoleCrawlResult, roles: list[RoleSession]) -> Non
                 "reason": "reachable with no authentication (anonymous role got substantive 2xx)",
                 "severity": "high", "class": "missing_authentication",
                 "by_role": e.by_role,
+                "reached_by_principals": sorted(reached_principals),
+                "by_principal": _principal_summary(e, e.by_principal),
             })
         else:
             # Function-level authz gap: a lower-trust role reaches something a
             # strictly higher-trust role in this run does NOT -- the privilege
             # direction is inverted from what RBAC would produce.
             reached_trust = min(_trust(x) for x in reachable)
-            higher_absent = sorted(r.role for r in roles
-                                   if r.role not in reachable and _trust(r.role) > reached_trust)
+            higher_absent = sorted({r.role for r in roles
+                                    if r.role not in reachable and _trust(r.role) > reached_trust})
             if higher_absent and reached_trust > 0:
                 result.auth_bypass_candidates.append({
                     "path": e.path, "method": e.method, "reached_by": sorted(reachable),
@@ -791,16 +936,23 @@ def _derive_candidates(result: RoleCrawlResult, roles: list[RoleSession]) -> Non
                               f"function-level authorization candidate",
                     "severity": "medium", "class": "authz",
                     "by_role": e.by_role,
+                    "reached_by_principals": sorted(reached_principals),
+                    "by_principal": _principal_summary(e, e.by_principal),
                 })
 
         # IDOR/BOLA: an object-scoped endpoint reachable by >=1 authenticated
         # identity -- the target for a same-object cross-identity comparison.
         authed_reach = sorted(x for x in reachable if _trust(x) > 0)
         if e.object_scoped and authed_reach:
+            authed_principals = sorted(
+                pid for pid in reached_principals
+                if _trust((e.by_principal.get(pid) or {}).get("role") or "") > 0)
             result.idor_candidates.append({
                 "path": e.path, "method": e.method, "reached_by": authed_reach,
                 "reason": "object-scoped endpoint ({id} in path) reachable by an authenticated "
                           "identity -- test same object id across identities for IDOR/BOLA",
                 "severity": "high", "class": "idor",
                 "by_role": e.by_role,
+                "reached_by_principals": authed_principals,
+                "by_principal": _principal_summary(e, e.by_principal),
             })
