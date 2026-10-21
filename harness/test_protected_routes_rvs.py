@@ -134,9 +134,11 @@ class _ChainCase(unittest.TestCase):
     """Drives the production chain with the doubled builder and worklist."""
 
     def _run_chain(self, route, paths, *, authz=None, engagement_paths=None,
-                   roles=None, via: str = "shape", use_run_context: bool = False):
+                   roles=None, via: str = "shape", use_run_context: bool = False,
+                   exchange_headers: dict | None = None):
         """`authz(server) -> dict | None` builds the config's `authz` section once the
-        server's port is known. Returns ({path: findings}, server)."""
+        server's port is known. `exchange_headers` are the probe identity's headers
+        (none: the node was reached anonymously). Returns ({path: findings}, server)."""
         server = _Loopback(route)
         self.addCleanup(server.close)
         base = server.origin + "/"
@@ -156,7 +158,8 @@ class _ChainCase(unittest.TestCase):
         async def investigate(*args, **kwargs):
             outcomes = []
             for node in nodes:
-                ex = worklist_investigator._seed_exchange(base, node, {}, "1")
+                ex = worklist_investigator._seed_exchange(
+                    base, node, dict(exchange_headers or {}), "1")
                 if via == "shape":
                     findings = await kwargs["precondition_fn"](node, ex)
                 else:
@@ -296,6 +299,30 @@ class ListedRouteDeniedTests(_ChainCase):
                 sent = server.sent_to("/admin/report")
                 self.assertEqual(len(sent), 1, "no baseline after an anonymous denial")
                 self.assertFalse({"authorization", "x-tenant-session", "cookie"} & set(sent[0]))
+
+    def test_identity_session_header_never_reaches_the_anonymous_replay(self):
+        # The node was reached as the user, so the probe exchange carries the user's
+        # headers, including a session header the probe does not strip by name.
+        user = {"Authorization": _TOKEN, "X-Tenant-Session": "t-1"}
+        for via in ("shape", "label"):
+            with self.subTest(via=via):
+                found, server = self._run_chain(
+                    self._guarded, ["/admin/report"], roles=_roles(user), via=via,
+                    exchange_headers=user,
+                    authz=lambda s: _authz({s.key: ["/admin/**"]}))
+                self._assert_not_confirmed(found["/admin/report"], via)
+                sent = server.sent_to("/admin/report")
+                self.assertEqual(len(sent), 1, "no baseline after an anonymous denial")
+                self.assertFalse({"authorization", "x-tenant-session", "cookie"} & set(sent[0]))
+
+    def test_identity_exchange_on_a_leaking_listed_route_still_confirms(self):
+        # Control: dropping the identity's other headers keeps a real leak confirmable.
+        user = {"Authorization": _TOKEN, "X-Tenant-Session": "t-1"}
+        found, server = self._run_chain(
+            _leak, ["/admin/report"], roles=_roles(user), exchange_headers=user,
+            authz=lambda s: _authz({s.key: ["/admin/**"]}))
+        self._assert_confirmed(found["/admin/report"], "/admin/**", "config")
+        self._assert_anonymous_then_baseline(server.sent_to("/admin/report"))
 
 
 # ------------------------------------------------------------------ S4

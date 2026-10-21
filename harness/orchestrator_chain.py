@@ -926,6 +926,16 @@ class ChainMixin:
                             engagement_paths=getattr(state, "protected_paths", None)))
                     declared = _protected[0].match(method, exchange.url)
                     baseline = exchange.request_headers
+                    if declared is not None:
+                        # The probe strips only the credential headers it knows by
+                        # name; any other header a supplied identity sets (a custom
+                        # session header) would ride along on the "anonymous"
+                        # replay. Drop those, so a listed route is replayed with no
+                        # identity at all (fail closed: the baseline may then fail).
+                        supplied = {k.lower() for r in roles for k in (r.headers or {})}
+                        baseline = {k: v for k, v in (baseline or {}).items()
+                                    if k.lower() in missing_auth_probe._AUTH_HEADERS
+                                    or k.lower() not in supplied}
                     if declared is not None and not any(
                             k.lower() in missing_auth_probe._AUTH_HEADERS for k in (baseline or {})):
                         # The probe identity of an anonymously reached node is
