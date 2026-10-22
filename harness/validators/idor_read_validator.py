@@ -50,6 +50,7 @@ from harness.missing_auth_probe import _AUTH_HEADERS
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
+from .send_failures import SendFailures
 
 # Query keys that carry an object reference an IDOR would swap.
 _ID_QUERY_KEYS = {"id", "user", "user_id", "userid", "uid", "order", "order_id",
@@ -196,7 +197,9 @@ class IdorReadValidator(Validator):
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "idor", summary=why)
 
-    async def _get(self, url: str, headers: dict):
+    async def _get(self, url: str, headers: dict, failures=None):
+        if failures is not None:
+            failures.attempted += 1
         try:
             await global_throttle.acquire()
             async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
@@ -204,9 +207,9 @@ class IdorReadValidator(Validator):
                 resp = await client.request("GET", url, headers=headers or None)
             location = (getattr(resp, "headers", None) or {}).get("location", "") or ""
             return resp.status_code, (resp.text or ""), location
-        except SafetyGateBlocked:
-            return None
-        except httpx.HTTPError:
+        except (SafetyGateBlocked, httpx.HTTPError) as e:
+            if failures is not None:
+                failures.exception(SendFailures.label("GET", url), e)
             return None
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
@@ -222,8 +225,11 @@ class IdorReadValidator(Validator):
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("host", "content-length")}
 
-        own = await self._get(exchange.url, headers)
+        baseline = SendFailures()
+        own = await self._get(exchange.url, headers, baseline)
         if own is None:
+            if baseline.refused:
+                return baseline.result(self.name, "idor", "IDOR baseline")
             return ValidationResult(self.name, "error", "idor",
                                     summary="baseline request blocked or failed")
         s_own, b_own, _ = own
@@ -249,9 +255,10 @@ class IdorReadValidator(Validator):
         has_session = len(anon_headers) < len(headers)
         candidate = ""  # a distinct foreign object we could not show is protected
         protected = ""  # a protected foreign object this one principal could read
+        failures = SendFailures()
         for cand in foreigns:
             foreign_url = _with_id(exchange, kind, key, cand)
-            fr = await self._get(foreign_url, headers)
+            fr = await self._get(foreign_url, headers, failures)
             if fr is None:
                 continue
             s_f, b_f, _ = fr
@@ -326,6 +333,8 @@ class IdorReadValidator(Validator):
                 evidence=(f"On the {kind} id {key!r}, a foreign id returned a different object, but "
                           f"{candidate}. Different objects at neighbouring ids are not proof of "
                           f"broken object-level authorization."))
+        if failures.failures:
+            return failures.result(self.name, "idor", "IDOR foreign reads")
         return ValidationResult(
             self.name, "not_confirmed", "idor", confidence=0.0, confirmed=False,
             summary="No cross-object read: foreign ids were denied or returned no distinct object",

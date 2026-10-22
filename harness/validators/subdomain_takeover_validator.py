@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .base import Validator, ValidationResult
+from .send_failures import SendFailures
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -70,12 +71,15 @@ class TakeoverTestResult:
     evidence: str
     vulnerable: bool = False
     checked: bool = True
+    failure: str = ""
+    refused: bool = False
 
     def to_dict(self) -> dict:
         return {
             "test": self.test_name, "passed": self.passed, "severity": self.severity,
             "detail": self.detail, "evidence": self.evidence,
             "vulnerable": self.vulnerable, "checked": self.checked,
+            "failure": self.failure, "refused": self.refused,
         }
 
 
@@ -157,6 +161,13 @@ class SubdomainTakeoverValidator(Validator):
 
             vulnerable_tests = [t for t in tests if t.vulnerable]
             vulnerable = bool(vulnerable_tests)
+            failed = [t for t in tests if t.failure]
+            if failed and not vulnerable:
+                sends = SendFailures(
+                    attempted=len([t for t in tests if t.failure or t.test_name.startswith("Fingerprint:")]),
+                    failures=[t.failure for t in failed], refused=sum(t.refused for t in failed))
+                return sends.result(self.get_name(), finding.vulnerability_class, "subdomain_takeover")
+
 
             summary_parts = []
             if vulnerable_tests:
@@ -211,6 +222,7 @@ class SubdomainTakeoverValidator(Validator):
 
     async def _check_fingerprint(self, host: str) -> TakeoverTestResult:
         url = self._fingerprint_url(host)
+        outcome = None
         try:
             if self.run_context is not None:
                 from types import SimpleNamespace
@@ -236,6 +248,8 @@ class SubdomainTakeoverValidator(Validator):
                 f"Fingerprint: {host}", True, "low",
                 f"Could not fetch {url} ({e}) -- inconclusive, not a negative result", "",
                 vulnerable=False, checked=False,
+                failure=f"{url}: {type(e).__name__}: " + (outcome.outcome if outcome is not None else "transport failure"),
+                refused=outcome is not None and not outcome.executed,
             )
 
         body = response.text or ""

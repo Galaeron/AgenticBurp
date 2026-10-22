@@ -26,6 +26,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import httpx
 
 from .base import Validator, ValidationResult
+from .send_failures import SendFailures
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -42,12 +43,15 @@ class OAuthTestResult:
     evidence: str
     vulnerable: bool = False
     checked: bool = True  # False when the check didn't apply to this exchange at all
+    failure: str = ""
+    refused: bool = False
 
     def to_dict(self) -> dict:
         return {
             "test": self.test_name, "passed": self.passed, "severity": self.severity,
             "detail": self.detail, "evidence": self.evidence,
             "vulnerable": self.vulnerable, "checked": self.checked,
+            "failure": self.failure, "refused": self.refused,
         }
 
 
@@ -121,6 +125,13 @@ class OAuthValidator(Validator):
 
             checked = [t for t in tests if t.checked]
             vulnerable = any(t.vulnerable for t in checked)
+            failed = [t for t in tests if t.failure]
+            if failed and not vulnerable:
+                sends = SendFailures(
+                    attempted=len([t for t in tests if t.failure or t.test_name == "Redirect URI Validation"]),
+                    failures=[t.failure for t in failed], refused=sum(t.refused for t in failed))
+                return sends.result(self.get_name(), finding.vulnerability_class, "oauth")
+
             if not checked:
                 return ValidationResult(
                     validator=self.get_name(), status="skipped",
@@ -252,6 +263,7 @@ class OAuthValidator(Validator):
         flat_qs = {k: v[0] for k, v in new_qs.items()}
         probe_url = urlunparse(parsed._replace(query=urlencode(flat_qs)))
 
+        outcome = None
         try:
             if self.run_context is not None:
                 from types import SimpleNamespace
@@ -262,7 +274,7 @@ class OAuthValidator(Validator):
                 if not outcome.ok:
                     raise httpx.TransportError(outcome.error or outcome.outcome)
                 response = SimpleNamespace(status_code=outcome.status,
-                                           headers=outcome.headers)
+                                           headers=httpx.Headers(outcome.headers))
             else:
                 async with httpx.AsyncClient(
                     timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
@@ -276,7 +288,9 @@ class OAuthValidator(Validator):
         except Exception as e:
             log.debug(f"redirect_uri probe failed: {e}")
             return OAuthTestResult("Redirect URI Validation", True, "low",
-                                    "Could not send redirect_uri probe", "", checked=True, vulnerable=False)
+                                    "Could not send redirect_uri probe", "", checked=True, vulnerable=False,
+                                    failure=f"redirect_uri: {type(e).__name__}: " + (outcome.outcome if outcome is not None else "transport failure"),
+                                    refused=outcome is not None and not outcome.executed)
 
         location = response.headers.get("Location", "")
         if response.status_code in (301, 302, 303, 307, 308) and location.startswith(tampered):

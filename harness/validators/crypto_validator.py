@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from .base import Validator, ValidationResult
+from .send_failures import SendFailures
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -43,12 +44,15 @@ class CryptoTestResult:
     evidence: str
     vulnerable: bool = False
     checked: bool = True
+    failure: str = ""
+    refused: bool = False
 
     def to_dict(self) -> dict:
         return {
             "test": self.test_name, "passed": self.passed, "severity": self.severity,
             "detail": self.detail, "evidence": self.evidence,
             "vulnerable": self.vulnerable, "checked": self.checked,
+            "failure": self.failure, "refused": self.refused,
         }
 
 
@@ -135,6 +139,13 @@ class CryptoValidator(Validator):
 
             checked = [t for t in tests if t.checked]
             vulnerable = any(t.vulnerable for t in checked)
+            failed = [t for t in tests if t.failure]
+            if failed and not vulnerable:
+                sends = SendFailures(
+                    attempted=len([t for t in tests if t.failure or t.test_name == "TLS Configuration"]),
+                    failures=[t.failure for t in failed], refused=sum(t.refused for t in failed))
+                return sends.result(self.get_name(), finding.vulnerability_class, "crypto")
+
             severities = [t.severity for t in checked if t.vulnerable]
             severity = "critical" if "critical" in severities else ("high" if "high" in severities else "medium")
 
@@ -185,7 +196,8 @@ class CryptoValidator(Validator):
         except Exception as e:
             log.debug(f"TLS check failed for {hostname}:{port}: {e}")
             return CryptoTestResult("TLS Configuration", True, "low",
-                                     f"Could not establish TLS connection to verify: {e}", "", checked=False)
+                                     f"Could not establish TLS connection to verify: {e}", "", checked=False,
+                                     failure=f"TLS {hostname}:{port}: {type(e).__name__}")
 
         issues = []
         if version in _WEAK_PROTOCOLS:
