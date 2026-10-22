@@ -188,9 +188,9 @@ class OwnershipFact:
     tenant: str | None = None              # None = unknown tenant
     shared_with: frozenset = frozenset()    # principals explicitly granted access
     public: bool = False
-    authenticated: bool = False
     provenance: str = ""                    # how observed, e.g. "created-as:alice via POST /items"
     observed_at: float = field(default_factory=time.time)
+    authenticated: bool = False
 
     @property
     def known(self) -> bool:

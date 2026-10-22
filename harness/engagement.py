@@ -777,9 +777,9 @@ class EngagementState:
         for ident in getattr(other, "identities", []) or []:
             if not any(i.get("name") == ident.get("name") for i in self.identities):
                 self.identities.append(ident)
-        for entry in getattr(other, "owners", []) or []:
-            if entry not in self.owners:
-                self.owners.append(entry)
+        owners = getattr(other, "owners", None)
+        if isinstance(owners, list) and isinstance(self.owners, list):
+            self.owners.extend(entry for entry in owners if entry not in self.owners)
         theirs = getattr(other, "protected_paths", None)
         if isinstance(theirs, list) and isinstance(self.protected_paths, list):
             self.protected_paths.extend(p for p in theirs if p not in self.protected_paths)

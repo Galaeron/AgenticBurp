@@ -125,6 +125,26 @@ class PassivePrivacyCallerTests(privacy_fixture._PrivacyTestBase, unittest.TestC
 
 
 class DriverCeilingCallerTests(driver_fixture.RunEngagementRunBoundTests, unittest.TestCase):
+    def test_borrowed_driver_refuses_mutation_even_when_parent_allows_it(self):
+        from harness.orchestrator import Orchestrator
+        from harness.models import AnalysisResponse
+        outcomes = []
+        async def mutation(orch, exchange, **kwargs):
+            outcomes.append(await kwargs['run_context'].executor().send(
+                'POST', self.target.base + '/api/write', capability='analysis_probe', max_redirects=0))
+            return AnalysisResponse(coordinator_model='fixture', dispatched_agents=[], agent_reports=[],
+                                    summary='', test_plans=[])
+        cfg = driver_fixture._config(runs_max=20)
+        cfg['engagement']['driver_max_requests'] = 10
+        parent = RunContext.create(allowed_hosts=['127.0.0.1'], config=cfg, max_requests=20,
+            gate_config={'active_enabled': True, 'allow_mutating_replay': True})
+        self._drive(cfg, enclosing=parent, scripted=False,
+                    extra_patches=(patch.object(Orchestrator, '_analyze_inner', mutation),))
+        self.assertTrue(outcomes)
+        self.assertFalse(any(outcome.ok for outcome in outcomes))
+        self.assertTrue(all(method == 'GET' for method, _ in self.target.requests))
+        self.assertTrue(parent.gate.config.allow_mutating_replay)
+
     def test_driver_ceiling_includes_nested_analysis_sends(self):
         cfg = driver_fixture._config(runs_max=20)
         cfg['engagement']['driver_max_requests'] = 3
@@ -160,6 +180,12 @@ class DriverCeilingCallerTests(driver_fixture.RunEngagementRunBoundTests, unitte
 
 
 class OwnershipModelTests(unittest.TestCase):
+    def test_malformed_engagement_owners_do_not_break_merge(self):
+        state = engagement.EngagementState(host='app.test')
+        other = engagement.EngagementState.from_dict({'host': 'app.test', 'owners': 42})
+        state.merge_from(other)
+        self.assertEqual(state.owners, [])
+
     def test_shares_only_and_tie_order(self):
         entries = [{'path': '/reports/*', 'shared_with': ['alice']},
                    {'path': '/reports/*', 'public': True}]
@@ -186,6 +212,19 @@ class OwnershipModelTests(unittest.TestCase):
 
 
 class SensitiveSeverityCallerTests(file_fixture.SensitiveFileConfirmationCallerTests, unittest.TestCase):
+    def test_empty_credential_assignments_are_medium_real_value_is_high(self):
+        empty = ('APP_NAME=fixture\nPASSWORD=\nAPI_KEY=   \nSECRET=""\n'
+                 "TOKEN=''\nPRIVATE_KEY='   '\nACCESS_KEY=\" \t \"\n"
+                 'DB_PASSWORD= # intentionally empty\nPUBLIC_URL=https://example.test/\n')
+        for body, expected in ((empty, 'medium'), (empty + 'API_TOKEN=fixture-secret\n', 'high')):
+            with self.subTest(expected=expected), patch.object(file_fixture, '_DOTENV', body):
+                findings, _, records = self._investigate(catch_all=False)
+            self.assertTrue(findings['/.env']['confirmed'])
+            self.assertEqual(findings['/.env']['severity'], expected)
+            record = next(r for r in records if r['path'] == '/.env')
+            self.assertEqual(record['contains_credentials'], expected == 'high')
+            self.assertNotIn('fixture-secret', findings['/.env']['evidence'])
+
     def test_served_candidates_are_low_and_redirect_is_informational(self):
         findings, _, _ = self._investigate(catch_all=False)
         self.assertEqual(findings['/.env']['severity'], 'high')

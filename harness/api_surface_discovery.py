@@ -696,8 +696,7 @@ class SurfaceDiscovery:
                             if body else ""),
             "expected_structure": sensitive_artifact_class(path) or "",
             "structure": verdict.structure or "",
-            "contains_credentials": bool(verdict.structure == "dotenv" and re.search(
-                r"(?im)^\s*[A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*[^\s#]+", body)),
+            "contains_credentials": verdict.structure == "dotenv" and _dotenv_has_credentials(body),
             "confirmed": verdict.structure is not None,
             "outcome": verdict.outcome,
             "reason": verdict.reason,
@@ -1034,6 +1033,33 @@ _LOG_LINE = re.compile(
     r"|\[\w{3} \w{3} [ \d]?\d \d{2}:\d{2}:\d{2}"               # Apache error log
     r"|\S+ \S+ \S+ \[\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}"      # common/combined log
     r"|\w{3} [ \d]\d \d{2}:\d{2}:\d{2} ")                      # syslog
+
+
+def _dotenv_has_credentials(body: str) -> bool:
+    """Classify credential assignments without retaining values in evidence."""
+    for line in _content_lines(body):
+        if not _DOTENV_LINE.fullmatch(line):
+            continue
+        name, value = line.split("=", 1)
+        name = re.sub(r"^export\s+", "", name).strip()
+        value = value.strip()
+        if value.startswith(("'", '"')):
+            end = value.find(value[0], 1)
+            value = value[1:end] if end >= 1 else ""
+        else:
+            value = value.split("#", 1)[0]
+        if not value.strip():
+            continue
+        if re.search(r"PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY", name, re.I):
+            return True
+        # Connection URLs can hold credentials even without a secret-named key.
+        if "URL" in name.upper() or "DSN" in name.upper():
+            try:
+                if urlsplit(value).password:
+                    return True
+            except ValueError:
+                pass
+    return False
 
 
 def _sig_dotenv(body):
