@@ -156,6 +156,53 @@ def _responses_materially_same(a: ExecutionOutcome, b: ExecutionOutcome) -> bool
     return a_status == b_status and identity_compare.similarity(a_body, b_body) >= identity_compare.MATCH_THRESHOLD
 
 
+class _DriverBudget:
+    """Atomic child reservations spend the parent budget without replacing it."""
+    def __init__(self, parent, maximum):
+        import threading
+        self.parent, self.maximum, self.spent = parent, maximum, 0
+        self.lock = threading.Lock()
+
+    def reserve(self, n=1):
+        with self.lock:
+            if self.spent + n > self.maximum or not self.parent.reserve(n):
+                return False
+            self.spent += n
+            return True
+
+    @property
+    def remaining(self):
+        remaining = self.parent.remaining
+        own = max(0, self.maximum - self.spent)
+        return own if remaining is None else min(own, remaining)
+
+    @property
+    def used(self):
+        return self.parent.used
+
+
+@contextlib.asynccontextmanager
+async def _driver_scope(run, maximum):
+    import copy
+    from dataclasses import replace
+    from harness.safety_gate import push_gate, pop_gate
+    child = copy.copy(run)
+    child.budget = run.budget if maximum is None else _DriverBudget(run.budget, maximum)
+    child.gate = copy.copy(run.gate)
+    child.gate.config = replace(run.gate.config, allow_mutating_replay=False)
+    gate_restore = push_gate(child.gate)
+    # Task-local binding: sibling drivers retain their own child budget.
+    token = _run_context_mod._ambient_run.set(child)
+    try:
+        yield child
+    finally:
+        _run_context_mod._ambient_run.reset(token)
+        pop_gate(gate_restore)
+        # A lazily opened default client belongs to this child, not its parent.
+        if child._default_client is not None and child._default_client is not run._default_client:
+            await child._default_client.aclose()
+
+
 class ChainMixin:
     async def plan_engagement(self, host: str, *, max_targets: int = 10,
                               base_url: str = "") -> dict:
@@ -248,6 +295,9 @@ class ChainMixin:
             plan["note"] = "execution refused: engagement.driver_execute is disabled in config.yaml"
             return plan
 
+        driver_ceiling = (self.config.get("engagement", {}) or {}).get("driver_max_requests")
+        if driver_ceiling is not None and (type(driver_ceiling) is not int or driver_ceiling < 0):
+            raise ValueError("engagement.driver_max_requests must be a nonnegative integer")
         enclosing = _run_context_mod.current_run_context()
         owned = None
         if enclosing is None:
@@ -271,7 +321,7 @@ class ChainMixin:
         rounds: list[dict] = []
         seen_urls: set[str] = set()   # don't re-fetch the same target across rounds
 
-        async with (owned if owned is not None else contextlib.nullcontext(enclosing)) as run:
+        async with (owned if owned is not None else contextlib.nullcontext(enclosing)) as parent_run, _driver_scope(parent_run, driver_ceiling) as run:
             _tt = run.target_transport()
             for rnd in range(1, max(1, max_rounds) + 1):
                 stop = ("run cancelled" if run.cancel.cancelled else
@@ -319,8 +369,11 @@ class ChainMixin:
                     break
             remaining = run.budget.remaining
             run_info = {"run_id": run.run_id, "owned": owned is not None,
-                        "max_requests": None if remaining is None else run.budget.used + remaining,
+                        "max_requests": None if parent_run.budget.remaining is None else parent_run.budget.used + parent_run.budget.remaining,
                         "requests_used": run.budget.used, "cancelled": run.cancel.cancelled}
+            if driver_ceiling is not None:
+                run_info.update(driver_max_requests=driver_ceiling,
+                                driver_requests_used=getattr(run.budget, "spent", None))
 
         after = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
         return {"host": host, "executed": True, "rounds": rounds, "run": run_info,
@@ -726,6 +779,8 @@ class ChainMixin:
                 # with different credentials must not overwrite each other under a
                 # shared `role` key. Role is still carried for privilege checks.
                 identity_headers.set_identity(host, r.principal_id(), dict(r.headers), r.role)
+        ownership = self._configure_ownership(base_url, engagement_owners=getattr(state, "owners", None),
+                                              run_context=run_context, install=False)
         _xid_cfg = (self.config.get("validators", {}) or {}).get("cross_identity", {}) or {}
         _xval = CrossIdentityValidator(
             allowed_hosts=self.allowed_hosts,
@@ -734,7 +789,7 @@ class ChainMixin:
             run_context=run_context,
             # WL-04: the registry's declared-ownership source (D1 seam); None means
             # a cross-identity match is a `supported` lead, never a confirmation.
-            ownership=getattr(self.validator_registry, "ownership", None))
+            ownership=ownership)
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a

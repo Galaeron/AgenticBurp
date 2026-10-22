@@ -722,6 +722,7 @@ class EngagementState:
     # derived from target content or a model writes here. The missing-auth leg
     # confirms only a route listed here or in config authz.protected_paths.
     protected_paths: list = field(default_factory=list)
+    owners: list = field(default_factory=list)
 
     def __post_init__(self):
         from harness import task_graph
@@ -776,6 +777,9 @@ class EngagementState:
         for ident in getattr(other, "identities", []) or []:
             if not any(i.get("name") == ident.get("name") for i in self.identities):
                 self.identities.append(ident)
+        for entry in getattr(other, "owners", []) or []:
+            if entry not in self.owners:
+                self.owners.append(entry)
         theirs = getattr(other, "protected_paths", None)
         if isinstance(theirs, list) and isinstance(self.protected_paths, list):
             self.protected_paths.extend(p for p in theirs if p not in self.protected_paths)
@@ -1008,6 +1012,8 @@ class EngagementState:
              "endpoints": {k: v.to_dict() for k, v in self.endpoints.items()},
              "identities": self.identities,
              "task_graph": self.graph.to_dict()}
+        if self.owners:
+            d["owners"] = self.owners
         if self.protected_paths:
             d["protected_paths"] = self.protected_paths
         return d
@@ -1023,6 +1029,8 @@ class EngagementState:
             st.graph = task_graph.TaskGraph.from_dict(d["task_graph"])
         # Kept as stored, whatever its type: protected_routes ignores a malformed
         # value with a warning instead of this load guessing at it.
+        if d.get("owners") is not None:
+            st.owners = d["owners"]
         if d.get("protected_paths") is not None:
             st.protected_paths = d["protected_paths"]
         return st

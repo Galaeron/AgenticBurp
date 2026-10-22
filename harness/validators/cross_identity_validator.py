@@ -249,6 +249,10 @@ def _source_identity(idents: list, source_sig: tuple) -> dict | None:
     return None
 
 
+from contextvars import ContextVar
+_ownership_method = ContextVar("ownership_method", default="GET")
+
+
 class CrossIdentityValidator(Validator):
     name = "cross_identity"
     active = True  # sends live requests; only runs when validators.active_enabled
@@ -344,10 +348,14 @@ class CrossIdentityValidator(Validator):
         import harness.principals as _pr
         if self.ownership is None:
             return _pr.AuthzDecision.UNKNOWN
-        decision = self.ownership.authorization(principal, self._object_ref(url))
+        decision = self.ownership.authorization(principal, self._object_ref(url), _ownership_method.get())
         if decision == _pr.AuthzDecision.UNAUTHORIZED and getattr(principal, "provisional", False):
             return _pr.AuthzDecision.UNKNOWN
         return decision
+
+    def _ownership_provenance(self, exchange):
+        fact = self.ownership.lookup(self._object_ref(exchange.url), exchange.method) if self.ownership else None
+        return fact.provenance if fact else "no ownership provenance"
 
     def _undeclared_lead(self, fc: str, exchange: HttpExchange, ident: dict, detail: str,
                          function_level: bool = False) -> ValidationResult:
@@ -489,7 +497,7 @@ class CrossIdentityValidator(Validator):
                             evidence=f"{detail} The declared entitlement for "
                                      f"{self._object_ref(exchange.url)!r} does not include "
                                      f"{accessor.id!r}: a non-admin obtained the admin function's "
-                                     f"privileged data.")
+                                     f"privileged data. {self._ownership_provenance(exchange)}")
                     if decision == _pr.AuthzDecision.AUTHORIZED:
                         authorized += 1
                         continue
@@ -566,6 +574,13 @@ class CrossIdentityValidator(Validator):
         return self._skip(fc, "function-level comparison inconclusive")
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
+        token = _ownership_method.set(exchange.method)
+        try:
+            return await self._validate_with_ownership_method(finding, exchange)
+        finally:
+            _ownership_method.reset(token)
+
+    async def _validate_with_ownership_method(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         fc = finding.vulnerability_class
         if (exchange.method or "GET").upper() != "GET":
             return self._skip(fc, "cross-identity replay is GET-only (safe); a mutating request is not replayed here")
@@ -673,7 +688,7 @@ class CrossIdentityValidator(Validator):
                         confidence=ev.confidence, confirmed=True,
                         summary=f"Cross-identity ({ident['name']}): {ev.summary}",
                         evidence=f"Declared ownership of {self._object_ref(exchange.url)!r} does not "
-                                 f"entitle {accessor.id!r} to it. {ev.detail}")
+                                 f"entitle {accessor.id!r} to it. {self._ownership_provenance(exchange)}. {ev.detail}")
                 if decision == _pr.AuthzDecision.AUTHORIZED:
                     source_ident = _source_identity(idents, source_sig)
                     source = _principal_for(source_ident) if source_ident is not None else None
@@ -687,7 +702,7 @@ class CrossIdentityValidator(Validator):
                                     f"principal {accessor.id!r} sees, while anonymous was denied.",
                             evidence=f"Declared ownership of {self._object_ref(exchange.url)!r} does "
                                      f"not entitle the source principal {source.id!r}; the entitled "
-                                     f"principal's replay matched its captured response. {ev.detail}")
+                                     f"principal's replay matched its captured response. {self._ownership_provenance(exchange)}. {ev.detail}")
                     authorized += 1
                     continue
                 if undeclared is None:

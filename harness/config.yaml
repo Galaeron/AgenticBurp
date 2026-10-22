@@ -765,3 +765,13 @@ runs:
   # THIS run, never replayed from a prior one.
   hypothesis_cache:
     enabled: false
+
+# Ownership declarations are opt-in and belong in config.local.yaml:
+# authz:
+#   owners:
+#     "app.example.test":
+#       - {path: "GET /api/invoices/42", owner: "alice"}
+#       - {path: "/api/announcements/**", authenticated: true}
+#       - {path: "/api/orders/7", owner: "bob", shared_with: ["carol"]}
+# engagement:
+#   driver_max_requests: 100  # optional child ceiling within the owning run

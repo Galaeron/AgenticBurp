@@ -153,6 +153,15 @@ class SafeDefaultGuardTests(unittest.TestCase):
          lambda cfg: cfg.get("cross_site_poc", {}).get("enabled", False) is False),
     ]
 
+    def test_passive_privacy_guard(self):
+        # Privacy is intentionally true in shipped defaults, but must be false in passive-only.
+        self.assertIn("privacy.external_lookups", config_schema._PASSIVE_FORCE_OFF_KNOBS)
+        cfg = self._load_committed_config()
+        cfg["operating_profile"] = "passive-only"
+        cfg["privacy"] = {"external_lookups": True}
+        effective = config_schema.resolve_operating_profile(cfg, "passive-only")
+        self.assertIs(effective["privacy"]["external_lookups"], False)
+
     # Unsafe replacement value used to flip each flag for the negative control.
     UNSAFE_VALUES = {
         "server.allowed_hosts": ["evil.example.com"],

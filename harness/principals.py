@@ -188,23 +188,24 @@ class OwnershipFact:
     tenant: str | None = None              # None = unknown tenant
     shared_with: frozenset = frozenset()    # principals explicitly granted access
     public: bool = False
+    authenticated: bool = False
     provenance: str = ""                    # how observed, e.g. "created-as:alice via POST /items"
     observed_at: float = field(default_factory=time.time)
 
     @property
     def known(self) -> bool:
-        return bool(self.owner_principal_id) or self.public or bool(self.shared_with)
+        return bool(self.owner_principal_id) or self.public or self.authenticated or bool(self.shared_with)
 
     def to_dict(self) -> dict:
         return {"object_ref": self.object_ref, "owner_principal_id": self.owner_principal_id,
                 "tenant": self.tenant, "shared_with": sorted(self.shared_with),
-                "public": self.public, "provenance": self.provenance, "observed_at": self.observed_at}
+                "public": self.public, "authenticated": self.authenticated, "provenance": self.provenance, "observed_at": self.observed_at}
 
     @classmethod
     def from_dict(cls, d: dict) -> "OwnershipFact":
         return cls(object_ref=d.get("object_ref", ""), owner_principal_id=d.get("owner_principal_id", ""),
                    tenant=d.get("tenant"), shared_with=frozenset(d.get("shared_with", []) or []),
-                   public=bool(d.get("public", False)), provenance=d.get("provenance", ""),
+                   public=bool(d.get("public", False)), authenticated=bool(d.get("authenticated", False)), provenance=d.get("provenance", ""),
                    observed_at=d.get("observed_at", 0.0))
 
 
@@ -218,6 +219,7 @@ class OwnershipLedger:
 
     def __init__(self) -> None:
         self._by_ref: dict[str, OwnershipFact] = {}
+        self._patterns = []
 
     def record(self, fact: OwnershipFact) -> OwnershipFact:
         self._by_ref[fact.object_ref] = fact
@@ -235,24 +237,47 @@ class OwnershipLedger:
             tenant=tenant, shared_with=frozenset(shared_with or ()), public=bool(public),
             provenance=provenance))
 
-    def lookup(self, object_ref: str) -> OwnershipFact | None:
+    def declare_pattern(self, target_url, method, segments, fact):
+        from harness.protected_routes import _target_of
+        # Exact paths outrank globs, then more literal characters; method wins ties.
+        score = (not any('*' in s or s == '{id}' for s in segments),
+                 sum(len(s.replace('*', '')) for s in segments),
+                 -sum(s == '**' for s in segments), -sum(s.count('*') for s in segments), method is not None)
+        self._patterns.append((_target_of(target_url), method, segments, fact, score))
+
+    def lookup(self, object_ref: str, method: str = "GET") -> OwnershipFact | None:
         """The fact for an object reference: an observation recorded under exactly
         this (run-scoped) reference wins; otherwise the operator's run-agnostic
         declaration for the same application object, if any."""
         fact = self._by_ref.get(object_ref)
         if fact is None:
             fact = self._by_ref.get(run_agnostic(object_ref))
+        if fact is None and self._patterns:
+            from harness.protected_routes import _target_of, _path_matches
+            match = re.match(r"run:[^|]*\|app:([^|]*)\|tenant:[^|]*\|resource:(.*)", object_ref)
+            if match:
+                origin, resource = match.groups()
+                path = tuple(urlsplit(resource).path.split('/')[1:])
+                matches = [(score, candidate) for target, verb, segments, candidate, score in self._patterns
+                           if target == _target_of(origin) and (verb is None or verb == method.upper())
+                           and _path_matches(segments, path)]
+                if matches:
+                    best = max(score for score, _ in matches)
+                    facts = [candidate for score, candidate in matches if score == best]
+                    permissions = {(f.owner_principal_id, f.shared_with, f.public, f.authenticated) for f in facts}
+                    # Equally specific contradictory declarations are not proof of a boundary.
+                    return facts[0] if len(permissions) == 1 else None
         return fact
 
     def owner_of(self, object_ref: str) -> OwnershipFact | None:
         return self.lookup(object_ref)
 
-    def authorization(self, principal: Principal, object_ref: str) -> AuthzDecision:
-        fact = self.lookup(object_ref)
+    def authorization(self, principal: Principal, object_ref: str, method: str = "GET") -> AuthzDecision:
+        fact = self.lookup(object_ref, method)
         if fact is None or not fact.known:
             return AuthzDecision.UNKNOWN            # ownership not established -> never a crossing
         pid = principal.id
-        if fact.public:
+        if fact.public or (fact.authenticated and not principal.is_anonymous):
             return AuthzDecision.AUTHORIZED
         if pid and pid == fact.owner_principal_id:
             return AuthzDecision.AUTHORIZED         # own object

@@ -696,6 +696,8 @@ class SurfaceDiscovery:
                             if body else ""),
             "expected_structure": sensitive_artifact_class(path) or "",
             "structure": verdict.structure or "",
+            "contains_credentials": bool(verdict.structure == "dotenv" and re.search(
+                r"(?im)^\s*[A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*[^\s#]+", body)),
             "confirmed": verdict.structure is not None,
             "outcome": verdict.outcome,
             "reason": verdict.reason,
@@ -1312,18 +1314,18 @@ def sensitive_file_finding(record: dict) -> dict:
     if record.get("fingerprint"):
         size += f", sha256 {record['fingerprint']}"
     if record.get("confirmed") and record.get("structure"):
-        return {"vulnerability_class": "sensitive_file_exposure", "severity": "high",
+        return {"vulnerability_class": "sensitive_file_exposure", "severity": ("high" if record["structure"] == "private_key" or
+                    (record["structure"] == "dotenv" and record.get("contains_credentials")) else "medium"),
                 "confidence": 0.95,
                 "summary": f"Sensitive file exposed: {path} ({record['structure']})",
                 "evidence": (f"{status_text} at {path}; "
                              f"{record.get('reason') or 'content signature matched'}; "
                              f"content-type {content_type}; {size}; file values redacted"),
                 "confirmed": True, "confirmation_method": "sensitive_file_probe"}
-    # A served, non-empty, non-HTML body that matched no signature still deserves
-    # review; a redirect, an empty body or an HTML page is weaker.
-    served = record.get("outcome") in ("unknown_type", "signature_mismatch")
+    # Existence-only 2xx responses are low; non-2xx and followed redirects are informational.
+    served = isinstance(status, int) and 200 <= status < 300 and not record.get("redirected_to")
     return {"vulnerability_class": "sensitive_file_exposure",
-            "severity": "medium" if served else "low",
+            "severity": "low" if served else "info",
             "confidence": 0.4 if served else 0.2,
             "summary": f"Possible sensitive file (existence only): {path}",
             "evidence": (f"existence only: {status_text} at {path}; "

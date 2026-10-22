@@ -375,3 +375,58 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             (config.get("business_context", {}) or {}).get("enabled", False))
 
         log.info(f"Orchestrator initialized with {len(self.agent_manager.get_enabled_agents())} agents")
+
+    def _configure_ownership(self, url, *, engagement_owners=None, run_context=None, install=True):
+        from urllib.parse import urlsplit
+        from harness import identity_headers
+        from harness.ownership_declarations import load_ownership
+        from harness.protected_routes import _target_of
+        origin = (urlsplit(url).scheme.lower(), _target_of(url))
+        cached = getattr(run_context, "_declared_ownership", {}) if run_context else {}
+        if engagement_owners is None and origin in cached:
+            ledger = cached[origin]
+        else:
+            authz = self.config.get("authz", {}) or {}
+            configured = isinstance(authz, dict) and "owners" in authz
+            if not configured and not engagement_owners and not getattr(self, "_managed_ownership", False):
+                return self.validator_registry.ownership  # preserve explicitly injected ledgers
+            identities = identity_headers.identities_for_host(urlsplit(url).hostname or "")
+            if run_context is not None:
+                identities += [{"name": session.principal_id} for session in run_context.sessions.all()]
+            ledger = load_ownership(self.config, url, identities, engagement_owners=engagement_owners)
+            if run_context is not None:
+                cached[origin] = ledger
+                run_context._declared_ownership = cached
+        if install and self.validator_registry.ownership is not ledger:
+            self.validator_registry.set_ownership(ledger)
+        if install:
+            self._managed_ownership = True
+        return ledger
+
+    async def _validate_findings(self, exchange, reports, *, run_context=None):
+        from copy import copy
+        authz = (getattr(self, "config", {}) or {}).get("authz", {}) or {}
+        declared = isinstance(authz, dict) and "owners" in authz
+        if not declared and not getattr(run_context, "_declared_ownership", None):
+            # Keep the original registry protocol for callers without declarations,
+            # including evidence-only registries that do not expose a validators map.
+            return await ConfirmMixin._validate_findings(self, exchange, reports, run_context=run_context)
+        # The shared orchestrator must not change another concurrent run's
+        # cross-identity validator while that validator awaits a response.
+        local = copy(self)
+        registries = getattr(run_context, "_ownership_registries", {}) if run_context else {}
+        from harness.protected_routes import _target_of
+        registry_key = (id(self), exchange.url.split(":", 1)[0].lower(), _target_of(exchange.url))
+        registry = registries.get(registry_key)
+        if registry is None:
+            registry = copy(self.validator_registry)
+            registry.validators = dict(registry.validators)
+            if "cross_identity" in registry.validators:
+                registry.validators["cross_identity"] = copy(registry.validators["cross_identity"])
+            registry._auto_xid = None
+            if run_context is not None:
+                registries[registry_key] = registry
+                run_context._ownership_registries = registries
+        local.validator_registry = registry
+        local._configure_ownership(exchange.url, run_context=run_context)
+        return await ConfirmMixin._validate_findings(local, exchange, reports, run_context=run_context)

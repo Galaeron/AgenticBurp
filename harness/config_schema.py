@@ -225,6 +225,8 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
         )
     # RV-S: a malformed protected-route entry is ignored, so it declares nothing
     # protected (fail closed). A warning, not an error: the rest of the list stands.
+    from harness import ownership_declarations
+    warnings.extend(ownership_declarations.config_problems(cfg))
     from harness import protected_routes
     for problem in protected_routes.config_problems(cfg):
         warnings.append(f"{problem}; a malformed entry declares no route protected.")
@@ -316,6 +318,7 @@ def config_fingerprint(cfg: dict) -> str:
 # (everything there except server.allowed_hosts, which is a scope declaration,
 # not an active/mutating/discovery/engagement/cloud toggle).
 _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
+    "privacy.external_lookups",
     "validators.active_enabled",
     "validators.allow_mutating_replay",
     "autonomous_discovery.enabled",
