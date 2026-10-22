@@ -65,7 +65,7 @@ class CommandInjectionValidator(Validator):
         self.run_context = run_context
 
     def collab(self):
-        return self._collab or _collab.shared()
+        return _collab.resolve(self._collab)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         return super().applies(finding, exchange) and bool(param_targets(exchange))
@@ -178,9 +178,10 @@ class CommandInjectionValidator(Validator):
             if unsent:
                 return incomplete()
             return ValidationResult(
-                self.name, "not_confirmed", "command_injection", confidence=0.0,
+                self.name, "inconclusive", "command_injection", confidence=0.0,
                 confirmed=False,
-                summary="No in-band command-output marker observed",
+                summary="Command-injection check incomplete: no in-band marker and the callback "
+                        "listener is unreachable; not a negative result",
                 evidence=f"Tried {len(targets)} parameter(s) across {len(_INBAND)} "
                          "in-band shell forms; loopback collaborator was not reachable from the target.")
         for loc, param in targets:
@@ -202,6 +203,9 @@ class CommandInjectionValidator(Validator):
                                  f"into {param!r}; the target ran it and called back out-of-band (blind-safe).")
         if unsent:
             return incomplete()
+        unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "command_injection")
+        if unavailable is not None:
+            return unavailable
         return ValidationResult(
             self.name, "not_confirmed", "command_injection", confidence=0.0, confirmed=False,
             summary="No out-of-band callback observed -- parameters do not appear to reach a shell",

@@ -158,6 +158,20 @@ class LiveLegVerificationTest(EvidenceCase):
                 time.sleep(0.05)
         else:
             raise RuntimeError("leg-verification fixture did not come up")
+        # A clean OOB negative requires proven reachability from this fixture,
+        # not an inference from its loopback address (which could be a published
+        # container port). Exercise the fixture's real fetch path before cases;
+        # each case's send counter still starts after this separate preflight.
+        from harness import collaborator
+        from urllib.parse import urlencode
+        listener = collaborator.shared()
+        preflight = listener.token()
+        with urllib.request.urlopen(
+                cls._base + "/ssrf/fetch?" + urlencode({"url": listener.url(preflight)}),
+                timeout=5) as response:
+            response.read()
+        if not listener.record_preflight(preflight, cls._base):
+            raise RuntimeError("leg-verification fixture cannot reach the callback listener")
         safety_gate.reset_default_gate()
         # Seed the gate's SCOPE too, not just the mode flags: the scope lock
         # (3c622c3) fails closed on an empty active scope, so without the

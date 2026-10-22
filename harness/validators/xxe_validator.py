@@ -89,7 +89,7 @@ class XxeValidator(Validator):
         self._collab = collaborator
 
     def collab(self):
-        return self._collab or _collab.shared()
+        return _collab.resolve(self._collab)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         return super().applies(finding, exchange) or _looks_xml(exchange)
@@ -108,6 +108,8 @@ class XxeValidator(Validator):
         headers.setdefault("Content-Type", "application/xml")
         method = (exchange.method or "POST").upper()
 
+        # Bind and validate configuration before even the in-band probe.
+        collab = self.collab()
         # 1) In-band file-read proof first: inject a SYSTEM entity for a
         #    world-readable file and detect its signature reflected in the
         #    response. Definitive, needs no collaborator, and is a read-only PoC.
@@ -155,6 +157,9 @@ class XxeValidator(Validator):
                         "attacker-controlled URL out-of-band.",
                 evidence=f"POSTed an XML document declaring an external entity pointing at a unique "
                          f"collaborator URL to {exchange.url}; the parser called back to it (blind-safe proof).")
+        unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "xxe")
+        if unavailable is not None:
+            return unavailable
         return ValidationResult(
             self.name, "not_confirmed", "xxe", confidence=0.0, confirmed=False,
             summary="No out-of-band callback observed -- external entities appear disabled",

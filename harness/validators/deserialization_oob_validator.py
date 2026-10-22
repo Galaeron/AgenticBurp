@@ -120,7 +120,7 @@ class DeserializationOobValidator(Validator):
         self._collab = collaborator
 
     def collab(self):
-        return self._collab or _collab.shared()
+        return _collab.resolve(self._collab)
 
     def _sink_candidates(self, exchange: HttpExchange):
         """(location, name) points where a base64-pickle value currently lives --
@@ -240,6 +240,9 @@ class DeserializationOobValidator(Validator):
                 evidence=f"Overwrote {len(sinks)} pickle-shaped sink(s) with a benign beacon payload; "
                          f"{answered} answered beacon(s) drew no collaborator hit, but a beacon that "
                          f"never reached the target cannot call back.{waited}")
+        unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "deserialization")
+        if unavailable is not None:
+            return unavailable
         return ValidationResult(
             self.name, "not_confirmed", "deserialization", confidence=0.0, confirmed=False,
             summary="No out-of-band callback -- the pickle value does not appear to be deserialised unsafely",

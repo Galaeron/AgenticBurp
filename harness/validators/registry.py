@@ -45,6 +45,9 @@ log = logging.getLogger(__name__)
 
 class ValidatorRegistry:
     def __init__(self, config: dict):
+        from harness.collaborator import ConfiguredCollaborator
+        # Validate approval at construction, before any validator can send.
+        self.collaborator = ConfiguredCollaborator(config)
         cfg = config.get("validators", {})
         self.enabled = bool(cfg.get("enabled", True))
         self.active_enabled = bool(cfg.get("active_enabled", False))
@@ -191,18 +194,18 @@ class ValidatorRegistry:
         ssrf_cfg = cfg.get("ssrf", {})
         if ssrf_cfg.get("enabled", True):
             self.validators["ssrf"] = SsrfValidator(
-                allowed_hosts=_allowed, timeout=float(ssrf_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(ssrf_cfg.get("timeout", 10.0)), collaborator=self.collaborator)
         # XXE leg -- OOB via the collaborator (external entity -> callback). Active.
         xxe_cfg = cfg.get("xxe", {})
         if xxe_cfg.get("enabled", True):
             self.validators["xxe"] = XxeValidator(
-                allowed_hosts=_allowed, timeout=float(xxe_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(xxe_cfg.get("timeout", 10.0)), collaborator=self.collaborator)
         # Command-injection leg -- OOB via the collaborator (shell payload -> callback).
         # Active; a non-GET replay also needs allow_mutating_replay.
         cmdi_cfg = cfg.get("command_injection", {})
         if cmdi_cfg.get("enabled", True):
             self.validators["command_injection"] = CommandInjectionValidator(
-                allowed_hosts=_allowed, timeout=float(cmdi_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(cmdi_cfg.get("timeout", 10.0)), collaborator=self.collaborator)
         # SSTI leg -- in-band arithmetic differential (proves template evaluation). Active.
         ssti_cfg = cfg.get("ssti", {})
         if ssti_cfg.get("enabled", True):
@@ -239,7 +242,7 @@ class ValidatorRegistry:
         deser_oob_cfg = cfg.get("deserialization_oob", {})
         if deser_oob_cfg.get("enabled", True):
             self.validators["deserialization_oob"] = DeserializationOobValidator(
-                allowed_hosts=_allowed, timeout=float(deser_oob_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(deser_oob_cfg.get("timeout", 10.0)), collaborator=self.collaborator)
         # Auth-mechanism legs -- session fixation / weak-password / username enum
         # multi-request flows. Active; POST sends need allow_mutating_replay.
         auth_cfg = cfg.get("auth_sequence", {})

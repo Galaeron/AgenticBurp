@@ -210,10 +210,15 @@ class CommandInjectionUnsentTests(_RvoBase):
         reports = self._run(_shell(collab, sent), collab=collab)
         self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
 
-    def test_answered_in_band_probes_before_the_loopback_exit_stay_negative(self):
+    def test_answered_in_band_probes_with_unreachable_callback_stay_incomplete(self):
+        # Ticket 5: answered in-band probes cover only that phase. A listener
+        # the remote target cannot reach leaves blind command injection unknown.
+        # The preceding reachable-listener test still pins the clean negative.
         sent = []
         reports = self._run(_shell(None, sent), collab=_LoopbackCollaborator())
-        self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
+        self.assertEqual(len(sent), 3, "the in-band controls must still execute")
+        self._assert_not_negative(reports, "inconclusive")
+        self.assertIn("loopback collaborator was not reachable", reports[0].evidence)
 
 
 # ---------------------------------------------------------------- O3 stored XSS

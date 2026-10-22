@@ -118,7 +118,7 @@ class SsrfValidator(Validator):
         self._collab = collaborator
 
     def collab(self):
-        return self._collab or _collab.shared()
+        return _collab.resolve(self._collab)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         return super().applies(finding, exchange) and bool(_candidate_params(exchange))
@@ -272,6 +272,9 @@ class SsrfValidator(Validator):
                         f"({failed}); not a negative result",
                 evidence=f"Tried {len(cands)} URL-shaped parameter(s); no collaborator hit was seen, "
                          f"but a send that never reached the target cannot show one.")
+        unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "ssrf")
+        if unavailable is not None:
+            return unavailable
         return ValidationResult(
             self.name, "not_confirmed", "ssrf", confidence=0.0, confirmed=False,
             summary="No out-of-band callback and no in-band fetch differential observed",
