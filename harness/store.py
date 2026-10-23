@@ -1696,7 +1696,7 @@ def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int 
 
 def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_id: str = "",
                       captured_principal: str | None = None,
-                      include_chains: bool = False) -> list[dict]:
+                      include_chains: bool = False, run_id: str | None = None) -> list[dict]:
     """
     Full (not summarized) finding records for a host, for chain detection
     and report generation.
@@ -1737,8 +1737,10 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                WHERE f.host = ? AND f.engagement_id = ?
                  AND (? IS NULL OR f.captured_principal_id = ?)
+                 AND (? IS NULL OR f.run_id = ?)
                ORDER BY f.created_at ASC""",
-            (host, _engagement_partition(engagement_id), captured_principal, captured_principal),
+            (host, _engagement_partition(engagement_id), captured_principal, captured_principal,
+             run_id, run_id),
         ).fetchall()
     finally:
         conn.close()

@@ -35,6 +35,8 @@ Safe by construction, same envelope as every other outbound path here:
 Deterministic aside from the network I/O; no model call.
 """
 from __future__ import annotations
+
+from harness import scope_lock
 import logging
 import re
 from dataclasses import dataclass, field
@@ -119,7 +121,7 @@ def _host_allowed(url: str, allowed_hosts: list[str] | None) -> bool:
     if not allowed_hosts:
         return True
     host = (urlsplit(url).hostname or "").lower()
-    return any(host == h.lower() or host.endswith("." + h.lower()) for h in allowed_hosts)
+    return scope_lock.host_in_scope(url, allowed_hosts)
 
 
 def _build_url(base_url: str, path: str, id_fill: str) -> str:

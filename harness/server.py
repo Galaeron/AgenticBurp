@@ -621,7 +621,9 @@ async def analyze(req: AnalysisRequest, authorization: str | None = Header(defau
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     try:
-        partition = {"engagement_id": req.engagement_id} if req.engagement_id else {}
+        # An omitted name selects the site's shared history. Generating a new
+        # partition per request makes prior observations impossible to retrieve.
+        partition = {"engagement_id": req.engagement_id or ""}
         if attribution:
             partition["observation_attribution"] = attribution
         return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery,
@@ -1521,10 +1523,11 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             status_code=400,
             detail=f"route host {host!r} does not match base_url host {target_host!r}")
     allowed_hosts = {(h or "").lower() for h in (orchestrator.allowed_hosts or [])}
-    if target_host not in allowed_hosts:
+    from harness.scope_lock import host_in_scope
+    if not host_in_scope(req.base_url, allowed_hosts, active_mode=True):
         raise HTTPException(
             status_code=403,
-            detail=f"host {target_host!r} is not in pre-authorized scope "
+            detail=f"target {req.base_url!r} is not in pre-authorized scope "
                    f"(server.allowed_hosts); investigate cannot grant new scope")
 
     # P1-8 admission bound -- an ADDITIONAL gate that runs strictly AFTER
@@ -1575,6 +1578,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             run_id=job_id, target_identifier=host, config=security.sanitize_data(config),
             cache_namespace=run_context.cache_namespace, output_dir=runs_cfg.get("output_dir"),
             model_versions={"coordinator": orchestrator.coordinator_model,
+                        "critique": __import__("harness.coordinator", fromlist=["reasoning_model"]).reasoning_model(config),
+                        "surface_prioritization": (config.get("surface_prioritization") or {}).get("model", orchestrator.coordinator_model),
                         "agents": sorted({getattr(a, "model", "")
                                           for a in orchestrator.agent_manager.agents.values()
                                           if getattr(a, "model", "")}),
@@ -1606,6 +1611,11 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
 
     async def _run():
         try:
+            # Finding persistence and diagnostics use this task-local binding.
+            # The engagement job is a separate background task from /analyze,
+            # so it must establish the run coordinate itself.
+            from harness import telemetry
+            telemetry.bind_current_run(run_context.run_id)
             async with run_context:
                 job["result"] = await orchestrator.investigate_engagement(
                     req.base_url, roles,
@@ -1618,6 +1628,18 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             job["result"].setdefault("run_id", run_context.run_id)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
             job["result"].setdefault("request_count", run_context.budget.used)
+            # Use the persisted, proof-resolved projection and this run only.
+            # Raw model flags and repeated validator records are not issue counts.
+            rows = store.all_host_findings(req.base_url, run_id=run_context.run_id)
+            from harness.assessment_health import confirmed_issue_inventory
+            proven = confirmed_issue_inventory(
+                [*rows, *job["result"].get("findings", [])], run_context.run_id, store.proofs_for_case)
+            job["result"]["confirmed_issues"] = len(proven)
+            job["result"]["confirmed_issue_refs"] = proven
+            job["result"]["finding_summary"] = {
+                "records": len(rows), "proof_bound_confirmed_cases": len(proven),
+                "unproven_records": sum(not (r.get("confirmed") and r.get("proof_status") == "resolved") for r in rows),
+                "scoreboard_mapping": "not supplied"}
             job["status"] = "done"
             _finish_manifest("done", result=job["result"])
         except asyncio.CancelledError:

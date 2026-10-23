@@ -591,11 +591,11 @@ class ChainMixin:
         # is recorded here and surfaced in the result as `errors` + `degraded`, so a
         # run that skipped a phase is declared incomplete rather than looking clean.
         _errors: list[dict] = [
-            {"phase": "browser_capture", "error": message}
+            {"phase": "discovery", "error": message}
             for message in getattr(rc, "errors", [])
-            if message.startswith(("browser capture incomplete:", "browser capture failed:",
-                                   "browser capture skipped:"))
+            if not message.startswith("[discovery] used spec ")
         ]
+        _reviewed_captures: set[str] = set()
         workflow_results: list[dict] = []
 
         # Preserve real request shapes before any worklist leg runs. Full model
@@ -642,7 +642,7 @@ class ChainMixin:
                 feature_caps = await engagement_builder.feature_crawl_captures(
                     base_url, roles, allowed_hosts=self.allowed_hosts,
                     submit_forms=_get_gate().config.allow_mutating_replay,
-                    seed_paths=discovered_paths, run_context=run_context)
+                    seed_paths=discovered_paths, run_context=run_context, errors=_errors)
                 # Make workflow routes and their real request shapes visible to
                 # prioritisation. Content-level model review remains deferred.
                 for ex in feature_caps:
@@ -1376,13 +1376,8 @@ class ChainMixin:
             return _objective_result(False)
         if not (stop_on_confirm and _early_confirmed):
             await review_captured_exchanges(
-                self, state, getattr(rc, "captured", None), run_context=run_context)
-            try:
-                if feature_caps:
-                    await review_captured_exchanges(
-                        self, state, feature_caps, run_context=run_context)
-            except NameError:
-                pass
+                self, state, _all_captured, run_context=run_context,
+                seen=_reviewed_captures, errors=_errors)
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
         # credential (url -> {headers, body}), built from the real captured
@@ -1431,7 +1426,8 @@ class ChainMixin:
             outs2, new_findings = await _investigate(st2, derived)
             if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
                 await review_captured_exchanges(
-                    self, st2, getattr(rc2, "captured", None), run_context=run_context)
+                    self, st2, getattr(rc2, "captured", None), run_context=run_context,
+                    seen=_reviewed_captures, errors=_errors)
             outcomes.extend(outs2)
             all_findings.extend(new_findings)
             # R19: merge the derived-identity state back into the primary state, so
@@ -1731,7 +1727,12 @@ class ChainMixin:
         except Exception as e:
             log.debug("investigate_engagement: circuit breaker check failed: %s", e)
 
+        from harness.assessment_health import assessment_health
+        health = assessment_health(coverage, _errors)
         return {
+            "assessment": health,
+            "findings": [dict(f, url=f.get("url") or ep.path, method=ep.method)
+                         for ep in state.endpoints.values() for f in ep.findings],
             "summary": state.summary(),
             "worklist": state.worklist(50),
             "outcomes": outcomes,
@@ -1759,5 +1760,5 @@ class ChainMixin:
             # R30: operational failures are surfaced, not swallowed -- a run that
             # skipped a phase is declared degraded rather than presented as clean.
             "errors": _errors,
-            "degraded": bool(_errors),
+            "degraded": bool(_errors) or health["status"] == "incomplete",
         }

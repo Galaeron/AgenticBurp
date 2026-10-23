@@ -179,7 +179,7 @@ class CorsValidator(Validator):
         # Scope guard (defense-in-depth with the central backstop): never send
         # crafted-Origin probes to a host outside the configured engagement.
         host = urlparse(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
 
         # Extract base URL for testing

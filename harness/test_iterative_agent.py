@@ -170,6 +170,40 @@ class IterativeAgentTests(unittest.IsolatedAsyncioTestCase):
             for s in r.transcript))
         self.assertTrue(any("skipping duplicate request" in line for line in cm.output))
 
+    async def test_duplicate_loop_stops_before_spending_model_budget(self):
+        action = {"action": "set_header", "name": "X-Probe", "value": "same"}
+        ollama = _ScriptedOllama([action] * 64)
+        agent = IterativeAgent(ollama, "m", ["localhost"])
+        with patch("httpx.AsyncClient.request", return_value=_Resp(200, "ok")) as send:
+            result = await agent.run(_exchange(), "h", "auth", step_budget=64)
+        self.assertEqual(result.stop_reason, "no_progress")
+        self.assertEqual(result.steps_used, 4)
+        self.assertEqual(ollama.calls, 4)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(result.findings, [])
+
+    async def test_new_response_resets_no_progress_streak(self):
+        a = {"action": "set_header", "name": "X-Probe", "value": "a"}
+        b = dict(a, value="b")
+        ollama = _ScriptedOllama([a, a, a, b, b, b,
+                                {"action": "stop", "verdict": "not_found"}])
+        agent = IterativeAgent(ollama, "m", ["localhost"])
+        with patch("httpx.AsyncClient.request", return_value=_Resp(200, "ok")) as send:
+            result = await agent.run(_exchange(), "h", "auth", step_budget=64)
+        self.assertEqual(result.stop_reason, "gave_up")
+        self.assertEqual(ollama.calls, 7)
+        self.assertEqual(send.call_count, 2)
+
+    async def test_rejected_actions_also_stop_without_requests(self):
+        ollama = _ScriptedOllama([None] * 64)
+        agent = IterativeAgent(ollama, "m", ["localhost"])
+        with patch("httpx.AsyncClient.request") as send:
+            result = await agent.run(_exchange(), "h", "auth", step_budget=64)
+        self.assertEqual(result.stop_reason, "no_progress")
+        self.assertEqual(result.steps_used, 3)
+        self.assertEqual(ollama.calls, 3)
+        send.assert_not_called()
+
     async def test_different_request_is_not_skipped(self):
         """Negative control: two DIFFERENT mutations (different values) must
         both be sent -- the guard must not over-match."""

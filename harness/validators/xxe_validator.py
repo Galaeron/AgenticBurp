@@ -98,9 +98,9 @@ class XxeValidator(Validator):
         return ValidationResult(self.name, "skipped", "xxe", summary=why)
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
-        host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
-            return self._skip(f"host {host!r} out of scope")
+        from harness.scope_lock import host_in_scope
+        if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
+            return self._skip("target origin is out of scope")
         if not _looks_xml(exchange):
             return self._skip("endpoint does not take XML -- nothing to inject an external entity into")
         headers = {k: v for k, v in (exchange.request_headers or {}).items()

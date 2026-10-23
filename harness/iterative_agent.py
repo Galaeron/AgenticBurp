@@ -122,7 +122,7 @@ class IterativeResult:
     findings: list[Finding] = field(default_factory=list)
     handoff_note: str = ""
     steps_used: int = 0
-    stop_reason: str = ""            # found|exhausted_steps|gave_up|budget|error|target_distress
+    stop_reason: str = ""            # found|exhausted_steps|gave_up|budget|error|target_distress|no_progress
     transcript: list[IterativeStep] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -302,6 +302,7 @@ class IterativeAgent:
         budget = min(step_budget, self.max_steps)
         result = IterativeResult(agent=f"iterative:{specialty}")
         consecutive_trouble = 0
+        consecutive_no_progress = 0
 
         def emit(step_obj: IterativeStep) -> None:
             result.transcript.append(step_obj)
@@ -327,6 +328,13 @@ class IterativeAgent:
         ]
 
         for step in range(1, budget + 1):
+            if consecutive_no_progress >= 3:
+                result.stop_reason = "no_progress"
+                result.handoff_note = (
+                    "Stopped after three consecutive actions produced no response "
+                    "(duplicate, rejected, blocked, or failed requests). "
+                    "Assessment remains inconclusive; see transcript.")
+                break
             if effort_budget is not None:
                 allowed, reason = effort_budget.allow()
                 if not allowed:
@@ -353,6 +361,8 @@ class IterativeAgent:
 
             if not isinstance(action, dict):
                 history.append(f"[step {step}] invalid action (not an object); try again.")
+                consecutive_no_progress += 1
+                emit(IterativeStep(step, {}, "(rejected)", None, "invalid action", blocked="invalid action"))
                 continue
 
             kind = action.get("action")
@@ -371,6 +381,7 @@ class IterativeAgent:
 
             built, err = self._build_request(exchange, action, headers_state)
             if err:
+                consecutive_no_progress += 1
                 history.append(f"[step {step}] action rejected: {err}")
                 emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
                 continue
@@ -381,6 +392,7 @@ class IterativeAgent:
             status, text = await self._execute(method, url, headers, body)
             req_summary = f"{method} {url}" + (f" body={body[:80]}" if body else "")
             if status is None:
+                consecutive_no_progress += 1
                 history.append(f"[step {step}] {req_summary} -> {text}")
                 emit(IterativeStep(step, action, req_summary, None, text, blocked=text))
                 # A transport failure (or safety/scope block that returned None)
@@ -391,6 +403,7 @@ class IterativeAgent:
                 else:
                     consecutive_trouble = 0
             else:
+                consecutive_no_progress = 0
                 resp_summary = f"HTTP {status}, {len(text)} bytes: {text[:400]}"
                 history.append(f"[step {step}] {req_summary} -> {resp_summary}")
                 emit(IterativeStep(step, action, req_summary, status, text[:400]))

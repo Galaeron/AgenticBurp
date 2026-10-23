@@ -112,7 +112,7 @@ class DomXssValidator(Validator):
         if not self.allowed_hosts:
             return True
         host = (urlsplit(url).hostname or "").lower()
-        return any(host == h.lower() or host.endswith("." + h.lower()) for h in self.allowed_hosts)
+        return scope_lock.host_in_scope(url, self.allowed_hosts)
 
     def _candidate_urls(self, exchange: HttpExchange, a: int, b: int) -> list[str]:
         """One URL per payload: the captured URL (query preserved) with the

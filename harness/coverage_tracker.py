@@ -270,7 +270,7 @@ class CoverageTracker:
         matrix-DRIVER fires regardless of any agent label -- the I1 guarantee."""
         out = []
         for (ident, ep_key, check_id), cell in self.matrix.cells().items():
-            if cell.status != CellStatus.PENDING:
+            if cell.executed or cell.status not in (CellStatus.PENDING, CellStatus.DETECTED):
                 continue
             check = CHECKS_BY_ID.get(check_id)
             if not check or check.confirmation not in _LEG_CONFIRMATIONS:
@@ -293,15 +293,20 @@ class CoverageTracker:
         for (ident, ep_key, check) in self.pending_leg_cells(driveable):
             if n >= budget:
                 break
+            n += 1  # Bound attempts, including failed or declined dispatches.
             method, _, path = ep_key.partition(" ")
             try:
                 res = await run_leg(ident, method, path, check)
             except Exception as e:  # a leg blowing up must not sink coverage
                 log.debug("drive_coverage_legs: %s on %s failed: %s", check.confirmation, ep_key, e)
+                self.matrix.record(ident, ep_key, check.id, status=CellStatus.ERROR,
+                                   reason=f"validator dispatch failed: {type(e).__name__}",
+                                   validator=check.confirmation, executed=False)
                 continue
             if res is None:
+                self.matrix.record(ident, ep_key, check.id, status=CellStatus.INCONCLUSIVE,
+                                   reason="validator dispatch returned no result", validator=check.confirmation)
                 continue
-            n += 1
             status = _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN)
             self.matrix.record(
                 ident, ep_key, check.id, status=status,

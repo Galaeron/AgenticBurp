@@ -654,7 +654,7 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
 
 
 async def review_captured_exchanges(orch, state, captured, *, max_reviews: int = 200,
-                                    run_context=None) -> int:
+                                    run_context=None, seen=None, errors=None) -> int:
     """Phase 0.1: route every substantive 2xx captured during discovery through
     full content-level review and fold its findings into `state`.
 
@@ -674,7 +674,9 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     Returns the count of captured exchanges that yielded >=1 finding."""
     produced = 0
     reviewed = 0
-    for cap in list(captured or [])[:max_reviews]:
+    from itertools import islice
+    from harness.assessment_health import review_frontier
+    for cap in islice(review_frontier(captured, seen=seen), max_reviews):
         try:
             ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
         except Exception:
@@ -690,6 +692,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
         try:
             resp = await orch.analyze(ex, _from_discovery=True, run_context=run_context)
         except Exception as e:  # one capture's failure must not sink the rest
+            if errors is not None:
+                errors.append({"phase": "capture_review", "error": type(e).__name__})
             log.debug("review_captured_exchanges: analyze failed on %s: %s",
                       getattr(ex, "url", "?"), e)
             continue
@@ -731,7 +735,9 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
     )
 
     produced = 0
-    for cap in list(captured or [])[:max_exchanges]:
+    from itertools import islice
+    from harness.assessment_health import review_frontier
+    for cap in islice(review_frontier(captured), max_exchanges):
         try:
             ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
         except Exception:

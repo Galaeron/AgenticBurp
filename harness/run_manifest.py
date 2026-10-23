@@ -39,6 +39,9 @@ def config_fingerprint(config: dict) -> str:
 
 
 def _git_state(repo_root: Path) -> tuple[str | None, bool | None]:
+    # An exported package nested under another checkout is not that checkout.
+    if not (repo_root / ".git").exists():
+        return None, None
     try:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root, check=True,
                                   capture_output=True, text=True, timeout=5).stdout.strip()
@@ -48,6 +51,25 @@ def _git_state(repo_root: Path) -> tuple[str | None, bool | None]:
         return revision or None, dirty
     except (OSError, subprocess.SubprocessError):
         return None, None
+
+
+def source_fingerprint(root: Path) -> dict:
+    """Attest the source bytes, including dirty/untracked Python modules.
+
+    Local configuration and runtime artifacts are intentionally excluded.
+    The separately redacted config fingerprint identifies configuration.
+    """
+    digest = hashlib.sha256()
+    count = 0
+    for path in sorted((root / "harness").rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(root).as_posix().encode()
+        content = path.read_bytes()
+        digest.update(relative + b"\0" + hashlib.sha256(content).digest())
+        count += 1
+    return {"sha256": digest.hexdigest() if count else None, "files": count,
+            "scope": "harness/**/*.py"}
 
 
 class RunManifest:
@@ -70,6 +92,7 @@ class RunManifest:
         data = {
             "schema_version": SCHEMA_VERSION, "run_id": run_id,
             "git": {"revision": revision, "dirty": dirty},
+            "source": source_fingerprint(root),
             "config": redact(deepcopy(config)), "config_fingerprint": config_fingerprint(config),
             "cache_namespace": cache_namespace, "target_identifier": target_identifier,
             "model_versions": redact(model_versions or {}),
@@ -90,11 +113,18 @@ class RunManifest:
         errors = list(result.get("errors") or [])
         if error:
             errors.append({"phase": "job", "error": error})
+        from harness.assessment_health import assessment_health
+        health = assessment_health(result.get("coverage"), errors,
+                                   stopped_on_confirmation=result.get("stopped_on_confirmation", False))
         self.data.update({"finished_at": time.time(), "completion_status": status,
                           "request_count": result.get("request_count"),
                           "confirmed_issues": result.get("confirmed_issues"),
                           "operational_errors": redact(errors),
-                          "degraded": bool(result.get("degraded") or errors),
+                          "degraded": bool(result.get("degraded") or errors or health["status"] == "incomplete"),
+                          "assessment": health,
+                          "finding_summary": redact(result.get("finding_summary")),
+                          "confirmed_issue_refs": redact(result.get("confirmed_issue_refs", [])),
+                          "worklist_summary": redact(result.get("worklist_summary")),
                           # R01/R07: the auditable executed-vs-inferred coverage
                           # breakdown (coverage_summary.summarize_coverage's
                           # output, already additive on CoverageTracker.report()),

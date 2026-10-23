@@ -33,6 +33,8 @@ sweep for Allow mining); it never sends a mutating body.
 """
 from __future__ import annotations
 
+from harness import scope_lock
+
 import hashlib
 import json
 import re
@@ -226,7 +228,7 @@ def _header_value(headers, name: str) -> str:
 def _host_in_scope(url: str, allowed_hosts) -> bool:
     if not allowed_hosts:
         return True
-    return (urlparse(url).hostname or "") in set(allowed_hosts)
+    return scope_lock.host_in_scope(url, allowed_hosts)
 
 
 class SurfaceDiscovery:

@@ -151,7 +151,7 @@ class PathTraversalValidator(Validator):
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         targets = self._targets(exchange)
         if not targets:

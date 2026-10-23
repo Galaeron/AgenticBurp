@@ -183,6 +183,7 @@ async def feature_crawl_captures(
     max_captured: int = 200,
     seed_paths: list[str] | None = None,
     run_context=None,
+    errors=None,
 ) -> list:
     """Run the stateful feature-workflow crawl (feature_workflow.crawl_features) as
     each DISTINCT-feature role and union the captured exchanges.
@@ -228,8 +229,12 @@ async def feature_crawl_captures(
                 seed_paths=seed_paths,
                 max_steps=max_steps, max_depth=max_depth, max_captured=max_captured)
         except Exception as e:  # a role's feature crawl must not sink the build
+            if errors is not None:
+                errors.append({"phase": "feature_crawl", "error": f"{r.role}: {type(e).__name__}"})
             log.debug("feature_crawl_captures: role %r failed: %s", r.role, e)
             continue
+        if errors is not None:
+            errors.extend({"phase": "feature_crawl", "error": e} for e in res.errors)
         for ex in res.captured:
             sp = urlsplit(ex.url)
             hdrs = ex.request_headers or {}

@@ -20,6 +20,8 @@ Bounded and safe by construction:
 Deterministic aside from network I/O; the extraction it relies on is pure.
 """
 from __future__ import annotations
+
+from harness import scope_lock
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlsplit
@@ -107,7 +109,7 @@ def _host_allowed(url: str, allowed_hosts: list[str] | None) -> bool:
     if not allowed_hosts:
         return False
     host = (urlsplit(url).hostname or "").lower()
-    return any(host == h.lower() or host.endswith("." + h.lower()) for h in allowed_hosts)
+    return scope_lock.host_in_scope(url, allowed_hosts)
 
 
 async def crawl(

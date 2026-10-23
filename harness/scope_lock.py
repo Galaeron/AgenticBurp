@@ -65,6 +65,7 @@ class ScopeURL:
     scheme: str
     host: str
     port: int
+    explicit_port: bool = False
 
     @property
     def origin(self) -> str:
@@ -86,10 +87,11 @@ def parse_scope_url(url: str) -> ScopeURL | None:
         if parsed.netloc.endswith(":"):
             return None
         host = _host_name(parsed.hostname or "")
-        port = parsed.port if parsed.port is not None else _DEFAULT_PORTS[scheme]
+        explicit_port = parsed.port is not None
+        port = parsed.port if explicit_port else _DEFAULT_PORTS[scheme]
         if host is None or not 1 <= port <= 65535:
             return None
-        return ScopeURL(scheme, host, port)
+        return ScopeURL(scheme, host, port, explicit_port)
     except (ValueError, UnicodeError):
         return None
 
@@ -143,11 +145,30 @@ def parse_scope_entry(entry: str, *, extended: bool = False) -> ScopeEntry | Non
     if "*" in value:
         return None
     if not extended:
-        # Bare hostname only; preserve rejection of port/bracket/origin forms.
-        if ":" in value or "[" in value or "]" in value:
+        # Bare hostname remains host-wide for backwards compatibility. An
+        # explicitly configured port narrows that host to one service; this is
+        # important when a loopback target shares its address with local tools.
+        if "[" in value or "]" in value:
+            if not value.startswith("[") or "]" not in value:
+                return None
+            close = value.find("]")
+            raw_host, suffix = value[1:close], value[close + 1:]
+            if not suffix.startswith(":") or not suffix[1:].isdigit():
+                return None
+            host = _host_name(raw_host)
+            port = int(suffix[1:])
+        elif value.count(":") == 1:
+            raw_host, raw_port = value.rsplit(":", 1)
+            if not raw_port.isdigit():
+                return None
+            host, port = _host_name(raw_host), int(raw_port)
+        elif ":" in value:
+            # Bare IPv6 was handled above; do not guess whether a colon is a
+            # port delimiter or part of a malformed address.
             return None
-        host = _host_name(value)
-        return ScopeEntry(host=host) if host else None
+        else:
+            host, port = _host_name(value), None
+        return ScopeEntry(host=host, port=port) if host and (port is None or 1 <= port <= 65535) else None
     if "[" in value or "]" in value:
         # The discovery adapter never supported bracketed IPv6 allow entries;
         # recognizing URL brackets must not create new configured reachability.
@@ -181,7 +202,8 @@ def scope_matches(url: str, allowed_hosts, *, extended: bool = False,
         return allow_unset
     for raw in entries:
         entry = parse_scope_entry(raw, extended=extended)
-        if entry is None or entry.scheme is not None and target.scheme != entry.scheme or entry.port is not None and target.port != entry.port:
+        if (entry is None or entry.scheme is not None and target.scheme != entry.scheme
+                or entry.port is not None and (target.port != entry.port or not target.explicit_port)):
             continue
         if entry.network is not None:
             try:
