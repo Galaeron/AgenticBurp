@@ -24,7 +24,7 @@ import harness.collaborator as _collab
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
-from .base import Validator, ValidationResult
+from .base import SentAnswer, Validator, ValidationResult, artifact_id_of
 from harness.validators.sqlmap import (_mutate_query_param, _mutate_json_param, _mutate_form_param,
                                _looks_like_json, _content_type_of)
 
@@ -154,7 +154,7 @@ class SsrfValidator(Validator):
                                         follow_redirects=False, verify=False) as client:
                 resp = await client.request(method, url, headers=headers or None,
                                             content=body or None)
-            return resp.status_code, (resp.text or "")
+            return SentAnswer((resp.status_code, (resp.text or "")), artifact_id_of(resp))
         except SafetyGateBlocked as e:
             if unsent is not None:
                 unsent.append(("blocked", f"{label}: refused ({e.decision.reason})"))
@@ -186,7 +186,7 @@ class SsrfValidator(Validator):
             method, url, capability=self.name, headers=dict(headers or {}), body=body or None,
             max_redirects=0)
         if outcome.ok:
-            return outcome.status or 0, (outcome.body or "")
+            return SentAnswer((outcome.status or 0, (outcome.body or "")), outcome.artifact_id)
         if outcome.outcome == "error":
             failure = getattr(outcome.artifact, "transport_outcome", "").partition(":")[2]
             self._record_failure(unsent, label, failure or "transport error")
@@ -242,13 +242,22 @@ class SsrfValidator(Validator):
             if await collab.wait_for_hit(token, timeout=self.timeout):
                 lost = (f" The send itself got no response ({unsent[-1][1].rpartition(': ')[2]}), "
                         f"but the callback shows the request was delivered." if reply is None else "")
+                # Ticket 6 proof exchanges: the original request replayed (baseline)
+                # and the same parameter pointed at a closed loopback port, a URL
+                # that is not the collaborator (control). Neither is a verdict input.
+                baseline = control = None
+                if self.run_context is not None:  # outside a run they would name nothing
+                    baseline = await self._send(method, exchange.url, headers, exchange.request_body or "",
+                                                None, "proof baseline")
+                    control = await self._send(method, *self._mutated(exchange, loc, param, self._INBAND_CLOSED),
+                                               None, "proof control")
                 return ValidationResult(
                     self.name, "confirmed", "ssrf", confidence=0.95, confirmed=True,
                     summary=f"SSRF confirmed: the server fetched an attacker-controlled URL placed in "
                             f"the {loc} parameter {param!r}.",
                     evidence=f"Set {loc} param {param!r} to a unique collaborator URL; the target called "
                              f"back to it out-of-band, proving server-side request forgery (blind-safe)."
-                             + lost)
+                             + lost).with_artifacts(baseline=baseline, attack=reply, controls=[control])
             if reply is None:
                 kind, why = unsent[-1]
                 unsent[-1] = (kind, f"{why} after the request was sent; no callback within "

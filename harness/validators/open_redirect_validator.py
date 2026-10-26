@@ -100,6 +100,19 @@ class OpenRedirectValidator(Validator):
                 f"https:/{_SENTINEL_HOST}/{token}",
                 f"/\\{_SENTINEL_HOST}/{token}"]
 
+    async def _proof_send(self, method: str, url: str, headers: dict, body: str):
+        """One extra exchange a confirmation's proof names (Ticket 6); None when
+        it got no response, and not sent outside a run (it would name nothing)."""
+        if self.run_context is None:
+            return None
+        try:
+            await global_throttle.acquire()
+            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                        follow_redirects=False, verify=False) as client:
+                return await client.request(method, url, headers=headers or None, content=body or None)
+        except (SafetyGateBlocked, httpx.HTTPError):
+            return None
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
@@ -142,13 +155,20 @@ class OpenRedirectValidator(Validator):
                 # its path, or a Location on a non-redirect status, stays a candidate.
                 is_redirect = resp.status_code in _REDIRECT_STATUSES
                 if is_redirect and _destination_host(location, url) == _SENTINEL_HOST:
+                    # Proof exchanges: the original request replayed (baseline) and
+                    # the same parameter set to an on-origin path (control).
+                    baseline = await self._proof_send(method, exchange.url, headers,
+                                                      exchange.request_body or "")
+                    control_url, control_body = mutate(exchange, loc, param, f"/{loc}-{param}")
+                    control = await self._proof_send(method, control_url, headers, control_body)
                     return ValidationResult(
                         self.name, "confirmed", "open_redirect", confidence=0.9, confirmed=True,
                         summary=f"Open redirect confirmed: the {loc} parameter {param!r} controls the "
                                 f"Location the server redirects to.",
                         evidence=f"Set {param!r} to `{payload}`; the server responded with HTTP "
                                  f"{resp.status_code}, a redirect to the off-origin sentinel host "
-                                 f"{_SENTINEL_HOST!r} (Location: {location}).")
+                                 f"{_SENTINEL_HOST!r} (Location: {location})."
+                    ).with_artifacts(baseline=baseline, attack=resp, controls=[control])
                 if not candidate and _SENTINEL_HOST in location.lower():
                     why = ("it stays on the target's own origin" if is_redirect
                            else f"HTTP {resp.status_code} is not a redirect status")

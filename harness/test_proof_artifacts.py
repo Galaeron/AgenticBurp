@@ -20,17 +20,21 @@ import json
 import sqlite3
 import threading
 import unittest
+from urllib.parse import parse_qsl, urlsplit
 
 from harness import store
 from harness.assessment_health import confirmed_issue_accounting, stored_proof_artifacts_resolve
 from harness.models import AgentReport
 from harness.run_context import (_CREDENTIAL_HEADERS, RunContext, ScopePolicy, TypedRequest,
                                  case_scope)
-from harness.test_confirmation_soundness_rve import _CallerBase, _finding, _verdicts
+from harness.test_confirmation_soundness_rve import _CallerBase, _finding, _json_exchange, _verdicts
 from harness.test_default_history_caller import _exchange
+from harness.validators.auth_sequence_validator import AuthSequenceValidator
 from harness.validators.base import (SentAnswer, ValidationResult, artifact_id_of,
                                      proof_artifact_kwargs)
+from harness.validators.command_injection_validator import CommandInjectionValidator
 from harness.validators.jwt_forge_validator import JwtForgeValidator
+from harness.validators.sqlmap import SqlmapValidator
 
 
 def _b64url(raw: bytes) -> str:
@@ -284,6 +288,103 @@ class JwtForgeProofTests(_ProofCallerBase):
         self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
         self.assertEqual([p["verdict"] for p in proofs], ["inconclusive"])
         self.assertEqual(self._accounting(run_id, proofs[0], self.url, "jwt")["counts"]["vulnerabilities"], 0)
+
+
+def _query(path: str) -> dict:
+    return dict(parse_qsl(urlsplit(path).query, keep_blank_values=True))
+
+
+def _catalog(method, path, headers, body):
+    """A category filter whose WHERE clause takes the parameter unquoted: the
+    tautology lists every product, the contradiction lists none."""
+    category = _query(path).get("category", "")
+    if "'1'='1'" in category:
+        rows = [{"id": i, "name": f"product-{i}"} for i in range(40)]
+    elif "'1'='2'" in category:
+        rows = []
+    else:
+        rows = [{"id": 1, "name": "product-1"}]
+    return 200, json.dumps({"category": category, "rows": rows})
+
+
+def _shell(method, path, headers, body):
+    """A stock check that passes `host` to a shell: `;printf A%s B` prints AB.
+    Anything else is reflected as given (the literal pieces, never joined)."""
+    host = _query(path).get("host", "")
+    if ";printf " in host:
+        fmt, _, arg = host.rpartition(";printf ")[2].partition(" ")
+        return 200, json.dumps({"output": fmt.replace("%s", arg, 1)})
+    return 200, json.dumps({"output": f"pinged {host}"})
+
+
+def _login(method, path, headers, body):
+    """A login that answers a known account and an unknown one differently."""
+    fields = json.loads(body or "{}")
+    if fields.get("username") == "alice":
+        return 401, '{"error": "wrong password"}'
+    return 404, '{"error": "no such user"}'
+
+
+class SqlBooleanProofTests(_ProofCallerBase):
+    def test_boolean_differential_is_a_counted_vulnerability(self):
+        target = _Target(_catalog)
+        self.addCleanup(target.close)
+        url = target.origin + "/filter?category=Pets"
+        validator = SqlmapValidator(allowed_hosts=list(self.HOSTS), quick_only=True)
+        run_id, reports, proofs = self._confirm("sqlmap", validator, _finding("sqli"), _exchange(url))
+        self.assertEqual([r.status for r in reports], ["confirmed"], _verdicts(reports))
+        proof = self._stored_proof(proofs)
+        self._assert_counted(run_id, proof, url, "sqli")
+        rows = {role: len(json.loads(json.loads(store.get_evidence_blob(
+            _execution_event(proof, aid)["data"]["response_blob"]))["body"])["rows"])
+            for role, aid in (("baseline", proof["baseline_artifact_id"]),
+                              ("attack", proof["attack_artifact_id"]),
+                              ("control", proof["control_artifact_ids"][0]))}
+        self.assertEqual(rows, {"baseline": 1, "attack": 40, "control": 0})
+
+
+class CommandInjectionProofTests(_ProofCallerBase):
+    def _run(self, respond):
+        target = _Target(respond)
+        self.addCleanup(target.close)
+        url = target.origin + "/stock?host=127.0.0.1"
+        validator = CommandInjectionValidator(allowed_hosts=list(self.HOSTS), timeout=5.0,
+                                              oob_callbacks_enabled=False)
+        run_id, reports, proofs = self._confirm(
+            "command_injection", validator, _finding("command_injection"), _exchange(url))
+        self.assertEqual([r.status for r in reports], ["confirmed"], _verdicts(reports))
+        return run_id, url, self._stored_proof(proofs)
+
+    def test_in_band_marker_is_a_counted_vulnerability(self):
+        run_id, url, proof = self._run(_shell)
+        self._assert_counted(run_id, proof, url, "command_injection")
+
+    def test_control_that_also_shows_the_marker_is_not_named(self):
+        # A target that joins the pieces without any shell syntax: the control
+        # shows the same marker, so it proves nothing and the proof stays a candidate.
+        def joins_anything(method, path, headers, body):
+            host = _query(path).get("host", "")
+            if "%s " in host:
+                fmt, _, arg = host.rpartition(";printf ")[2].partition(" ")
+                return 200, json.dumps({"output": fmt.replace("%s", arg, 1)})
+            return 200, json.dumps({"output": f"pinged {host}"})
+        run_id, url, proof = self._run(joins_anything)
+        self.assertEqual(proof["control_artifact_ids"], [])
+        self._assert_candidate(run_id, proof, url, "command_injection")
+
+
+class UsernameEnumerationProofTests(_ProofCallerBase):
+    def test_status_oracle_is_a_counted_vulnerability(self):
+        target = _Target(_login)
+        self.addCleanup(target.close)
+        url = target.origin + "/login"
+        exchange = _json_exchange(url, "POST", '{"username": "alice", "password": "pw"}')
+        validator = AuthSequenceValidator(allowed_hosts=list(self.HOSTS), timeout=5.0)
+        run_id, reports, proofs = self._confirm(
+            "auth_sequence", validator, _finding("username_enumeration"), exchange)
+        self.assertEqual([r.status for r in reports], ["confirmed"], _verdicts(reports))
+        proof = self._stored_proof(proofs)
+        self._assert_counted(run_id, proof, url, "username_enumeration")
 
 
 class CaseScopeRecordTests(_ProofCallerBase):
