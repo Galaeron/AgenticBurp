@@ -19,8 +19,9 @@ Do not start another live run until the offline readiness gate below passes.
 Implementation is combined in `.test-work/wt-assessment-integration` on
 `codex/assessment-integration`, based on `9866784`. Assessment-only port `b4bf1fb`
 preserves the completed repairs; RV-T/RV-U/Ticket 5 follow through `4234506`.
-Remaining ticket changes are staged, with focused callers passing; final combined
-gates are running. Do not treat implementation completion as live readiness.
+Tickets 1-7 are committed (`d975bfc`, `e213f4b`); `b116c42` and `bc87804` add
+review and stage bounds. Combined gates passed on `bc87804` on 3.12 and 3.14.
+The live acceptance run left the assessment incomplete; see Ticket 8.
 
 - Ticket 1: shared history/report contract, named/principal isolation, and selected
   cache/knowledge privacy dependencies. `tickets-1-7.md` records caller evidence.
@@ -36,7 +37,9 @@ gates are running. Do not treat implementation completion as live readiness.
   `docs/CONFIRMATION_ACCOUNTING_AUDIT_2026-10-24.md` for historical case audits.
 - Ticket 7: transactional managed results, authenticated bounded retrieval,
   hash verification, restart recovery and cancellation partial evidence.
-- Ticket 8: authorized but NOT started; combined gates must pass first.
+- Ticket 8: run 2026-10-26 on `bc87804` (gates green on 3.12 and 3.14). The job
+  was terminal but the assessment INCOMPLETE; 2 unique vulnerabilities survived
+  the replay audit. See the Ticket 8 section below.
 
 Batch evidence: `.test-work/assessment-integration-20261023/`. The dependency
 description below records the original starting constraints; main WIP is preserved.
@@ -262,6 +265,37 @@ partial evidence on cancellation and distinguish execution error from delivery e
 5. Run the full authorized workload. Report coverage funnel, skips by reason,
    per-phase request/model/time cost, proof-backed unique issues, and remaining work.
    Distinguish terminal job status from complete assessment status.
+
+Status 2026-10-26 (evidence `.test-work/assessment-integration-20261023/`, HANDOFF.md):
+- Steps 1-2 done: v7 gates on `bc87804` passed on 3.12 and 3.14 (full 4196 + 440,
+  17 skipped, + 59). Step 3 rechecked live health and callback controls (exact
+  token recorded, wrong token rejected).
+- Step 4: diagnostics 3 and 4. Diagnostic 3 found a dead coverage drive, fixed by
+  `bc87804`; diagnostic 4 sent coverage legs.
+- Step 5 (job 383f0ebff8e8, gemma4:latest only, 9534.6 s):
+  - The job reached terminal status, but the assessment is incomplete: 155
+    captures were left unreviewed at the review time bound.
+  - Funnel: discovered 12882 → captured 10944 → applicable 5022 → queued 1343 →
+    attempted 1343 → sent 89 → conclusive 89.
+  - Terminal reasons: not_applicable 7860, unsupported_or_manual 3507,
+    incomplete_attempt 1254.
+  - Cost: 39,314 requests and 937 model calls, 24 of which failed with HTTP 500.
+  - Delivery: paged export verified by SHA256; recovery after restart returned an
+    identical result.
+- Issues:
+  - 617 raw findings and 164 ledger-confirmed proof instances. The strict
+    vulnerability count is 0, because every proof is legacy (no artifact ids).
+  - A replay audit re-ran all 149 distinct confirmed claims against the owned
+    target. Two unique vulnerabilities were confirmed:
+    - SQL injection on the login email returns an admin token.
+    - The JWT alg:none token is accepted on 10 routes.
+  - The other claims: 39 observations, 31 false positives, 52 not applicable,
+    12 not supported, 1 not reproduced and 3 inconclusive.
+- Not done:
+  - A complete assessment.
+  - Proof artifact ids.
+  - Stopping csp/recon over-confirmation.
+  - Storing full sqlmap evidence.
 
 ## Definition of done / agent delivery
 
