@@ -493,8 +493,11 @@ class GatedAsyncClient:
             resp_headers = {k: v for k, v in (outcome.headers or {}).items()
                             if k.lower() not in ("content-encoding", "content-length",
                                                  "transfer-encoding")}
+            # The run's exchange artifact id lets a validator name this send as a
+            # proof's baseline/attack/control (validators.base.artifact_id_of).
             return httpx.Response(outcome.status or 0, headers=resp_headers,
-                                  content=(outcome.body or "").encode("utf-8"), request=request)
+                                  content=(outcome.body or "").encode("utf-8"), request=request,
+                                  extensions={"harness_artifact_id": outcome.artifact_id})
         if outcome.outcome == "error":
             raise httpx.ConnectError(outcome.error or "transport error", request=request)
         tier = ActionRiskTier.OUT_OF_SCOPE if outcome.outcome == "out_of_scope" else (
