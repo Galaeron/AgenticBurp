@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from urllib.parse import urlparse, urlsplit
 
 import httpx
@@ -654,7 +655,8 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
 
 
 async def review_captured_exchanges(orch, state, captured, *, max_reviews: int = 200,
-                                    run_context=None, seen=None, errors=None) -> int:
+                                    run_context=None, seen=None, errors=None,
+                                    deadline: float | None = None) -> int:
     """Phase 0.1: route every substantive 2xx captured during discovery through
     full content-level review and fold its findings into `state`.
 
@@ -671,12 +673,29 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     analysis must not cascade into another scope-discovery pass (that guard also
     keeps this bounded -- one analyze per capture, not a recursive fan-out).
 
+    `max_reviews` and `deadline` (a `time.monotonic()` value) bound the phase so a
+    slow model cannot hold back chaining and coverage driving indefinitely. The
+    bounds are checked before a capture is taken from the frontier, so an
+    unreviewed capture is never marked seen; any left over are reported in
+    `errors` as truncation, keeping the assessment incomplete rather than clean.
+
     Returns the count of captured exchanges that yielded >=1 finding."""
     produced = 0
     reviewed = 0
-    from itertools import islice
+    stopped_by = None
     from harness.assessment_health import review_frontier
-    for cap in islice(review_frontier(captured, seen=seen), max_reviews):
+    seen = seen if seen is not None else set()
+    frontier = review_frontier(captured, seen=seen)
+    while True:
+        if reviewed >= max_reviews:
+            stopped_by = "capture review limit"
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            stopped_by = "capture review time budget"
+            break
+        cap = next(frontier, None)
+        if cap is None:
+            break
         try:
             ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
         except Exception:
@@ -704,6 +723,15 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     if reviewed:
         log.info("review_captured_exchanges: reviewed %d captured 2xx exchanges, "
                  "%d produced findings", reviewed, produced)
+    if stopped_by:
+        remaining = sum(1 for _ in review_frontier(captured, seen=set(seen)))
+        if remaining:
+            log.info("review_captured_exchanges: %s reached, %d captured exchange(s) "
+                     "not reviewed", stopped_by, remaining)
+            if errors is not None:
+                errors.append({"phase": "capture_review",
+                               "error": f"{stopped_by} reached: {remaining} captured "
+                                        "exchange(s) not reviewed"})
     return produced
 
 

@@ -62,6 +62,10 @@ class EngagementPolicy:
     coverage_leg_budget: int = 80
     engagement_coverage_case_drive: bool = False
     coverage_case_budget: int = 8
+    # Capture review bounds (added after the refactor). The defaults keep the
+    # former hard-coded 200-review cap and add no time bound.
+    capture_review_limit: int = 200
+    capture_review_seconds: float = 0.0
 
     @classmethod
     def from_config(cls, config: dict) -> "EngagementPolicy":
@@ -90,6 +94,8 @@ class EngagementPolicy:
                 eng_cfg.get("coverage_drive_cases", False)
             ),
             coverage_case_budget=int(eng_cfg.get("coverage_case_budget", 8)),
+            capture_review_limit=int(eng_cfg.get("capture_review_limit", 200)),
+            capture_review_seconds=float(eng_cfg.get("capture_review_seconds", 0)),
         )
 
     def as_dict(self) -> dict:

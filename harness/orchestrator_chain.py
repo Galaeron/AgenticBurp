@@ -10,6 +10,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 from __future__ import annotations
 
 import contextlib
+import time
 import uuid
 
 from harness import identity_compare
@@ -1434,10 +1435,14 @@ class ChainMixin:
             # negative result instead of silently changing the experiment into
             # an open-ended model review of unrelated vulnerability classes.
             return _objective_result(False)
+        # One review time budget covers this pass and every chain round's pass.
+        _review_deadline = (time.monotonic() + self.capture_review_seconds
+                            if self.capture_review_seconds > 0 else None)
         if not (stop_on_confirm and _early_confirmed):
             await review_captured_exchanges(
                 self, state, _all_captured, run_context=run_context,
-                seen=_reviewed_captures, errors=_errors)
+                seen=_reviewed_captures, errors=_errors,
+                max_reviews=self.capture_review_limit, deadline=_review_deadline)
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
         # credential (url -> {headers, body}), built from the real captured
@@ -1487,7 +1492,8 @@ class ChainMixin:
             if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
                 await review_captured_exchanges(
                     self, st2, getattr(rc2, "captured", None), run_context=run_context,
-                    seen=_reviewed_captures, errors=_errors)
+                    seen=_reviewed_captures, errors=_errors,
+                    max_reviews=self.capture_review_limit, deadline=_review_deadline)
             outcomes.extend(outs2)
             all_findings.extend(new_findings)
             # R19: merge the derived-identity state back into the primary state, so

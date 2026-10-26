@@ -359,6 +359,11 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # (finer fan-out = more leg traffic); bounded per cell by coverage_case_budget.
         self.engagement_coverage_case_drive = self.engagement_policy.engagement_coverage_case_drive
         self.coverage_case_budget = self.engagement_policy.coverage_case_budget
+        # Capture review runs before chaining and coverage driving; these bound it
+        # by count and by wall-clock seconds (0 = unbounded) so the later stages
+        # are reached. Unreviewed captures are reported as truncation.
+        self.capture_review_limit = self.engagement_policy.capture_review_limit
+        self.capture_review_seconds = self.engagement_policy.capture_review_seconds
         # P2-1: business-context planning agent (BusinessContextAgent). DEFAULT
         # OFF. When on, investigate_engagement runs ONE application-context pass
         # that builds an Application Semantic Model (roles/objects/workflows/
