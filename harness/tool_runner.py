@@ -347,6 +347,13 @@ class _Win:
                                                       ctypes.c_void_p]
             k32.CloseHandle.restype = wintypes.BOOL
             k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.IsProcessInJob.restype = wintypes.BOOL
+            k32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE,
+                                           ctypes.POINTER(wintypes.BOOL)]
+            k32.WaitForSingleObject.restype = wintypes.DWORD
+            k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
             ntdll = ctypes.WinDLL("ntdll")
             ntdll.NtResumeProcess.restype = ctypes.c_long
             ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
@@ -411,7 +418,7 @@ class _Win:
         cls._load().TerminateJobObject(job, 1)
 
     @classmethod
-    def active_processes(cls, job) -> int:
+    def _accounting(cls, job):
         import ctypes
         from ctypes import wintypes
 
@@ -427,8 +434,64 @@ class _Win:
         info = _Accounting()
         if not cls._load().QueryInformationJobObject(job, 1, ctypes.byref(info),
                                                      ctypes.sizeof(info), None):
-            return 1    # cannot query: never claim the tree is empty
-        return int(info.ActiveProcesses)
+            return None
+        return info
+
+    @classmethod
+    def active_processes(cls, job) -> int:
+        info = cls._accounting(job)
+        return 1 if info is None else int(info.ActiveProcesses)   # cannot query: never empty
+
+    @classmethod
+    def total_processes(cls, job) -> int | None:
+        """Processes ever associated with the job (nested jobs included)."""
+        info = cls._accounting(job)
+        return None if info is None else int(info.TotalProcesses)
+
+    @classmethod
+    def member_pids(cls, job) -> list[int] | None:
+        """PIDs of the job's active members; None when the list cannot be read."""
+        import ctypes
+        from ctypes import wintypes
+        size = 64
+        while size <= 65536:
+            class _IdList(ctypes.Structure):
+                _fields_ = [("NumberOfAssignedProcesses", wintypes.DWORD),
+                            ("NumberOfProcessIdsInList", wintypes.DWORD),
+                            ("ProcessIdList", ctypes.c_size_t * size)]
+
+            info = _IdList()
+            if cls._load().QueryInformationJobObject(job, 3, ctypes.byref(info),
+                                                     ctypes.sizeof(info), None):
+                return [int(info.ProcessIdList[i]) for i in range(info.NumberOfProcessIdsInList)]
+            if ctypes.get_last_error() != 234:    # not ERROR_MORE_DATA
+                return None
+            size *= 4
+        return None
+
+    @classmethod
+    def hold_member(cls, job, pid: int):
+        """A SYNCHRONIZE handle to `pid` while it is still this job's member; 0 when that
+        member is already gone; None when this cannot be established."""
+        import ctypes
+        from ctypes import wintypes
+        k32 = cls._load()
+        handle = k32.OpenProcess(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED
+        if not handle:
+            # ERROR_INVALID_PARAMETER: no such process, so its object is already freed.
+            return 0 if ctypes.get_last_error() == 87 else None
+        member = wintypes.BOOL()
+        if not k32.IsProcessInJob(handle, job, ctypes.byref(member)):
+            k32.CloseHandle(handle)
+            return None
+        if not member.value:    # the PID was reused: the member it named is gone
+            k32.CloseHandle(handle)
+            return 0
+        return handle
+
+    @classmethod
+    def exited(cls, handle) -> bool:
+        return cls._load().WaitForSingleObject(handle, 0) == 0    # WAIT_OBJECT_0
 
     @classmethod
     def close(cls, job) -> None:
@@ -438,13 +501,16 @@ class _Win:
 class _OwnedTree:
     """Every process a launched tool starts. Windows: the tool starts suspended, is
     placed in a kill-on-close Job Object and only then resumed, so no descendant can
-    escape; the job's ActiveProcesses proves emptiness. Without a job the tool is
-    never resumed (ToolContainmentUnavailable). POSIX: a fresh session, so the
-    process group holds every descendant that does not create its own."""
+    escape; the job's ActiveProcesses and the stopped members' own handles prove
+    emptiness. Without a job the tool is never resumed (ToolContainmentUnavailable).
+    POSIX: a fresh session, so the process group holds every descendant that does
+    not create its own."""
 
     def __init__(self):
         self._proc = None
         self._job = None
+        self._held = []           # Windows: handles to the members a terminate stopped
+        self._unproved = False    # Windows: a stopped member could not be held
         self.kind = ""
 
     @staticmethod
@@ -472,7 +538,24 @@ class _OwnedTree:
 
     def terminate(self) -> None:
         if os.name == "nt":
+            # ActiveProcesses drops to 0 as soon as the job is terminated, while its
+            # members are still exiting, and the launched process may be only a
+            # launcher (a venv python.exe, a console-script shim) whose exit says
+            # nothing about the tool. Hold every member first, so emptiness is
+            # proved by the members' own exit.
+            total = _Win.total_processes(self._job)
+            pids = _Win.member_pids(self._job)
+            for pid in pids or ():
+                handle = _Win.hold_member(self._job, pid)
+                if handle is None:
+                    self._unproved = True
+                elif handle:
+                    self._held.append(handle)
             _Win.terminate_job(self._job)
+            # A member that joined after the snapshot is stopped too, but its exit
+            # cannot be awaited: never prove such a tree empty.
+            if pids is None or total is None or _Win.total_processes(self._job) != total:
+                self._unproved = True
             return
         import signal
         try:
@@ -483,7 +566,8 @@ class _OwnedTree:
     def alive(self) -> int:
         """Members still running; 0 means none is left."""
         if os.name == "nt":
-            return _Win.active_processes(self._job)
+            return (_Win.active_processes(self._job) + int(self._unproved)
+                    + sum(not _Win.exited(handle) for handle in self._held))
         try:
             os.killpg(self._proc.pid, 0)
         except ProcessLookupError:
@@ -493,6 +577,9 @@ class _OwnedTree:
         return 1
 
     def close(self) -> None:
+        for handle in self._held:
+            _Win.close(handle)
+        self._held = []
         if self._job is not None:
             _Win.close(self._job)
             self._job = None
