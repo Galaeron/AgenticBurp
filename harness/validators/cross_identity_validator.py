@@ -35,6 +35,7 @@ validators.active_enabled (it sends live requests), and scoped to
 server.allowed_hosts. GET-only.
 """
 from __future__ import annotations
+from harness import scope_lock
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs

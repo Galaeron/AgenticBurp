@@ -23,6 +23,7 @@ active (validators.active_enabled), and a non-GET replay additionally needs
 validators.allow_mutating_replay (safety gate).
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import secrets
 from dataclasses import replace

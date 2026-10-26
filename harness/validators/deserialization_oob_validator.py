@@ -25,6 +25,7 @@ payloads are built -- those have no gadget-free in-process proof, so they stay w
 the passive format-confirmation validator.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import base64
 import os

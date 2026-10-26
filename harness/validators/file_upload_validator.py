@@ -12,6 +12,7 @@ server stores and serves a .html file, the upload filter is bypassable.
 Active; the upload is a POST (mutating), gated by allow_mutating_replay.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import secrets
 from urllib.parse import urlsplit

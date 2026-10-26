@@ -125,12 +125,14 @@ class NoOrphanTestFilesTest(unittest.TestCase):
             SimpleNamespace(returncode=1), SimpleNamespace(returncode=0),
             SimpleNamespace(returncode=0), SimpleNamespace(returncode=0),
             SimpleNamespace(returncode=0),
-        ]) as run, patch('builtins.print'):
+        ]) as run, patch('builtins.print'), \
+             patch('harness.verification_snapshot.preflight'):
             self.assertEqual(suite.main(['full']), 1)
             self.assertEqual(run.call_count, 5)
 
     def test_runner_success_and_dry_run(self):
-        with patch.object(suite.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run, patch('builtins.print'):
+        with patch.object(suite.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run, patch('builtins.print'), \
+             patch('harness.verification_snapshot.preflight'):
             self.assertEqual(suite.main(['native']), 0)
             self.assertEqual(run.call_count, 1)
             run.reset_mock()

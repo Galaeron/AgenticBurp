@@ -112,10 +112,11 @@ class SsrfValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None):
+                 collaborator=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
 
     def collab(self):
         return _collab.resolve(self._collab)
@@ -212,6 +213,7 @@ class SsrfValidator(Validator):
                 summary="SSRF check incomplete: its alternate-host probes and out-of-band callbacks are disabled by policy",
                 evidence=("This check requires a separately authorized internal-service or callback target. "
                           "No SSRF probe was sent and no callback listener was opened."))
+        collab = self.collab()
         method = (exchange.method or "GET").upper()
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("host", "content-length")}

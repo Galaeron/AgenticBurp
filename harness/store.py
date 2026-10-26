@@ -3211,3 +3211,15 @@ def wipe_engagement(host: str) -> dict:
         return counts
     finally:
         conn.close()
+
+
+def proofs_for_run(run_id: str) -> list[dict]:
+    """Read every immutable proof attempt for exact run-level accounting."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT {_PROOF_COLUMNS} FROM proof_records WHERE run_id = ? ORDER BY created_at ASC",
+            (run_id,)).fetchall()
+        return [_proof_row_to_dict(row) for row in rows]
+    finally:
+        conn.close()

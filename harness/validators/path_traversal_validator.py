@@ -22,6 +22,7 @@ Scope-gated; active (validators.active_enabled), and a non-GET replay additional
 needs validators.allow_mutating_replay (safety gate).
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import re
 from urllib.parse import urlsplit, urlunsplit, parse_qsl

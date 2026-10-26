@@ -15,6 +15,7 @@ Tests performed:
 """
 
 from __future__ import annotations
+from harness import scope_lock
 import asyncio
 import contextvars
 import logging

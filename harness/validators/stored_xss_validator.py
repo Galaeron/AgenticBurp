@@ -32,6 +32,7 @@ Scope-gated; the plant is a mutating write, so it self-gates on
 validators.allow_mutating_replay and routes through the safety gate.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import json
 import secrets

@@ -28,6 +28,40 @@ from urllib.parse import urlsplit
 from harness.models import HttpExchange
 from harness.safety_gate import SafetyGateBlocked
 
+
+def captured_nodes(node, base_url, roles):
+    """Yield each observed shape under its own matching supplied identity."""
+    from harness.engagement import capture_identity_key
+    from harness.scope_lock import parse_scope_url
+    variants = node.get("capture_variants") or []
+    if not variants:
+        yield node
+        return
+    origin = parse_scope_url(base_url)
+    for variant in variants:
+        target = parse_scope_url(variant.get("url", ""))
+        if target is None or origin is None or target.origin != origin.origin:
+            yield dict(node, capture_error="scope_rejected")
+            continue
+        matches = [r for r in roles if capture_identity_key(r.headers) == variant.get("identity_key")]
+        if not matches:
+            yield dict(node, capture_error="missing_principal")
+            continue
+        for role in matches:
+            yield dict(node, template=variant["template"], capture=variant,
+                       probe_session=role, reachable_roles=[role.role])
+
+
+def capture_problem(node):
+    if node.get("capture_error"):
+        return node["capture_error"]
+    if node.get("method", "GET").upper() not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
+        return "unsupported_method"
+    if node.get("capture") and node.get("method", "GET").upper() in {"POST", "PUT", "PATCH"}:
+        if not (node.get("template") or {}).get("body"):
+            return "missing_body"
+    return None
+
 log = logging.getLogger("harness.worklist_investigator")
 
 # Trust order so the driver probes from the LOWEST-privilege identity that can
@@ -170,7 +204,9 @@ def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
     return HttpExchange(
         url=url, method=node.get("method", "GET"),
         request_headers=merged, request_body=body,
-        response_status=None, response_headers={}, response_body="",
+        response_status=(node.get("capture") or {}).get("response_status"),
+        response_headers=(node.get("capture") or {}).get("response_headers", {}),
+        response_body=(node.get("capture") or {}).get("response_body", ""),
     )
 
 
@@ -208,7 +244,9 @@ def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
         return SKIP_UNREACHABLE
     if eligible and investigated >= max_nodes:
         return SKIP_BUDGET_EXHAUSTED
-    return SKIP_MISSING_TEMPLATE
+    if not node.get("template"):
+        return SKIP_MISSING_TEMPLATE
+    return "no_applicable_hypothesis"
 
 
 async def investigate_worklist(
@@ -273,7 +311,14 @@ async def investigate_worklist(
     eligible_count = 0
     skipped: list[dict] = []
 
-    for node in state.worklist(worklist_limit):
+    nodes = (variant for node in state.worklist(worklist_limit)
+             for variant in captured_nodes(node, base_url, roles))
+    for node in nodes:
+        problem = capture_problem(node)
+        if problem:
+            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
+                            "reason": problem, "next_action": "Supply an in-scope complete capture and its owning identity"})
+            continue
         derived = _derive_probe(node)
         # R21: completion belongs to an (endpoint, check) case, not the whole
         # endpoint -- a "validated" endpoint may still hold UNRELATED vulnerabilities.
@@ -305,7 +350,8 @@ async def investigate_worklist(
         reach = node.get("reachable_roles", []) or []
         # probe from the lowest-trust identity that can reach it (strongest proof).
         probe_role = min(reach, key=_trust) if reach else (roles[0].role if roles else "anonymous")
-        headers = role_headers.get(probe_role, {})
+        session = node.get("probe_session")
+        headers = dict(session.headers or {}) if session else role_headers.get(probe_role, {})
         parent_id = _parent_template_object_id(state, node)
         exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
 
@@ -398,6 +444,13 @@ async def investigate_worklist(
     if summary_out is not None:
         by_reason: dict[str, int] = {}
         for s in skipped:
+            s.setdefault("next_action", {
+                "missing_template": "Capture the actual request and response",
+                "no_applicable_hypothesis": "Inspect deterministic coverage or add a supported check",
+                "budget_exhausted": "Resume with additional budget",
+                "policy_blocked": "Review the operation's authorization",
+                "unreachable": "Verify access with the supplied identity",
+            }.get(s["reason"], "Inspect the recorded prerequisite"))
             by_reason[s["reason"]] = by_reason.get(s["reason"], 0) + 1
         summary_out.update({
             "eligible": eligible_count,

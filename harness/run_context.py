@@ -320,6 +320,15 @@ class TargetTransport:
 
     def __init__(self, ctx: "RunContext"):
         self.ctx = ctx
+        self._sent_count = contextvars.ContextVar("transport_observed_sends", default=0)
+
+    @property
+    def sent_count(self):
+        return self._sent_count.get()
+
+    @sent_count.setter
+    def sent_count(self, value):
+        self._sent_count.set(value)
 
     async def send(self, method: str, url: str, *, capability: str,
                    session_ref: str | None = None, headers: dict | None = None,
@@ -550,6 +559,8 @@ class TargetTransport:
             except Exception as e:  # transport error -> honest error artifact, never a crash
                 return ExecutionOutcome(outcome="error", final_url=url, error=str(e),
                                         artifact=self._artifact(url, f"error:{type(e).__name__}", session_ref, case_ref=case_ref))
+
+            self.sent_count += 1
 
             if resp.status_code in _REDIRECT_CODES and resp.headers.get("location") and _hop < max_redirects:
                 nxt = urljoin(url, resp.headers["location"])

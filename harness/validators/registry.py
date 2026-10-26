@@ -194,18 +194,18 @@ class ValidatorRegistry:
         ssrf_cfg = cfg.get("ssrf", {})
         if ssrf_cfg.get("enabled", True):
             self.validators["ssrf"] = SsrfValidator(
-                allowed_hosts=_allowed, timeout=float(ssrf_cfg.get("timeout", 10.0)), collaborator=self.collaborator)
+                allowed_hosts=_allowed, timeout=float(ssrf_cfg.get("timeout", 10.0)), collaborator=self.collaborator, oob_callbacks_enabled=bool(cfg.get("oob_callbacks_enabled", True)))
         # XXE leg -- OOB via the collaborator (external entity -> callback). Active.
         xxe_cfg = cfg.get("xxe", {})
         if xxe_cfg.get("enabled", True):
             self.validators["xxe"] = XxeValidator(
-                allowed_hosts=_allowed, timeout=float(xxe_cfg.get("timeout", 10.0)), collaborator=self.collaborator)
+                allowed_hosts=_allowed, timeout=float(xxe_cfg.get("timeout", 10.0)), collaborator=self.collaborator, oob_callbacks_enabled=bool(cfg.get("oob_callbacks_enabled", True)))
         # Command-injection leg -- OOB via the collaborator (shell payload -> callback).
         # Active; a non-GET replay also needs allow_mutating_replay.
         cmdi_cfg = cfg.get("command_injection", {})
         if cmdi_cfg.get("enabled", True):
             self.validators["command_injection"] = CommandInjectionValidator(
-                allowed_hosts=_allowed, timeout=float(cmdi_cfg.get("timeout", 10.0)), collaborator=self.collaborator)
+                allowed_hosts=_allowed, timeout=float(cmdi_cfg.get("timeout", 10.0)), collaborator=self.collaborator, oob_callbacks_enabled=bool(cfg.get("oob_callbacks_enabled", True)))
         # SSTI leg -- in-band arithmetic differential (proves template evaluation). Active.
         ssti_cfg = cfg.get("ssti", {})
         if ssti_cfg.get("enabled", True):

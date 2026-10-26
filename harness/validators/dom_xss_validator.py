@@ -24,6 +24,7 @@ negative), same safe posture: GET navigation only, scope-gated, throttled,
 degrades to skipped when no browser is installed.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import logging
 import secrets

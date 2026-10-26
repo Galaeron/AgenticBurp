@@ -605,7 +605,7 @@ class ChainMixin:
                                      objective_class: str | None = None,
                                      objective_task: "ObjectiveTask | None" = None,
                                      objective_provider=None,
-                                     seed_exchanges=None) -> dict:
+                                     seed_exchanges=None, coverage_checkpoint=None) -> dict:
         """Milestone A+B, end to end: build the app model (active discovery ->
         per-role access matrix -> prioritised worklist), then drive the ITERATIVE
         agent top-down over that worklist -- each high-value node gets a bounded
@@ -808,10 +808,12 @@ class ChainMixin:
         _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts, run_context=run_context)
         _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts,
                                  run_context=run_context)
-        _ssrf = SsrfValidator(allowed_hosts=self.allowed_hosts)
-        _xxe = XxeValidator(allowed_hosts=self.allowed_hosts)
+        from harness.collaborator import ConfiguredCollaborator
+        _callbacks = getattr(getattr(self, "validator_registry", None), "collaborator", None) or ConfiguredCollaborator(self.config)
+        _ssrf = SsrfValidator(allowed_hosts=self.allowed_hosts, collaborator=_callbacks, oob_callbacks_enabled=bool((self.config.get("validators") or {}).get("oob_callbacks_enabled", True)))
+        _xxe = XxeValidator(allowed_hosts=self.allowed_hosts, collaborator=_callbacks, oob_callbacks_enabled=bool((self.config.get("validators") or {}).get("oob_callbacks_enabled", True)))
         _cmdi = CommandInjectionValidator(allowed_hosts=self.allowed_hosts,
-                                          run_context=run_context)
+                                          run_context=run_context, collaborator=_callbacks, oob_callbacks_enabled=bool((self.config.get("validators") or {}).get("oob_callbacks_enabled", True)))
         # Stored SSTI often writes a preference/editor value and evaluates it on
         # a separate public render.  Supply only GET pages already observed in
         # this engagement; the validator keeps the set bounded and same-origin.
@@ -876,7 +878,10 @@ class ChainMixin:
                 getattr(finding_obj, "vulnerability_class", None))
             if key in _confirmation_cache:
                 return _confirmation_cache[key]
+            before = getattr(getattr(run_context, "transport", None), "sent_count", None)
             result = await validator.validate(finding_obj, exchange)
+            if before is not None:
+                result.sent_count = run_context.transport.sent_count - before
             _confirmation_cache[key] = result
             return result
 
@@ -1688,15 +1693,15 @@ class ChainMixin:
                     return str(p()) if callable(p) else (getattr(r, "role", None) or "anonymous")
                 _role_headers = {_pid(r): dict(r.headers or {}) for r in roles}
 
-                async def _run_leg_core(identity, method, path, check, case_key=None):
+                async def _run_captured_leg(identity, method, path, check, case_key=None, node=None):
                     validator = _val_by_conf.get(check.confirmation)
                     if validator is None:
                         return None  # e.g. sqlmap/race_condition -- not driven here
-                    node = {"method": method, "path": path}
+                    node = node or {"method": method, "path": path}
                     # R05: replay the captured template for this endpoint if we have
                     # one, so the coverage-driven leg sends the real shape too.
                     _ep_obj = state.endpoints.get(f"{method} {path}")
-                    if _ep_obj is not None and getattr(_ep_obj, "template", None):
+                    if "template" not in node and _ep_obj is not None and getattr(_ep_obj, "template", None):
                         node["template"] = _ep_obj.template
                     ex = worklist_investigator._seed_exchange(
                         base_url, node, _role_headers.get(identity, {}), "1")
@@ -1723,6 +1728,34 @@ class ChainMixin:
                         all_findings.append(cf)
                     return res
 
+                async def _run_leg_core(identity, method, path, check, case_key=None):
+                    ep = state.endpoints.get(f"{method} {path}")
+                    if ep is None or not ep.capture_variants:
+                        return await _run_captured_leg(identity, method, path, check, case_key)
+                    from harness.engagement import capture_identity_key
+                    key = capture_identity_key(_role_headers.get(identity, {}))
+                    variants = [v for v in ep.capture_variants if v.get("identity_key") == key]
+                    if not variants:
+                        return _VR(check.confirmation, "inconclusive", check.vulnerability_class,
+                                   summary="missing_principal: capture the request as this identity")
+                    selected_roles = [r for r in roles if _pid(r) == identity]
+                    outcomes = []
+                    for node in worklist_investigator.captured_nodes(
+                            dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles):
+                        problem = worklist_investigator.capture_problem(node)
+                        if problem:
+                            outcomes.append(_VR(check.confirmation, "inconclusive", check.vulnerability_class,
+                                                summary=problem + ": supply a complete authorized capture"))
+                        else:
+                            outcomes.append(await _run_captured_leg(identity, method, path, check, case_key, node))
+                    # Every proof instance was recorded above. A positive instance
+                    # does not turn another unanswered variant into a clean cell.
+                    incomplete = [r for r in outcomes if r is None or r.status not in
+                                  {"confirmed", "not_confirmed", "controlled_negative", "safe"}]
+                    if incomplete:
+                        return next((r for r in incomplete if r is not None), None)
+                    return next((r for r in outcomes if r.confirmed), outcomes[0] if outcomes else None)
+
                 async def _run_leg(identity, method, path, check):
                     return await _run_leg_core(identity, method, path, check, None)
 
@@ -1733,11 +1766,15 @@ class ChainMixin:
                     coverage = await coverage_tracker.build_coverage_cases_driven(
                         state, roles, _run_leg_core, budget=self.coverage_leg_budget,
                         per_cell_case_budget=self.coverage_case_budget,
-                        driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys)
+                        driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
+                        checkpoint=coverage_checkpoint,
+                        context_key=coverage_tracker.resume_context_key(self.config))
                 else:
                     coverage = await coverage_tracker.build_coverage_driven(
                         state, roles, _run_leg, budget=self.coverage_leg_budget,
-                        driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys)
+                        driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
+                        checkpoint=coverage_checkpoint,
+                        context_key=coverage_tracker.resume_context_key(self.config))
             else:
                 coverage = coverage_tracker.build_coverage(state, roles,
                                                            investigated_keys=investigated_keys)
@@ -1783,6 +1820,11 @@ class ChainMixin:
             log.debug("investigate_engagement: circuit breaker check failed: %s", e)
 
         from harness.assessment_health import assessment_health
+        try:
+            from harness.engagement import persist_surface
+            await asyncio.to_thread(persist_surface, state)
+        except Exception as exc:
+            _errors.append({"phase": "surface_persistence", "error": type(exc).__name__})
         health = assessment_health(coverage, _errors)
         return {
             "assessment": health,

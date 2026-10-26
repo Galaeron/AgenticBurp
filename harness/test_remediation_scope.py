@@ -83,8 +83,13 @@ class ScopeContractTests(unittest.TestCase):
             self.assertFalse(scope_discovery.is_host_allowed(url, ['*.target.test']))
         for url in ('http://target.test.other.test/a', 'http://other-target.test/a'):
             self.assertFalse(scope_discovery.is_host_allowed(url, ['*.target.test']))
-        for entries in (['.target.test'], ['*target.test'], ['[::1]:8080'], ['http://[::1]']):
+        for entries in (['.target.test'], ['*target.test'], ['http://[::1]']):
             self.assertFalse(scope_discovery.is_host_allowed('http://[::1]:8080/a', entries))
+
+    def test_exact_host_port_authorizes_only_that_explicit_service(self):
+        self.assertTrue(scope_lock.host_in_scope('http://[::1]:8080/a', ['[::1]:8080'], active_mode=True))
+        self.assertFalse(scope_lock.host_in_scope('http://[::1]:8081/a', ['[::1]:8080'], active_mode=True))
+        self.assertFalse(scope_lock.host_in_scope('http://[::1]/a', ['[::1]:80'], active_mode=True))
 
     def test_passive_unset_compatibility_is_explicit_and_not_strict_authority(self):
         self.assertEqual(self.decisions('https://target.test/a', [], active=False), {

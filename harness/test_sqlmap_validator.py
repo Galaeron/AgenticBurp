@@ -329,13 +329,8 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "confirmed")
         self.assertIn("query:category", result.summary)
 
-    async def test_error_signature_confirms_when_boolean_differential_does_not(self):
-        """The exact real gap found live against Juice Shop's product
-        search: a LIKE '%...%'-wrapped parameter where OR-based tautology
-        and contradiction both return identical (all-matching) results --
-        no boolean differential -- but the tautology payload's trailing
-        syntax produces a genuine, visible database error. Must still
-        confirm via the error signature, not report not_confirmed."""
+    async def test_error_signature_is_candidate_without_boolean_differential(self):
+        """An identical error for both payloads is an anomaly, not SQLi proof."""
         v = self._validator()
         exchange = HttpExchange(
             url="http://localhost:3000/rest/products/search?q=apple", method="GET",
@@ -351,9 +346,9 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[resp_a, resp_b]):
             result = await v._boolean_probe_fallback(_finding(), exchange)
-        self.assertEqual(result.status, "confirmed")
-        self.assertTrue(result.confirmed)
-        self.assertIn("Error-based", result.summary)
+        self.assertEqual(result.status, "inconclusive")
+        self.assertFalse(result.confirmed)
+        self.assertIn("independent controlled evidence", result.summary)
 
     async def test_baseline_already_erroring_endpoint_is_not_flagged(self):
         """An endpoint that already returns DB-error-shaped text for

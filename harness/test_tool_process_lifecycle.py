@@ -293,6 +293,25 @@ class SqlmapHostLifecycleTests(_ToolFixture, unittest.TestCase):
 
         self.assertEqual(asyncio.run(go()), [], "the task ended while the tool still ran")
 
+    def test_loop_shutdown_cancellation_waits_for_tool_cleanup(self):
+        """Runner shutdown cancels all Tasks, including any worker bridge Task."""
+        survivors_at_completion = []
+        async def validate():
+            try:
+                await self._validator(timeout_seconds=60).validate(_sqli(), _exchange())
+            finally:
+                survivors_at_completion.extend(self.survivors())
+
+        async def go():
+            asyncio.create_task(validate())
+            await asyncio.to_thread(self.wait_started)
+            # asyncio.run now cancels every pending task at once. Checking only
+            # after run() returns would hide leaks behind executor shutdown.
+
+        asyncio.run(go())
+        self.assertEqual(survivors_at_completion, [],
+                         "validator completed before shutdown stopped its tool")
+
 
 # --- the server job: terminal only after cleanup -------------------------------------
 class JobCancelLifecycleTests(_ToolFixture, unittest.TestCase):

@@ -40,8 +40,8 @@ from harness.validators.base import ValidationResult
 from harness.test_engagement_transport_callers import (
     _ROLES, _Model, _Target, _canned, _config, _install_model)
 
-# Reachable by both identities: anonymous's sqli cell is served from the worklist's
-# confirmation cache, so alice's cell is the one the coverage drive actually dispatches.
+# Reachable and captured by both identities. These coverage caller tests suppress
+# earlier shape dispatch so a cached worklist result cannot replace the SQL leg.
 _ITEM_NODE = {"method": "GET", "path": "/api/items/{id}",
               "by_role": {"anonymous": 200, "alice": 200},
               "reachable_roles": ["anonymous", "alice"], "object_scoped": True}
@@ -53,6 +53,13 @@ def _captured_search(base):
                         response_headers={"Content-Type": "application/json"},
                         response_body='{"id": 7, "owner": "alice"}').model_dump()
 _JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJpMDUtZXNjYWxhdGUifQ.i05signaturevalue"
+
+
+def _captured_alice_search(base):
+    """Coverage must replay a capture belonging to its actual principal."""
+    captured = _captured_search(base)
+    captured["request_headers"] = dict(_ROLES[1].headers)
+    return captured
 
 
 async def _skip_timing_leg(self, finding, exchange):
@@ -119,8 +126,9 @@ class CoverageDriveSqlmapLegTests(_IsolatedStateBase, unittest.TestCase):
                 await rc.aclose()
 
         patches = [patch("harness.engagement_builder.build_engagement",
-                         side_effect=_canned([_ITEM_NODE], [_captured_search])),
+                         side_effect=_canned([_ITEM_NODE], [_captured_search, _captured_alice_search])),
                    patch("harness.browser_driver.default_driver", return_value=None),
+                   patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]),
                    patch("harness.validators.command_injection_validator."
                          "CommandInjectionValidator.validate", _skip_timing_leg),
                    *extra_patches]

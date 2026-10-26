@@ -18,6 +18,7 @@ as inconclusive rather than guess. The trigger is a mutating POST, routed throug
 GatedAsyncClient (needs allow_mutating_replay); N is small (default 5).
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import base64
 import math

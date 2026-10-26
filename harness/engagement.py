@@ -28,6 +28,8 @@ call and no network. Persistence is a JSON snapshot per host (see store).
 """
 from __future__ import annotations
 import re
+import hashlib
+import json
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -149,6 +151,38 @@ def template_from_exchange(ex) -> dict:
     return {"method": method, "query": parts.query or "", "body": body,
             "content_type": ctype or "", "object_id": obj_id,
             "path_ids": path_id_values(url)}
+
+
+def capture_identity_key(headers) -> str:
+    """Match observed credentials without storing another copy in the graph."""
+    public_headers = {"host", "content-type", "content-length", "accept", "accept-encoding",
+                      "accept-language", "user-agent", "connection", "referer", "origin",
+                      "cache-control", "pragma", "upgrade-insecure-requests"}
+    credentials = {k.lower(): v for k, v in (headers or {}).items()
+                   if k.lower() not in public_headers and not k.lower().startswith('sec-')}
+    return hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).hexdigest()
+
+
+def capture_variant(exchange) -> dict:
+    from harness import security
+    data = exchange if isinstance(exchange, dict) else exchange.model_dump()
+    variant = {"template": template_from_exchange(data), "url": data.get("url", ""),
+               "identity_key": capture_identity_key(data.get("request_headers")),
+               "response_status": data.get("response_status"),
+               "response_headers": security.redact_headers(data.get("response_headers") or {}),
+               "response_body": security.redact_secrets_in_body(data.get("response_body") or "")}
+    variant["capture_id"] = hashlib.sha256(json.dumps(variant, sort_keys=True).encode()).hexdigest()
+    return variant
+
+
+def persist_surface(state):
+    """Atomically retain observed variants alongside existing concurrent findings."""
+    from harness import store
+    def merge(prior):
+        combined = EngagementState.from_dict(prior)
+        combined.merge_from(state)
+        return combined.to_dict()
+    return store.mutate_engagement(state.host, merge)
 
 
 # --- WL-02: principal-keyed access cells and the derived role view -----------
@@ -282,6 +316,7 @@ class SurfaceEndpoint:
     # view above is derived from these.
     access_by_principal: dict = field(default_factory=dict)
     reachable_principals: list = field(default_factory=list)
+    capture_variants: list = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -534,6 +569,7 @@ class SurfaceEndpoint:
             "access": self.access, "reachable_roles": self.reachable_roles,
             "object_scoped": self.object_scoped, "findings": self.findings,
             "template": self.template,
+            "capture_variants": self.capture_variants,
             "score": s, "reasons": reasons,
             # Step 2/3 (2026-09-17 coverage-recovery plan): surfaced so a
             # dict-based consumer (investigate_worklist) can preserve a bounded
@@ -560,6 +596,7 @@ class SurfaceEndpoint:
             access=d.get("access", {}) or {}, reachable_roles=d.get("reachable_roles", []) or [],
             object_scoped=bool(d.get("object_scoped", False)), findings=d.get("findings", []) or [],
             status=d.get("status", "discovered"), template=d.get("template"),
+            capture_variants=list(d.get("capture_variants") or []),
             business_score=d.get("business_score"),
             business_reasons=d.get("business_reasons", []) or [],
             access_by_principal={str(k): dict(v) for k, v in
@@ -771,6 +808,8 @@ class EngagementState:
             mine.merge_access_record(ep.access_by_principal, ep.access, ep.reachable_roles)
             if ep.template and not mine.template:
                 mine.template = ep.template
+            known = {v.get("capture_id") for v in mine.capture_variants}
+            mine.capture_variants.extend(v for v in ep.capture_variants if v.get("capture_id") not in known)
             # a proven endpoint status propagates upward, never downward
             if ep.status == "validated":
                 mine.status = "validated"
@@ -832,6 +871,9 @@ class EngagementState:
         object-id beats an empty one)."""
         ep = self._ep(method, normalize_path(url))
         tmpl = template_from_exchange(exchange)
+        variant = capture_variant(exchange)
+        if not any(v.get("capture_id") == variant["capture_id"] for v in ep.capture_variants):
+            ep.capture_variants.append(variant)
 
         def _richness(t: dict | None) -> int:
             if not t:

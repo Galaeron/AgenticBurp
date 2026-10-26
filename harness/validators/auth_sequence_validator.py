@@ -29,6 +29,7 @@ gate's mutating-burst ceiling) and reset-token entropy (what entropy threshold /
 sample size counts as "predictable").
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import json
 import re

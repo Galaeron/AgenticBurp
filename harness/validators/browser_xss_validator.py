@@ -25,6 +25,7 @@ Bounded and safe:
     whole validator is exercised in tests via an injected fake driver.
 """
 from __future__ import annotations
+from harness import scope_lock
 import logging
 import secrets
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode

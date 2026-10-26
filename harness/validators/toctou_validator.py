@@ -29,6 +29,7 @@ raised max_burst_size), then fired through its executor. Standalone registry
 callers retain the legacy direct-client compatibility path.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import asyncio
 import json

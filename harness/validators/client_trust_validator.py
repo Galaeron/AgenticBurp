@@ -14,6 +14,7 @@ validators.allow_mutating_replay); NO checkout/purchase is performed -- the proo
 is that the amount was trusted, read back from the cart, not an order placed.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import json
 import re

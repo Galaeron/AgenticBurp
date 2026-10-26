@@ -15,6 +15,7 @@ redirect-shaped parameter. Scope-gated; active (validators.active_enabled). The
 sends are read-only follows (a non-GET capture still routes through the gate).
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import re
 from urllib.parse import urlsplit, parse_qsl

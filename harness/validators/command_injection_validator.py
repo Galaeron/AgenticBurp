@@ -58,10 +58,11 @@ class CommandInjectionValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None, run_context=None):
+                 collaborator=None, run_context=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
         self.run_context = run_context
 
     def collab(self):
@@ -80,6 +81,7 @@ class CommandInjectionValidator(Validator):
         targets = param_targets(exchange)[:_MAX_PARAMS]
         if not targets:
             return self._skip("no parameter to inject a shell payload into")
+        collab = self.collab() if self.oob_callbacks_enabled else None
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
         session_ref = None
@@ -171,6 +173,9 @@ class CommandInjectionValidator(Validator):
         # multiplying the configured timeout across payloads when it cannot
         # produce evidence; explicit/external collaborators still cover blind
         # command injection.
+        if collab is None:
+            return ValidationResult(self.name, "inconclusive", "command_injection",
+                                    summary="In-band check did not confirm; callback probes disabled by policy")
         collab_host = urlsplit(collab.url("reachability-check")).hostname or ""
         target_host = urlsplit(exchange.url).hostname or ""
         if collab_host in {"127.0.0.1", "localhost", "::1"} and target_host not in {

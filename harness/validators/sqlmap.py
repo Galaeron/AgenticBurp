@@ -752,6 +752,7 @@ class SqlmapValidator(Validator):
         # shaped text for perfectly ordinary input doesn't get flagged
         # just for continuing to do so under a mutated value.
         baseline_already_errors = _text_has_db_error_markers(exchange.response_body or "")
+        error_anomalies = []
         attempts: list[str] = []
         errors: list[str] = []
         had_clean_comparison = False
@@ -843,7 +844,8 @@ class SqlmapValidator(Validator):
                 f"({len(resp_a.content)}b); contradiction (' OR '1'='2' -- ) -> "
                 f"HTTP {resp_b.status_code} ({len(resp_b.content)}b)"
             )
-            if _responses_differ(resp_a, resp_b):
+            both_db_errors = _looks_like_db_error(resp_a) and _looks_like_db_error(resp_b)
+            if _responses_differ(resp_a, resp_b) and not both_db_errors:
                 return ValidationResult(
                     self.name, "confirmed", finding.vulnerability_class,
                     confidence=0.85, confirmed=True,
@@ -852,25 +854,12 @@ class SqlmapValidator(Validator):
                             f"value (same syntax, true vs. false) changed the response.",
                     evidence=evidence, command=cmd_desc,
                 )
-            # Error-based signal, checked whenever the boolean-blind check
-            # above doesn't fire: catches injection points where the value
-            # is wrapped in a way (e.g. LIKE '%...%') that makes an
-            # OR-based tautology/contradiction pair meaningless as a
-            # true/false test (both sides of a wildcard-matched OR return
-            # everything regardless of the injected predicate) -- verified
-            # live, against Juice Shop's product search, that this is a
-            # real gap the boolean-blind check alone misses even though
-            # the underlying injection is genuine and produces a visible
-            # raw DB error.
+            # A changed database-error signature is worth retaining for review,
+            # but without a differential it cannot establish exploitable injection.
             if not baseline_already_errors and (_looks_like_db_error(resp_a) or _looks_like_db_error(resp_b)):
-                return ValidationResult(
-                    self.name, "confirmed", finding.vulnerability_class,
-                    confidence=0.8, confirmed=True,
-                    summary=f"Error-based probe confirmed SQL injection via the {label} "
-                            f"parameter: an injected quote/comment payload produced a raw "
-                            f"database error that the original, unmutated request did not.",
-                    evidence=evidence, command=cmd_desc,
-                )
+                # A raw error alone is an anomaly, not proof of exploitable SQLi.
+                # Keep testing other parameters for an independent differential.
+                error_anomalies.append(evidence)
             attempts.append(evidence)
 
         if not had_clean_comparison:
@@ -886,6 +875,13 @@ class SqlmapValidator(Validator):
                         f"{'; '.join(errors)}",
             )
 
+        if error_anomalies:
+            return ValidationResult(
+                self.name, "inconclusive", finding.vulnerability_class,
+                confidence=0.3, confirmed=False,
+                summary="SQL injection candidate: payloads produced database errors without a "
+                        "independent truth-value differential; independent controlled evidence is required",
+                evidence="; ".join(error_anomalies), command=cmd_desc)
         return ValidationResult(
             self.name, "not_confirmed", finding.vulnerability_class,
             confidence=0.1, confirmed=False,

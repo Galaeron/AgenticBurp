@@ -277,10 +277,11 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         self.assertTrue(result.get("degraded"))
         self.assertTrue(any(e.get("phase") == "coverage_build" for e in result.get("errors", [])))
 
-    def test_clean_run_is_not_degraded(self):
+    def test_no_exception_does_not_hide_incomplete_assessment(self):
         result = self._run(vulnerable=True)
-        self.assertFalse(result.get("degraded"))
         self.assertEqual(result.get("errors"), [])
+        self.assertEqual(result["assessment"]["status"], "incomplete")
+        self.assertTrue(result["degraded"])
 
     def test_negative_control_secure_server_yields_no_confirmation(self):
         # A server that actually verifies signatures must NOT be confirmed -- proving

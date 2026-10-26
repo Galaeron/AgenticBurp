@@ -23,6 +23,7 @@ cover) -- here we specifically prove the signature check is broken.
 GET-only and scope-gated, like the other replay legs. Deterministic; no LLM.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import base64
 import hashlib

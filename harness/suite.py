@@ -47,6 +47,15 @@ def main(argv=None) -> int:
     parser.add_argument('tier', choices=('smoke', 'native', 'evaluation', 'full'))
     parser.add_argument('--list', action='store_true', help='Print commands without running tests')
     args = parser.parse_args(argv)
+    if not args.list:
+        from harness.verification_snapshot import preflight, SnapshotError, INVENTORY, isolate_imports
+        try:
+            preflight(ROOT)
+            if (ROOT / INVENTORY).exists():
+                isolate_imports(ROOT)
+        except SnapshotError as error:
+            print(f"Verification preflight failed: {error}", file=sys.stderr)
+            return 2
     failed = False
     # Isolate suites while preserving the caller's explicit import environment.
     env = os.environ.copy()

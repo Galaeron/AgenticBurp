@@ -83,10 +83,11 @@ class XxeValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None):
+                 collaborator=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
 
     def collab(self):
         return _collab.resolve(self._collab)
@@ -109,7 +110,7 @@ class XxeValidator(Validator):
         method = (exchange.method or "POST").upper()
 
         # Bind and validate configuration before even the in-band probe.
-        collab = self.collab()
+        collab = self.collab() if self.oob_callbacks_enabled else None
         # 1) In-band file-read proof first: inject a SYSTEM entity for a
         #    world-readable file and detect its signature reflected in the
         #    response. Definitive, needs no collaborator, and is a read-only PoC.
@@ -137,7 +138,13 @@ class XxeValidator(Validator):
                           f"contents are redacted here; the read is non-destructive."))
 
         # 2) Out-of-band proof: catches BLIND XXE (no reflection) via a collaborator.
+        if not self.oob_callbacks_enabled:
+            return ValidationResult(self.name, "inconclusive", "xxe",
+                                    summary="Check incomplete: callback probes disabled by policy")
         collab = self.collab()
+        if collab is None:
+            return ValidationResult(self.name, "inconclusive", "xxe",
+                                    summary="In-band check did not confirm; callback probes disabled by policy")
         token = collab.token()
         try:
             await global_throttle.acquire()

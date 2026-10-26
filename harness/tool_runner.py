@@ -609,7 +609,14 @@ async def call_cancellable(fn, *args, cancel=None, **kwargs):
     def poll() -> bool:
         return stop.is_set() or _is_cancelled(cancel)
 
-    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, cancel=poll, **kwargs))
+    # Keep the worker completion as a Future, not a Task: loop shutdown cancels
+    # every Task, which would mark a to_thread bridge done while its thread and
+    # process still run. Preserve to_thread's task-local context propagation.
+    import contextvars
+    import functools
+    context = contextvars.copy_context()
+    invoke = functools.partial(fn, *args, cancel=poll, **kwargs)
+    fut = asyncio.get_running_loop().run_in_executor(None, context.run, invoke)
     try:
         await asyncio.wait({fut})   # unlike shield/wait_for, never cancels `fut`
     except asyncio.CancelledError:

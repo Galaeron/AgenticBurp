@@ -28,6 +28,39 @@ network, no LLM; it reconciles what the run already produced.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
+from collections import deque
+
+
+def _fair_cells(items):
+    """Interleave routes and identities; rotate the first check class per group."""
+    groups = {}
+    for item in items:
+        groups.setdefault(item[:2], []).append(item)
+    queues = []
+    for index, values in enumerate(groups.values()):
+        offset = index % len(values)
+        queues.append(deque(values[offset:] + values[:offset]))
+    while queues:
+        for queue in list(queues):
+            yield queue.popleft()
+            if not queue:
+                queues.remove(queue)
+
+
+def _executed(result, status):
+    count = getattr(result, "sent_count", None)
+    if count is not None:
+        return count > 0
+    return status in {CellStatus.CONFIRMED, CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE}
+
+
+def resume_context_key(config):
+    from pathlib import Path
+    from harness.run_manifest import config_fingerprint, source_fingerprint
+    source = source_fingerprint(Path(__file__).resolve().parents[1])
+    return hashlib.sha256((source['sha256'] + config_fingerprint(config)).encode()).hexdigest()
 
 from harness.categories import canonicalize
 from harness.coverage_model import (
@@ -106,6 +139,13 @@ class CoverageTracker:
     def __init__(self, checks: tuple[Check, ...] = CHECK_CATALOG):
         self.matrix = CoverageMatrix()
         self.checks = checks
+        self.attempted = set()
+        self.queued = set()
+        self.reused = set()
+        self.endpoints = {}
+        self.driveable = set()
+        self.checkpoint_signature = ""
+        self.context_key = ""
         # canonical vulnerability_class -> [check_id]; plus the raw class token so
         # a check class canonicalize() returns None for (e.g. "misconfig") still maps.
         self._class_to_checks: dict[str, list[str]] = {}
@@ -157,6 +197,7 @@ class CoverageTracker:
         object_scoped (see `endpoint_view`). Returns {applicable, not_applicable,
         skipped_reach}."""
         identity_roles = identity_roles or {}
+        self.endpoints = endpoints
         na = self.matrix.fill_applicability(identities, endpoints, self.checks)
         skipped = 0
         for ep_key, ep in endpoints.items():
@@ -290,10 +331,14 @@ class CoverageTracker:
         independent of whether the LLM labelled it. Returns cells driven. Bounded
         by `budget` so a large surface can't fan out unboundedly."""
         n = 0
-        for (ident, ep_key, check) in self.pending_leg_cells(driveable):
+        self.driveable = set(driveable or _LEG_CONFIRMATIONS)
+        pending = self.pending_leg_cells(driveable)
+        self.queued.update((ident, ep_key, check.id) for ident, ep_key, check in pending)
+        for (ident, ep_key, check) in _fair_cells(pending):
             if n >= budget:
                 break
             n += 1  # Bound attempts, including failed or declined dispatches.
+            self.attempted.add((ident, ep_key, check.id))
             method, _, path = ep_key.partition(" ")
             try:
                 res = await run_leg(ident, method, path, check)
@@ -314,7 +359,7 @@ class CoverageTracker:
                 confidence=getattr(res, "confidence", None),
                 validator=getattr(res, "validator", None) or check.confirmation,
                 evidence=(getattr(res, "evidence", "") or "")[:200],
-                executed=status in _LEG_EXECUTED)
+                executed=_executed(res, status))
         return n
 
     def expand_parameter_cases(self, endpoints: dict[str, dict], *,
@@ -394,7 +439,10 @@ class CoverageTracker:
                                         status=CellStatus.INCONCLUSIVE, reason=reason)
 
         attempts = 0
-        for (ident, ep_key, check_id), cks in cells.items():
+        self.driveable = set(driveable or _LEG_CONFIRMATIONS)
+        self.queued.update(cells)
+        for (ident, ep_key, check_id) in _fair_cells(list(cells)):
+            cks = cells[(ident, ep_key, check_id)]
             if attempts >= budget:
                 break
             check = CHECKS_BY_ID[check_id]
@@ -404,6 +452,7 @@ class CoverageTracker:
             no_attr_reason = (f"{check.confirmation} ran at request level; this leg does not "
                               f"attribute per-parameter evidence, so this input is untested")
             attempts += 1
+            self.attempted.add((ident, ep_key, check_id))
             try:
                 res = await run_case(ident, method, path, check, rep)
             except Exception as e:  # a leg blowing up is recorded, never swallowed
@@ -414,7 +463,7 @@ class CoverageTracker:
                 self.matrix.record_case(
                     ident, ep_key, check_id, rep, status=CellStatus.ERROR,
                     reason=f"{check.confirmation} attempt errored: {type(e).__name__}: {e}"[:180],
-                    validator=check.confirmation, executed=True)
+                    validator=check.confirmation, executed=False)
                 _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep,
                                             f"{check.confirmation} attempt errored at request level")
                 continue
@@ -433,7 +482,7 @@ class CoverageTracker:
                 reason=(getattr(res, "summary", "") or f"{check.confirmation} driven at request level")[:180],
                 confidence=getattr(res, "confidence", None),
                 validator=getattr(res, "validator", None) or check.confirmation,
-                evidence=(getattr(res, "evidence", "") or "")[:200], executed=True)
+                evidence=(getattr(res, "evidence", "") or "")[:200], executed=_executed(res, status))
             _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
         return attempts
 
@@ -466,6 +515,62 @@ class CoverageTracker:
             n += 1
         return n
 
+    def restore_checkpoint(self, checkpoint, context_key=""):
+        self.context_key = context_key
+        payload = [self.endpoints, sorted(self.matrix.cells()), context_key]
+        self.checkpoint_signature = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+        if not checkpoint or checkpoint.get("signature") != self.checkpoint_signature:
+            return
+        prior = CoverageMatrix.from_dict(checkpoint.get("matrix") or {})
+        conclusive = {CellStatus.CONFIRMED, CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE}
+        for key, cell in prior.cells().items():
+            if key in self.matrix.cells() and cell.executed and cell.status in conclusive:
+                self.matrix.record(*key, status=cell.status, reason=cell.reason,
+                                   severity=cell.severity, confidence=cell.confidence,
+                                   validator=cell.validator, evidence=cell.evidence, executed=True)
+                self.reused.add(key)
+
+    def phase_ledger(self):
+        rows = []
+        for key, cell in self.matrix.cells().items():
+            ident, ep, cid = key
+            check = CHECKS_BY_ID.get(cid)
+            captured = bool(self.endpoints.get(ep, {}).get("template"))
+            capability = bool(check and check.confirmation in (self.driveable or _LEG_CONFIRMATIONS))
+            applicable = cell.status != CellStatus.NOT_APPLICABLE
+            conclusive = cell.executed and cell.status in {
+                CellStatus.CONFIRMED, CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE}
+            if conclusive:
+                reason = "conclusive"
+            elif not applicable:
+                reason = "not_applicable"
+            elif not capability:
+                reason = "unsupported_or_manual"
+            elif cell.status == CellStatus.BLOCKED:
+                reason = "policy_blocked"
+            elif any(marker in cell.reason for marker in ("missing_principal", "missing_body", "scope_rejected")):
+                reason = next(marker for marker in ("missing_principal", "missing_body", "scope_rejected") if marker in cell.reason)
+            elif key in self.attempted:
+                reason = "incomplete_attempt"
+            elif key in self.queued:
+                reason = "budget_exhausted"
+            elif not captured:
+                reason = "missing_capture"
+            else:
+                reason = "prerequisite_unmet"
+            rows.append({"identity": ident, "endpoint": ep, "check": cid,
+                         "discovered": True, "captured": captured,
+                         "shape_applicable": applicable, "implemented": capability,
+                         "eligible": applicable and capability,
+                         "queued": key in self.queued,
+                         "policy": "allowed" if cell.executed else ("denied" if cell.status == CellStatus.BLOCKED else "not_established"),
+                         "attempted": key in self.attempted, "sent": bool(cell.executed),
+                         "conclusive": bool(conclusive), "resumed": key in self.reused,
+                         "terminal_reason": reason, "detail": cell.reason})
+        return {"counts": {stage: sum(bool(row[stage]) for row in rows) for stage in
+                           ("discovered", "captured", "shape_applicable", "implemented", "eligible",
+                            "queued", "attempted", "sent", "conclusive", "resumed")}, "cells": rows}
+
     def report(self) -> dict:
         s = self.matrix.summary()
         s["not_tested"] = self.matrix.not_tested()
@@ -478,6 +583,9 @@ class CoverageTracker:
         # run through build_coverage/build_coverage_driven/build_coverage_cases_driven.
         from harness.coverage_summary import summarize_coverage
         s["audited"] = summarize_coverage(self.matrix)
+        s["phase_ledger"] = self.phase_ledger()
+        s["checkpoint"] = {"signature": self.checkpoint_signature, "context_key": self.context_key,
+                           "matrix": self.matrix.to_dict()}
         return s
 
 
@@ -496,6 +604,7 @@ def endpoint_view(state) -> dict[str, dict]:
             # T05: the captured request template, so the case layer can derive the
             # endpoint's concrete inputs (query/body/object-id) rather than invent them.
             "template": getattr(ep, "template", None),
+            "capture_variants": getattr(ep, "capture_variants", []),
         }
     return out
 
@@ -532,7 +641,8 @@ def build_coverage(state, roles, investigated_keys: set[str] | None = None,
 
 
 async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | None = None,
-                                budget: int = 80, investigated_keys: set[str] | None = None) -> dict:
+                                budget: int = 80, investigated_keys: set[str] | None = None,
+                                checkpoint=None, context_key="") -> dict:
     """Like build_coverage, but ACTIVELY DRIVES the deterministic legs (I1): after
     recording the findings the run already produced, it fires every applicable
     leg-backed cell via `run_leg` (regardless of any agent label) and records the
@@ -546,6 +656,7 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     # The driver records REAL leg outcomes cell-by-cell; there is no inference to
     # add afterwards. Cells the driver did not reach stay pending and are given an
     # honest skip reason below (R01: never fabricate a not_detected).
+    tracker.restore_checkpoint(checkpoint, context_key)
     driven = await tracker.drive_coverage_legs(run_leg, driveable=driveable, budget=budget)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
@@ -555,7 +666,8 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
 
 async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[str] | None = None,
                                       budget: int = 80, per_cell_case_budget: int = 8,
-                                      investigated_keys: set[str] | None = None) -> dict:
+                                      investigated_keys: set[str] | None = None,
+                                      checkpoint=None, context_key="") -> dict:
     """Case-granular coverage driving (T05/R26): enumerate each applicable leg
     cell's concrete input cases from the endpoint template, then fire a leg PER
     CASE via `run_case(identity, method, path, check, case_key)` and record the
@@ -570,6 +682,7 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     identities, identity_roles = _identities_of(roles)
     tracker.build(endpoints, identities, identity_roles)
     tracker.record_findings_from_state(endpoints, identities, identity_roles)
+    tracker.restore_checkpoint(checkpoint, context_key)
     enumerated = tracker.expand_parameter_cases(
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
     driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget)

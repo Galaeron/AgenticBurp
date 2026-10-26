@@ -124,6 +124,9 @@ class RunManifest:
                           "assessment": health,
                           "finding_summary": redact(result.get("finding_summary")),
                           "confirmed_issue_refs": redact(result.get("confirmed_issue_refs", [])),
+                          "confirmed_issues_unit": "proof_bound_cases",
+                          "issue_accounting": redact(result.get("issue_accounting")),
+                          "confirmed_vulnerabilities": (result.get("issue_accounting") or {}).get("counts", {}).get("vulnerabilities"),
                           "worklist_summary": redact(result.get("worklist_summary")),
                           # R01/R07: the auditable executed-vs-inferred coverage
                           # breakdown (coverage_summary.summarize_coverage's

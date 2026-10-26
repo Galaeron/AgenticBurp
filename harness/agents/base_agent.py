@@ -266,7 +266,12 @@ more or less significant in light of what's already known):
 {_neutralize_fence_breakout(prior_context)}
 """
 
-        retrieved = knowledge.retrieve(self.name, exchange)
+        # Stored legacy/manual notes have no captured-principal attribution.
+        # A scoped passive analysis uses only the shared built-in methodology;
+        # exact-owned findings arrive through its filtered prior_context.
+        from harness import store
+        retrieved = knowledge.retrieve(self.name, exchange,
+                                       include_external=not bool(store._CURRENT_CAPTURED_PRINCIPAL.get()))
         retrieved = security.sanitize_text(retrieved)
         knowledge_block = ""
         if retrieved:

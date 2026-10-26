@@ -1,18 +1,22 @@
 """Durable job metadata; recovering status never schedules or executes work."""
 from contextlib import closing
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
 import time
+from urllib.parse import quote
 
 from harness import security
 
 RUNNING = frozenset({'running', 'cancelling'})
 TERMINAL = frozenset({'done', 'error', 'cancelled', 'interrupted'})
 FIELDS = ('job_id', 'host', 'base_url', 'status', 'started_at', 'finished_at',
-          'error', 'manifest_path', 'result', 'result_available', 'recovered')
+          'error', 'manifest_path', 'result', 'result_available', 'recovered',
+          'result_ref', 'result_size_bytes', 'result_sha256', 'result_summary', 'delivery_error')
+INLINE_LIMIT = 2_000_000
 
 
 def process_alive(pid):
@@ -61,6 +65,8 @@ class JobStatusStore:
             conn.execute('CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, '
                          'owner TEXT NOT NULL, pid INTEGER NOT NULL, status TEXT NOT NULL, '
                          'started REAL NOT NULL, finished REAL, payload TEXT NOT NULL)')
+            conn.execute('CREATE TABLE IF NOT EXISTS job_results (job_id TEXT PRIMARY KEY, '
+                         'content BLOB NOT NULL, sha256 TEXT NOT NULL)')
             conn.commit()
             return conn
         except Exception:
@@ -71,13 +77,47 @@ class JobStatusStore:
     def _payload(job):
         data = security.sanitize_data({k: job.get(k) for k in FIELDS})
         data['base_url'] = security.redact_secrets_in_url(data.get('base_url') or '')
-        data['result_available'] = data.get('result') is not None
-        # Metadata/result bounds do not delete manifests or findings artifacts.
-        if len(json.dumps(data.get('result'), ensure_ascii=True)) > 2_000_000:
+        data['result_available'] = data.get('result') is not None or bool(data.get('result_ref'))
+        if len(json.dumps(data.get('result'), ensure_ascii=True)) > INLINE_LIMIT:
             data['result'] = None
-            data['result_available'] = False
-            data['error'] = 'job result exceeds durable polling limit; see preserved artifacts'
+            data['result_available'] = bool(data.get('result_ref'))
+            if not data['result_available']:
+                data['delivery_error'] = 'complete result has not been durably stored'
         return json.dumps(data, ensure_ascii=True, sort_keys=True)
+
+    @staticmethod
+    def _store_result(conn, job):
+        """Commit result and job metadata together; no operator-controlled paths."""
+        data = dict(job)
+        if job.get('result') is not None:
+            result = security.sanitize_data(job['result'])
+            content = json.dumps(result, ensure_ascii=True, sort_keys=True).encode('utf-8')
+            digest = hashlib.sha256(content).hexdigest()
+            conn.execute('INSERT OR REPLACE INTO job_results VALUES (?,?,?)',
+                         (job['job_id'], content, digest))
+            summary = {key: result[key][:128] if isinstance(result[key], str) else result[key]
+                       for key in ('run_id', 'request_count', 'confirmed_issues', 'partial')
+                       if key in result and isinstance(result[key], (int, bool, str))}
+            if isinstance(result.get('findings'), list):
+                summary['findings'] = len(result['findings'])
+            data.update(result_ref=f"/engagement/{quote(job['host'], safe='')}/investigate/{quote(job['job_id'], safe='')}/result",
+                        result_size_bytes=len(content), result_sha256=digest,
+                        result_summary=summary, result_available=True, delivery_error=job.get('delivery_error'))
+        return data
+
+    def read_result(self, job_id):
+        """Read and validate the managed JSON artifact; never follows a path."""
+        with closing(self._connect()) as conn:
+            row = conn.execute('SELECT content,sha256 FROM job_results WHERE job_id=?', (job_id,)).fetchone()
+            job = conn.execute('SELECT payload FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        if not row or not job:
+            raise ValueError('result artifact is missing')
+        content, digest = row
+        meta = json.loads(job[0])
+        if (hashlib.sha256(content).hexdigest() != digest or digest != meta.get('result_sha256')
+                or len(content) != meta.get('result_size_bytes')):
+            raise ValueError('result artifact failed integrity validation')
+        return content
 
     @classmethod
     def public_snapshot(cls, job):
@@ -94,18 +134,23 @@ class JobStatusStore:
             count = conn.execute("SELECT count(*) FROM jobs WHERE status IN ('running','cancelling')").fetchone()[0]
             if count >= self.max_running:
                 raise JobCapacityError('durable job capacity reached')
+            saved = self._store_result(conn, job)
             conn.execute('INSERT INTO jobs VALUES (?,?,?,?,?,?,?)',
                          (job['job_id'], self.owner, os.getpid(), job['status'],
-                          job['started_at'], job.get('finished_at'), self._payload(job)))
+                          job['started_at'], job.get('finished_at'), self._payload(saved)))
             return job, True
 
     def update(self, job):
         with closing(self._connect()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            saved = self._store_result(conn, job)
             changed = conn.execute('UPDATE jobs SET status=?,finished=?,payload=? WHERE job_id=? AND owner=?',
-                                   (job['status'], job.get('finished_at'), self._payload(job),
+                                   (job['status'], job.get('finished_at'), self._payload(saved),
                                     job['job_id'], self.owner)).rowcount
             if changed != 1:
                 raise ValueError('job ownership missing; durable status was not updated')
+        for key in ('result_ref', 'result_size_bytes', 'result_sha256', 'result_summary', 'delivery_error'):
+            job[key] = saved.get(key)
 
     def recover_interrupted(self, *, now=None, is_alive=process_alive):
         stamp = time.time() if now is None else now
@@ -117,7 +162,7 @@ class JobStatusStore:
                     continue
                 job = json.loads(payload)
                 job.update(status='interrupted', finished_at=stamp, recovered=True,
-                           error='previous job process ended; no work was resumed', result=None)
+                           error='previous job process ended; no work was resumed')
                 conn.execute('UPDATE jobs SET status=?,finished=?,payload=? WHERE job_id=?',
                              ('interrupted', stamp, self._payload(job), job_id))
 
@@ -138,3 +183,4 @@ class JobStatusStore:
                          (stamp - self.retention,))
             rows = conn.execute("SELECT job_id FROM jobs WHERE status IN ('done','error','cancelled','interrupted') ORDER BY finished DESC").fetchall()
             conn.executemany('DELETE FROM jobs WHERE job_id=?', rows[self.max_terminal:])
+            conn.execute('DELETE FROM job_results WHERE job_id NOT IN (SELECT job_id FROM jobs)')

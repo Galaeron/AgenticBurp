@@ -562,6 +562,18 @@ class ExchangeCache:
                         config_fingerprint=row["config_fingerprint"],
                     )
 
+                    # A persisted payload is another trust boundary: older or
+                    # corrupted rows must not bypass put_hypothesis's guard.
+                    if self._hypothesis_has_authority(entry.reports):
+                        conn.execute(
+                            "DELETE FROM hypothesis_cache_entries WHERE exchange_hash = ?",
+                            (exchange_hash,),
+                        )
+                        self._hyp_stats.misses += 1
+                        self._hyp_stats.evictions += 1
+                        log.warning("Rejected hypothesis cache entry carrying proof/confirmation authority")
+                        return None
+
                     if entry.is_expired():
                         conn.execute(
                             "DELETE FROM hypothesis_cache_entries WHERE exchange_hash = ?",
@@ -621,15 +633,9 @@ class ExchangeCache:
         if not self._enabled:
             return
 
-        for r in reports:
-            for f in r.findings:
-                if (f.proof_id or f.case_id or f.oracle_verified
-                        or f.oracle_capsule_id or f.oracle_reason):
-                    log.warning(
-                        "Refusing hypothesis-cache put: a Finding already carries a "
-                        "run-bound proof/oracle field -- these must never be cached."
-                    )
-                    return
+        if self._hypothesis_has_authority(reports):
+            log.warning("Refusing hypothesis-cache put carrying proof/confirmation authority")
+            return
 
         exchange_hash = self.compute_exchange_hash(exchange, namespace=namespace)
         payload = {
@@ -666,6 +672,15 @@ class ExchangeCache:
 
             except Exception as e:
                 log.warning(f"Hypothesis cache store failed: {e}")
+
+    @staticmethod
+    def _hypothesis_has_authority(reports: list[AgentReport]) -> bool:
+        return any(
+            f.proof_id or f.case_id or f.confirmed or f.confirmed_by_leg
+            or f.oracle_verified or f.oracle_capsule_id or f.oracle_reason
+            or f.verification_state != "candidate"
+            for report in reports for f in report.findings
+        )
 
     def _evict_hypothesis_if_needed(self, conn: sqlite3.Connection) -> None:
         """Evict old hypothesis-cache entries if at capacity (mirrors

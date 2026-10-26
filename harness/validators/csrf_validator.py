@@ -10,6 +10,7 @@ Ordinary token-stripping POST replays remain observations rather than confirmati
 because a successful status alone does not prove that the state changed.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import logging
 import re

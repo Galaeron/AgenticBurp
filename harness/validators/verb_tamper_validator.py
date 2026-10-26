@@ -14,6 +14,7 @@ and even then every mutating send goes through the safety gate + allow_mutating_
 (triple-gated) per LEG_DECISIONS.md #1. Active; scope-gated.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 from urllib.parse import urlsplit
 

@@ -39,6 +39,7 @@ Off by default with the rest of the active validators (validators.active_enabled
 scope-gated, GET-only.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import re
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode

@@ -31,6 +31,7 @@ GETs, so it respects max_mutating_requests_per_finding. Scope-gated; the mutatin
 send is routed through the safety gate (needs validators.allow_mutating_replay).
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import json
 import re

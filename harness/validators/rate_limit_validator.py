@@ -22,6 +22,7 @@ authorised once through the gate (needs allow_mutating_replay) then fired via a
 plain client, exactly like the race-condition leg.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import re
 from urllib.parse import urlsplit
