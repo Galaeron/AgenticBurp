@@ -819,7 +819,8 @@ class SqlmapValidator(Validator):
                         return httpx.Response(
                             outcome.status or 0, content=(outcome.body or "").encode(),
                             headers=decoded_headers,
-                            request=httpx.Request(exchange.method.upper(), url))
+                            request=httpx.Request(exchange.method.upper(), url),
+                            extensions={"harness_artifact_id": outcome.artifact_id})
 
                     resp_a = await routed(target_a, body_a)
                     resp_b = await routed(target_b, body_b)
@@ -846,6 +847,15 @@ class SqlmapValidator(Validator):
             )
             both_db_errors = _looks_like_db_error(resp_a) and _looks_like_db_error(resp_b)
             if _responses_differ(resp_a, resp_b) and not both_db_errors:
+                baseline = None
+                if self.run_context is not None:
+                    try:
+                        # The original value, replayed: the reference answer the
+                        # differential is audited against (Ticket 6 proof baseline).
+                        # Best effort: a proof send never changes the verdict.
+                        baseline = await routed(exchange.url, body)
+                    except Exception:
+                        baseline = None
                 return ValidationResult(
                     self.name, "confirmed", finding.vulnerability_class,
                     confidence=0.85, confirmed=True,
@@ -853,7 +863,7 @@ class SqlmapValidator(Validator):
                             f"{label} parameter: flipping the injected predicate's truth "
                             f"value (same syntax, true vs. false) changed the response.",
                     evidence=evidence, command=cmd_desc,
-                )
+                ).with_artifacts(baseline=baseline, attack=resp_a, controls=[resp_b])
             # A changed database-error signature is worth retaining for review,
             # but without a differential it cannot establish exploitable injection.
             if not baseline_already_errors and (_looks_like_db_error(resp_a) or _looks_like_db_error(resp_b)):

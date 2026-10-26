@@ -32,6 +32,7 @@ per session, never shared across principals.
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import ipaddress
 import json
@@ -317,6 +318,38 @@ class ExecutionOutcome:
         NOT execute (and did not consume budget)."""
         return self.outcome in ("ok", "error")
 
+    @property
+    def artifact_id(self) -> str:
+        """The exchange artifact this send recorded ("" when none was built)."""
+        return getattr(self.artifact, "artifact_id", "") or ""
+
+
+# Ticket 6 follow-up: the confirmation case a validator job runs for. The
+# orchestrator enters it around one validator dispatch, so every send that job
+# makes is recorded as a case-bound EXECUTION event (artifact id + redacted
+# request/response blobs) without each validator threading a case_ref. Inside
+# a scope it is the record's case (a validator's finding id is not a case). It
+# binds that field only: the record's finding_ref and the gate's per-finding
+# mutating ceiling (R16) stay keyed on the caller's own case_ref, as before, so
+# per-finding reconstruction is unchanged; a caller with none files under the case.
+_ambient_case_ref: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "harness_case_ref_ambient", default="")
+
+
+def current_case_ref() -> str:
+    """The case id of the enclosing `case_scope`, or "" outside one."""
+    return _ambient_case_ref.get()
+
+
+@contextlib.contextmanager
+def case_scope(case_ref: str):
+    """Bind sends made in this block (and in tasks it starts) to `case_ref`."""
+    token = _ambient_case_ref.set(case_ref or "")
+    try:
+        yield
+    finally:
+        _ambient_case_ref.reset(token)
+
 
 # ---------------------------------------------------------------------------
 # Executor -- the single policy-bearing send path (R15/R17)
@@ -391,7 +424,7 @@ class TargetTransport:
 
     def _artifact(self, url: str, outcome: str, session_ref: str | None,
                   status: int | None = None, case_ref: str = "", *,
-                  method: str | None = None, req_headers: dict | None = None,
+                  finding_ref: str = "", method: str | None = None, req_headers: dict | None = None,
                   req_body: str | None = None, resp_headers: dict | None = None,
                   resp_body: str | None = None) -> "evidence.ExchangeArtifact":
         artifact = evidence.ExchangeArtifact.make(
@@ -470,7 +503,8 @@ class TargetTransport:
                 evidence_ledger.emit(
                     evidence_ledger.EventType.EXECUTION if executed
                     else evidence_ledger.EventType.AUTHORIZATION_DECISION,
-                    case_ref, f"{outcome}: {url}"[:500], data=data, provenance=prov, case_ref=case_ref)
+                    finding_ref or case_ref, f"{outcome}: {url}"[:500], data=data,
+                    provenance=prov, case_ref=case_ref)
             except Exception:
                 pass
         return artifact
@@ -483,24 +517,29 @@ class TargetTransport:
         MANUALLY so every hop is re-checked. Captures an artifact on every path,
         including blocks and errors."""
         ctx = self.ctx
+        # R16 accounting and the record's finding_ref: the caller's own case_ref,
+        # never ambient. The record's case: the enclosing case_scope, if any.
+        mutation_key = case_ref
+        case_ref = current_case_ref() or case_ref
+        finding_ref = mutation_key or case_ref
         session = ctx.sessions.get(session_ref)
         if session_ref and session is None:
             return ExecutionOutcome(
                 outcome="unknown_session", final_url=request.url,
                 error=f"unknown session reference: {session_ref}",
-                artifact=self._artifact(request.url, "unknown_session", session_ref, case_ref=case_ref))
+                artifact=self._artifact(request.url, "unknown_session", session_ref, case_ref=case_ref, finding_ref=finding_ref))
         if not session_ref and any(k.lower() in _CREDENTIAL_HEADERS
                                    for k in (request.headers or {})):
             return ExecutionOutcome(
                 outcome="blocked", final_url=request.url,
                 error="credential-bearing request requires an explicit session reference",
-                artifact=self._artifact(request.url, "credentials_require_session", None, case_ref=case_ref))
+                artifact=self._artifact(request.url, "credentials_require_session", None, case_ref=case_ref, finding_ref=finding_ref))
         origin0 = ScopePolicy.origin_of(request.url)
         if session and origin0 not in session.allowed_origins:
             return ExecutionOutcome(
                 outcome="blocked", final_url=request.url,
                 error="session is not authorized for the requested destination",
-                artifact=self._artifact(request.url, "credential_destination_blocked", session_ref, case_ref=case_ref))
+                artifact=self._artifact(request.url, "credential_destination_blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
         method = (request.method or "GET").upper()
         url = request.url
         headers = dict(request.headers or {})
@@ -514,7 +553,7 @@ class TargetTransport:
             try:
                 from harness import evidence_ledger
                 evidence_ledger.emit(
-                    evidence_ledger.EventType.PLANNED_ACTION, case_ref,
+                    evidence_ledger.EventType.PLANNED_ACTION, finding_ref,
                     f"{method} {url}"[:500], data={"request": f"{method} {url}", "capability": capability},
                     provenance=evidence_ledger.Provenance.capture(config=ctx.config), case_ref=case_ref)
             except Exception:
@@ -523,28 +562,28 @@ class TargetTransport:
         for _hop in range(max_redirects + 1):
             if ctx.cancel.cancelled and not allow_cancelled_cleanup:
                 return ExecutionOutcome(outcome="cancelled", final_url=url,
-                                        artifact=self._artifact(url, "cancelled", session_ref, case_ref=case_ref))
+                                        artifact=self._artifact(url, "cancelled", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 1. Scope -- BEFORE any send, so an off-scope (redirect) target is never contacted.
             if not ctx.scope.in_scope(url):
                 return ExecutionOutcome(outcome="out_of_scope", final_url=url,
-                                        artifact=self._artifact(url, "out_of_scope", session_ref, case_ref=case_ref))
+                                        artifact=self._artifact(url, "out_of_scope", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             reason = ctx.target_policy.denial_reason(url)
             if reason:
                 return ExecutionOutcome(outcome="blocked", final_url=url, error=reason,
-                                        artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref))
+                                        artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 2. Gate -- reuse the SafetyGate decision (no contradictory rules). GET is
             #    not treated as universally harmless: scope + budget still bind it, and a
             #    mutating method is gated exactly as the validators' sends are.
             decision = ctx.gate.authorize(validator_name=capability, method=method, url=url,
                                           body=body if isinstance(body, str) else None,
-                                          finding_id=case_ref or None)
+                                          finding_id=mutation_key or None)
             if not decision.allowed:
                 return ExecutionOutcome(outcome="blocked", final_url=url, error=decision.reason,
-                                        artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref))
+                                        artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 3. Budget -- reserve atomically before sending; a denial does not count as executed.
             if not ctx.budget.reserve(1):
                 return ExecutionOutcome(outcome="budget_exhausted", final_url=url,
-                                        artifact=self._artifact(url, "budget_exhausted", session_ref, case_ref=case_ref))
+                                        artifact=self._artifact(url, "budget_exhausted", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 3b. I05-B: the CONNECT target is pinned by the run's clients themselves
             #     (AddressPins, at the socket): one address per name for the whole
             #     run, special-purpose addresses refused. Scope, gate and credential
@@ -571,10 +610,10 @@ class TargetTransport:
             except DestinationBlocked as e:   # refused at connect: nothing was sent
                 return ExecutionOutcome(outcome="blocked", final_url=url, error=str(e),
                                         artifact=self._artifact(url, "destination_blocked", session_ref,
-                                                                case_ref=case_ref))
+                                                                case_ref=case_ref, finding_ref=finding_ref))
             except Exception as e:  # transport error -> honest error artifact, never a crash
                 return ExecutionOutcome(outcome="error", final_url=url, error=str(e),
-                                        artifact=self._artifact(url, f"error:{type(e).__name__}", session_ref, case_ref=case_ref))
+                                        artifact=self._artifact(url, f"error:{type(e).__name__}", session_ref, case_ref=case_ref, finding_ref=finding_ref))
 
             self.sent_count += 1
 
@@ -590,13 +629,13 @@ class TargetTransport:
             return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
                                     headers=dict(resp.headers), final_url=url,
                                     artifact=self._artifact(
-                                        url, "ok", session_ref, status=resp.status_code, case_ref=case_ref,
+                                        url, "ok", session_ref, status=resp.status_code, case_ref=case_ref, finding_ref=finding_ref,
                                         method=method, req_headers=send_headers,
                                         req_body=body if isinstance(body, str) else None,
                                         resp_headers=dict(resp.headers), resp_body=resp.text))
         # Redirect budget exhausted -> return the last hop as ok-ish (no further follow).
         return ExecutionOutcome(outcome="ok", status=None, final_url=url,
-                                artifact=self._artifact(url, "redirect_limit", session_ref, case_ref=case_ref))
+                                artifact=self._artifact(url, "redirect_limit", session_ref, case_ref=case_ref, finding_ref=finding_ref))
 
 
 # Back-compat alias: TargetTransport was named Executor through Astra T03-T08. The

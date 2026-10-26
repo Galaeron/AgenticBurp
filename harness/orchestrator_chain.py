@@ -20,7 +20,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # investigate_engagement has a `run_context` parameter that would shadow the module;
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
 # standalone one when it is None".
-from harness.run_context import transport_for, ExecutionOutcome
+from harness.run_context import transport_for, ExecutionOutcome, case_scope
 # FR-6: need the module too, for `_CREDENTIAL_HEADERS` -- aliased for the same
 # shadowing reason as above (several methods below have a `run_context` parameter).
 from harness import run_context as _run_context_mod
@@ -874,21 +874,34 @@ class ChainMixin:
         # confirmation_cache_key() -- which includes the IDENTITY (auth headers)
         # and finding subtype, not just (validator, method, url, body), so a probe
         # AS one identity never returns a result computed AS another (R03).
-        from harness.validators.base import ValidationResult as _VR
+        from harness.validators.base import ValidationResult as _VR, proof_artifact_kwargs
         _confirmation_cache: dict[tuple, _VR] = {}
 
-        async def _cached_validate(validator, finding_obj, exchange):
+        async def _cached_validate(validator, finding_obj, exchange, case_ref=None):
             """Wrapper around validator.validate() that caches results within this
             run. The key includes identity + finding class (R03) so cross-identity
             / cross-subtype cases do not collide. A hit returns the previous
-            ValidationResult without any HTTP/container work."""
+            ValidationResult without any HTTP/container work.
+
+            The leg's sends are recorded under `case_ref` (default: the case
+            _apply builds for this class and exchange), so the exchanges its
+            result names resolve for that case's proof. A hit for another case
+            keeps the first case's artifacts, which do not resolve here: that
+            proof stays a candidate."""
             key = confirmation_cache_key(
                 validator.name, exchange,
                 getattr(finding_obj, "vulnerability_class", None))
             if key in _confirmation_cache:
                 return _confirmation_cache[key]
+            if case_ref is None:
+                try:
+                    case_ref = _rb4_case(getattr(finding_obj, "vulnerability_class", ""),
+                                         exchange).case_id
+                except Exception:
+                    case_ref = ""
             before = getattr(getattr(run_context, "transport", None), "sent_count", None)
-            result = await validator.validate(finding_obj, exchange)
+            with case_scope(case_ref):
+                result = await validator.validate(finding_obj, exchange)
             if before is not None:
                 result.sent_count = run_context.transport.sent_count - before
             _confirmation_cache[key] = result
@@ -919,6 +932,15 @@ class ChainMixin:
                     pid = getattr(r, "principal_id", None)
                     return str(pid()) if callable(pid) else (getattr(r, "role", None) or "")
             return ""
+
+        def _rb4_case(vulnerability_class, exchange):
+            """The case _apply binds a graph-loop confirmation to."""
+            check_id = _rb4_canon(vulnerability_class or "") or (vulnerability_class or "")
+            template_id = evidence._short(
+                (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
+            return evidence.TestCaseRef.make(
+                run_id=_rb4_run_id, request_template_id=template_id,
+                check_id=check_id, principal_id=_rb4_principal_for(exchange))
 
         async def _apply(finding, res, leg, floor, exchange):
             # I04: an unconfirmed check that leaves a human-verifiable candidate
@@ -954,19 +976,13 @@ class ChainMixin:
                 # -- a proof/ledger hiccup must never sink the graph loop or alter
                 # the confirmation this function already decided above.
                 try:
-                    check_id = (_rb4_canon(finding.get("vulnerability_class") or "")
-                               or (finding.get("vulnerability_class") or ""))
-                    template_id = evidence._short(
-                        (exchange.method or "").upper(), exchange.url or "",
-                        exchange.request_body or "")
-                    case = evidence.TestCaseRef.make(
-                        run_id=_rb4_run_id, request_template_id=template_id,
-                        check_id=check_id, principal_id=_rb4_principal_for(exchange))
+                    case = _rb4_case(finding.get("vulnerability_class") or "", exchange)
                     validator_name = leg.replace("-", "_")
                     ok, proof_dict, reason = await self._persist_confirmation_proof(
                         case=case, validator_name=validator_name,
                         status=res.status, confirmed=res.confirmed,
                         observed_result=(res.summary or res.evidence or "")[:500],
+                        proof_artifacts=proof_artifact_kwargs(res),
                         finding_ref=case.case_id,
                         ledger_summary=(f"{validator_name}: {res.status} (confirmed)"
                                         + (f" -- {res.summary}" if res.summary else "")),
@@ -1737,16 +1753,22 @@ class ChainMixin:
                         node["template"] = _ep_obj.template
                     ex = worklist_investigator._seed_exchange(
                         base_url, node, _role_headers.get(identity, {}), "1")
+                    try:
+                        leg_case = self._coverage_case(identity=identity, check=check, exchange=ex,
+                                                       case_key=case_key, run_context=run_context)
+                    except Exception:
+                        leg_case = None
                     res = await _cached_validate(
                         validator, _as_finding({"vulnerability_class": check.vulnerability_class},
-                                               check.vulnerability_class), ex)
+                                               check.vulnerability_class), ex,
+                        case_ref=leg_case.case_id if leg_case is not None else "")
                     # T05/R26: bind a case-bound structured proof to this driven leg
                     # (concrete parameter case when the driver fanned out to one),
                     # so a coverage-driven confirmation carries a stable case id to
                     # the T01 proof store -- not just a matrix cell.
                     proof_id, case_id = await self._coverage_proof(
                         identity=identity, check=check, exchange=ex, result=res,
-                        case_key=case_key, run_context=run_context)
+                        case_key=case_key, run_context=run_context, case=leg_case)
                     # R06: a coverage-driven CONFIRMATION enters the SAME finding
                     # pipeline as every other confirmed finding -- ingested into
                     # `state` (=> worklist, summary, report, persistence, chain

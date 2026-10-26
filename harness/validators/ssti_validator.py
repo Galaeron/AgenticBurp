@@ -34,7 +34,7 @@ import httpx
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
-from .base import Validator, ValidationResult
+from .base import Validator, ValidationResult, artifact_id_of
 from .injection_targets import param_targets, mutate, replay_headers
 
 # Two 2-digit primes -> a distinctive 4-digit product unlikely to appear by
@@ -154,6 +154,7 @@ class SstiValidator(Validator):
                 ok = True
                 outcome = "ok"
                 body = resp.text
+                artifact_id = artifact_id_of(resp)
             return _Outcome()
 
         # A stored template setting can be written at one endpoint and evaluated
@@ -166,10 +167,12 @@ class SstiValidator(Validator):
             readbacks = [u for u in self.readback_urls
                          if u.startswith(origin + "/") and u != exchange.url][:_MAX_READBACKS]
         baseline_product = {}
+        baseline_reads = {}
         for read_url in readbacks:
             out = await _send("GET", read_url, send_headers=request_headers, redirects=2)
             if out.ok:
                 baseline_product[read_url] = _PRODUCT in (out.body or "")
+                baseline_reads[read_url] = out
 
         # R12: every attempt to put the captured request back is checked, and any that
         # failed is disclosed on whatever result this call returns.
@@ -180,6 +183,7 @@ class SstiValidator(Validator):
         # target is not a negative.
         failed: list[str] = []
         sends = 0
+        restores: list = []  # accepted restore sends: the original request replayed
 
         async def _restore_original():
             """Replay the captured request. None when no stored plant is in play, else
@@ -194,6 +198,8 @@ class SstiValidator(Validator):
                 ok, detail = False, f"{type(exc).__name__}: {exc}"
             else:
                 ok, detail = _restore_succeeded(restore_outcome)
+                if ok:
+                    restores.append(restore_outcome)
             if not ok:
                 residual.append(detail)
             return ok, detail
@@ -261,13 +267,37 @@ class SstiValidator(Validator):
                     continue
                 answered += 1
                 if evaluated in text:
-                    await _restore_original()
+                    restore = await _restore_original()
+                    # Ticket 6 proof exchanges, never verdict inputs. A stored plant
+                    # names its restore as the baseline and sends no control: another
+                    # write could leave no room for the restore.
+                    proof_control = proof_baseline = None
+                    if restore:
+                        proof_baseline = restores[-1] if restore[0] else None
+                    elif self.run_context is not None:
+                        # Control: the nonce-wrapped expression without template
+                        # syntax, named only when it was not evaluated. Baseline: the
+                        # original request replayed, sent last. Outside a run they
+                        # would name nothing, so they are not sent.
+                        control_url, control_body = mutate(exchange, loc, param, f"{nonce}{_EXPR}{nonce}")
+                        try:
+                            proof_control = await _send(method, control_url, send_body=control_body or None,
+                                                        send_headers=request_headers, redirects=2)
+                            proof_baseline = await _send(method, exchange.url,
+                                                         send_body=exchange.request_body or None,
+                                                         send_headers=request_headers, redirects=2)
+                        except (SafetyGateBlocked, httpx.HTTPError):
+                            pass
+                        if proof_control is not None and (
+                                not proof_control.ok or evaluated in (proof_control.body or "")):
+                            proof_control = None
                     return _finish(ValidationResult(
                         self.name, "confirmed", "ssti", confidence=0.95, confirmed=True,
                         summary=f"SSTI confirmed: a template expression in the {loc} parameter {param!r} "
                                 f"was evaluated server-side.",
                         evidence=f"Injected `{payload}`; the response contained the evaluated product "
-                                 f"`{evaluated}` (not the literal `{_EXPR}`), proving template evaluation."))
+                                 f"`{evaluated}` (not the literal `{_EXPR}`), proving template evaluation."
+                    ).with_artifacts(baseline=proof_baseline, attack=outcome, controls=[proof_control]))
                 if payload == _EXPR and readbacks:
                     for read_url in readbacks:
                         rendered = await _send("GET", read_url,
@@ -290,7 +320,11 @@ class SstiValidator(Validator):
                                          "was evaluated on a separate rendered page."),
                                 evidence=(f"Baseline `{read_url}` lacked `{_PRODUCT}`; after saving "
                                           f"`{_EXPR}`, the rendered page contained `{_PRODUCT}`. "
-                                          f"{replayed}")))
+                                          f"{replayed}")
+                            # Ticket 6: the original setting replayed (baseline), the
+                            # page after the plant (attack), the page before it (control).
+                            ).with_artifacts(baseline=restores[-1] if restore and restore[0] else None,
+                                             attack=rendered, controls=[baseline_reads.get(read_url)]))
                 await _restore_original()
         if failed:
             return _finish(ValidationResult(

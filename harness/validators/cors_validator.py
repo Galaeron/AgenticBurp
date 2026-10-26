@@ -19,6 +19,7 @@ from harness import scope_lock
 import asyncio
 import contextvars
 import logging
+import secrets
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -26,7 +27,7 @@ from urllib.parse import urlparse
 import httpx
 
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
-from .base import Validator, ValidationResult
+from .base import Validator, ValidationResult, artifact_id_of
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -79,6 +80,8 @@ class CorsTestResult:
     detail: str
     evidence: str
     vulnerable: bool = False
+    # The run exchange behind a vulnerable origin grant (Ticket 6 attack).
+    artifact_id: str = ""
     
     def to_dict(self) -> dict:
         return {
@@ -287,7 +290,7 @@ class CorsValidator(Validator):
                 summary=" ".join(summary_parts),
                 evidence=self._build_evidence(tests),
                 raw_output=self._build_raw_output(tests),
-            )
+            ).with_artifacts(**(await self._proof_exchanges(exchange, tests) if vulnerable else {}))
             
         except Exception as e:
             log.error(f"CORS validation error: {e}")
@@ -303,6 +306,24 @@ class CorsValidator(Validator):
             )
         finally:
             _PROBES.reset(probe_scope)
+
+    async def _proof_exchanges(self, exchange: HttpExchange, tests: list) -> dict:
+        """Ticket 6: the exchanges a confirmed origin grant rests on. Attack: the
+        granting probe. Baseline: the same request without an Origin header.
+        Control: a second, random untrusted origin; for a reflection it is named
+        only when that origin was reflected too (any origin, not one configured
+        partner). Empty when the grant was not sent through a run."""
+        grant = next((t for t in tests if t.vulnerable and t.test_name in _ORIGIN_GRANT_TESTS
+                      and t.artifact_id), None)
+        if grant is None:
+            return {}
+        baseline = await self._send_request(exchange.url, headers={})
+        origin = f"https://{secrets.token_hex(4)}.cors-control.invalid"
+        control = await self._send_request(exchange.url, headers={"Origin": origin})
+        if (control is not None and grant.test_name == "Origin Reflection"
+                and control.headers.get("Access-Control-Allow-Origin", "").lower() != origin):
+            control = None
+        return {"baseline": baseline, "attack": grant.artifact_id, "controls": [control]}
 
     def _get_base_url(self, url: str) -> str:
         """Extract base URL from a full URL."""
@@ -336,7 +357,8 @@ class CorsValidator(Validator):
                 _note_probe("ok")
                 return httpx.Response(
                     outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=outcome.headers, request=httpx.Request(method, url))
+                    headers=outcome.headers, request=httpx.Request(method, url),
+                    extensions={"harness_artifact_id": outcome.artifact_id})
             from harness import global_throttle
             await global_throttle.acquire()
             # No run_context (e.g. the header-audit or a standalone path): route
@@ -438,6 +460,7 @@ class CorsValidator(Validator):
                     detail=detail,
                     evidence=evidence,
                     vulnerable=True,
+                    artifact_id=artifact_id_of(response),
                 )
         
         return CorsTestResult(
@@ -475,6 +498,7 @@ class CorsValidator(Validator):
                     detail="Server allows null origin (can be exploited from sandboxed iframes)",
                     evidence=f"Origin: null -> Access-Control-Allow-Origin: {acao}",
                     vulnerable=True,
+                    artifact_id=artifact_id_of(response),
                 )
         
         return CorsTestResult(

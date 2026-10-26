@@ -38,7 +38,7 @@ import httpx
 from harness import global_throttle
 import harness.missing_auth_probe as map_
 from harness.models import Finding, HttpExchange
-from .base import Validator, ValidationResult
+from .base import SentAnswer, Validator, ValidationResult
 
 _JWT_RE = re.compile(r"\b(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)\b")
 # Claims that, when present, we flip to an elevated value -- so a confirmed forge
@@ -210,7 +210,7 @@ class JwtForgeValidator(Validator):
                 if not outcome.ok:
                     art = getattr(outcome, "artifact", None)
                     return None, getattr(art, "transport_outcome", "") or outcome.error
-                return outcome.status, outcome.body or ""
+                return SentAnswer((outcome.status, outcome.body or ""), outcome.artifact_id)
             await global_throttle.acquire()
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
                 r = await client.get(url, headers=headers or None)
@@ -247,7 +247,17 @@ class JwtForgeValidator(Validator):
         # CONTROL: a garbage-signature token must be rejected, else the endpoint
         # isn't verifying anything and "forged accepted" would be meaningless.
         garbage = f"{token.rsplit('.', 1)[0]}.{_b64url_encode(b'not-a-valid-signature-xxxx')}"
-        g_status, g_body = await self._probe(exchange.url, _hdrs(garbage))
+        g_sent = await self._probe(exchange.url, _hdrs(garbage))
+        g_status, g_body = g_sent
+
+        async def _baseline():
+            # The captured token itself, replayed: the authenticated answer a
+            # confirming exchange is audited against (Ticket 6 proof baseline).
+            # Named only when it was still accepted; outside a run it names nothing.
+            if self.run_context is None:
+                return None
+            sent = await self._probe(exchange.url, _hdrs(token))
+            return sent if sent[0] is not None and map_._substantive(*sent) else None
         if g_status is None:
             return ValidationResult(self.name, "error", "jwt", summary=f"garbage-token control probe failed ({g_body or 'no response'})")
         if map_._substantive(g_status, g_body):
@@ -257,7 +267,8 @@ class JwtForgeValidator(Validator):
             # control: if removing the token is DENIED while the invalid-signature
             # token is accepted, the token DOES gate access yet its signature is not
             # checked -- confirmed, safely (GET only, no forged privileged action).
-            n_status, n_body = await self._probe(exchange.url, _hdrs_no_token())
+            n_sent = await self._probe(exchange.url, _hdrs_no_token())
+            n_status, n_body = n_sent
             if n_status is None:
                 return ValidationResult(
                     self.name, "inconclusive", "jwt", confidence=0.0, confirmed=False,
@@ -277,7 +288,8 @@ class JwtForgeValidator(Validator):
                               f"{exchange.url}; the same request with NO token returned a non-authenticated "
                               f"response (login page/redirect, HTTP {n_status}). Because the signature is "
                               f"unchecked, any claim (e.g. an admin identity) can be forged."),
-                    raw_output=(g_body or "")[:600])
+                    raw_output=(g_body or "")[:600]).with_artifacts(
+                        baseline=await _baseline(), attack=g_sent, controls=[n_sent])
             return self._skip("endpoint accepts a garbage-signature token AND a tokenless request -- it "
                               "does not gate on the token at all (an access-control leg covers that, not a "
                               "signature-verification bug)")
@@ -317,7 +329,8 @@ class JwtForgeValidator(Validator):
                                       _hs256(confused_header, payload, pem)))
         forgeries += _kid_forgeries(header, payload)
         for label, forged in forgeries:
-            f_status, f_body = await self._probe(exchange.url, _hdrs(forged))
+            f_sent = await self._probe(exchange.url, _hdrs(forged))
+            f_status, f_body = f_sent
             if f_status is None:
                 misses.append(f"{label}: {f_body or 'no response'}")
                 continue
@@ -330,7 +343,8 @@ class JwtForgeValidator(Validator):
                             f"escalation{kidnote}.",
                     evidence=(f"garbage token -> HTTP {g_status} (rejected); forged {label} with elevated claims -> "
                               f"HTTP {f_status} (accepted) at {exchange.url}. The verifier honours the forged token."),
-                    raw_output=(f_body or "")[:600])
+                    raw_output=(f_body or "")[:600]).with_artifacts(
+                        baseline=await _baseline(), attack=f_sent, controls=[g_sent])
         if misses:
             total = len(forgeries) + jwks_probes
             return ValidationResult(

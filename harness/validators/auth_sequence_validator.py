@@ -298,7 +298,7 @@ class AuthSequenceValidator(Validator):
                 f"Login answered HTTP {resp.status_code}. Presenting only the fixed {names} reached no "
                 f"page showing an authenticated session (a logout control or the account's username) "
                 f"that an anonymous request is denied, so the fixed id is not shown to carry the login.")
-        url, status, denial = proof
+        url, status, denial, fixed_read, anon_read = proof
         return ValidationResult(
             self.name, "confirmed", fc, confidence=0.9, confirmed=True,
             summary=f"Session fixation confirmed: the pre-login {names} survived login and alone "
@@ -306,19 +306,23 @@ class AuthSequenceValidator(Validator):
             evidence=f"Pre-auth {names} was not rotated by a successful login (HTTP {resp.status_code}). "
                      f"GET {url} with only that cookie returned an authenticated page (HTTP {status}, a "
                      f"logout control or the account's username), while the same request with no session "
-                     f"was denied ({denial}): an attacker-planted id becomes a logged-in session.")
+                     f"was denied ({denial}): an attacker-planted id becomes a logged-in session."
+        # Ticket 6: the login that kept the id (baseline), the fixed id alone reaching
+        # the page (attack), and the same page denied with no session (control).
+        ).with_artifacts(baseline=resp, attack=fixed_read, controls=[anon_read])
 
     def _candidate(self, why: str, evidence: str, fc: str = "session_fixation") -> ValidationResult:
         return ValidationResult(self.name, "inconclusive", fc, confidence=0.4, confirmed=False,
                                 summary=f"Candidate only, not confirmed: {why}.", evidence=evidence)
 
     async def _fixed_id_authenticates(self, exchange, login_resp, fixed: dict
-                                      ) -> tuple[tuple[str, int, str] | None, str]:
+                                      ) -> tuple[tuple | None, str]:
         """GET-only proof that the fixed cookie(s) carry the login: the login's
         same-origin redirect target, then common account pages, each fetched in
         a fresh client with only the fixed cookie, and an anonymous control.
-        Returns ((url, status, denial), "") on proof, else (None, why the first
-        failed anonymous control did not count, or "")."""
+        Returns ((url, status, denial, fixed-id response, anonymous response), "")
+        on proof, else (None, why the first failed anonymous control did not
+        count, or "")."""
         from urllib.parse import urljoin
         from harness.missing_auth_probe import _AUTH_HEADERS, _substantive
         fields, _ = _parse_body(exchange)
@@ -370,7 +374,7 @@ class AuthSequenceValidator(Validator):
             denial = _anonymous_denial(anon_got.status_code, anon_got.text or "",
                                        anon_got.headers.get("location") or "")
             if denial:
-                return (url, got.status_code, denial), ""
+                return (url, got.status_code, denial, got, anon_got), ""
             failed = failed or (
                 f"the anonymous control GET {url} answered HTTP {anon_got.status_code}, which is not an "
                 f"authorization denial (only 401/403, a redirect to a login page or a login page is)")
@@ -482,7 +486,11 @@ class AuthSequenceValidator(Validator):
                     evidence=f"Login required a second factor (marker in the login response/redirect), yet "
                              f"GET {url} returned authenticated content (HTTP {got.status_code}) while the same "
                              f"path with no session was denied ({denial}). The protected page is reachable "
-                             f"without the 2FA code -- the second factor is not enforced on the session.")
+                             f"without the 2FA code -- the second factor is not enforced on the session."
+                # Ticket 6: the step-1 login that stopped at the second factor
+                # (baseline), the partial session reaching the page (attack), and the
+                # same page denied with no session (control).
+                ).with_artifacts(baseline=resp, attack=got, controls=[anon_got])
         if unproven:
             return self._candidate("a page is reachable before the second factor, but the "
                                    "anonymous control did not deny it", unproven, fc)
@@ -604,17 +612,44 @@ class AuthSequenceValidator(Validator):
             return b
 
         vmask, imask = _mask(vbody, valid_user), _mask(ibody, invalid_user)
+
+        async def proof() -> dict:
+            """Ticket 6 proof exchanges, never verdict inputs: the non-existent
+            account's answer (baseline), the existing account's (attack), and a
+            second non-existent account (control), named only when it answers
+            exactly like the first, so the difference is not per-request noise.
+            Outside a run the control is not sent: it would name nothing."""
+            if self.run_context is None:
+                return {"baseline": r_invalid, "attack": r_valid}
+            other_user = (f"nouser_{secrets.token_hex(4)}@example.com" if "@" in valid_user
+                          else f"nouser_{secrets.token_hex(4)}")
+            control = None
+            try:
+                async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                            follow_redirects=False, verify=False) as client:
+                    control = await self._send(client, method, exchange.url, self._headers(exchange),
+                                               _probe_body(other_user))
+            except (SafetyGateBlocked, httpx.HTTPError):
+                control = None
+            if control is not None and (
+                    control.status_code != istatus
+                    or _mask(control.text or "", other_user).strip() != imask.strip()):
+                control = None
+            return {"baseline": r_invalid, "attack": r_valid, "controls": [control]}
+
         if vstatus != istatus:
             return ValidationResult(
                 self.name, "confirmed", fc, confidence=0.8, confirmed=True,
                 summary="Username enumeration confirmed: valid vs invalid account give different HTTP status.",
                 evidence=f"Same wrong password: existing user -> HTTP {vstatus}, non-existent user -> HTTP "
-                         f"{istatus}. The status discriminates account existence.")
+                         f"{istatus}. The status discriminates account existence."
+            ).with_artifacts(**await proof())
         if vmask.strip() != imask.strip():
             return ValidationResult(
                 self.name, "confirmed", fc, confidence=0.75, confirmed=True,
                 summary="Username enumeration confirmed: valid vs invalid account give different responses.",
                 evidence=f"Same wrong password and identical status ({vstatus}); after masking the echoed "
                          f"username and stripping dynamic tokens, the bodies still differ, leaking "
-                         f"which usernames exist.")
+                         f"which usernames exist."
+            ).with_artifacts(**await proof())
         return self._not("valid and invalid usernames produced indistinguishable responses (no enumeration)", fc)
