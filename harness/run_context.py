@@ -134,14 +134,30 @@ class RequestBudget:
     def __init__(self, max_requests: int | None = None):
         self._max = max_requests
         self._used = 0
+        self._held = 0
         self._lock = threading.Lock()
 
     def reserve(self, n: int = 1) -> bool:
         with self._lock:
-            if self._max is not None and self._used + n > self._max:
+            if self._max is not None and self._used + n > self._max - self._held:
                 return False
             self._used += n
             return True
+
+    def hold(self, n: int) -> int:
+        """Withhold up to `n` unspent requests from every reservation until
+        `release_hold`, so a later stage keeps a share of the ceiling. Returns
+        the amount actually held (0 for an unbounded budget)."""
+        with self._lock:
+            if self._max is None or n <= 0:
+                return 0
+            self._held = min(self._held + n, self._max - self._used)
+            return self._held
+
+    def release_hold(self) -> int:
+        with self._lock:
+            released, self._held = self._held, 0
+            return released
 
     @property
     def used(self) -> int:
@@ -149,7 +165,7 @@ class RequestBudget:
 
     @property
     def remaining(self) -> int | None:
-        return None if self._max is None else max(0, self._max - self._used)
+        return None if self._max is None else max(0, self._max - self._used - self._held)
 
 
 class CancelToken:

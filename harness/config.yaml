@@ -303,6 +303,17 @@ engagement:
   # bound are reported as truncation, and the assessment stays incomplete.
   capture_review_limit: 200
   capture_review_seconds: 0
+  # Every stage spends the one run request ceiling (runs.max_requests), and the
+  # coverage drive runs last. coverage_request_reserve withholds that many requests
+  # from every earlier stage and releases them to the coverage drive.
+  # investigation_seconds (0 = no time bound), counted from the engagement's start,
+  # stops the worklist starting a new node, capture review a new capture and the
+  # chain loop a new round; coverage_drive_seconds (0 = no time bound) stops the
+  # coverage drive dispatching a new leg. Work left undone by a bound is reported
+  # as truncation, and the assessment stays incomplete.
+  coverage_request_reserve: 0
+  investigation_seconds: 0
+  coverage_drive_seconds: 0
 
 # RV-S: operator-declared protected routes (harness/protected_routes.py). The
 # engagement chain confirms missing authentication ONLY on a route listed here

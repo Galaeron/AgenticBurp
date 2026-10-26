@@ -83,7 +83,8 @@ class EnumerationSafeDefaultsTests(unittest.TestCase):
             "engagement_feature_crawl", "engagement_coverage_drive",
             "coverage_leg_budget", "engagement_coverage_case_drive",
             "coverage_case_budget", "capture_review_limit",
-            "capture_review_seconds",
+            "capture_review_seconds", "coverage_request_reserve",
+            "investigation_seconds", "coverage_drive_seconds",
         }
         self.assertEqual(set(d.keys()), expected_fields)
 
@@ -120,6 +121,10 @@ class ParityTests(unittest.TestCase):
             # and no review time bound unless configured.
             capture_review_limit=int(eng_cfg.get("capture_review_limit", 200)),
             capture_review_seconds=float(eng_cfg.get("capture_review_seconds", 0)),
+            # Added after the refactor: stage reservations, none by default.
+            coverage_request_reserve=int(eng_cfg.get("coverage_request_reserve", 0)),
+            investigation_seconds=float(eng_cfg.get("investigation_seconds", 0)),
+            coverage_drive_seconds=float(eng_cfg.get("coverage_drive_seconds", 0)),
         )
 
     def test_parity_on_committed_config(self):
@@ -152,6 +157,9 @@ class ParityTests(unittest.TestCase):
                 "coverage_case_budget": 3,
                 "capture_review_limit": "40",
                 "capture_review_seconds": "1800",
+                "coverage_request_reserve": "1500",
+                "investigation_seconds": "3600",
+                "coverage_drive_seconds": "900",
             },
         }
         policy = EngagementPolicy.from_config(config)
@@ -165,6 +173,9 @@ class ParityTests(unittest.TestCase):
         self.assertEqual(policy.coverage_case_budget, 3)
         self.assertEqual(policy.capture_review_limit, 40)
         self.assertEqual(policy.capture_review_seconds, 1800.0)
+        self.assertEqual(policy.coverage_request_reserve, 1500)
+        self.assertEqual(policy.investigation_seconds, 3600.0)
+        self.assertEqual(policy.coverage_drive_seconds, 900.0)
 
     def test_parity_missing_engagement_section_entirely(self):
         """engagement: (present but empty/None) must behave like the old

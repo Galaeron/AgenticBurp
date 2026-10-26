@@ -28,6 +28,7 @@ network, no LLM; it reconciles what the run already produced.
 from __future__ import annotations
 
 import logging
+import time
 import hashlib
 import json
 from collections import deque
@@ -146,6 +147,8 @@ class CoverageTracker:
         self.driveable = set()
         self.checkpoint_signature = ""
         self.context_key = ""
+        # Why a drive stopped with queued cells left: "leg budget" or "time budget".
+        self.stopped_by = None
         # canonical vulnerability_class -> [check_id]; plus the raw class token so
         # a check class canonicalize() returns None for (e.g. "misconfig") still maps.
         self._class_to_checks: dict[str, list[str]] = {}
@@ -322,20 +325,25 @@ class CoverageTracker:
         return out
 
     async def drive_coverage_legs(self, run_leg, *, driveable: set[str] | None = None,
-                                  budget: int = 80) -> int:
+                                  budget: int = 80, deadline: float | None = None) -> int:
         """Actively FIRE each applicable+pending leg-backed cell via the injected
         async `run_leg(identity, method, path, check) -> result` (result exposing
         .status / .summary, or None to skip), recording the REAL outcome. This is
         what turns the matrix from an after-the-fact record into I1's work-program:
         every applicable deterministic check is attempted deterministically,
         independent of whether the LLM labelled it. Returns cells driven. Bounded
-        by `budget` so a large surface can't fan out unboundedly."""
+        by `budget` so a large surface can't fan out unboundedly, and by
+        `deadline` (a `time.monotonic()` value) so it ends in time."""
         n = 0
         self.driveable = set(driveable or _LEG_CONFIRMATIONS)
         pending = self.pending_leg_cells(driveable)
         self.queued.update((ident, ep_key, check.id) for ident, ep_key, check in pending)
         for (ident, ep_key, check) in _fair_cells(pending):
             if n >= budget:
+                self.stopped_by = "leg budget"
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                self.stopped_by = "time budget"
                 break
             n += 1  # Bound attempts, including failed or declined dispatches.
             self.attempted.add((ident, ep_key, check.id))
@@ -397,7 +405,7 @@ class CoverageTracker:
         return total
 
     async def drive_coverage_cases(self, run_case, *, driveable: set[str] | None = None,
-                                   budget: int = 80) -> int:
+                                   budget: int = 80, deadline: float | None = None) -> int:
         """Fire each PENDING child case via the injected async
         `run_case(identity, method, path, check, case_key) -> result` (result
         exposing .status/.summary/..., or None when the leg produced no send),
@@ -416,7 +424,8 @@ class CoverageTracker:
         that RAISES records the representative ERROR (visible, never swallowed); one
         that returns None records INCONCLUSIVE (dispatched, no usable send). An
         unknown status fails conservatively to INCONCLUSIVE, not an optimistic
-        NOT_DETECTED (R06). Returns the number of dispatch attempts made."""
+        NOT_DETECTED (R06). `deadline`, a `time.monotonic()` value, stops new
+        dispatches once passed. Returns the number of dispatch attempts made."""
         _STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.NOT_DETECTED,
                    "controlled_negative": CellStatus.CONTROLLED_NEGATIVE,
                    "blocked": CellStatus.BLOCKED, "inconclusive": CellStatus.INCONCLUSIVE,
@@ -444,6 +453,10 @@ class CoverageTracker:
         for (ident, ep_key, check_id) in _fair_cells(list(cells)):
             cks = cells[(ident, ep_key, check_id)]
             if attempts >= budget:
+                self.stopped_by = "leg budget"
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                self.stopped_by = "time budget"
                 break
             check = CHECKS_BY_ID[check_id]
             method, _, path = ep_key.partition(" ")
@@ -642,7 +655,8 @@ def build_coverage(state, roles, investigated_keys: set[str] | None = None,
 
 async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | None = None,
                                 budget: int = 80, investigated_keys: set[str] | None = None,
-                                checkpoint=None, context_key="") -> dict:
+                                checkpoint=None, context_key="",
+                                deadline: float | None = None) -> dict:
     """Like build_coverage, but ACTIVELY DRIVES the deterministic legs (I1): after
     recording the findings the run already produced, it fires every applicable
     leg-backed cell via `run_leg` (regardless of any agent label) and records the
@@ -657,17 +671,21 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     # add afterwards. Cells the driver did not reach stay pending and are given an
     # honest skip reason below (R01: never fabricate a not_detected).
     tracker.restore_checkpoint(checkpoint, context_key)
-    driven = await tracker.drive_coverage_legs(run_leg, driveable=driveable, budget=budget)
+    driven = await tracker.drive_coverage_legs(run_leg, driveable=driveable, budget=budget,
+                                               deadline=deadline)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["legs_driven"] = driven
+    report["drive_stopped_by"] = tracker.stopped_by
+    report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
     return report
 
 
 async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[str] | None = None,
                                       budget: int = 80, per_cell_case_budget: int = 8,
                                       investigated_keys: set[str] | None = None,
-                                      checkpoint=None, context_key="") -> dict:
+                                      checkpoint=None, context_key="",
+                                      deadline: float | None = None) -> dict:
     """Case-granular coverage driving (T05/R26): enumerate each applicable leg
     cell's concrete input cases from the endpoint template, then fire a leg PER
     CASE via `run_case(identity, method, path, check, case_key)` and record the
@@ -685,9 +703,12 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     tracker.restore_checkpoint(checkpoint, context_key)
     enumerated = tracker.expand_parameter_cases(
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
-    driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget)
+    driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget,
+                                                deadline=deadline)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["cases_enumerated"] = enumerated
     report["cases_driven"] = driven
+    report["drive_stopped_by"] = tracker.stopped_by
+    report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
     return report

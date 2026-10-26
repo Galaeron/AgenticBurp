@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from urllib.parse import urlsplit
 
 from harness.models import HttpExchange
@@ -230,6 +231,7 @@ SKIP_BUDGET_EXHAUSTED = "budget_exhausted"
 SKIP_UNREACHABLE = "unreachable"
 SKIP_MISSING_TEMPLATE = "missing_template"
 SKIP_POLICY_BLOCKED = "policy_blocked"
+SKIP_TIME_BUDGET = "time_budget"
 
 
 def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
@@ -264,6 +266,7 @@ async def investigate_worklist(
     id_fill: str = "1",
     worklist_limit: int = 200,
     summary_out: dict | None = None,
+    deadline: float | None = None,
 ) -> list[dict]:
     """Drive `probe_fn` over the top `max_nodes` actionable worklist nodes.
 
@@ -302,6 +305,10 @@ async def investigate_worklist(
     what makes a "max coverage" claim checkable instead of asserted: a run
     with a nonempty `skipped_by_reason[budget_exhausted]` reached its node
     budget with eligible work still on the table.
+
+    `deadline`, a `time.monotonic()` value, stops the sweep starting work on a
+    node once passed; every later node that had work due is skipped as
+    `time_budget`, and one with nothing to run keeps its own reason.
 
     Returns a per-node outcome list; findings are folded back into `state`."""
     role_headers = {r.role: dict(r.headers or {}) for r in roles}
@@ -346,6 +353,11 @@ async def investigate_worklist(
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
                             "reason": _skip_reason(node, eligible, investigated, max_nodes, False)})
             continue  # no agent hypothesis AND no shape-driven leg to run -- skip
+        if deadline is not None and time.monotonic() >= deadline:
+            # Work was due here but the investigation time budget is spent.
+            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
+                            "reason": SKIP_TIME_BUDGET})
+            continue
 
         reach = node.get("reachable_roles", []) or []
         # probe from the lowest-trust identity that can reach it (strongest proof).
@@ -448,6 +460,7 @@ async def investigate_worklist(
                 "missing_template": "Capture the actual request and response",
                 "no_applicable_hypothesis": "Inspect deterministic coverage or add a supported check",
                 "budget_exhausted": "Resume with additional budget",
+                "time_budget": "Resume with additional time",
                 "policy_blocked": "Review the operation's authorization",
                 "unreachable": "Verify access with the supplied identity",
             }.get(s["reason"], "Inspect the recorded prerequisite"))

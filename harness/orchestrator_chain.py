@@ -622,6 +622,14 @@ class ChainMixin:
         from harness import worklist_investigator
         from harness import chain_linker
         from harness import role_crawl
+        # Stage reservations: the coverage drive runs last, so withhold its share of
+        # the one run ceiling from every earlier stage (released just before the
+        # drive), and bound the investigation stages by wall-clock time.
+        _investigation_deadline = (time.monotonic() + self.investigation_seconds
+                                   if self.investigation_seconds > 0 else None)
+        _run_budget = getattr(run_context or _run_context_mod.current_run_context(), "budget", None)
+        _coverage_hold = (_run_budget.hold(self.coverage_request_reserve)
+                          if self.coverage_request_reserve > 0 and hasattr(_run_budget, "hold") else 0)
         state, rc = await engagement_builder.build_engagement(
             base_url, roles, allowed_hosts=self.allowed_hosts,
             crawl_max_pages=discovery_max_pages,
@@ -1382,7 +1390,12 @@ class ChainMixin:
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
                 max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary,
-                stop_on_confirm=stop_on_confirm)
+                stop_on_confirm=stop_on_confirm, deadline=_investigation_deadline)
+            timed_out = (worklist_summary.get("skipped_by_reason") or {}).get("time_budget", 0)
+            if timed_out:
+                _errors.append({"phase": "worklist",
+                                "error": f"investigation time budget reached: {timed_out} "
+                                         "worklist node(s) not investigated"})
             return outs, [f for o in outs for f in o.get("findings_detail", [])]
 
         if _objective_outcomes:
@@ -1438,6 +1451,9 @@ class ChainMixin:
         # One review time budget covers this pass and every chain round's pass.
         _review_deadline = (time.monotonic() + self.capture_review_seconds
                             if self.capture_review_seconds > 0 else None)
+        if _investigation_deadline is not None:
+            _review_deadline = min(_review_deadline or _investigation_deadline,
+                                   _investigation_deadline)
         if not (stop_on_confirm and _early_confirmed):
             await review_captured_exchanges(
                 self, state, _all_captured, run_context=run_context,
@@ -1471,6 +1487,11 @@ class ChainMixin:
         chains = list(link["chain_findings"])
         creds, rounds, seen_ident = link["credential_caps"], 0, set()
         while creds and rounds < max_chain_rounds:
+            if _investigation_deadline is not None and time.monotonic() >= _investigation_deadline:
+                _errors.append({"phase": "chain_rounds",
+                                "error": f"investigation time budget reached: chain round "
+                                         f"{rounds + 1} of up to {max_chain_rounds} not started"})
+                break
             rounds += 1
             derived = [role_crawl.RoleSession(role="anonymous", headers={})]
             for c in creds:
@@ -1662,6 +1683,11 @@ class ChainMixin:
         # tested and why" is answerable. `investigated_keys` only phrases the skip
         # reason for legs that were never recorded as executed; it never infers a
         # not_detected. The coverage-driver path records live leg outcomes cell-by-cell.
+        _requests_before_coverage = getattr(_run_budget, "used", None)
+        if _coverage_hold:
+            _run_budget.release_hold()
+        _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds
+                              if self.coverage_drive_seconds > 0 else None)
         coverage: dict = {}
         try:
             from harness import coverage_tracker
@@ -1774,13 +1800,20 @@ class ChainMixin:
                         per_cell_case_budget=self.coverage_case_budget,
                         driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
                         checkpoint=coverage_checkpoint,
-                        context_key=coverage_tracker.resume_context_key(self.config))
+                        context_key=coverage_tracker.resume_context_key(self.config),
+                        deadline=_coverage_deadline)
                 else:
                     coverage = await coverage_tracker.build_coverage_driven(
                         state, roles, _run_leg, budget=self.coverage_leg_budget,
                         driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
                         checkpoint=coverage_checkpoint,
-                        context_key=coverage_tracker.resume_context_key(self.config))
+                        context_key=coverage_tracker.resume_context_key(self.config),
+                        deadline=_coverage_deadline)
+                if coverage.get("drive_stopped_by") == "time budget":
+                    _errors.append({"phase": "coverage_drive",
+                                    "error": "coverage drive time budget reached: "
+                                             f"{coverage.get('queued_not_attempted', 0)} queued "
+                                             "leg(s) not attempted"})
             else:
                 coverage = coverage_tracker.build_coverage(state, roles,
                                                            investigated_keys=investigated_keys)
@@ -1853,6 +1886,13 @@ class ChainMixin:
             # chaining hypotheses that drove the re-ranking.
             "application_semantic_model": _asm.to_dict() if _asm else None,
             "coverage": coverage,
+            # Stage reservations in effect: requests withheld for the coverage drive,
+            # what the earlier stages spent, and the stage time bounds (0 = none).
+            "stage_budgets": {"coverage_request_reserve": _coverage_hold,
+                              "requests_before_coverage": _requests_before_coverage,
+                              "requests_at_end": getattr(_run_budget, "used", None),
+                              "investigation_seconds": self.investigation_seconds,
+                              "coverage_drive_seconds": self.coverage_drive_seconds},
             "workflows": workflow_results,
             "task_graph": state.graph.to_dict(),
             "ready_tasks": state.pending(),
