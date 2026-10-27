@@ -32,12 +32,14 @@ per session, never shared across principals.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import ipaddress
 import json
 import socket
 import threading
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -49,14 +51,35 @@ import httpx
 from harness import evidence
 from harness import scope_lock
 from harness.safety_gate import SafetyGate, SafetyGateConfig
+from harness.security import is_credential_header, is_identity_credential_header
 from harness.tls_policy import TLSPolicy
 from harness.target_request_policy import TargetRequestPolicy
 
 # Redirect status codes and the ones that rewrite the method to GET.
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 _REDIRECT_TO_GET = frozenset({301, 302, 303})
-# Request headers that carry credentials and must NOT cross an origin boundary.
+# Request headers that carry credentials and must NOT cross an origin boundary are
+# decided by security.is_credential_header (H1). This three-name set is the old,
+# narrower rule, kept only as a deprecated alias for tests that import it; nothing in
+# this module consults it.
 _CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
+# Interval clock for session rechecks and route-circuit cooldowns (a name, so tests
+# can advance it without sleeping).
+_clock = time.monotonic
+# E5a: a session that already answered a health probe is not probed again for this long.
+_SESSION_RECHECK_SECONDS = 30.0
+_HEALTH_CAPABILITY = "session_health"
+
+
+def _response_size(resp) -> int:
+    """Body bytes of a response; a stub client's response may carry only `.text`."""
+    content = getattr(resp, "content", None)
+    return len(content if content is not None else str(getattr(resp, "text", "")).encode("utf-8"))
+
+
+def _session_expired_message(session) -> str:
+    return (f"session {session.name} is expired: its credentials were rejected by the health "
+            "probe; refresh or re-authenticate this identity to resume its tests")
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +159,19 @@ class RequestBudget:
         self._max = max_requests
         self._used = 0
         self._held = 0
+        self._by_label: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def reserve(self, n: int = 1) -> bool:
+    def reserve(self, n: int = 1, label: str = "") -> bool:
+        """`label` names who spent the reservation (the transport passes the
+        capability), so the count can be attributed afterwards; callers that do
+        not know theirs leave it blank and are counted as "unlabelled"."""
         with self._lock:
             if self._max is not None and self._used + n > self._max - self._held:
                 return False
             self._used += n
+            key = label or "unlabelled"
+            self._by_label[key] = self._by_label.get(key, 0) + n
             return True
 
     def hold(self, n: int) -> int:
@@ -163,6 +192,12 @@ class RequestBudget:
     @property
     def used(self) -> int:
         return self._used
+
+    @property
+    def by_label(self) -> dict:
+        """Reservations granted so far, per label (sums to `used`)."""
+        with self._lock:
+            return dict(self._by_label)
 
     @property
     def remaining(self) -> int | None:
@@ -188,6 +223,14 @@ class CancelToken:
 # Sessions -- one persistent client + cookie jar per principal (no cross-talk)
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class HealthProbe:
+    """A request that tells a rejected session from a route that merely refuses it."""
+    method: str
+    url: str
+    expect_status: tuple = (200,)
+
+
 @dataclass
 class ManagedSession:
     """A principal's authenticated session: its auth headers plus its OWN persistent
@@ -201,9 +244,34 @@ class ManagedSession:
     role: str = "user"
     name: str = ""
     principal: object | None = None
+    # Bumped each time the session's credentials are replaced (a refresh or
+    # SessionManager.replace_headers). A caller that caches anything derived from
+    # the credentials -- a token, decoded claims, a cache key -- must key it on
+    # (session_id, generation) so a refreshed session never serves stale state.
     generation: int = 0
+    # E5a health: "unverified" until a send is accepted, then "healthy"; "suspect"
+    # after a 401 the run could not explain; "expired" once the health probe rejected
+    # the credentials and no refresh restored them (sends are then refused unsent).
+    health: str = "unverified"
+    last_ok_at: float = 0.0          # wall clock of the last send the target accepted
+    auth_failures: int = 0           # 401s seen on sends that carried this session's credentials
+    _probe: "HealthProbe | None" = field(default=None, repr=False)
+    _refresh_fn: object = field(default=None, repr=False)
+    _refreshes: int = field(default=0, repr=False)
+    _checked_at: "float | None" = field(default=None, repr=False)   # _clock() of the last probe
+    _expiry_reported: bool = field(default=False, repr=False)
+    _lock: object = field(default=None, repr=False)
+    _lock_loop: object = field(default=None, repr=False)
     _client: httpx.AsyncClient | None = None
     _fixture_clients: dict = field(default_factory=dict, repr=False)
+
+    def health_lock(self) -> asyncio.Lock:
+        """Serialises one session's health checks so a burst of 401s probes once.
+        Bound to the running loop; a new loop gets a fresh lock."""
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock, self._lock_loop = asyncio.Lock(), loop
+        return self._lock
 
     def client(self, timeout: float, *, http2: bool = False,
                trust_policy: TLSPolicy | None = None, destination: str | None = None,
@@ -260,6 +328,47 @@ class SessionManager:
     def all(self) -> list[ManagedSession]:
         return list(self._by_id.values())
 
+    # -- E5a: session health -------------------------------------------------
+
+    def register_health_probe(self, session_id: str, method: str, url: str,
+                              expect_status=(200,)) -> HealthProbe:
+        """Set the request that checks `session_id` after one of its sends got a 401.
+        It is sent through that same session, so `url` must be on one of its allowed
+        origins. Without a probe (and without `transport.session_probe`) a session is
+        never rechecked and never expires."""
+        session = self._by_id.get(session_id)
+        if session is None:
+            raise ValueError(f"unknown session reference: {session_id}")
+        statuses = (expect_status,) if isinstance(expect_status, int) else tuple(expect_status)
+        session._probe = HealthProbe((method or "GET").upper(), url, statuses)
+        return session._probe
+
+    def set_refresh(self, session_id: str, fn) -> None:
+        """Register `async fn() -> dict | None` that re-authenticates this identity and
+        returns its new headers (None when it could not). It runs only after the health
+        probe rejected the credentials, at most `transport.max_session_refreshes` times
+        per session per run."""
+        session = self._by_id.get(session_id)
+        if session is None:
+            raise ValueError(f"unknown session reference: {session_id}")
+        session._refresh_fn = fn
+
+    def replace_headers(self, session_id: str, headers: dict) -> ManagedSession:
+        """Install new credentials for a session: bumps `generation`, marks it
+        healthy, and drops the cookie jar (its cookies belonged to the old login)."""
+        session = self._by_id.get(session_id)
+        if session is None:
+            raise ValueError(f"unknown session reference: {session_id}")
+        session.headers = dict(headers or {})
+        session.generation += 1
+        session.health = "healthy"
+        session.last_ok_at = time.time()
+        session._expiry_reported = False
+        for client in [session._client, *session._fixture_clients.values()]:
+            if client is not None:
+                client.cookies.clear()
+        return session
+
     def bind_headers(self, headers: dict | None) -> tuple[str | None, dict]:
         """Resolve credential headers to their owning session.
 
@@ -268,22 +377,116 @@ class SessionManager:
         Executor's credential-without-session rule fails closed.
         """
         supplied = dict(headers or {})
+        # Identity credentials only: a CSRF/XSRF token or Idempotency-Key that a
+        # capture carries (or a role was configured with) changes per page and
+        # does not say who is calling, so it neither blocks the match nor is
+        # removed -- it stays in the returned headers and is sent as captured.
         wanted = {k.lower(): v for k, v in supplied.items()
-                  if k.lower() in _CREDENTIAL_HEADERS}
+                  if is_identity_credential_header(k)}
         if not wanted:
             return None, supplied
         for session in self._by_id.values():
             actual = {k.lower(): v for k, v in session.headers.items()
-                      if k.lower() in _CREDENTIAL_HEADERS}
+                      if is_identity_credential_header(k)}
             if actual == wanted:
                 return session.session_id, {
                     k: v for k, v in supplied.items()
-                    if k.lower() not in _CREDENTIAL_HEADERS}
+                    if not is_identity_credential_header(k)}
         return None, supplied
 
     async def aclose(self) -> None:
         for s in self._by_id.values():
             await s.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Route circuit + health events -- what the run learned about its own transport
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _RouteState:
+    errors_5xx: int = 0
+    saw_non_5xx: bool = False         # once true the route answers: never paused again
+    open: bool = False
+    opened_at: float = 0.0
+    reported: bool = False
+
+
+class TransportHealth:
+    """Per-run record of routes that answer 5xx to everything and of the one-time
+    health events (session expired, route paused). Shared by every TargetTransport
+    built from the run, so the state is the run's, not one transport's.
+
+    A route is keyed (method, origin, route template). It opens only when it has
+    NEVER answered with a non-5xx and has returned `threshold` 5xx responses, so a
+    payload-induced 5xx on a route that normally answers never pauses it. Once
+    open, one send is let through per cooldown (half-open); any non-5xx closes it
+    for good."""
+
+    def __init__(self):
+        self._routes: dict[tuple, _RouteState] = {}
+        self._events: list[dict] = []
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def route_key(method: str, url: str) -> tuple:
+        from harness import engagement   # lazy: the one route-template normalizer
+        return ((method or "GET").upper(), ScopePolicy.origin_of(url),
+                engagement.normalize_path(url))
+
+    @staticmethod
+    def route_key_for(method: str, url: str, session) -> tuple:
+        """route_key plus the calling principal: a route that answers 5xx to
+        anonymous can still answer an authenticated user (and an IDOR leg needs
+        that answer), so each identity's circuit is its own."""
+        principal = (session.principal_id if session is not None
+                     and ScopePolicy.origin_of(url) in session.allowed_origins else "")
+        return TransportHealth.route_key(method, url) + (principal,)
+
+    def record_event(self, kind: str, message: str, **detail) -> None:
+        with self._lock:
+            self._events.append({"kind": kind, "message": message, "at": time.time(), **detail})
+
+    def events(self) -> list[dict]:
+        with self._lock:
+            return [dict(e) for e in self._events]
+
+    def route_blocked(self, key: tuple, cooldown: float) -> bool:
+        """True when `key`'s circuit is open and this send must not go out. After the
+        cooldown it admits ONE send (and restarts the cooldown) as the half-open probe."""
+        with self._lock:
+            state = self._routes.get(key)
+            if state is None or not state.open:
+                return False
+            now = _clock()
+            if now - state.opened_at >= cooldown:
+                state.opened_at = now
+                return False
+            return True
+
+    def route_observed(self, key: tuple, status: int, threshold: int) -> None:
+        with self._lock:
+            state = self._routes.setdefault(key, _RouteState())
+            if 500 <= status <= 599:
+                state.errors_5xx += 1
+                if (not state.saw_non_5xx and not state.open
+                        and state.errors_5xx >= max(1, threshold)):
+                    state.open, state.opened_at = True, _clock()
+                    if not state.reported:
+                        state.reported = True
+                        self._events.append({
+                            "kind": "route_paused", "at": time.time(),
+                            "route": f"{key[0]} {key[2]}", "origin": key[1],
+                            "message": f"route {key[0]} {key[2]} returned 5xx on all "
+                                       f"{state.errors_5xx} requests; further probes skipped"})
+                return
+            state.saw_non_5xx = True
+            state.open = False
+
+    def paused_routes(self) -> list[dict]:
+        with self._lock:
+            return [{"route": f"{k[0]} {k[2]}", "origin": k[1], "errors_5xx": s.errors_5xx}
+                    for k, s in self._routes.items() if s.open]
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +503,9 @@ class TypedRequest:
 
 @dataclass
 class ExecutionOutcome:
-    outcome: str                      # ok | out_of_scope | blocked | budget_exhausted | cancelled | error
+    # ok | out_of_scope | blocked | budget_exhausted | cancelled | error, plus
+    # session_expired | route_unavailable (E5a): refused unsent, like blocked.
+    outcome: str
     status: int | None = None
     body: str = ""
     headers: dict = field(default_factory=dict)
@@ -407,7 +612,7 @@ class TargetTransport:
         max_redirects=0 to match a raw client's follow_redirects=False.
         """
         hdrs = dict(headers or {})
-        cred = {k: v for k, v in hdrs.items() if k.lower() in _CREDENTIAL_HEADERS}
+        cred = {k: v for k, v in hdrs.items() if is_identity_credential_header(k)}
         session_ref = None
         if cred:
             session_ref, non_cred = self.ctx.sessions.bind_headers(hdrs)
@@ -416,7 +621,7 @@ class TargetTransport:
                 self.ctx.sessions.register(sid, sid, headers=cred, allowed_origins=[url])
                 session_ref = sid
                 non_cred = {k: v for k, v in hdrs.items()
-                            if k.lower() not in _CREDENTIAL_HEADERS}
+                            if not is_identity_credential_header(k)}
             hdrs = non_cred
         return await self.send(method, url, capability=capability, session_ref=session_ref,
                                headers=hdrs, body=body, case_ref=case_ref,
@@ -426,7 +631,9 @@ class TargetTransport:
                   status: int | None = None, case_ref: str = "", *,
                   finding_ref: str = "", method: str | None = None, req_headers: dict | None = None,
                   req_body: str | None = None, resp_headers: dict | None = None,
-                  resp_body: str | None = None) -> "evidence.ExchangeArtifact":
+                  resp_body: str | None = None, capability: str = "",
+                  elapsed_ms: float | None = None,
+                  size_bytes: int | None = None) -> "evidence.ExchangeArtifact":
         artifact = evidence.ExchangeArtifact.make(
             request_ref=url, response_ref="" if status is None else f"HTTP {status}",
             actual_destination=ScopePolicy.origin_of(url), transport_outcome=outcome,
@@ -474,6 +681,13 @@ class TargetTransport:
                     # a real send, since a recipe reads the event data, not
                     # the blob contents.
                     data["method"] = method
+                    # E5a: who sent it, how long the target took, how much it returned.
+                    if capability:
+                        data["capability"] = capability
+                    if elapsed_ms is not None:
+                        data["elapsed_ms"] = round(elapsed_ms, 1)
+                    if size_bytes is not None:
+                        data["bytes"] = size_bytes
                     try:
                         from harness import security, store
                         req_record = {
@@ -528,8 +742,7 @@ class TargetTransport:
                 outcome="unknown_session", final_url=request.url,
                 error=f"unknown session reference: {session_ref}",
                 artifact=self._artifact(request.url, "unknown_session", session_ref, case_ref=case_ref, finding_ref=finding_ref))
-        if not session_ref and any(k.lower() in _CREDENTIAL_HEADERS
-                                   for k in (request.headers or {})):
+        if not session_ref and any(is_identity_credential_header(k) for k in (request.headers or {})):
             return ExecutionOutcome(
                 outcome="blocked", final_url=request.url,
                 error="credential-bearing request requires an explicit session reference",
@@ -540,6 +753,13 @@ class TargetTransport:
                 outcome="blocked", final_url=request.url,
                 error="session is not authorized for the requested destination",
                 artifact=self._artifact(request.url, "credential_destination_blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
+        if session and session.health == "expired":
+            # E5a: the health probe rejected this identity's credentials; nothing is sent.
+            return ExecutionOutcome(
+                outcome="session_expired", final_url=request.url,
+                error=_session_expired_message(session),
+                artifact=self._artifact(request.url, "session_expired", session_ref, case_ref=case_ref, finding_ref=finding_ref))
+        transport_cfg = ctx.config.get("transport", {}) or {}
         method = (request.method or "GET").upper()
         url = request.url
         headers = dict(request.headers or {})
@@ -571,6 +791,17 @@ class TargetTransport:
             if reason:
                 return ExecutionOutcome(outcome="blocked", final_url=url, error=reason,
                                         artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
+            # 1b. E5a route circuit -- a route that has only ever answered 5xx is not
+            #     probed further (after the gate-free checks above so an unsent request
+            #     spends neither gate nor budget). One send per cooldown is let through.
+            route_key = TransportHealth.route_key_for(method, url, session)
+            if ctx.health.route_blocked(route_key, float(
+                    transport_cfg.get("route_circuit_cooldown_seconds", 300))):
+                return ExecutionOutcome(
+                    outcome="route_unavailable", final_url=url,
+                    error=f"route {route_key[0]} {route_key[2]} answered 5xx to every request; "
+                          "paused until its cooldown ends",
+                    artifact=self._artifact(url, "route_unavailable", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 2. Gate -- reuse the SafetyGate decision (no contradictory rules). GET is
             #    not treated as universally harmless: scope + budget still bind it, and a
             #    mutating method is gated exactly as the validators' sends are.
@@ -581,7 +812,9 @@ class TargetTransport:
                 return ExecutionOutcome(outcome="blocked", final_url=url, error=decision.reason,
                                         artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 3. Budget -- reserve atomically before sending; a denial does not count as executed.
-            if not ctx.budget.reserve(1):
+            # Only RequestBudget (and the driver child budget forwarding to it) takes a label.
+            if not (ctx.budget.reserve(1, label=capability) if hasattr(ctx.budget, "by_label")
+                    else ctx.budget.reserve(1)):
                 return ExecutionOutcome(outcome="budget_exhausted", final_url=url,
                                         artifact=self._artifact(url, "budget_exhausted", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 3b. I05-B: the CONNECT target is pinned by the run's clients themselves
@@ -592,9 +825,12 @@ class TargetTransport:
             #    when this hop is the session's own origin. Cross-origin -> no creds.
             credential_destination = bool(
                 session and ScopePolicy.origin_of(url) in session.allowed_origins)
+            # Without a session only identity credentials are withheld (and those
+            # were refused above); a CSRF/idempotency header goes out as before H1.
+            # A session's hop off its own origin drops every credential header.
+            withheld = is_identity_credential_header if session is None else is_credential_header
             send_headers = {k: v for k, v in headers.items()
-                            if k.lower() not in _CREDENTIAL_HEADERS
-                            or credential_destination}
+                            if credential_destination or not withheld(k)}
             if session and credential_destination:
                 for k, v in session.headers.items():
                     send_headers.setdefault(k, v)
@@ -605,6 +841,7 @@ class TargetTransport:
                       if session and credential_destination else ctx.default_client(destination=url))
             request_kwargs: dict = {"headers": send_headers or None,
                                     "content": body if isinstance(body, str) else None}
+            started = time.perf_counter()
             try:
                 resp = await client.request(method, url, **request_kwargs)
             except DestinationBlocked as e:   # refused at connect: nothing was sent
@@ -615,7 +852,12 @@ class TargetTransport:
                 return ExecutionOutcome(outcome="error", final_url=url, error=str(e),
                                         artifact=self._artifact(url, f"error:{type(e).__name__}", session_ref, case_ref=case_ref, finding_ref=finding_ref))
 
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
             self.sent_count += 1
+            ctx.health.route_observed(route_key, resp.status_code,
+                                      int(transport_cfg.get("route_5xx_threshold", 8)))
+            if session and credential_destination and capability != _HEALTH_CAPABILITY:
+                await self._session_feedback(session, resp.status_code, url)
 
             if resp.status_code in _REDIRECT_CODES and resp.headers.get("location") and _hop < max_redirects:
                 nxt = urljoin(url, resp.headers["location"])
@@ -632,10 +874,99 @@ class TargetTransport:
                                         url, "ok", session_ref, status=resp.status_code, case_ref=case_ref, finding_ref=finding_ref,
                                         method=method, req_headers=send_headers,
                                         req_body=body if isinstance(body, str) else None,
-                                        resp_headers=dict(resp.headers), resp_body=resp.text))
+                                        resp_headers=dict(resp.headers), resp_body=resp.text,
+                                        capability=capability, elapsed_ms=elapsed_ms,
+                                        size_bytes=_response_size(resp)))
         # Redirect budget exhausted -> return the last hop as ok-ish (no further follow).
         return ExecutionOutcome(outcome="ok", status=None, final_url=url,
                                 artifact=self._artifact(url, "redirect_limit", session_ref, case_ref=case_ref, finding_ref=finding_ref))
+
+    # -- E5a: session health ----------------------------------------------------
+
+    async def _session_feedback(self, session: ManagedSession, status: int, url: str) -> None:
+        """What a send that carried `session`'s credentials says about the session."""
+        if status < 400:
+            session.last_ok_at = time.time()
+            if session.health in ("unverified", "suspect"):
+                session.health = "healthy"
+            return
+        if status == 401:
+            session.auth_failures += 1
+            await self._recheck_session(session, url)
+
+    def _probe_for(self, session: ManagedSession, url: str) -> "HealthProbe | None":
+        """The session's registered probe, else the one `transport.session_probe.path`
+        names on the origin the 401 came from; None means nothing can be checked."""
+        if session._probe is not None:
+            return session._probe
+        cfg = (self.ctx.config.get("transport", {}) or {}).get("session_probe") or {}
+        path = cfg.get("path") if isinstance(cfg, dict) else None
+        origin = ScopePolicy.origin_of(url)
+        if not path or not origin:
+            return None
+        expect = cfg.get("expect_status", (200,))
+        return HealthProbe(str(cfg.get("method") or "GET").upper(), origin + str(path),
+                           (expect,) if isinstance(expect, int) else tuple(expect))
+
+    async def _recheck_session(self, session: ManagedSession, url: str) -> None:
+        """A 401 on a send with `session`'s credentials: ask the probe whether the
+        session or only that route refuses it. No probe -> the session is only marked
+        suspect and nothing extra is sent."""
+        probe = self._probe_for(session, url)
+        if probe is None:
+            if session.health != "expired":
+                session.health = "suspect"
+            return
+        async with session.health_lock():
+            now = _clock()
+            if session.health == "expired" or (
+                    session._checked_at is not None
+                    and now - session._checked_at < _SESSION_RECHECK_SECONDS):
+                return
+            session._checked_at = now
+            verdict = await self._run_health_probe(session, probe)
+            if verdict == "ok":              # the 401 was route-specific
+                session.health = "healthy"
+                session.last_ok_at = time.time()
+                return
+            if verdict == "inconclusive":    # the probe never got an answer: do not expire on a guess
+                session.health = "suspect"
+                return
+            cfg = self.ctx.config.get("transport", {}) or {}
+            limit = int(cfg.get("max_session_refreshes", 2))
+            if session._refresh_fn is not None and session._refreshes < limit:
+                session._refreshes += 1
+                try:
+                    fresh = await session._refresh_fn()
+                except Exception:
+                    fresh = None
+                if isinstance(fresh, dict) and fresh:
+                    self.ctx.sessions.replace_headers(session.session_id, fresh)
+                    session._checked_at = _clock()
+                    return
+                if session._refreshes < limit:   # a failed attempt: re-check on the next 401
+                    session.health, session._checked_at = "suspect", None
+                    return
+            session.health = "expired"
+            if not session._expiry_reported:
+                session._expiry_reported = True
+                self.ctx.health.record_event(
+                    "session_expired",
+                    f"session {session.name} expired: its credentials were rejected by the "
+                    "health probe; refresh or re-authenticate this identity to resume its tests",
+                    session=session.name, session_id=session.session_id)
+
+    async def _run_health_probe(self, session: ManagedSession, probe: "HealthProbe") -> str:
+        """Send the probe once through `session`: "ok", "rejected" (the target answered
+        with a status the probe does not expect) or "inconclusive" (unsent, a transport
+        error, or a 5xx -- the target's trouble, not proof the credentials are bad)."""
+        with case_scope(""):    # a health check belongs to no case
+            out = await self.execute(TypedRequest(probe.method, probe.url),
+                                     capability=_HEALTH_CAPABILITY,
+                                     session_ref=session.session_id, max_redirects=0)
+        if not out.ok or out.status is None or out.status >= 500:
+            return "inconclusive"
+        return "ok" if out.status in probe.expect_status else "rejected"
 
 
 # Back-compat alias: TargetTransport was named Executor through Astra T03-T08. The
@@ -848,6 +1179,8 @@ class RunContext:
     # I05-B: one connect address per name for the whole run (None = opted out).
     address_pins: "AddressPins | None" = field(default_factory=AddressPins, repr=False)
     target_policy: TargetRequestPolicy = field(default_factory=TargetRequestPolicy, repr=False)
+    # E5a: the run's route circuits and one-time health events (see health_report).
+    health: TransportHealth = field(default_factory=TransportHealth, repr=False)
     # What safety_gate.push_gate returned when this run installed its gate as
     # ambient -- the gate (or None) that was ambient before it, to restore on
     # aclose(). Not a contextvars.Token: see push_gate's docstring for why.
@@ -921,6 +1254,19 @@ class RunContext:
 
     def target_transport(self) -> "TargetTransport":
         return TargetTransport(self)
+
+    def health_report(self) -> dict:
+        """What the run learned about its own transport: each session's health, the
+        routes currently paused, the one-time health events, and the request budget
+        spent per label (capability). Plain data, safe to serialise."""
+        return {
+            "sessions": [{"name": s.name, "principal": s.principal_id, "health": s.health,
+                          "generation": s.generation, "auth_failures": s.auth_failures}
+                         for s in self.sessions.all()],
+            "routes_paused": self.health.paused_routes(),
+            "events": self.health.events(),
+            "budget_by_label": dict(getattr(self.budget, "by_label", {}) or {}),
+        }
 
     def executor(self) -> "TargetTransport":   # back-compat name for target_transport()
         return self.target_transport()

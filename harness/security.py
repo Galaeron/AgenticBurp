@@ -169,6 +169,56 @@ def _is_secret_field_name(name: str) -> bool:
     return normalized in SECRET_FIELD_NAMES
 
 
+# H1: the one answer to "does this REQUEST header carry a credential?", shared by
+# session binding, the Executor's credential-needs-a-session rule and redirect
+# stripping. The three names every client sends, plus anything redact_headers or the
+# field redactor already treats as secret, plus any Proxy-* header, plus a name
+# pattern for the custom schemes targets invent (X-API-Key, Ocp-Apim-Subscription-Key,
+# X-CSRF-Token, X-JWT-Assertion, X-Password ...). It errs towards "credential": the
+# cost of a false positive is a send that needs a session reference, the cost of a
+# miss is a credential that rides along unscoped. "pass" must not start inside a word
+# (X-Bypass-*); Sec-* headers are set by the browser or the handshake (Fetch
+# metadata, Sec-WebSocket-Key), never by a login, so they are not credentials.
+_ALWAYS_CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
+_CREDENTIAL_HEADER_PATTERN = re.compile(
+    r"auth|token|api[-_]?key|key$|secret|session|sid$|csrf|xsrf|jwt|bearer"
+    r"|(?<![a-z])pass(?:word|wd|phrase)?|credential")
+
+
+def is_credential_header(name) -> bool:
+    """True when a request header called `name` carries a credential. Pure; case
+    insensitive; non-strings and blank names are not credentials."""
+    if not isinstance(name, str):
+        return False
+    lowered = name.strip().lower()
+    if not lowered:
+        return False
+    if lowered == "proxy-connection":      # hop-by-hop connection control, no secret
+        return False
+    if (lowered in _ALWAYS_CREDENTIAL_HEADERS or lowered in SECRET_HEADER_NAMES
+            or _is_secret_field_name(lowered) or lowered.startswith("proxy-")):
+        return True
+    if lowered.startswith("sec-"):
+        return False
+    return _CREDENTIAL_HEADER_PATTERN.search(lowered) is not None
+
+
+# Credential-classed headers that bind a request rather than name who sends it:
+# anti-CSRF tokens and idempotency keys travel WITH a session's identity
+# credential but are not one, and change per page or per request.
+_REQUEST_BINDING_HEADER_PATTERN = re.compile(r"csrf|xsrf|idempotency")
+
+
+def is_identity_credential_header(name) -> bool:
+    """True for a credential header that says WHO is calling (Authorization,
+    Cookie, X-API-Key ...): `is_credential_header` minus the request-binding
+    tokens (CSRF/XSRF, Idempotency-Key). Session binding and the Executor's
+    credential-needs-a-session rule key on these; redirect stripping still drops
+    every credential header."""
+    return (is_credential_header(name)
+            and _REQUEST_BINDING_HEADER_PATTERN.search(name.strip().lower()) is None)
+
+
 def redact_secrets_in_url(url: str) -> str:
     """Redact the VALUES of secret-named query params in a URL.
 

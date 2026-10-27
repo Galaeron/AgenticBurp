@@ -26,6 +26,17 @@ transport:
     ca_bundle: null
     fixture_insecure_origins: []
     fixture_insecure_reason: null
+  # E5a transport health. session_probe: {path: "/rest/user/whoami"} names a request
+  # that is sent through a session (once per 30 s) after one of its sends got a 401,
+  # to tell an expired session from a route that merely refuses it; null = never
+  # probe, never expire a session. A route that has only ever answered 5xx is paused
+  # after route_5xx_threshold such responses (one send per cooldown goes through; any
+  # non-5xx closes it for good). A session whose probe fails is refreshed at most
+  # max_session_refreshes times, if a refresh callback is registered, then expired.
+  session_probe: null
+  max_session_refreshes: 2
+  route_5xx_threshold: 8
+  route_circuit_cooldown_seconds: 300
 
 ollama:
   base_url: "http://localhost:11434"
