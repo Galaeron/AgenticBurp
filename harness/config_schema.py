@@ -337,6 +337,12 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     # autonomous_discovery.enabled above; passive-only forces it off too.
     "driver_capture.enabled",
     "iterative_agent.enabled",
+    # Ticket G: the experiment cycle creates objects on the target and reads them
+    # back as two identities (GET reads count as SAFE to the gate, so only this
+    # flag stops them), and its planner is an extra model call. Passive-only
+    # ("just analyze captured traffic") forces both off.
+    "engagement.experiments.enabled",
+    "engagement.experiments.planner",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

@@ -745,6 +745,25 @@ def detect_capabilities(finding: dict, resp_headers: dict | None, resp_body: str
     return caps
 
 
+def add_chain_hypothesis_task(graph, hyp, *, needs="operator review (proposed chain -- not confirmed)",
+                              depends_on=None, extra_meta=None):
+    """The BLOCKED `chain-hypothesis` proposal task for one ChainingHypothesis. By
+    default it waits on the operator; the experiment cycle (experiment.py) instead
+    gates it on an experiment task. Either way it is a PROPOSAL: never auto-run,
+    never marked confirmed, and it selects no URL for a validator."""
+    meta = {"auto_runnable": False,
+            "rank": getattr(hyp, "rank", 0.0),
+            "classes": list(getattr(hyp, "classes", []) or []),
+            "proposed_only": True}
+    meta.update(extra_meta or {})
+    return graph.add(
+        "chain-hypothesis", getattr(hyp, "id", "") or "hypothesis",
+        reason=(getattr(hyp, "rationale", "") or
+                f"{getattr(hyp, 'source', '?')} -> {getattr(hyp, 'target', '?')}"),
+        needs=needs, depends_on=depends_on,
+        source=",".join(getattr(hyp, "endpoints", []) or [])[:200], meta=meta)
+
+
 @dataclass
 class EngagementState:
     host: str
@@ -760,6 +779,12 @@ class EngagementState:
     # confirms only a route listed here or in config authz.protected_paths.
     protected_paths: list = field(default_factory=list)
     owners: list = field(default_factory=list)
+    # Ticket G: values the experiment cycle observed (name -> value, e.g. the id of
+    # an object it created) and the ASM its tasks were derived from. Working state
+    # only: deliberately NOT part of to_dict(), so observed values are never
+    # persisted or logged with the surface.
+    observed_values: dict = field(default_factory=dict)
+    semantic_model: "object" = None
 
     def __post_init__(self):
         from harness import task_graph
@@ -980,7 +1005,7 @@ class EngagementState:
                        needs=spec["needs"], source=url)
         return True
 
-    def apply_semantic_model(self, asm, *, ledger=None) -> int:
+    def apply_semantic_model(self, asm, *, ledger=None, experiments=None) -> int:
         """P2-1: fold an Application Semantic Model into the surface + graph.
 
         Two effects, both additive and reversible, NEITHER a confirmation:
@@ -997,9 +1022,17 @@ class EngagementState:
         `asm` is duck-typed (anything with `business_impact_for` +
         `chaining_hypotheses`), so this never hard-imports the ASM module.
         Returns the number of endpoints that received a positive business score.
-        Sends nothing."""
+        Sends nothing.
+
+        `experiments` (Ticket G, default None = off) is a dict {"expectations",
+        "sessions", optional "values"/"base_url"}. When given, each IDOR/BOLA
+        hypothesis is translated into a cross-account experiment (experiment.py)
+        instead of the blanket operator-review disposition: a READY or BLOCKED
+        `experiment` task, with the proposal's chain-hypothesis task gated on it.
+        Hypotheses of other classes keep the operator-review task either way."""
         if asm is None:
             return 0
+        self.semantic_model = asm
         scored = 0
         for ep in self.endpoints.values():
             try:
@@ -1010,20 +1043,26 @@ class EngagementState:
             ep.business_reasons = list(reasons)
             if score > 0:
                 scored += 1
+        if experiments is not None:
+            from harness import experiment as _experiment
         for hyp in getattr(asm, "chaining_hypotheses", []) or []:
             try:
-                self.graph.add(
-                    "chain-hypothesis", getattr(hyp, "id", "") or "hypothesis",
-                    reason=(getattr(hyp, "rationale", "") or
-                            f"{getattr(hyp, 'source', '?')} -> {getattr(hyp, 'target', '?')}"),
-                    needs="operator review (proposed chain -- not confirmed)",
-                    source=",".join(getattr(hyp, "endpoints", []) or [])[:200],
-                    meta={"auto_runnable": False,
-                          "rank": getattr(hyp, "rank", 0.0),
-                          "classes": list(getattr(hyp, "classes", []) or []),
-                          "proposed_only": True})
+                if experiments is not None and _experiment.supports(hyp):
+                    continue   # evaluate_experiments below records it, gated on its experiment
+                add_chain_hypothesis_task(self.graph, hyp)
             except Exception:
                 continue
+        if experiments is not None:
+            try:
+                _experiment.evaluate_experiments(
+                    self, asm, experiments.get("expectations") or [],
+                    experiments.get("sessions") or [], experiments.get("values"),
+                    base_url=experiments.get("base_url", ""))
+            except Exception:
+                # Never lose a proposal: fall back to the blanket disposition.
+                for hyp in getattr(asm, "chaining_hypotheses", []) or []:
+                    if _experiment.supports(hyp):
+                        add_chain_hypothesis_task(self.graph, hyp)
         return scored
 
     # --- the fused output ---

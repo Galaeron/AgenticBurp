@@ -314,6 +314,45 @@ engagement:
   coverage_request_reserve: 0
   investigation_seconds: 0
   coverage_drive_seconds: 0
+  # Graph -> experiment -> workflow -> proof cycle (experiment.py). When enabled, each
+  # IDOR/BOLA business-context hypothesis is turned into a stateful cross-account
+  # test (create a private object as one identity, read it as that identity and as
+  # a second one, control with the second identity's own object), judged and stored
+  # as a structured proof. It needs the business-context pass (a hypothesis to
+  # test), two authenticated sessions, and an OPERATOR-DECLARED expectation in
+  # access_expectations below; with any of them missing the experiment is reported
+  # BLOCKED with the exact missing input and sends nothing. DEFAULT OFF: it creates
+  # objects on the target, so its POSTs also need validators.active_enabled and
+  # allow_mutating_replay. max_runs bounds experiments per engagement; planner
+  # (separately off) lets the local model propose JSON pointers/values read from
+  # real captures -- it can never declare an expectation.
+  experiments:
+    enabled: false
+    max_runs: 4
+    planner: false
+  # Operator-declared access expectations (never inferred from a successful read).
+  # Declare real ones in the git-ignored config.local.yaml, never here. Each entry:
+  #   - object: Note                        # the business object's name
+  #     expectation: private_to_creator     # the only supported value
+  #     create: {method: POST, path: /api/notes, body: {title: "note {tag}"},
+  #              id_pointer: /data/id}       # JSON pointer to the new object's id
+  #     read: {method: GET, path: "/api/notes/{id}"}
+  #     delete: {method: DELETE, path: "/api/notes/{id}"}   # optional cleanup
+  #     marker_pointer: /data/owner         # optional, see below
+  # `{tag}` in a create body (inside a string value) is filled, per identity and per
+  # run, with a random token (16 hex chars) only that identity's create sends. It makes
+  # an object that carries no owner field distinguishable: a read of the owner's object
+  # that returns the owner's token can only be the owner's object, whereas an error
+  # object that merely echoes the id cannot. Without a `{tag}` and without content that
+  # differs between the two identities' own objects, a read that looks like a leak ends
+  # BLOCKED with "the create body needs a per-identity {tag} field ...", never as an
+  # unexplained inconclusive. A denial (401/403/404) needs no tag.
+  # `marker_pointer` names the field of the READ response that holds a per-identity
+  # value (e.g. the owner, or the title when it holds `{tag}`); the owner's value there
+  # must reappear in the attacker's response and differ from the attacker's own object's.
+  # Default: the object's id at id_pointer, plus the object it sits in (volatile keys such
+  # as updatedAt and viewer-relative fields such as isOwner or counters do not have to match).
+  access_expectations: []
 
 # RV-S: operator-declared protected routes (harness/protected_routes.py). The
 # engagement chain confirms missing authentication ONLY on a route listed here
