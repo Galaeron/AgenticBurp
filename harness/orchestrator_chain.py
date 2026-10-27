@@ -22,9 +22,10 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
 # standalone one when it is None".
 from harness.run_context import transport_for, ExecutionOutcome, case_scope
-# FR-6: need the module too, for `_CREDENTIAL_HEADERS` -- aliased for the same
-# shadowing reason as above (several methods below have a `run_context` parameter).
+# FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
+# same shadowing reason as above (several methods below have a `run_context` parameter).
 from harness import run_context as _run_context_mod
+from harness.security import is_credential_header
 from harness import objective_completion as _objective_completion_mod
 from harness.objective_profiles import ObjectiveTask
 
@@ -166,14 +167,14 @@ def _invalidated_headers(headers: dict) -> dict:
     """Return a copy of `headers` with the credential corrupted, for the
     invalid-token control probe in `_credential_grants_access`. Corrupts the
     VALUE of every header recognised as a credential header
-    (`run_context._CREDENTIAL_HEADERS`: authorization/cookie/proxy-authorization)
-    so the server should reject it. If none of the supplied headers are
-    recognised credential headers (e.g. a bespoke `X-Api-Key` scheme), corrupts
-    every supplied header's value instead, so the control is always genuinely
-    invalid rather than an accidental no-op. Header NAMES are always preserved
+    (`security.is_credential_header`: authorization/cookie, API-key and token
+    schemes, ...) so the server should reject it. If none of the supplied headers
+    are recognised credential headers (a scheme the classifier does not know),
+    corrupts every supplied header's value instead, so the control is always
+    genuinely invalid rather than an accidental no-op. Header NAMES are always preserved
     so routing/auth dispatch is unchanged -- only the value is corrupted."""
     out = dict(headers or {})
-    cred_keys = [k for k in out if k.lower() in _run_context_mod._CREDENTIAL_HEADERS]
+    cred_keys = [k for k in out if is_credential_header(k)]
     for k in (cred_keys or list(out.keys())):
         out[k] = f"{out[k]}{_FR6_INVALID_SENTINEL}"
     return out
@@ -216,12 +217,19 @@ class _DriverBudget:
         self.parent, self.maximum, self.spent = parent, maximum, 0
         self.lock = threading.Lock()
 
-    def reserve(self, n=1):
+    def reserve(self, n=1, label=""):
         with self.lock:
-            if self.spent + n > self.maximum or not self.parent.reserve(n):
+            # A parent that predates labels (no by_label) is reserved unlabelled.
+            if self.spent + n > self.maximum or not (
+                    self.parent.reserve(n, label=label) if hasattr(self.parent, "by_label")
+                    else self.parent.reserve(n)):
                 return False
             self.spent += n
             return True
+
+    @property
+    def by_label(self):
+        return self.parent.by_label
 
     @property
     def remaining(self):

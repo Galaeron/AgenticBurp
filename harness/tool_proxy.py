@@ -211,7 +211,10 @@ class ToolProxy:
             self.forwarded += 1
         if out.outcome != "ok":
             self._refuse(out.outcome)
-            if out.outcome in ("budget_exhausted", "cancelled"):
+            # A run that stopped the tool's traffic (budget, cancel, an expired session,
+            # a paused route) ends the scan: what the tool saw is incomplete, not a 403.
+            if out.outcome in ("budget_exhausted", "cancelled", "session_expired",
+                               "route_unavailable"):
                 self.stop_reason = self.stop_reason or out.outcome
                 return 503, {}, f"harness tool proxy: run {out.outcome}".encode()
             if out.outcome == "error":

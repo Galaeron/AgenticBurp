@@ -28,6 +28,12 @@ from harness.safety_gate import get_default_gate
 # field names, as an earlier version of this module did for password/
 # email specifically, cannot generalize to "whatever parameters this
 # exchange happens to have").
+# Why the run stopped the tool's proxied traffic (ToolProxy.stop_reason), for summaries.
+_PROXY_STOP_WHY = {"budget_exhausted": "the run's request budget ran out",
+                   "session_expired": "the identity's session expired during the scan",
+                   "route_unavailable": "the route answered 5xx to every request and was paused"}
+
+
 def _looks_like_json(body: str, content_type: str) -> bool:
     if "json" in content_type.lower():
         return True
@@ -625,7 +631,8 @@ class SqlmapValidator(Validator):
                     why = ("the run's request budget is exhausted "
                            f"({proxy.forwarded} sqlmap request(s) were sent through the run)"
                            if proxy is not None and proxy.stop_reason == "budget_exhausted"
-                           else "the run was cancelled")
+                           else _PROXY_STOP_WHY.get(proxy.stop_reason if proxy is not None else "",
+                                                    "the run was cancelled"))
                     return ValidationResult(self.name, "skipped", finding.vulnerability_class,
                                             summary=f"sqlmap stopped: {why}", command=cmd)
                 return ValidationResult(self.name, "error", finding.vulnerability_class,
@@ -646,8 +653,7 @@ class SqlmapValidator(Validator):
                 )
             if proxy is not None and proxy.stop_reason:
                 # The run refused part of the scan: an incomplete scan is not a negative.
-                why = ("the run's request budget ran out" if proxy.stop_reason == "budget_exhausted"
-                       else "the run was cancelled")
+                why = _PROXY_STOP_WHY.get(proxy.stop_reason, "the run was cancelled")
                 return ValidationResult(
                     self.name, "skipped", finding.vulnerability_class,
                     summary=f"sqlmap incomplete: {why} after {proxy.forwarded} request(s) "
