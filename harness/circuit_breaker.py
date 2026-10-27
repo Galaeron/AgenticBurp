@@ -20,6 +20,7 @@ import asyncio
 import contextvars
 import logging
 import time
+from collections import deque
 from typing import Optional, Callable, Any
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -55,6 +56,19 @@ class CircuitBreakerConfig:
     
     # Enabled: whether the circuit breaker is active
     enabled: bool = True
+
+    # Failure-rate window (optional, OFF by default). When window_size > 0 the
+    # breaker ALSO opens once at least `window_size` calls have been observed
+    # and the failure fraction over the most recent `window_size` calls is
+    # >= failure_rate_threshold -- even if no `failure_threshold` consecutive
+    # failures ever happen. This catches a steady partial failure rate (e.g.
+    # every ~5th call failing) that the consecutive-failure rule can never see
+    # because successes keep resetting its counter. None (unset) or 0 =
+    # disabled, which keeps the consecutive-failure behaviour byte-for-byte
+    # unchanged. OllamaCircuitBreaker fills an unset value with its own default
+    # but keeps an explicit 0, so 0 is how a caller switches the rule off.
+    window_size: Optional[int] = None
+    failure_rate_threshold: float = 0.5
 
 
 @dataclass
@@ -108,6 +122,9 @@ class CircuitBreaker:
         self._half_open_requests = 0
         self._lock = asyncio.Lock()
         self._stats = CircuitBreakerStats(state=CircuitState.CLOSED)
+        # Most recent call outcomes (True = failure) for the optional
+        # failure-rate rule; only fed when config.window_size > 0.
+        self._window: deque[bool] = deque()
     
     @property
     def state(self) -> CircuitState:
@@ -134,6 +151,22 @@ class CircuitBreaker:
         return (self._consecutive_failures >= self.config.failure_threshold and 
                 self.config.enabled)
     
+    @property
+    def _window_size(self) -> int:
+        """The configured window size, 0 when the rule is off (None or 0)."""
+        return self.config.window_size or 0
+
+    def _window_failure_rate_exceeded(self) -> bool:
+        """Failure-rate rule: True when window_size > 0, at least window_size
+        calls have been observed, and the failure fraction over the last
+        window_size calls is >= failure_rate_threshold. Always False when the
+        window is off (the default), so consecutive-failure behaviour is
+        untouched."""
+        size = self._window_size
+        if size <= 0 or not self.config.enabled or len(self._window) < size:
+            return False
+        return sum(self._window) / len(self._window) >= self.config.failure_rate_threshold
+
     def _should_reset(self) -> bool:
         """Check if the circuit should reset (close)."""
         return (self._consecutive_successes >= self.config.success_threshold and 
@@ -162,12 +195,32 @@ class CircuitBreaker:
                 self.name, old_state.name, new_state.name
             )
     
+    def _trip_on_failure_rate(self) -> None:
+        """Open the circuit because the windowed failure rate is too high, then
+        start a fresh window so the stale failures that tripped it cannot
+        instantly re-trip the breaker once it heals."""
+        log.warning(
+            "Circuit breaker '%s' opening on failure rate: %d/%d recent calls failed (threshold %.2f)",
+            self.name, sum(self._window), len(self._window), self.config.failure_rate_threshold,
+        )
+        self._change_state(CircuitState.OPEN)
+        self._window.clear()
+
+    def _push_outcome(self, failed: bool) -> None:
+        """Append one call outcome to the rolling window, keeping only the most
+        recent window_size entries."""
+        self._window.append(failed)
+        while len(self._window) > self._window_size:
+            self._window.popleft()
+
     def _record_failure(self) -> None:
         """Record a failure."""
         self._consecutive_failures += 1
         self._consecutive_successes = 0
         self._last_failure_time = time.time()
         self._stats.total_failures += 1
+        if self._window_size > 0:
+            self._push_outcome(True)
     
     def _record_success(self) -> None:
         """Record a success."""
@@ -175,6 +228,8 @@ class CircuitBreaker:
         self._consecutive_successes += 1
         self._last_success_time = time.time()
         self._stats.total_successes += 1
+        if self._window_size > 0:
+            self._push_outcome(False)
     
     async def __aenter__(self) -> CircuitBreaker:
         """Enter the circuit breaker context."""
@@ -234,12 +289,24 @@ class CircuitBreaker:
                 # Check if we should trip the circuit
                 if self._should_trip():
                     self._change_state(CircuitState.OPEN)
+                elif self._window_failure_rate_exceeded():
+                    self._trip_on_failure_rate()
+                elif self._window_size > 0 and self._state == CircuitState.HALF_OPEN:
+                    # A rate-tripped breaker does not leave failure_threshold
+                    # consecutive failures behind, so the rule above would let a
+                    # failed trial request keep the breaker HALF_OPEN. A failed
+                    # trial must re-open it (only when the window is enabled,
+                    # so the default behaviour is untouched).
+                    self._change_state(CircuitState.OPEN)
             else:
                 self._record_success()
-                
+
                 # Check if we should reset the circuit
                 if self._should_reset():
                     self._change_state(CircuitState.CLOSED)
+                elif self._state == CircuitState.CLOSED and self._window_failure_rate_exceeded():
+                    # A success can be the call that fills the window.
+                    self._trip_on_failure_rate()
     
     async def call(self, func: Callable, *args, **kwargs) -> Any:
         """
@@ -274,7 +341,8 @@ class CircuitBreaker:
             self._consecutive_failures = 0
             self._consecutive_successes = 0
             self._half_open_requests = 0
-    
+            self._window.clear()
+
     def force_open(self) -> None:
         """Manually force the circuit breaker to open state."""
         asyncio.run(self._force_open_async())
@@ -380,6 +448,12 @@ class OllamaCircuitBreaker(CircuitBreaker):
             timeout_seconds=60.0,
             half_open_max_requests=1,
             enabled=True,
+            # Failure-rate rule (E6): a ~19% steady failure rate never produced
+            # 3 CONSECUTIVE failures, so the breaker stayed CLOSED for an hour.
+            # Open when half of the last 20 calls failed, even if interleaved
+            # with successes.
+            window_size=20,
+            failure_rate_threshold=0.5,
         )
         if config:
             # Merge config with defaults
@@ -390,6 +464,9 @@ class OllamaCircuitBreaker(CircuitBreaker):
                 half_open_max_requests=config.half_open_max_requests or ollama_config.half_open_max_requests,
                 excluded_exceptions=config.excluded_exceptions or ollama_config.excluded_exceptions,
                 enabled=config.enabled if config.enabled is not None else ollama_config.enabled,
+                window_size=(config.window_size if config.window_size is not None
+                             else ollama_config.window_size),
+                failure_rate_threshold=config.failure_rate_threshold or ollama_config.failure_rate_threshold,
             )
         
         super().__init__(ollama_config, name)
@@ -479,6 +556,7 @@ def _set_state(
     breaker._consecutive_successes = consecutive_successes
     breaker._half_open_requests = half_open_requests
     breaker._last_state_change = time.time()
+    breaker._window.clear()
 
 
 def reset_ollama_circuit_breaker(name: str = "ollama") -> "OllamaCircuitBreaker":
@@ -527,6 +605,7 @@ class scoped_ollama_breaker:
         self._saved_consecutive_failures = 0
         self._saved_consecutive_successes = 0
         self._saved_half_open_requests = 0
+        self._saved_window: list[bool] = []
 
     def __enter__(self) -> "OllamaCircuitBreaker":
         breaker = get_ollama_circuit_breaker(self.name)
@@ -538,6 +617,7 @@ class scoped_ollama_breaker:
         self._saved_consecutive_failures = breaker._consecutive_failures
         self._saved_consecutive_successes = breaker._consecutive_successes
         self._saved_half_open_requests = breaker._half_open_requests
+        self._saved_window = list(breaker._window)
         # Set directly (not via the sync reset()/force_open() wrappers,
         # which call asyncio.run() and would raise if this context manager
         # is entered from inside an already-running event loop, e.g. a
@@ -561,6 +641,7 @@ class scoped_ollama_breaker:
             self._saved_consecutive_successes,
             self._saved_half_open_requests,
         )
+        breaker._window.extend(self._saved_window)
 
 
 def raise_if_ollama_starved(context: str = "", name: str = "ollama") -> None:

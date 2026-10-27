@@ -42,6 +42,12 @@ ollama:
   # isolated as two separate experiments -- if timeouts recur at 240s,
   # narrow further from here rather than assuming this alone is sufficient.
   timeout_seconds: 240
+  # Bounded retry of TRANSIENT model failures (HTTP 500/502/503/504, timeouts,
+  # connection errors): up to this many extra attempts per call, after a 1 s
+  # then 2 s backoff. Permanent errors (404 model not found, other 4xx, invalid
+  # JSON) are never retried. Only the final failure counts toward the circuit
+  # breaker. 0 turns retrying off. Capped at 5 in code.
+  transient_retries: 2
 
 # How many specialist agents are allowed to run concurrently against
 # Ollama through one AgentManager. The application orchestrator shares that

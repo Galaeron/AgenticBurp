@@ -39,6 +39,65 @@ class OllamaInvalidJSONError(OllamaError):
     pass
 
 
+class OllamaTransientError(OllamaError):
+    """A fault that is plausibly gone on the next attempt: HTTP 500/502/503/504,
+    a request timeout, a refused/failed connection, or a connection dropped
+    mid-response (E6). OllamaClient retries these a bounded number of times
+    (`ollama.transient_retries`); when the retries run out the last one is
+    re-raised unchanged -- still an OllamaError, so every existing
+    `except OllamaError` caller behaves exactly as before. Permanent errors
+    (404 model-not-found, other 4xx, invalid JSON, validation failures) are
+    never this type and are never retried.
+
+    `timeout` marks a request timeout: those already cost the full
+    `timeout_seconds`, so at most MAX_TIMEOUT_RETRIES of them are retried."""
+
+    def __init__(self, message: str = "", *, timeout: bool = False):
+        super().__init__(message)
+        self.timeout = timeout
+
+
+# Bounded transient retry (E6). Measured on job 383f0ebff8e8: 24 of 126
+# critique calls got an Ollama HTTP 500 (3.2 s median time-to-fail) and none was
+# ever retried, so each shipped its findings unreviewed.
+_TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+DEFAULT_TRANSIENT_RETRIES = 2
+# A timed-out attempt already waited timeout_seconds (240 s live); with
+# max_parallel_agents 1, two such retries would stall serial dispatch for ~12
+# minutes. One retry still recovers a one-off slow load.
+MAX_TIMEOUT_RETRIES = 1
+# Hard ceiling on the configured retry count: a typo like `transient_retries:
+# 500` must not turn one failing call into minutes of retrying.
+_MAX_TRANSIENT_RETRIES = 5
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_CAP_SECONDS = 8.0
+
+
+def _is_transient_status(status_code: int) -> bool:
+    """HTTP statuses worth retrying. 404 (model not found) and every other 4xx
+    are permanent and deliberately absent."""
+    return status_code in _TRANSIENT_HTTP_STATUSES
+
+
+def _backoff_delay(retry_number: int) -> float:
+    """Seconds to wait before retry number `retry_number` (1-based): 1 s before
+    the first retry, 2 s before the second, doubling, capped."""
+    return min(_BACKOFF_BASE_SECONDS * (2 ** (max(retry_number, 1) - 1)), _BACKOFF_CAP_SECONDS)
+
+
+async def _backoff_sleep(seconds: float) -> None:
+    """The retry backoff wait. A module-level seam so tests can patch it out;
+    a CancelledError raised while waiting propagates (no retry after cancel)."""
+    await asyncio.sleep(seconds)
+
+
+def _cancellation_requested() -> bool:
+    """True when the current task has a pending cancellation request, so a
+    retry is never started on behalf of a caller that has already cancelled."""
+    cancelling = getattr(asyncio.current_task(), "cancelling", None)
+    return bool(cancelling and cancelling())
+
+
 @dataclass
 class OllamaResult:
     """Parsed response body plus real token usage from the same call --
@@ -126,9 +185,16 @@ class OllamaClient:
     """
 
     def __init__(self, base_url: str, timeout_seconds: float = 120.0,
-                 num_ctx: int | None = None, seed: int | None = None):
+                 num_ctx: int | None = None, seed: int | None = None,
+                 transient_retries: int | None = DEFAULT_TRANSIENT_RETRIES):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        # Max retries (not attempts) after a transient failure; 0 disables.
+        # Clamped to [0, _MAX_TRANSIENT_RETRIES] so the retry is always bounded.
+        # None => the default, so an unset config value never means "unbounded".
+        self.transient_retries = max(0, min(
+            int(DEFAULT_TRANSIENT_RETRIES if transient_retries is None else transient_retries),
+            _MAX_TRANSIENT_RETRIES))
         # Optional run-level Ollama seed (options.seed), a reproducibility control
         # for the decisive run -- NOT a guarantee of identical output across
         # hardware or Ollama/model versions. Because every model call in the
@@ -170,6 +236,14 @@ class OllamaClient:
         self.model_error_count = 0
         self.model_cancelled_count = 0
         self.model_unknown_usage_count = 0
+        # E6 retry visibility. model_retry_count: resends made after a transient
+        # failure (a call retried twice adds 2; one cancelled while backing off
+        # adds 0).
+        # model_retry_recovered_count: calls that needed >= 1 retry and then
+        # returned a usable result. The attempted/error counters above stay
+        # per LOGICAL call so run accounting is unchanged by retries.
+        self.model_retry_count = 0
+        self.model_retry_recovered_count = 0
 
         # Initialize circuit breaker. Uses the shared-registry accessor
         # (not `OllamaCircuitBreaker(...)` directly) so that every
@@ -195,6 +269,10 @@ class OllamaClient:
                 half_open_max_requests=1,
                 excluded_exceptions=(OllamaModelNotFoundError, OllamaInvalidJSONError),
                 enabled=True,
+                # E6 failure-rate rule: also open when >= half of the last 20
+                # calls failed, even if never 3 in a row.
+                window_size=20,
+                failure_rate_threshold=0.5,
             ),
         )
         
@@ -310,102 +388,176 @@ class OllamaClient:
             "think": False,
         }
         url = f"{self.base_url}/api/chat"
-        
+
         # Use circuit breaker and rate limiter. Resolved AT CALL TIME (not
         # self.circuit_breaker, cached at __init__) via current_ollama_breaker
         # (AR-2, LOOP half): when a RunContext has pushed a per-run breaker,
         # this call is governed by THAT run's isolated breaker; otherwise it
         # falls back to self.circuit_breaker -- the same process-wide shared
         # singleton this always used, unchanged for every no-run caller.
+        #
+        # E6 bounded transient retry: the retry loop lives INSIDE the breaker
+        # context on purpose. The breaker sees one call and records one
+        # outcome: a retry that recovers is a breaker SUCCESS, and only the
+        # final failure (retries exhausted, or a permanent error) counts as a
+        # breaker failure. The rate limiter is re-entered per attempt so
+        # retries still respect it, and is NOT held during the backoff sleep.
         queue_started = time.monotonic()
         breaker = circuit_breaker.current_ollama_breaker("ollama")
+        retries_done = 0
+        timeout_retries_done = 0
         async with breaker:
-            async with self.rate_limiter:
-                measurement["queue_ms"] = (time.monotonic() - queue_started) * 1000.0
+            while True:
+                attempt_queue_started = queue_started if retries_done == 0 else time.monotonic()
                 try:
-                    async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                        resp = await client.post(url, json=payload)
-                except httpx.ConnectError as e:
-                    self.audit_logger.log_llm_error(
+                    async with self.rate_limiter:
+                        waited_ms = (time.monotonic() - attempt_queue_started) * 1000.0
+                        measurement["queue_ms"] = (
+                            waited_ms if measurement["queue_ms"] is None
+                            else measurement["queue_ms"] + waited_ms)
+                        parsed, data = await self._send_once(url, payload, model, measurement)
+                except OllamaTransientError as exc:
+                    if not self._may_retry(retries_done) or (
+                            getattr(exc, "timeout", False)
+                            and timeout_retries_done >= MAX_TIMEOUT_RETRIES):
+                        if retries_done:
+                            log.warning(
+                                "Ollama call for model %s failed after %d transient retr%s (%s); giving up",
+                                model, retries_done, "y" if retries_done == 1 else "ies", exc)
+                        raise
+                    retries_done += 1
+                    timeout_retries_done += bool(getattr(exc, "timeout", False))
+                    delay = _backoff_delay(retries_done)
+                    log.warning(
+                        "Ollama transient failure for model %s (%s); retry %d/%d in %.1fs",
+                        model, exc, retries_done, self.transient_retries, delay)
+                    # A CancelledError raised while backing off propagates: no
+                    # further attempt is made once the caller has cancelled.
+                    await _backoff_sleep(delay)
+                    # Counted only once the resend is really about to happen.
+                    self.model_retry_count += 1
+                    # Each resend is its own audited attempt.
+                    self.audit_logger.log_llm_prompt(
                         model=model,
-                        error=OllamaError(safe_error_summary(e)),
+                        system_prompt=validated_system,
+                        user_prompt=validated_user,
                     )
-                    raise OllamaError(
-                        "Could not reach configured Ollama service"
-                    ) from e
-                except httpx.TimeoutException as e:
-                    self.audit_logger.log_llm_error(
-                        model=model,
-                        error=e,
-                    )
-                    raise OllamaError(f"Ollama request timed out after {self.timeout_seconds}s") from e
+                    continue
+                if retries_done:
+                    self.model_retry_recovered_count += 1
+                    log.info("Ollama call for model %s recovered after %d transient retr%s",
+                             model, retries_done, "y" if retries_done == 1 else "ies")
+                return parsed, data
 
-                if resp.status_code == 404:
-                    # Verified directly against a live Ollama instance: this
-                    # is specifically "model tag doesn't exist" -- see
-                    # OllamaModelNotFoundError's own docstring for why this
-                    # must not count as a circuit-breaker failure.
-                    err = OllamaModelNotFoundError(
-                        f"Model '{model}' not found on this Ollama instance"
-                    )
-                    self.audit_logger.log_llm_error(model=model, error=err)
-                    raise err
+    def _may_retry(self, retries_done: int) -> bool:
+        """True while another transient retry is allowed: under the configured
+        bound, and the calling task has not been cancelled."""
+        return retries_done < self.transient_retries and not _cancellation_requested()
 
-                if resp.status_code != 200:
-                    self.audit_logger.log_llm_error(
-                        model=model,
-                        error=OllamaError(f"Ollama returned HTTP {resp.status_code}"),
-                    )
-                    raise OllamaError(f"Ollama returned HTTP {resp.status_code}")
+    async def _send_once(self, url: str, payload: dict, model: str, measurement: dict) -> tuple[dict, dict]:
+        """One HTTP attempt against /api/chat. Transient faults (see
+        _is_transient_status and the transport errors below) raise
+        OllamaTransientError so the caller's retry loop can recognise them;
+        everything else raises exactly what it always did and is never retried."""
+        from harness.security import safe_error_summary
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                resp = await client.post(url, json=payload)
+        except httpx.ConnectError as e:
+            self.audit_logger.log_llm_error(
+                model=model,
+                error=OllamaError(safe_error_summary(e)),
+            )
+            raise OllamaTransientError(
+                "Could not reach configured Ollama service"
+            ) from e
+        except httpx.TimeoutException as e:
+            self.audit_logger.log_llm_error(
+                model=model,
+                error=e,
+            )
+            raise OllamaTransientError(f"Ollama request timed out after {self.timeout_seconds}s",
+                                       timeout=True) from e
+        except httpx.RemoteProtocolError as e:
+            self.audit_logger.log_llm_error(
+                model=model,
+                error=OllamaError(safe_error_summary(e)),
+            )
+            raise OllamaTransientError("Ollama closed the connection unexpectedly") from e
 
-                data = resp.json()
-                if not isinstance(data, dict):
-                    raise OllamaInvalidJSONError("Ollama returned an invalid response envelope")
-                def count(key):
-                    value = data.get(key)
-                    return value if type(value) is int and value >= 0 else None
-                prompt_tokens, completion_tokens = count("prompt_eval_count"), count("eval_count")
-                measurement.update(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                                   completed=True)
-                duration = data.get("eval_duration")
-                if type(duration) in (int, float) and duration >= 0:
-                    measurement["generation_ms"] = duration / 1_000_000.0
-                data["_inference_measurement"] = measurement
-                self.model_completed_count += 1
-                self.model_prompt_tokens += prompt_tokens or 0
-                self.model_completion_tokens += completion_tokens or 0
-                if prompt_tokens is None or completion_tokens is None:
-                    self.model_unknown_usage_count += 1
-                self.rate_limiter.record_usage(prompt_tokens, completion_tokens)
-                content = data.get("message", {}).get("content", "")
-                if not content:
-                    self.audit_logger.log_llm_error(
-                        model=model,
-                        error=OllamaError("Ollama returned an empty message body"),
-                    )
-                    raise OllamaError("Ollama returned an empty message body")
+        if resp.status_code != 200:
+            if _is_transient_status(resp.status_code):
+                self.audit_logger.log_llm_error(
+                    model=model,
+                    error=OllamaError(f"Ollama returned HTTP {resp.status_code}"),
+                )
+                raise OllamaTransientError(f"Ollama returned HTTP {resp.status_code}")
 
-                try:
-                    parsed = _loads_lenient(_strip_json_fence(content))
-                    if not isinstance(parsed, dict):
-                        raise OllamaInvalidJSONError("Model output must be a JSON object")
+            if resp.status_code == 404:
+                # Verified directly against a live Ollama instance: this
+                # is specifically "model tag doesn't exist" -- see
+                # OllamaModelNotFoundError's own docstring for why this
+                # must not count as a circuit-breaker failure.
+                err = OllamaModelNotFoundError(
+                    f"Model '{model}' not found on this Ollama instance"
+                )
+                self.audit_logger.log_llm_error(model=model, error=err)
+                raise err
 
-                    # Log the response
-                    self.audit_logger.log_llm_response(
-                        model=model, response=content,
-                        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                    )
-                    
-                    return parsed, data
-                except json.JSONDecodeError as e:
-                    self.audit_logger.log_llm_error(
-                        model=model,
-                        error=OllamaError(safe_error_summary(e)),
-                    )
-                    raise OllamaInvalidJSONError(
-                        f"Model '{model}' did not return valid JSON. "
-                        "Response content omitted."
-                    ) from e
+            self.audit_logger.log_llm_error(
+                model=model,
+                error=OllamaError(f"Ollama returned HTTP {resp.status_code}"),
+            )
+            raise OllamaError(f"Ollama returned HTTP {resp.status_code}")
+
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise OllamaInvalidJSONError("Ollama returned an invalid response envelope")
+        def count(key):
+            value = data.get(key)
+            return value if type(value) is int and value >= 0 else None
+        prompt_tokens, completion_tokens = count("prompt_eval_count"), count("eval_count")
+        measurement.update(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                           completed=True)
+        duration = data.get("eval_duration")
+        if type(duration) in (int, float) and duration >= 0:
+            measurement["generation_ms"] = duration / 1_000_000.0
+        data["_inference_measurement"] = measurement
+        self.model_completed_count += 1
+        self.model_prompt_tokens += prompt_tokens or 0
+        self.model_completion_tokens += completion_tokens or 0
+        if prompt_tokens is None or completion_tokens is None:
+            self.model_unknown_usage_count += 1
+        self.rate_limiter.record_usage(prompt_tokens, completion_tokens)
+        content = data.get("message", {}).get("content", "")
+        if not content:
+            self.audit_logger.log_llm_error(
+                model=model,
+                error=OllamaError("Ollama returned an empty message body"),
+            )
+            raise OllamaError("Ollama returned an empty message body")
+
+        try:
+            parsed = _loads_lenient(_strip_json_fence(content))
+            if not isinstance(parsed, dict):
+                raise OllamaInvalidJSONError("Model output must be a JSON object")
+
+            # Log the response
+            self.audit_logger.log_llm_response(
+                model=model, response=content,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            )
+
+            return parsed, data
+        except json.JSONDecodeError as e:
+            self.audit_logger.log_llm_error(
+                model=model,
+                error=OllamaError(safe_error_summary(e)),
+            )
+            raise OllamaInvalidJSONError(
+                f"Model '{model}' did not return valid JSON. "
+                "Response content omitted."
+            ) from e
 
     async def list_models(self) -> list[str]:
         """Model tags Ollama reports via GET /api/tags. Best-effort: returns []
