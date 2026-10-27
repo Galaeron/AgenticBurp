@@ -26,6 +26,11 @@ class CorsAgent(BaseAgent):
     """
     name = "cors"
 
+    # E8: CORS is judged from response headers (Access-Control-*, Vary), so a
+    # long HTML/JSON body adds prompt tokens without adding evidence. A
+    # high-signal marker beyond this budget is still excerpted by _user_prompt.
+    input_body_chars = 1500
+
     tactical_guide = """
 1. Read the Access-Control-Allow-Origin value literally: `*` with
    credentials disallowed is normal; a REFLECTED Origin (the response
