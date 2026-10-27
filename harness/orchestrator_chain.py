@@ -10,6 +10,7 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 from __future__ import annotations
 
 import contextlib
+import copy
 import time
 import uuid
 
@@ -31,6 +32,57 @@ from harness.objective_profiles import ObjectiveTask
 # FR-6 (F10) sentinel appended to a header value to make it a genuinely invalid
 # credential control -- see `_invalidated_headers` below.
 _FR6_INVALID_SENTINEL = "_fr6_invalid"
+
+
+class _ConfirmationCache:
+    """Within-run memo of confirmation results for investigate_engagement().
+
+    Keyed by confirmation_cache_key() -- which includes the IDENTITY (auth headers)
+    and finding subtype, not just (validator, method, url, body), so a probe AS one
+    identity never returns a result computed AS another (R03). Each entry also
+    remembers the case its sends were recorded under."""
+
+    def __init__(self, run_context, case_for):
+        self._run_context = run_context
+        self._case_for = case_for  # (vulnerability_class, exchange) -> case id
+        self._entries: dict[tuple, tuple] = {}  # key -> (result, case it ran under)
+
+    async def validate(self, validator, finding_obj, exchange, case_ref=None):
+        """Wrapper around validator.validate() that caches results within this
+        run. The key includes identity + finding class (R03) so cross-identity
+        / cross-subtype cases do not collide. A hit returns the previous
+        ValidationResult without any HTTP/container work.
+
+        The leg's sends are recorded under `case_ref` (default: the case
+        _apply builds for this class and exchange), so the exchanges its
+        result names resolve for that case's proof. A hit for the same case
+        returns the cached result. A hit for another case returns a copy
+        without the named exchanges, which were recorded under the first case
+        and do not resolve here: that proof stays a candidate. The cached
+        original is never changed."""
+        vulnerability_class = getattr(finding_obj, "vulnerability_class", None)
+        key = confirmation_cache_key(validator.name, exchange, vulnerability_class)
+        if case_ref is None:
+            try:
+                case_ref = self._case_for(getattr(finding_obj, "vulnerability_class", ""), exchange)
+            except Exception:
+                case_ref = ""
+        if key in self._entries:
+            cached, ran_under = self._entries[key]
+            if ran_under == case_ref:
+                return cached
+            other_case = copy.copy(cached)
+            other_case.baseline_artifact_id = other_case.attack_artifact_id = ""
+            other_case.control_artifact_ids = ()
+            return other_case
+        run_context = self._run_context
+        before = getattr(getattr(run_context, "transport", None), "sent_count", None)
+        with case_scope(case_ref):
+            result = await validator.validate(finding_obj, exchange)
+        if before is not None:
+            result.sent_count = run_context.transport.sent_count - before
+        self._entries[key] = (result, case_ref)
+        return result
 
 
 import re as _re
@@ -870,42 +922,10 @@ class ChainMixin:
         )
 
         # Memoisation cache: avoid re-running the same validator on the same
-        # endpoint during one investigate_engagement() call. Keyed by
-        # confirmation_cache_key() -- which includes the IDENTITY (auth headers)
-        # and finding subtype, not just (validator, method, url, body), so a probe
-        # AS one identity never returns a result computed AS another (R03).
+        # endpoint during one investigate_engagement() call (see _ConfirmationCache).
         from harness.validators.base import ValidationResult as _VR, proof_artifact_kwargs
-        _confirmation_cache: dict[tuple, _VR] = {}
-
-        async def _cached_validate(validator, finding_obj, exchange, case_ref=None):
-            """Wrapper around validator.validate() that caches results within this
-            run. The key includes identity + finding class (R03) so cross-identity
-            / cross-subtype cases do not collide. A hit returns the previous
-            ValidationResult without any HTTP/container work.
-
-            The leg's sends are recorded under `case_ref` (default: the case
-            _apply builds for this class and exchange), so the exchanges its
-            result names resolve for that case's proof. A hit for another case
-            keeps the first case's artifacts, which do not resolve here: that
-            proof stays a candidate."""
-            key = confirmation_cache_key(
-                validator.name, exchange,
-                getattr(finding_obj, "vulnerability_class", None))
-            if key in _confirmation_cache:
-                return _confirmation_cache[key]
-            if case_ref is None:
-                try:
-                    case_ref = _rb4_case(getattr(finding_obj, "vulnerability_class", ""),
-                                         exchange).case_id
-                except Exception:
-                    case_ref = ""
-            before = getattr(getattr(run_context, "transport", None), "sent_count", None)
-            with case_scope(case_ref):
-                result = await validator.validate(finding_obj, exchange)
-            if before is not None:
-                result.sent_count = run_context.transport.sent_count - before
-            _confirmation_cache[key] = result
-            return result
+        _cached_validate = _ConfirmationCache(
+            run_context, lambda cls, exchange: _rb4_case(cls, exchange).case_id).validate
 
         # RB-4/INV-2: this path (worklist_investigator's confirm_fn for agent
         # findings, and its precondition_fn for every shape-driven leg dispatch

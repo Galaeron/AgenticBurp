@@ -67,6 +67,13 @@ def _destination_host(location: str, request_url: str) -> str:
         return ""
 
 
+def _redirects_to_sentinel(resp, request_url: str) -> bool:
+    """True when this response is a real redirect whose parsed destination host is
+    the sentinel: the attack's own test, applied to the proof control."""
+    return (resp.status_code in _REDIRECT_STATUSES
+            and _destination_host(resp.headers.get("location", ""), request_url) == _SENTINEL_HOST)
+
+
 def _redirect_params(exchange: HttpExchange) -> list[tuple[str, str]]:
     qs = dict(parse_qsl(urlsplit(exchange.url).query, keep_blank_values=True))
     out = []
@@ -161,6 +168,10 @@ class OpenRedirectValidator(Validator):
                                                       exchange.request_body or "")
                     control_url, control_body = mutate(exchange, loc, param, f"/{loc}-{param}")
                     control = await self._proof_send(method, control_url, headers, control_body)
+                    # Rules out a redirect the parameter does not control: the on-origin
+                    # path must not reach the sentinel host. Unsent or redirecting, it names nothing.
+                    if control is not None and _redirects_to_sentinel(control, control_url):
+                        control = None
                     return ValidationResult(
                         self.name, "confirmed", "open_redirect", confidence=0.9, confirmed=True,
                         summary=f"Open redirect confirmed: the {loc} parameter {param!r} controls the "

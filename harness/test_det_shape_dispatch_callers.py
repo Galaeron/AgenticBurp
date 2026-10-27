@@ -13,14 +13,18 @@ precondition must make the positive case fail.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import subprocess
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from harness import store
 from harness.models import HttpExchange
+from harness.orchestrator_chain import _ConfirmationCache
 from harness.role_crawl import RoleSession
+from harness.run_context import current_case_ref
 from harness.test_engagement_transport_callers import _EngagementCallerBase
 from harness.validators.base import ValidationResult
 
@@ -121,6 +125,69 @@ class JwtCookieDispatchCallerTests(_EngagementCallerBase, unittest.TestCase):
 
     def test_opaque_session_cookie_does_not_dispatch_the_forge_leg(self):
         self.assertEqual(self._run_jwt("opaque-session-0123456789"), [])
+
+
+class ConfirmationCacheWiringCallerTests(_EngagementCallerBase, unittest.TestCase):
+    """investigate_engagement builds one confirmation cache and runs each leg
+    through it under its own case: the one _apply files the proof under, because a
+    result's exchanges resolve only for the case they were recorded under. The jwt
+    leg is stubbed to confirm and name three exchanges; a spy on the cache class
+    records what the engagement built."""
+
+    def _run_jwt_leg(self):
+        roles = [RoleSession("anonymous", {}), RoleSession("user", {"Cookie": f"session={_jwt()}"})]
+        built, legs = [], []
+
+        class SpyCache(_ConfirmationCache):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                built.append(self)
+
+        async def confirmed_leg(validator, finding, exchange, *args, **kwargs):
+            legs.append((validator, finding, exchange, current_case_ref()))
+            return ValidationResult("jwt_forge", "confirmed", "jwt", confidence=0.9, confirmed=True,
+                                    summary="stub").with_artifacts(
+                baseline="art-b", attack="art-a", controls=["art-c"])
+
+        result, _, _ = self._run(
+            self._target(), max_requests=500, endpoints=[_PROFILE_NODE], roles=roles,
+            extra_patches=[patch("harness.validators.jwt_forge_validator.JwtForgeValidator.validate",
+                                 new=confirmed_leg),
+                           patch("harness.orchestrator_chain._ConfirmationCache", SpyCache)])
+        profile = [leg for leg in legs if leg[2].url.endswith("/api/profile")]
+        confirmed = [f for f in result["findings"] if f.get("confirmed_by_leg") == "jwt_forge"]
+        return built, profile, confirmed
+
+    def test_one_cache_runs_the_leg_under_the_case_its_proof_is_filed_under(self):
+        built, profile, confirmed = self._run_jwt_leg()
+        self.assertEqual(len(built), 1, "the engagement did not build exactly one confirmation cache")
+        self.assertEqual(len(profile), 1, "the jwt leg did not run once through the cache")
+        self.assertEqual(len(confirmed), 1)
+        case_id = confirmed[0].get("case_id")
+        self.assertTrue(case_id, "_apply stamped no case on the confirmed finding")
+        self.assertEqual(profile[0][3], case_id,
+                         "the leg's sends would be recorded under another case than its proof")
+        proof = [p for p in store.proofs_for_case(case_id) if p["proof_id"] == confirmed[0]["proof_id"]]
+        self.assertEqual(len(proof), 1)
+        self.assertEqual((proof[0]["baseline_artifact_id"], proof[0]["attack_artifact_id"],
+                          proof[0]["control_artifact_ids"]), ("art-b", "art-a", ["art-c"]))
+
+    def test_that_cache_keeps_the_exchanges_for_its_case_and_strips_them_for_another(self):
+        built, profile, _ = self._run_jwt_leg()
+        validator, finding, exchange, _ = profile[0]
+
+        async def hits():
+            return (await built[0].validate(validator, finding, exchange),
+                    await built[0].validate(validator, finding, exchange, case_ref="another-case"))
+        same_case, other_case = asyncio.run(hits())
+        # Both were hits: the stubbed leg ran once. The case a miss derives is the
+        # case _apply uses, so its hit keeps the exchanges; another case's does not.
+        self.assertEqual(len(profile), 1)
+        self.assertEqual((same_case.baseline_artifact_id, same_case.attack_artifact_id,
+                          same_case.control_artifact_ids), ("art-b", "art-a", ("art-c",)))
+        self.assertEqual((other_case.baseline_artifact_id, other_case.attack_artifact_id,
+                          other_case.control_artifact_ids), ("", "", ()))
+        self.assertTrue(other_case.confirmed)
 
 
 if __name__ == "__main__":

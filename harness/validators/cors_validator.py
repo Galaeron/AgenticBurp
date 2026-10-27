@@ -312,7 +312,8 @@ class CorsValidator(Validator):
         granting probe. Baseline: the same request without an Origin header.
         Control: a second, random untrusted origin; for a reflection it is named
         only when that origin was reflected too (any origin, not one configured
-        partner). Empty when the grant was not sent through a run."""
+        partner), for a null grant only when it was not granted (not every origin).
+        Empty when the grant was not sent through a run."""
         grant = next((t for t in tests if t.vulnerable and t.test_name in _ORIGIN_GRANT_TESTS
                       and t.artifact_id), None)
         if grant is None:
@@ -320,9 +321,15 @@ class CorsValidator(Validator):
         baseline = await self._send_request(exchange.url, headers={})
         origin = f"https://{secrets.token_hex(4)}.cors-control.invalid"
         control = await self._send_request(exchange.url, headers={"Origin": origin})
-        if (control is not None and grant.test_name == "Origin Reflection"
-                and control.headers.get("Access-Control-Allow-Origin", "").lower() != origin):
-            control = None
+        if control is not None:
+            acao = control.headers.get("Access-Control-Allow-Origin", "").lower()
+            if grant.test_name == "Origin Reflection":
+                # Rules out one configured partner: the random origin must be reflected too.
+                if acao != origin:
+                    control = None
+            elif acao in (origin, "*"):
+                # Rules out a blanket grant: "null" must be trusted, not every origin.
+                control = None
         return {"baseline": baseline, "attack": grant.artifact_id, "controls": [control]}
 
     def _get_base_url(self, url: str) -> str:

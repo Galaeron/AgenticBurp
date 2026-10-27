@@ -163,6 +163,15 @@ class SsrfValidator(Validator):
             self._record_failure(unsent, label, e.__class__.__name__)
             return None
 
+    async def _proof_send(self, method: str, url: str, headers: dict, body: str, label: str):
+        """One extra exchange a confirmation's proof names (Ticket 6): the answer,
+        or None when it got none. Best effort -- any failure leaves that artifact
+        unnamed and never changes the verdict the callback already established."""
+        try:
+            return await self._send(method, url, headers, body, None, label)
+        except Exception:
+            return None
+
     @staticmethod
     def _record_failure(unsent: list | None, label: str, failure: str) -> None:
         if unsent is not None:
@@ -247,10 +256,12 @@ class SsrfValidator(Validator):
                 # that is not the collaborator (control). Neither is a verdict input.
                 baseline = control = None
                 if self.run_context is not None:  # outside a run they would name nothing
-                    baseline = await self._send(method, exchange.url, headers, exchange.request_body or "",
-                                                None, "proof baseline")
-                    control = await self._send(method, *self._mutated(exchange, loc, param, self._INBAND_CLOSED),
-                                               None, "proof control")
+                    baseline = await self._proof_send(method, exchange.url, headers,
+                                                      exchange.request_body or "", "proof baseline")
+                    ctrl_url, ctrl_body = self._mutated(exchange, loc, param, self._INBAND_CLOSED)
+                    # Rules out the request alone causing the callback; named only if answered.
+                    control = await self._proof_send(method, ctrl_url, headers, ctrl_body,
+                                                     "proof control")
                 return ValidationResult(
                     self.name, "confirmed", "ssrf", confidence=0.95, confirmed=True,
                     summary=f"SSRF confirmed: the server fetched an attacker-controlled URL placed in "

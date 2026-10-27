@@ -41,6 +41,7 @@ from harness.validators.csrf_validator import CsrfValidator
 from harness import browser_driver
 from harness import driver_capture
 from harness.testing_fixtures.leg_fault import bound_test_names, outcomes_with_leg_severed
+from harness.testing_fixtures.loopback_port import bind_browser_safe
 
 _FIXTURE = (Path(__file__).resolve().parent.parent
             / "testing" / "leg-verification" / "vuln_fixture.py")
@@ -143,7 +144,7 @@ class LiveLegVerificationTest(EvidenceCase):
         global_throttle.configure(0)
         app = _load_make_app()()
         cls._counter = _RequestCounter(app)  # Rule 4: prove each leg reached the fixture
-        cls._server = make_server("127.0.0.1", 0, cls._counter, threaded=True)
+        cls._server = bind_browser_safe(lambda: make_server("127.0.0.1", 0, cls._counter, threaded=True))
         cls._port = cls._server.server_address[1]
         cls._thread = threading.Thread(target=cls._server.serve_forever, daemon=True)
         cls._thread.start()

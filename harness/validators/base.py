@@ -49,11 +49,14 @@ def artifact_id_of(sent) -> str:
     """The run's exchange artifact id behind one send: an ExecutionOutcome, an
     httpx.Response built by the run transport (GatedAsyncClient), a SentAnswer,
     or an id.
-    "" for a send that never went through a run (plain client, Burp, fakes)."""
+    "" for a send that never went through a run (plain client, Burp, fakes), and
+    for an outcome that was refused or errored: nothing was sent and answered."""
     if sent is None:
         return ""
     if isinstance(sent, str):
         return sent
+    if not getattr(sent, "ok", True):
+        return ""
     artifact_id = getattr(sent, "artifact_id", None)
     if isinstance(artifact_id, str):
         return artifact_id
