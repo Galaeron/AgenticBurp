@@ -22,6 +22,12 @@ class CspAgent(BaseAgent):
     """
     name = "csp"
 
+    # E8: CSP is judged from response headers, plus a possible
+    # <meta http-equiv="Content-Security-Policy"> tag in the HTML head.
+    # 2,500 characters covers a normal head; a meta CSP beyond it is still
+    # excerpted (base_agent._SIGNAL_RE matches "http-equiv").
+    input_body_chars = 2500
+
     tactical_guide = """
 1. Read the actual Content-Security-Policy header (or its absence) on THIS
    response -- don't assume a site-wide policy from one exchange.
