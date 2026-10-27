@@ -9,7 +9,10 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
+import functools
+
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
+from harness.execution_registry import ExecutionRegistry
 from harness.validators.base import ValidationResult, proof_artifact_kwargs
 
 
@@ -485,6 +488,9 @@ class ConfirmMixin:
                 config=_cfg,
                 gate_config=per_run_gate_config(_cfg, getattr(self, "validator_registry", None)))
         _run_id = run_context.run_id
+        registry = getattr(run_context, "execution_registry", None)
+        if not isinstance(registry, ExecutionRegistry):
+            registry = None
         _template_id = evidence._short(
             (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
         from harness.categories import canonicalize as _vf_canon
@@ -546,7 +552,16 @@ class ConfirmMixin:
                         if not applies(candidate, exchange):
                             continue
                         routed = candidate
-                    jobs.append(self._in_case(case, self._maybe_replay(validator, routed, exchange)))
+                    if registry is None:
+                        work = self._maybe_replay(validator, routed, exchange)
+                    else:
+                        # E4: ask the run's registry first, so a check the worklist
+                        # or the coverage drive already ran on this shape is not run
+                        # again. The run still happens inside this case's scope.
+                        work = registry.run(
+                            validator, routed, exchange, case_ref=case.case_id,
+                            call=functools.partial(self._maybe_replay, validator, routed, exchange))
+                    jobs.append(self._in_case(case, work))
                     plan = validator.plan(routed, exchange)
                     if plan is not None and routed is not finding:
                         plan = plan.model_copy(update={"finding_class": finding.vulnerability_class})

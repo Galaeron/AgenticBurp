@@ -21,6 +21,7 @@ integrate loop.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -30,11 +31,16 @@ from harness.models import HttpExchange
 from harness.safety_gate import SafetyGateBlocked
 
 
-def captured_nodes(node, base_url, roles):
-    """Yield each observed shape under its own matching supplied identity."""
-    from harness.engagement import capture_identity_key
+def captured_nodes(node, base_url, roles, include_probes=False):
+    """Yield each observed shape under its own matching supplied identity.
+
+    Access-matrix probe variants (E5b) are replay templates for the coverage
+    drive; the worklist investigates full captures, so they are left out unless
+    `include_probes`."""
+    from harness.engagement import ACCESS_MATRIX_SOURCE, capture_identity_key
     from harness.scope_lock import parse_scope_url
-    variants = node.get("capture_variants") or []
+    variants = [v for v in node.get("capture_variants") or []
+                if include_probes or v.get("source") != ACCESS_MATRIX_SOURCE]
     if not variants:
         yield node
         return
@@ -51,6 +57,50 @@ def captured_nodes(node, base_url, roles):
         for role in matches:
             yield dict(node, template=variant["template"], capture=variant,
                        probe_session=role, reachable_roles=[role.role])
+
+
+def _sha256(text) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _capture_fingerprint(node):
+    """What makes one replayed capture the same investigation as another: the
+    route and method, the identity (credentials AND principal), the whole request
+    (query, object ids, content type, body) and the response it drew (status,
+    body hash). Response HEADERS are left out on purpose: a Date or ETag header is
+    the whole difference between most repeated captures of one request. None for
+    a node with no capture of its own, which is never a duplicate."""
+    capture = node.get("capture")
+    if not capture:
+        return None
+    template = capture.get("template") or {}
+    principal = getattr(node.get("probe_session"), "principal_id", None)
+    return (str(node.get("method") or "GET").upper(), node.get("path"),
+            capture.get("identity_key"), principal() if callable(principal) else None,
+            template.get("query") or "", tuple(template.get("path_ids") or ()),
+            template.get("object_id"), template.get("content_type") or "",
+            _sha256(template.get("body")), capture.get("response_status"),
+            capture.get("response_body_sha256") or _sha256(capture.get("response_body")))
+
+
+def _without_duplicate_captures(nodes, duplicates: list):
+    """Pass each node through once per distinct capture; a node whose capture is
+    identical to an earlier one is recorded in `duplicates` (with the capture that
+    covers it) instead of being investigated again."""
+    first_seen: dict = {}
+    for node in nodes:
+        fingerprint = _capture_fingerprint(node)
+        if fingerprint is not None:
+            if fingerprint in first_seen:
+                principal = getattr(node.get("probe_session"), "principal_id", None)
+                duplicates.append({"path": node.get("path"),
+                                   "method": node.get("method", "GET"),
+                                   "principal": principal() if callable(principal) else None,
+                                   "capture_id": node["capture"].get("capture_id"),
+                                   "covered_by": first_seen[fingerprint]})
+                continue
+            first_seen[fingerprint] = node["capture"].get("capture_id")
+        yield node
 
 
 def capture_problem(node):
@@ -317,9 +367,11 @@ async def investigate_worklist(
     precondition_run = 0
     eligible_count = 0
     skipped: list[dict] = []
+    duplicates: list[dict] = []
 
-    nodes = (variant for node in state.worklist(worklist_limit)
-             for variant in captured_nodes(node, base_url, roles))
+    nodes = _without_duplicate_captures(
+        (variant for node in state.worklist(worklist_limit)
+         for variant in captured_nodes(node, base_url, roles)), duplicates)
     for node in nodes:
         problem = capture_problem(node)
         if problem:
@@ -470,5 +522,8 @@ async def investigate_worklist(
             "investigated": investigated,
             "skipped": skipped,
             "skipped_by_reason": by_reason,
+            # E4: captures identical to an earlier one (same route, identity,
+            # request and response) that were not investigated a second time.
+            "duplicates_skipped": duplicates,
         })
     return outcomes

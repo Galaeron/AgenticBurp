@@ -22,6 +22,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
 # standalone one when it is None".
 from harness.run_context import transport_for, ExecutionOutcome, case_scope
+from harness.execution_registry import ExecutionRegistry
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
 # same shadowing reason as above (several methods below have a `run_context` parameter).
 from harness import run_context as _run_context_mod
@@ -38,21 +39,22 @@ _FR6_INVALID_SENTINEL = "_fr6_invalid"
 class _ConfirmationCache:
     """Within-run memo of confirmation results for investigate_engagement().
 
-    Keyed by confirmation_cache_key() -- which includes the IDENTITY (auth headers)
-    and finding subtype, not just (validator, method, url, body), so a probe AS one
-    identity never returns a result computed AS another (R03). Each entry also
-    remembers the case its sends were recorded under."""
+    Delegates to the run's ExecutionRegistry (execution_registry.py), whose key
+    includes the IDENTITY (auth headers) and finding subtype, so a probe AS one
+    identity never returns a result computed AS another (R03), and which the
+    model-review path shares so one run does not repeat a check across paths.
+    Each entry also remembers the case its sends were recorded under."""
 
-    def __init__(self, run_context, case_for):
+    def __init__(self, run_context, case_for, registry=None):
         self._run_context = run_context
         self._case_for = case_for  # (vulnerability_class, exchange) -> case id
-        self._entries: dict[tuple, tuple] = {}  # key -> (result, case it ran under)
+        self._registry = registry if registry is not None else ExecutionRegistry(
+            budget=getattr(run_context, "budget", None))
 
     async def validate(self, validator, finding_obj, exchange, case_ref=None):
         """Wrapper around validator.validate() that caches results within this
-        run. The key includes identity + finding class (R03) so cross-identity
-        / cross-subtype cases do not collide. A hit returns the previous
-        ValidationResult without any HTTP/container work.
+        run. A hit returns the previous ValidationResult without any
+        HTTP/container work.
 
         The leg's sends are recorded under `case_ref` (default: the case
         _apply builds for this class and exchange), so the exchanges its
@@ -61,29 +63,22 @@ class _ConfirmationCache:
         without the named exchanges, which were recorded under the first case
         and do not resolve here: that proof stays a candidate. The cached
         original is never changed."""
-        vulnerability_class = getattr(finding_obj, "vulnerability_class", None)
-        key = confirmation_cache_key(validator.name, exchange, vulnerability_class)
         if case_ref is None:
             try:
                 case_ref = self._case_for(getattr(finding_obj, "vulnerability_class", ""), exchange)
             except Exception:
                 case_ref = ""
-        if key in self._entries:
-            cached, ran_under = self._entries[key]
-            if ran_under == case_ref:
-                return cached
-            other_case = copy.copy(cached)
-            other_case.baseline_artifact_id = other_case.attack_artifact_id = ""
-            other_case.control_artifact_ids = ()
-            return other_case
         run_context = self._run_context
-        before = getattr(getattr(run_context, "transport", None), "sent_count", None)
-        with case_scope(case_ref):
-            result = await validator.validate(finding_obj, exchange)
-        if before is not None:
-            result.sent_count = run_context.transport.sent_count - before
-        self._entries[key] = (result, case_ref)
-        return result
+
+        async def run_it():
+            before = getattr(getattr(run_context, "transport", None), "sent_count", None)
+            with case_scope(case_ref):
+                result = await validator.validate(finding_obj, exchange)
+            if before is not None:
+                result.sent_count = run_context.transport.sent_count - before
+            return result
+        return await self._registry.run(validator, finding_obj, exchange,
+                                        case_ref=case_ref, call=run_it)
 
 
 import re as _re
@@ -1006,8 +1001,17 @@ class ChainMixin:
         # Memoisation cache: avoid re-running the same validator on the same
         # endpoint during one investigate_engagement() call (see _ConfirmationCache).
         from harness.validators.base import ValidationResult as _VR, proof_artifact_kwargs
+        # E4: the run's one execution registry, also read by the model-review path
+        # (orchestrator_confirm._validate_findings) through run_context, so a check
+        # that ran for the worklist is not run again for the review or the drive.
+        _exec_registry = getattr(run_context, "execution_registry", None)
+        if not isinstance(_exec_registry, ExecutionRegistry):
+            _exec_registry = ExecutionRegistry(budget=getattr(run_context, "budget", None))
+            if run_context is not None:
+                run_context.execution_registry = _exec_registry
         _cached_validate = _ConfirmationCache(
-            run_context, lambda cls, exchange: _rb4_case(cls, exchange).case_id).validate
+            run_context, lambda cls, exchange: _rb4_case(cls, exchange).case_id,
+            registry=_exec_registry).validate
 
         # RB-4/INV-2: this path (worklist_investigator's confirm_fn for agent
         # findings, and its precondition_fn for every shape-driven leg dispatch
@@ -1554,6 +1558,7 @@ class ChainMixin:
                 "chain_rounds": 0,
                 "application_semantic_model": _asm.to_dict() if _asm else None,
                 "experiments": _experiments,
+                "execution_registry": _exec_registry.stats(),
                 "coverage": {},
                 "workflows": workflow_results,
                 "task_graph": state.graph.to_dict(),
@@ -1821,6 +1826,7 @@ class ChainMixin:
         _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds
                               if self.coverage_drive_seconds > 0 else None)
         coverage: dict = {}
+        _prerequisite_blocks: dict = {}   # (endpoint, identity) -> grouped entry (E5b)
         try:
             from harness import coverage_tracker
             investigated_paths = {o.get("path") for o in outcomes if o.get("path")}
@@ -1898,20 +1904,46 @@ class ChainMixin:
                         all_findings.append(cf)
                     return res
 
+                # E5b: whether each (endpoint, identity) has a request to replay,
+                # worked out ONCE here rather than per check. Only requests that were
+                # observed as that identity count; nothing is built for an identity
+                # that was never probed or captured on the endpoint.
+                from harness.engagement import capture_identity_key, replayable_variants
+                _identity_role = {_pid(r): r.role for r in roles}
+                _replayable = {
+                    (ep_key, identity): replayable_variants(ep, capture_identity_key(headers))
+                    for ep_key, ep in state.endpoints.items() if ep.capture_variants
+                    for identity, headers in _role_headers.items()}
+
                 async def _run_leg_core(identity, method, path, check, case_key=None):
-                    ep = state.endpoints.get(f"{method} {path}")
+                    ep_key = f"{method} {path}"
+                    ep = state.endpoints.get(ep_key)
                     if ep is None or not ep.capture_variants:
                         return await _run_captured_leg(identity, method, path, check, case_key)
-                    from harness.engagement import capture_identity_key
-                    key = capture_identity_key(_role_headers.get(identity, {}))
-                    variants = [v for v in ep.capture_variants if v.get("identity_key") == key]
+                    variants = _replayable.get((ep_key, identity))
+                    if variants is None:
+                        variants = replayable_variants(
+                            ep, capture_identity_key(_role_headers.get(identity, {})))
                     if not variants:
+                        # The cell's reason stays "missing_principal"; the pair is
+                        # reported once, with how many checks it blocked.
+                        role = _identity_role.get(identity, identity)
+                        block = _prerequisite_blocks.setdefault((ep_key, identity), {
+                            "endpoint": ep_key, "identity": identity,
+                            "missing": "no request captured as this identity",
+                            "action": ("capture this request with no credentials"
+                                       if role == "anonymous" else
+                                       f"capture this request while signed in as {role}")
+                                      + " (or add it to the role crawl seed)",
+                            "checks_affected": 0})
+                        block["checks_affected"] += 1
                         return _VR(check.confirmation, "inconclusive", check.vulnerability_class,
                                    summary="missing_principal: capture the request as this identity")
                     selected_roles = [r for r in roles if _pid(r) == identity]
                     outcomes = []
                     for node in worklist_investigator.captured_nodes(
-                            dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles):
+                            dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles,
+                            include_probes=True):
                         problem = worklist_investigator.capture_problem(node)
                         if problem:
                             outcomes.append(_VR(check.confirmation, "inconclusive", check.vulnerability_class,
@@ -2024,7 +2056,15 @@ class ChainMixin:
             # chaining hypotheses that drove the re-ranking.
             "application_semantic_model": _asm.to_dict() if _asm else None,
             "experiments": _experiments,
+            # E4: how many validator executions the run's registry served without
+            # running again, and the requests that saved (by validator).
+            "execution_registry": _exec_registry.stats(),
             "coverage": coverage,
+            # E5b: each (endpoint, identity) the coverage drive could not replay
+            # because no request was observed as that identity, once, with the
+            # number of checks it blocked and what to supply.
+            "prerequisite_blocks": sorted(_prerequisite_blocks.values(),
+                                          key=lambda b: (b["endpoint"], b["identity"])),
             # Stage reservations in effect: requests withheld for the coverage drive,
             # what the earlier stages spent, and the stage time bounds (0 = none).
             "stage_budgets": {"coverage_request_reserve": _coverage_hold,

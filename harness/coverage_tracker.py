@@ -34,13 +34,24 @@ import json
 from collections import deque
 
 
-def _fair_cells(items):
-    """Interleave routes and identities; rotate the first check class per group."""
+def _fair_cells(items, unauthenticated=frozenset()):
+    """Order queued cells so a small leg budget spreads over identities and routes.
+
+    One group per (identity, endpoint), visited endpoint by endpoint with that
+    endpoint's identities in turn, signed-in principals ahead of `unauthenticated`
+    ones; each pass takes one check from every group, and the first check rotates
+    from group to group so the check mix varies. Visiting the groups in matrix
+    order drained the first identity (alphabetically, anonymous) before any other."""
     groups = {}
     for item in items:
         groups.setdefault(item[:2], []).append(item)
+    endpoint_rank = {}
+    for _ident, endpoint in groups:
+        endpoint_rank.setdefault(endpoint, len(endpoint_rank))
+    ordered = sorted(groups, key=lambda g: (g[0] in unauthenticated, endpoint_rank[g[1]]))
     queues = []
-    for index, values in enumerate(groups.values()):
+    for index, group in enumerate(ordered):
+        values = groups[group]
         offset = index % len(values)
         queues.append(deque(values[offset:] + values[:offset]))
     while queues:
@@ -48,6 +59,16 @@ def _fair_cells(items):
             yield queue.popleft()
             if not queue:
                 queues.remove(queue)
+
+
+def _covered_status(result, status):
+    """A result the execution registry served from another case (E4) carries no
+    artifacts of its own, so it cannot make this cell CONFIRMED or
+    CONTROLLED_NEGATIVE; its summary names the case that holds the proof."""
+    if getattr(result, "covered_by", "") and status in {CellStatus.CONFIRMED,
+                                                        CellStatus.CONTROLLED_NEGATIVE}:
+        return CellStatus.INCONCLUSIVE
+    return status
 
 
 def _executed(result, status):
@@ -152,6 +173,7 @@ class CoverageTracker:
         self.queued = set()
         self.reused = set()
         self.endpoints = {}
+        self.identity_roles: dict[str, str] = {}
         self.driveable = set()
         self.checkpoint_signature = ""
         self.context_key = ""
@@ -209,6 +231,7 @@ class CoverageTracker:
         skipped_reach}."""
         identity_roles = identity_roles or {}
         self.endpoints = endpoints
+        self.identity_roles = dict(identity_roles)
         na = self.matrix.fill_applicability(identities, endpoints, self.checks)
         skipped = 0
         for ep_key, ep in endpoints.items():
@@ -315,6 +338,11 @@ class CoverageTracker:
                 n += 1
         return n
 
+    def _unauthenticated(self) -> set[str]:
+        """Identities with no credentials: the anonymous principal, by role or id."""
+        return {i for i in {c[0] for c in self.matrix.cells()}
+                if (self.identity_roles.get(i, i) or "").lower() == "anonymous"}
+
     def pending_leg_cells(self, driveable: set[str] | None = None) -> list:
         """(identity, endpoint_key, Check) for every applicable+PENDING cell whose
         check has a deterministic leg (optionally restricted to the `driveable`
@@ -346,7 +374,7 @@ class CoverageTracker:
         self.driveable = set(driveable or _LEG_CONFIRMATIONS)
         pending = self.pending_leg_cells(driveable)
         self.queued.update((ident, ep_key, check.id) for ident, ep_key, check in pending)
-        for (ident, ep_key, check) in _fair_cells(pending):
+        for (ident, ep_key, check) in _fair_cells(pending, self._unauthenticated()):
             if n >= budget:
                 self.stopped_by = "leg budget"
                 break
@@ -368,7 +396,7 @@ class CoverageTracker:
                 self.matrix.record(ident, ep_key, check.id, status=CellStatus.INCONCLUSIVE,
                                    reason="validator dispatch returned no result", validator=check.confirmation)
                 continue
-            status = _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN)
+            status = _covered_status(res, _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN))
             self.matrix.record(
                 ident, ep_key, check.id, status=status,
                 reason=(getattr(res, "summary", "") or f"{check.confirmation} leg driven off the matrix")[:180],
@@ -458,7 +486,7 @@ class CoverageTracker:
         attempts = 0
         self.driveable = set(driveable or _LEG_CONFIRMATIONS)
         self.queued.update(cells)
-        for (ident, ep_key, check_id) in _fair_cells(list(cells)):
+        for (ident, ep_key, check_id) in _fair_cells(list(cells), self._unauthenticated()):
             cks = cells[(ident, ep_key, check_id)]
             if attempts >= budget:
                 self.stopped_by = "leg budget"
@@ -497,7 +525,7 @@ class CoverageTracker:
                     validator=check.confirmation, executed=False)
                 _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
                 continue
-            status = _STATUS.get(getattr(res, "status", ""), CellStatus.INCONCLUSIVE)
+            status = _covered_status(res, _STATUS.get(getattr(res, "status", ""), CellStatus.INCONCLUSIVE))
             self.matrix.record_case(
                 ident, ep_key, check_id, rep, status=status,
                 reason=(getattr(res, "summary", "") or f"{check.confirmation} driven at request level")[:180],
