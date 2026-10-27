@@ -146,6 +146,8 @@ class JwtForgeTests(unittest.TestCase):
 
     def test_confirms_when_alg_none_accepted_and_garbage_rejected(self):
         def responder(auth):
+            if not auth:
+                return 401, ""              # a gated route: no token -> denied
             alg, sig = _alg_of(auth)
             if "not-a-valid" in (_b64url_decode(sig).decode("latin1", "ignore") if sig else ""):
                 return 401, ""              # garbage rejected -> control holds
@@ -165,6 +167,8 @@ class JwtForgeTests(unittest.TestCase):
         # A proper verifier: only the untampered, properly-signed original passes;
         # both forgeries escalate role->admin, so both are rejected.
         def responder(auth):
+            if not auth:
+                return 401, ""              # a gated route: no token -> denied
             tok = auth.split()[-1]
             parts = tok.split(".")
             try:

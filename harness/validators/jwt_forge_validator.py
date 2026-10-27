@@ -20,6 +20,10 @@ Confirmation requires a CONTROL: a garbage-signature token must be REJECTED. Tha
 rules out "the endpoint ignores auth entirely" (which the access-control legs
 cover) -- here we specifically prove the signature check is broken.
 
+A route whose tokenless answer already equals the authenticated one (a public
+route) is skipped after two requests: the token does not gate access there, so no
+forged or invalid-signature token can show a signature bug.
+
 GET-only and scope-gated, like the other replay legs. Deterministic; no LLM.
 """
 from __future__ import annotations
@@ -35,7 +39,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from harness import global_throttle
+from harness import global_throttle, identity_compare
 import harness.missing_auth_probe as map_
 from harness.models import Finding, HttpExchange
 from .base import SentAnswer, Validator, ValidationResult
@@ -47,6 +51,34 @@ _ROLE_CLAIMS = {"role": "admin", "roles": ["admin"], "is_admin": True, "admin": 
                 "isadmin": True, "user_role": "admin", "scope": "admin", "authz": "admin",
                 "privilege": "admin", "group": "admin", "sub": "administrator",
                 "username": "administrator", "user": "administrator"}
+
+
+# "Materially the same" for the tokenless-first skip: lengths within this fraction,
+# and no comparison at all on bodies larger than the cap (the full flow runs).
+_SAME_LENGTH_TOLERANCE = 0.02
+_SAME_MAX_CHARS = 50_000
+# Before that skip, one forged alg:none token with escalated role claims: a route
+# that serves anonymous callers can still show more to a forged admin identity
+# (optional auth that rejects bad tokens). Off only in a negative-control test.
+_FORGED_PROBE_BEFORE_SKIP = True
+
+
+def _answers_materially_same(a, b) -> bool:
+    """True when two (status, body) answers are the same answer: the same status
+    class and the same body after whitespace normalisation, or bodies within 2% in
+    length that also pass the repo's trigram match (per-request noise such as a
+    timestamp or nonce). Equal length alone is not enough: a public view and a
+    private one of similar size must stay different, or the skip would hide a bug."""
+    (a_status, a_body), (b_status, b_body) = a, b
+    if a_status is None or b_status is None or a_status // 100 != b_status // 100:
+        return False
+    a_norm, b_norm = " ".join((a_body or "").split()), " ".join((b_body or "").split())
+    if a_norm == b_norm:
+        return True
+    longest = max(len(a_norm), len(b_norm))
+    if longest > _SAME_MAX_CHARS or abs(len(a_norm) - len(b_norm)) > _SAME_LENGTH_TOLERANCE * longest:
+        return False
+    return identity_compare.similarity(a_norm, b_norm) >= identity_compare.MATCH_THRESHOLD
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -244,42 +276,80 @@ class JwtForgeValidator(Validator):
             return {k: v for k, v in (exchange.request_headers or {}).items()
                     if k.lower() != hdr_name.lower()}
 
+        # Every probe goes through here so the verdict can record how many were sent.
+        probes = 0
+
+        async def _send(url: str, headers: dict):
+            nonlocal probes
+            probes += 1
+            return await self._probe(url, headers)
+
+        def _counted(result: ValidationResult) -> ValidationResult:
+            note = f"probes sent: {probes}"
+            result.evidence = f"{result.evidence} [{note}]" if result.evidence else note
+            return result
+
+        # CHEAP DISCRIMINATOR FIRST: one tokenless request. When it already gets a
+        # real payload, the captured token is replayed once; the same answer for
+        # both means the token does not gate this route, so neither a forged nor an
+        # invalid-signature token can show a signature bug -- stop before the probes.
+        n_sent = await _send(exchange.url, _hdrs_no_token())
+        r_sent = None  # the captured token's replay, kept as the proof baseline
+        if map_._substantive(*n_sent):
+            r_sent = await _send(exchange.url, _hdrs(token))
+            if (r_sent[0] is not None and map_._substantive(*r_sent)
+                    and _answers_materially_same(n_sent, r_sent)):
+                a_sent = (await _send(exchange.url, _hdrs(_forge_alg_none(header, payload)))
+                          if _FORGED_PROBE_BEFORE_SKIP else None)
+                # A rejected or identical forged answer keeps the skip; only a forged
+                # token that gets a DIFFERENT real answer sends the route through the
+                # full flow below, where the forgery leg can confirm it.
+                if a_sent is None or not map_._substantive(*a_sent)                         or _answers_materially_same(a_sent, r_sent):
+                    return _counted(self._skip(
+                        "token does not gate this route: a tokenless request returns the same "
+                        "answer as the authenticated one, and a forged admin token changes "
+                        "nothing; a signature check cannot change access here"))
+
         # CONTROL: a garbage-signature token must be rejected, else the endpoint
         # isn't verifying anything and "forged accepted" would be meaningless.
         garbage = f"{token.rsplit('.', 1)[0]}.{_b64url_encode(b'not-a-valid-signature-xxxx')}"
-        g_sent = await self._probe(exchange.url, _hdrs(garbage))
+        g_sent = await _send(exchange.url, _hdrs(garbage))
         g_status, g_body = g_sent
 
         async def _baseline():
             # The captured token itself, replayed: the authenticated answer a
             # confirming exchange is audited against (Ticket 6 proof baseline).
-            # Named only when it was still accepted; outside a run it names nothing.
+            # Reuses the tokenless-first replay when one answered; named only when
+            # it was still accepted; outside a run it names nothing.
             if self.run_context is None:
                 return None
-            sent = await self._probe(exchange.url, _hdrs(token))
+            sent = r_sent if r_sent is not None and r_sent[0] is not None \
+                else await _send(exchange.url, _hdrs(token))
             return sent if sent[0] is not None and map_._substantive(*sent) else None
         if g_status is None:
-            return ValidationResult(self.name, "error", "jwt", summary=f"garbage-token control probe failed ({g_body or 'no response'})")
+            return _counted(ValidationResult(self.name, "error", "jwt", summary=f"garbage-token control probe failed ({g_body or 'no response'})"))
         if map_._substantive(g_status, g_body):
             # The endpoint accepts an INVALID-signature token. That is EITHER the
             # unverified-signature bug (the server never checks the signature) OR a
-            # public endpoint that ignores the token. Disambiguate with a TOKENLESS
+            # public endpoint that ignores the token. Disambiguate with the TOKENLESS
             # control: if removing the token is DENIED while the invalid-signature
             # token is accepted, the token DOES gate access yet its signature is not
             # checked -- confirmed, safely (GET only, no forged privileged action).
-            n_sent = await self._probe(exchange.url, _hdrs_no_token())
+            # The tokenless answer is already in hand; only an unanswered one resends.
+            if n_sent[0] is None:
+                n_sent = await _send(exchange.url, _hdrs_no_token())
             n_status, n_body = n_sent
             if n_status is None:
-                return ValidationResult(
+                return _counted(ValidationResult(
                     self.name, "inconclusive", "jwt", confidence=0.0, confirmed=False,
                     summary=f"JWT check incomplete: a garbage-signature token was accepted (HTTP "
                             f"{g_status}) but the tokenless control got no response "
                             f"({n_body or 'no response'}), so an unverified signature cannot be told "
                             f"from an endpoint that ignores the token; not a negative result",
                     evidence=f"invalid-signature token -> HTTP {g_status} at {exchange.url}; the "
-                             f"same request with no token was never answered.")
+                             f"same request with no token was never answered."))
             if not map_._substantive(n_status, n_body):
-                return ValidationResult(
+                return _counted(ValidationResult(
                     self.name, "confirmed", "jwt", confidence=0.9, confirmed=True,
                     summary="JWT signature not verified: a token with an INVALID signature was accepted "
                             "for authenticated access that a tokenless request is denied -- the server "
@@ -289,10 +359,11 @@ class JwtForgeValidator(Validator):
                               f"response (login page/redirect, HTTP {n_status}). Because the signature is "
                               f"unchecked, any claim (e.g. an admin identity) can be forged."),
                     raw_output=(g_body or "")[:600]).with_artifacts(
-                        baseline=await _baseline(), attack=g_sent, controls=[n_sent])
-            return self._skip("endpoint accepts a garbage-signature token AND a tokenless request -- it "
-                              "does not gate on the token at all (an access-control leg covers that, not a "
-                              "signature-verification bug)")
+                        baseline=await _baseline(), attack=g_sent, controls=[n_sent]))
+            return _counted(self._skip(
+                "endpoint accepts a garbage-signature token AND a tokenless request -- it "
+                "does not gate on the token at all (an access-control leg covers that, not a "
+                "signature-verification bug)"))
 
         # Probes that got no response (RV-P P9): a forgery that never answered
         # was not rejected, and a JWKS fetch that never answered leaves the
@@ -310,7 +381,7 @@ class JwtForgeValidator(Validator):
             jwks_seen: set[str] = set()
             for path in ("/jwks.json", "/.well-known/jwks.json"):
                 jwks_probes += 1
-                key_status, key_body = await self._probe(origin + path, {})
+                key_status, key_body = await _send(origin + path, {})
                 if key_status is None:
                     misses.append(f"GET {path}: {key_body or 'no response'}")
                     continue
@@ -329,14 +400,14 @@ class JwtForgeValidator(Validator):
                                       _hs256(confused_header, payload, pem)))
         forgeries += _kid_forgeries(header, payload)
         for label, forged in forgeries:
-            f_sent = await self._probe(exchange.url, _hdrs(forged))
+            f_sent = await _send(exchange.url, _hdrs(forged))
             f_status, f_body = f_sent
             if f_status is None:
                 misses.append(f"{label}: {f_body or 'no response'}")
                 continue
             if f_status is not None and map_._substantive(f_status, f_body):
                 kidnote = " (kid key-confusion)" if "kid" in label else ""
-                return ValidationResult(
+                return _counted(ValidationResult(
                     self.name, "confirmed", "jwt", confidence=0.9, confirmed=True,
                     summary=f"JWT signature not verified: a forged token ({label}) was accepted where a "
                             f"garbage-signature token was rejected -- authentication bypass / privilege "
@@ -344,18 +415,18 @@ class JwtForgeValidator(Validator):
                     evidence=(f"garbage token -> HTTP {g_status} (rejected); forged {label} with elevated claims -> "
                               f"HTTP {f_status} (accepted) at {exchange.url}. The verifier honours the forged token."),
                     raw_output=(f_body or "")[:600]).with_artifacts(
-                        baseline=await _baseline(), attack=f_sent, controls=[g_sent])
+                        baseline=await _baseline(), attack=f_sent, controls=[g_sent]))
         if misses:
             total = len(forgeries) + jwks_probes
-            return ValidationResult(
+            return _counted(ValidationResult(
                 self.name, "inconclusive", "jwt", confidence=0.0, confirmed=False,
                 summary=f"JWT forgery check incomplete: {len(misses)} of {total} probe(s) got no "
                         f"response ({'; '.join(misses[:3])}); not a negative result",
                 evidence=f"garbage -> HTTP {g_status}; {total - len(misses)} answered probe(s) were "
                          f"rejected at {exchange.url}, but a forgery that never answered was not "
-                         f"rejected.")
-        return ValidationResult(
+                         f"rejected."))
+        return _counted(ValidationResult(
             self.name, "not_confirmed", "jwt", confidence=0.6, confirmed=False,
             summary="JWT signature appears to be verified: alg:none, reused-signature, and kid "
                     "key-confusion forgeries were all rejected like the garbage control.",
-            evidence=f"garbage -> HTTP {g_status}; all {len(forgeries)} forgeries rejected at {exchange.url}.")
+            evidence=f"garbage -> HTTP {g_status}; all {len(forgeries)} forgeries rejected at {exchange.url}."))

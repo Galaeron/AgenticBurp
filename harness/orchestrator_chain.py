@@ -1539,7 +1539,7 @@ class ChainMixin:
         def _objective_result(stopped: bool) -> dict:
             return {
                 "summary": state.summary(),
-                "worklist": state.worklist(50),
+                "worklist": state.result_worklist(50),
                 "outcomes": outcomes,
                 "worklist_summary": worklist_summary,
                 "chains": [],
@@ -2000,7 +2000,7 @@ class ChainMixin:
             "findings": [dict(f, url=f.get("url") or ep.path, method=ep.method)
                          for ep in state.endpoints.values() for f in ep.findings],
             "summary": state.summary(),
-            "worklist": state.worklist(50),
+            "worklist": state.result_worklist(50),
             "outcomes": outcomes,
             # 2026-09-17 coverage-recovery plan, Step 2: eligible/investigated
             # counts + a named, reasoned list of every eligible node this run did
