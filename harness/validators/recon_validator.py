@@ -3,6 +3,11 @@ Recon Validator for Attack Surface Mapping
 
 This validator performs active reconnaissance to build comprehensive
 attack maps of the target application.
+
+Reconnaissance is evidence, not proof of a vulnerability: a finding is
+confirmed only when the map holds at least one item of the kind its class
+claims (a technology, a parameter, a sensitive endpoint), and the evidence
+lists those items. A class reconnaissance cannot speak to is skipped.
 """
 
 from __future__ import annotations
@@ -22,6 +27,35 @@ if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.recon")
+
+# The kind of item a finding class claims reconnaissance found, in the order
+# they are checked and listed; the keys are ReconResult attributes' labels.
+_CLAIM_PATTERNS = (
+    ("technology", re.compile(r"\b(?:technolog|fingerprint|version|banner)|\bserver\b(?! side)")),
+    ("parameter", re.compile(r"\bparameter")),
+    ("sensitive endpoint", re.compile(
+        r"directory listing|\bexpos|\bdisclos|\bsensitive|\bendpoint|attack surface|attack map")),
+)
+_CLAIM_LABELS = {"technology": "technologies", "parameter": "parameters",
+                 "sensitive endpoint": "sensitive endpoints"}
+_EVIDENCE_ITEMS = 10  # most items of one kind written into evidence
+
+
+def _claim_kinds(vulnerability_class: str) -> list[str]:
+    """The item kinds this class claims reconnaissance found; empty when
+    reconnaissance cannot speak to the class (so it cannot confirm it)."""
+    text = re.sub(r"[\s_\-/]+", " ", (vulnerability_class or "").lower()).strip()
+    return [kind for kind, pattern in _CLAIM_PATTERNS if pattern.search(text)]
+
+
+def _claim_items(result: "ReconResult", kind: str) -> list[str]:
+    """The items of one claimed kind in a recon result."""
+    if kind == "technology":
+        return [f"{t.name} {t.version}".strip() for t in result.technologies]
+    if kind == "parameter":
+        return sorted(result.parameters)
+    # These URLs are written into evidence: withhold secret-named query values.
+    return [security.redact_secrets_in_url(url) for url, info in result.endpoints.items() if info.sensitive]
 
 
 @dataclass
@@ -171,6 +205,15 @@ class ReconValidator(Validator):
                 validator=self.name, status="skipped",
                 finding_class=finding.vulnerability_class,
                 summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts))
+        # The map is evidence; the verdict is only whether it holds what the
+        # finding's class claims. A class reconnaissance cannot speak to is
+        # skipped before anything is sent.
+        kinds = _claim_kinds(finding.vulnerability_class)
+        if not kinds:
+            return ValidationResult(
+                validator=self.name, status="skipped",
+                finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
+                summary=f"not supported: reconnaissance cannot confirm {finding.vulnerability_class}")
         try:
             # Initialize
             base_url = self._get_base_url(exchange.url)
@@ -204,15 +247,27 @@ class ReconValidator(Validator):
             
             if sensitive_endpoints or sensitive_params:
                 summary_parts.append(f"Found {len(sensitive_endpoints)} sensitive endpoints, {len(sensitive_params)} sensitive parameters")
-            
+
+            missing = [k for k in kinds if not _claim_items(recon_result, k)]
+            if missing:
+                status, confirmed, confidence = "not_confirmed", False, 0.0
+                verdict = ("not confirmed: reconnaissance found "
+                           + " and ".join(f"0 {_CLAIM_LABELS[k]}" for k in missing)
+                           + f" for {finding.vulnerability_class}")
+            else:
+                status, confirmed, confidence = "confirmed", True, 0.95
+                verdict = "reconnaissance found " + ", ".join(
+                    f"{len(_claim_items(recon_result, k))} {_CLAIM_LABELS[k]}" for k in kinds)
+            summary_parts.insert(0, verdict)
+
             return ValidationResult(
                 validator=self.name,
-                status="confirmed",
+                status=status,
                 finding_class=finding.vulnerability_class,
-                confidence=0.95,
-                confirmed=True,
+                confidence=confidence,
+                confirmed=confirmed,
                 summary=" | ".join(summary_parts),
-                evidence=self._build_evidence(recon_result),
+                evidence=self._build_evidence(recon_result, kinds),
                 raw_output=self._build_raw_output(recon_result),
             )
             
@@ -828,20 +883,22 @@ class ReconValidator(Validator):
         
         return visited / total if total > 0 else 0.0
     
-    def _build_evidence(self, result: ReconResult) -> str:
-        """Build evidence string."""
-        parts = []
-        
-        if result.endpoints:
-            parts.append(f"{len(result.endpoints)} endpoints")
-        if result.parameters:
-            parts.append(f"{len(result.parameters)} parameters")
-        if result.technologies:
-            tech_names = [t.name for t in result.technologies]
-            parts.append(f"Technologies: {', '.join(tech_names)}")
-        if result.attack_paths:
-            parts.append(f"{len(result.attack_paths)} attack paths")
-        
+    def _build_evidence(self, result: ReconResult, kinds: list[str] | None = None) -> str:
+        """Build evidence string: the counts, then the actual items of each
+        claimed kind (at most _EVIDENCE_ITEMS of each)."""
+        parts = [
+            f"{len(result.endpoints)} endpoints",
+            f"{len(result.parameters)} parameters",
+            f"{len(result.technologies)} technologies",
+            f"{len(_claim_items(result, 'sensitive endpoint'))} sensitive endpoints",
+            f"{len(result.attack_paths)} attack paths",
+        ]
+        for kind in kinds or ():
+            items = _claim_items(result, kind)
+            listed = ", ".join(item[:200] for item in items[:_EVIDENCE_ITEMS])
+            if len(items) > _EVIDENCE_ITEMS:
+                listed += f" (+{len(items) - _EVIDENCE_ITEMS} more)"
+            parts.append(f"{_CLAIM_LABELS[kind]} ({len(items)}): {listed or 'none'}")
         return " | ".join(parts)
     
     def _build_raw_output(self, result: ReconResult) -> str:

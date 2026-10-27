@@ -1473,6 +1473,61 @@ def get_lineage_attempts(category: str, source_exchange_hash: str) -> list[dict]
         for r in rows
     ]
 
+
+# sqlmap is a deterministic tool whose entire purpose is to
+# independently confirm SQL injection -- excluding it here
+# directly contradicts the project's own "known vs rediscover"
+# principle (trust deterministic tools over LLM reasoning) for
+# the one capability that is MOST deterministic. Verified live:
+# sqlmap genuinely confirmed a real SQLi on OWASP Juice Shop's
+# login endpoint in this session: excluding it from ever setting
+# confirmed=True would have silently discarded that result.
+#
+# Expanded this session after a real, live audit of every OTHER
+# active/Burp-plane capability's actual confirmation rigor (not a
+# decision folded into an unrelated bugfix -- this is exactly the
+# audit HANDOVER.md's §5i/§6.9 said had to happen before touching
+# this list). Each addition below independently replays a real
+# request/probe against the real target and compares it against a
+# real observed response -- the same deterministic shape as the
+# three original entries, not an LLM guess:
+# - cors_misconfiguration_detection: already found live, this
+#   session, to be exactly this deterministic -- a real Juice Shop
+#   run produced 10 genuine CORS confirmations (foreign Origin
+#   replayed, ACAO reflection + credentials checked in the real
+#   response) that this allowlist was silently discarding.
+# - reflection_context_validation (XSS): XssPayloadLogic.classify()
+#   requires the exact random canary string to survive unescaped in
+#   a live replayed response -- a real proof of execution context.
+# - open_redirect_validation: requires an exact Location header
+#   match to the injected external URL on a live replay.
+# - jwt_validation: requires a forged token to be accepted with a
+#   materially matching response to the original authenticated
+#   request.
+# command_injection_validation deliberately NOT added: its
+# differential-timing design (CommandInjectionTimingLogic) is
+# already calibrated to a lower confidence ceiling (0.75, vs 0.85+
+# elsewhere) specifically because timing evidence is inherently
+# noisier than content evidence -- left off pending a live
+# false-positive check this pass didn't have time for, not
+# forgotten.
+_CONFIRMATION_CAPABILITIES = frozenset({
+    "cross_identity_compare", "authorization_boundary_compare",
+    "sql_injection_validation",
+    "cors_misconfiguration_detection",
+    "reflection_context_validation",
+    "open_redirect_validation",
+    "jwt_validation",
+})
+
+
+def capability_can_confirm(capability: str) -> bool:
+    """The one confirmation policy: whether a plan's capability may mark a
+    vulnerability confirmed. Evidence-only capabilities (header, CSP and recon
+    observations) may still be recorded, as status "observed"."""
+    return capability in _CONFIRMATION_CAPABILITIES
+
+
 def persist_validation_submission(submission: ValidationSubmission) -> tuple[bool, str]:
     conn = _connect()
     try:
@@ -1494,55 +1549,13 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
         expected_executor = f"{row[3]}:{row[2]}"
         if submission.executor != expected_executor:
             return False, "executor does not match the registered capability"
-        # sqlmap is a deterministic tool whose entire purpose is to
-        # independently confirm SQL injection -- excluding it here
-        # directly contradicts the project's own "known vs rediscover"
-        # principle (trust deterministic tools over LLM reasoning) for
-        # the one capability that is MOST deterministic. Verified live:
-        # sqlmap genuinely confirmed a real SQLi on OWASP Juice Shop's
-        # login endpoint in this session: excluding it from ever setting
-        # confirmed=True would have silently discarded that result.
-        #
-        # Expanded this session after a real, live audit of every OTHER
-        # active/Burp-plane capability's actual confirmation rigor (not a
-        # decision folded into an unrelated bugfix -- this is exactly the
-        # audit HANDOVER.md's §5i/§6.9 said had to happen before touching
-        # this list). Each addition below independently replays a real
-        # request/probe against the real target and compares it against a
-        # real observed response -- the same deterministic shape as the
-        # three original entries, not an LLM guess:
-        # - cors_misconfiguration_detection: already found live, this
-        #   session, to be exactly this deterministic -- a real Juice Shop
-        #   run produced 10 genuine CORS confirmations (foreign Origin
-        #   replayed, ACAO reflection + credentials checked in the real
-        #   response) that this allowlist was silently discarding.
-        # - reflection_context_validation (XSS): XssPayloadLogic.classify()
-        #   requires the exact random canary string to survive unescaped in
-        #   a live replayed response -- a real proof of execution context.
-        # - open_redirect_validation: requires an exact Location header
-        #   match to the injected external URL on a live replay.
-        # - jwt_validation: requires a forged token to be accepted with a
-        #   materially matching response to the original authenticated
-        #   request.
-        # command_injection_validation deliberately NOT added: its
-        # differential-timing design (CommandInjectionTimingLogic) is
-        # already calibrated to a lower confidence ceiling (0.75, vs 0.85+
-        # elsewhere) specifically because timing evidence is inherently
-        # noisier than content evidence -- left off pending a live
-        # false-positive check this pass didn't have time for, not
-        # forgotten.
-        confirmation_capabilities = {
-            "cross_identity_compare", "authorization_boundary_compare",
-            "sql_injection_validation",
-            "cors_misconfiguration_detection",
-            "reflection_context_validation",
-            "open_redirect_validation",
-            "jwt_validation",
-        }
-        if submission.confirmed and row[2] not in confirmation_capabilities:
+        if submission.confirmed and not capability_can_confirm(row[2]):
             return False, "this capability may provide evidence but cannot mark the vulnerability confirmed"
         if submission.confirmed and submission.status != "confirmed":
             return False, "confirmed result has invalid status"
+        # Any other status is stored as given: "observed" is a capability that
+        # cannot confirm reporting what it saw (confirmed is False, so the
+        # coverage ledger reads it as supported evidence, never confirmed/refuted).
         conn.execute(
             """INSERT INTO validation_runs
                (plan_id, status, confidence, confirmed, summary, evidence, created_at)
@@ -2150,6 +2163,8 @@ def mark_chain_detected(url: str, signature: str, *, engagement_id: str = "") ->
 # Status vocabulary:
 #   confirmed       - a validation_runs row with confirmed=1 exists
 #   supported       - positive evidence exists, but nothing independently confirmed it
+#                     (a validation_runs row of status "supported", or "observed": an
+#                     evidence-only capability's result, which can never confirm)
 #   blocked         - the only validation attempt errored out (tool missing, timeout, etc.)
 #   tested_clean    - independently tested and no evidence found
 #   not_tested      - a specialist flagged this category but no validation was ever run
@@ -2234,7 +2249,7 @@ def coverage_report(host: str) -> list[dict]:
 
         runs = by_category.get(category, [])
         confirmed_run = next((r for r in runs if r[2]), None)
-        supported_run = next((r for r in runs if r[1] == "supported"), None)
+        supported_run = next((r for r in runs if r[1] in ("supported", "observed")), None)
         error_run = next((r for r in runs if r[1] == "error"), None)
         clean_run = next((r for r in runs if r[1] in ("rejected", "not_confirmed")), None)
 

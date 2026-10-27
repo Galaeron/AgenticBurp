@@ -40,6 +40,7 @@ _STATUS_MAP = {
     "confirmed": AttemptStatus.CONFIRMED,
     "supported": AttemptStatus.SUPPORTED,
     "not_confirmed": AttemptStatus.NOT_CONFIRMED,
+    "observed": AttemptStatus.NOT_CONFIRMED,
     "inconclusive": AttemptStatus.INCONCLUSIVE,
     "error": AttemptStatus.ERROR,
     "blocked": AttemptStatus.ERROR,

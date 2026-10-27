@@ -54,7 +54,7 @@ class ReconCapturedLinkTests(_StateBase):
         ex = _exchange("http://shop.invalid/")
         ex.response_body = captured_page
         ex.response_headers = {"Content-Type": "text/html"}
-        finding = Finding(vulnerability_class="recon", confidence=0.5, summary="candidate",
+        finding = Finding(vulnerability_class="attack surface mapping", confidence=0.5, summary="candidate",
                           evidence="fixture", suggested_test="map", basis="derived")
         sent = []
         pages = dict(extra_pages or {})
@@ -119,7 +119,7 @@ class ReconCapturedLinkTests(_StateBase):
         ex = _exchange("http://shop.invalid/")
         ex.response_body = page
         ex.response_headers = {"Content-Type": "text/html"}
-        finding = Finding(vulnerability_class="recon", confidence=0.5, summary="candidate",
+        finding = Finding(vulnerability_class="attack surface mapping", confidence=0.5, summary="candidate",
                           evidence="fixture", suggested_test="map", basis="derived")
         sent = []
 

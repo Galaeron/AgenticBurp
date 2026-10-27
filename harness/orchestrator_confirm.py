@@ -746,12 +746,20 @@ class ConfirmMixin:
                 await asyncio.to_thread(
                     store.persist_test_plans, exchange, [plan]
                 )
+                # One confirmation policy (store.capability_can_confirm): a plan
+                # whose capability cannot confirm (CSP/header and recon
+                # validators) records what it saw as an observation. The proof
+                # record above is unchanged; the accounting labels it hardening
+                # or reconnaissance, so submitting confirmed=True here only
+                # produced a refusal warning per result.
+                observed = bool(result.confirmed) and not store.capability_can_confirm(
+                    plan.capability)
                 submission = ValidationSubmission(
                     plan_id=plan.id,
-                    status=result.status,
+                    status="observed" if observed else result.status,
                     confidence=result.confidence,
-                    confirmed=result.confirmed,
-                    summary=result.summary,
+                    confirmed=result.confirmed and not observed,
+                    summary=f"observation: {result.summary}" if observed else result.summary,
                     evidence=result.evidence or result.raw_output,
                     executor=f"{plan.execution_plane}:{plan.capability}",
                     source_exchange_hash=plan.source_exchange_hash,
