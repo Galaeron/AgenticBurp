@@ -601,6 +601,7 @@ async def validation_result(submission: ValidationSubmission, authorization: str
     if plan is not None:
         step = await active_verification.decide_next_step(
             plan, submission, ollama_client=orchestrator.ollama,
+            config=orchestrator.config,
         )
         if step.next_plan is not None:
             await __import__("asyncio").to_thread(store.persist_retry_plan, step.next_plan)
@@ -1486,6 +1487,10 @@ class InvestigateRequest(_BaseModel):
     max_chain_rounds: int = 2
     seed_exchanges: list[HttpExchange] = []
     active_discovery: bool = True
+    # Per-request cap on active-discovery probes, bounded at use exactly like
+    # the analysis request's field above (max(1, min(v, 20000))). The default
+    # equals investigate_engagement's own default, so omitting it changes nothing.
+    discovery_max_probes: int = 6000
     resume_job_id: str | None = None
 
 
@@ -1651,6 +1656,7 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                     run_context=run_context,
                     seed_exchanges=req.seed_exchanges,
                     active_discovery=req.active_discovery,
+                    discovery_max_probes=max(1, min(req.discovery_max_probes, 20000)),
                     **({'coverage_checkpoint': coverage_checkpoint} if coverage_checkpoint is not None else {}))
             job["result"].setdefault("run_id", run_context.run_id)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
