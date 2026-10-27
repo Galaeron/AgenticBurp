@@ -869,6 +869,9 @@ class RunContext:
     fail_open_counters: object = field(default=None, repr=False, compare=False)
     _fail_open_restore: object = field(default=None, repr=False, compare=False)
     _fail_open_pushed: bool = field(default=False, repr=False, compare=False)
+    # E4: the run's one validator-execution registry (execution_registry.py), set
+    # by the engagement that owns the run; None means every path runs its own checks.
+    execution_registry: object = field(default=None, repr=False, compare=False)
 
     @classmethod
     def create(cls, *, run_id: str | None = None, allowed_hosts=None, gate_config: dict | None = None,

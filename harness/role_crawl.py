@@ -496,6 +496,15 @@ class RoleCrawlResult:
     # would otherwise be dropped without ever becoming reviewable. Deduped by
     # response content, so identical bodies across roles collapse to one.
     captured: list = field(default_factory=list)
+    # E5b: one record per probe that got a response, as ANY identity and with ANY
+    # status -- {url, method, request_headers, request_body, identity_key,
+    # response_status, response_headers, response_body_sha256, response_body_len,
+    # principal_id, role}. `captured` keeps one exchange per distinct response
+    # body, so an identity that drew the same body as an earlier one (or a 401/403)
+    # has no replayable request there; this is what lets the engagement replay a
+    # check AS that identity. The body itself is never kept (captured holds it),
+    # and the records stay out of to_dict(): they carry the probe's credentials.
+    identity_probes: list = field(default_factory=list)
     sensitive_file_hits: list = field(default_factory=list)
     # Destructive-looking operations (delete/remove/reset/... paths, or forms with
     # such actions) that were deliberately NOT probed, so a run can show it never
@@ -774,6 +783,19 @@ async def crawl_roles(
                 probe_method, url, r.norm_headers(), timeout, run_context=run_context,
                 session_ref=session_ref, body=req_body, content_type=req_ctype)
             substantive = map_._substantive(status, body)
+            if status is not None:
+                probe_headers = dict(r.norm_headers())
+                if req_ctype and not any((k or "").lower() == "content-type" for k in probe_headers):
+                    probe_headers["Content-Type"] = req_ctype
+                result.identity_probes.append({
+                    "url": url, "method": access.method,
+                    "request_headers": probe_headers, "request_body": req_body,
+                    "identity_key": _engagement.capture_identity_key(probe_headers),
+                    "response_status": status, "response_headers": resp_headers,
+                    "response_body_sha256": hashlib.sha256(
+                        (body or "").encode("utf-8", errors="replace")).hexdigest(),
+                    "response_body_len": len(body or ""),
+                    "principal_id": _matrix_principal_id(r), "role": r.role})
             # For object-scoped endpoints also record a body fingerprint, so the
             # SAME object's response can be compared across principals below.
             access.record(

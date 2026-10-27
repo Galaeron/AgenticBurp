@@ -187,7 +187,9 @@ class ConfirmationCacheWiringCallerTests(_EngagementCallerBase, unittest.TestCas
                           same_case.control_artifact_ids), ("art-b", "art-a", ("art-c",)))
         self.assertEqual((other_case.baseline_artifact_id, other_case.attack_artifact_id,
                           other_case.control_artifact_ids), ("", "", ()))
-        self.assertTrue(other_case.confirmed)
+        # E4: another case's copy keeps the status but is no confirmation of its own.
+        self.assertEqual(other_case.status, "confirmed")
+        self.assertFalse(other_case.confirmed)
 
 
 if __name__ == "__main__":

@@ -163,6 +163,11 @@ async def build_engagement(
             ep.record_principal_observation(principal_id, **observation)
             access.record(principal_id, **observation)
         state.record_template(ex.url, ex.method, ex)
+    # E5b: every probe the crawl sent is a replayable request AS the identity that
+    # sent it, so a check on an identity whose body (or 401) was not kept as a
+    # capture still has its own request to replay.
+    for probe in getattr(result, "identity_probes", None) or []:
+        state.record_identity_probe(probe["url"], probe["method"], probe)
     for r in roles:
         state.ingest_identity(f"rolecrawl:{r.role}", r.role, source="seed")
 

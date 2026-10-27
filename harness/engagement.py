@@ -175,6 +175,41 @@ def capture_variant(exchange) -> dict:
     return variant
 
 
+# Marks a variant built from an access-matrix probe rather than a full capture.
+ACCESS_MATRIX_SOURCE = "access_matrix"
+
+
+def identity_probe_variant(probe: dict) -> dict:
+    """A capture variant for one role-crawl probe (E5b), built with
+    capture_variant()'s semantics: the replayable request template, the identity
+    key computed from the probe's own credential headers, the response status and
+    redacted headers. The response body is NOT kept ("" plus its sha256 and
+    length); the deduped full capture already holds it, and bodies are most of a
+    snapshot. `source` and the digest fields make its capture_id differ from a full
+    capture's, so dedup by capture_id still tells the two apart."""
+    variant = capture_variant(dict(probe, response_body=""))
+    variant.update(response_body_sha256=probe.get("response_body_sha256") or "",
+                   response_body_len=int(probe.get("response_body_len") or 0),
+                   source=ACCESS_MATRIX_SOURCE)
+    variant.pop("capture_id", None)
+    variant["capture_id"] = hashlib.sha256(json.dumps(variant, sort_keys=True).encode()).hexdigest()
+    return variant
+
+
+def replayable_variants(ep, identity_key: str) -> list:
+    """The variants a check can replay AS this identity: its full captures, plus
+    its access-matrix probe unless a full capture already holds the same request
+    (the full one also carries the response). Empty when the identity was never
+    observed on this endpoint. Only observed requests count; nothing is built."""
+    mine = [v for v in (getattr(ep, "capture_variants", None) or [])
+            if v.get("identity_key") == identity_key]
+    shapes = lambda v: json.dumps(v.get("template"), sort_keys=True)   # noqa: E731
+    full = [v for v in mine if v.get("source") != ACCESS_MATRIX_SOURCE]
+    held = {shapes(v) for v in full}
+    return full + [v for v in mine if v.get("source") == ACCESS_MATRIX_SOURCE
+                   and shapes(v) not in held]
+
+
 _RESULT_BODY_HEAD = 200
 
 
@@ -190,8 +225,10 @@ def compact_variant_bodies(entry: dict) -> dict:
             continue
         body = variant.get("response_body") or ""
         slim = {k: v for k, v in variant.items() if k != "response_body"}
-        slim["response_body_sha256"] = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
-        slim["response_body_len"] = len(body)
+        if variant.get("source") != ACCESS_MATRIX_SOURCE:
+            # (a probe variant already holds the digest of a body it never kept)
+            slim["response_body_sha256"] = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+            slim["response_body_len"] = len(body)
         slim["response_body_head"] = body[:_RESULT_BODY_HEAD]
         variants.append(slim)
     return dict(entry, capture_variants=variants) if "capture_variants" in entry else dict(entry)
@@ -930,6 +967,17 @@ class EngagementState:
 
         if _richness(tmpl) > _richness(ep.template):
             ep.template = tmpl
+
+    def record_identity_probe(self, url: str, method: str, probe: dict) -> None:
+        """Attach one role-crawl probe (E5b) to its endpoint as a replayable
+        variant AS the identity that sent it, whatever the response was. This
+        only adds a variant: the endpoint's template, status and ranking are
+        left to record_template, so what is applicable and prioritised is
+        unchanged. An identity that was never probed gets nothing."""
+        ep = self._ep(method, normalize_path(url))
+        variant = identity_probe_variant(dict(probe, url=url, method=method))
+        if not any(v.get("capture_id") == variant["capture_id"] for v in ep.capture_variants):
+            ep.capture_variants.append(variant)
 
     def ingest_findings(self, url: str, method: str, findings) -> int:
         """From /analyze (agents + validators): attach findings to the endpoint,

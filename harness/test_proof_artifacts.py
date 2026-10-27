@@ -661,8 +661,13 @@ class ConfirmationCacheProofTests(_ProofCallerBase):
                           other.control_artifact_ids), ("", "", ()))
         self.assertEqual(_named(first), named)
         self.assertEqual(len(first.control_artifact_ids), 1)
-        self.assertEqual((other.status, other.confirmed, other.confidence, other.summary),
-                         (first.status, first.confirmed, first.confidence, first.summary))
+        # E4: the copy keeps the status and confidence but is not a confirmation (the
+        # proof belongs to case-a) and says which case covered it.
+        self.assertEqual((other.status, other.confidence), (first.status, first.confidence))
+        self.assertTrue(first.confirmed)
+        self.assertFalse(other.confirmed)
+        self.assertTrue(other.summary.startswith("covered by case-a "), other.summary)
+        self.assertTrue(other.summary.endswith(first.summary), other.summary)
         # Nothing was recorded for the other case, and a proof built from the copy
         # carries no exchanges, so it stays legacy (a candidate).
         self.assertFalse(named & set(_executions("case-b")))
