@@ -175,6 +175,28 @@ def capture_variant(exchange) -> dict:
     return variant
 
 
+_RESULT_BODY_HEAD = 200
+
+
+def compact_variant_bodies(entry: dict) -> dict:
+    """A COPY of a worklist entry whose capture_variants carry a digest of each
+    response body (sha256, length, a short head) instead of the body itself. The
+    job result is read, not replayed: the full bodies stay in the engagement
+    state and its snapshot, which `entry` (a live to_dict()) is never mutated by."""
+    variants = []
+    for variant in entry.get("capture_variants") or []:
+        if not isinstance(variant, dict) or "response_body" not in variant:
+            variants.append(variant)
+            continue
+        body = variant.get("response_body") or ""
+        slim = {k: v for k, v in variant.items() if k != "response_body"}
+        slim["response_body_sha256"] = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+        slim["response_body_len"] = len(body)
+        slim["response_body_head"] = body[:_RESULT_BODY_HEAD]
+        variants.append(slim)
+    return dict(entry, capture_variants=variants) if "capture_variants" in entry else dict(entry)
+
+
 def persist_surface(state):
     """Atomically retain observed variants alongside existing concurrent findings."""
     from harness import store
@@ -1070,6 +1092,11 @@ class EngagementState:
     def worklist(self, limit: int = 25) -> list:
         ranked = sorted(self.endpoints.values(), key=lambda e: e.fused_score()[0], reverse=True)
         return [e.to_dict() for e in ranked[:limit]]
+
+    def result_worklist(self, limit: int = 25) -> list:
+        """The worklist as the JOB RESULT carries it: the same ranked entries with
+        each capture variant's response body reduced to a digest (E11)."""
+        return [compact_variant_bodies(e) for e in self.worklist(limit)]
 
     def pending(self) -> list:
         """Ready-to-act tasks (all prerequisites satisfied)."""

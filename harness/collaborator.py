@@ -17,6 +17,7 @@ Usage:
     tok = c.token(); url = c.url(tok)        # embed url in the payload
     ... send the payload ...
     if await c.wait_for_hit(tok): CONFIRMED   # the target fetched our url
+    hit = await c.wait_for_any([tok1, tok2])  # one wait for a batch of probes
 """
 from __future__ import annotations
 
@@ -189,6 +190,26 @@ class Collaborator:
             await asyncio.sleep(0.25)
         return False
 
+    def _first_hit(self, tokens) -> str | None:
+        with self._srv.hit_lock:
+            for token in tokens:
+                if "/" + token in self._srv.hits:
+                    return token
+        return None
+
+    async def wait_for_any(self, tokens, timeout: float = 6.0) -> str | None:
+        """One wait for a batch of probes: poll for a callback carrying ANY of
+        `tokens`, up to `timeout` seconds. Returns the first token (in the order
+        given) that was hit, or None."""
+        tokens = list(tokens)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            hit = self._first_hit(tokens)
+            if hit is not None:
+                return hit
+            await asyncio.sleep(0.25)
+        return None
+
     def stop(self) -> None:
         """Stop serving AND release the listening socket (idempotent). `shutdown()`
         alone only ends the serve loop; the bound socket stays open until
@@ -234,6 +255,9 @@ class ConfiguredCollaborator:
             if self._listener is not None:
                 self._listener.stop()
 
+    async def wait_for_any(self, tokens, timeout: float = 6.0) -> str | None:
+        return await self.start().wait_for_any(tokens, timeout=timeout)
+
     def __getattr__(self, name):
         return getattr(self.start(), name)
 
@@ -242,6 +266,20 @@ def resolve(listener):
     if isinstance(listener, ConfiguredCollaborator):
         return listener.start()
     return listener if listener is not None else shared()
+
+
+def listener_stopped(listener) -> bool:
+    """True when the listener can no longer record any callback, so a payload sent
+    for it cannot produce out-of-band evidence. An unverified target network is NOT
+    this: an exact registered callback proves its probe without a preflight, so a
+    validator still sends and only an absent callback stays inconclusive."""
+    health = getattr(listener, "health", None)
+    if health is None:
+        return False
+    try:
+        return not health().get("available", True)
+    except Exception:
+        return False
 
 
 def unavailable_result(listener, target_url, validator, vulnerability_class):

@@ -600,7 +600,7 @@ class LiveLegVerificationTest(EvidenceCase):
         res = self._run_ex(v, self._jwt_exchange("/jwt/public"), "jwt")
         self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
-        self._assert_controlled_negative(res, skipped_because="does not gate on the token")
+        self._assert_controlled_negative(res, skipped_because="token does not gate this route")
 
     # --- File upload via a CSRF-bound multipart form (PortSwigger-shaped) ------
     def _upload_exchange(self, action, referer):

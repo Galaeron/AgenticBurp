@@ -530,7 +530,10 @@ class CoverageNotTestedTests(unittest.TestCase):
         self.assertTrue(report["not_tested"])
         for item in report["not_tested"]:
             self.assertIn(item["status"], _PRE_O6)
-        listed = sum(1 for item in report["not_tested"])
+        # E11: not-applicable cells are counted per check and reason, not listed row by row.
+        listed = (len(report["not_tested"])
+                  + sum(n for reasons in report["not_tested_not_applicable"].values()
+                        for n in reasons.values()))
         self.assertEqual(listed, sum(report["by_status"].get(s, 0) for s in _PRE_O6))
 
     def test_case_bearing_parent_is_left_to_cases_not_tested(self):

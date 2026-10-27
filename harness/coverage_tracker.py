@@ -134,6 +134,14 @@ _LEG_CONFIRMATIONS = {
 }
 
 
+def _listed_in_compact_ledger(row: dict) -> bool:
+    """A ledger row the job result keeps: the cell is shape-applicable, or it has a
+    non-default state -- a not-applicable cell that was queued, attempted, sent or
+    resumed must stay visible, or a real attempt would be hidden in a count."""
+    return bool(row["shape_applicable"] or row["queued"] or row["attempted"]
+                or row["sent"] or row["resumed"])
+
+
 class CoverageTracker:
     """Reconciles a finished engagement into a filled CoverageMatrix."""
 
@@ -543,7 +551,11 @@ class CoverageTracker:
                                    validator=cell.validator, evidence=cell.evidence, executed=True)
                 self.reused.add(key)
 
-    def phase_ledger(self):
+    def phase_ledger(self, *, compact: bool = True):
+        """Stage counts over EVERY cell, plus the per-cell rows. `compact` (the
+        job-result form, E11) lists a row only for a cell that is shape-applicable
+        or has a non-default state (queued, attempted, sent, resumed); the rest are
+        counted in `not_applicable` and listed in checkpoint.matrix."""
         rows = []
         for key, cell in self.matrix.cells().items():
             ident, ep, cid = key
@@ -580,13 +592,38 @@ class CoverageTracker:
                          "attempted": key in self.attempted, "sent": bool(cell.executed),
                          "conclusive": bool(conclusive), "resumed": key in self.reused,
                          "terminal_reason": reason, "detail": cell.reason})
-        return {"counts": {stage: sum(bool(row[stage]) for row in rows) for stage in
-                           ("discovered", "captured", "shape_applicable", "implemented", "eligible",
-                            "queued", "attempted", "sent", "conclusive", "resumed")}, "cells": rows}
+        ledger = {"counts": {stage: sum(bool(row[stage]) for row in rows) for stage in
+                             ("discovered", "captured", "shape_applicable", "implemented", "eligible",
+                              "queued", "attempted", "sent", "conclusive", "resumed")}, "cells": rows}
+        if not compact:
+            return ledger
+        kept, omitted = [], {}
+        for row in rows:
+            if _listed_in_compact_ledger(row):
+                kept.append(row)
+            else:
+                omitted[row["check"]] = omitted.get(row["check"], 0) + 1
+        ledger["cells"] = kept
+        ledger["not_applicable"] = {"total": sum(omitted.values()), "by_check": dict(sorted(omitted.items()))}
+        ledger["cells_omitted_note"] = ("not-applicable cells are counted in not_applicable "
+                                        "and listed in checkpoint.matrix")
+        return ledger
 
-    def report(self) -> dict:
+    def report(self, *, compact: bool = True) -> dict:
         s = self.matrix.summary()
         s["not_tested"] = self.matrix.not_tested()
+        if compact:
+            # E11: a not-applicable cell is not a gap, so it is counted per check and
+            # reason instead of listed row by row (the full matrix is in the checkpoint).
+            # Done here, not in CoverageMatrix.not_tested(), so that method is unchanged.
+            na_value = CellStatus.NOT_APPLICABLE.value
+            aggregated: dict[str, dict[str, int]] = {}
+            for row in s["not_tested"]:
+                if row["status"] == na_value:
+                    reasons = aggregated.setdefault(row["check"], {})
+                    reasons[row["reason"]] = reasons.get(row["reason"], 0) + 1
+            s["not_tested"] = [row for row in s["not_tested"] if row["status"] != na_value]
+            s["not_tested_not_applicable"] = aggregated
         # T05: the case-granular "not tested + why" (pending/budget-skipped/blocked
         # child cases). Empty when no case layer was populated -- fully additive.
         s["cases_not_tested"] = self.matrix.cases_not_tested()
@@ -596,7 +633,7 @@ class CoverageTracker:
         # run through build_coverage/build_coverage_driven/build_coverage_cases_driven.
         from harness.coverage_summary import summarize_coverage
         s["audited"] = summarize_coverage(self.matrix)
-        s["phase_ledger"] = self.phase_ledger()
+        s["phase_ledger"] = self.phase_ledger(compact=compact)
         s["checkpoint"] = {"signature": self.checkpoint_signature, "context_key": self.context_key,
                            "matrix": self.matrix.to_dict()}
         return s
