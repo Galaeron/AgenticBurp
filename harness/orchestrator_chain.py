@@ -596,6 +596,74 @@ class ChainMixin:
         state.apply_semantic_model(asm)
         return asm
 
+    def _experiments_config(self) -> dict:
+        eng = (getattr(self, "config", {}) or {}).get("engagement", {}) or {}
+        return eng.get("experiments", {}) or {}
+
+    def _experiment_ownership(self, state, run_context, base_url):
+        """The engagement's ownership ledger for the experiment cycle: the one
+        `_configure_ownership` builds from the operator's `authz.owners`
+        declarations (cached on the run), so declared sharing governs the verdict
+        and the experiment's own ownership fact lands where CrossIdentityValidator
+        and the report read it. With nothing declared anywhere a run-scoped
+        ledger is filed under the same cache key, so every later
+        `_configure_ownership(...)` for this origin in the run finds it too."""
+        from harness.principals import OwnershipLedger
+        if run_context is None or not base_url:
+            return OwnershipLedger()
+        # `state.owners` is [] (not None) until an engagement declares some, and a
+        # non-None value makes `_configure_ownership` REBUILD the ledger and replace
+        # the cached one -- leaving every holder of the earlier ledger (the
+        # cross-identity validator) blind to what this cycle records.
+        ledger = self._configure_ownership(
+            base_url, engagement_owners=getattr(state, "owners", None) or None,
+            run_context=run_context, install=False)
+        if ledger is not None:
+            return ledger
+        from urllib.parse import urlsplit
+        from harness.protected_routes import _target_of
+        origin = (urlsplit(base_url).scheme.lower(), _target_of(base_url))
+        cached = getattr(run_context, "_declared_ownership", None)
+        cached = cached if isinstance(cached, dict) else {}
+        cached.setdefault(origin, OwnershipLedger())
+        run_context._declared_ownership = cached
+        return cached[origin]
+
+    async def _run_experiments(self, state, asm, run_context, *, base_url="", captured=(),
+                               ownership=None):
+        """Ticket G seam: run the graph -> experiment -> workflow -> proof -> graph
+        cycle (experiment.run_experiment_loop) over the hypotheses of `asm`.
+
+        Behind `engagement.experiments.enabled` (default off) and an owning
+        RunContext: otherwise returns None and sends nothing -- the engagement
+        behaves exactly as before (the negative control). The privacy expectations
+        come only from `engagement.access_expectations`; a hypothesis without one
+        is reported BLOCKED with the exact missing input, never guessed. Mutating
+        sends stay gated by validators.active_enabled / allow_mutating_replay.
+
+        Split out of investigate_engagement so the caller-level test can disable
+        this one connection and prove the cycle depends on it."""
+        eng = (getattr(self, "config", {}) or {}).get("engagement", {}) or {}
+        cfg = self._experiments_config()
+        if run_context is None or not cfg.get("enabled", False):
+            return None
+        from harness import experiment, experiment_planner
+        planner = None
+        # The planner reasons with the LOCAL agent model on the local client --
+        # never the coordinator's cloud settings. No local model configured: no planner.
+        local_model = ((self.config.get("agent_defaults") or {}).get("model") or "")
+        if cfg.get("planner", False) and local_model:
+            planner = experiment_planner.ExperimentPlanner(
+                experiment_planner.ollama_propose_fn(self.ollama, local_model),
+                captures=captured)
+        ledger = ownership if ownership is not None else self._experiment_ownership(
+            state, run_context, base_url)
+        return await experiment.run_experiment_loop(
+            state, run_context, ledger=ledger,
+            expectations=eng.get("access_expectations", []) or [],
+            sessions=experiment.run_sessions(run_context),
+            max_runs=int(cfg.get("max_runs", 4)), planner=planner, asm=asm, base_url=base_url)
+
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
                                      discovery_max_endpoints: int = 150,
@@ -790,6 +858,12 @@ class ChainMixin:
                 identity_headers.set_identity(host, r.principal_id(), dict(r.headers), r.role)
         ownership = self._configure_ownership(base_url, engagement_owners=getattr(state, "owners", None),
                                               run_context=run_context, install=False)
+        if (ownership is None and run_context is not None
+                and self._experiments_config().get("enabled", False)):
+            # Ticket G: share ONE ledger between the experiment cycle and the
+            # cross-identity validator, so an ownership fact an experiment
+            # establishes is what that validator consults.
+            ownership = self._experiment_ownership(state, run_context, base_url)
         _xid_cfg = (self.config.get("validators", {}) or {}).get("cross_identity", {}) or {}
         _xval = CrossIdentityValidator(
             allowed_hosts=self.allowed_hosts,
@@ -1321,6 +1395,19 @@ class ChainMixin:
             log.warning("investigate_engagement: business-context pass failed: %s", e)
             _errors.append({"phase": "business_context", "error": f"{type(e).__name__}: {e}"})
 
+        # Ticket G: the graph -> experiment -> workflow -> proof -> graph cycle for
+        # the business-context hypotheses. Default off (engagement.experiments);
+        # when off this returns None without a send. Best-effort like the passes
+        # around it: a failure is recorded as an "experiments" phase error.
+        _experiments = None
+        try:
+            _experiments = await self._run_experiments(
+                state, _asm, run_context, base_url=base_url, captured=_all_captured,
+                ownership=ownership)
+        except Exception as e:
+            log.warning("investigate_engagement: experiments phase failed: %s", e)
+            _errors.append({"phase": "experiments", "error": f"{type(e).__name__}: {e}"})
+
         worklist_summary: dict = {}
 
         # Objective mode gets one deterministic pass over the real captured
@@ -1438,6 +1525,7 @@ class ChainMixin:
                 "chains": [],
                 "chain_rounds": 0,
                 "application_semantic_model": _asm.to_dict() if _asm else None,
+                "experiments": _experiments,
                 "coverage": {},
                 "workflows": workflow_results,
                 "task_graph": state.graph.to_dict(),
@@ -1907,6 +1995,7 @@ class ChainMixin:
             # inferred roles/objects/workflows/value-flows/sinks and the ranked
             # chaining hypotheses that drove the re-ranking.
             "application_semantic_model": _asm.to_dict() if _asm else None,
+            "experiments": _experiments,
             "coverage": coverage,
             # Stage reservations in effect: requests withheld for the coverage drive,
             # what the earlier stages spent, and the stage time bounds (0 = none).

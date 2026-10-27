@@ -70,6 +70,18 @@ class WorkflowStep:
     assertions: tuple[Assertion, ...] = ()
     transition: str = ""
     cleanup: bool = False
+    # Ticket G (experiment cycle). All three default to the pre-existing behaviour.
+    # observe: record ANY HTTP status as PASSED with its status code and artifact
+    #   (no 401 refresh, no 401/403 failure, no assertions) so a caller that must
+    #   judge the response itself -- a denial is a result, not a failure -- sees it.
+    #   A send that never reached the target (blocked/out of scope/error) still
+    #   BLOCKS; observe never turns a non-send into a pass.
+    # case_ref: send under this case id instead of the per-step "<wf>:<ver>:<step>"
+    #   string, so the evidence ledger files the exchange under a proof's case.
+    # content_type: Content-Type request header for the body (none by default).
+    observe: bool = False
+    case_ref: str = ""
+    content_type: str = ""
 
     def __post_init__(self):
         if not self.id or not self.url_template or not self.session_ref:
@@ -229,13 +241,18 @@ def _assertions_hold(assertions: tuple[Assertion, ...], *, status: int | None,
 async def execute_workflow(workflow: Workflow, run_context, *, initial_values=None,
                            capability: str = "workflow", refresh_fn=None,
                            max_refresh_attempts: int = 1,
-                           resume: WorkflowResult | None = None) -> WorkflowResult:
+                           resume: WorkflowResult | None = None,
+                           case_ref: str = "") -> WorkflowResult:
     """Execute an explicit workflow through the run-scoped policy executor.
 
     Cleanup steps are deferred and registered as soon as their prerequisite step
     succeeds. They run in reverse registration order on success, failure, or
     cancellation. A 401 is classified as session expiry and may invoke the bounded
     refresh callback; a 403 is access denial and is never refreshed.
+
+    `case_ref`, when non-empty, is the send case for every step that does not carry
+    its own `WorkflowStep.case_ref`; a step's own ref wins, and with neither set the
+    per-step "<workflow>:<version>:<step>" string is used, as before.
     """
     from harness.run_context import TypedRequest
 
@@ -268,13 +285,16 @@ async def execute_workflow(workflow: Workflow, run_context, *, initial_values=No
             return StepResult(step.id, StepStatus.BLOCKED,
                               f"missing extracted values: {', '.join(missing)}")
         attempts = 0
+        send_case = step.case_ref or case_ref or f"{workflow.id}:{workflow.version}:{step.id}"
         while True:
             outcome = await executor.execute(
-                TypedRequest(step.method, url, body=body or None), capability=capability,
-                session_ref=step.session_ref,
-                case_ref=f"{workflow.id}:{workflow.version}:{step.id}",
-                allow_cancelled_cleanup=is_cleanup)
-            if outcome.status != 401 or refresh_fn is None or attempts >= max_refresh_attempts:
+                TypedRequest(step.method, url, body=body or None,
+                             **({"headers": {"Content-Type": step.content_type}}
+                                if step.content_type else {})),
+                capability=capability, session_ref=step.session_ref,
+                case_ref=send_case, allow_cancelled_cleanup=is_cleanup)
+            if (step.observe or outcome.status != 401 or refresh_fn is None
+                    or attempts >= max_refresh_attempts):
                 break
             attempts += 1
             refreshed = await refresh_fn(step.session_ref, run_context)
@@ -285,6 +305,16 @@ async def execute_workflow(workflow: Workflow, run_context, *, initial_values=No
             status = StepStatus.CANCELLED if outcome.outcome == "cancelled" else StepStatus.BLOCKED
             return StepResult(step.id, status, outcome.error or outcome.outcome,
                               outcome.status, artifact_id)
+        if step.observe:
+            # The response is data for the caller's verdict. Extractors are
+            # best-effort here: a missing value is information, not a block.
+            values, _ = extract_all(
+                step.extractors, body=outcome.body, headers=outcome.headers,
+                response_url=outcome.final_url or url)
+            result.values.update(values)
+            return StepResult(step.id, StepStatus.CLEANED if is_cleanup else StepStatus.PASSED,
+                              f"observed HTTP {outcome.status}", outcome.status,
+                              artifact_id, values)
         if outcome.status == 401:
             return StepResult(step.id, StepStatus.FAILED, "session expired", 401, artifact_id)
         if outcome.status == 403:

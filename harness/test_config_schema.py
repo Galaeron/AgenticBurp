@@ -151,6 +151,12 @@ class SafeDefaultGuardTests(unittest.TestCase):
          lambda cfg: cfg.get("driver_capture", {}).get("enabled", False) is False),
         ("cross_site_poc.enabled",
          lambda cfg: cfg.get("cross_site_poc", {}).get("enabled", False) is False),
+        # Ticket G: the experiment cycle creates objects on the target; its
+        # separately-gated planner is an extra model call.
+        ("engagement.experiments.enabled",
+         lambda cfg: cfg.get("engagement", {}).get("experiments", {}).get("enabled", False) is False),
+        ("engagement.experiments.planner",
+         lambda cfg: cfg.get("engagement", {}).get("experiments", {}).get("planner", False) is False),
     ]
 
     def test_passive_privacy_guard(self):
@@ -161,6 +167,21 @@ class SafeDefaultGuardTests(unittest.TestCase):
         cfg["privacy"] = {"external_lookups": True}
         effective = config_schema.resolve_operating_profile(cfg, "passive-only")
         self.assertIs(effective["privacy"]["external_lookups"], False)
+
+    def test_passive_only_forces_the_experiment_cycle_off(self):
+        """Ticket G: GET reads are SAFE to the gate, so only these flags stop an
+        enabled experiment cycle from sending reads under passive-only."""
+        for knob in ("engagement.experiments.enabled", "engagement.experiments.planner"):
+            self.assertIn(knob, config_schema._PASSIVE_FORCE_OFF_KNOBS)
+        cfg = self._load_committed_config()
+        cfg["engagement"]["experiments"].update(enabled=True, planner=True)
+        effective = config_schema.resolve_operating_profile(cfg, "passive-only")
+        self.assertIs(effective["engagement"]["experiments"]["enabled"], False)
+        self.assertIs(effective["engagement"]["experiments"]["planner"], False)
+        self.assertEqual(effective["engagement"]["experiments"]["max_runs"], 4)
+        # Negative control: another profile leaves an explicitly enabled cycle alone.
+        kept = config_schema.resolve_operating_profile(cfg, "workstation")
+        self.assertIs(kept["engagement"]["experiments"]["enabled"], True)
 
     # Unsafe replacement value used to flip each flag for the negative control.
     UNSAFE_VALUES = {
@@ -178,6 +199,8 @@ class SafeDefaultGuardTests(unittest.TestCase):
         "business_context.enabled": True,
         "driver_capture.enabled": True,
         "cross_site_poc.enabled": True,
+        "engagement.experiments.enabled": True,
+        "engagement.experiments.planner": True,
     }
 
     @staticmethod
@@ -208,8 +231,11 @@ class SafeDefaultGuardTests(unittest.TestCase):
         for name, _ in self.SAFE_CHECKS:
             with self.subTest(flag=name):
                 cfg = self._load_committed_config()
-                section, key = name.split(".")
-                cfg.setdefault(section, {})[key] = self.UNSAFE_VALUES[name]
+                *parents, key = name.split(".")
+                node = cfg
+                for part in parents:
+                    node = node.setdefault(part, {})
+                node[key] = self.UNSAFE_VALUES[name]
                 violations = self._violations(cfg)
                 self.assertIn(
                     name, violations,

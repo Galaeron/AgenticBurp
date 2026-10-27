@@ -252,22 +252,38 @@ class OwnershipLedger:
         fact = self._by_ref.get(object_ref)
         if fact is None:
             fact = self._by_ref.get(run_agnostic(object_ref))
-        if fact is None and self._patterns:
-            from harness.protected_routes import _target_of, _path_matches
-            match = re.match(r"run:[^|]*\|app:([^|]*)\|tenant:[^|]*\|resource:(.*)", object_ref)
-            if match:
-                origin, resource = match.groups()
-                path = tuple(urlsplit(resource).path.split('/')[1:])
-                matches = [(score, candidate) for target, verb, segments, candidate, score in self._patterns
-                           if target == _target_of(origin) and (verb is None or verb == method.upper())
-                           and _path_matches(segments, path)]
-                if matches:
-                    best = max(score for score, _ in matches)
-                    facts = [candidate for score, candidate in matches if score == best]
-                    permissions = {(f.owner_principal_id, f.shared_with, f.public, f.authenticated) for f in facts}
-                    # Equally specific contradictory declarations are not proof of a boundary.
-                    return facts[0] if len(permissions) == 1 else None
+        if fact is None:
+            matches = self._pattern_matches(object_ref, method)
+            if matches:
+                best = max(score for score, _ in matches)
+                facts = [candidate for score, candidate in matches if score == best]
+                permissions = {(f.owner_principal_id, f.shared_with, f.public, f.authenticated) for f in facts}
+                # Equally specific contradictory declarations are not proof of a boundary.
+                return facts[0] if len(permissions) == 1 else None
         return fact
+
+    def _pattern_matches(self, object_ref: str, method: str = "GET") -> list:
+        """(specificity, fact) for every declared path pattern matching this object
+        reference's application, path and method."""
+        if not self._patterns:
+            return []
+        from harness.protected_routes import _target_of, _path_matches
+        match = re.match(r"run:[^|]*\|app:([^|]*)\|tenant:[^|]*\|resource:(.*)", object_ref)
+        if not match:
+            return []
+        origin, resource = match.groups()
+        path = tuple(urlsplit(resource).path.split('/')[1:])
+        return [(score, candidate) for target, verb, segments, candidate, score in self._patterns
+                if target == _target_of(origin) and (verb is None or verb == method.upper())
+                and _path_matches(segments, path)]
+
+    def has_declaration(self, object_ref: str, method: str = "GET") -> bool:
+        """Whether anything is declared for this object -- an exact or run-agnostic
+        fact, or a path pattern that matches -- even when `lookup` returns None
+        because equally specific declarations contradict each other. A caller must
+        not treat such an object as undeclared."""
+        return (object_ref in self._by_ref or run_agnostic(object_ref) in self._by_ref
+                or bool(self._pattern_matches(object_ref, method)))
 
     def owner_of(self, object_ref: str) -> OwnershipFact | None:
         return self.lookup(object_ref)
