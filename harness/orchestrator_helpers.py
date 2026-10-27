@@ -783,25 +783,32 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
             if v.name == "verbose_error_validator":
                 continue  # already ran above
             try:
-                dummy_finding = Finding(
-                    vulnerability_class=next(iter(v.finding_classes)),
-                    severity="medium", confidence=0.5,
-                    summary=f"Universal header audit: {v.name}",
-                    evidence="", suggested_test="", basis="derived",
-                )
-                result = await v.validate(dummy_finding, ex)
-                if result.confirmed:
-                    exchange_findings.append(Finding(
-                        vulnerability_class=result.finding_class,
-                        severity="medium",
-                        confidence=result.confidence,
-                        summary=result.summary,
-                        evidence=result.evidence,
-                        suggested_test="",
-                        basis="derived",
-                        confirmed=True,
-                        confirmation_method=v.get_name(),
-                    ))
+                if callable(getattr(v, "audit", None)):
+                    # A validator that decides each class by its own check (CSP
+                    # vs framing) audits every class from ONE fetch of the
+                    # exchange; set iteration order is not a choice of class.
+                    results = list((await v.audit(ex)).values())
+                else:
+                    dummy_finding = Finding(
+                        vulnerability_class=next(iter(v.finding_classes)),
+                        severity="medium", confidence=0.5,
+                        summary=f"Universal header audit: {v.name}",
+                        evidence="", suggested_test="", basis="derived",
+                    )
+                    results = [await v.validate(dummy_finding, ex)]
+                for result in results:
+                    if result.confirmed:
+                        exchange_findings.append(Finding(
+                            vulnerability_class=result.finding_class,
+                            severity="medium",
+                            confidence=result.confidence,
+                            summary=result.summary,
+                            evidence=result.evidence,
+                            suggested_test="",
+                            basis="derived",
+                            confirmed=True,
+                            confirmation_method=v.get_name(),
+                        ))
             except Exception as e:
                 log.debug("universal_header_audit: %s failed on %s: %s",
                           v.get_name(), getattr(ex, "url", "?"), e)
