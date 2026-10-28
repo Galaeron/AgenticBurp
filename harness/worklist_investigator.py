@@ -59,6 +59,17 @@ def captured_nodes(node, base_url, roles, include_probes=False):
                        probe_session=role, reachable_roles=[role.role])
 
 
+def node_key(node) -> str:
+    """A worklist node's identity across runs (E7): method, normalized route, the
+    identity key and capture id of the capture it replays, and its principal. All
+    of them come from the discovery state, so the same state gives the same key."""
+    capture = node.get("capture") or {}
+    principal = getattr(node.get("probe_session"), "principal_id", None)
+    return "|".join([str(node.get("method") or "GET").upper(), str(node.get("path") or ""),
+                     str(capture.get("identity_key") or ""), str(capture.get("capture_id") or ""),
+                     str(principal() if callable(principal) else "")])
+
+
 def _sha256(text) -> str:
     return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
 
@@ -317,6 +328,8 @@ async def investigate_worklist(
     worklist_limit: int = 200,
     summary_out: dict | None = None,
     deadline: float | None = None,
+    completed: dict[str, dict] | None = None,
+    on_outcome=None,
 ) -> list[dict]:
     """Drive `probe_fn` over the top `max_nodes` actionable worklist nodes.
 
@@ -359,6 +372,13 @@ async def investigate_worklist(
     `deadline`, a `time.monotonic()` value, stops the sweep starting work on a
     node once passed; every later node that had work due is skipped as
     `time_budget`, and one with nothing to run keeps its own reason.
+
+    `completed` (E7 resume) maps node_key(node) to the outcome an earlier,
+    interrupted run recorded for that node. Such a node is not run again: it uses the
+    budget it used, folds its stored findings into `state` and returns the stored
+    outcome marked `resumed`, without calling probe_fn, confirm_fn or precondition_fn.
+    `on_outcome(node_key, outcome)` is called as each node's outcome finishes (an
+    errored probe is not reported, so it runs again on resume).
 
     Returns a per-node outcome list; findings are folded back into `state`."""
     role_headers = {r.role: dict(r.headers or {}) for r in roles}
@@ -405,12 +425,6 @@ async def investigate_worklist(
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
                             "reason": _skip_reason(node, eligible, investigated, max_nodes, False)})
             continue  # no agent hypothesis AND no shape-driven leg to run -- skip
-        if deadline is not None and time.monotonic() >= deadline:
-            # Work was due here but the investigation time budget is spent.
-            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
-                            "reason": SKIP_TIME_BUDGET})
-            continue
-
         reach = node.get("reachable_roles", []) or []
         # probe from the lowest-trust identity that can reach it (strongest proof).
         probe_role = min(reach, key=_trust) if reach else (roles[0].role if roles else "anonymous")
@@ -418,6 +432,28 @@ async def investigate_worklist(
         headers = dict(session.headers or {}) if session else role_headers.get(probe_role, {})
         parent_id = _parent_template_object_id(state, node)
         exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
+
+        # E7: a node an earlier run finished needs no work, so the deadline does not apply.
+        key = node_key(node) if (completed is not None or on_outcome is not None) else ""
+        if completed is not None and key in completed:
+            stored = completed[key]
+            if do_precond:
+                precondition_run += 1
+            if do_agent and not (stop_on_confirm and stored.get("confirmed")):
+                investigated += 1
+            node_findings = [dict(f) for f in stored.get("findings_detail") or []]
+            if node_findings:
+                state.ingest_findings(exchange.url, exchange.method, node_findings)
+            outcomes.append(dict(stored, findings_detail=node_findings, resumed=True))
+            if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
+                break
+            continue
+
+        if deadline is not None and time.monotonic() >= deadline:
+            # Work was due here but the investigation time budget is spent.
+            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
+                            "reason": SKIP_TIME_BUDGET})
+            continue
 
         node_findings: list[dict] = []
 
@@ -499,6 +535,11 @@ async def investigate_worklist(
             "confirmed": any(f.get("confirmed") for f in node_findings),
             "stop_reason": agent_stop,
         })
+        if on_outcome is not None:
+            try:
+                on_outcome(key, outcomes[-1])
+            except Exception as e:  # recording a unit never sinks the sweep
+                log.warning("investigate_worklist: on_outcome failed: %s", e)
         if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
             break
 

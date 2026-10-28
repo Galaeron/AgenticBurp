@@ -9,8 +9,10 @@ from urllib.parse import urlsplit
 from harness.models import HttpExchange
 
 
-def review_frontier(captured, *, seen=None):
+def review_frontier(captured, *, seen=None, with_keys=False):
     """Deduplicate exact observations and interleave routes and identities.
+    With `with_keys` each item is (observation key, exchange): the key is the sha256
+    that decides "seen", stable across runs for the same observation.
 
     Keep different bodies, credentials and responses. Polling on one route must
     not consume the review budget before another route gets its first review.
@@ -42,7 +44,7 @@ def review_frontier(captured, *, seen=None):
                 del groups[group]
             if key not in seen:
                 seen.add(key)
-                yield ex
+                yield (key, ex) if with_keys else ex
 
 
 def assessment_health(coverage, errors=(), *, stopped_on_confirmation=False):

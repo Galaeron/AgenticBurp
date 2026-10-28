@@ -1384,10 +1384,11 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
 # --- Flagship graph investigation as a tracked, cancellable job (R18) ----------
 # Before this, server.py exposed run/advance/crawl but NEVER invoked
 # investigate_engagement, so the Burp UI could not reach the flagship path at all.
-# This runs it as a background asyncio job with status/result/cancel. NOTE: a
-# persisted mid-run RESUME cursor (SHOULD-tier) is not implemented -- investigate_
-# engagement is not internally checkpointed; that needs the execution ledger
-# (roadmap Phase 2) and is an explicit follow-up. Jobs live in-process.
+# This runs it as a background asyncio job with status/result/cancel. With
+# runs.journal on (default off), the run also writes each finished unit (discovery,
+# worklist nodes, capture reviews, coverage checkpoints) to a run journal
+# (run_journal.py), so an interrupted job -- which has no result -- can be resumed with
+# resume_job_id without repeating them. Job status lives in-process and in the job store.
 import uuid as _uuid
 import time as _time
 import harness.run_manifest as _run_manifest
@@ -1415,6 +1416,10 @@ def _job_store():
                           retention=_JOB_RETENTION_SECONDS,
                           max_terminal=_MAX_RETAINED_TERMINAL_JOBS,
                           max_running=_MAX_RUNNING_JOBS)
+
+
+def _run_journal_path():
+    return Path(store._DB_PATH).with_name('harness_run_journal.db')
 
 
 def _save_job_status(job):
@@ -1477,6 +1482,28 @@ def _job_public(job: dict, *, include_result: bool = False) -> dict:
     if include_result and snapshot['status'] in _TERMINAL_STATUSES:
         out['result'] = snapshot['result']
     return out
+
+
+def _journal_context_key(config, req) -> str:
+    """E7: the run journal's context key. Source and configuration
+    (resume_context_key) plus the request inputs that shape what a run discovers
+    and investigates: the target URL, each role's identity (role, name, tenant,
+    expected permissions, credential header NAMES), the seed requests and the
+    limits. Credential VALUES are left out on purpose: a resumed run logs in again
+    and the journal fills each `$role:` placeholder from the new run's roles."""
+    import hashlib
+    import json
+    from harness.coverage_tracker import resume_context_key
+    roles = sorted(
+        (str(r.get("role", "user")), str(r.get("name") or ""), str(r.get("tenant") or ""),
+         sorted(str(p) for p in (r.get("expected_permissions") or [])),
+         sorted(str(k).lower() for k in (r.get("headers") or {})))
+        for r in (req.roles or []))
+    seeds = [(s.method, s.url, hashlib.sha256((s.request_body or "").encode()).hexdigest())
+             for s in (req.seed_exchanges or [])]
+    limits = req.model_dump(exclude={"base_url", "roles", "seed_exchanges", "resume_job_id"})
+    inputs = json.dumps([req.base_url, roles, seeds, limits], sort_keys=True, default=str)
+    return f"{resume_context_key(config)}:{hashlib.sha256(inputs.encode()).hexdigest()[:16]}"
 
 
 class InvestigateRequest(_BaseModel):
@@ -1552,6 +1579,10 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     # server has finite job capacity and the caller can just retry later.
     _evict_expired_jobs()
     coverage_checkpoint = None
+    journal_on = bool((config.get('runs', {}) or {}).get('journal', False))
+    journal_root = None
+    journal_key = _journal_context_key(config, req) if journal_on else ''
+
     if req.resume_job_id:
         journal = _job_store()
         prior = journal.get(req.resume_job_id)
@@ -1562,15 +1593,35 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             return parsed.scheme.lower(), parsed.hostname, parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
         if prior['status'] not in _TERMINAL_STATUSES or _origin(prior['base_url']) != _origin(req.base_url):
             raise HTTPException(status_code=409, detail='prior job is not terminal or has a different target origin')
+        from harness.coverage_tracker import resume_context_key
+        prior_root = prior.get('journal_root') or req.resume_job_id
+        result_missing = False
         try:
             import json
             prior_result = json.loads(await asyncio.to_thread(journal.read_result, req.resume_job_id))
             coverage_checkpoint = (prior_result.get('coverage') or {}).get('checkpoint')
         except (ValueError, OSError, __import__('sqlite3').Error, AttributeError):
-            raise HTTPException(status_code=409, detail='prior result is missing or corrupt') from None
-        from harness.coverage_tracker import resume_context_key
-        if not isinstance(coverage_checkpoint, dict) or coverage_checkpoint.get('context_key') != resume_context_key(config):
-            raise HTTPException(status_code=409, detail='prior coverage is unavailable or source/configuration changed')
+            result_missing = True
+        if not result_missing:
+            if not isinstance(coverage_checkpoint, dict) or coverage_checkpoint.get('context_key') != resume_context_key(config):
+                raise HTTPException(status_code=409, detail='prior coverage is unavailable or source/configuration changed')
+        else:
+            # An interrupted job has no result. With the run journal on, the units it
+            # journaled stand in for one, if this configuration is the one that wrote them;
+            # the coverage checkpoint then comes from the journal, inside the run.
+            if not journal_on:
+                raise HTTPException(status_code=409, detail='prior result is missing or corrupt')
+            from harness.run_journal import RunJournal
+            prior_units = RunJournal(_run_journal_path(), prior_root, journal_key)
+            if not await asyncio.to_thread(prior_units.has_any):
+                if await asyncio.to_thread(prior_units.has_any, any_context=True):
+                    raise HTTPException(status_code=409,
+                                        detail='prior coverage is unavailable or source, configuration '
+                                               'or request inputs changed')
+                raise HTTPException(status_code=409, detail='prior result is missing or corrupt')
+            # Only an interrupted job resumes from its journal; a finished one keeps
+            # the result-and-checkpoint path above.
+            journal_root = prior_root
     running_count = sum(1 for j in _INVESTIGATE_JOBS.values() if j["status"] in _RUNNING_STATUSES)
     if running_count >= _MAX_RUNNING_JOBS:
         raise HTTPException(
@@ -1592,11 +1643,23 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
         gate_config=_live_validators_gate_config(),
         max_requests=runs_cfg.get("max_requests"), config=config,
         timeout=float(runs_cfg.get("request_timeout_seconds", 15.0)))
+    # E7: the run's journal, rooted at this job, or at the prior job's root when resuming.
+    if journal_on:
+        try:
+            from harness.run_journal import RunJournal
+            run_context.run_journal = RunJournal(
+                _run_journal_path(), journal_root or job_id, journal_key, roles=roles)
+            await asyncio.to_thread(run_context.run_journal.prune)
+        except Exception as exc:
+            run_context.run_journal = None
+            log.warning('run journal unavailable (%s); this job is not journaled', type(exc).__name__)
     output_dir = Path(runs_cfg.get('output_dir') or Path(__file__).parent / 'run-output')
     job: dict = {"job_id": job_id, "host": host, "base_url": req.base_url,
                  "status": "running", "task": None, "result": None, "error": None,
                  "started_at": _time.time(), "finished_at": None,
-                 "manifest_path": str(output_dir / f'{job_id}.json'), "run_context": run_context}
+                 "manifest_path": str(output_dir / f'{job_id}.json'), "run_context": run_context,
+                 "journal_root": (run_context.run_journal.root_job_id
+                                  if run_context.run_journal is not None else None)}
     try:
         _, admitted = _job_store().create(job)
         if not admitted:

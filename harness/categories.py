@@ -149,6 +149,13 @@ _SYNONYMS: dict[str, str] = {
     "weak_crypto": "crypto", "tls": "crypto", "ssl": "crypto",
     "csp": "csp", "content security policy": "csp", "content_security_policy": "csp",
     "clickjacking": "csp",
+    # E2: the spellings of one host-wide header fact. _normalize() folds hyphens to
+    # spaces, so the spaced form of each hyphenated spelling covers both.
+    "missing csp": "csp", "missing content security policy": "csp",
+    "content security policy missing": "csp", "missing x frame options": "csp",
+    "x frame options missing": "csp", "clickjacking vulnerability": "csp",
+    "clickjacking exposure": "csp", "missing security headers (csp)": "csp",
+    "cors wildcard": "cors", "permissive cors": "cors",
     "header_injection": "header_injection", "header injection": "header_injection",
     "crlf injection": "header_injection", "crlf_injection": "header_injection",
     "response splitting": "header_injection",

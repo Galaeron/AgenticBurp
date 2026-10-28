@@ -840,6 +840,11 @@ runs:
   # THIS run, never replayed from a prior one.
   hypothesis_cache:
     enabled: false
+  # E7: write each finished unit of an investigation (discovery, worklist nodes, capture
+  # reviews, coverage checkpoints) to a run journal beside the job store, so an interrupted
+  # job (one with no result) can be resumed with resume_job_id without repeating them.
+  # SAFE DEFAULT: false -- no journal is written and only a job with a result resumes.
+  journal: false
 
 # Ownership declarations are opt-in and belong in config.local.yaml:
 # authz:

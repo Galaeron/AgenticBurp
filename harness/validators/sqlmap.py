@@ -243,6 +243,105 @@ def _looks_like_auth_request(exchange: HttpExchange) -> bool:
     return any(seg in _AUTH_PATH_SEGMENTS for seg in path.split("/") if seg)
 
 
+# Ticket 2B: sqlmap's own report of WHERE it found injection. The block starts with
+# "sqlmap identified|resumed the following injection point(s)" and holds, per
+# parameter, a "Parameter: <name> (<place>)" line followed by repeated
+# Type/Title/Payload lines.
+_POINTS_HEADER_RE = re.compile(r"sqlmap (?:identified|resumed) the following injection point", re.I)
+_POINT_PARAM_RE = re.compile(r"^Parameter:\s*(?P<name>.+?)\s*\((?P<place>.+)\)\s*$")
+_POINT_FIELD_RE = re.compile(r"^(?P<key>Type|Title|Payload):\s*(?P<value>.*)$", re.I)
+_HEADER_PLACES = frozenset({"user-agent", "referer", "host", "x-forwarded-for", "x-forwarded-host"})
+# Where the harness's boolean differential can mutate a parameter (see
+# _boolean_probe_fallback's only_params).
+_DIFFERENTIAL_LOCATIONS = ("query", "body_form", "body_json")
+_MAX_REPRODUCED_POINTS = 3
+_MAX_LISTED_POINTS = 8
+_PAYLOAD_LINE_CAP = 200
+_TAIL_MARKER = "--- sqlmap output (tail) ---"
+
+
+def _point_location(place: str, name: str) -> tuple[str, str]:
+    """(harness parameter location, parameter name) for sqlmap's "(place)" label and
+    its parameter name ("JSON email" is the JSON body field "email")."""
+    label = place.strip().lower()
+    if label == "get":
+        return "query", name
+    if label == "post":
+        return "body_form", name
+    if label == "(custom) post":
+        return "body_json", name[5:].strip() if name[:5].lower() == "json " else name
+    if label == "uri":
+        return "path", name
+    if label == "cookie":
+        return "cookie", name
+    if label in _HEADER_PLACES or label.startswith("x-"):
+        return "header", name
+    return label, name
+
+
+def parse_injection_points(output: str) -> list[dict]:
+    """The injection points sqlmap reported in its output: one dict per
+    (parameter, type) with place (the harness's parameter location), parameter,
+    type, title and payload. Missing lines leave "" and Windows line endings are
+    fine. [] when the output has no injection-point block."""
+    points: list[dict] = []
+    in_block = False
+    param: tuple[str, str] | None = None
+    entry: dict | None = None
+    for raw in (output or "").splitlines():
+        line = raw.strip()
+        if _POINTS_HEADER_RE.search(line):
+            in_block, param, entry = True, None, None
+            continue
+        if not in_block:
+            continue
+        if line.startswith("[") and "] [" in line[:30]:
+            in_block, param, entry = False, None, None   # a log line ends the block
+            continue
+        found = _POINT_PARAM_RE.match(line)
+        if found:
+            param, entry = _point_location(found.group("place"), found.group("name").strip()), None
+            continue
+        field = _POINT_FIELD_RE.match(line)
+        if field is None or param is None:
+            continue
+        key, value = field.group("key").lower(), field.group("value").strip()
+        # A Type line, or a Title/Payload that repeats one this entry already has,
+        # starts a new entry for the parameter.
+        if entry is None or key == "type" or entry[key]:
+            entry = {"place": param[0], "parameter": param[1], "type": "", "title": "", "payload": ""}
+            points.append(entry)
+        entry[key] = value
+    unique: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for point in points:
+        ident = (point["place"], point["parameter"], point["type"])
+        if ident not in seen:
+            seen.add(ident)
+            unique.append(point)
+    return unique
+
+
+def _point_label(point: dict) -> str:
+    return f"{point['place']}:{point['parameter']}"
+
+
+def _points_evidence(points: list[dict], tail: str, differential: str = "") -> str:
+    """The evidence of a sqlmap confirmation: what it found where, then its payloads
+    (and the harness's own differential, when it reproduced one), then the output
+    tail (callers keep only the first 1000 characters)."""
+    if not points:
+        return tail
+    listed = points[:_MAX_LISTED_POINTS]
+    lines = [f"injection point: {_point_label(p)} — {p['type'] or 'injection'}"
+             + (f" ({p['title']})" if p["title"] else "") for p in listed]
+    lines += [f"payload ({_point_label(p)}): {p['payload'][:_PAYLOAD_LINE_CAP]}"
+              for p in listed if p["payload"]]
+    if differential:
+        lines.append(f"harness differential: {differential}")
+    return "\n".join(lines) + f"\n{_TAIL_MARKER}\n" + tail
+
+
 class SqlmapValidator(Validator):
     """Optional active SQLi validator.
 
@@ -645,12 +744,7 @@ class SqlmapValidator(Validator):
             lower = output.lower()
             confirmed = proc.returncode == 0 and "is vulnerable" in lower
             if confirmed:
-                return ValidationResult(
-                    self.name, "confirmed", finding.vulnerability_class,
-                    confidence=0.98, confirmed=True,
-                    summary="sqlmap independently reported the target as injectable",
-                    evidence=output, raw_output=output, command=cmd,
-                )
+                return await self._sqlmap_confirmation(finding, exchange, output, cmd)
             if proxy is not None and proxy.stop_reason:
                 # The run refused part of the scan: an incomplete scan is not a negative.
                 why = _PROXY_STOP_WHY.get(proxy.stop_reason, "the run was cancelled")
@@ -683,6 +777,40 @@ class SqlmapValidator(Validator):
                 evidence=output, raw_output=output, command=cmd,
             )
 
+    async def _sqlmap_confirmation(self, finding: Finding, exchange: HttpExchange,
+                                   output: str, cmd: list[str]) -> ValidationResult:
+        """The confirmation for a sqlmap that reported the target injectable (Ticket 2B).
+
+        sqlmap stays the authority for the verdict. Its injection points lead the
+        evidence, and each boolean-based point the harness can mutate (up to
+        _MAX_REPRODUCED_POINTS) is replayed through the boolean differential
+        restricted to that parameter. The first one that reproduces gives the result
+        the differential's baseline/attack/control artifacts; otherwise the result is
+        marked tool-reported and names no exchanges, so its proof stays a candidate."""
+        points = parse_injection_points(output)
+        result = ValidationResult(
+            self.name, "confirmed", finding.vulnerability_class,
+            confidence=0.98, confirmed=True,
+            summary="sqlmap independently reported the target as injectable",
+            evidence=_points_evidence(points, output), raw_output=output, command=cmd,
+            injection_points=tuple(points),
+        )
+        eligible = [p for p in points
+                    if "boolean" in p["type"].lower() and p["place"] in _DIFFERENTIAL_LOCATIONS]
+        for point in eligible[:_MAX_REPRODUCED_POINTS]:
+            repro = await self._boolean_probe_fallback(
+                finding, exchange, only_params=[(point["place"], point["parameter"])])
+            if repro is None or not repro.confirmed:
+                continue
+            result.summary = (f"sqlmap reported injection at {_point_label(point)} ({point['type']}); "
+                              "the harness reproduced a true/false differential on the same parameter")
+            result.evidence = _points_evidence(points, output, repro.evidence)
+            return result.with_artifacts(
+                baseline=repro.baseline_artifact_id, attack=repro.attack_artifact_id,
+                controls=repro.control_artifact_ids)
+        result.summary = "tool-reported, not reproduced by the harness: " + result.summary
+        return result
+
     # Cap on how many parameters this fallback probes per exchange -- this
     # is a bounded, opt-in active check (same philosophy as
     # recon_validator.py's own request caps and scope_discovery.py's
@@ -694,7 +822,8 @@ class SqlmapValidator(Validator):
     _MAX_PROBE_PARAMS = 5
 
     async def _boolean_probe_fallback(
-        self, finding: Finding, exchange: HttpExchange
+        self, finding: Finding, exchange: HttpExchange,
+        only_params: list[tuple[str, str]] | None = None,
     ) -> ValidationResult | None:
         """Dependency-free confirmation for SQL injection when sqlmap isn't
         installed. NOT limited to credential/auth fields -- SQLi is not an
@@ -719,6 +848,10 @@ class SqlmapValidator(Validator):
         syntax alone (a broken query would fail both identically) that
         changed it.
 
+        `only_params` ((location, name) pairs with location query, body_form or
+        body_json) restricts the candidates to those parameters, so a tool's
+        reported injection point is replayed without probing the others.
+
         Returns None (not a ValidationResult) when there are no query or
         body parameters to mutate at all -- the caller falls back to a
         plain "sqlmap not found" error in that case, since this probe's
@@ -738,6 +871,10 @@ class SqlmapValidator(Validator):
             ):
                 body_kind = "form"
                 candidates += [("body", p) for p in _form_top_level_params(body)]
+        if only_params is not None:
+            wanted = set(only_params)
+            candidates = [(loc, p) for loc, p in candidates
+                          if (("query" if loc == "query" else f"body_{body_kind}"), p) in wanted]
         candidates = candidates[: self._MAX_PROBE_PARAMS]
         if not candidates:
             return None

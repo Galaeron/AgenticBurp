@@ -1,4 +1,6 @@
 from __future__ import annotations
+import hashlib
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -35,6 +37,15 @@ class ValidationResult:
     baseline_artifact_id: str = ""
     attack_artifact_id: str = ""
     control_artifact_ids: tuple[str, ...] = ()
+    # Ticket 2B: the injection points a tool reported (sqlmap), one dict per
+    # (parameter, type): {"place", "parameter", "type", "title", "payload"}, where
+    # place is the harness's parameter location (query, body_form, body_json, path,
+    # cookie, header). Empty for every other validator.
+    injection_points: tuple[dict, ...] = ()
+    # E2: sha256 of the normalized response-header policy a header check decided from
+    # (header_fingerprint below), so findings of one host-wide policy group as one
+    # issue. "" when the validator is not a header check or saw no response.
+    header_fingerprint: str = ""
 
     def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
         """Name the sends behind this verdict; each is an ExecutionOutcome, a
@@ -91,6 +102,30 @@ def proof_artifact_kwargs(result) -> dict:
         return {}
     return {"executed": True, "baseline_artifact_id": baseline,
             "attack_artifact_id": attack, "control_artifact_ids": controls}
+
+
+def header_fingerprint(*values: str | None) -> str:
+    """sha256 of the normalized values of the response headers a policy is made of;
+    None is a header that was absent. Case and whitespace are folded and a CSP nonce
+    (new on every response) is dropped, so one policy has one fingerprint however
+    often it is fetched."""
+    parts = ["-" if v is None else re.sub(r"'nonce-[^']*'", "'nonce-'", " ".join(str(v).split()).lower())
+             for v in values]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8", errors="replace")).hexdigest()
+
+
+def observed_result_of(result, limit: int = 500) -> str:
+    """ProofRecord.observed_result for a result: its summary (else evidence), and
+    for a tool that reported injection points the "<location>:<parameter> <type>"
+    list, so a proof names what was tested even when the summary is long."""
+    base = getattr(result, "summary", "") or getattr(result, "evidence", "") or ""
+    points = getattr(result, "injection_points", ()) or ()
+    if not points:
+        return base[:limit]
+    listed = "; ".join(f"{p.get('place', '')}:{p.get('parameter', '')} {p.get('type', '')}".strip()
+                       for p in points)[:limit // 2]
+    tail = f" [injection points: {listed}]"
+    return base[:max(0, limit - len(tail))] + tail
 
 
 def _enclosing_run():
