@@ -35,7 +35,7 @@ import httpx
 
 from harness import security
 
-from .base import Validator, ValidationResult
+from .base import Validator, ValidationResult, header_fingerprint
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -310,6 +310,10 @@ class CspValidator(Validator):
             summary=" ".join(summary_parts),
             evidence=f"{observed} | {self._build_evidence(checked)}",
             raw_output=self._build_raw_output(tests),
+            header_fingerprint=header_fingerprint(
+                headers_lower.get("content-security-policy"),
+                headers_lower.get("content-security-policy-report-only"),
+                headers_lower.get("x-frame-options")),
         )
 
     def _skipped(self, finding_class: str, observed: str, tests: list[CspTestResult],

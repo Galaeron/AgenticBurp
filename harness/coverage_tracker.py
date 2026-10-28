@@ -154,6 +154,10 @@ _LEG_CONFIRMATIONS = {
     "file_upload", "rate_limit", "reset_token", "dom_xss", "toctou", "race_condition",
 }
 
+# E7: a drive hands its checkpoint to `on_checkpoint` after every this many completed
+# legs, so a run that dies inside a long drive resumes from the last of them.
+CHECKPOINT_EVERY_LEGS = 25
+
 
 def _listed_in_compact_ledger(row: dict) -> bool:
     """A ledger row the job result keeps: the cell is shape-applicable, or it has a
@@ -177,6 +181,8 @@ class CoverageTracker:
         self.driveable = set()
         self.checkpoint_signature = ""
         self.context_key = ""
+        # E7: called with checkpoint() every CHECKPOINT_EVERY_LEGS completed legs.
+        self.on_checkpoint = None
         # Why a drive stopped with queued cells left: "leg budget" or "time budget".
         self.stopped_by = None
         # canonical vulnerability_class -> [check_id]; plus the raw class token so
@@ -381,6 +387,7 @@ class CoverageTracker:
             if deadline is not None and time.monotonic() >= deadline:
                 self.stopped_by = "time budget"
                 break
+            self._checkpoint_after(n)
             n += 1  # Bound attempts, including failed or declined dispatches.
             self.attempted.add((ident, ep_key, check.id))
             method, _, path = ep_key.partition(" ")
@@ -494,6 +501,7 @@ class CoverageTracker:
             if deadline is not None and time.monotonic() >= deadline:
                 self.stopped_by = "time budget"
                 break
+            self._checkpoint_after(attempts)
             check = CHECKS_BY_ID[check_id]
             method, _, path = ep_key.partition(" ")
             # the request-level representative the whole-request result binds to
@@ -662,9 +670,23 @@ class CoverageTracker:
         from harness.coverage_summary import summarize_coverage
         s["audited"] = summarize_coverage(self.matrix)
         s["phase_ledger"] = self.phase_ledger(compact=compact)
-        s["checkpoint"] = {"signature": self.checkpoint_signature, "context_key": self.context_key,
-                           "matrix": self.matrix.to_dict()}
+        s["checkpoint"] = self.checkpoint()
         return s
+
+    def checkpoint(self) -> dict:
+        """What a later run restores completed cells from (restore_checkpoint)."""
+        return {"signature": self.checkpoint_signature, "context_key": self.context_key,
+                "matrix": self.matrix.to_dict()}
+
+    def _checkpoint_after(self, completed: int) -> None:
+        """Hand the checkpoint to on_checkpoint once `completed` legs are done, at each
+        multiple of CHECKPOINT_EVERY_LEGS. A failing callback never stops the drive."""
+        if self.on_checkpoint is None or completed <= 0 or completed % CHECKPOINT_EVERY_LEGS:
+            return
+        try:
+            self.on_checkpoint(self.checkpoint())
+        except Exception as e:
+            log.warning("coverage checkpoint callback failed: %s", e)
 
 
 def endpoint_view(state) -> dict[str, dict]:
@@ -721,7 +743,7 @@ def build_coverage(state, roles, investigated_keys: set[str] | None = None,
 async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | None = None,
                                 budget: int = 80, investigated_keys: set[str] | None = None,
                                 checkpoint=None, context_key="",
-                                deadline: float | None = None) -> dict:
+                                deadline: float | None = None, on_checkpoint=None) -> dict:
     """Like build_coverage, but ACTIVELY DRIVES the deterministic legs (I1): after
     recording the findings the run already produced, it fires every applicable
     leg-backed cell via `run_leg` (regardless of any agent label) and records the
@@ -736,6 +758,7 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     # add afterwards. Cells the driver did not reach stay pending and are given an
     # honest skip reason below (R01: never fabricate a not_detected).
     tracker.restore_checkpoint(checkpoint, context_key)
+    tracker.on_checkpoint = on_checkpoint
     driven = await tracker.drive_coverage_legs(run_leg, driveable=driveable, budget=budget,
                                                deadline=deadline)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
@@ -750,7 +773,7 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
                                       budget: int = 80, per_cell_case_budget: int = 8,
                                       investigated_keys: set[str] | None = None,
                                       checkpoint=None, context_key="",
-                                      deadline: float | None = None) -> dict:
+                                      deadline: float | None = None, on_checkpoint=None) -> dict:
     """Case-granular coverage driving (T05/R26): enumerate each applicable leg
     cell's concrete input cases from the endpoint template, then fire a leg PER
     CASE via `run_case(identity, method, path, check, case_key)` and record the
@@ -766,6 +789,7 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     tracker.build(endpoints, identities, identity_roles)
     tracker.record_findings_from_state(endpoints, identities, identity_roles)
     tracker.restore_checkpoint(checkpoint, context_key)
+    tracker.on_checkpoint = on_checkpoint
     enumerated = tracker.expand_parameter_cases(
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
     driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget,

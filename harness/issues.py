@@ -33,7 +33,7 @@ from harness.categories import canonicalize
 from harness.engagement import normalize_path
 from harness import security
 
-_ISSUE_VERSION = 1
+_ISSUE_VERSION = 2   # 2: csp/cors issues group by host + header_fingerprint (E2)
 
 # Method -> the authorization boundary it crosses. A safe method reads; a
 # body/state method writes. Kept explicit (not merely implied by the method) so
@@ -75,6 +75,14 @@ _DEPENDENCY_CLASS_PREFIXES = ("known-vulnerable-dependency:", "recently-publishe
 
 def _is_dependency_class(vulnerability_class: str) -> bool:
     return (vulnerability_class or "").strip().lower().startswith(_DEPENDENCY_CLASS_PREFIXES)
+
+
+# E2: a header-policy finding (a missing or weak CSP, a CORS grant) is a fact about
+# the response-header policy a host serves, which one header set repeats on every
+# route. These canonical classes group by host + class + the policy's fingerprint
+# (Finding.header_fingerprint), not by endpoint family, so 30 routes serving one
+# policy are one issue listing 30 routes; routes with different policies stay apart.
+_HEADER_POLICY_CLASSES = frozenset({"csp", "cors"})
 
 
 # --------------------------------------------------------------------------- #
@@ -260,7 +268,10 @@ def issue_key(finding: dict) -> tuple:
     branch groups by host + canonical class/component only: endpoint_family
     and method are dropped (irrelevant to a host-wide banner) and no
     disambiguator is added, letting genuinely identical advisories collapse to
-    ONE issue regardless of which exchange first surfaced them."""
+    ONE issue regardless of which exchange first surfaced them.
+
+    E2 exception: a header-policy finding (csp, cors; see `_HEADER_POLICY_CLASSES`)
+    groups by host + class + `header_fingerprint`, with no endpoint family or method."""
     url = finding.get("url", "")
     host = _host_of(url)
     method = (finding.get("method") or "").upper()
@@ -268,6 +279,10 @@ def issue_key(finding: dict) -> tuple:
     canon = canonicalize(vc) or vc.strip().lower()
     if _is_dependency_class(vc):
         return (host, "", "", canon, "", "read", "")
+    # Without a fingerprint (a stored or model finding) nothing says the policy is the
+    # same, so it keeps the endpoint-family key below rather than matching every route.
+    if canon in _HEADER_POLICY_CLASSES and finding.get("header_fingerprint"):
+        return (host, "", "", canon, "", "read", finding["header_fingerprint"])
     family = normalize_path(url) if url else ""
     affected = _affected_input(finding)
     # Unknown input is not a wildcard: keep distinct findings distinct.
@@ -528,6 +543,8 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "proof_references": proof_refs,
         "affected_instances": [redact_url(u) for u in issue.affected_instances],
         "instances_count": len(issue.members),
+        **({"affected_routes": sorted({normalize_path(u) for u in issue.affected_instances})}
+           if issue.vulnerability_class in _HEADER_POLICY_CLASSES else {}),
         "captured_auth_contexts": sorted({member.get("captured_principal_id") for member in issue.members
                                           if member.get("captured_principal_id")}),
         "artifacts": {"replayable": has_proof, "missing": missing_artifacts},

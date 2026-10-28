@@ -23,6 +23,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # standalone one when it is None".
 from harness.run_context import transport_for, ExecutionOutcome, case_scope
 from harness.execution_registry import ExecutionRegistry
+from harness import run_journal
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
 # same shadowing reason as above (several methods below have a `run_context` parameter).
 from harness import run_context as _run_context_mod
@@ -760,15 +761,83 @@ class ChainMixin:
         _instr = RunInstrumentation(self, run_context or _run_context_mod.current_run_context(),
                                     _run_budget)
         _instr.phases.begin("discovery")
-        state, rc = await engagement_builder.build_engagement(
-            base_url, roles, allowed_hosts=self.allowed_hosts,
-            crawl_max_pages=discovery_max_pages,
-            max_endpoints=discovery_max_endpoints,
-            active_discovery=active_discovery,
-            discovery_max_probes=discovery_max_probes, run_context=run_context,
-            **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
-            **({"driver_capture_config": self.config["driver_capture"]}
-               if (self.config.get("driver_capture") or {}).get("enabled") else {}))
+
+        # E7: with a journal on the run, each finished unit is written as it completes, and
+        # a journal that already holds units for this root job (an interrupted earlier
+        # run, or the same run's earlier attempt) is resumed from instead of repeated.
+        _journal = getattr(run_context, "run_journal", None)
+        _resumed_units = {"discovery": False, "worklist": 0, "review": 0, "coverage_checkpoint": False}
+
+        def _journal_read(read, default):
+            """A journal read that fails is a journal with nothing in it: the run goes on."""
+            try:
+                return read()
+            except Exception as e:
+                log.warning("investigate_engagement: journal read failed (%s)", type(e).__name__)
+                return default
+
+        _resuming = _journal is not None and _journal_read(_journal.has_any, False)
+
+        def _journal_put(unit, payload):
+            if _journal is None:
+                return
+            try:
+                _journal.put(unit, payload)
+            except Exception as e:  # losing a unit costs a repeat on resume, never the run
+                log.warning("investigate_engagement: journal write of %s failed: %s", unit, e)
+
+        def _journal_phase(name):
+            _journal_put(f"phase:{name}", {"finished_at": time.time()})
+
+        _stored_discovery = _journal_read(lambda: _journal.get("discovery"), None) if _resuming else None
+        if _stored_discovery is not None:
+            try:
+                state, rc = run_journal.restore_discovery(_stored_discovery, roles)
+                # Discovery registers the roles' sessions with the run; restoring it must too.
+                engagement_builder.register_role_sessions(run_context, base_url, roles)
+                _resumed_units["discovery"] = True
+            except Exception as e:
+                log.warning("investigate_engagement: journaled discovery unusable (%s); "
+                            "discovering again", type(e).__name__)
+        if not _resumed_units["discovery"]:
+            state, rc = await engagement_builder.build_engagement(
+                base_url, roles, allowed_hosts=self.allowed_hosts,
+                crawl_max_pages=discovery_max_pages,
+                max_endpoints=discovery_max_endpoints,
+                active_discovery=active_discovery,
+                discovery_max_probes=discovery_max_probes, run_context=run_context,
+                **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
+                **({"driver_capture_config": self.config["driver_capture"]}
+                   if (self.config.get("driver_capture") or {}).get("enabled") else {}))
+            if _journal is not None:
+                try:
+                    _journal_put("discovery", run_journal.discovery_payload(state, rc, roles))
+                    _journal_phase("discovery")
+                except Exception as e:
+                    log.warning("investigate_engagement: journaling discovery failed: %s", e)
+
+        # Units an earlier attempt finished, passed to the phases that skip them. Their
+        # findings come back marked `resumed_from`, a confirmation only while its proof
+        # still resolves (run_journal.resume_finding).
+        _worklist_kwargs: dict = {}
+        _review_kwargs: dict = {}
+        _review_summary: dict = {}
+        if _journal is not None:
+            _root = _journal.root_job_id
+            _worklist_kwargs = {
+                "completed": (_journal_read(lambda: {
+                    unit[len("worklist:"):]: run_journal.resume_outcome(payload, _root)
+                    for unit, payload in _journal.units("worklist:").items()}, {})
+                              if _resuming else None),
+                "on_outcome": lambda key, outcome: _journal_put(f"worklist:{key}", outcome)}
+            _review_kwargs = {
+                "resumed": (_journal_read(lambda: {
+                    unit[len("review:"):]: {"findings": [run_journal.resume_finding(f, _root)
+                                                         for f in payload.get("findings") or []]}
+                    for unit, payload in _journal.units("review:").items()}, {})
+                            if _resuming else None),
+                "on_review": lambda key, payload: _journal_put(f"review:{key}", payload),
+                "summary_out": _review_summary}
 
         # Operator/capture supplied shapes (for example the runner's successful
         # login setup exchange) are first-class evidence. They do not trigger new
@@ -844,6 +913,16 @@ class ChainMixin:
             except Exception as e:  # feature crawl is additive -- never sink the run
                 log.warning("investigate_engagement: feature crawl failed: %s", e)
                 _errors.append({"phase": "feature_crawl", "error": f"{type(e).__name__}: {e}"})
+
+        # E4/E2: the run's one execution registry, made before the header audit so the
+        # audit's csp/cors checks are recorded in it and the model-review path (which
+        # reads it through run_context) does not run them again for the same route and
+        # identity, nor the worklist or the drive any other check.
+        _exec_registry = getattr(run_context, "execution_registry", None)
+        if not isinstance(_exec_registry, ExecutionRegistry):
+            _exec_registry = ExecutionRegistry(budget=getattr(run_context, "budget", None))
+            if run_context is not None:
+                run_context.execution_registry = _exec_registry
 
         _instr.phases.begin("header_audit")
         # Universal header audit: run CORS, CSP, verbose-error validators
@@ -1009,15 +1088,12 @@ class ChainMixin:
 
         # Memoisation cache: avoid re-running the same validator on the same
         # endpoint during one investigate_engagement() call (see _ConfirmationCache).
-        from harness.validators.base import ValidationResult as _VR, proof_artifact_kwargs
-        # E4: the run's one execution registry, also read by the model-review path
-        # (orchestrator_confirm._validate_findings) through run_context, so a check
-        # that ran for the worklist is not run again for the review or the drive.
-        _exec_registry = getattr(run_context, "execution_registry", None)
-        if not isinstance(_exec_registry, ExecutionRegistry):
-            _exec_registry = ExecutionRegistry(budget=getattr(run_context, "budget", None))
-            if run_context is not None:
-                run_context.execution_registry = _exec_registry
+        from harness.validators.base import (
+            ValidationResult as _VR, observed_result_of, proof_artifact_kwargs)
+        # E4: `_exec_registry` (made before the header audit) is also read by the
+        # model-review path (orchestrator_confirm._validate_findings) through
+        # run_context, so a check that ran for the worklist is not run again for the
+        # review or the drive.
         _cached_validate = _ConfirmationCache(
             run_context, lambda cls, exchange: _rb4_case(cls, exchange).case_id,
             registry=_exec_registry).validate
@@ -1080,6 +1156,8 @@ class ChainMixin:
                 # here), and until now it stamped confirmation ONLY into the
                 # free-text evidence string, recoverable only by regex.
                 finding["confirmed_by_leg"] = leg.replace("-", "_")
+                if getattr(res, "header_fingerprint", ""):
+                    finding["header_fingerprint"] = res.header_fingerprint   # E2: issue grouping
                 # RB-4/INV-2: route this GENUINE confirmation through the SAME
                 # proof persistence + evidence_ledger emission PASS1's
                 # _validate_findings uses (ConfirmMixin._persist_confirmation_proof)
@@ -1096,7 +1174,7 @@ class ChainMixin:
                     ok, proof_dict, reason = await self._persist_confirmation_proof(
                         case=case, validator_name=validator_name,
                         status=res.status, confirmed=res.confirmed,
-                        observed_result=(res.summary or res.evidence or "")[:500],
+                        observed_result=observed_result_of(res),
                         proof_artifacts=proof_artifact_kwargs(res),
                         finding_ref=case.case_id,
                         ledger_summary=(f"{validator_name}: {res.status} (confirmed)"
@@ -1537,7 +1615,8 @@ class ChainMixin:
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
                 max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary,
-                stop_on_confirm=stop_on_confirm, deadline=_investigation_deadline)
+                stop_on_confirm=stop_on_confirm, deadline=_investigation_deadline,
+                **_worklist_kwargs)
             timed_out = (worklist_summary.get("skipped_by_reason") or {}).get("time_budget", 0)
             if timed_out:
                 _errors.append({"phase": "worklist",
@@ -1550,6 +1629,7 @@ class ChainMixin:
             all_findings = [f for o in outcomes for f in o["findings_detail"]]
         else:
             outcomes, all_findings = await _investigate(state, roles)
+            _journal_phase("worklist")
 
         # Phase 0.1 now runs after deterministic confirmation. Broad engagements
         # retain the full content review. Objective runners may stop once a
@@ -1560,8 +1640,18 @@ class ChainMixin:
             for o in outcomes
             for f in (o.get("findings_detail", []) or [])
         )
+        def _resume_report() -> dict:
+            """What this run took from the journal instead of running (E7); {} without one."""
+            if _journal is None:
+                return {}
+            _resumed_units["worklist"] = sum(1 for o in outcomes if o.get("resumed"))
+            _resumed_units["review"] = _review_summary.get("resumed", 0)
+            return {"resume": {"root_job_id": _journal.root_job_id, "resumed": _resuming,
+                               "resumed_units": dict(_resumed_units), "journal": _journal.stats()}}
+
         def _objective_result(stopped: bool) -> dict:
             return {
+                **_resume_report(),
                 "summary": state.summary(),
                 "worklist": state.result_worklist(50),
                 "outcomes": outcomes,
@@ -1610,7 +1700,9 @@ class ChainMixin:
             await review_captured_exchanges(
                 self, state, _all_captured, run_context=run_context,
                 seen=_reviewed_captures, errors=_errors, stats=_review_stats,
-                max_reviews=self.capture_review_limit, deadline=_review_deadline)
+                max_reviews=self.capture_review_limit, deadline=_review_deadline,
+                **_review_kwargs)
+            _journal_phase("review")
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
         # credential (url -> {headers, body}), built from the real captured
@@ -1667,7 +1759,8 @@ class ChainMixin:
                 await review_captured_exchanges(
                     self, st2, getattr(rc2, "captured", None), run_context=run_context,
                     seen=_reviewed_captures, errors=_errors, stats=_review_stats,
-                    max_reviews=self.capture_review_limit, deadline=_review_deadline)
+                    max_reviews=self.capture_review_limit, deadline=_review_deadline,
+                    **_review_kwargs)
             outcomes.extend(outs2)
             all_findings.extend(new_findings)
             # R19: merge the derived-identity state back into the primary state, so
@@ -1679,6 +1772,7 @@ class ChainMixin:
             link = chain_linker.link_findings(state, all_findings, responses=_responses)
             chains = list(link["chain_findings"])
             creds = link["credential_caps"]
+        _journal_phase("chain")
 
         _instr.phases.begin("second_order")
         # Second-order auto-confirmation (V22 SQLi / V17 IDOR): actively run the
@@ -1847,6 +1941,16 @@ class ChainMixin:
         _prerequisite_blocks: dict = {}   # (endpoint, identity) -> grouped entry (E5b)
         try:
             from harness import coverage_tracker
+            # E7: a caller's checkpoint wins; otherwise the journal's, when an earlier attempt
+            # got far enough to write one. It is handed back every N legs of the drive.
+            _coverage_kwargs: dict = {}
+            if _journal is not None:
+                _coverage_kwargs = {"on_checkpoint": lambda cp: _journal_put("coverage:checkpoint", cp)}
+                _stored_checkpoint = (_journal_read(lambda: _journal.get("coverage:checkpoint"), None)
+                                      if _resuming and coverage_checkpoint is None else None)
+                if _stored_checkpoint is not None:
+                    coverage_checkpoint = _stored_checkpoint
+                    _resumed_units["coverage_checkpoint"] = True
             investigated_paths = {o.get("path") for o in outcomes if o.get("path")}
             investigated_keys = {k for k in state.endpoints
                                  if k.split(" ", 1)[-1] in investigated_paths}
@@ -1989,14 +2093,17 @@ class ChainMixin:
                         driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
                         checkpoint=coverage_checkpoint,
                         context_key=coverage_tracker.resume_context_key(self.config),
-                        deadline=_coverage_deadline)
+                        deadline=_coverage_deadline, **_coverage_kwargs)
                 else:
                     coverage = await coverage_tracker.build_coverage_driven(
                         state, roles, _run_leg, budget=self.coverage_leg_budget,
                         driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
                         checkpoint=coverage_checkpoint,
                         context_key=coverage_tracker.resume_context_key(self.config),
-                        deadline=_coverage_deadline)
+                        deadline=_coverage_deadline, **_coverage_kwargs)
+                if coverage.get("checkpoint"):
+                    _journal_put("coverage:checkpoint", coverage["checkpoint"])
+                    _journal_phase("coverage")
                 if coverage.get("drive_stopped_by") == "time budget":
                     _errors.append({"phase": "coverage_drive",
                                     "error": "coverage drive time budget reached: "
@@ -2058,6 +2165,7 @@ class ChainMixin:
             "assessment": health,
             "findings": [dict(f, url=f.get("url") or ep.path, method=ep.method)
                          for ep in state.endpoints.values() for f in ep.findings],
+            **_resume_report(),
             "summary": state.summary(),
             "worklist": state.result_worklist(50),
             "outcomes": outcomes,

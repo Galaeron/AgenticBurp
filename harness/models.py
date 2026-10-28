@@ -131,6 +131,10 @@ class Finding(BaseModel):
     # I04: harness-owned guidance for a candidate that needs a manual check
     # (copy-ready steps). Not confirmation; agents can never set it.
     manual_verification: str = ""
+    # E2: header_fingerprint of the response-header policy a csp/cors finding was
+    # decided from, set by the harness (never an agent). Findings of one host-wide
+    # policy share it; routes with different policies do not.
+    header_fingerprint: str = ""
 
     @computed_field
     @property

@@ -12,6 +12,7 @@ lists those items. A class reconnaissance cannot speak to is skipped.
 
 from __future__ import annotations
 import asyncio
+import copy
 import logging
 import re
 from dataclasses import dataclass, field
@@ -229,8 +230,8 @@ class ReconValidator(Validator):
                     raw_output="",
                 )
             
-            # Perform recon
-            recon_result = await self._perform_recon(base_url, exchange)
+            # Perform recon (once per host and identity in a run: E2)
+            recon_result, reused = await self._recon_once(base_url, exchange)
             
             # Build summary
             summary_parts = [
@@ -260,6 +261,9 @@ class ReconValidator(Validator):
                     f"{len(_claim_items(recon_result, k))} {_CLAIM_LABELS[k]}" for k in kinds)
             summary_parts.insert(0, verdict)
 
+            evidence = self._build_evidence(recon_result, kinds)
+            if reused:
+                evidence += f" | recon reused from first crawl of {base_url}"
             return ValidationResult(
                 validator=self.name,
                 status=status,
@@ -267,7 +271,7 @@ class ReconValidator(Validator):
                 confidence=confidence,
                 confirmed=confirmed,
                 summary=" | ".join(summary_parts),
-                evidence=self._build_evidence(recon_result, kinds),
+                evidence=evidence,
                 raw_output=self._build_raw_output(recon_result),
             )
             
@@ -290,6 +294,35 @@ class ReconValidator(Validator):
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}"
     
+    async def _recon_once(self, base_url: str, exchange: HttpExchange) -> tuple[ReconResult, bool]:
+        """(map, reused): the crawl of a host re-fetches the same host-level paths for
+        every plan, so a run crawls each host once per identity. Without the run's
+        execution registry there is no cache. A later plan gets its own copy of the
+        first crawl plus its own exchange, and decides its own claim from that."""
+        registry = getattr(self.run_context, "execution_registry", None)
+        if not callable(getattr(registry, "memo", None)):
+            return await self._perform_recon(base_url, exchange), False
+        from harness.engagement import capture_identity_key
+
+        async def crawl():
+            return (await self._perform_recon(base_url, exchange),
+                    frozenset(self.visited_urls), frozenset(self.discovered_urls))
+        key = (base_url.lower(), capture_identity_key(exchange.request_headers), self.max_depth)
+        (crawled, visited, discovered), reused = await registry.memo(key, crawl, name=self.name)
+        if not reused:
+            return crawled, False
+        result = copy.deepcopy(crawled)
+        self.visited_urls, self.discovered_urls = set(visited), set(discovered)
+        self._analyze_exchange(exchange, result)
+        # The first crawl started from its own exchange; this plan's start page may
+        # lead to pages it never reached. Only pages not yet visited are fetched.
+        await self._crawl(base_url, exchange.url, 0, self.max_depth, result)
+        result.attack_paths, result.priorities = [], []
+        self._build_attack_paths(result)
+        self._prioritize_endpoints(result)
+        result.coverage = self._calculate_coverage(result)
+        return result, True
+
     async def _perform_recon(self, base_url: str, exchange: HttpExchange) -> ReconResult:
         """Perform comprehensive reconnaissance."""
         result = ReconResult()

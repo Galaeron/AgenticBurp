@@ -516,7 +516,7 @@ class SurfaceEndpoint:
         # the link survives ingestion into state and the report projection.)
         for k in ("evidence", "summary", "url", "confirmation_method",
                   "validator", "identity", "basis", "proof_id", "case_id",
-                  "confirmed_by_leg"):
+                  "confirmed_by_leg", "header_fingerprint"):
             if f.get(k):
                 slim[k] = f[k]
 

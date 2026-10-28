@@ -15,7 +15,8 @@ RUNNING = frozenset({'running', 'cancelling'})
 TERMINAL = frozenset({'done', 'error', 'cancelled', 'interrupted'})
 FIELDS = ('job_id', 'host', 'base_url', 'status', 'started_at', 'finished_at',
           'error', 'manifest_path', 'result', 'result_available', 'recovered',
-          'result_ref', 'result_size_bytes', 'result_sha256', 'result_summary', 'delivery_error')
+          'result_ref', 'result_size_bytes', 'result_sha256', 'result_summary', 'delivery_error',
+          'journal_root')
 INLINE_LIMIT = 2_000_000
 
 

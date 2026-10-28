@@ -13,7 +13,7 @@ import functools
 
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 from harness.execution_registry import ExecutionRegistry
-from harness.validators.base import ValidationResult, proof_artifact_kwargs
+from harness.validators.base import ValidationResult, observed_result_of, proof_artifact_kwargs
 
 
 def _fallback_result_binds(result, routed) -> bool:
@@ -303,7 +303,7 @@ class ConfirmMixin:
                 case=case, validator=result.validator,
                 validator_version=getattr(result, "version", "") or "",
                 status=result.status, confirmed=result.confirmed,
-                observed_result=(result.summary or result.evidence or "")[:500],
+                observed_result=observed_result_of(result),
                 **proof_artifact_kwargs(result))
             ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
             if ok:
@@ -704,7 +704,7 @@ class ConfirmMixin:
                     case=case, validator_name=result.validator,
                     validator_version=getattr(validator, "version", ""),
                     status=result.status, confirmed=result.confirmed,
-                    observed_result=(result.summary or result.evidence or "")[:500],
+                    observed_result=observed_result_of(result),
                     expected_invariant=getattr(validator, "expected_invariant", ""),
                     proof_artifacts=proof_artifact_kwargs(result),
                     finding_ref=finding.finding_id,
@@ -735,6 +735,9 @@ class ConfirmMixin:
                         # leg name, set at the exact same moment as proof_id/case_id
                         # -- not recovered later by regex-parsing evidence text.
                         finding.confirmed_by_leg = result.validator
+                        # E2: the header policy a csp/cors confirmation rests on (issue grouping).
+                        finding.header_fingerprint = (getattr(result, "header_fingerprint", "")
+                                                      or finding.header_fingerprint)
                         # P0.1-WIRE: oracle gate runs (or no-ops, per config)
                         # at the exact moment a finding is first confirmed.
                         if routed is finding:

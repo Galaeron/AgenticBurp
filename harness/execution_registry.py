@@ -13,6 +13,10 @@ A key is a statement about what the leg tests, never about who asked:
 - Every other leg is about an object or an identity (cross_identity, idor_read,
   jwt_forge, csrf, ...), so its key stays exactly `confirmation_cache_key` and a
   different object id or identity is a different case.
+- HEADER_CHECKED legs (csp, cors) read response headers, which belong to the route
+  template and the identity, so their key is (validator, method, host, route template,
+  identity) with no parameters or body: the universal header audit and the model-review
+  path answer the same question once.
 """
 from __future__ import annotations
 
@@ -32,6 +36,8 @@ SHAPE_KEYED = frozenset({
     "sqlmap", "command_injection", "ssti", "xxe", "nosql",
     "header_injection_validator", "verbose_error_validator",
 })
+# Validators whose verdict is a fact about a route's response headers (E2).
+HEADER_CHECKED = frozenset({"csp_validator", "cors_validator"})
 # Not shape-keyed although they test parameters: ssrf, open_redirect, path_traversal
 # and deserialization_oob pick WHICH parameter to attack by its value (URL-, path- or
 # blob-shaped), so two requests with the same names can need different checks.
@@ -60,11 +66,25 @@ def _body_shape(exchange) -> tuple:
     return ("sha256", hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest())
 
 
+def _header_claim(validator_name: str, finding_class: str | None) -> tuple:
+    """Which header check a class asks for. The CSP validator decides a CSP claim and a
+    framing claim from different headers, so they are different checks of one fetch;
+    CORS runs one battery whatever the class, so its claim is empty."""
+    if validator_name != "csp_validator":
+        return ()
+    from harness.validators.csp_validator import _claim_kinds
+    return tuple(sorted(_claim_kinds(finding_class or "")))
+
+
 def execution_key(validator_name: str, exchange, finding_class: str | None = None) -> tuple:
     """The within-run key for one validator execution (see the module docstring)."""
     # _identity_signature reads Authorization and Cookie only; capture_identity_key
     # adds every non-public header, so an X-Api-Key identity is not shared either.
     identity = capture_identity_key(exchange.request_headers)
+    if validator_name in HEADER_CHECKED:
+        return (validator_name, (exchange.method or "GET").upper(),
+                urlsplit(exchange.url or "").netloc.lower(), normalize_path(exchange.url or ""),
+                identity, _header_claim(validator_name, finding_class))
     if validator_name not in SHAPE_KEYED:
         return confirmation_cache_key(validator_name, exchange, finding_class) + (identity,)
     parts = urlsplit(exchange.url or "")
@@ -138,12 +158,56 @@ class ExecutionRegistry:
             tally["inflight_joins"] += 1
             # shield: cancelling this waiter must not cancel the run others share.
             await asyncio.shield(flight)
-        return await self._miss(key, tally, call, case_ref)
+        return await self._miss([key], tally, call, case_ref)
 
-    async def _miss(self, key, tally, call, case_ref):
+    async def run_audit(self, validator, exchange, classes, *, case_ref, call):
+        """`run` for a validator that decides several classes from ONE send
+        (CspValidator.audit): `call()` returns {class: result} and each class is stored
+        under its own key, so a later single-class `run` for the same route and
+        identity is a hit. Returns {class: result}; a hit for another case returns the
+        covered copies `run` returns."""
+        name = getattr(validator, "name", "") or "validator"
+        keys = {c: execution_key(name, exchange, c) for c in classes}
+        tally = self._tally(name)
+        while True:
+            stored = {c: self._stored.get(k) for c, k in keys.items()}
+            if all(stored.values()):
+                tally["hits"] += 1
+                tally["sends_saved"] += max(s.sent_count for s in stored.values())
+                return {c: self._for_case(s, case_ref) for c, s in stored.items()}
+            flight = next((self._flying[k] for k in keys.values() if k in self._flying), None)
+            if flight is None:
+                break
+            tally["inflight_joins"] += 1
+            await asyncio.shield(flight)
+        return await self._miss(list(keys.values()), tally, call, case_ref,
+                                entries=lambda results: [(keys[c], results.get(c)) for c in keys])
+
+    async def memo(self, key, coro_fn, *, name: str = "memo"):
+        """(value, reused) for `key`: the first caller runs `coro_fn()`, a later caller
+        gets the stored value (reused=True) and one that finds it in flight waits for
+        that run. For work that is not a validator verdict (the recon crawl). A run
+        that raises stores nothing; the caller owns copying a value it will change."""
+        key = ("memo", name, *key)
+        tally = self._tally(name)
+        while True:
+            stored = self._stored.get(key)
+            if stored is not None:
+                tally["hits"] += 1
+                tally["sends_saved"] += stored.sent_count
+                return stored.result, True
+            flight = self._flying.get(key)
+            if flight is None:
+                break
+            tally["inflight_joins"] += 1
+            await asyncio.shield(flight)
+        return await self._miss([key], tally, coro_fn, ""), False
+
+    async def _miss(self, keys, tally, call, case_ref, entries=None):
         tally["misses"] += 1
         flight = asyncio.get_running_loop().create_future()
-        self._flying[key] = flight
+        for key in keys:
+            self._flying[key] = flight
         state = {"overlapped": bool(self._active)}
         for other in self._active:
             other["overlapped"] = True
@@ -152,7 +216,8 @@ class ExecutionRegistry:
         try:
             result = await call()
         except BaseException as exc:
-            self._flying.pop(key, None)
+            for key in keys:
+                self._flying.pop(key, None)
             if isinstance(exc, Exception):
                 flight.set_exception(exc)
                 flight.exception()          # waiters get it; nobody left is not an error
@@ -165,9 +230,11 @@ class ExecutionRegistry:
         if not isinstance(sent, int) or isinstance(sent, bool):
             sent = (self._budget.used - used_before
                     if used_before is not None and not state["overlapped"] else 0)
-        if result is not None and getattr(result, "status", None) not in _NOT_RUN:
-            self._stored[key] = _Stored(result, case_ref, max(0, sent))
-        self._flying.pop(key, None)
+        for key, one in (entries(result) if entries else [(keys[0], result)]):
+            if one is not None and getattr(one, "status", None) not in _NOT_RUN:
+                self._stored[key] = _Stored(one, case_ref, max(0, sent))
+        for key in keys:
+            self._flying.pop(key, None)
         flight.set_result(None)
         return result
 

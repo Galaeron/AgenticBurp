@@ -11,6 +11,8 @@ the exact namespace orchestrator.py used to expose -- keeping existing
 """
 from __future__ import annotations
 import asyncio
+import functools
+import hashlib
 import logging
 import re
 import time
@@ -403,6 +405,7 @@ def coverage_confirmation_finding(res, check, url: str, identity: str) -> dict |
         # path never wrote, so a single provenance reader had to know which
         # path produced a given finding.
         "confirmed_by_leg": getattr(res, "validator", None) or check.confirmation,
+        "header_fingerprint": getattr(res, "header_fingerprint", "") or "",   # E2: issue grouping
         "url": url,
         "identity": identity,
         "basis": "derived",
@@ -657,7 +660,9 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
 async def review_captured_exchanges(orch, state, captured, *, max_reviews: int = 200,
                                     run_context=None, seen=None, errors=None,
                                     deadline: float | None = None, stats: dict | None = None,
-                                    group_identical: bool = True) -> int:
+                                    group_identical: bool = True,
+                                    resumed: dict | None = None, on_review=None,
+                                    summary_out: dict | None = None) -> int:
     """Phase 0.1: route every substantive 2xx captured during discovery through
     full content-level review and fold its findings into `state`.
 
@@ -691,6 +696,12 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     `stats`, when given, is added to (so one dict can span several calls):
     reviewed, grouped (the entries above), unreviewed (left by a bound) and
     by_tier (reviewed per tier name).
+
+    E7 resume: `resumed` maps a capture's observation key (review_frontier's) to the
+    findings an earlier, interrupted run got from it; such a capture skips
+    `orch.analyze` and contributes those findings. `on_review(key, {"findings": [...]})`
+    is called for each capture analyzed here, so a journal can record it. `summary_out`
+    gets the count of captures taken from `resumed` under "resumed".
 
     Returns the count of captured exchanges that yielded >=1 finding."""
     produced = 0
@@ -736,21 +747,29 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             state.record_template(ex.url, ex.method, ex)
         except Exception:
             pass
-        try:
-            resp = await orch.analyze(ex, _from_discovery=True, run_context=run_context)
-        except Exception as e:  # one capture's failure must not sink the rest
-            # Captures grouped under this representative were not actually reviewed:
-            # unmark them, so a later review round (a chain round) can still take them.
-            for entry in grouped[grouped_before:]:
-                entry["representative_review"] = "failed"
-            for key in grouped_keys[grouped_before:]:
-                seen.discard(key)
-            if errors is not None:
-                errors.append({"phase": "capture_review", "error": type(e).__name__})
-            log.debug("review_captured_exchanges: analyze failed on %s: %s",
-                      getattr(ex, "url", "?"), e)
-            continue
-        findings = [f.model_dump() for r in resp.agent_reports for f in r.findings]
+        key = assessment_health.observation_key(ex)
+        if resumed is not None and key in resumed:
+            findings = list(resumed[key].get("findings") or [])
+            if summary_out is not None:
+                summary_out["resumed"] = summary_out.get("resumed", 0) + 1
+        else:
+            try:
+                resp = await orch.analyze(ex, _from_discovery=True, run_context=run_context)
+            except Exception as e:  # one capture's failure must not sink the rest
+                # Captures grouped under this representative were not actually reviewed:
+                # unmark them, so a later review round (a chain round) can still take them.
+                for entry in grouped[grouped_before:]:
+                    entry["representative_review"] = "failed"
+                for grouped_key in grouped_keys[grouped_before:]:
+                    seen.discard(grouped_key)
+                if errors is not None:
+                    errors.append({"phase": "capture_review", "error": type(e).__name__})
+                log.debug("review_captured_exchanges: analyze failed on %s: %s",
+                          getattr(ex, "url", "?"), e)
+                continue
+            findings = [f.model_dump() for r in resp.agent_reports for f in r.findings]
+            if on_review is not None:
+                on_review(key, {"findings": findings})
         if findings:
             state.ingest_findings(ex.url, ex.method, findings)
             produced += 1
@@ -809,6 +828,11 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
     produced = 0
     from itertools import islice
     from harness.assessment_health import review_frontier
+    # E2: the run's execution registry records each template/identity this audit
+    # checked, so the model-review path does not fetch the same headers again.
+    registry = getattr(run_context, "execution_registry", None)
+    if not callable(getattr(registry, "run_audit", None)):
+        registry = None
     for cap in islice(review_frontier(captured), max_exchanges):
         try:
             ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
@@ -827,11 +851,21 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
             if v.name == "verbose_error_validator":
                 continue  # already ran above
             try:
+                # One case ref per exchange: a second exchange of the same route
+                # template and identity is a "covered by" hit, not another fetch.
+                case_ref = "header-audit:" + hashlib.sha256(
+                    f"{ex.method} {ex.url}".encode("utf-8", errors="replace")).hexdigest()[:12]
                 if callable(getattr(v, "audit", None)):
                     # A validator that decides each class by its own check (CSP
                     # vs framing) audits every class from ONE fetch of the
                     # exchange; set iteration order is not a choice of class.
-                    results = list((await v.audit(ex)).values())
+                    classes = tuple(getattr(v, "audit_classes", None) or ())
+                    if registry is None or not classes:
+                        results = list((await v.audit(ex)).values())
+                    else:
+                        results = list((await registry.run_audit(
+                            v, ex, classes, case_ref=case_ref,
+                            call=functools.partial(v.audit, ex))).values())
                 else:
                     dummy_finding = Finding(
                         vulnerability_class=next(iter(v.finding_classes)),
@@ -839,7 +873,12 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
                         summary=f"Universal header audit: {v.name}",
                         evidence="", suggested_test="", basis="derived",
                     )
-                    results = [await v.validate(dummy_finding, ex)]
+                    if registry is None:
+                        results = [await v.validate(dummy_finding, ex)]
+                    else:
+                        results = [await registry.run(
+                            v, dummy_finding, ex, case_ref=case_ref,
+                            call=functools.partial(v.validate, dummy_finding, ex))]
                 for result in results:
                     if result.confirmed:
                         exchange_findings.append(Finding(
@@ -852,6 +891,7 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
                             basis="derived",
                             confirmed=True,
                             confirmation_method=v.get_name(),
+                            header_fingerprint=getattr(result, "header_fingerprint", "") or "",
                         ))
             except Exception as e:
                 log.debug("universal_header_audit: %s failed on %s: %s",

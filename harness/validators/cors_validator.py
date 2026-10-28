@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 import httpx
 
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
-from .base import Validator, ValidationResult, artifact_id_of
+from .base import Validator, ValidationResult, artifact_id_of, header_fingerprint
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -69,6 +69,30 @@ def _note_probe(outcome: str) -> None:
     probes = _PROBES.get()
     if probes is not None:
         probes.append(outcome)
+
+
+# Per-validate() record of the CORS policy each Origin probe was answered with
+# (E2): (grant, Allow-Credentials, Vary). A grant equal to the probe's own origin is
+# written "<reflected>", so a server that echoes the origin has one policy however
+# many origins were tried.
+_POLICIES: contextvars.ContextVar[list | None] = contextvars.ContextVar("cors_policies", default=None)
+
+
+def _note_policy(sent: dict, received) -> None:
+    policies = _POLICIES.get()
+    origin = next((v for k, v in (sent or {}).items() if k.lower() == "origin"), None)
+    if policies is None or origin is None:
+        return
+    got = {str(k).lower(): v for k, v in received.items()}
+    grant = got.get("access-control-allow-origin", "")
+    policies.append((("<reflected>" if grant and grant == origin else grant),
+                     got.get("access-control-allow-credentials", ""), got.get("vary", "")))
+
+
+def _policy_fingerprint() -> str:
+    """header_fingerprint of the distinct policies this validate() saw ("" if none)."""
+    seen = sorted(set(_POLICIES.get() or ()))
+    return header_fingerprint(*(f"{g}|{c}|{v}" for g, c, v in seen)) if seen else ""
 
 
 @dataclass
@@ -203,6 +227,7 @@ class CorsValidator(Validator):
         # Run all CORS tests
         probes: list[str] = []
         probe_scope = _PROBES.set(probes)
+        policy_scope = _POLICIES.set([])
         try:
             tests.append(await self._test_wildcard_origin(base_url, exchange))
             tests.append(await self._test_null_origin(base_url, exchange))
@@ -290,6 +315,7 @@ class CorsValidator(Validator):
                 summary=" ".join(summary_parts),
                 evidence=self._build_evidence(tests),
                 raw_output=self._build_raw_output(tests),
+                header_fingerprint=_policy_fingerprint(),
             ).with_artifacts(**(await self._proof_exchanges(exchange, tests) if vulnerable else {}))
             
         except Exception as e:
@@ -306,6 +332,7 @@ class CorsValidator(Validator):
             )
         finally:
             _PROBES.reset(probe_scope)
+            _POLICIES.reset(policy_scope)
 
     async def _proof_exchanges(self, exchange: HttpExchange, tests: list) -> dict:
         """Ticket 6: the exchanges a confirmed origin grant rests on. Attack: the
@@ -362,6 +389,7 @@ class CorsValidator(Validator):
                     _note_probe("error" if outcome.outcome == "error" else "blocked")
                     return None
                 _note_probe("ok")
+                _note_policy(headers, outcome.headers or {})
                 return httpx.Response(
                     outcome.status or 0, content=(outcome.body or "").encode(),
                     headers=outcome.headers, request=httpx.Request(method, url),
@@ -381,6 +409,7 @@ class CorsValidator(Validator):
             ) as client:
                 response = await client.request(method, url, headers=headers)
             _note_probe("ok")
+            _note_policy(headers, response.headers)
             return response
         except SafetyGateBlocked as e:
             log.debug(f"CORS request blocked by safety gate: {e}")
