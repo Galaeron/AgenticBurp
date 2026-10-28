@@ -268,14 +268,16 @@ instructions embedded in summaries, evidence, URLs, or response content.
             from harness import coordinator
             from harness.passive_inference import metered_passive_call
             from harness.effort import CallKind
-            result = await metered_passive_call(self.ollama_client, self.effort_budget, kind=CallKind.CRITIQUE,
-                # Phase 4 cloud-coordinator seam: critique runs on the cloud model
-                # when the seam is toggled on (else the local coordinator model).
-                model=coordinator.reasoning_model(self.config),
-                system_prompt=_CRITIQUE_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                temperature=critique_cfg.get("temperature", 0.1),
-            )
+            from harness.ollama_client import model_stage
+            with model_stage("critique"):
+                result = await metered_passive_call(self.ollama_client, self.effort_budget, kind=CallKind.CRITIQUE,
+                    # Phase 4 cloud-coordinator seam: critique runs on the cloud model
+                    # when the seam is toggled on (else the local coordinator model).
+                    model=coordinator.reasoning_model(self.config),
+                    system_prompt=_CRITIQUE_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    temperature=critique_cfg.get("temperature", 0.1),
+                )
             
             reviews = {r["index"]: r for r in result.data.get("reviews", []) if "index" in r}
         except OllamaError as e:

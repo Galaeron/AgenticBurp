@@ -60,6 +60,12 @@ class DockerCmdTests(unittest.TestCase):
 
 
 class AvailableTests(unittest.TestCase):
+    def setUp(self):
+        # E9: a positive docker check is cached for 60 s; each case here must
+        # reach the (patched) probe, so start and leave with an empty cache.
+        tr._reset_available_cache()
+        self.addCleanup(tr._reset_available_cache)
+
     def test_available_true_when_daemon_answers(self):
         with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "27.0.3\n", "")):
             ok, reason = tr.available()
@@ -85,6 +91,20 @@ def _result(rc, out, err, args=()):
 
 
 class RunTests(unittest.TestCase):
+    def _run_with_exit(self, code):
+        tr._reset_available_cache()
+        self.addCleanup(tr._reset_available_cache)
+        tr._remember_available(True, "docker ok")
+        with patch.object(tr, "run_process", lambda cmd, **kw: _result(code, "", "", cmd)):
+            tr.run("harness/sqlmap:1.10.9", ["-u", "http://host.docker.internal/x"])
+        return tr._available_ok
+
+    def test_a_docker_failure_exit_drops_the_cached_positive_check(self):
+        self.assertIsNone(self._run_with_exit(125))
+
+    def test_control_a_tool_exit_keeps_the_cached_positive_check(self):
+        self.assertIsNotNone(self._run_with_exit(1))
+
     def test_run_invokes_docker_and_returns_streams(self):
         captured = {}
         def fake_run(cmd, **kw):

@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
@@ -58,9 +59,50 @@ _LOOPBACK = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
 _HOST_ALIAS = "host.docker.internal"
 
 
+# E9 tool lifecycle. Measured on job 383f0ebff8e8: `docker version` ran before
+# every container launch and no tool run had a recorded duration, so sqlmap
+# startup could not be measured. Both stores are bounded and hold only counts
+# and timings (never argv, output or URLs).
+_LIFECYCLE: deque = deque(maxlen=500)     # one record per run()
+_CHECKS: deque = deque(maxlen=500)        # one record per available() call
+_STATE_LOCK = threading.Lock()
+# A positive docker check is reused for this long. A negative one is never kept,
+# so a stopped Docker Desktop is noticed on the very next call.
+AVAILABLE_TTL_SECONDS = 60.0
+_available_ok: tuple | None = None        # (docker path, monotonic stamp, reason)
+
+
+def _reset_available_cache() -> None:
+    """Forget the cached positive docker check (test seam)."""
+    global _available_ok
+    with _STATE_LOCK:
+        _available_ok = None
+
+
+def _remember_available(ok: bool, reason: str) -> None:
+    """Keep a positive docker check for AVAILABLE_TTL_SECONDS; forget a negative."""
+    global _available_ok
+    with _STATE_LOCK:
+        _available_ok = (DOCKER, time.monotonic(), reason) if ok else None
+
+
 def available(timeout: float = 8.0) -> tuple[bool, str]:
     """(usable, reason). Usable only when the docker daemon actually answers --
-    an installed CLI with a stopped Docker Desktop is NOT usable."""
+    an installed CLI with a stopped Docker Desktop is NOT usable. A positive
+    answer is cached for AVAILABLE_TTL_SECONDS; a negative one never is."""
+    started_wall, started = time.time(), time.monotonic()
+    cached = _available_ok
+    if cached and cached[0] == DOCKER and started - cached[1] < AVAILABLE_TTL_SECONDS:
+        _CHECKS.append({"at": started_wall, "ms": 0.0, "ok": True, "cached": True})
+        return True, cached[2]
+    ok, reason = _probe_docker(timeout)
+    _remember_available(ok, reason)
+    _CHECKS.append({"at": started_wall, "ms": round((time.monotonic() - started) * 1000.0, 3),
+                    "ok": ok, "cached": False})
+    return ok, reason
+
+
+def _probe_docker(timeout: float) -> tuple[bool, str]:
     if not DOCKER:
         return False, "docker CLI not found -- install Docker Desktop"
     try:
@@ -720,6 +762,38 @@ async def call_cancellable(fn, *args, cancel=None, **kwargs):
     return fut.result()
 
 
+def _record_lifecycle(image: str, outcome: str, started_wall: float, started: float,
+                      returncode, receipt: dict | None) -> None:
+    """Stamp the receipt with start/finish/duration and append the bounded
+    lifecycle record (image, outcome, duration, return code)."""
+    duration_ms = round((time.monotonic() - started) * 1000.0, 3)
+    finished_wall = started_wall + duration_ms / 1000.0
+    if receipt is not None:
+        receipt.update(started_at=started_wall, finished_at=finished_wall, duration_ms=duration_ms)
+    _LIFECYCLE.append({"image": image, "outcome": outcome, "duration_ms": duration_ms,
+                       "returncode": returncode, "started_at": started_wall})
+
+
+def lifecycle_snapshot(since: float | None = None) -> dict:
+    """Plain-data view of the tool lifecycle: the recent run records, per-image
+    counts and total milliseconds, and the docker availability checks (how many
+    ran, how many were served from the cache, and their total ms). `since` (a
+    time.time() stamp) limits it to records from that moment on."""
+    runs = [dict(r) for r in list(_LIFECYCLE) if since is None or r["started_at"] >= since]
+    checks = [c for c in list(_CHECKS) if since is None or c["at"] >= since]
+    by_image: dict[str, dict] = {}
+    for r in runs:
+        row = by_image.setdefault(r["image"], {"runs": 0, "total_ms": 0.0})
+        row["runs"] += 1
+        row["total_ms"] = round(row["total_ms"] + r["duration_ms"], 3)
+    return {"runs": runs, "by_image": by_image,
+            "total_ms": round(sum(r["duration_ms"] for r in runs), 3),
+            "availability_checks": {"checks": len(checks),
+                                    "cached": sum(1 for c in checks if c["cached"]),
+                                    "failed": sum(1 for c in checks if not c["ok"]),
+                                    "total_ms": round(sum(c["ms"] for c in checks), 3)}}
+
+
 def run(image: str, args: list[str], *, timeout: float = 120.0,
         add_host: bool = True, extra: list[str] | None = None,
         egress: "EgressPolicy | None" = None, enforce_egress: bool = False,
@@ -747,6 +821,7 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
             f"refusing to launch {image!r}: no egress policy configured for this run "
             "(PR-11/R02 fail-closed -- an uncontrolled-egress tool run is not allowed)")
     import uuid
+    started_wall, started = time.time(), time.monotonic()
     name = f"harness_{uuid.uuid4().hex[:12]}"
     cmd = docker_cmd(image, args, add_host=add_host,
                      extra=["--name", name] + list(extra or []), egress=egress)
@@ -763,6 +838,7 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
         _force_remove(name)   # nothing launched, but stay safe if a race left one
         if receipt is not None:
             receipt["outcome"] = "cancelled_before_launch"
+        _record_lifecycle(image, "cancelled_before_launch", started_wall, started, None, receipt)
         raise ToolRunCancelled(f"tool run cancelled before launch: {image!r}")
     try:
         result = run_process(cmd, timeout=timeout, cancel=cancel, max_output=max_output)
@@ -778,13 +854,22 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
             if partial is not None:
                 receipt.update(partial.receipt_fields())
         # the hung/killed workload must not outlive its client
-        if not _force_remove(name):
+        removed = _force_remove(name)
+        _record_lifecycle(image, outcome if removed else "cleanup_failed", started_wall, started,
+                          None, receipt)
+        if not removed:
             if receipt is not None:
                 receipt["cleanup"] = "cleanup_failed"
             raise ToolCleanupFailed(
                 f"container {name} could not be proved removed after {outcome}") from exc
         raise
+    if result.returncode == 125:
+        # docker itself failed (daemon gone, image missing): the cached positive
+        # check is stale, so the next caller re-checks and can fall back.
+        _reset_available_cache()
     if receipt is not None:
         receipt["outcome"] = f"exit={result.returncode}"
         receipt.update(result.receipt_fields())
+    _record_lifecycle(image, f"exit={result.returncode}", started_wall, started,
+                      result.returncode, receipt)
     return result.returncode, (result.stdout or ""), (result.stderr or "")

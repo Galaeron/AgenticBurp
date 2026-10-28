@@ -33,6 +33,21 @@ def redact(value: Any) -> Any:
     return repr(value)
 
 
+def _counters(value: Any) -> Any:
+    """JSON-safe copy of a counters block (E9 model_metrics / phase_timings).
+    Unlike redact(), a number is kept under a key such as `prompt_tokens`: it is a
+    count, not a credential. A non-numeric value under a secret-looking key is
+    still withheld."""
+    if isinstance(value, dict):
+        return {str(k): ("[REDACTED]" if _is_secret_key(k) and not (v is None or isinstance(v, (int, float, bool)))
+                         else _counters(v)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_counters(v) for v in value]
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return redact(value)
+
+
 def config_fingerprint(config: dict) -> str:
     encoded = json.dumps(redact(config), sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
@@ -101,6 +116,7 @@ class RunManifest:
             "started_at": time.time(), "finished_at": None, "request_count": None,
             "confirmed_issues": None, "operational_errors": [],
             "completion_status": "running", "degraded": False, "model_metrics": None,
+            "phase_timings": None,
             "measurement": {"fixture_kind": "unscored", "precision": None, "recall": None,
                             "scoring_limitation": "No independent expected-case mapping supplied"},
         }
@@ -111,6 +127,7 @@ class RunManifest:
     def finish(self, status: str, *, result: dict | None = None, error: str | None = None) -> None:
         result = result or {}
         errors = list(result.get("errors") or [])
+        instrumentation = result.get("instrumentation") or {}
         if error:
             errors.append({"phase": "job", "error": error})
         from harness.assessment_health import assessment_health
@@ -134,7 +151,11 @@ class RunManifest:
                           # persisted here so a LATER reader (e.g. the MCP
                           # coverage resource) can see it without needing the
                           # live in-memory job result.
-                          "coverage_audited": (result.get("coverage") or {}).get("audited")})
+                          "coverage_audited": (result.get("coverage") or {}).get("audited"),
+                          # E9: per-stage model usage and phase walls, read from the
+                          # run's own instrumentation block (None when it has none).
+                          "model_metrics": _counters(instrumentation.get("model_metrics")),
+                          "phase_timings": _counters(instrumentation.get("phase_timings"))})
         self._persist(append_ledger=True)
 
     def _persist(self, *, append_ledger: bool) -> None:

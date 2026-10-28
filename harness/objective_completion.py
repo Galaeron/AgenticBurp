@@ -115,7 +115,9 @@ async def _propose_payload(provider, action_class: str, target_path: str,
         "Return strict JSON: {\"payload\": \"<the single template expression>\"}"
     )
     try:
-        result = await provider.chat_json("", system, user, temperature=0.0)
+        from harness.ollama_client import model_stage
+        with model_stage("objective_completion"):
+            result = await provider.chat_json("", system, user, temperature=0.0)
         data = getattr(result, "data", None) or {}
         payload = data.get("payload")
         return payload if isinstance(payload, str) and payload.strip() else None

@@ -30,7 +30,7 @@ from harness import coordinator
 from harness import payload_library
 from harness import store
 from harness.models import TestPlan, ValidationSubmission
-from harness.ollama_client import OllamaClient, OllamaError
+from harness.ollama_client import OllamaClient, OllamaError, model_stage
 from harness.retry_policy import Action, Attempt, AttemptStatus, RetryPolicy
 
 log = logging.getLogger("harness.active_verification")
@@ -168,11 +168,12 @@ async def decide_next_step(
             failure_notes=failure_notes,
         )
         try:
-            result = await ollama_client.chat_json(
-                model=model,
-                system_prompt="You are a focused security payload assistant. Respond with ONLY the requested JSON.",
-                user_prompt=prompt,
-            )
+            with model_stage("escalation"):
+                result = await ollama_client.chat_json(
+                    model=model,
+                    system_prompt="You are a focused security payload assistant. Respond with ONLY the requested JSON.",
+                    user_prompt=prompt,
+                )
             new_payload = str(result.get("payload", "")).strip()
             rationale = str(result.get("rationale", ""))
         except OllamaError as e:

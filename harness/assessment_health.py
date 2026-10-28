@@ -3,46 +3,205 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from urllib.parse import urlsplit
 
 from harness.models import HttpExchange
 
+# E1 review tiers, highest priority first. `review_stats.by_tier` uses these names.
+TIER_NAMES = ("authenticated_api", "anonymous_api", "other_non_html", "html")
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# Response headers that carry the security posture (E1). Access-Control-Allow-* is
+# matched by prefix and Set-Cookie is reduced to its cookie names (values are
+# per-session). The extended set adds what the hardening agents also read.
+_SECURITY_HEADERS = ("content-security-policy", "content-security-policy-report-only",
+                     "x-frame-options", "strict-transport-security")
+_HARDENING_EXTRA_HEADERS = ("x-content-type-options", "referrer-policy", "permissions-policy",
+                            "feature-policy", "x-xss-protection", "cache-control", "vary",
+                            "server", "x-powered-by")
+_COOKIE_START = re.compile(r"(?:^|\n|,\s*)\s*([^=;,\s]+)=")
+_COOKIE_SPLIT = re.compile(r"\n|,\s*(?=[^=;,\s]+=)")
 
-def review_frontier(captured, *, seen=None):
-    """Deduplicate exact observations and interleave routes and identities.
 
-    Keep different bodies, credentials and responses. Polling on one route must
-    not consume the review budget before another route gets its first review.
-    Original observations are retained by the caller, never removed from storage.
+def new_review_stats() -> dict:
+    """The empty `review_stats` block the capture review fills in."""
+    return {"reviewed": 0, "grouped": [], "unreviewed": 0, "by_tier": dict.fromkeys(TIER_NAMES, 0)}
+
+
+def _lower(headers) -> dict:
+    return {str(k).lower(): v for k, v in (headers or {}).items()}
+
+
+def _identity(ex) -> tuple:
+    """The credential headers that say who sent the request, as sorted pairs."""
+    from harness.security import is_identity_credential_header
+    return tuple(sorted((k, v) for k, v in _lower(ex.request_headers).items()
+                        if is_identity_credential_header(k)))
+
+
+def identity_kind(ex) -> str:
+    return "authenticated" if _identity(ex) else "anon"
+
+
+def content_type_family(ex) -> str:
+    """html | json | xml | text | other, from the response Content-Type (or, when it
+    is absent, a look at the first bytes of the body)."""
+    ctype = str(_lower(ex.response_headers).get("content-type") or "").split(";")[0].strip().lower()
+    if ctype:
+        for family in ("html", "json", "xml"):
+            if family in ctype:
+                return family
+        return "text" if ctype.startswith("text/") else "other"
+    head = (ex.response_body or "").lstrip()[:200].lower()
+    if head.startswith(("<!doctype html", "<html")) or "<html" in head:
+        return "html"
+    if head.startswith(("{", "[")):
+        return "json"
+    return "xml" if head.startswith("<?xml") else "other"
+
+
+def _first_segment(url: str) -> str:
+    return urlsplit(url).path.lstrip("/").split("/", 1)[0].lower()
+
+
+def capture_tier(ex) -> int:
+    """0 authenticated JSON/API or write, 1 anonymous JSON/API or write, 2 other
+    non-HTML, 3 HTML (index into TIER_NAMES)."""
+    family = content_type_family(ex)
+    if (ex.method or "").upper() in _WRITE_METHODS or family == "json":
+        return 0 if _identity(ex) else 1
+    return 3 if family == "html" else 2
+
+
+def _route_family(ex) -> tuple:
+    """What takes turns inside a tier: one identity on one first path segment."""
+    return (_identity(ex), _first_segment(ex.url))
+
+
+def _cookie_facts(value, *, flags: bool) -> tuple:
+    cookies = []
+    for raw in _COOKIE_SPLIT.split(str(value or "")):
+        name = _COOKIE_START.match(raw.strip())
+        if not name:
+            continue
+        attrs = ()
+        if flags:
+            attrs = tuple(sorted(
+                (a.split("=", 1)[0].strip().lower() + ("=" + a.split("=", 1)[1].strip().lower()
+                 if a.strip().lower().startswith("samesite") and "=" in a else ""))
+                for a in raw.split(";")[1:]
+                if a.strip() and a.split("=", 1)[0].strip().lower() not in ("expires", "max-age", "path", "domain")))
+        cookies.append((name.group(1),) + attrs)
+    return tuple(sorted(set(cookies)))
+
+
+def security_header_fingerprint(response_headers, *, extended: bool = False) -> tuple:
+    """A stable, value-free-of-secrets summary of a response's security headers:
+    CSP, X-Frame-Options, HSTS, every Access-Control-Allow-* and the Set-Cookie
+    names. `extended` adds the cache, banner and hardening headers the
+    csp/cors/misconfig/web_cache_poisoning agents also read."""
+    low = _lower(response_headers)
+    names = _SECURITY_HEADERS + (_HARDENING_EXTRA_HEADERS if extended else ())
+    pairs = [(k, str(low[k]).strip()) for k in names if k in low]
+    pairs += [(k, str(v).strip()) for k, v in sorted(low.items()) if k.startswith("access-control-allow-")]
+    return tuple(pairs), _cookie_facts(low.get("set-cookie"), flags=extended)
+
+
+def _group_key(ex):
+    """Identity of a capture's CONTENT for the review (E1), or None when the capture
+    must never be grouped: it carries its own input (a query string, a request body)
+    or names an object (an id-like path segment). Two captures with the same key
+    would be reviewed by the same model on the same bytes."""
+    from harness.engagement import path_id_values
+    parts = urlsplit(ex.url)
+    if parts.query or (ex.request_body or "").strip() or path_id_values(ex.url):
+        return None
+    body = hashlib.sha256((ex.response_body or "").encode("utf-8", "replace")).hexdigest()
+    # Every response header NAME counts, not only the security set: an extra debug or
+    # banner header on one route is something to review there.
+    return ((ex.method or "").upper(), parts.netloc.lower(), ex.response_status, _identity(ex),
+            content_type_family(ex), body, tuple(sorted(_lower(ex.response_headers))),
+            security_header_fingerprint(ex.response_headers, extended=True))
+
+
+def observation_key(ex) -> str:
+    """The exact-observation key review_frontier marks in `seen`."""
+    headers = {k.lower(): v for k, v in (ex.request_headers or {}).items()}
+    record = [ex.method, ex.url, headers, ex.request_body, ex.response_status,
+              {k.lower(): v for k, v in (ex.response_headers or {}).items()}, ex.response_body]
+    return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+
+
+def review_frontier(captured, *, seen=None, group_identical: bool = False, on_grouped=None):
+    """Deduplicate exact observations, then order what is left for review.
+
+    Order (E1): tier first -- authenticated JSON/API or write, anonymous JSON/API
+    or write, other non-HTML, HTML (see capture_tier) -- and inside a tier the
+    identity + first-path-segment families take turns, and inside a family the
+    individual routes do, so polling on one route or one route family cannot
+    consume the review budget before another gets its first review. Nothing is
+    dropped by the ordering; only a consumer's own bound can leave a capture
+    unreviewed. Keep different bodies, credentials and responses. Original
+    observations are retained by the caller, never removed from storage.
+
+    `group_identical` (content review only): captures that share a `_group_key`
+    -- same identity, method, status, content family, body bytes and security
+    headers, and no input or object id of their own -- yield only the first as the
+    representative. When the representative is taken, each other capture of its
+    group is marked in `seen` (so it is never reviewed again) and
+    `on_grouped(capture, representative)` is called for it. A group whose
+    representative is never taken leaves its members untouched.
     """
     seen = seen if seen is not None else set()
-    groups = {}
+    tiers: dict[int, dict[tuple, dict[tuple, deque]]] = {}
+    queued: set[str] = set()
+    representatives: dict[tuple, str] = {}
+    followers: dict[str, list] = {}
     for cap in captured or []:
         try:
             ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
         except (TypeError, ValueError):
             continue
-        headers = {k.lower(): v for k, v in (ex.request_headers or {}).items()}
-        record = [ex.method, ex.url, headers, ex.request_body, ex.response_status,
-                  {k.lower(): v for k, v in (ex.response_headers or {}).items()}, ex.response_body]
-        key = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
-        if key in seen:
+        key = observation_key(ex)
+        if key in seen or key in queued:
             continue
+        queued.add(key)
         # Do not mark reviewed until actually selected by the consumer.
-        identity = tuple(sorted((k, v) for k, v in headers.items()
-                                if k in {"authorization", "cookie", "x-api-key", "x-auth-token"}))
+        if group_identical:
+            content = _group_key(ex)
+            if content is not None:
+                rep = representatives.setdefault(content, key)
+                if rep != key:
+                    followers.setdefault(rep, []).append((key, ex))
+                    continue
         parts = urlsplit(ex.url)
-        group = (ex.method, parts.netloc, parts.path, identity)
-        groups.setdefault(group, deque()).append((key, ex))
-    while groups:
-        for group in list(groups):
-            key, ex = groups[group].popleft()
-            if not groups[group]:
-                del groups[group]
-            if key not in seen:
-                seen.add(key)
-                yield ex
+        group = (ex.method, parts.netloc, parts.path, _identity(ex))
+        tiers.setdefault(capture_tier(ex), {}).setdefault(_route_family(ex), {}) \
+            .setdefault(group, deque()).append((key, ex))
+    for tier in sorted(tiers):
+        families = tiers[tier]
+        while families:
+            # Popping and re-inserting moves a family/group to the back of its
+            # insertion-ordered dict: that is the round-robin.
+            family = next(iter(families))
+            groups = families.pop(family)
+            group = next(iter(groups))
+            queue = groups.pop(group)
+            key, ex = queue.popleft()
+            if queue:
+                groups[group] = queue
+            if groups:
+                families[family] = groups
+            if key in seen:
+                continue
+            seen.add(key)
+            for member_key, member in followers.get(key, ()):
+                if member_key not in seen:
+                    seen.add(member_key)
+                    if on_grouped is not None:
+                        on_grouped(member, ex)
+            yield ex
 
 
 def assessment_health(coverage, errors=(), *, stopped_on_confirmation=False):

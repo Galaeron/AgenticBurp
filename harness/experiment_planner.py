@@ -224,9 +224,11 @@ def ollama_propose_fn(ollama, model: str, *, temperature: float = 0.0):
     """The production `propose_fn`: the run's Ollama client asked for JSON. A model
     failure propagates to the caller, which counts it and moves on."""
     async def propose(subgraph: dict) -> list:
-        data = await ollama.chat_json(model, SYSTEM_PROMPT,
-                                      json.dumps(subgraph, default=str)[:12000],
-                                      temperature=temperature)
+        from harness.ollama_client import model_stage
+        with model_stage("planner"):
+            data = await ollama.chat_json(model, SYSTEM_PROMPT,
+                                          json.dumps(subgraph, default=str)[:12000],
+                                          temperature=temperature)
         proposals = data.get("proposals") if isinstance(data, dict) else None
         return proposals if isinstance(proposals, list) else []
     return propose

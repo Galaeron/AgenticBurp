@@ -508,15 +508,18 @@ class IterativeAgent:
                     "\n\n" + _prior_attempts_block(attempts, result.duplicate_proposals) +
                     "\n\nChoose your next action as a single JSON object.")
             try:
+                from harness.ollama_client import model_stage
                 if effort_budget is not None:
-                    r = await self.ollama.chat_json_metered(
-                        model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
+                    with model_stage("iterative"):
+                        r = await self.ollama.chat_json_metered(
+                            model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
                     from harness.effort import CallKind
                     effort_budget.record(CallKind.ESCALATION, self.model, r.prompt_tokens, r.completion_tokens)
                     action = r.data
                 else:
-                    action = await self.ollama.chat_json(
-                        model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
+                    with model_stage("iterative"):
+                        action = await self.ollama.chat_json(
+                            model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
             except Exception as e:
                 result.stop_reason = "error"
                 result.handoff_note = f"LLM call failed at step {step}: {e}"

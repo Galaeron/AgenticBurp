@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import re
 
-from harness.ollama_client import OllamaClient, OllamaError
+from harness.ollama_client import OllamaClient, OllamaError, model_stage
 
 log = logging.getLogger("harness.allocation_prioritizer")
 
@@ -95,8 +95,9 @@ async def rank(
     user_prompt = "Candidates:\n" + "\n".join(lines)
 
     try:
-        parsed = await ollama.chat_json(
-            model=model, system_prompt=_SYSTEM_PROMPT, user_prompt=user_prompt, temperature=temperature)
+        with model_stage("allocation"):
+            parsed = await ollama.chat_json(
+                model=model, system_prompt=_SYSTEM_PROMPT, user_prompt=user_prompt, temperature=temperature)
     except OllamaError as e:
         log.warning("allocation prioritization call failed: %s -- keeping static ranking", e)
         return {}
