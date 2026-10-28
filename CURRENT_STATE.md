@@ -1,24 +1,24 @@
-# Current state — 2026-10-26 (branch `codex/assessment-integration`)
+# Current state — 2026-10-28 (branch `codex/assessment-integration`)
 
 ## Checkout
 - Integration worktree `.test-work/wt-assessment-integration`. The branch is based
-  on `9866784` and carries the assessment-only port `b4bf1fb`, RV-T, RV-U and
-  Ticket 5, followed by Tickets 1-7 (`d975bfc`, `e213f4b`), the review bound
-  (`b116c42`) and the stage reservations (`bc87804`). Not pushed or merged.
+  on `9866784`. It carries the assessment-only port `b4bf1fb`, Tickets 1-8 through
+  `bc87804` (v7), the repair batches through `9d656d2` (v8) and the iterative
+  response view `3acd392`. Not pushed or merged.
 - The main checkout (`reconciliation-backlog`, PR Galaeron/AgenticBurp#1) keeps
   uncommitted W1-W4 WIP; it is dispositioned in
   docs/I01_CANDIDATE_MANIFEST_2026-10-17.md. Do not touch it from here.
 - Untracked here and never committed: `sitecustomize.py` (blocks the venv's
   editable-install leak) and `.test-tmp/`. Safe `harness/config.yaml` is
   unchanged; live settings live only in ignored config.local.yaml.
-- Plan: docs/ACTIVE_ASSESSMENT_REPAIR_PLAN_2026-10-21.md (Tickets 1-8). Batch
-  evidence and the handoff: `.test-work/assessment-integration-20261023/HANDOFF.md`.
+- Plans: docs/ACTIVE_ASSESSMENT_REPAIR_PLAN_2026-10-21.md (Tickets 1-8). Repair
+  batches and owner notes: `.test-work/assessment-integration-20261023/
+  repair-batch-notes.md`. Handoff: HANDOFF.md in that directory.
 
 ## Verification
-- `bc87804` (v7) passed on system Python 3.14 and venv 3.12:
-  - precondition 74, smoke 147;
-  - full 4196 harness + 440 evaluation (17 skipped) + 59 integrity;
-  - source_changed []; inventory hash 149450c0…a169.
+- `9d656d2` (v8) gates passed on venv 3.12 and system 3.14
+  (`integrated-v8-py312`/`-py314`, gates-v8.status). `3acd392` gates:
+  `integrated-v9-*`, run_gates_v9.sh → gates-v9.status.
 - Verify in an in-repo worktree with `PYTHONPATH=<worktree>` and the untracked
   `sitecustomize.py`. Windows Defender deletes `file_upload_agent.py` from
   worktrees under %TEMP%. CI runs Python 3.14.
@@ -27,53 +27,45 @@
   pointing at `.audit-external/gradle-cache/caches`.
 - Stop background runs by exact PID tree. TaskStop leaves orphaned processes.
 
-## Live acceptance (Ticket 8, 2026-10-26)
+## Live acceptance v8 (2026-10-28, live-v8-gemma4-full/RUN_STATUS.md)
 - Target: owned `av-eval-js-daybreak-20261021`, 127.0.0.1:3002 only. Port 3000 is
-  unrelated and was left alone.
-- Model: local gemma4:latest for every stage; cloud selection off (the
-  gemma4:31b-cloud quota is exhausted).
-- Callback origin: http://host.docker.internal:38698. The exact token was recorded
-  and the wrong-token control rejected.
-- sqlmap ran only from the Docker image `harness/sqlmap:1.10.9`.
-- Full run, job 383f0ebff8e8:
-  - The job is terminal, but the assessment is INCOMPLETE: the review time bound
-    left 155 captures unreviewed.
-  - Funnel: discovered 12882, applicable 5022, queued 1343, attempted 1343,
-    sent 89, conclusive 89.
-  - Terminal reasons: incomplete_attempt 1254, unsupported_or_manual 3507.
-  - Cost: 39,314 requests, 937 model calls (24 HTTP 500s), 9534.6 s.
-  - Delivery: paged export verified by SHA256, and restart recovery returned
-    identical bytes.
+  unrelated and was left alone. Model: local gemma4:latest for every stage; cloud
+  off. Callback origin http://host.docker.internal:38698. sqlmap only from the
+  Docker image `harness/sqlmap:1.10.9`.
+- Job f2a78499593e: done in 11113.2 s. Export 10,192,182 B / 39 pages.
+- The assessment is INCOMPLETE:
+  - 5070 applicable checks; 110 executed.
+  - Funnel: discovered 12882 → queued 1380 → sent 110.
+  - Terminal reasons: unsupported_or_manual 3516, incomplete_attempt 1270,
+    prerequisite_unmet 174.
+- Cost: 31,793 requests; 1646 model calls (22 errors); sqlmap 76 runs, 830 s.
+  Capture review takes 7051 s of the run.
+- Against v7:
+  - capture review left 0 captures unreviewed (v7: 155);
+  - iterative duplicates are 17.5% (v7: 49.9%);
+  - proofs are executed, with artifacts (v7: all legacy).
 - Issues:
-  - 617 raw findings; 164 ledger-confirmed proof instances; 158 proof-bound cases.
-  - Strict vulnerabilities: 0, because every proof is legacy.
-  - The replay audit of all 149 distinct confirmed claims (`replay_audit.py`, run
-    against the owned target) confirmed 2 unique vulnerabilities:
-    - SQL injection on the login email returns an admin token.
-    - The JWT alg:none token is accepted on 10 routes.
-  - The other claims: 24 hardening observations, 15 recon observations, 31 false
-    positives, 52 not applicable, 12 not supported, 1 not reproduced and
-    3 inconclusive.
+  - 648 raw findings; 49 confirmed proof instances; 20 vulnerabilities.
+  - Replay audit (22 claims): jwt 17 confirmed, csp 2 hardening, 3 not audited,
+    0 false positives (v7: 31).
+  - All 20 vulnerabilities are one flaw, JWT alg:none accepted.
+  - No SQLi confirmed. v7 confirmed login SQLi.
 
 ## Open work (priority order)
-1. Proof artifact ids. orchestrator_confirm's ProofRecord.from_validation_result
-   callers pass no baseline/attack/control ids, so no proof can count as a
-   vulnerability. The session "Link validator confirmations to stored exchanges"
-   owns this.
-2. csp_validator reports "no CSP header" even where one is sent, confirms CSP and
-   framing claims on JSON responses, and confirms an XSS class from headers alone.
-3. recon_validator confirms technology and parameter classes that its own result
-   counts as 0.
-4. sqlmap evidence is truncated to the banner, so parameter, technique and
-   payload are lost. On the login route sqlmap gave a different answer each run.
-5. Local-tool results fail to persist (139 records: csp, clickjacking and recon).
-   Ollama returned 24 HTTP 500s. Capture review is serial, at 44-65 s per capture.
-6. Coverage: 1254 incomplete attempts, mostly SESS-01/ATHZ-02/CRYP-04 cells whose
-   validators decline them; the drive takes anonymous cells first;
-   discovery_max_probes cannot be set through the investigate API.
-7. harness/active_verification.py:143 falls back to llama3.1:8b (Burp validation
+1. sqlmap login: it sent 191 requests to POST /rest/user/login and confirmed
+   nothing. v7 confirmed that route, and in v7 the answer already varied between
+   runs. Diagnose the request, identity and flags offline.
+2. Proof/issue dedup (owner, 2026-10-28): one vulnerability gets one proof, keyed
+   on host, mechanism, principal and check family. Other routes become affected
+   locations. Today 44 jwt proofs yield 20 vulnerabilities, under mixed classes.
+3. Coverage drive throughput: 110 of 1380 queued sent, 1270 incomplete attempts.
+4. Redaction false positive: metric keys "csrf" and "auth" become
+   [REDACTED-SECRET].
+5. 3acd392 has had no live run yet. The live check is whether the iterative agent
+   adapts to errors deep in a page.
+6. harness/active_verification.py:143 falls back to llama3.1:8b (Burp validation
    endpoint only).
-8. Still open from before this branch:
+7. Still open from before this branch:
    - Code review 02 RV-K.
    - I05 batch D on `i05d-browser-credentials`, waiting for the owner's review.
    - I16 wiring: protected routes, ownership and `suggested_test`.
@@ -91,6 +83,7 @@
 - `privacy.external_lookups` true by default (passive-only: false); connect-time
   pin on; external tools via the counting proxy.
 - Ticket 8 authorization (2026-10-22): full local Juice Shop on port 3002 only.
+- One proof per vulnerability (2026-10-28), not one per route.
 
 ## Working rules
 - Follow AGENTS.md. Never read answer keys, blind labels or blind-target
