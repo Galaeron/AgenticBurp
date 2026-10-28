@@ -656,7 +656,8 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
 
 async def review_captured_exchanges(orch, state, captured, *, max_reviews: int = 200,
                                     run_context=None, seen=None, errors=None,
-                                    deadline: float | None = None) -> int:
+                                    deadline: float | None = None, stats: dict | None = None,
+                                    group_identical: bool = True) -> int:
     """Phase 0.1: route every substantive 2xx captured during discovery through
     full content-level review and fold its findings into `state`.
 
@@ -679,13 +680,38 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     unreviewed capture is never marked seen; any left over are reported in
     `errors` as truncation, keeping the assessment incomplete rather than clean.
 
+    Order (E1): authenticated JSON/API and write captures first, then anonymous
+    ones, other non-HTML, and HTML last (see assessment_health.review_frontier).
+    With `group_identical`, captures whose response content, identity and security
+    headers match one already taken -- and that carry no input or object id of their
+    own -- are covered by that representative instead of being reviewed again: each
+    is marked in `seen` and recorded in `stats["grouped"]` as {capture, method,
+    identity, covered_by, reason}; it is never reported as reviewed or as a finding.
+
+    `stats`, when given, is added to (so one dict can span several calls):
+    reviewed, grouped (the entries above), unreviewed (left by a bound) and
+    by_tier (reviewed per tier name).
+
     Returns the count of captured exchanges that yielded >=1 finding."""
     produced = 0
     reviewed = 0
     stopped_by = None
+    from harness import assessment_health
     from harness.assessment_health import review_frontier
     seen = seen if seen is not None else set()
-    frontier = review_frontier(captured, seen=seen)
+    grouped: list[dict] = []
+    grouped_keys: list[str] = []   # observation_key of each grouped entry, in order
+    tier_counts = dict.fromkeys(assessment_health.TIER_NAMES, 0)
+
+    def _grouped(member, representative):
+        grouped_keys.append(assessment_health.observation_key(member))
+        grouped.append({"capture": member.url, "method": member.method,
+                        "identity": assessment_health.identity_kind(member),
+                        "covered_by": representative.url,
+                        "reason": "identical response content, no input"})
+
+    frontier = review_frontier(captured, seen=seen, group_identical=group_identical,
+                               on_grouped=_grouped)
     while True:
         if reviewed >= max_reviews:
             stopped_by = "capture review limit"
@@ -693,6 +719,7 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
         if deadline is not None and time.monotonic() >= deadline:
             stopped_by = "capture review time budget"
             break
+        grouped_before = len(grouped)
         cap = next(frontier, None)
         if cap is None:
             break
@@ -701,6 +728,7 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
         except Exception:
             continue
         reviewed += 1
+        tier_counts[assessment_health.TIER_NAMES[assessment_health.capture_tier(ex)]] += 1
         # R05: record the captured request template on its endpoint so the graph +
         # coverage replay the real body/query/content-type/object-id, not an empty
         # fabricated shape. Cheap and additive; failure must not sink the review.
@@ -711,6 +739,12 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
         try:
             resp = await orch.analyze(ex, _from_discovery=True, run_context=run_context)
         except Exception as e:  # one capture's failure must not sink the rest
+            # Captures grouped under this representative were not actually reviewed:
+            # unmark them, so a later review round (a chain round) can still take them.
+            for entry in grouped[grouped_before:]:
+                entry["representative_review"] = "failed"
+            for key in grouped_keys[grouped_before:]:
+                seen.discard(key)
             if errors is not None:
                 errors.append({"phase": "capture_review", "error": type(e).__name__})
             log.debug("review_captured_exchanges: analyze failed on %s: %s",
@@ -723,6 +757,7 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     if reviewed:
         log.info("review_captured_exchanges: reviewed %d captured 2xx exchanges, "
                  "%d produced findings", reviewed, produced)
+    remaining = 0
     if stopped_by:
         remaining = sum(1 for _ in review_frontier(captured, seen=set(seen)))
         if remaining:
@@ -732,6 +767,15 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
                 errors.append({"phase": "capture_review",
                                "error": f"{stopped_by} reached: {remaining} captured "
                                         "exchange(s) not reviewed"})
+    if stats is not None:
+        base = assessment_health.new_review_stats()
+        for name, empty in base.items():
+            stats.setdefault(name, empty)
+        stats["reviewed"] += reviewed
+        stats["grouped"].extend(grouped)
+        stats["unreviewed"] += remaining
+        for name, count in tier_counts.items():
+            stats["by_tier"][name] = stats["by_tier"].get(name, 0) + count
     return produced
 
 

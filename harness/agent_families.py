@@ -211,11 +211,13 @@ class FamilyRunner:
         try:
             user_prompt = agent._user_prompt(exchange, body_budget, prior_context)
             from harness.passive_inference import passive_chat_json
-            parsed = await passive_chat_json(
-                agent.ollama, effort_budget, model=agent.model,
-                system_prompt=self._system_prompt(), user_prompt=user_prompt,
-                temperature=agent.temperature,
-            )
+            from harness.ollama_client import model_stage
+            with model_stage(label):
+                parsed = await passive_chat_json(
+                    agent.ollama, effort_budget, model=agent.model,
+                    system_prompt=self._system_prompt(), user_prompt=user_prompt,
+                    temperature=agent.temperature,
+                )
             raw_findings = parsed.get("findings", [])
             # W-7/W-24/R02, same as BaseAgent.run: strip harness-owned
             # authority fields from untrusted model output before it

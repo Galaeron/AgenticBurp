@@ -750,6 +750,8 @@ class ChainMixin:
         from harness import worklist_investigator
         from harness import chain_linker
         from harness import role_crawl
+        from harness.instrumentation import RunInstrumentation
+        from harness.assessment_health import new_review_stats
         # Stage reservations: the coverage drive runs last, so withhold its share of
         # the one run ceiling from every earlier stage (released just before the
         # drive), and bound the investigation stages by wall-clock time.
@@ -758,6 +760,11 @@ class ChainMixin:
         _run_budget = getattr(run_context or _run_context_mod.current_run_context(), "budget", None)
         _coverage_hold = (_run_budget.hold(self.coverage_request_reserve)
                           if self.coverage_request_reserve > 0 and hasattr(_run_budget, "hold") else 0)
+        # E9: observation only. Each `phases.begin(...)` below closes the previous
+        # phase and opens the next; nothing is reordered or skipped by it.
+        _instr = RunInstrumentation(self, run_context or _run_context_mod.current_run_context(),
+                                    _run_budget)
+        _instr.phases.begin("discovery")
         state, rc = await engagement_builder.build_engagement(
             base_url, roles, allowed_hosts=self.allowed_hosts,
             crawl_max_pages=discovery_max_pages,
@@ -786,6 +793,7 @@ class ChainMixin:
             if not message.startswith("[discovery] used spec ")
         ]
         _reviewed_captures: set[str] = set()
+        _review_stats = new_review_stats()
         workflow_results: list[dict] = []
 
         # Preserve real request shapes before any worklist leg runs. Full model
@@ -842,6 +850,7 @@ class ChainMixin:
                 log.warning("investigate_engagement: feature crawl failed: %s", e)
                 _errors.append({"phase": "feature_crawl", "error": f"{type(e).__name__}: {e}"})
 
+        _instr.phases.begin("header_audit")
         # Universal header audit: run CORS, CSP, verbose-error validators
         # against EVERY captured exchange from discovery + feature_crawl.
         # This catches header-level issues the LLM agents never labelled.
@@ -1416,6 +1425,7 @@ class ChainMixin:
         # is unchanged. It sends nothing and confirms nothing. Best-effort: an
         # ASM failure must never sink the engagement (same contract as the
         # additive phases above).
+        _instr.phases.begin("business_context")
         _asm = None
         try:
             _asm = self._apply_business_context(state, _all_captured, roles)
@@ -1427,6 +1437,7 @@ class ChainMixin:
         # the business-context hypotheses. Default off (engagement.experiments);
         # when off this returns None without a send. Best-effort like the passes
         # around it: a failure is recorded as an "experiments" phase error.
+        _instr.phases.begin("experiments")
         _experiments = None
         try:
             _experiments = await self._run_experiments(
@@ -1436,6 +1447,7 @@ class ChainMixin:
             log.warning("investigate_engagement: experiments phase failed: %s", e)
             _errors.append({"phase": "experiments", "error": f"{type(e).__name__}: {e}"})
 
+        _instr.phases.begin("worklist")
         worklist_summary: dict = {}
 
         # Objective mode gets one deterministic pass over the real captured
@@ -1563,8 +1575,10 @@ class ChainMixin:
                 "idor_candidates": rc.idor_candidates,
                 "idor_findings": rc.idor_findings,
                 "errors": _errors,
+                "review_stats": _review_stats,
                 "degraded": bool(_errors),
                 "stopped_on_confirmation": stopped,
+                "instrumentation": _instr.snapshot(),
             }
 
         if stop_on_confirm and _early_confirmed:
@@ -1580,6 +1594,7 @@ class ChainMixin:
             # negative result instead of silently changing the experiment into
             # an open-ended model review of unrelated vulnerability classes.
             return _objective_result(False)
+        _instr.phases.begin("capture_review")
         # One review time budget covers this pass and every chain round's pass.
         _review_deadline = (time.monotonic() + self.capture_review_seconds
                             if self.capture_review_seconds > 0 else None)
@@ -1589,7 +1604,7 @@ class ChainMixin:
         if not (stop_on_confirm and _early_confirmed):
             await review_captured_exchanges(
                 self, state, _all_captured, run_context=run_context,
-                seen=_reviewed_captures, errors=_errors,
+                seen=_reviewed_captures, errors=_errors, stats=_review_stats,
                 max_reviews=self.capture_review_limit, deadline=_review_deadline)
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
@@ -1613,6 +1628,7 @@ class ChainMixin:
         except NameError:
             pass
 
+        _instr.phases.begin("chain_rounds")
         # Milestone C: link findings into escalation edges + composed chains, then
         # walk the closed loop -- re-test AS any credential a finding leaked.
         link = chain_linker.link_findings(state, all_findings, responses=_responses)
@@ -1645,7 +1661,7 @@ class ChainMixin:
             if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
                 await review_captured_exchanges(
                     self, st2, getattr(rc2, "captured", None), run_context=run_context,
-                    seen=_reviewed_captures, errors=_errors,
+                    seen=_reviewed_captures, errors=_errors, stats=_review_stats,
                     max_reviews=self.capture_review_limit, deadline=_review_deadline)
             outcomes.extend(outs2)
             all_findings.extend(new_findings)
@@ -1659,6 +1675,7 @@ class ChainMixin:
             chains = list(link["chain_findings"])
             creds = link["credential_caps"]
 
+        _instr.phases.begin("second_order")
         # Second-order auto-confirmation (V22 SQLi / V17 IDOR): actively run the
         # plant->trigger differential over each composed (A,B) pair. The plant is a
         # mutating write, so this is gated on allow_mutating_replay; inert by
@@ -1815,6 +1832,7 @@ class ChainMixin:
         # tested and why" is answerable. `investigated_keys` only phrases the skip
         # reason for legs that were never recorded as executed; it never infers a
         # not_detected. The coverage-driver path records live leg outcomes cell-by-cell.
+        _instr.phases.begin("coverage_drive")
         _requests_before_coverage = getattr(_run_budget, "used", None)
         if _coverage_hold:
             _run_budget.release_hold()
@@ -1959,6 +1977,7 @@ class ChainMixin:
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
 
+        _instr.phases.begin("finalise")
         # RB-5/INV-3: re-link chains over the FINAL findings set. The passes at
         # ~741/771 above (kept as-is, not removed) compute `chains` from
         # `all_findings` as it stood BEFORE the second-order auto-confirm phase
@@ -2042,5 +2061,7 @@ class ChainMixin:
             # R30: operational failures are surfaced, not swallowed -- a run that
             # skipped a phase is declared degraded rather than presented as clean.
             "errors": _errors,
+            "review_stats": _review_stats,
             "degraded": bool(_errors) or health["status"] == "incomplete",
+            "instrumentation": _instr.snapshot(),
         }

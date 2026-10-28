@@ -7,8 +7,10 @@ import json
 import contextvars
 import functools
 import hmac
+import os
 import re
 import secrets
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -439,13 +441,74 @@ CREATE TABLE IF NOT EXISTS observation_attributions (
 _CONNECT_MAX_ATTEMPTS = 12
 _CONNECT_RETRY_BASE_SLEEP = 0.02
 
+# E9: the setup above is about 58 statements, several of them write-lock takers
+# (+0.33 ms per connection), and it re-ran on EVERY _connect(). This process now
+# runs it once per database file. The key is the absolute path plus the file's
+# identity after setup -- (st_dev, st_ino, st_ctime_ns) so a deleted or recreated
+# file never matches, and PRAGMA schema_version so any DDL since (a table dropped
+# by a test, a migration by another process) makes the next connect run the
+# idempotent setup again. busy_timeout is per connection and is set every time;
+# WAL mode persists in the file.
+_INITIALISED: dict[str, tuple] = {}
+_INIT_LOCK = threading.Lock()
+_STATS_LOCK = threading.Lock()
+_CONNECT_STATS = {"connects": 0, "initialisations": 0, "skipped_initialisations": 0,
+                  "connect_ms": 0.0, "init_ms": 0.0, "max_connect_ms": 0.0}
+_SAVE_ENGAGEMENT_STATS = {"calls": 0, "bytes": 0, "ms": 0.0, "max_bytes": 0, "max_ms": 0.0}
+_ENGAGEMENT_WRITE = threading.local()   # bytes of the snapshot _write_engagement just stored
+
+
+def _db_identity(conn: sqlite3.Connection) -> tuple[str, tuple] | None:
+    """(absolute path, file identity) for the database `conn` is open on, or None
+    when it cannot be read (no file yet, in-memory, or locked mid-setup)."""
+    try:
+        st = os.stat(_DB_PATH)
+        version = conn.execute("PRAGMA schema_version").fetchone()[0]
+    except (OSError, sqlite3.Error):
+        return None
+    return os.path.abspath(_DB_PATH), (st.st_dev, st.st_ino, st.st_ctime_ns, version)
+
+
+def timing_snapshot() -> dict:
+    """Plain-data view of connection and snapshot-write timing (E9)."""
+    with _STATS_LOCK:
+        connect = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in _CONNECT_STATS.items()}
+        save = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in _SAVE_ENGAGEMENT_STATS.items()}
+    return {**connect, "save_engagement": save}
+
 
 def _connect() -> sqlite3.Connection:
+    started = time.perf_counter()
+    try:
+        return _connect_counted()
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        with _STATS_LOCK:
+            _CONNECT_STATS["connects"] += 1
+            _CONNECT_STATS["connect_ms"] += elapsed_ms
+            _CONNECT_STATS["max_connect_ms"] = max(_CONNECT_STATS["max_connect_ms"], elapsed_ms)
+
+
+def _connect_counted() -> sqlite3.Connection:
     last_exc: sqlite3.OperationalError | None = None
     for attempt in range(_CONNECT_MAX_ATTEMPTS):
         conn = sqlite3.connect(_DB_PATH, timeout=10.0)
         try:
+            identity = _db_identity(conn)
+            if identity is not None and _INITIALISED.get(identity[0]) == identity[1]:
+                conn.execute("PRAGMA busy_timeout=10000")
+                with _STATS_LOCK:
+                    _CONNECT_STATS["skipped_initialisations"] += 1
+                return conn
+            init_started = time.perf_counter()
             _initialise_connection(conn)
+            after = _db_identity(conn)
+            if after is not None:
+                with _INIT_LOCK:
+                    _INITIALISED[after[0]] = after[1]
+            with _STATS_LOCK:
+                _CONNECT_STATS["initialisations"] += 1
+                _CONNECT_STATS["init_ms"] += (time.perf_counter() - init_started) * 1000.0
             return conn
         except sqlite3.OperationalError as exc:
             conn.close()
@@ -1982,11 +2045,13 @@ def _read_engagement(conn, host: str, engagement_id: str) -> tuple[dict | None, 
 def _write_engagement(conn, host, engagement_id, state, revision):
     snapshot = dict(state)
     snapshot.update(host=host, _engagement_id=engagement_id, _snapshot_revision=revision)
+    state_json = json.dumps(snapshot)
+    _ENGAGEMENT_WRITE.bytes = len(state_json)   # ensure_ascii: one byte per char
     conn.execute(
         "INSERT INTO scoped_engagement_state (engagement_id,host,revision,state_json,updated_at) "
         "VALUES (?,?,?,?,?) ON CONFLICT(engagement_id,host) DO UPDATE SET "
         "revision=excluded.revision,state_json=excluded.state_json,updated_at=excluded.updated_at",
-        (engagement_id, host, revision, json.dumps(snapshot), time.time()))
+        (engagement_id, host, revision, state_json, time.time()))
     return snapshot
 
 
@@ -2002,6 +2067,8 @@ def save_engagement(host: str, state: dict, *, engagement_id: str = "",
         raise EngagementRevisionConflict("engagement snapshot belongs to another partition")
     if expected_revision is None:
         expected_revision = state.get("_snapshot_revision")
+    started = time.perf_counter()
+    _ENGAGEMENT_WRITE.bytes = 0
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2015,6 +2082,13 @@ def save_engagement(host: str, state: dict, *, engagement_id: str = "",
         if conn.in_transaction:
             conn.rollback()
         conn.close()
+        elapsed_ms, written = (time.perf_counter() - started) * 1000.0, _ENGAGEMENT_WRITE.bytes
+        with _STATS_LOCK:
+            _SAVE_ENGAGEMENT_STATS["calls"] += 1
+            _SAVE_ENGAGEMENT_STATS["bytes"] += written
+            _SAVE_ENGAGEMENT_STATS["ms"] += elapsed_ms
+            _SAVE_ENGAGEMENT_STATS["max_bytes"] = max(_SAVE_ENGAGEMENT_STATS["max_bytes"], written)
+            _SAVE_ENGAGEMENT_STATS["max_ms"] = max(_SAVE_ENGAGEMENT_STATS["max_ms"], elapsed_ms)
 
 
 def load_engagement(host: str, *, engagement_id: str = "") -> dict | None:

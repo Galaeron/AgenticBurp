@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 
 from harness.models import PrioritizeRequestItem, PrioritizeResultItem
-from harness.ollama_client import OllamaClient, OllamaError
+from harness.ollama_client import OllamaClient, OllamaError, model_stage
 
 log = logging.getLogger("harness.surface_prioritizer")
 
@@ -81,9 +81,10 @@ async def prioritize(
     results = [_placeholder(it, "model did not return a result for this endpoint") for it in items]
 
     try:
-        parsed = await ollama.chat_json(
-            model=model, system_prompt=_SYSTEM_PROMPT, user_prompt=user_prompt, temperature=temperature,
-        )
+        with model_stage("surface_priority"):
+            parsed = await ollama.chat_json(
+                model=model, system_prompt=_SYSTEM_PROMPT, user_prompt=user_prompt, temperature=temperature,
+            )
     except OllamaError as e:
         log.warning("surface prioritization call failed: %s", e)
         return [_placeholder(it, f"prioritization call failed: {e}") for it in items]

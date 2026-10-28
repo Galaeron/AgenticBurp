@@ -276,17 +276,21 @@ class BusinessContextAgent:
         dicts); `exchanges` optional HttpExchange (or dicts); `roles` optional
         RoleSession list (or role-name strings). Deterministic; no send, no
         confirmation. Emits a HYPOTHESIS ledger event per chaining hypothesis."""
-        projected = self.project_surface(surface, exchanges, cloud_reasoning=cloud_reasoning)
-        asm = ApplicationSemanticModel(host=host or "", built_from_raw=bool(cloud_reasoning))
+        # E9: the pass is deterministic today; the label keeps any model call a
+        # later change adds out of "unlabelled".
+        from harness.ollama_client import model_stage
+        with model_stage("business_context"):
+            projected = self.project_surface(surface, exchanges, cloud_reasoning=cloud_reasoning)
+            asm = ApplicationSemanticModel(host=host or "", built_from_raw=bool(cloud_reasoning))
 
-        asm.roles = self._infer_roles(projected, roles)
-        asm.business_objects = self._infer_objects(projected)
-        asm.workflows = self._infer_workflows(projected)
-        asm.value_flows = self._infer_value_flows(projected)
-        asm.sensitive_sinks = self._infer_sinks(projected)
-        asm.chaining_hypotheses = self._infer_hypotheses(asm, projected)
+            asm.roles = self._infer_roles(projected, roles)
+            asm.business_objects = self._infer_objects(projected)
+            asm.workflows = self._infer_workflows(projected)
+            asm.value_flows = self._infer_value_flows(projected)
+            asm.sensitive_sinks = self._infer_sinks(projected)
+            asm.chaining_hypotheses = self._infer_hypotheses(asm, projected)
 
-        self._emit_hypotheses(asm)
+            self._emit_hypotheses(asm)
         log.info("business_context_agent: %s -- %d roles, %d objects, %d workflows, "
                  "%d value-flows, %d sinks, %d hypotheses",
                  asm.host, len(asm.roles), len(asm.business_objects), len(asm.workflows),

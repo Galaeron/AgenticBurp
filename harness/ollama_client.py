@@ -4,6 +4,8 @@ import logging
 import re
 import asyncio
 import time
+import contextlib
+import contextvars
 import httpx
 from dataclasses import dataclass
 
@@ -13,6 +15,31 @@ from harness import rate_limiter
 from harness import audit_logger
 
 log = logging.getLogger("harness.ollama_client")
+
+# E9 profiling label for the model calls made inside a `with model_stage(...)`
+# block. A ContextVar, so it follows the awaiting task (and any task or thread
+# copied from it) without a parameter threaded through every call site, and a
+# call made outside any block lands in "unlabelled". The label is bookkeeping
+# only: it never reaches the prompt, the payload, or any verdict.
+_MODEL_STAGE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "harness_model_stage", default="unlabelled")
+
+
+@contextlib.contextmanager
+def model_stage(label: str):
+    """Attribute every OllamaClient call made inside the block to `label`."""
+    token = _MODEL_STAGE.set(str(label or "unlabelled"))
+    try:
+        yield
+    finally:
+        _MODEL_STAGE.reset(token)
+
+
+# Per-stage counters; the ms fields are floats, the rest ints.
+_STAGE_COUNT_FIELDS = ("calls", "completed", "failed", "cancelled", "retried",
+                       "prompt_tokens", "completion_tokens")
+_STAGE_MS_FIELDS = ("prompt_eval_ms", "eval_ms", "load_ms", "wall_ms")
+
 
 class OllamaError(RuntimeError):
     pass
@@ -244,6 +271,10 @@ class OllamaClient:
         # per LOGICAL call so run accounting is unchanged by retries.
         self.model_retry_count = 0
         self.model_retry_recovered_count = 0
+        # E9: the same usage, split by the active model_stage label. Pure
+        # bookkeeping read off values this client already has -- it adds no
+        # request and changes no result.
+        self.stage_metrics: dict[str, dict] = {}
 
         # Initialize circuit breaker. Uses the shared-registry accessor
         # (not `OllamaCircuitBreaker(...)` directly) so that every
@@ -285,10 +316,39 @@ class OllamaClient:
         # Initialize audit logger
         self.audit_logger = audit_logger.get_audit_logger()
 
+    def _stage_row(self) -> dict:
+        """The counters for the active model_stage label, created on first use."""
+        label = _MODEL_STAGE.get()
+        row = self.stage_metrics.get(label)
+        if row is None:
+            row = self.stage_metrics[label] = {
+                **dict.fromkeys(_STAGE_COUNT_FIELDS, 0), **dict.fromkeys(_STAGE_MS_FIELDS, 0.0)}
+        return row
+
+    def metrics_snapshot(self) -> dict:
+        """Plain-data copy of the per-stage usage plus the client-wide counters,
+        for the job result and run manifest (E9)."""
+        stages = {label: {k: (round(v, 1) if isinstance(v, float) else v) for k, v in row.items()}
+                  for label, row in self.stage_metrics.items()}
+        totals = {k: sum(row[k] for row in stages.values())
+                  for k in (*_STAGE_COUNT_FIELDS, *_STAGE_MS_FIELDS)}
+        totals.update({k: round(totals[k], 1) for k in _STAGE_MS_FIELDS})
+        return {"stages": stages, "totals": totals,
+                "client": {"attempted": self.model_attempted_count,
+                           "completed": self.model_completed_count,
+                           "usable": self.model_call_count,
+                           "errors": self.model_error_count,
+                           "cancelled": self.model_cancelled_count,
+                           "retries": self.model_retry_count,
+                           "retry_recovered": self.model_retry_recovered_count,
+                           "unknown_usage": self.model_unknown_usage_count}}
+
     async def _chat(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         """Keep consumption independent of successful JSON parsing."""
         started = time.monotonic()
         self.model_attempted_count += 1
+        stage = self._stage_row()
+        stage["calls"] += 1
         measurement = {"prompt_tokens": None, "completion_tokens": None,
                        "attempted": True, "completed": False, "usable": False,
                        "queue_ms": None, "connection_ms": None,
@@ -304,13 +364,16 @@ class OllamaClient:
             if isinstance(exc, asyncio.CancelledError):
                 measurement["outcome"] = "cancelled"
                 self.model_cancelled_count += 1
+                stage["cancelled"] += 1
             else:
                 self.model_error_count += 1
+                stage["failed"] += 1
             # This receipt contains only counts/timing/state, never response text.
             setattr(exc, "inference_usage", measurement)
             raise
         finally:
             measurement["wall_ms"] = (time.monotonic() - started) * 1000.0
+            stage["wall_ms"] += measurement["wall_ms"]
 
     async def _chat_impl(
         self,
@@ -436,6 +499,7 @@ class OllamaClient:
                     await _backoff_sleep(delay)
                     # Counted only once the resend is really about to happen.
                     self.model_retry_count += 1
+                    self._stage_row()["retried"] += 1
                     # Each resend is its own audited attempt.
                     self.audit_logger.log_llm_prompt(
                         model=model,
@@ -526,6 +590,15 @@ class OllamaClient:
         self.model_completed_count += 1
         self.model_prompt_tokens += prompt_tokens or 0
         self.model_completion_tokens += completion_tokens or 0
+        stage = self._stage_row()
+        stage["completed"] += 1
+        stage["prompt_tokens"] += prompt_tokens or 0
+        stage["completion_tokens"] += completion_tokens or 0
+        for field, key in (("prompt_eval_ms", "prompt_eval_duration"), ("eval_ms", "eval_duration"),
+                           ("load_ms", "load_duration")):
+            nanos = data.get(key)
+            if type(nanos) in (int, float) and nanos >= 0:
+                stage[field] += nanos / 1_000_000.0
         if prompt_tokens is None or completion_tokens is None:
             self.model_unknown_usage_count += 1
         self.rate_limiter.record_usage(prompt_tokens, completion_tokens)
