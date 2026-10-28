@@ -3,8 +3,9 @@
 ## Checkout
 - Integration worktree `.test-work/wt-assessment-integration`. The branch is based
   on `9866784`. It carries the assessment-only port `b4bf1fb`, Tickets 1-8 through
-  `bc87804` (v7), the repair batches through `9d656d2` (v8) and the iterative
-  response view `3acd392`. Not pushed or merged.
+  `bc87804` (v7), the repair batches through `9d656d2` (v8), the iterative
+  response view `3acd392`, the sqlmap login repair `7203a44` and the coverage
+  capability reconciliation `1370b6f` (v10). Not pushed or merged.
 - The main checkout (`reconciliation-backlog`, PR Galaeron/AgenticBurp#1) keeps
   uncommitted W1-W4 WIP; it is dispositioned in
   docs/I01_CANDIDATE_MANIFEST_2026-10-17.md. Do not touch it from here.
@@ -19,6 +20,8 @@
 - `9d656d2` (v8) gates passed on venv 3.12 and system 3.14
   (`integrated-v8-py312`/`-py314`, gates-v8.status). `3acd392` passed as
   `integrated-v9-py312`/`-py314` (precondition, smoke and full exit 0; gates-v9.status).
+  `1370b6f` passed as `integrated-v10c-py312`/`-py314` (full 4840 each, sources
+  unchanged; gates-v10c.status). `integrated-v10-*` is invalid: concurrent edits.
 - Verify in an in-repo worktree with `PYTHONPATH=<worktree>` and the untracked
   `sitecustomize.py`. Windows Defender deletes `file_upload_agent.py` from
   worktrees under %TEMP%. CI runs Python 3.14.
@@ -52,9 +55,10 @@
   - No SQLi confirmed. v7 confirmed login SQLi.
 
 ## Open work (priority order)
-1. sqlmap login: it sent 191 requests to POST /rest/user/login and confirmed
-   nothing. v7 confirmed that route, and in v7 the answer already varied between
-   runs. Diagnose the request, identity and flags offline.
+1. Live run v10: full shape, 8 h, no request cap. Follow RUN_INSTRUCTIONS-v10-full.md
+   in the batch directory. It is the live check of 7203a44 (v8 missed login SQLi
+   because of a timing-dependent sqlmap stability check and an empty-email false
+   probe), of 1370b6f, and of 3acd392 (item 5).
 2. Proof/issue dedup (owner, 2026-10-28): one vulnerability gets one proof, keyed
    on host, mechanism, principal and check family. Other routes become affected
    locations. Today 44 jwt proofs yield 20 vulnerabilities, under mixed classes.
