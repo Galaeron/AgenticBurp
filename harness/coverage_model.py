@@ -467,6 +467,7 @@ class Check:
     academy_url: str = ""                # optional full Academy topic URL (scenario reference)
     wstg_version: str = "4.2"            # the WSTG release a genuine WSTG id is anchored to
     external_refs: tuple[ExternalRef, ...] = ()   # independently-verified external sources
+    origin_scoped: bool = False  # A transport/deployment fact, not a response policy.
 
     def applies(self, endpoint: dict) -> tuple[bool, str]:
         """Deterministic applicability + the rationale for WHY it applies or doesn't."""
@@ -500,7 +501,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
     Check("WSTG-CRYP-01", "TLS/SSL configuration", Phase.DOMAIN,
           "crypto", _always_applicable, "crypto",
           "Verify TLS versions, cipher suites, certificate validity",
-          "Server-side TLS"),
+          "Server-side TLS", origin_scoped=True),
     Check("WSTG-CONF-07", "HTTP Strict Transport Security", Phase.DOMAIN,
           "misconfig", _always_applicable, "crypto",
           "Check HSTS header presence and configuration"),
@@ -536,7 +537,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
                           "4-Web_Application_Security_Testing/"
                           "02-Configuration_and_Deployment_Management_Testing/09-Test_File_Permission",
                           "Test File Permission", version="4.2"),
-          )),
+          ), origin_scoped=True),
 
     # === ENDPOINT phase ===
     Check("WSTG-ATHZ-04", "IDOR / Broken Object-Level Authorization", Phase.ENDPOINT,
@@ -572,7 +573,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "session_fixation", _has_auth_endpoint, "auth_sequence",
           "Test if session tokens are regenerated after login"),
     Check("WSTG-BUSL-09", "File upload", Phase.ENDPOINT,
-          "file_upload", _has_file_path_segment, "manual",
+          "file_upload", _has_file_path_segment, "file_upload",
           "Test file type/size/content validation on upload endpoints",
           "File upload vulnerabilities"),
     Check("WSTG-ATHZ-01", "Path traversal", Phase.ENDPOINT,
@@ -654,7 +655,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "Test redirect parameters for off-site redirection",
           "Open redirection"),
     Check("WSTG-INPV-06", "NoSQL injection", Phase.PARAMETER,
-          "nosql", _accepts_input, "agent",
+          "nosql", _accepts_input, "nosql",
           "Test for NoSQL query manipulation",
           "NoSQL injection"),
     Check("WSTG-CRYP-04", "JWT weaknesses", Phase.PARAMETER,
@@ -743,6 +744,8 @@ class CoverageMatrix:
         purely agent-attributed result (no leg ran) must leave it False."""
         key = (identity, endpoint_key, check_id)
         existing = self._cells.get(key)
+        if existing and existing.reason.startswith("origin_scoped:"):
+            return existing  # Endpoint findings cannot recreate a host-level denominator.
         if existing and existing.status == CellStatus.CONFIRMED:
             return existing
         result = CellResult(status=status, reason=reason, severity=severity,

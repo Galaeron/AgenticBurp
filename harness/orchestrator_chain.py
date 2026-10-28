@@ -1978,6 +1978,26 @@ class ChainMixin:
                 _sqlmap_inst = self.validator_registry.validators.get("sqlmap")
                 if _sqlmap_inst is not None:
                     _val_by_conf["sqlmap"] = _sqlmap_inst
+                # These registered validators have check-specific oracles. Do not
+                # wire generic recon/crypto here: their aggregate verdict cannot
+                # establish each individual header, metadata, method or TLS check.
+                for name in ("csp", "cors", "header_injection",
+                             "http_request_smuggling", "race_condition"):
+                    registered = self.validator_registry.validators.get(name)
+                    if registered is not None:
+                        _val_by_conf[name] = self.validator_registry.bind_run_context(
+                            [registered], run_context)[0]
+                # An explicit disabled setting also applies to locally assembled
+                # legs. Never advertise an unavailable validator as executable.
+                # cross_identity is the exception: its flag arms the registry's
+                # tester-fed instance (off in the committed config), while this leg
+                # is built above from the engagement's own identities whatever that
+                # flag says. Honouring it here dropped IDOR/BOLA from every drive.
+                _validator_config = self.config.get("validators", {})
+                _val_by_conf = {name: validator for name, validator in _val_by_conf.items()
+                                if _validator_config.get("enabled", True)
+                                and (name == "cross_identity"
+                                     or _validator_config.get(name, {}).get("enabled", True))}
                 # Key headers by DURABLE PRINCIPAL id (R02), matching the coverage
                 # identity, so two same-role accounts don't collapse/overwrite.
                 def _pid(r):

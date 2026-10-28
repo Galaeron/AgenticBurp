@@ -87,6 +87,11 @@ def _test_config() -> dict:
     validators = cfg.setdefault("validators", {})
     validators["active_enabled"] = True          # the legs send live (here: stubbed) requests
     validators["allow_mutating_replay"] = False
+    # This fixture supplies only a JWT response oracle (AsyncClient.get).
+    # Other coverage families have their own caller tests; leaving them enabled
+    # would send unmocked requests through AsyncClient.request to localhost.
+    for name in ("csp", "cors", "header_injection", "http_request_smuggling", "race_condition"):
+        validators.setdefault(name, {})["enabled"] = False
     cfg.setdefault("autonomous_discovery", {})["enabled"] = False
     cfg.setdefault("github_advisories", {})["enabled"] = False
     cfg.setdefault("kev_check", {})["enabled"] = False

@@ -36,7 +36,7 @@ class CoverageRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(completed, calls)
         self.assertEqual(second['phase_ledger']['counts']['resumed'], 1)
         self.assertEqual(first['audited']['applicable'], second['audited']['applicable'])
-        self.assertTrue(any(r['terminal_reason'] == 'unsupported_or_manual'
+        self.assertTrue(any(r['terminal_reason'] == 'manual_required'
                             for r in second['phase_ledger']['cells']))
         self.assertTrue(all(r['terminal_reason'] for r in second['phase_ledger']['cells']))
 

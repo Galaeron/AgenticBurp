@@ -152,6 +152,7 @@ _LEG_CONFIRMATIONS = {
     "command_injection", "path_traversal", "open_redirect", "sequence",
     "deserialization_oob", "auth_sequence", "stored_xss", "verb_tamper", "csrf",
     "file_upload", "rate_limit", "reset_token", "dom_xss", "toctou", "race_condition",
+    "csp", "cors", "nosql", "header_injection", "http_request_smuggling",
 }
 
 # E7: a drive hands its checkpoint to `on_checkpoint` after every this many completed
@@ -178,7 +179,7 @@ class CoverageTracker:
         self.reused = set()
         self.endpoints = {}
         self.identity_roles: dict[str, str] = {}
-        self.driveable = set()
+        self.driveable = None  # None means no driver supplied; an empty set means none available.
         self.checkpoint_signature = ""
         self.context_key = ""
         # E7: called with checkpoint() every CHECKPOINT_EVERY_LEGS completed legs.
@@ -239,6 +240,22 @@ class CoverageTracker:
         self.endpoints = endpoints
         self.identity_roles = dict(identity_roles)
         na = self.matrix.fill_applicability(identities, endpoints, self.checks)
+        # One engagement is one origin. Transport/deployment checks have one
+        # representative; response policies (CSP, CORS, HSTS, etc.) remain per
+        # route and identity because those responses can differ.
+        for check in self.checks:
+            if not check.origin_scoped or not identities or not endpoints:
+                continue
+            ep_key = min(endpoints, key=lambda k: (
+                not bool(endpoints[k].get("reachable_roles")),
+                not k.startswith("GET "), k))
+            ident = self._probe_identity(endpoints[ep_key], identities, identity_roles)
+            for key, cell in list(self.matrix.cells().items()):
+                if key[2] == check.id and key[:2] != (ident, ep_key):
+                    if cell.status != CellStatus.NOT_APPLICABLE:
+                        na += 1
+                    self.matrix.set(*key, CellResult.not_applicable(
+                        f"origin_scoped: represented by {ident} / {ep_key}"))
         skipped = 0
         for ep_key, ep in endpoints.items():
             reach = [str(r) for r in (ep.get("reachable_roles") or [])]
@@ -377,7 +394,7 @@ class CoverageTracker:
         by `budget` so a large surface can't fan out unboundedly, and by
         `deadline` (a `time.monotonic()` value) so it ends in time."""
         n = 0
-        self.driveable = set(driveable or _LEG_CONFIRMATIONS)
+        self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
         pending = self.pending_leg_cells(driveable)
         self.queued.update((ident, ep_key, check.id) for ident, ep_key, check in pending)
         for (ident, ep_key, check) in _fair_cells(pending, self._unauthenticated()):
@@ -491,7 +508,7 @@ class CoverageTracker:
                                         status=CellStatus.INCONCLUSIVE, reason=reason)
 
         attempts = 0
-        self.driveable = set(driveable or _LEG_CONFIRMATIONS)
+        self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
         self.queued.update(cells)
         for (ident, ep_key, check_id) in _fair_cells(list(cells), self._unauthenticated()):
             cks = cells[(ident, ep_key, check_id)]
@@ -561,13 +578,16 @@ class CoverageTracker:
                 continue
             check = CHECKS_BY_ID.get(check_id)
             if check and check.confirmation in _LEG_CONFIRMATIONS:
-                if ep_key in investigated_keys:
+                if self.driveable is not None and check.confirmation not in self.driveable:
+                    reason = f"validator unavailable or disabled for this run: {check.confirmation}"
+                elif ep_key in investigated_keys:
                     reason = (f"endpoint investigated but no {check.confirmation} execution was recorded "
                               f"for identity {ident!r} (attempt not tracked -- not inferred as tested)")
                 else:
                     reason = "endpoint not reached in this run's node budget (leg available, not attempted)"
             else:
-                reason = f"no deterministic leg (confirmation={getattr(check, 'confirmation', '?')}); needs agent/manual review"
+                reason = ("manual verification required" if check and check.confirmation == "manual"
+                          else f"no check-specific coverage adapter (confirmation={getattr(check, 'confirmation', '?')})")
             self.matrix.record(ident, ep_key, check_id, status=CellStatus.SKIPPED, reason=reason)
             n += 1
         return n
@@ -597,22 +617,34 @@ class CoverageTracker:
             ident, ep, cid = key
             check = CHECKS_BY_ID.get(cid)
             captured = bool(self.endpoints.get(ep, {}).get("template"))
-            capability = bool(check and check.confirmation in (self.driveable or _LEG_CONFIRMATIONS))
+            supported = bool(check and check.confirmation in _LEG_CONFIRMATIONS)
+            capability = supported and (self.driveable is None or check.confirmation in self.driveable)
             applicable = cell.status != CellStatus.NOT_APPLICABLE
             conclusive = cell.executed and cell.status in {
                 CellStatus.CONFIRMED, CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE}
+            # Child aggregation intentionally leaves incomplete cells pending.
+            # Preserve a representative's refusal instead of hiding it behind
+            # that aggregate status (parameter siblings have no separate send).
+            representative = next((result for case, result in self.matrix.cases_for_cell(*key)
+                                   if case.is_no_parameter), cell)
             if conclusive:
                 reason = "conclusive"
             elif not applicable:
                 reason = "not_applicable"
-            elif not capability:
-                reason = "unsupported_or_manual"
-            elif cell.status == CellStatus.BLOCKED:
+            elif representative.status == CellStatus.BLOCKED:
                 reason = "policy_blocked"
             elif any(marker in cell.reason for marker in ("missing_principal", "missing_body", "scope_rejected")):
                 reason = next(marker for marker in ("missing_principal", "missing_body", "scope_rejected") if marker in cell.reason)
+            elif "did not reach this endpoint" in cell.reason:
+                reason = "unreachable_identity"
             elif key in self.attempted:
                 reason = "incomplete_attempt"
+            elif check and check.confirmation == "manual":
+                reason = "manual_required"
+            elif not supported:
+                reason = "check_adapter_missing"
+            elif not capability:
+                reason = "validator_unavailable"
             elif key in self.queued:
                 reason = "budget_exhausted"
             elif not captured:
@@ -621,10 +653,12 @@ class CoverageTracker:
                 reason = "prerequisite_unmet"
             rows.append({"identity": ident, "endpoint": ep, "check": cid,
                          "discovered": True, "captured": captured,
+                         "confirmation": getattr(check, "confirmation", None),
+                         "observation_status": cell.status.value,
                          "shape_applicable": applicable, "implemented": capability,
                          "eligible": applicable and capability,
                          "queued": key in self.queued,
-                         "policy": "allowed" if cell.executed else ("denied" if cell.status == CellStatus.BLOCKED else "not_established"),
+                         "policy": "allowed" if cell.executed else ("denied" if reason == "policy_blocked" else "not_established"),
                          "attempted": key in self.attempted, "sent": bool(cell.executed),
                          "conclusive": bool(conclusive), "resumed": key in self.reused,
                          "terminal_reason": reason, "detail": cell.reason})
