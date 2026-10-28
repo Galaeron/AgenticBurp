@@ -621,5 +621,72 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((d["duplicate_proposals"], d["distinct_requests"]), (0, 0))
 
 
+_FILLER = "<div class='product'><span>Apple Juice</span><span>1.99</span></div>\n" * 70
+_ERROR_PAGE = ("<html><head><title>Error</title></head><body>" + _FILLER +
+               "<pre>SQLITE_ERROR: near \"'\": syntax error</pre>" + _FILLER + "</body></html>")
+
+
+def _mutations(*values):
+    return [{"action": "mutate", "location": "query", "param": "q", "value": v} for v in values]
+
+
+class ResponseFeedbackTests(unittest.IsolatedAsyncioTestCase):
+    """What the model sees of each probe response: an error or reflection deep in a
+    realistic page must reach the next prompt, and old responses must not grow it."""
+    def setUp(self):
+        safety_gate.reset_default_gate()
+
+    async def _prompts(self, actions, page, headers=None):
+        ollama = _ScriptedOllama(actions)
+        agent = IterativeAgent(ollama, "m", ["localhost"])
+        with patch("httpx.AsyncClient.request", return_value=_Resp(500, page, headers)):
+            await agent.run(_exchange(), "SQLi in q", "sqli")
+        return ollama.prompts
+
+    async def test_an_error_deep_in_the_page_reaches_the_next_prompt(self):
+        self.assertGreater(_ERROR_PAGE.index("SQLITE_ERROR"), 4000)
+        prompts = await self._prompts(_mutations("'"), _ERROR_PAGE,
+                                      {"Content-Type": "text/html", "X-Powered-By": "Express"})
+        self.assertIn("SQLITE_ERROR: near", prompts[1])
+        self.assertIn("[error @", prompts[1])
+        self.assertIn("x-powered-by=Express", prompts[1])
+        self.assertIn("RESPONSE BODY (captured baseline, start): results", prompts[0])
+
+    async def test_control_without_the_windows_only_the_head_is_seen(self):
+        with patch("harness.iterative_agent._RESP_MAX_WINDOWS", 0):
+            prompts = await self._prompts(_mutations("'"), _ERROR_PAGE)
+        self.assertNotIn("SQLITE_ERROR", prompts[1])
+        self.assertIn("Apple Juice", prompts[1])
+
+    async def test_a_reflected_value_is_shown_where_it_lands(self):
+        page = "<html><body>" + _FILLER + "<p>No results for zq&lt;b&gt;91</p><p>raw zq<b>91</p>" + _FILLER
+        prompts = await self._prompts(_mutations("zq<b>91"), page)
+        self.assertIn("[reflected @", prompts[1])
+        self.assertIn("raw zq<b>91", prompts[1])
+
+    async def test_control_a_value_that_is_not_reflected_is_not_tagged(self):
+        prompts = await self._prompts(_mutations("zq<b>91"), "<html><body>" + _FILLER)
+        self.assertNotIn("reflected", prompts[1])
+
+    async def test_older_responses_shrink_to_one_line(self):
+        prompts = await self._prompts(_mutations("'", "''", "1'", "1\"", "\""), _ERROR_PAGE)
+        last = prompts[5]
+        self.assertEqual(last.count("SQLITE_ERROR: near"), 2)          # steps 4 and 5 in full
+        for step in (1, 2, 3):
+            self.assertRegex(last, rf"\[step {step}\] GET \S+ -> HTTP 500, \d+ bytes \[error")
+        self.assertLess(len(last), 6000)
+
+    async def test_control_with_every_step_detailed_all_errors_are_repeated(self):
+        with patch("harness.iterative_agent._DETAILED_STEPS", 10):
+            prompts = await self._prompts(_mutations("'", "''", "1'", "1\"", "\""), _ERROR_PAGE)
+        self.assertEqual(prompts[5].count("SQLITE_ERROR: near"), 5)
+
+    async def test_cookie_values_are_never_shown(self):
+        prompts = await self._prompts(_mutations("'"), _ERROR_PAGE,
+                                      {"Set-Cookie": "token=s3cr3tvalue; Path=/"})
+        self.assertIn("set-cookie names=token", prompts[1])
+        self.assertNotIn("s3cr3tvalue", prompts[1])
+
+
 if __name__ == "__main__":
     unittest.main()

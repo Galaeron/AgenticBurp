@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -48,15 +49,13 @@ from harness.run_context import transport_for  # W-16: the single TargetTranspor
 from harness.validators.sqlmap import (
     _mutate_query_param, _mutate_json_param, _mutate_form_param,
     _query_top_level_params, _json_top_level_params, _form_top_level_params,
-    _looks_like_json, _content_type_of,
+    _looks_like_json, _content_type_of, _DB_ERROR_MARKERS,
 )
 
 if TYPE_CHECKING:
     from harness.effort import EffortBudget
 
 log = logging.getLogger("harness.iterative_agent")
-
-_MAX_RESP_CHARS = 1200  # response summary fed back to the model, per step
 
 
 def _request_signature(method: str, url: str, headers: dict | None, body: str | None) -> str:
@@ -100,6 +99,69 @@ def _header_value_view(name: object, value: object) -> str:
     if str(name).lower() in SECRET_HEADER_NAMES:
         return "<redacted #" + hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()[:8] + ">"
     return _excerpt(value)
+
+
+# The body kept from each probe response, so an error or a reflection anywhere in a
+# realistic page is still found; only _response_view's few hundred characters of it
+# reach the model.
+_MAX_RESP_CHARS = 262144
+_RESP_HEAD_CHARS = 500          # start of the body shown for every response
+_RESP_WINDOW_CHARS = 180        # context each side of an error, reflection or change
+_RESP_MAX_WINDOWS = 3
+_DETAILED_STEPS = 2             # latest responses shown in full; older ones as one line
+_VIEW_HEADERS = ("content-type", "location", "www-authenticate", "x-powered-by", "server")
+_SERVER_ERROR_RE = re.compile(
+    "|".join(re.escape(m) for m in _DB_ERROR_MARKERS)
+    + r"|exception|traceback|stack trace|syntax error|unexpected token|\berror:", re.I)
+_COOKIE_NAME_RE = re.compile(r"(?:^|[,\n]\s*)([^=;,\s]+)=")
+
+
+def _response_view(text: object, *, headers: dict | None = None, baseline: object = None,
+                   probe: object = None) -> tuple[str, list[str]]:
+    """What the model is shown of one probe response, and the signals found in it.
+
+    The start of the body, then a window around each place that matters wherever it
+    is: a database or server error, the value just sent coming back (reflection), and
+    the first place the body departs from the captured baseline. A cut at a fixed
+    length hides exactly these on a realistic page (an SQL error under 3 KB of HTML).
+    A few response headers come first; cookie values are never shown."""
+    body = re.sub(r"\s+", " ", str(text or ""))
+    found: list[tuple[str, int]] = []
+    error = _SERVER_ERROR_RE.search(body)
+    if error:
+        found.append(("error", error.start()))
+    needle = re.sub(r"\s+", " ", str(probe or "")).strip()
+    if len(needle) >= 3 and (at := body.find(needle)) >= 0:
+        found.append(("reflected", at))
+    if baseline is not None:
+        base = re.sub(r"\s+", " ", str(baseline))
+        if base != body:
+            found.append(("differs from baseline", len(os.path.commonprefix([base, body]))))
+    parts = [body[:_RESP_HEAD_CHARS] + ("..." if len(body) > _RESP_HEAD_CHARS else "")]
+    shown_to = _RESP_HEAD_CHARS
+    for name, at in sorted(found, key=lambda f: f[1])[:_RESP_MAX_WINDOWS]:
+        if at + 60 <= shown_to:  # already readable in what is shown
+            continue
+        start, end = max(at - _RESP_WINDOW_CHARS, shown_to), min(len(body), at + _RESP_WINDOW_CHARS)
+        parts.append(f"[{name} @{at}] ...{body[start:end]}...")
+        shown_to = end
+    lowered = {str(k).lower(): v for k, v in (headers or {}).items()}
+    shown = [f"{k}={_excerpt(_header_value_view(k, lowered[k]), 80)}"
+             for k in _VIEW_HEADERS if k in lowered]
+    if "set-cookie" in lowered:
+        shown.append("set-cookie names=" + ",".join(_COOKIE_NAME_RE.findall(str(lowered["set-cookie"]))))
+    view = (f"headers: {'; '.join(shown)}\n" if shown else "") + "\n".join(parts)
+    return view, [name for name, _ in found]
+
+
+def _render_history(history: list) -> str:
+    """The prompt's history. Plain lines as they are; of the (short, full) step responses
+    the latest _DETAILED_STEPS in full and older ones as their short line, so the prompt
+    stays inside the model's context window however many steps ran."""
+    responses = [i for i, item in enumerate(history) if isinstance(item, tuple)]
+    full = set(responses[-_DETAILED_STEPS:]) if _DETAILED_STEPS > 0 else set()
+    return "\n".join(item if isinstance(item, str) else item[1] if i in full else item[0]
+                     for i, item in enumerate(history))
 
 
 def _sorted_query(query: str) -> str:
@@ -316,6 +378,7 @@ class IterativeAgent:
         # (orchestrator_confirm.py), so this set's lifetime is exactly "this
         # session", never leaking across sessions or agents.
         self._sent_signatures: set[str] = set()
+        self._last_response_headers: dict = {}   # of the latest send, for _response_view
 
     @property
     def gate(self):
@@ -418,6 +481,7 @@ class IterativeAgent:
                 return None, f"blocked by safety gate: {out.error}"
             if not out.ok:
                 return None, f"request failed: {out.error or out.outcome}"
+            self._last_response_headers = dict(out.headers or {})
             return out.status, (out.body or "")[:_MAX_RESP_CHARS]
         finally:
             if _ctx is not None:
@@ -482,10 +546,12 @@ class IterativeAgent:
         headers_state.setdefault("User-Agent", "harness-iterative-agent/1.0")
 
         system = _SYSTEM_PROMPT.format(specialty=specialty)
-        history: list[str] = [
+        history: list[str | tuple[str, str]] = [
             f"HYPOTHESIS: {hypothesis}",
             f"ENDPOINT: {exchange.method} {exchange.url}",
             f"RESPONSE STATUS (captured baseline): {exchange.response_status}",
+            f"RESPONSE BODY (captured baseline, start): "
+            f"{_excerpt(exchange.response_body or '', _RESP_HEAD_CHARS)}",
             f"MUTABLE PARAMETERS: {json.dumps(self._mutable_params(exchange))}",
         ]
 
@@ -504,7 +570,7 @@ class IterativeAgent:
                     result.handoff_note = f"Halted by effort budget at step {step}: {reason}"
                     break
 
-            user = ("\n".join(history) +
+            user = (_render_history(history) +
                     "\n\n" + _prior_attempts_block(attempts, result.duplicate_proposals) +
                     "\n\nChoose your next action as a single JSON object.")
             try:
@@ -590,6 +656,7 @@ class IterativeAgent:
             dup_streak.reset()  # a non-duplicate send resets consecutive_duplicates
             result.distinct_requests += 1
 
+            self._last_response_headers = {}
             status, text = await self._execute(method, url, headers, body)
             changed = {action["name"]: action["value"]} if kind == "set_header" else {}
             rec = AttemptRecord(
@@ -616,9 +683,15 @@ class IterativeAgent:
                     consecutive_trouble = 0
             else:
                 consecutive_no_progress = 0
-                resp_summary = f"HTTP {status}, {len(text)} bytes: {text[:400]}"
-                history.append(f"[step {step}] {req_summary} -> {resp_summary}")
-                emit(IterativeStep(step, action, req_summary, status, text[:400]))
+                view, signals = _response_view(
+                    text, headers=self._last_response_headers,
+                    baseline=exchange.response_body or None,
+                    probe=None if kind == "set_header" else action.get("value"))
+                line = f"[step {step}] {req_summary} -> HTTP {status}, {len(text)} bytes"
+                # Shown in full while among the latest _DETAILED_STEPS, then as the short line.
+                history.append((line + (f" [{', '.join(signals)}]" if signals else ""),
+                                f"{line}:\n{view}"))
+                emit(IterativeStep(step, action, req_summary, status, view))
                 consecutive_trouble = consecutive_trouble + 1 if status in _DISTRESS_STATUSES else 0
 
             # Abort if the target is clearly in trouble -- stop piling on a
