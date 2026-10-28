@@ -17,8 +17,8 @@
 
 ## Verification
 - `9d656d2` (v8) gates passed on venv 3.12 and system 3.14
-  (`integrated-v8-py312`/`-py314`, gates-v8.status). `3acd392` gates:
-  `integrated-v9-*`, run_gates_v9.sh → gates-v9.status.
+  (`integrated-v8-py312`/`-py314`, gates-v8.status). `3acd392` passed as
+  `integrated-v9-py312`/`-py314` (precondition, smoke and full exit 0; gates-v9.status).
 - Verify in an in-repo worktree with `PYTHONPATH=<worktree>` and the untracked
   `sitecustomize.py`. Windows Defender deletes `file_upload_agent.py` from
   worktrees under %TEMP%. CI runs Python 3.14.
