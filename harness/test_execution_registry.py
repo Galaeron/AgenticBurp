@@ -148,8 +148,11 @@ class ExecutionKeyTests(unittest.TestCase):
         for name in ("cross_identity", "idor_read", "jwt_forge", "csrf", "sequence", "toctou",
                      "stored_xss", "browser_xss", "auth_sequence", "rate_limit"):
             self.assertNotIn(name, SHAPE_KEYED)
-            # The exact key, plus the identity of every non-public header.
-            self.assertEqual(execution_key(name, one, "idor")[:-1],
+            # The exact key, plus the identity of every non-public header, then the
+            # batch 04 reuse conditions (mechanism version, relevant state).
+            self.assertEqual(execution_key(name, one, "idor")[-2:],
+                             (("mechanism", "1"), ("state", "")))
+            self.assertEqual(execution_key(name, one, "idor")[:-3],
                              confirmation_cache_key(name, one, "idor"), name)
             self.assertNotEqual(execution_key(name, one, "idor"), execution_key(name, six, "idor"))
 
@@ -357,7 +360,8 @@ class ExecutionRegistryTests(unittest.TestCase):
         stats = registry.stats()
         self.assertEqual((stats["misses"], stats["hits"], stats["sends_saved"]), (1, 2, 14))
         self.assertEqual(stats["by_validator"]["sqlmap"],
-                         {"hits": 2, "misses": 1, "inflight_joins": 0, "sends_saved": 14})
+                         {"hits": 2, "misses": 1, "inflight_joins": 0, "sends_saved": 14,
+                          "retry_limited": 0})
         self.assertEqual(budget.used, 7)
 
 
@@ -931,3 +935,127 @@ class TypedIncompleteReuseTests(unittest.TestCase):
         self.assertEqual(registry.stats()["misses"], 2)
         self.assertEqual(registry.stats()["hits"], 0)
         self.assertTrue(result["pending"] or result["skipped"])
+
+
+class ConditionalReuseCallerTests(unittest.TestCase):
+    """Batch 04: reuse is conditional on the inputs that decide the verdict and
+    linked to the original attempt. Every case dispatches through the production
+    `_ConfirmationCache` against a real registry; CORS cases use the real
+    validator and a loopback target."""
+
+    def _cors(self, *, failing_requests, calls, budget=400, retry_limit=None):
+        from harness.validators.cors_validator import CorsValidator
+        target = _Target(cors=True, failed_requests=failing_requests)
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=budget,
+                                gate_config={"active_enabled": True})
+        registry = (ExecutionRegistry(ctx.budget) if retry_limit is None
+                    else ExecutionRegistry(ctx.budget, retry_limit=retry_limit))
+        cache = _ConfirmationCache(ctx, lambda *args: "unused", registry=registry)
+        validator = CorsValidator(run_context=ctx, allowed_hosts=["127.0.0.1"])
+
+        async def run():
+            try:
+                return [await cache.validate(validator, _finding_of("cors"),
+                        _ex(target.base + "/cors"), case_ref="case")
+                        for _ in range(calls)]
+            finally:
+                await ctx.aclose()
+        try:
+            return asyncio.run(run()), target.server.requests, registry.stats()
+        finally:
+            target.close()
+
+    def _dispatch(self, pairs, validator=None):
+        """[(finding, exchange, case)] through one cache; returns (results, validator)."""
+        validator = validator or _Counting()
+        ctx = RunContext.create(allowed_hosts=["fixture.invalid"])
+        cache = _ConfirmationCache(ctx, lambda *args: "unused", registry=ExecutionRegistry())
+
+        async def run():
+            out = []
+            for finding, exchange, case, v in pairs:
+                out.append(await cache.validate(v or validator, finding, exchange, case_ref=case))
+            return out
+        return asyncio.run(run()), validator
+
+    def test_partial_cors_then_recovery_gets_a_new_attempt_and_a_bounded_retry(self):
+        results, sends, stats = self._cors(failing_requests=1000, calls=4)
+        self.assertEqual([r.status for r in results[:2]], ["inconclusive", "inconclusive"])
+        self.assertEqual(stats["misses"], 2, stats)
+        # Nothing about the experiment changed: the third and fourth callers get a
+        # reference to the last incomplete attempt, not another send.
+        self.assertEqual(stats["retry_limited"], 2, stats)
+        self.assertTrue(all(r.sent_count == 0 and not r.confirmed for r in results[2:]))
+        self.assertEqual(results[3].referenced_attempt, results[1].attempt_id)
+        self.assertEqual(sends, 2 * (sends // 2))
+
+    def test_unchanged_successful_experiment_references_its_evidence_without_a_send(self):
+        results, sends, stats = self._cors(failing_requests=0, calls=2)
+        self.assertTrue(results[0].confirmed)
+        self.assertIs(results[1], results[0])
+        self.assertEqual((stats["misses"], stats["hits"], stats["sends_saved"] > 0), (1, 1, True))
+
+    def test_a_changed_principal_runs_again(self):
+        url = "http://fixture.invalid/a?q=1"
+        f = _finding_of("sqli")
+        _, v = self._dispatch([(f, _ex(url, headers=_ALICE), "c", None),
+                               (f, _ex(url, headers=_BOB), "c", None)])
+        self.assertEqual(len(v.calls), 2)
+
+    def test_a_changed_relevant_state_runs_again_but_an_unrelated_one_does_not(self):
+        url, other = "http://fixture.invalid/a?q=1", "http://fixture.invalid/b?q=1"
+        s1, s2 = _finding_of("sqli"), _finding_of("sqli")
+        s1.workflow_state_id, s2.workflow_state_id = "cart:empty", "cart:full"
+        unrelated = _finding_of("sqli")
+        unrelated.workflow_state_id = "profile:edited"
+        results, v = self._dispatch([(s1, _ex(url), "c", None), (s2, _ex(url), "c", None),
+                                     (unrelated, _ex(other), "d", None), (s1, _ex(url), "c", None)])
+        self.assertEqual(v.calls, [url, url, other])
+        self.assertIs(results[3], results[0])
+
+    def test_a_changed_nested_json_body_does_not_collide(self):
+        url = "http://fixture.invalid/api"
+        h = {"Content-Type": "application/json"}
+        a = json.dumps({"user": {"name": "x"}})
+        b = json.dumps({"user": {"role": "x"}})
+        c = json.dumps({"user": [{"name": "x"}]})
+        f = _finding_of("sqli")
+        _, v = self._dispatch([(f, _ex(url, "POST", h, a), "c", None),
+                               (f, _ex(url, "POST", h, b), "c", None),
+                               (f, _ex(url, "POST", h, c), "c", None),
+                               (f, _ex(url, "POST", h, json.dumps({"user": {"name": "y"}})), "c", None)])
+        # Shape-keyed: a different nested shape runs; only a nested VALUE change is
+        # the declared equivalence of a shape-keyed mechanism.
+        self.assertEqual(len(v.calls), 3)
+
+    def test_a_nested_value_change_runs_again_for_an_exact_mechanism(self):
+        url = "http://fixture.invalid/api"
+        h = {"Content-Type": "application/json"}
+        f = _finding_of("cross_identity")
+        v = _Counting(name="cross_identity_validator")
+        _, v = self._dispatch([(f, _ex(url, "POST", h, json.dumps({"o": {"id": 1}})), "c", v),
+                               (f, _ex(url, "POST", h, json.dumps({"o": {"id": 2}})), "c", v)], v)
+        self.assertEqual(len(v.calls), 2)
+
+    def test_a_changed_mechanism_version_runs_again(self):
+        url = "http://fixture.invalid/a?q=1"
+        old, new = _Counting(), _Counting()
+        new.calls = old.calls
+        new.mechanism_version = "2"
+        f = _finding_of("sqli")
+        results, _ = self._dispatch([(f, _ex(url), "c", old), (f, _ex(url), "c", new),
+                                     (f, _ex(url), "c", old)], old)
+        self.assertEqual(len(old.calls), 2)
+        self.assertIs(results[2], results[0])
+
+    def test_a_cache_hit_for_another_case_manufactures_no_proof(self):
+        url = "http://fixture.invalid/a?q=1"
+        f = _finding_of("sqli")
+        results, v = self._dispatch([(f, _ex(url), "one", None), (f, _ex(url), "two", None)])
+        self.assertEqual(len(v.calls), 1)
+        covered = results[1]
+        self.assertFalse(covered.confirmed)
+        self.assertEqual((covered.attack_artifact_id, covered.baseline_artifact_id,
+                          tuple(covered.control_artifact_ids)), ("", "", ()))
+        self.assertEqual(covered.referenced_attempt, results[0].attempt_id)
+        self.assertTrue(results[0].confirmed and results[0].attack_artifact_id == "art-a")

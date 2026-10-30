@@ -17,6 +17,13 @@ A key is a statement about what the leg tests, never about who asked:
   template and the identity, so their key is (validator, method, host, route template,
   identity) with no parameters or body: the universal header audit and the model-review
   path answer the same question once.
+
+Batch 04: reuse is conditional and evidence-linked. Every key also carries the
+mechanism (validator) version and the finding's relevant workflow state, so a new
+oracle or a changed state is a new experiment while a state change elsewhere leaves
+this key alone. A shape-keyed body keys on its full nested shape. An incomplete
+result is never stored; the same unchanged key is retried at most `retry_limit`
+times, after which callers get a zero-send reference to the last attempt.
 """
 from __future__ import annotations
 
@@ -43,8 +50,18 @@ HEADER_CHECKED = frozenset({"csp_validator", "cors_validator"})
 # blob-shaped), so two requests with the same names can need different checks.
 
 
+def _json_shape(value):
+    """The nested structure of a JSON value: object keys, list element shapes and
+    leaf types, without the leaf values."""
+    if isinstance(value, dict):
+        return ("{", tuple(sorted((str(k), _json_shape(v)) for k, v in value.items())))
+    if isinstance(value, list):
+        return ("[", tuple(sorted({_json_shape(v) for v in value}, key=repr)))
+    return type(value).__name__
+
+
 def _body_shape(exchange) -> tuple:
-    """The body's parameter NAMES: JSON top-level keys or form field names. A body
+    """The body's parameter NAMES: the nested JSON shape or form field names. A body
     that is neither (XML, multipart, a JSON list, a form with no declared content
     type) keeps its sha256, so two different opaque bodies never share a key."""
     body = exchange.request_body or ""
@@ -58,7 +75,7 @@ def _body_shape(exchange) -> tuple:
         except ValueError:
             parsed = None
         if isinstance(parsed, dict):
-            return ("json", tuple(sorted(str(k) for k in parsed)))
+            return ("json", _json_shape(parsed))
     elif "application/x-www-form-urlencoded" in ctype:
         names = tuple(sorted(k for k, _ in parse_qsl(body, keep_blank_values=True)))
         if names:
@@ -76,8 +93,14 @@ def _header_claim(validator_name: str, finding_class: str | None) -> tuple:
     return tuple(sorted(_claim_kinds(finding_class or "")))
 
 
-def execution_key(validator_name: str, exchange, finding_class: str | None = None) -> tuple:
+def execution_key(validator_name: str, exchange, finding_class: str | None = None, *,
+                  mechanism_version: str = "1", state: str = "") -> tuple:
     """The within-run key for one validator execution (see the module docstring)."""
+    return _base_key(validator_name, exchange, finding_class) + (
+        ("mechanism", str(mechanism_version)), ("state", state or ""))
+
+
+def _base_key(validator_name: str, exchange, finding_class: str | None) -> tuple:
     # _identity_signature reads Authorization and Cookie only; capture_identity_key
     # adds every non-public header, so an X-Api-Key identity is not shared either.
     identity = capture_identity_key(exchange.request_headers)
@@ -109,6 +132,11 @@ class _Stored:
     sent_count: int
 
 
+def _conditions(validator, finding=None) -> dict:
+    return {"mechanism_version": str(getattr(validator, "mechanism_version", "1") or "1"),
+            "state": str(getattr(finding, "workflow_state_id", "") or "")}
+
+
 class ExecutionRegistry:
     """Run-scoped memo of validator executions, shared by every execution path.
 
@@ -119,8 +147,11 @@ class ExecutionRegistry:
     spend is then this call's); an overlapped call records 0, so the saving is
     an under-estimate, never an over-claim."""
 
-    def __init__(self, budget=None):
+    def __init__(self, budget=None, *, retry_limit: int = 2):
         self._budget = budget
+        # Incomplete attempts per unchanged key: (count, last result, case).
+        self._retry_limit = max(1, int(retry_limit))
+        self._incomplete: dict[tuple, tuple[int, object, str]] = {}
         self._stored: dict[tuple, _Stored] = {}
         self._flying: dict[tuple, asyncio.Future] = {}
         self._active: list[dict] = []     # calls in progress, for overlap detection
@@ -128,7 +159,8 @@ class ExecutionRegistry:
 
     def _tally(self, name: str) -> dict:
         return self._by_validator.setdefault(
-            name, {"hits": 0, "misses": 0, "inflight_joins": 0, "sends_saved": 0})
+            name, {"hits": 0, "misses": 0, "inflight_joins": 0, "sends_saved": 0,
+                   "retry_limited": 0})
 
     async def run(self, validator, finding, exchange, *, case_ref, call):
         """Return the validator's result for this execution key.
@@ -143,7 +175,8 @@ class ExecutionRegistry:
         run that was cancelled hands the key back, so a failure or a decline never
         stands in for a check that did not happen."""
         name = getattr(validator, "name", "") or "validator"
-        key = execution_key(name, exchange, getattr(finding, "vulnerability_class", None))
+        key = execution_key(name, exchange, getattr(finding, "vulnerability_class", None),
+                            **_conditions(validator, finding))
         tally = self._tally(name)
         while True:
             stored = self._stored.get(key)
@@ -153,6 +186,9 @@ class ExecutionRegistry:
                 return self._for_case(stored, case_ref)
             flight = self._flying.get(key)
             if flight is None:
+                limited = self._retry_limited(key, tally)
+                if limited is not None:
+                    return limited
                 break
             tally["inflight_joins"] += 1
             # shield: cancelling this waiter must not cancel the run others share.
@@ -166,7 +202,7 @@ class ExecutionRegistry:
         identity is a hit. Returns {class: result}; a hit for another case returns the
         covered copies `run` returns."""
         name = getattr(validator, "name", "") or "validator"
-        keys = {c: execution_key(name, exchange, c) for c in classes}
+        keys = {c: execution_key(name, exchange, c, **_conditions(validator)) for c in classes}
         tally = self._tally(name)
         while True:
             stored = {c: self._stored.get(k) for c, k in keys.items()}
@@ -230,13 +266,45 @@ class ExecutionRegistry:
             sent = (self._budget.used - used_before
                     if used_before is not None and not state["overlapped"] else 0)
         for key, one in (entries(result) if entries else [(keys[0], result)]):
-            if one is not None and getattr(one, "status", None) not in _NOT_RUN and \
+            if one is None:
+                continue
+            if getattr(one, "status", None) not in _NOT_RUN and \
                     getattr(one, "control_outcome", "") != "inconclusive":
                 self._stored[key] = _Stored(one, case_ref, max(0, sent))
+                self._incomplete.pop(key, None)
+            elif self._attempted(one, sent):
+                # An incomplete attempt that sent: the next caller may retry, up to
+                # the bound. One that sent nothing (blocked, declined) is no attempt.
+                count = self._incomplete.get(key, (0, None, ""))[0] + 1
+                self._incomplete[key] = (count, one, case_ref)
         for key in keys:
             self._flying.pop(key, None)
         flight.set_result(None)
         return result
+
+    @staticmethod
+    def _attempted(result, sent) -> bool:
+        if getattr(result, "status", None) in ("blocked", "skipped"):
+            return False        # declined before the check ran: never a retry spent
+        observed = getattr(result, "observed_sends", None)
+        return (isinstance(observed, int) and observed > 0) or sent > 0
+
+    def _retry_limited(self, key, tally):
+        """A zero-send reference to the last incomplete attempt once this unchanged
+        key has used its retries; None while a retry is still allowed."""
+        count, last, case = self._incomplete.get(key, (0, None, ""))
+        if count < self._retry_limit:
+            return None
+        tally["retry_limited"] += 1
+        ref = copy.copy(last)
+        ref.baseline_artifact_id = ref.attack_artifact_id = ""
+        ref.control_artifact_ids = ()
+        ref.confirmed = False
+        ref.sent_count = 0
+        ref.referenced_attempt = getattr(last, "attempt_id", "") or ""
+        ref.summary = (f"retry limit reached ({count} incomplete attempts, nothing changed); "
+                       f"last attempt under {case or 'this run'}: {last.summary or ''}")
+        return ref
 
     @staticmethod
     def _for_case(stored: _Stored, case_ref):
@@ -249,6 +317,7 @@ class ExecutionRegistry:
         # Nothing was sent for this case; the proof lives on stored.case_ref.
         covered.sent_count = 0
         covered.covered_by = stored.case_ref
+        covered.referenced_attempt = getattr(stored.result, "attempt_id", "") or ""
         covered.summary = (f"covered by {stored.case_ref} (same check, route template, "
                            f"parameters and identity): {stored.result.summary or ''}")
         return covered
@@ -259,5 +328,5 @@ class ExecutionRegistry:
         among the hits, and the requests the hits avoided."""
         rows = {name: dict(row) for name, row in sorted(self._by_validator.items())}
         total = {field: sum(row[field] for row in rows.values())
-                 for field in ("hits", "misses", "inflight_joins", "sends_saved")}
+                 for field in ("hits", "misses", "inflight_joins", "sends_saved", "retry_limited")}
         return {**total, "by_validator": rows}

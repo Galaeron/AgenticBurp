@@ -138,6 +138,9 @@ class Validator(ABC):
     name: str = "base"
     finding_classes: set[str] = set()
     active: bool = False
+    # Batch 04: bump when the oracle or executor changes what a verdict means; a
+    # result from another version is never reused.
+    mechanism_version: str = "1"
     _bound_run = None
 
     @property
