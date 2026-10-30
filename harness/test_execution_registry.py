@@ -285,7 +285,7 @@ class ExecutionRegistryTests(unittest.TestCase):
         self.assertEqual(len(validator.calls), 2)
 
     def test_a_run_that_did_not_happen_never_stands_in_for_the_check(self):
-        for status in ("error", "skipped", "blocked"):
+        for status in ("error", "skipped", "blocked", "inconclusive", "incomplete", "partial"):
             with self.subTest(status=status):
                 registry, validator = ExecutionRegistry(), _Counting(status=status, confirmed=False)
 
@@ -300,7 +300,7 @@ class ExecutionRegistryTests(unittest.TestCase):
 
     def test_every_answered_status_is_stored(self):
         for status, confirmed in (("confirmed", True), ("not_confirmed", False),
-                                  ("controlled_negative", False), ("inconclusive", False)):
+                                  ("controlled_negative", False), ("safe", False)):
             with self.subTest(status=status):
                 registry, validator = ExecutionRegistry(), _Counting(status=status, confirmed=confirmed)
 
@@ -438,7 +438,7 @@ class CrossPathCallerTests(_CallerBase, unittest.TestCase):
 class _Target:
     """Loopback target answering every GET with a small JSON object."""
 
-    def __init__(self):
+    def __init__(self, *, cors=False, failed_requests=0):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import threading
 
@@ -447,13 +447,25 @@ class _Target:
                 pass
 
             def do_GET(self):
-                data = b'{"id": 1, "owner": "alice"}'
+                self.server.requests += 1
+                malformed = self.server.requests <= failed_requests
+                data = b'not gzip' if malformed else b'{"id": 1, "owner": "alice"}'
                 self.send_response(200)
+                if malformed:
+                    self.send_header("Content-Encoding", "gzip")
+                if cors:
+                    self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", ""))
+                    self.send_header("Access-Control-Allow-Credentials", "true")
+                    self.send_header("Vary", "Origin")
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+
+            do_OPTIONS = do_GET
+
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.requests = 0
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -550,8 +562,7 @@ class EngagementCallerTests(_EngagementCallerBase, unittest.TestCase):
         self.assertEqual(len(launches.on("/api/items/")), 2, launches.commands)
 
     def test_the_coverage_drive_is_covered_by_the_worklist_run(self):
-        """P1 ran the shape for each route id; the drive (P3) then finds the same
-        shape already run and sends nothing for it."""
+        """The drive reuses completed shape checks; incomplete checks stay eligible."""
         def drive_config(*, mutating):
             cfg = _config(mutating=mutating)
             cfg["engagement"]["coverage_drive_legs"] = True
@@ -564,7 +575,11 @@ class EngagementCallerTests(_EngagementCallerBase, unittest.TestCase):
                            "the drive did not run")
         self.assertEqual(len(launches.on("/api/items/")), 1, launches.commands)
         stats = result["execution_registry"]
-        self.assertGreaterEqual(stats["by_validator"]["command_injection"]["hits"], 3, stats)
+        # Only complete outcomes are reusable. This fixture completes sqlmap;
+        # its incomplete command-injection checks must remain eligible later.
+        self.assertGreaterEqual(stats["by_validator"]["sqlmap"]["hits"], 3, stats)
+        self.assertEqual(stats["by_validator"]["command_injection"]["hits"], 0, stats)
+        self.assertGreater(stats["by_validator"]["command_injection"]["misses"], 0, stats)
 
 
 def _node_for(roles, *exchanges):
@@ -812,3 +827,107 @@ class CoveredCellTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(builder=builder.__name__, status=status):
                     report = await self.drive(builder, status, "")
                     self.assertEqual(report[status], 1, report["by_status"])
+
+
+class IncompleteRecoveryCallerTests(unittest.TestCase):
+    def _scenario(self, *, failing_requests, budget, calls):
+        from harness.validators.cors_validator import CorsValidator
+        target = _Target(cors=True, failed_requests=failing_requests)
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=budget,
+                                gate_config={"active_enabled": True})
+        registry = ExecutionRegistry(ctx.budget)
+        cache = _ConfirmationCache(ctx, lambda *args: "unused", registry=registry)
+        validator = CorsValidator(run_context=ctx, allowed_hosts=["127.0.0.1"])
+
+        async def run():
+            try:
+                return [await cache.validate(validator, _finding_of("cors"),
+                        _ex(target.base + "/cors?x=" + str(i)), case_ref="case-" + str(i))
+                        for i in range(calls)]
+            finally:
+                await ctx.aclose()
+        try:
+            results = asyncio.run(run())
+            return results, target.server.requests, registry.stats()
+        finally:
+            target.close()
+
+    def test_incomplete_cors_recovers_then_reuses_successful_evidence_reference(self):
+        results, sends, stats = self._scenario(failing_requests=8, budget=24, calls=3)
+        self.assertEqual(results[0].status, "inconclusive")
+        self.assertTrue(results[1].confirmed, results[1].summary)
+        self.assertTrue(results[1].attack_artifact_id)
+        self.assertEqual(results[2].covered_by, "case-1")
+        self.assertFalse(results[2].confirmed)
+        self.assertEqual(results[2].attack_artifact_id, "")
+        self.assertEqual(results[2].sent_count, 0)
+        self.assertEqual((sends, stats["misses"], stats["hits"]), (19, 2, 1))
+
+    def test_repeated_incomplete_attempts_respect_existing_transport_budget(self):
+        results, sends, stats = self._scenario(failing_requests=100, budget=12, calls=4)
+        self.assertEqual([r.status for r in results],
+                         ["inconclusive", "blocked", "blocked", "blocked"])
+        self.assertFalse(any(r.confirmed for r in results))
+        self.assertEqual((sends, stats["misses"], stats["hits"]), (12, 4, 0))
+
+    def test_concurrent_callers_allow_bounded_recovery_and_join_completed_result(self):
+        registry, validator = ExecutionRegistry(), _Counting(delay=0.02)
+        calls = 0
+        async def actual():
+            nonlocal calls
+            calls += 1
+            result = await validator.validate(_finding_of("sqli"), _ex("http://fixture.invalid/a?q=1"))
+            if calls == 1:
+                result.status, result.confirmed = "inconclusive", False
+            return result
+        async def run():
+            first, second = await asyncio.gather(*[
+                registry.run(validator, _finding_of("sqli"), _ex("http://fixture.invalid/a?q=1"),
+                             case_ref=case, call=actual) for case in ("a", "b")])
+            third = await registry.run(validator, _finding_of("sqli"), _ex("http://fixture.invalid/a?q=1"),
+                                       case_ref="c", call=actual)
+            return first, second, third
+        first, second, third = asyncio.run(run())
+        self.assertEqual(first.status, "inconclusive")
+        self.assertTrue(second.confirmed)
+        self.assertEqual(third.covered_by, "b")
+        self.assertEqual(calls, 2)
+        self.assertEqual(registry.stats()["inflight_joins"], 1)
+
+
+class TypedIncompleteReuseTests(unittest.TestCase):
+    def test_explicit_legacy_incompleteness_is_not_reused_but_held_control_is(self):
+        registry, validator = ExecutionRegistry(), _Counting(status="not_confirmed", confirmed=False)
+        calls = 0
+        async def actual():
+            nonlocal calls
+            calls += 1
+            result = await validator.validate(_finding_of("sqli"), _ex("http://fixture.invalid/a"))
+            result.control_outcome = "inconclusive" if calls == 1 else "control_held"
+            return result
+        async def run():
+            return [await registry.run(validator, _finding_of("sqli"), _ex("http://fixture.invalid/a"),
+                                       case_ref=str(i), call=actual) for i in range(3)]
+        first, healthy, covered = asyncio.run(run())
+        self.assertEqual(first.control_outcome, "inconclusive")
+        self.assertEqual(healthy.control_outcome, "control_held")
+        self.assertEqual(covered.covered_by, "1")
+        self.assertEqual(calls, 2)
+
+    def test_production_coverage_dispatch_budget_bounds_incomplete_calls(self):
+        from harness.test_assessment_coverage_repair import CoverageRepairTests
+        state, roles = CoverageRepairTests.fixture(None)
+        registry, validator = ExecutionRegistry(), _Counting(status="inconclusive", confirmed=False)
+        calls = []
+        async def dispatch(identity, method, path, check):
+            calls.append((identity, method, path, check.id))
+            exchange = _ex("http://shop.test" + path, method)
+            finding = _finding_of(check.vulnerability_class)
+            return await registry.run(validator, finding, exchange, case_ref=str(len(calls)),
+                                      call=lambda: validator.validate(finding, exchange))
+        result = asyncio.run(build_coverage_driven(state, roles, dispatch,
+                                                  driveable={"cross_identity"}, budget=2))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(registry.stats()["misses"], 2)
+        self.assertEqual(registry.stats()["hits"], 0)
+        self.assertTrue(result["pending"] or result["skipped"])

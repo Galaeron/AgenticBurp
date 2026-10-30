@@ -96,11 +96,10 @@ def execution_key(validator_name: str, exchange, finding_class: str | None = Non
             canonicalize(raw_class) or raw_class)
 
 
-# A result with one of these statuses says the check did NOT run (it failed, the
-# validator declined for a reason about its caller, or a budget or gate refused it),
-# which is no evidence about the shape; it is returned to its caller but never
-# stands in for another case's check.
-_NOT_RUN = frozenset({"error", "skipped", "blocked"})
+# These outcomes do not establish a completed reusable check. Some may have
+# sent requests, but an incomplete observation cannot cover another case. Keep
+# legacy not_confirmed semantics unchanged until its callers expose completeness.
+_NOT_RUN = frozenset({"error", "skipped", "blocked", "inconclusive", "incomplete", "partial"})
 
 
 @dataclass
@@ -140,7 +139,7 @@ class ExecutionRegistry:
         result; a hit for another case returns a copy that names no exchanges, is
         not confirmed (the proof belongs to the first case), keeps the original
         status, and says which case covered it. A result whose check did not run
-        (status error or skipped) is returned to its caller but not stored, and a
+        (error, skipped, blocked or explicitly incomplete) is returned to its caller but not stored, and a
         run that was cancelled hands the key back, so a failure or a decline never
         stands in for a check that did not happen."""
         name = getattr(validator, "name", "") or "validator"
@@ -231,7 +230,8 @@ class ExecutionRegistry:
             sent = (self._budget.used - used_before
                     if used_before is not None and not state["overlapped"] else 0)
         for key, one in (entries(result) if entries else [(keys[0], result)]):
-            if one is not None and getattr(one, "status", None) not in _NOT_RUN:
+            if one is not None and getattr(one, "status", None) not in _NOT_RUN and \
+                    getattr(one, "control_outcome", "") != "inconclusive":
                 self._stored[key] = _Stored(one, case_ref, max(0, sent))
         for key in keys:
             self._flying.pop(key, None)

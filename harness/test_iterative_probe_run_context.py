@@ -122,9 +122,12 @@ class ArchOneBudgetEnforcementTests(unittest.IsolatedAsyncioTestCase):
 class _RecordingAgent:
     """Captures the run_context run_active_probe hands the agent; no real work."""
     last_run_context = "unset"
+    last_experiment_handoff = "unset"
 
-    def __init__(self, ollama, model, allowed_hosts, *, max_steps=250, run_context=None):
+    def __init__(self, ollama, model, allowed_hosts, *, max_steps=250, run_context=None,
+                 experiment_handoff=None):
         type(self).last_run_context = run_context
+        type(self).last_experiment_handoff = experiment_handoff
 
     async def run(self, *a, **k):
         return SimpleNamespace(to_dict=lambda: {"stop_reason": "gave_up", "findings": []})
@@ -148,6 +151,7 @@ class ArchOneThreadingOwnershipTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         safety_gate.reset_default_gate()
         _RecordingAgent.last_run_context = "unset"
+        _RecordingAgent.last_experiment_handoff = "unset"
 
     async def test_run_active_probe_forwards_the_owning_run_context(self):
         host = _ProbeHost({})
@@ -157,6 +161,7 @@ class ArchOneThreadingOwnershipTests(unittest.IsolatedAsyncioTestCase):
                    new=AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {}))):
             await host.run_active_probe(_exchange(), "h", "sqli", run_context=borrowed)
         self.assertIs(_RecordingAgent.last_run_context, borrowed)  # borrowed, not rebuilt
+        self.assertTrue(callable(_RecordingAgent.last_experiment_handoff))
 
     async def test_standalone_probe_builds_one_ceilinged_owned_context(self):
         host = _ProbeHost({})
@@ -168,6 +173,7 @@ class ArchOneThreadingOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(built)
         self.assertIsNot(built, "unset")
         self.assertIsNotNone(built.budget.remaining)  # an EXPLICIT ceiling, not unbounded
+        self.assertTrue(callable(_RecordingAgent.last_experiment_handoff))
 
     async def test_config_max_requests_overrides_the_derived_ceiling(self):
         host = _ProbeHost({"iterative_agent": {"max_requests": 7}})
@@ -176,6 +182,7 @@ class ArchOneThreadingOwnershipTests(unittest.IsolatedAsyncioTestCase):
                    new=AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {}))):
             await host.run_active_probe(_exchange(), "h", "sqli", step_budget=10)
         self.assertEqual(_RecordingAgent.last_run_context.budget.remaining, 7)
+        self.assertTrue(callable(_RecordingAgent.last_experiment_handoff))
 
     async def test_standalone_zero_ceiling_blocks_real_agent_send(self):
         host = _ProbeHost({"iterative_agent": {"max_requests": 0}})

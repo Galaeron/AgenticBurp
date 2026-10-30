@@ -177,6 +177,7 @@ class CoverageTracker:
         self.attempted = set()
         self.queued = set()
         self.reused = set()
+        self.readiness: dict[tuple, dict] = {}
         self.endpoints = {}
         self.identity_roles: dict[str, str] = {}
         self.driveable = None  # None means no driver supplied; an empty set means none available.
@@ -366,6 +367,41 @@ class CoverageTracker:
         return {i for i in {c[0] for c in self.matrix.cells()}
                 if (self.identity_roles.get(i, i) or "").lower() == "anonymous"}
 
+    def evaluate_readiness(self, resolve=None):
+        """One-shot disposition before queue/budget; legacy callers omit it.
+
+        Changed captures/prerequisites use a fresh build_coverage_* tracker and
+        its existing conclusive-only checkpoint. This does not retry/re-arm
+        previously dispositioned cases on the same tracker.
+        """
+        if resolve is None:
+            return
+        for key, cell in self.matrix.cells().items():
+            if cell.executed or cell.status == CellStatus.NOT_APPLICABLE:
+                continue
+            identity, endpoint, check_id = key
+            check = CHECKS_BY_ID.get(check_id)
+            if check is None:
+                continue
+            method, _, path = endpoint.partition(" ")
+            value = resolve(identity, method, path, check)
+            if not isinstance(value, dict) or "status" not in value:
+                value = {"status": "needs_prerequisite", "reason_code": "invalid_readiness",
+                         "reason": "readiness resolver produced no usable decision"}
+            self.readiness[key] = dict(value)
+            if value["status"] == "ready":
+                continue
+            code = value.get("reason_code", "prerequisite_unmet")
+            status = (CellStatus.NOT_APPLICABLE if code == "protocol_inapplicable" else
+                      CellStatus.BLOCKED if value["status"] == "policy_denied" else
+                      CellStatus.INCONCLUSIVE if value["status"] == "needs_prerequisite" else CellStatus.SKIPPED)
+            reason = f"{code}: {value.get('reason', '')}"
+            for case, child in self.matrix.cases_for_cell(*key):
+                if not child.executed and child.status == CellStatus.PENDING:
+                    self.matrix.record_case(*key, case, status=status, reason=reason, executed=False)
+            if cell.status not in (CellStatus.CONFIRMED, CellStatus.DETECTED):
+                self.matrix.record(*key, status=status, reason=reason, executed=False)
+
     def pending_leg_cells(self, driveable: set[str] | None = None) -> list:
         """(identity, endpoint_key, Check) for every applicable+PENDING cell whose
         check has a deterministic leg (optionally restricted to the `driveable`
@@ -374,6 +410,8 @@ class CoverageTracker:
         out = []
         for (ident, ep_key, check_id), cell in self.matrix.cells().items():
             if cell.executed or cell.status not in (CellStatus.PENDING, CellStatus.DETECTED):
+                continue
+            if self.readiness.get((ident, ep_key, check_id), {}).get("status", "ready") != "ready":
                 continue
             check = CHECKS_BY_ID.get(check_id)
             if not check or check.confirmation not in _LEG_CONFIRMATIONS:
@@ -384,7 +422,7 @@ class CoverageTracker:
         return out
 
     async def drive_coverage_legs(self, run_leg, *, driveable: set[str] | None = None,
-                                  budget: int = 80, deadline: float | None = None) -> int:
+                                  budget: int = 80, deadline: float | None = None, readiness=None) -> int:
         """Actively FIRE each applicable+pending leg-backed cell via the injected
         async `run_leg(identity, method, path, check) -> result` (result exposing
         .status / .summary, or None to skip), recording the REAL outcome. This is
@@ -393,6 +431,7 @@ class CoverageTracker:
         independent of whether the LLM labelled it. Returns cells driven. Bounded
         by `budget` so a large surface can't fan out unboundedly, and by
         `deadline` (a `time.monotonic()` value) so it ends in time."""
+        self.evaluate_readiness(readiness)
         n = 0
         self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
         pending = self.pending_leg_cells(driveable)
@@ -465,7 +504,7 @@ class CoverageTracker:
         return total
 
     async def drive_coverage_cases(self, run_case, *, driveable: set[str] | None = None,
-                                   budget: int = 80, deadline: float | None = None) -> int:
+                                   budget: int = 80, deadline: float | None = None, readiness=None) -> int:
         """Fire each PENDING child case via the injected async
         `run_case(identity, method, path, check, case_key) -> result` (result
         exposing .status/.summary/..., or None when the leg produced no send),
@@ -491,8 +530,11 @@ class CoverageTracker:
                    "blocked": CellStatus.BLOCKED, "inconclusive": CellStatus.INCONCLUSIVE,
                    "skipped": CellStatus.SKIPPED, "error": CellStatus.ERROR}
         # group pending cases by cell so each leg is driven once, at request level
+        self.evaluate_readiness(readiness)
         cells: dict[tuple[str, str, str], list] = {}
         for (ident, ep_key, check_id, ck) in self.matrix.pending_cases():
+            if self.readiness.get((ident, ep_key, check_id), {}).get("status", "ready") != "ready":
+                continue
             check = CHECKS_BY_ID.get(check_id)
             if not check or check.confirmation not in _LEG_CONFIRMATIONS:
                 continue
@@ -627,8 +669,19 @@ class CoverageTracker:
             # that aggregate status (parameter siblings have no separate send).
             representative = next((result for case, result in self.matrix.cases_for_cell(*key)
                                    if case.is_no_parameter), cell)
+            disposition = self.readiness.get(key, {})
+            ready = disposition.get("status", "ready") == "ready"
+            if disposition.get("status") in {"unsupported", "disabled"}:
+                capability = False
             if conclusive:
                 reason = "conclusive"
+            elif disposition and not ready:
+                code = disposition.get("reason_code", "prerequisite_unmet")
+                reason = ("validator_unavailable" if disposition.get("status") == "disabled" else
+                          code if code in {"manual_required", "check_adapter_missing", "protocol_inapplicable",
+                                          "validator_unavailable", "missing_principal", "missing_body", "scope_rejected"}
+                          else "policy_blocked" if disposition.get("status") == "policy_denied"
+                          else "prerequisite_unmet")
             elif not applicable:
                 reason = "not_applicable"
             elif representative.status == CellStatus.BLOCKED:
@@ -656,7 +709,8 @@ class CoverageTracker:
                          "confirmation": getattr(check, "confirmation", None),
                          "observation_status": cell.status.value,
                          "shape_applicable": applicable, "implemented": capability,
-                         "eligible": applicable and capability,
+                         "eligible": applicable and capability and ready,
+                         "readiness": disposition,
                          "queued": key in self.queued,
                          "policy": "allowed" if cell.executed else ("denied" if reason == "policy_blocked" else "not_established"),
                          "attempted": key in self.attempted, "sent": bool(cell.executed),
@@ -704,6 +758,9 @@ class CoverageTracker:
         from harness.coverage_summary import summarize_coverage
         s["audited"] = summarize_coverage(self.matrix)
         s["phase_ledger"] = self.phase_ledger(compact=compact)
+        s["capability_schema_version"] = 1
+        s["capability_dispositions"] = [{"identity":k[0], "endpoint":k[1], "check":k[2], **v}
+                                        for k,v in self.readiness.items()]
         s["checkpoint"] = self.checkpoint()
         return s
 
@@ -777,7 +834,7 @@ def build_coverage(state, roles, investigated_keys: set[str] | None = None,
 async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | None = None,
                                 budget: int = 80, investigated_keys: set[str] | None = None,
                                 checkpoint=None, context_key="",
-                                deadline: float | None = None, on_checkpoint=None) -> dict:
+                                deadline: float | None = None, on_checkpoint=None, readiness=None) -> dict:
     """Like build_coverage, but ACTIVELY DRIVES the deterministic legs (I1): after
     recording the findings the run already produced, it fires every applicable
     leg-backed cell via `run_leg` (regardless of any agent label) and records the
@@ -794,7 +851,7 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     tracker.restore_checkpoint(checkpoint, context_key)
     tracker.on_checkpoint = on_checkpoint
     driven = await tracker.drive_coverage_legs(run_leg, driveable=driveable, budget=budget,
-                                               deadline=deadline)
+                                               deadline=deadline, readiness=readiness)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["legs_driven"] = driven
@@ -807,7 +864,7 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
                                       budget: int = 80, per_cell_case_budget: int = 8,
                                       investigated_keys: set[str] | None = None,
                                       checkpoint=None, context_key="",
-                                      deadline: float | None = None, on_checkpoint=None) -> dict:
+                                      deadline: float | None = None, on_checkpoint=None, readiness=None) -> dict:
     """Case-granular coverage driving (T05/R26): enumerate each applicable leg
     cell's concrete input cases from the endpoint template, then fire a leg PER
     CASE via `run_case(identity, method, path, check, case_key)` and record the
@@ -824,10 +881,11 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     tracker.record_findings_from_state(endpoints, identities, identity_roles)
     tracker.restore_checkpoint(checkpoint, context_key)
     tracker.on_checkpoint = on_checkpoint
+    tracker.evaluate_readiness(readiness)
     enumerated = tracker.expand_parameter_cases(
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
     driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget,
-                                                deadline=deadline)
+                                                deadline=deadline, readiness=None)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["cases_enumerated"] = enumerated

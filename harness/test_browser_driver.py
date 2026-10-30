@@ -32,6 +32,7 @@ def _fake_playwright():
     context.new_page = AsyncMock(return_value=page)
     context.close = AsyncMock()
     context.route = AsyncMock()  # PR-10: visit() now registers per-request interception
+    context.route_web_socket = AsyncMock()
     context.add_cookies = AsyncMock()
     page.goto = AsyncMock()
     page.wait_for_timeout = AsyncMock()
@@ -61,6 +62,12 @@ class CdpModeTest(unittest.TestCase):
         with patch.dict(sys.modules, {"playwright": fake_pkg, "playwright.async_api": fake_mod}):
             d = browser_driver.PlaywrightDriver(cdp_endpoint=cdp_endpoint)
             obs = asyncio.run(d.visit("http://localhost/x", wait_ms=0))
+        browser = chromium.launch.return_value
+        browser.new_context.assert_awaited_once_with(service_workers="block")
+        context = browser.new_context.return_value
+        context.route_web_socket.assert_awaited_once()
+        self.assertEqual(context.route_web_socket.await_args.args[0], "**/*")
+        self.assertTrue(callable(context.route_web_socket.await_args.args[1]))
         return chromium, obs
 
     def test_cdp_endpoint_connects_over_cdp_not_launch(self):

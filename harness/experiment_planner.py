@@ -113,6 +113,15 @@ class PlannerOutcome:
     stopped: bool = False
 
 
+def validate_instantiation(kind, hypothesis, hypothesis_ids) -> str:
+    """Shared bounded mechanism selection guard; never authorizes a request."""
+    if not isinstance(kind, str) or kind not in SUPPORTED_KINDS:
+        return f"unsupported workflow kind {kind!r}"
+    if not isinstance(hypothesis, str) or hypothesis not in hypothesis_ids:
+        return f"hypothesis {hypothesis!r} does not exist"
+    return ""
+
+
 class ExperimentPlanner:
     def __init__(self, propose_fn, *, captures=(), max_proposals: int = DEFAULT_MAX_PROPOSALS):
         self.propose_fn = propose_fn
@@ -169,10 +178,9 @@ class ExperimentPlanner:
             outcome.stopped = True
             return ""
         if action == "instantiate_workflow":
-            if proposal.get("kind") not in SUPPORTED_KINDS:
-                return f"unsupported workflow kind {proposal.get('kind')!r}"
-            if proposal.get("hypothesis") not in hypothesis_ids:
-                return f"hypothesis {proposal.get('hypothesis')!r} does not exist"
+            problem = validate_instantiation(proposal.get("kind"), proposal.get("hypothesis"), hypothesis_ids)
+            if problem:
+                return problem
             outcome.instantiate.append(proposal["hypothesis"])
             return ""
         index, reason = self._capture_index(proposal)

@@ -685,8 +685,86 @@ class ChainMixin:
         run_context._declared_ownership = cached
         return cached[origin]
 
+    async def _handoff_experiment(self, action, run_context):
+        """A closed selection of an existing hypothesis, never model-authored I/O."""
+        from harness import experiment, experiment_planner, task_graph, store
+        from harness.assessment_health import stored_proof_artifacts_resolve
+        def disposition(status, reason, **extra):
+            return dict(status=status, readiness=reason, fresh_attempt_ids=[],
+                        referenced_attempt_ids=[], budget_spent=0, **extra)
+        if set(action) != {"action", "kind", "hypothesis"}:
+            return disposition("rejected", "selection fields must be action, kind, hypothesis")
+        if not self._experiments_config().get("enabled", False):
+            return disposition("disabled", "experiments disabled")
+        context = getattr(run_context, "experiment_context", None)
+        if not context:
+            return disposition("needs_prerequisite", "owning engagement context unavailable")
+        state, asm = context["state"], context["asm"]
+        hypotheses = {h.id: h for h in getattr(asm, "chaining_hypotheses", [])}
+        if experiment_planner.validate_instantiation(action.get("kind"), action.get("hypothesis"), hypotheses):
+            return disposition("rejected", "unknown mechanism or hypothesis")
+        hid = action["hypothesis"]
+        hyp = hypotheses[hid]
+        if action["kind"] not in experiment.BROWSER_KINDS and (action["kind"] != experiment.KIND or not experiment.supports(hyp)):
+            return disposition("rejected", "hypothesis does not support this mechanism")
+        if run_context.cancel.cancelled:
+            return disposition("cancelled", "owning run cancelled")
+        if not run_context.scope.in_scope(context["base_url"]):
+            return disposition("blocked", "target outside owning scope")
+        gate = run_context.gate.config
+        if not gate.active_enabled or (action["kind"] != experiment.BROWSER_HASH and not gate.allow_mutating_replay):
+            return disposition("blocked", "active and mutating permissions required")
+        expectations = (self.config.get("engagement", {}) or {}).get("access_expectations", [])
+        sessions = experiment.run_sessions(run_context)
+        plan = (experiment.translate_browser(hid, asm, run_context, check_cost=False) if action['kind'] in experiment.BROWSER_KINDS else
+                experiment.translate_cross_account(hyp, asm, expectations, sessions,
+                    state.observed_values, base_url=context["base_url"]))
+        if not plan.ready:
+            return disposition("needs_prerequisite", "; ".join(plan.missing))
+        if plan.experiment.kind != action["kind"]:
+            return disposition("rejected", "declared mechanism does not match selection")
+        from harness.run_context import ScopePolicy
+        for step in (plan.experiment.setup_steps + plan.experiment.baseline_steps +
+                     plan.experiment.attack_steps + plan.experiment.control_steps + plan.experiment.cleanup_steps):
+            session = run_context.sessions.get(step.session_ref)
+            if (session is None or session.health == 'expired' or
+                    ScopePolicy.origin_of(step.url_template) not in session.allowed_origins or
+                    not run_context.scope.in_scope(step.url_template)):
+                return disposition("needs_prerequisite", "required identity is not authorized for step origin")
+        experiment._evaluate_browser(state, asm, run_context)
+        experiment.evaluate_experiments(state, asm, expectations, sessions,
+                    base_url=context["base_url"])
+        tasks = experiment.selected_experiment_tasks(state, {hid})
+        fingerprint = experiment.experiment_applicability(plan.experiment, run_context, state.observed_values)
+        for task in tasks:
+            if task.status == task_graph.DONE and task.meta.get("applicability") == fingerprint:
+                proof = next((p for p in store.proofs_for_run(run_context.run_id)
+                              if p['proof_id'] == task.evidence_ref), None)
+                if proof and proof['verdict'] in ('confirmed', 'controlled_negative') and stored_proof_artifacts_resolve(proof):
+                    out = disposition("reused", "matching completed attempt")
+                    out['referenced_attempt_ids'] = [task.evidence_ref]
+                    return out
+            if task.status == task_graph.FAILED and task.meta.get("applicability") == fingerprint:
+                if run_context.experiment_runs >= int(self._experiments_config().get("max_runs", 4)):
+                    return disposition("deferred", "engagement experiment max_runs exhausted")
+                return disposition("inconclusive", "unchanged failed attempt requires new evidence")
+            if task.status in (task_graph.DONE, task_graph.FAILED):
+                state.graph.mark(task.id, task_graph.READY)
+        if run_context.experiment_runs >= int(self._experiments_config().get("max_runs", 4)):
+            return disposition("deferred", "engagement experiment max_runs exhausted")
+        before = run_context.budget.used
+        outcome = await self._run_experiments(state, asm, run_context,
+            base_url=context["base_url"], captured=context.get("captured", ()), hypothesis_ids={hid})
+        entries = (outcome or {}).get("completed", []) + (outcome or {}).get("failed", [])
+        out = disposition("completed" if (outcome or {}).get("completed") else "inconclusive",
+                          "controller attempt completed" if entries else "controller produced no attempt",
+                          kind=action['kind'], hypothesis=hid, produced_values=sorted(state.observed_values))
+        out['fresh_attempt_ids'] = [e['proof_id'] for e in entries]
+        out['budget_spent'] = run_context.budget.used - before
+        return out
+
     async def _run_experiments(self, state, asm, run_context, *, base_url="", captured=(),
-                               ownership=None):
+                               ownership=None, hypothesis_ids=None):
         """Ticket G seam: run the graph -> experiment -> workflow -> proof -> graph
         cycle (experiment.run_experiment_loop) over the hypotheses of `asm`.
 
@@ -714,11 +792,15 @@ class ChainMixin:
                 captures=captured)
         ledger = ownership if ownership is not None else self._experiment_ownership(
             state, run_context, base_url)
-        return await experiment.run_experiment_loop(
+        remaining = max(0, int(cfg.get("max_runs", 4)) - run_context.experiment_runs)
+        result = await experiment.run_experiment_loop(
             state, run_context, ledger=ledger,
             expectations=eng.get("access_expectations", []) or [],
             sessions=experiment.run_sessions(run_context),
-            max_runs=int(cfg.get("max_runs", 4)), planner=planner, asm=asm, base_url=base_url)
+            max_runs=remaining, planner=planner, asm=asm, base_url=base_url,
+            **({"hypothesis_ids": hypothesis_ids} if hypothesis_ids is not None else {}))
+
+        return result
 
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
@@ -1519,6 +1601,8 @@ class ChainMixin:
         # the business-context hypotheses. Default off (engagement.experiments);
         # when off this returns None without a send. Best-effort like the passes
         # around it: a failure is recorded as an "experiments" phase error.
+        if run_context is not None:
+            run_context.experiment_context = {"state": state, "asm": _asm, "base_url": base_url, "captured": _all_captured}
         _instr.phases.begin("experiments")
         _experiments = None
         try:
@@ -1650,7 +1734,12 @@ class ChainMixin:
                                "resumed_units": dict(_resumed_units), "journal": _journal.stats()}}
 
         def _objective_result(stopped: bool) -> dict:
+            from harness.experiment import task_dispositions
             return {
+                "experiment_preflight": task_dispositions(state,run_context,
+                    enabled=bool(self._experiments_config().get('enabled',False)),
+                    max_runs=int(self._experiments_config().get('max_runs',4)),
+                    planner_enabled=bool(self._experiments_config().get('planner',False))),
                 **_resume_report(),
                 "summary": state.summary(),
                 "worklist": state.result_worklist(50),
@@ -2005,6 +2094,34 @@ class ChainMixin:
                     return str(p()) if callable(p) else (getattr(r, "role", None) or "anonymous")
                 _role_headers = {_pid(r): dict(r.headers or {}) for r in roles}
 
+                def _capability_decision(check, exchange):
+                    resolve = getattr(self.validator_registry, "capability_for_check", None)
+                    if resolve is None:
+                        # Explicit compatibility for legacy injected registries.
+                        return {"status": "ready", "reason_code": "legacy_adapter",
+                                "reason": "legacy caller capability adapter",
+                                "finding_class": check.vulnerability_class,
+                                "mechanism_id": "legacy:" + check.confirmation}
+                    return resolve(check, exchange, run_context=run_context,
+                                   validator=_val_by_conf.get(check.confirmation, False))
+
+                def _known_capture_exchange(identity, node):
+                    # Readiness must never turn an unresolved route placeholder
+                    # into an allegedly observed id=1 (or repeat a single id for
+                    # several unrelated placeholders).
+                    template = node.get("template") or {}
+                    slots = (node.get("path") or "").count("{id}")
+                    ids = template.get("path_ids") or []
+                    complete = len(ids) == slots and all(v is not None and str(v) not in ("", "{id}") for v in ids)
+                    legacy = slots == 1 and template.get("object_id") is not None and str(template["object_id"]) not in ("", "{id}")
+                    if slots and not complete and not legacy:
+                        return None, {"status": "needs_prerequisite", "reason_code": "missing_object_id",
+                                      "reason": "route placeholders have no complete observed object identifiers", "finding_class": None}
+                    if legacy:
+                        node = dict(node, template=dict(template, object_id=str(template["object_id"])))
+                    return worklist_investigator._seed_exchange(
+                        base_url, node, _role_headers.get(identity, {}), ""), None
+
                 async def _run_captured_leg(identity, method, path, check, case_key=None, node=None):
                     validator = _val_by_conf.get(check.confirmation)
                     if validator is None:
@@ -2015,16 +2132,22 @@ class ChainMixin:
                     _ep_obj = state.endpoints.get(f"{method} {path}")
                     if "template" not in node and _ep_obj is not None and getattr(_ep_obj, "template", None):
                         node["template"] = _ep_obj.template
-                    ex = worklist_investigator._seed_exchange(
-                        base_url, node, _role_headers.get(identity, {}), "1")
+                    ex, problem = _known_capture_exchange(identity, node)
+                    capability = problem or _capability_decision(check, ex)
+                    if capability["status"] != "ready":
+                        from harness.validators.base import ValidationResult
+                        status = ("blocked" if capability["status"] == "policy_denied" else
+                                  "inconclusive" if capability["status"] == "needs_prerequisite" else "skipped")
+                        return ValidationResult(check.confirmation, status, check.vulnerability_class,
+                            summary=f"{capability['reason_code']}: {capability['reason']}")
                     try:
                         leg_case = self._coverage_case(identity=identity, check=check, exchange=ex,
                                                        case_key=case_key, run_context=run_context)
                     except Exception:
                         leg_case = None
                     res = await _cached_validate(
-                        validator, _as_finding({"vulnerability_class": check.vulnerability_class},
-                                               check.vulnerability_class), ex,
+                        validator, _as_finding({"vulnerability_class": capability["finding_class"]},
+                                               capability["finding_class"]), ex,
                         case_ref=leg_case.case_id if leg_case is not None else "")
                     # T05/R26: bind a case-bound structured proof to this driven leg
                     # (concrete parameter case when the driver fanned out to one),
@@ -2056,6 +2179,50 @@ class ChainMixin:
                     (ep_key, identity): replayable_variants(ep, capture_identity_key(headers))
                     for ep_key, ep in state.endpoints.items() if ep.capture_variants
                     for identity, headers in _role_headers.items()}
+
+                def _captured_readiness(identity, method, path, check):
+                    if check.id == "WSTG-CRYP-01":
+                        return _capability_decision(check, HttpExchange(url=base_url, method="GET"))
+                    preliminary = _capability_decision(check, None)
+                    if preliminary["status"] in {"unsupported", "disabled", "policy_denied"}:
+                        return preliminary
+                    ep_key = f"{method} {path}"
+                    ep = state.endpoints.get(ep_key)
+                    if ep is not None and ep.capture_variants:
+                        variants = _replayable.get((ep_key, identity))
+                        if variants is None:
+                            variants = replayable_variants(ep, capture_identity_key(_role_headers.get(identity, {})))
+                        if not variants:
+                            role = _identity_role.get(identity, identity)
+                            block = _prerequisite_blocks.setdefault((ep_key, identity), {
+                                "endpoint": ep_key, "identity": identity,
+                                "missing": "no request captured as this identity",
+                                "action": "capture this request signed in as " + role
+                                          + " (or add it to the role crawl seed)",
+                                "checks_affected": 0})
+                            block["checks_affected"] += 1
+                            return {"status": "needs_prerequisite", "reason_code": "missing_principal",
+                                    "reason": "capture the request as this identity", "finding_class": None}
+                        selected_roles = [r for r in roles if _pid(r) == identity]
+                        nodes = worklist_investigator.captured_nodes(
+                            dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles,
+                            include_probes=True)
+                    else:
+                        nodes = [{"method": method, "path": path,
+                                  "template": getattr(ep, "template", {}) if ep else {}}]
+                    decisions = []
+                    for node in nodes:
+                        problem = worklist_investigator.capture_problem(node) if node.get("capture") else None
+                        if problem:
+                            decisions.append({"status": "needs_prerequisite", "reason_code": problem.split(":",1)[0],
+                                              "reason": "supply a complete authorized capture", "finding_class": None})
+                            continue
+                        exchange, problem = _known_capture_exchange(identity, node)
+                        decision = problem or _capability_decision(check, exchange)
+                        if decision["status"] == "ready":
+                            return decision
+                        decisions.append(decision)
+                    return decisions[0] if decisions else preliminary
 
                 async def _run_leg_core(identity, method, path, check, case_key=None):
                     ep_key = f"{method} {path}"
@@ -2108,7 +2275,7 @@ class ChainMixin:
                     # the endpoint's concrete inputs so a confirmation binds to the
                     # exact parameter case and un-run inputs stay visibly pending.
                     coverage = await coverage_tracker.build_coverage_cases_driven(
-                        state, roles, _run_leg_core, budget=self.coverage_leg_budget,
+                        state, roles, _run_leg_core, budget=self.coverage_leg_budget, readiness=_captured_readiness,
                         per_cell_case_budget=self.coverage_case_budget,
                         driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
                         checkpoint=coverage_checkpoint,
@@ -2116,7 +2283,7 @@ class ChainMixin:
                         deadline=_coverage_deadline, **_coverage_kwargs)
                 else:
                     coverage = await coverage_tracker.build_coverage_driven(
-                        state, roles, _run_leg, budget=self.coverage_leg_budget,
+                        state, roles, _run_leg, budget=self.coverage_leg_budget, readiness=_captured_readiness,
                         driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
                         checkpoint=coverage_checkpoint,
                         context_key=coverage_tracker.resume_context_key(self.config),
@@ -2136,6 +2303,18 @@ class ChainMixin:
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
 
+        from harness.experiment import project_proofs
+        try:
+            _experiment_projection = project_proofs(state, run_context)
+        except Exception as exc:
+            _errors.append({"phase":"experiment_projection", "error":type(exc).__name__})
+            _experiment_projection = {"cases":[{"status":"unresolved", "reason":"experiment projection unavailable"}], "findings":[]}
+        coverage["experiment_cases"] = _experiment_projection["cases"]
+        from harness.experiment import task_dispositions
+        _experiment_dispositions = task_dispositions(state, run_context,
+            enabled=bool(self._experiments_config().get('enabled', False)),
+            max_runs=int(self._experiments_config().get('max_runs', 4)),
+            planner_enabled=bool(self._experiments_config().get('planner',False)))
         _instr.phases.begin("finalise")
         # RB-5/INV-3: re-link chains over the FINAL findings set. The passes at
         # ~741/771 above (kept as-is, not removed) compute `chains` from
@@ -2184,7 +2363,7 @@ class ChainMixin:
         return {
             "assessment": health,
             "findings": [dict(f, url=f.get("url") or ep.path, method=ep.method)
-                         for ep in state.endpoints.values() for f in ep.findings],
+                         for ep in state.endpoints.values() for f in ep.findings] + _experiment_projection["findings"],
             **_resume_report(),
             "summary": state.summary(),
             "worklist": state.result_worklist(50),
@@ -2203,6 +2382,7 @@ class ChainMixin:
             # chaining hypotheses that drove the re-ranking.
             "application_semantic_model": _asm.to_dict() if _asm else None,
             "experiments": _experiments,
+            "experiment_preflight": _experiment_dispositions,
             # E4: how many validator executions the run's registry served without
             # running again, and the requests that saved (by validator).
             "execution_registry": _exec_registry.stats(),
@@ -2217,6 +2397,8 @@ class ChainMixin:
             "stage_budgets": {"coverage_request_reserve": _coverage_hold,
                               "requests_before_coverage": _requests_before_coverage,
                               "requests_at_end": getattr(_run_budget, "used", None),
+                              "outer_wall_seconds": None, "outer_wall_owner": "caller",
+                              "capture_review_seconds": self.capture_review_seconds,
                               "investigation_seconds": self.investigation_seconds,
                               "coverage_drive_seconds": self.coverage_drive_seconds},
             "workflows": workflow_results,

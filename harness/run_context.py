@@ -1205,6 +1205,10 @@ class RunContext:
     # E4: the run's one validator-execution registry (execution_registry.py), set
     # by the engagement that owns the run; None means every path runs its own checks.
     execution_registry: object = field(default=None, repr=False, compare=False)
+    # Borrowed, in-memory experiment graph/capture context for typed worker handoff.
+    # Never serialized and never supplied by the model.
+    experiment_runs: int = field(default=0, repr=False, compare=False)
+    experiment_context: dict | None = field(default=None, repr=False, compare=False)
     # E7: the run's durable journal of finished units (run_journal.RunJournal), set by the
     # server when runs.journal is on; None means the run is not journaled or resumed.
     run_journal: object = field(default=None, repr=False, compare=False)
@@ -1285,6 +1289,7 @@ class RunContext:
             await client.aclose()
         self._fixture_clients.clear()
         await self.sessions.aclose()
+        self.experiment_context = None
         if self._gate_pushed:
             from harness.safety_gate import pop_gate
             pop_gate(self._gate_restore)

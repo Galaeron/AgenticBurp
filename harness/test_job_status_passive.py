@@ -61,6 +61,28 @@ class DurableJobCallerTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f'job did not reach {expected}: {reply.text}')
 
+    def test_export_retains_child_execution_without_parent_completion(self):
+        from harness.coverage_model import CoverageMatrix, CaseKey, NO_PARAMETER_CASE, CellStatus
+        matrix = CoverageMatrix()
+        key = ("alice", "GET /x", "WSTG-INPV-05")
+        matrix.expand_cases(*key, [NO_PARAMETER_CASE, CaseKey("query", "q")])
+        matrix.record_case(*key, NO_PARAMETER_CASE, status=CellStatus.INCONCLUSIVE,
+                           executed=True, validator="fixture")
+        async def projection(*args, **kwargs):
+            self.calls += 1
+            return {"coverage": {"matrix": matrix.to_dict(), "summary": matrix.summary()}}
+        self.server.orchestrator.investigate_engagement = projection
+        job_id = self.start()
+        completed = self.poll(job_id, 'done')
+        self.server._INVESTIGATE_JOBS.clear()
+        durable = self.poll(job_id, 'done')
+        for result in (completed['result'], durable['result']):
+            coverage = result['coverage']
+            parent = coverage['matrix']['cells']['alice|GET /x|WSTG-INPV-05']
+            self.assertEqual(parent['status'], 'pending')
+            self.assertTrue(parent.get('executed', False))
+            self.assertEqual(coverage['summary']['cases']['pending'], 1)
+
     def test_completed_job_survives_registry_loss_without_reexecution(self):
         job_id = self.start()
         completed = self.poll(job_id, 'done')

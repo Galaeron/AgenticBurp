@@ -396,6 +396,43 @@ _GATE_ROUTED_EXCEPTIONS = {
 }
 
 
+def _readiness_method_guard_lines(source):
+    """Exempt metadata only if every use of its local value is a comparison."""
+    import ast
+    tree = ast.parse(source)
+    normalization = ast.dump(ast.parse('(exchange.method or "GET").upper()', mode='eval').body)
+    safe = set()
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef) or function.name != 'capability_for_check':
+            continue
+        parents = {child: parent for parent in ast.walk(function) for child in ast.iter_child_nodes(parent)}
+        for assignment in ast.walk(function):
+            if not isinstance(assignment, ast.Assign) or len(assignment.targets) != 1:
+                continue
+            target = assignment.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if ast.dump(assignment.value) != normalization:
+                continue
+            attributes = [node for node in ast.walk(assignment.value)
+                          if isinstance(node, ast.Attribute) and node.attr == 'method'
+                          and isinstance(node.value, ast.Name) and node.value.id == 'exchange']
+            if len(attributes) != 1:
+                continue
+            on_line = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+                       and node.attr == 'method' and isinstance(node.value, ast.Name)
+                       and node.value.id == 'exchange' and node.lineno == attributes[0].lineno]
+            if len(on_line) != 1:
+                continue
+            uses = [node for node in ast.walk(function) if isinstance(node, ast.Name)
+                    and node.id == target.id and isinstance(node.ctx, ast.Load)]
+            writes = [node for node in ast.walk(function) if isinstance(node, ast.Name)
+                      and node.id == target.id and isinstance(node.ctx, ast.Store)]
+            if len(writes) == 1 and uses and all(isinstance(parents.get(node), ast.Compare) for node in uses):
+                safe.add(attributes[0].lineno)
+    return safe
+
+
 class TestNoValidatorBypassesTheGate(unittest.TestCase):
     """
     These tests read the actual validator source files and fail the
@@ -466,6 +503,7 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             if path.name == "__init__.py":
                 continue
             text = path.read_text()
+            readiness_guard_lines = _readiness_method_guard_lines(text) if path.name == 'registry.py' else set()
             # Matches e.g. "exchange.method, exchange.url" or
             # "method=exchange.method" appearing anywhere near a live
             # send call. Deliberately broad/simple (a real security
@@ -474,6 +512,8 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             for match in re.finditer(r'exchange\.method', text):
                 line_no = text[:match.start()].count("\n") + 1
                 line = text.splitlines()[line_no - 1]
+                if line_no in readiness_guard_lines:
+                    continue  # metadata comparison only; sender/alias mutations are rejected
                 if "target_method=" in line:
                     continue  # metadata field only, not a live send -- harmless
                 if path.name in gate_routed_exceptions:
@@ -487,6 +527,19 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
                           "gate-routed exceptions -- this is the exact pattern that let "
                           "13 validators blindly replay a captured mutating method:\n" +
                           "\n".join(violations))
+
+    def test_readiness_metadata_exemption_rejects_sender_and_alias_mutants(self):
+        source = ('def capability_for_check(exchange):\n'
+                  '    method = (exchange.method or "GET").upper()\n'
+                  '    return method != "GET"\n')
+        self.assertEqual(_readiness_method_guard_lines(source), {2})
+        for mutant in (source + '    client.request(method, "https://example.invalid")\n',
+                       source + '    alias = method\n',
+                       source.replace('(exchange.method or "GET").upper()', 'sender(exchange.method)'),
+                       source.replace('.upper()\n', '.upper(); sender(exchange.method)\n'),
+                       source.replace('capability_for_check', 'send_request')):
+            with self.subTest(mutant=mutant):
+                self.assertEqual(_readiness_method_guard_lines(mutant), set())
 
     def test_no_validator_hardcodes_a_mutating_method_for_an_ungated_send(self):
         """

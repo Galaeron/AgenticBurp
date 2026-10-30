@@ -49,6 +49,9 @@ class ValidatorRegistry:
         # Validate approval at construction, before any validator can send.
         self.collaborator = ConfiguredCollaborator(config)
         cfg = config.get("validators", {})
+        self._disabled_capabilities = {name for name, value in cfg.items()
+                                       if isinstance(value, dict) and value.get("enabled") is False
+                                       and name != "cross_identity"}
         self.enabled = bool(cfg.get("enabled", True))
         self.active_enabled = bool(cfg.get("active_enabled", False))
         # Seed the process-wide safety gate from the real config now,
@@ -437,6 +440,107 @@ class ValidatorRegistry:
         if getattr(self, "_auto_xid", None) is None:
             self._auto_xid = self._build_cross_identity()
         return self._auto_xid
+
+    def capability_for_check(self, check, exchange, *, run_context=None, validator=None):
+        """Exact procedure/readiness for catalog dispatch; performs no I/O.
+
+        Unrelated legacy adapters keep their existing class. This deliberately
+        does not make the broad auth taxonomy executable.
+        """
+        from urllib.parse import urlsplit
+        family = check.confirmation
+        finding_class = check.vulnerability_class
+        mechanism = "legacy:" + family
+        def decision(status, code, reason):
+            return {"status": status, "reason_code": code, "reason": reason,
+                    "mechanism_id": mechanism if status != "unsupported" else None,
+                    "mechanism_version": 1, "finding_class": finding_class if status == "ready" else None}
+        unavailable = {
+            "WSTG-CONF-02": "individual security-header oracle is not bound",
+            "WSTG-CONF-06": "method enumeration is not a security verdict",
+            "WSTG-CONF-07": "HTTP absence does not prove HTTPS HSTS policy",
+            "WSTG-ERRH-01": "no check-specific error oracle is bound",
+            "WSTG-INFO-02": "fingerprinting is reconnaissance, without this check adapter",
+            "WSTG-INFO-05": "comments alone do not establish sensitive disclosure",
+            "WSTG-ATHN-01": "generic authentication bypass has no exact bound procedure",
+            "WSTG-SESS-01": "generic session management has no exact bound procedure",
+        }
+        if check.id == "WSTG-CRYP-01":
+            if exchange is not None and urlsplit(exchange.url).scheme == "http":
+                return decision("unsupported", "protocol_inapplicable", "no TLS surface on this HTTP target")
+            return decision("unsupported", "check_adapter_missing", "no TLS configuration adapter is bound")
+        if check.id in unavailable:
+            return decision("unsupported", "check_adapter_missing", unavailable[check.id])
+        if family == "manual":
+            return decision("unsupported", "manual_required", "operator verification is required")
+        if validator is None:
+            validator = self.validators.get(family)
+        if not self.enabled or not validator or family in getattr(self, "_disabled_capabilities", set()):
+            return decision("disabled", "validator_unavailable", "validator unavailable or disabled: " + family)
+        if getattr(validator, "active", False) and not self.active_enabled:
+            return decision("disabled", "active_disabled", "active validation is disabled")
+        if exchange is None:
+            return decision("needs_prerequisite", "missing_capture", "an authorized capture is required")
+        if run_context is not None and not run_context.scope.in_scope(exchange.url):
+            return decision("policy_denied", "scope_rejected", "capture is outside the owning run scope")
+        method = (exchange.method or "GET").upper()
+        path = urlsplit(exchange.url).path.lower()
+        if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03"}:
+            from .auth_sequence_validator import _parse_body, _find_key, _PASS_KEYS, _USER_KEYS
+            fields, _kind = _parse_body(exchange)
+            password, user = _find_key(fields, _PASS_KEYS), _find_key(fields, _USER_KEYS)
+            if method not in {"POST", "PUT"}:
+                return decision("unsupported", "unsupported_method", "auth procedure needs a captured credential write")
+            if check.id == "WSTG-ATHN-07":
+                if not any(word in path for word in ("regist", "signup", "sign-up")):
+                    return decision("unsupported", "unsupported_boundary", "weak-password procedure requires registration")
+                finding_class, mechanism = "weak_password_policy", "auth.weak_password_policy"
+            else:
+                if not any(word in path for word in ("login", "signin", "sign-in", "session")):
+                    return decision("unsupported", "unsupported_boundary", "session fixation requires an observed login")
+                finding_class, mechanism = "session_fixation", "auth.session_fixation"
+            if not password or not user:
+                return decision("needs_prerequisite", "missing_credentials", "captured username/password fields are required")
+        if family == "nosql":
+            from .nosql_validator import _credential_names
+            if method != "POST" or "login" not in path:
+                return decision("unsupported", "unsupported_boundary", "NoSQL adapter only supports a POST login boundary")
+            if not all(_credential_names(exchange.request_body or "")):
+                return decision("needs_prerequisite", "missing_credentials", "observed login username/password fields are required")
+            mechanism = "nosql.login_operator"
+        if family == "csp":
+            content_type = next((str(v).lower() for k,v in exchange.response_headers.items()
+                                 if k.lower() == "content-type"), "")
+            if not content_type:
+                return decision("needs_prerequisite", "missing_response_media_type", "observed response media type is required")
+            if "html" not in content_type:
+                return decision("unsupported", "non_html_response", "this CSP procedure requires an HTML response")
+        if family == "jwt_forge":
+            from .jwt_forge_validator import _extract_jwt, _decode
+            if method != "GET":
+                return decision("unsupported", "unsupported_method", "JWT forge replay is GET-only")
+            token = _extract_jwt(exchange.request_headers)
+            if not token:
+                return decision("needs_prerequisite", "missing_jwt", "an observed JWT is required")
+            if not _decode(token[1]):
+                return decision("needs_prerequisite", "undecodable_jwt", "a complete decodable observed JWT is required")
+        if family == "cross_identity" and run_context is not None and not any(
+                s.headers and s.principal_id != "anonymous" and s.health != "expired"
+                for s in run_context.sessions.all()):
+            return decision("needs_prerequisite", "missing_principal", "a registered non-expired authenticated principal is required")
+        if family == "cross_identity" and run_context is not None and not any(
+                s.principal_id == "anonymous" and s.health != "expired"
+                for s in run_context.sessions.all()):
+            return decision("needs_prerequisite", "missing_anonymous_control", "an explicit anonymous control session is required")
+        if family == "cross_identity" and method != "GET":
+            return decision("unsupported", "unsupported_method", "cross-identity replay is GET-only")
+        if check.id == "WSTG-ATHZ-04":
+            from .idor_read_validator import _locate_id
+            if not _locate_id(exchange):
+                return decision("needs_prerequisite", "missing_object_id", "an observed object identifier is required")
+        if family in {"auth_sequence", "nosql"} and run_context is not None and not run_context.gate.config.allow_mutating_replay:
+            return decision("policy_denied", "mutating_policy_denied", "this procedure needs explicit mutating replay permission")
+        return decision("ready", "ready", "exact procedure and known inputs are available")
 
     def for_finding(self, finding, exchange, agent=None):
         if not self.enabled:

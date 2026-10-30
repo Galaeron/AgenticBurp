@@ -28,6 +28,7 @@ Off by default; this is a fundamentally more active mode than the passive
 pipeline and is opt-in per run.
 """
 from __future__ import annotations
+import asyncio
 import hashlib
 import json
 import logging
@@ -312,10 +313,12 @@ class IterativeResult:
     # was already attempted, and distinct requests actually tried (sent, or
     # blocked/failed at transport -- anything handed to _execute once).
     duplicate_proposals: int = 0
+    mechanism_results: list[dict] = field(default_factory=list)
     distinct_requests: int = 0
 
     def to_dict(self) -> dict:
         return {
+            "contract_version": 2, "mechanism_results": self.mechanism_results,
             "agent": self.agent,
             "findings": [f.model_dump() for f in self.findings],
             "handoff_note": self.handoff_note,
@@ -358,7 +361,7 @@ Rules:
 
 class IterativeAgent:
     def __init__(self, ollama, model: str, allowed_hosts: list[str], *, temperature: float = 0.2,
-                 max_steps: int = 250, run_context=None):
+                 max_steps: int = 250, run_context=None, experiment_handoff=None):
         self.ollama = ollama
         self.model = model
         self.allowed_hosts = allowed_hosts or []
@@ -372,6 +375,7 @@ class IterativeAgent:
         # evidence context instead of escaping into a throwaway per-send client
         # that no parent accounting ever covered. The agent BORROWS the context;
         # ownership (and aclose) stays with the caller (see run_active_probe).
+        self._experiment_handoff = experiment_handoff
         self._run_context = run_context
         # P2.6: idempotency guard, scoped to THIS active-probe session -- one
         # IterativeAgent is constructed fresh per run_active_probe() call
@@ -546,6 +550,13 @@ class IterativeAgent:
         headers_state.setdefault("User-Agent", "harness-iterative-agent/1.0")
 
         system = _SYSTEM_PROMPT.format(specialty=specialty)
+        context = getattr(self._run_context, "experiment_context", None)
+        if self._experiment_handoff and context:
+            from harness import experiment
+            bindings = ((self._run_context.config or {}).get('engagement', {}) or {}).get('browser_bindings', [])
+            catalog = [{'hypothesis': h.id, 'kind': experiment.KIND} for h in getattr(context['asm'], 'chaining_hypotheses', []) if experiment.supports(h)]
+            catalog += [{'hypothesis': b.get('hypothesis_id'), 'kind': b.get('mechanism')} for b in bindings if b.get('mechanism') in experiment.BROWSER_KINDS]
+            system += '\nYou may select a declared mechanism with exactly ' + json.dumps({"action":"experiment", "kind":"<registered kind>", "hypothesis":"<existing id>"}) + '\nExisting selections: ' + json.dumps(catalog)
         history: list[str | tuple[str, str]] = [
             f"HYPOTHESIS: {hypothesis}",
             f"ENDPOINT: {exchange.method} {exchange.url}",
@@ -598,6 +609,25 @@ class IterativeAgent:
                 continue
 
             kind = action.get("action")
+            if kind == "experiment":
+                if self._experiment_handoff is None:
+                    outcome = {"status": "needs_prerequisite", "readiness": "owning controller unavailable"}
+                else:
+                    try:
+                        outcome = await self._experiment_handoff(action)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.warning("experiment handoff failed: %s", type(exc).__name__)
+                        outcome = {"status": "inconclusive", "readiness": "controller failure"}
+                result.mechanism_results.append(outcome)
+                consecutive_no_progress = 0 if outcome['status'] == 'completed' else consecutive_no_progress + 1
+                if outcome['status'] == 'reused':
+                    result.duplicate_proposals += 1
+                history.append(f"[step {step}] mechanism result: {json.dumps(outcome)}")
+                emit(IterativeStep(step, {"action":"experiment", "kind":outcome.get('kind','<rejected>'),
+                     "hypothesis":outcome.get('hypothesis','<rejected>')}, "(controller selection)", None, json.dumps(outcome)))
+                continue
             if kind == "stop":
                 result.stop_reason = "found" if action.get("verdict") == "found" else "gave_up"
                 fd = action.get("finding")

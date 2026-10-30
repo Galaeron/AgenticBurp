@@ -884,14 +884,15 @@ class CoverageMatrix:
         # actually came from an executed leg -- never defaulting to
         # executed=False just because the parent cell itself never called
         # `record()` directly.
-        rep_executed = False
+        # Execution is a fact of any child send, independent of the rolled-up
+        # verdict. Pending siblings and prior risk must not erase that fact.
+        rep_executed = any(r.executed for _ck, r in bucket.values()) or bool(
+            prior and prior.executed)
         rep_validator: str | None = None
         for _ck, r in bucket.values():
             if r.status == agg:
-                rep_executed = rep_executed or bool(r.executed)
                 rep_validator = rep_validator or r.validator
         if prior and prior.status == agg:
-            rep_executed = rep_executed or bool(prior.executed)
             rep_validator = rep_validator or prior.validator
         self._cells[key] = CellResult(status=agg, reason=reason, validator=rep_validator,
                                       executed=rep_executed)

@@ -388,12 +388,17 @@ class CorsValidator(Validator):
                 if not outcome.ok:
                     _note_probe("error" if outcome.outcome == "error" else "blocked")
                     return None
-                _note_probe("ok")
-                _note_policy(headers, outcome.headers or {})
-                return httpx.Response(
+                # TargetTransport already decoded the body. Only this consumer
+                # view drops wire encoding/length; evidence keeps original headers.
+                decoded_headers = {k: v for k, v in (outcome.headers or {}).items()
+                                   if k.lower() not in {"content-encoding", "content-length"}}
+                response = httpx.Response(
                     outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=outcome.headers, request=httpx.Request(method, url),
+                    headers=decoded_headers, request=httpx.Request(method, url),
                     extensions={"harness_artifact_id": outcome.artifact_id})
+                _note_policy(headers, outcome.headers or {})
+                _note_probe("ok")
+                return response
             from harness import global_throttle
             await global_throttle.acquire()
             # No run_context (e.g. the header-audit or a standalone path): route
@@ -408,8 +413,8 @@ class CorsValidator(Validator):
                 max_redirects=self.max_redirects,
             ) as client:
                 response = await client.request(method, url, headers=headers)
-            _note_probe("ok")
             _note_policy(headers, response.headers)
+            _note_probe("ok")
             return response
         except SafetyGateBlocked as e:
             log.debug(f"CORS request blocked by safety gate: {e}")

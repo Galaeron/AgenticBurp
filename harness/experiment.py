@@ -36,7 +36,7 @@ import hashlib
 import json
 import re
 import secrets
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from harness import task_graph
 from harness.application_semantic_model import endpoint_key
@@ -51,7 +51,10 @@ KIND = "cross_account_private_object"
 CHECK_ID = "ATHZ-cross-account"
 VALIDATOR = "cross_account_experiment"
 VALIDATOR_VERSION = "1"
-SUPPORTED_KINDS = (KIND,)
+BROWSER_HASH = "browser_hash_input_execution"
+BROWSER_STORED = "browser_stored_input_execution"
+BROWSER_KINDS = (BROWSER_HASH, BROWSER_STORED)
+SUPPORTED_KINDS = (KIND, *BROWSER_KINDS)
 SUPPORTED_CLASSES = frozenset({"idor", "bola"})
 SUPPORTED_EXPECTATIONS = ("private_to_creator",)
 EXPECTATION_SOURCE = "config engagement.access_expectations"
@@ -93,7 +96,7 @@ def _step_dict(step: WorkflowStep) -> dict:
     return {"id": step.id, "method": step.method, "url_template": step.url_template,
             "session_ref": step.session_ref, "prerequisites": list(step.prerequisites),
             "extracts": [e.name for e in step.extractors], "observe": step.observe,
-            "cleanup": step.cleanup}
+            "cleanup": step.cleanup, "action": step.action}
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,8 @@ class Experiment:
     marker_declared: bool = False      # False: the owner's id is the marker
     consumed_values: tuple = ()        # observed values the steps bind
     tagged: bool = False               # the declared create body carries a `{tag}`
+    mechanism_version: int = 1
+    binding: dict = field(default_factory=dict)  # declared mechanism input references, no credentials
 
     def to_workflow(self, case_ref: str = "") -> Workflow:
         """Compile to ONE workflow: setup, baseline, attack, control, then the
@@ -134,10 +139,13 @@ class Experiment:
         judged = tuple(replace(s, case_ref=case_ref) if case_ref else s
                        for s in self.baseline_steps + self.attack_steps + self.control_steps)
         cleanup = tuple(replace(s, cleanup=True) for s in self.cleanup_steps)
-        return Workflow(self.id, self.setup_steps + judged + cleanup, 1, self.assertions)
+        return Workflow(self.id, self.setup_steps + judged + cleanup,
+                        2 if self.kind in BROWSER_KINDS else 1, self.assertions)
 
     def to_dict(self) -> dict:
-        return {"id": self.id, "kind": self.kind, "hypothesis_id": self.hypothesis_id,
+        return {"contract_version": 2, "id": self.id, "kind": self.kind,
+                "mechanism_version": self.mechanism_version, "binding": dict(self.binding),
+                "hypothesis_id": self.hypothesis_id,
                 "required_identities": dict(self.required_identities),
                 "access_expectation": dict(self.access_expectation),
                 "setup_steps": [_step_dict(s) for s in self.setup_steps],
@@ -145,6 +153,8 @@ class Experiment:
                 "attack_steps": [_step_dict(s) for s in self.attack_steps],
                 "control_steps": [_step_dict(s) for s in self.control_steps],
                 "cleanup_steps": [_step_dict(s) for s in self.cleanup_steps],
+                "cost": {"minimum_requests": len(self.setup_steps + self.baseline_steps + self.attack_steps + self.control_steps),
+                         "mutating_requests": sum(s.action == 'http' and s.method.upper() not in ('GET','HEAD','OPTIONS') for s in self.setup_steps + self.baseline_steps + self.attack_steps + self.control_steps)},
                 "extracted_values": list(self.extracted_values),
                 "consumed_values": list(self.consumed_values),
                 "tagged": self.tagged, "assertions": self.assertions}
@@ -724,6 +734,8 @@ async def run_experiment(experiment: Experiment, run_context, *, ledger,
     """Run one ready experiment through the run's transport, judge it and persist
     its proof. Baseline, attack and control are sent under the proof's case id."""
     from harness import store
+    if experiment.kind in BROWSER_KINDS:
+        return await _run_browser_experiment(experiment, run_context)
     owner_pid, other_pid = experiment.principals["owner"], experiment.principals["other"]
     case = TestCaseRef.make(
         run_id=run_context.run_id, request_template_id=experiment.read_template,
@@ -888,11 +900,71 @@ def evaluate_experiments(state, asm, expectations, sessions, values=None, *,
 # --- the feedback loop ------------------------------------------------------------------
 
 
+def selected_experiment_tasks(state, hypothesis_ids=None) -> list:
+    tasks = experiment_tasks(state)
+    if hypothesis_ids is None:
+        return tasks
+    selected = set(hypothesis_ids)
+    aliases = {t.meta.get("experiment") for t in state.graph.tasks.values()
+               if t.kind == "chain-hypothesis" and t.target in selected}
+    return [t for t in tasks if t.meta.get("hypothesis_id") in selected or t.id in aliases]
+
+
+def _relevant_policy(plan, run_context):
+    gate = run_context.gate.config
+    if plan.kind == BROWSER_HASH:
+        return {'active':gate.active_enabled}
+    capability = 'browser_stored_experiment' if plan.kind == BROWSER_STORED else VALIDATOR
+    policy = {'active':gate.active_enabled,'writes':gate.allow_mutating_replay,
+              'effective_mutating_ceiling':run_context.gate.mutating_headroom(None,capability)[2]}
+    if plan.kind in BROWSER_KINDS:
+        return policy
+    from urllib.parse import urlsplit
+    route = urlsplit(plan.read_url_template)
+    prefix = route.path.split('{', 1)[0]
+    owners = ((run_context.config or {}).get('authz') or {}).get('owners', {})
+    selected = {}
+    for host, entries in owners.items():
+        if host not in (route.netloc, route.hostname, '*'):
+            continue
+        selected[host] = [entry for entry in entries if
+            str(entry.get('path', '')).split('{', 1)[0].startswith(prefix) or
+            prefix.startswith(str(entry.get('path', '')).split('{', 1)[0].split('*', 1)[0])]
+    policy['owners'] = {host:rows for host,rows in selected.items() if rows}
+    return policy
+
+
+def experiment_applicability(plan: Experiment, run_context, values=None) -> str:
+    """Exact within-run applicability of a migrated attempt, never credentials.
+
+    Hash only consumed values, not the whole engagement's mutable state. Session
+    refreshes change generation even when a reference/principal is unchanged.
+    """
+    data = asdict(plan)
+    data.pop("id", None)
+    data.pop("hypothesis_id", None)  # equivalent aliases can reference one object's proof
+    sessions = {}
+    for role, ref in plan.required_identities.items():
+        session = run_context.sessions.get(ref)
+        sessions[role] = {"reference": ref, "principal": getattr(session, "principal_id", None),
+                          "generation": getattr(session, "generation", None),
+                          "expired": getattr(session, "health", "expired") == "expired",
+                          "origins": sorted(getattr(session, "allowed_origins", ())),
+                          "registration": id(session) if session is not None else None}
+    consumed = {name: hashlib.sha256(str((values or {}).get(name, "")).encode()).hexdigest()
+                for name in plan.consumed_values}
+    payload = {"run": run_context.run_id, "mechanism": data, "oracle_version": VALIDATOR_VERSION,
+               "sessions": sessions, "consumed_values": consumed,
+               "declared_policy": _relevant_policy(plan, run_context)}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def run_sessions(run_context) -> list:
     """The run's authenticated sessions as (session ref, principal id), in
     registration order. The anonymous session is never an experiment identity."""
     return [(s.session_id, s.principal_id) for s in run_context.sessions.all()
-            if s.headers and s.session_id != "anonymous" and s.principal_id not in ("", ANON)]
+            if s.headers and s.session_id != "anonymous" and s.principal_id not in ("", ANON)
+            and s.health != "expired"]
 
 
 def _resolve_value_needs(state, name: str) -> None:
@@ -904,14 +976,14 @@ def _resolve_value_needs(state, name: str) -> None:
             state.graph.resolve_need(task.id)
 
 
-async def _consult_planner(state, planner, asm, ctx: dict, counts: dict, asked: set) -> bool:
+async def _consult_planner(state, planner, asm, ctx: dict, counts: dict, asked: set, hypothesis_ids=None) -> bool:
     """Ask the planner, once per task, about a blocked experiment whose missing
     items are only an extraction pointer or an unobserved value. Returns whether
     anything it proposed was accepted AND resolved an input."""
     if planner is None:
         return False
     changed = False
-    for task in [t for t in experiment_tasks(state) if t.status == task_graph.BLOCKED]:
+    for task in [t for t in selected_experiment_tasks(state, hypothesis_ids) if t.status == task_graph.BLOCKED]:
         unblock = task.meta.get("unblock") or {}
         if task.id in asked or unblock.get("hard") or not (
                 unblock.get("extractions") or unblock.get("values")):
@@ -936,13 +1008,15 @@ async def _consult_planner(state, planner, asm, ctx: dict, counts: dict, asked: 
 
 
 def _replan(state, asm, ctx: dict) -> dict:
+    if ctx.get("run_context") is not None:
+        _evaluate_browser(state, asm, ctx["run_context"])
     return evaluate_experiments(state, asm, ctx["expectations"], ctx["sessions"],
                                 state.observed_values, base_url=ctx["base_url"],
                                 id_pointers=ctx["id_pointers"])
 
 
 async def run_experiment_loop(state, run_context, *, ledger, expectations, sessions, max_runs,
-                              planner=None, asm=None, base_url: str = "") -> dict:
+                              planner=None, asm=None, base_url: str = "", hypothesis_ids=None) -> dict:
     """Run READY experiment tasks, feeding each outcome back into the graph.
 
     Per run: execute (compile, send, judge, persist the proof); mark the task DONE
@@ -961,31 +1035,61 @@ async def run_experiment_loop(state, run_context, *, ledger, expectations, sessi
         return {"completed": [], "failed": [], "blocked": {}, "deferred": [], "runs": 0,
                 "planner": counts, "skipped": "no application semantic model"}
     ctx = {"expectations": expectations or [], "sessions": list(sessions or []),
-           "base_url": base_url, "id_pointers": {}}
+           "base_url": base_url, "id_pointers": {}, "run_context": run_context}
     asked: set = set()
     _replan(state, asm, ctx)
-    if await _consult_planner(state, planner, asm, ctx, counts, asked):
+    if run_context.cancel.cancelled:
+        planner = None
+    if await _consult_planner(state, planner, asm, ctx, counts, asked, hypothesis_ids):
         _replan(state, asm, ctx)
 
-    while runs < max_runs:
-        task = next((t for t in state.graph.ready_by_value() if t.kind == "experiment"), None)
+    while runs < max_runs and not run_context.cancel.cancelled:
+        selected = {t.id for t in selected_experiment_tasks(state, hypothesis_ids)}
+        task = next((t for t in state.graph.ready_by_value()
+                     if t.kind == "experiment" and t.id in selected), None)
         if task is None:
             break
-        plan = translate_cross_account(task, asm, ctx["expectations"], ctx["sessions"],
-                                       state.observed_values, base_url=base_url,
-                                       id_pointers=ctx["id_pointers"])
+        if task.meta.get("kind") in BROWSER_KINDS:
+            plan = translate_browser(task.meta.get("hypothesis_id"), asm, run_context)
+        else:
+            plan = translate_cross_account(task, asm, ctx["expectations"], ctx["sessions"],
+                                           state.observed_values, base_url=base_url,
+                                           id_pointers=ctx["id_pointers"])
         if not plan.ready:
             # What made it ready is gone (a session left, a value was withdrawn): park it.
             task.needs = "; ".join(plan.missing)
             task.meta.update(missing=list(plan.missing), unblock=plan.unblock)
             state.graph.mark(task.id, task_graph.BLOCKED)
             continue
-        done = await run_experiment(plan.experiment, run_context, ledger=ledger,
-                                    values=state.observed_values)
+        missing_authority = preflight_authority(plan.experiment, run_context)
+        if missing_authority:
+            task.needs = missing_authority
+            task.meta['missing'] = [missing_authority]
+            task.meta['readiness'] = {'status':'needs_prerequisite','reason':missing_authority}
+            state.graph.mark(task.id, task_graph.BLOCKED)
+            continue
+        applicability = experiment_applicability(plan.experiment, run_context, state.observed_values)
+        run_context.experiment_runs += 1  # reserve before I/O; failures/cancellation still consume the bound
+        try:
+            done = await run_experiment(plan.experiment, run_context, ledger=ledger,
+                                        values=state.observed_values)
+        except Exception as exc:
+            task.meta['applicability'] = applicability
+            task.meta['reason'] = 'experiment attempt failed: '+type(exc).__name__
+            task.meta['readiness'] = {'status':'inconclusive','reason':task.meta['reason']}
+            state.graph.mark(task.id,task_graph.FAILED)
+            raise
         runs += 1
         art = {"baseline": done.proof.baseline_artifact_id, "attack": done.proof.attack_artifact_id,
                "control": (done.proof.control_artifact_ids or ("",))[0]}
+        attempt_ids = task.meta.setdefault("attempt_ids", [])
+        if task.evidence_ref and task.evidence_ref != task.source and task.evidence_ref not in attempt_ids:
+            attempt_ids.append(task.evidence_ref)
+        if done.proof.proof_id not in attempt_ids:
+            attempt_ids.append(done.proof.proof_id)
         task.evidence_ref = done.proof.proof_id
+        task.meta["applicability"] = applicability
+        task.meta["readiness"] = {"status": "ready", "reason": "attempt executed"}
         task.meta.update(outcome=done.outcome, artifacts=art, reason=done.reason,
                          workflow=_mask_workflow(done.workflow), cleanup=done.cleanup,
                          proof_verdict=done.proof.verdict.value)
@@ -1014,11 +1118,366 @@ async def run_experiment_loop(state, run_context, *, ledger, expectations, sessi
             state.observed_values[name] = value
             _resolve_value_needs(state, name)
         _replan(state, asm, ctx)
-        if await _consult_planner(state, planner, asm, ctx, counts, asked):
+        if await _consult_planner(state, planner, asm, ctx, counts, asked, hypothesis_ids):
             _replan(state, asm, ctx)
 
-    return {"completed": completed, "failed": failed,
+    stopped_by = ('owning run cancelled' if run_context.cancel.cancelled else
+                  'experiment max_runs exhausted' if runs >= max_runs else
+                  'no ready selected experiment; prerequisites or selection remain')
+    return {"stopped_by": stopped_by, "completed": completed, "failed": failed,
             "blocked": {t.id: list(t.meta.get("missing") or [t.needs])
                         for t in experiment_tasks(state) if t.status == task_graph.BLOCKED},
             "deferred": [t.id for t in experiment_tasks(state) if t.status == task_graph.READY],
             "runs": runs, "planner": counts}
+
+
+def project_proofs(state, run_context):
+    """Project only this run's stored attempts; never broaden a case to a family."""
+    from harness import store
+    from harness.assessment_health import stored_proof_artifacts_resolve
+    if run_context is None:
+        return {"cases": [], "findings": []}
+    references = {ref for task in experiment_tasks(state)
+                  for ref in [task.evidence_ref, *task.meta.get("attempt_ids", [])] if ref and ref != task.source}
+    if not references:
+        return {"cases": [], "findings": []}
+    cases, findings, found = [], [], set()
+    for proof in store.proofs_for_run(run_context.run_id):
+        if proof['proof_id'] not in references:
+            continue
+        found.add(proof['proof_id'])
+        case = proof['case']
+        resolved = stored_proof_artifacts_resolve(proof)
+        conclusive = proof['verdict'] in ('confirmed', 'controlled_negative') and resolved
+        cases.append(dict(case_id=case['case_id'], proof_id=proof['proof_id'],
+            mechanism=proof['validator'], status=proof['verdict'] if conclusive else 'inconclusive',
+            executed=proof['executed'], artifacts_resolved=resolved,
+            request_template_id=case['request_template_id'], principal_id=case['principal_id'],
+            workflow_state_id=case['workflow_state_id']))
+        if not conclusive or proof['verdict'] != 'confirmed':
+            continue
+        # The attack event supplies the actual observed location, never a guessed ID.
+        events = store.ledger_events_for(case['case_id'])
+        event = next((e for e in events if (e.get('data') or {}).get('artifact_id') == proof['attack_artifact_id']), None)
+        url = (event or {}).get('data', {}).get('request', '')
+        findings.append(dict(vulnerability_class=('dom_xss' if proof['validator'] == BROWSER_HASH else 'stored_xss' if proof['validator'] == BROWSER_STORED else 'idor'), severity='high', confidence=1.0,
+            confirmed=True, confirmed_by_leg=proof['validator'], validator=proof['validator'],
+            case_id=case['case_id'], proof_id=proof['proof_id'], url=url,
+            summary=proof['observed_result'], basis='derived'))
+    cases.extend({"proof_id": ref, "status": "unresolved", "executed": False,
+                  "reason": "referenced attempt missing from owning run store"} for ref in sorted(references - found))
+    return {"cases": cases, "findings": findings}
+
+
+# Browser mechanisms are compilers/judges in the same controller, not validators
+# that infer execution from reflected text or guessed consumer URLs.
+def translate_browser(hypothesis_id, asm, run_context, *, check_cost=True):
+    from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
+    from harness.run_context import ScopePolicy
+    eng = (run_context.config or {}).get('engagement', {})
+    bindings = [b for b in eng.get('browser_bindings', []) if b.get('hypothesis_id') == hypothesis_id]
+    kind = bindings[0].get('mechanism', '') if len(bindings) == 1 else ''
+    eid = experiment_id(kind, hypothesis_id, 'browser')
+    def blocked(reason):
+        return ExperimentPlan('blocked', missing=[reason], experiment_id=eid,
+                              hypothesis_id=hypothesis_id, object_name='browser', unblock={'hard':True})
+    if hypothesis_id not in {h.id for h in getattr(asm, 'chaining_hypotheses', [])}:
+        return blocked('existing semantic hypothesis required')
+    if len(bindings) != 1 or kind not in BROWSER_KINDS:
+        return blocked('one explicit supported browser binding required')
+    allowed = {'mechanism','hypothesis_id','session_ref'} | ({'route','location','parameter'} if kind == BROWSER_HASH else {'write_capture','pointer','consumer_url'})
+    if set(bindings[0]) - allowed:
+        return blocked('unsupported browser binding fields')
+    binding = dict(bindings[0])
+    session_ref = binding.get('session_ref', '')
+    session = run_context.sessions.get(session_ref)
+    if session is None or session.health == 'expired':
+        return blocked('registered nonexpired browser session required')
+    gate = run_context.gate.config
+    if not gate.active_enabled:
+        return blocked('active browser testing disabled')
+    context = run_context.experiment_context or {}
+    route = binding.get('route', '') if kind == BROWSER_HASH else binding.get('consumer_url', '')
+    if not isinstance(route, str) or urlsplit(route).scheme not in ('http','https') or urlsplit(route).username is not None:
+        return blocked('explicit HTTP consumer route required')
+    urls = [route]
+    from harness import security
+    binding['route_sha256'] = hashlib.sha256(route.encode()).hexdigest()
+    binding['route' if kind == BROWSER_HASH else 'consumer_url'] = security.sanitize_text(route)
+    body_template, write = '', None
+    if kind == BROWSER_HASH:
+        parsed = urlsplit(route)
+        fragment_path, separator, query = parsed.fragment.partition('?')
+        pairs = parse_qsl(query, keep_blank_values=True)
+        parameter = binding.get('parameter')
+        if binding.get('location') != 'fragment_query' or not fragment_path or not separator or sum(k == parameter for k,v in pairs) != 1:
+            return blocked('existing unique fragment-query parameter required')
+        phases = []
+        public_base = _browser_url_base(route)
+        for phase in (BASELINE, ATTACK, CONTROL):
+            url = public_base + '{{browser_url_suffix_' + phase + '}}'
+            phases.append((WorkflowStep(phase,'GET',url,session_ref,action='browser_visit', observation_marker='{{browser_marker_'+phase+'}}'),))
+    else:
+        if not gate.allow_mutating_replay:
+            return blocked('stored writes require mutating permission')
+        ceiling = getattr(gate, 'mutating_ceiling_by_check', {}).get('browser_stored_experiment', 0)
+        if ceiling < 3:
+            return blocked('explicit browser_stored_experiment mutating ceiling of at least 3 required')
+        captures = context.get('captured', ())
+        index = binding.get('write_capture')
+        if isinstance(index,bool) or not isinstance(index,int) or not 0 <= index < len(captures):
+            return blocked('existing write capture index required')
+        try:
+            write = _browser_capture(run_context,index)
+        except (ValueError,TypeError,KeyError,IndexError):
+            return blocked("valid observed write capture required")
+        if write.method.upper() not in ('POST','PUT','PATCH'):
+            return blocked('stored mechanism supports JSON POST/PUT/PATCH only')
+        headers = {str(k).lower():v for k,v in (write.request_headers or {}).items()}
+        if 'application/json' not in str(headers.get('content-type','')).lower():
+            return blocked('observed JSON write content type required')
+        try:
+            data = json.loads(write.request_body or '')
+            pointer = binding.get('pointer','')
+            if not isinstance(pointer,str) or not pointer.startswith('/'):
+                raise ValueError('pointer')
+            tokens = [t.replace('~1','/').replace('~0','~') for t in pointer[1:].split('/')]
+            container = data
+            for token in tokens[:-1]:
+                container = container[_array_index(token)] if isinstance(container,list) else container[token]
+            key = _array_index(tokens[-1]) if isinstance(container,list) else tokens[-1]
+            if not isinstance(container[key],str):
+                raise ValueError('existing string')
+            body_template = json.dumps(data)
+        except (ValueError,TypeError,KeyError,IndexError):
+            return blocked('existing JSON string pointer required')
+        if urlsplit(write.url).username is not None:
+            return blocked('credential-bearing write URL unsupported')
+        urls.append(write.url)
+        # Pin the actual captured write binding for applicability; credentials omitted.
+        binding['write'] = {'method':write.method.upper(),'url_sha256':hashlib.sha256(write.url.encode()).hexdigest(),'url':security.sanitize_text(write.url),
+                            'body_sha256':hashlib.sha256((write.request_body or '').encode()).hexdigest()}
+        phases = []
+        previous = ()
+        for phase in (BASELINE, ATTACK, CONTROL):
+            plant = 'plant_' + phase
+            body = '{{browser_body_' + phase + '}}'
+            phases.append((WorkflowStep(plant,write.method.upper(),_browser_url_base(write.url)+'{{browser_write_suffix}}',session_ref,
+                body_template=body,prerequisites=previous,content_type='application/json',require_success=True),
+                WorkflowStep(phase,'GET',_browser_url_base(route)+'{{browser_consumer_suffix}}',session_ref,prerequisites=(plant,),action='browser_visit',observation_marker='{{browser_marker_'+phase+'}}')))
+            previous = (phase,)
+    if any(not run_context.scope.in_scope(url) or ScopePolicy.origin_of(url) not in session.allowed_origins for url in urls):
+        return blocked('browser binding outside scope or registered identity origins')
+    exp = Experiment(eid,kind,hypothesis_id,{'browser':session_ref},{},
+        baseline_steps=phases[0],attack_steps=phases[1],control_steps=phases[2],
+        principals={'browser':session.principal_id},read_template='GET '+security.sanitize_text(route),
+        read_url_template=security.sanitize_text(route),binding=binding,
+        assertions='computed nonce execution only in attack; baseline and escaped control silent')
+    minimum = 6 if kind == BROWSER_STORED else 3
+    if check_cost and run_context.budget.remaining is not None and run_context.budget.remaining < minimum:
+        return blocked('insufficient request budget for complete browser protocol')
+    if check_cost and kind == BROWSER_STORED and run_context.gate.mutating_headroom(_browser_case(exp,run_context).case_id,'browser_stored_experiment')[0] < 3:
+        return blocked('insufficient same-case mutating allowance for three plants')
+    return ExperimentPlan('ready',exp,experiment_id=eid,hypothesis_id=hypothesis_id,object_name='browser')
+
+
+def _evaluate_browser(state, asm, run_context):
+    from harness.engagement import add_chain_hypothesis_task
+    bindings = ((run_context.config or {}).get('engagement', {}) or {}).get('browser_bindings', [])
+    selected = {b.get('hypothesis_id') for b in bindings}
+    selected.update(h.id for h in getattr(asm, 'chaining_hypotheses', []) if set(h.classes or []) & {'dom_xss','stored_xss'})
+    for hyp in getattr(asm, 'chaining_hypotheses', []):
+        if hyp.id not in selected:
+            continue
+        plan = translate_browser(hyp.id,asm,run_context)
+        kind = next((b.get('mechanism') for b in bindings if b.get('hypothesis_id') == hyp.id),'')
+        task = state.graph.add('experiment',plan.experiment_id,reason='declared browser execution experiment',
+            needs='' if plan.ready else '; '.join(plan.missing),
+            meta={'hypothesis_id':hyp.id,'kind':kind},value=float(hyp.rank or 0))
+        task.meta['readiness'] = {'status':'ready' if plan.ready else 'needs_prerequisite','reason':'; '.join(plan.missing)}
+        if task.status in (task_graph.READY,task_graph.BLOCKED):
+            task.needs = '' if plan.ready else '; '.join(plan.missing)
+            task.meta['missing'] = list(plan.missing)
+            if plan.ready:
+                task.meta['experiment'] = plan.experiment.to_dict()
+                state.graph.resolve_need(task.id)
+            else:
+                state.graph.mark(task.id,task_graph.BLOCKED)
+        add_chain_hypothesis_task(state.graph,hyp,needs='validated by '+task.id,
+                                 depends_on=[task.id],extra_meta={'experiment':task.id})
+
+
+async def _run_browser_experiment(plan, run_context):
+    import html
+    from urllib.parse import quote
+    from harness import store
+    a,b = secrets.randbelow(800)+100, secrets.randbelow(800)+100
+    markers = {phase:'av_'+secrets.token_hex(12)+':'+phase+':' for phase in (BASELINE,ATTACK,CONTROL)}
+    def payload(phase):
+        return '<img src=x onerror="alert(\'' + markers[phase] + "'+(" + str(a) + '*' + str(b) + '))">'
+    raw = {BASELINE:'baseline_'+markers[BASELINE], ATTACK:payload(ATTACK), CONTROL:html.escape(payload(CONTROL),quote=True)}
+    values = {'browser_'+phase: (quote(value,safe='') if plan.kind == BROWSER_HASH else json.dumps(value)[1:-1])
+              for phase,value in raw.items()}
+    private = _browser_private_binding(plan,run_context)
+    route = private['route' if plan.kind == BROWSER_HASH else 'consumer_url']
+    values.update({'browser_marker_'+phase:marker for phase,marker in markers.items()})
+    if plan.kind == BROWSER_HASH:
+        from urllib.parse import unquote_plus
+        prefix, query = route.split('#',1)[1].split('?',1)
+        for phase in (BASELINE,ATTACK,CONTROL):
+            pairs = query.split('&')
+            replaced = [pair.split('=',1)[0]+'='+quote(raw[phase],safe='') if unquote_plus(pair.split('=',1)[0]) == private['parameter'] else pair for pair in pairs]
+            values['browser_url_suffix_'+phase] = ('?'+route.split('#',1)[0].split('?',1)[1] if '?' in route.split('#',1)[0] else '')+'#'+prefix+'?'+'&'.join(replaced)
+    else:
+        values['browser_consumer_suffix'] = route[len(_browser_url_base(route)):]
+    case = _browser_case(plan,run_context)
+    wf = plan.to_workflow(case.case_id)
+    # The three plants share this exact case; policy cannot be reset by a phase label.
+    steps=[]
+    for step in wf.steps:
+        if step.action == 'http':
+            phase=step.id.removeprefix('plant_')
+            capture = _browser_capture(run_context,plan.binding['write_capture'])
+            pin = plan.binding['write']
+            if (capture.method.upper() != pin['method'] or hashlib.sha256(capture.url.encode()).hexdigest() != pin['url_sha256'] or
+                    hashlib.sha256((capture.request_body or '').encode()).hexdigest() != pin['body_sha256']):
+                raise ValueError('declared write capture changed after compilation')
+            values['browser_write_suffix'] = capture.url[len(_browser_url_base(capture.url)):]
+            data=json.loads(capture.request_body)
+            container=data
+            tokens=[t.replace('~1','/').replace('~0','~') for t in plan.binding['pointer'][1:].split('/')]
+            for token in tokens[:-1]:
+                container=container[_array_index(token)] if isinstance(container,list) else container[token]
+            key=_array_index(tokens[-1]) if isinstance(container,list) else tokens[-1]
+            container[key]=raw[phase]
+            name='browser_body_'+phase
+            values[name]=json.dumps(data)
+            step=replace(step,body_template='{{'+name+'}}')
+        steps.append(replace(step,case_ref=case.case_id))
+    wf=replace(wf,steps=tuple(steps))
+    result = await execute_workflow(wf,run_context,initial_values=values,
+        capability='browser_stored_experiment' if plan.kind == BROWSER_STORED else plan.kind)
+    observations = {s.step_id:s for s in result.steps if s.step_id in (BASELINE,ATTACK,CONTROL)}
+    arts = {phase:observations[phase].artifact_id for phase in observations}
+    verdict,reason = Verdict.INCONCLUSIVE,'required browser writes/visits incomplete'
+    if result.complete and len(arts) == 3 and len(set(arts.values())) == 3 and all(observations[p].observation.get('marker_present') for p in (BASELINE,ATTACK,CONTROL)):
+        dialogs = {phase:observations[phase].observation.get('dialogs',[]) for phase in observations}
+        console = {phase:[text for text in observations[phase].observation.get('console',[]) if markers[phase] in text] for phase in observations}
+        expected = markers[ATTACK]+str(a*b)
+        attack = dialogs[ATTACK] == ['alert:'+expected] or (not dialogs[ATTACK] and console[ATTACK] == [expected])
+        silent_controls = not dialogs[BASELINE] and not dialogs[CONTROL] and not console[BASELINE] and not console[CONTROL]
+        if silent_controls and attack:
+            verdict,reason = Verdict.CONFIRMED,'computed nonce executed only in attack visit'
+        elif not any(dialogs.values()) and not any(console.values()):
+            verdict,reason = Verdict.CONTROLLED_NEGATIVE,'all three observations completed without input execution'
+        else:
+            reason = 'unmatched or control browser signal; execution boundary inconclusive'
+    from harness.assessment_health import stored_proof_artifacts_resolve
+    if verdict in (Verdict.CONFIRMED,Verdict.CONTROLLED_NEGATIVE) and not stored_proof_artifacts_resolve({'case':case.to_dict(),'baseline_artifact_id':arts.get(BASELINE,''),'attack_artifact_id':arts.get(ATTACK,''),'control_artifact_ids':[arts.get(CONTROL,'')]}):
+        verdict,reason = Verdict.INCONCLUSIVE,'durable browser evidence unavailable'
+    control_verified = (any(s.step_id == 'plant_control' and s.status == StepStatus.PASSED for s in result.steps)
+                        and CONTROL in observations and observations[CONTROL].status == StepStatus.PASSED
+                        and observations[CONTROL].observation.get('marker_present',False))
+    cleanup = ('none declared; final stored state is escaped control' if control_verified else
+               'none declared; escaped control state unverified') if plan.kind == BROWSER_STORED else 'none declared'
+    proof = ProofRecord('',case,plan.kind,verdict,validator_version='1',
+        baseline_artifact_id=arts.get(BASELINE,''),attack_artifact_id=arts.get(ATTACK,''),
+        control_artifact_ids=(arts[CONTROL],) if arts.get(CONTROL) else (),
+        expected_invariant=plan.assertions,observed_result=reason,limitation='cleanup: '+cleanup,
+        executed=any(s.executed for s in result.steps))
+    ok,why = store.persist_proof_record(proof)
+    outcome = CONFIRMED if verdict == Verdict.CONFIRMED else NEGATIVE if verdict == Verdict.CONTROLLED_NEGATIVE else INCONCLUSIVE
+    if not ok:
+        outcome,reason = INCONCLUSIVE,'proof persistence failed: '+why
+    return ExperimentOutcome(outcome,reason,proof,ok,result,case,{},cleanup)
+
+
+
+def preflight_authority(plan, run_context):
+    """Check every declared leg before the first write; transport rechecks at send."""
+    from harness.run_context import ScopePolicy
+    for step in (plan.setup_steps + plan.baseline_steps + plan.attack_steps + plan.control_steps + plan.cleanup_steps):
+        session = run_context.sessions.get(step.session_ref)
+        if session is None or session.health == 'expired':
+            return 'required registered identity missing or expired'
+        if ScopePolicy.origin_of(step.url_template) not in session.allowed_origins:
+            return 'required identity is not authorized for step origin'
+        if not run_context.scope.in_scope(step.url_template):
+            return 'declared step outside owning run scope'
+    return ''
+
+
+def task_dispositions(state, run_context, *, enabled, max_runs, planner_enabled=False):
+    """Bounded final case state; a pending proposal never becomes a clean negative."""
+    tasks=[]
+    for task in experiment_tasks(state):
+        if not enabled:
+            status,reason='disabled','engagement experiments disabled'
+        elif task.status == task_graph.DONE:
+            status,reason='completed','stored attempt completed'
+        elif task.status == task_graph.FAILED:
+            status,reason='inconclusive',task.meta.get('reason','attempt failed')
+        elif task.status == task_graph.BLOCKED:
+            reason=task.needs
+            status=('deferred' if 'budget' in reason or 'allowance' in reason else
+                    'policy_denied' if 'permission' in reason or 'scope' in reason else
+                    'disabled' if 'disabled' in reason else 'missing_prerequisite')
+        elif run_context is not None and run_context.cancel.cancelled:
+            status,reason='deferred','owning run cancelled'
+        elif run_context is not None and run_context.experiment_runs >= max_runs:
+            status,reason='deferred','engagement experiment max_runs exhausted'
+        elif run_context is not None and run_context.budget.remaining == 0:
+            status,reason='deferred','owning request budget exhausted'
+        else:
+            status,reason='advisory','ready experiment not selected before stage termination'
+        tasks.append({'task_id':task.id,'hypothesis_id':task.meta.get('hypothesis_id'),
+            'status':status,'reason':reason,'attempt_ids':list(task.meta.get('attempt_ids',[])),
+            'readiness':dict(task.meta.get('readiness',{})),
+            'cost':dict((task.meta.get('experiment') or {}).get('cost',{}))})
+    advisory = [{'task_id':t.id,'kind':t.kind,'status':'advisory',
+                 'reason':'no registered experiment compiler attached to this proposal'}
+                for t in state.graph.tasks.values() if t.kind == 'chain-hypothesis' and not t.meta.get('experiment')]
+    return {'schema_version':1,'enabled':enabled,'planner_enabled':planner_enabled,
+            'supported_mechanisms':list(SUPPORTED_KINDS),'advisory_tasks':advisory,'max_runs':max_runs,
+            'attempts_reserved':getattr(run_context,'experiment_runs',0),
+            'request_budget_remaining':run_context.budget.remaining if run_context else None,
+            'tasks':tasks}
+
+
+def _array_index(token):
+    if not token.isdecimal() or str(int(token)) != token:
+        raise ValueError("canonical nonnegative JSON array index required")
+    return int(token)
+
+
+def _browser_case(plan,run_context):
+    check = 'INPV-browser-hash' if plan.kind == BROWSER_HASH else 'INPV-browser-stored'
+    return TestCaseRef.make(run_id=run_context.run_id,request_template_id=plan.read_template,
+        check_id=check,principal_id=plan.principals['browser'],workflow_state_id=plan.id,
+        finding_ref=plan.hypothesis_id,parameter_location='fragment_query' if plan.kind == BROWSER_HASH else 'body_json',
+        parameter_name=plan.binding.get('parameter',plan.binding.get('pointer','')))
+
+
+
+def _browser_url_base(url):
+    from urllib.parse import urlsplit,urlunsplit
+    parsed=urlsplit(url)
+    return urlunsplit((parsed.scheme,parsed.netloc,parsed.path,'',''))
+
+
+def _browser_capture(run_context,index):
+    from harness.models import HttpExchange
+    raw=(run_context.experiment_context or {}).get('captured',())[index]
+    return raw if isinstance(raw,HttpExchange) else HttpExchange.model_validate(raw)
+
+
+def _browser_private_binding(plan,run_context):
+    bindings=((run_context.config or {}).get('engagement',{}) or {}).get('browser_bindings',[])
+    matches=[b for b in bindings if b.get('hypothesis_id') == plan.hypothesis_id and b.get('mechanism') == plan.kind]
+    if len(matches) != 1:
+        raise ValueError('declared browser binding unavailable')
+    binding=matches[0]
+    route=binding.get('route' if plan.kind == BROWSER_HASH else 'consumer_url','')
+    if hashlib.sha256(route.encode()).hexdigest() != plan.binding['route_sha256']:
+        raise ValueError('declared browser route changed after compilation')
+    return binding

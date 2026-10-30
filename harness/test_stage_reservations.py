@@ -218,8 +218,8 @@ class CoverageDeadlineTests(unittest.TestCase):
         """Defect injection: the former driver had no deadline; the test above sees it."""
         original = CoverageTracker.drive_coverage_legs
 
-        async def no_deadline(self, run_leg, *, driveable=None, budget=80, deadline=None):
-            return await original(self, run_leg, driveable=driveable, budget=budget)
+        async def no_deadline(self, run_leg, *, driveable=None, budget=80, deadline=None, readiness=None):
+            return await original(self, run_leg, driveable=driveable, budget=budget, readiness=readiness)
 
         with patch.object(CoverageTracker, "drive_coverage_legs", no_deadline):
             sent, report = self._legs(time.monotonic() - 1)

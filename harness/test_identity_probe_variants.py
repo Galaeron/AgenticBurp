@@ -357,8 +357,9 @@ class DriveCallerTests(_EngagementCallerBase, unittest.TestCase):
             self.assertIn("role crawl seed", block["action"])
         self.assertFalse([c for c in calls if c[1] == "Bearer ghost-token"], calls)
         # The coverage accounting keeps the per-cell reason.
-        ghost_cells = [c for c in self.cells(result, "ghost") if c["attempted"]]
+        ghost_cells = [c for c in self.cells(result, "ghost") if c["terminal_reason"] == "missing_principal"]
         self.assertTrue(ghost_cells)
+        self.assertTrue(all(not c["attempted"] and not c["sent"] for c in ghost_cells), ghost_cells)
         self.assertTrue(all(c["terminal_reason"] == "missing_principal" for c in ghost_cells), ghost_cells)
         self.assertEqual(sum(b["checks_affected"] for b in ghost), len(ghost_cells))
         # The inventory is worked out once per (endpoint, identity), not per check.

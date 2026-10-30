@@ -170,9 +170,12 @@ class ConfirmMixin:
             owned_ctx = standalone_context(self.allowed_hosts, config=self.config,
                                            gate=get_default_gate(), max_requests=ceiling)
             probe_ctx = owned_ctx
+        async def experiment_handoff(action):
+            return await self._handoff_experiment(action, probe_ctx)
         agent = IterativeAgent(
             self.ollama, chosen_model, self.allowed_hosts,
             max_steps=self.iterative_agent_max_steps, run_context=probe_ctx,
+            experiment_handoff=experiment_handoff,
         )
 
         # Publish each step to the live feed (V1), and still call any caller-
