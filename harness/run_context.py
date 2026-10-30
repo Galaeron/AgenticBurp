@@ -558,6 +558,25 @@ _ambient_case_ref: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "harness_case_ref_ambient", default="")
 
 
+# Batch 02: answered sends made inside a `count_sends()` block, across every
+# TargetTransport and the tasks the block starts (the counters are shared
+# lists, so a child task's increments reach the caller). Nested blocks each
+# see their own sends.
+_ambient_send_counters: "contextvars.ContextVar[tuple]" = contextvars.ContextVar(
+    "harness_send_counters", default=())
+
+
+@contextlib.contextmanager
+def count_sends():
+    """Yield a one-item list holding the answered sends made in this block."""
+    counter = [0]
+    token = _ambient_send_counters.set(_ambient_send_counters.get() + (counter,))
+    try:
+        yield counter
+    finally:
+        _ambient_send_counters.reset(token)
+
+
 def current_case_ref() -> str:
     """The case id of the enclosing `case_scope`, or "" outside one."""
     return _ambient_case_ref.get()
@@ -871,6 +890,8 @@ class TargetTransport:
 
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             self.sent_count += 1
+            for counter in _ambient_send_counters.get():
+                counter[0] += 1
             ctx.health.route_observed(route_key, resp.status_code,
                                       int(transport_cfg.get("route_5xx_threshold", 8)))
             if session and credential_destination and capability != _HEALTH_CAPABILITY:

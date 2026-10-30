@@ -23,6 +23,7 @@ import httpx
 
 from harness import security
 from .base import Validator, ValidationResult
+from .send_failures import SendFailures
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -112,6 +113,9 @@ class ReconResult:
     attack_paths: list[AttackPath] = field(default_factory=list)
     priorities: list[tuple[str, str, str]] = field(default_factory=list)  # (endpoint, priority, reason)
     coverage: float = 0.0  # Percentage of attack surface covered
+    # Sends that got no response (transport error, malformed encoding, refusal):
+    # a map built with gaps cannot support a "found nothing" verdict.
+    send_failures: SendFailures = field(default_factory=SendFailures)
 
 
 class ReconValidator(Validator):
@@ -250,6 +254,11 @@ class ReconValidator(Validator):
                 summary_parts.append(f"Found {len(sensitive_endpoints)} sensitive endpoints, {len(sensitive_params)} sensitive parameters")
 
             missing = [k for k in kinds if not _claim_items(recon_result, k)]
+            if missing and recon_result.send_failures.failures:
+                # Batch 01 follow-up: an absent item is not a negative when
+                # sends failed; report the incomplete map visibly instead.
+                return recon_result.send_failures.result(
+                    self.name, finding.vulnerability_class, "Reconnaissance")
             if missing:
                 status, confirmed, confidence = "not_confirmed", False, 0.0
                 verdict = ("not confirmed: reconnaissance found "
@@ -313,6 +322,7 @@ class ReconValidator(Validator):
             return crawled, False
         result = copy.deepcopy(crawled)
         self.visited_urls, self.discovered_urls = set(visited), set(discovered)
+        self._failures = result.send_failures
         self._analyze_exchange(exchange, result)
         # The first crawl started from its own exchange; this plan's start page may
         # lead to pages it never reached. Only pages not yet visited are fetched.
@@ -326,6 +336,7 @@ class ReconValidator(Validator):
     async def _perform_recon(self, base_url: str, exchange: HttpExchange) -> ReconResult:
         """Perform comprehensive reconnaissance."""
         result = ReconResult()
+        self._failures = result.send_failures
         
         # Clear state
         self.visited_urls = set()
@@ -578,6 +589,9 @@ class ReconValidator(Validator):
         """Send an HTTP request."""
         headers = headers or {}
         headers['User-Agent'] = self.user_agent
+        failures = getattr(self, "_failures", None)
+        if failures is not None:
+            failures.attempted += 1
         
         try:
             if self.run_context is not None:
@@ -586,6 +600,8 @@ class ReconValidator(Validator):
                     TypedRequest(method, url, headers=headers),
                     capability=self.get_name(), max_redirects=self.max_redirects)
                 if not outcome.ok:
+                    if failures is not None:
+                        failures.outcome(SendFailures.label(method, url), outcome)
                     return None
                 return outcome.to_httpx_response(method, url)
             if not self.client:
@@ -600,6 +616,8 @@ class ReconValidator(Validator):
             response = await self.client.request(method, url, headers=headers)
             return response
         except Exception as e:
+            if failures is not None:
+                failures.exception(SendFailures.label(method, url), e)
             log.debug(f"Request to {url} failed: {e}")
             return None
     

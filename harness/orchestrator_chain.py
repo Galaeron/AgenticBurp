@@ -21,7 +21,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # investigate_engagement has a `run_context` parameter that would shadow the module;
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
 # standalone one when it is None".
-from harness.run_context import transport_for, ExecutionOutcome, case_scope
+from harness.run_context import transport_for, ExecutionOutcome, case_scope, count_sends
 from harness.execution_registry import ExecutionRegistry
 from harness import run_journal
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
@@ -69,17 +69,25 @@ class _ConfirmationCache:
                 case_ref = self._case_for(getattr(finding_obj, "vulnerability_class", ""), exchange)
             except Exception:
                 case_ref = ""
-        run_context = self._run_context
-
         async def run_it():
-            before = getattr(getattr(run_context, "transport", None), "sent_count", None)
-            with case_scope(case_ref):
+            # Answered run-transport sends of this dispatch (batch 02). Kept apart
+            # from sent_count, whose absence still means "decide from status"
+            # for validators that send through a host tool.
+            with case_scope(case_ref), count_sends() as sent:
                 result = await validator.validate(finding_obj, exchange)
-            if before is not None:
-                result.sent_count = run_context.transport.sent_count - before
+            if result is not None:
+                result.observed_sends = sent[0]
+            if result is not None and not getattr(result, "attempt_id", ""):
+                # Batch 02: the stable id of this one real execution.
+                from harness.coverage_tracker import new_attempt_id
+                result.attempt_id = new_attempt_id()
             return result
-        return await self._registry.run(validator, finding_obj, exchange,
-                                        case_ref=case_ref, call=run_it)
+        result = await self._registry.run(validator, finding_obj, exchange,
+                                          case_ref=case_ref, call=run_it)
+        # A same-case hit is the cached object itself: it carries the original
+        # attempt id, which the matrix merges by id, so no fresh attempt is
+        # counted twice. A hit for another case is the registry's covered copy.
+        return result
 
 
 import re as _re

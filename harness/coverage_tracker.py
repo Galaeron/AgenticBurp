@@ -31,6 +31,7 @@ import logging
 import time
 import hashlib
 import json
+import uuid
 from collections import deque
 
 
@@ -78,6 +79,41 @@ def _executed(result, status):
     return status in {CellStatus.CONFIRMED, CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE}
 
 
+def new_attempt_id() -> str:
+    """A unique, immutable id for one fresh dispatch that sent requests."""
+    return f"att-{uuid.uuid4().hex[:16]}"
+
+
+def _attempt_facts(result, status):
+    """(executed, attempts, referenced_attempts) for one leg result (batch 02).
+
+    A result the run's confirmation cache served from an earlier execution
+    (`reused_attempt_id`) or the registry served from another case
+    (`covered_by`) references that execution and is never a fresh send. Any
+    other result that sent requests is one fresh attempt, with the id the
+    cache stamped at the real send when there is one."""
+    executed = _executed(result, status)
+    reused = getattr(result, "reused_attempt_id", "") or ""
+    covered = getattr(result, "covered_by", "") or ""
+    if reused or covered:
+        return executed, (), (reused or f"case:{covered}",)
+    attempt_id = getattr(result, "attempt_id", "") or ""
+    if attempt_id and getattr(result, "_attempt_claimed", False):
+        # A same-case cache hit hands back the very object an earlier record
+        # already claimed: it references that execution, sending nothing new.
+        return executed, (), (attempt_id,)
+    if attempt_id:
+        try:
+            result._attempt_claimed = True
+        except AttributeError:
+            pass
+    if not executed:
+        return False, (), ()
+    sent = next((n for n in (getattr(result, "sent_count", None), getattr(result, "observed_sends", None))
+                 if isinstance(n, int) and not isinstance(n, bool)), None)
+    return True, ({"id": attempt_id or new_attempt_id(), "sent": sent},), ()
+
+
 def resume_context_key(config):
     from pathlib import Path
     from harness.run_manifest import config_fingerprint, source_fingerprint
@@ -86,7 +122,7 @@ def resume_context_key(config):
 
 from harness.categories import canonicalize
 from harness.coverage_model import (
-    CHECK_CATALOG, CHECKS_BY_ID, Check, CellStatus, CellResult, CoverageMatrix,
+    ATTEMPT_SCHEMA_VERSION, CHECK_CATALOG, CHECKS_BY_ID, Check, CellStatus, CellResult, CoverageMatrix,
 )
 
 log = logging.getLogger("harness.coverage_tracker")
@@ -352,13 +388,22 @@ class CoverageTracker:
                 if cell.status != CellStatus.PENDING and not (
                         cell.status in (CellStatus.NOT_DETECTED, CellStatus.DETECTED, CellStatus.ERROR)
                         and status == CellStatus.CONFIRMED):
+                    if cell.status != CellStatus.NOT_APPLICABLE:
+                        # Batch 02: the verdict label stays, but a prior label
+                        # (an agent's detected/confirmed) never erases the leg
+                        # that actually ran here.
+                        self.matrix.record(ident, ep_key, cid, status=cell.status, reason=cell.reason,
+                                           severity=cell.severity, confidence=cell.confidence,
+                                           validator=cell.validator, evidence=cell.evidence,
+                                           executed=True, attempts=({"id": new_attempt_id(), "sent": None},))
                     continue
                 self.matrix.record(
                     ident, ep_key, cid, status=status,
                     reason=ev.get("reason") or f"{conf or cid} leg executed",
                     confidence=ev.get("confidence"),
                     validator=conf or (CHECKS_BY_ID.get(cid).confirmation if cid in CHECKS_BY_ID else None),
-                    evidence=(ev.get("evidence") or "")[:200] or None, executed=True)
+                    evidence=(ev.get("evidence") or "")[:200] or None, executed=True,
+                    attempts=({"id": new_attempt_id(), "sent": None},))
                 n += 1
         return n
 
@@ -460,13 +505,14 @@ class CoverageTracker:
                                    reason="validator dispatch returned no result", validator=check.confirmation)
                 continue
             status = _covered_status(res, _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN))
+            executed, fresh, referenced = _attempt_facts(res, status)
             self.matrix.record(
                 ident, ep_key, check.id, status=status,
                 reason=(getattr(res, "summary", "") or f"{check.confirmation} leg driven off the matrix")[:180],
                 confidence=getattr(res, "confidence", None),
                 validator=getattr(res, "validator", None) or check.confirmation,
                 evidence=(getattr(res, "evidence", "") or "")[:200],
-                executed=_executed(res, status))
+                executed=executed, attempts=fresh, referenced_attempts=referenced)
         return n
 
     def expand_parameter_cases(self, endpoints: dict[str, dict], *,
@@ -593,12 +639,14 @@ class CoverageTracker:
                 _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
                 continue
             status = _covered_status(res, _STATUS.get(getattr(res, "status", ""), CellStatus.INCONCLUSIVE))
+            executed, fresh, referenced = _attempt_facts(res, status)
             self.matrix.record_case(
                 ident, ep_key, check_id, rep, status=status,
                 reason=(getattr(res, "summary", "") or f"{check.confirmation} driven at request level")[:180],
                 confidence=getattr(res, "confidence", None),
                 validator=getattr(res, "validator", None) or check.confirmation,
-                evidence=(getattr(res, "evidence", "") or "")[:200], executed=_executed(res, status))
+                evidence=(getattr(res, "evidence", "") or "")[:200], executed=executed,
+                attempts=fresh, referenced_attempts=referenced)
             _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
         return attempts
 
@@ -644,9 +692,14 @@ class CoverageTracker:
         conclusive = {CellStatus.CONFIRMED, CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE}
         for key, cell in prior.cells().items():
             if key in self.matrix.cells() and cell.executed and cell.status in conclusive:
+                # A resumed verdict references the prior run's attempts; nothing is
+                # re-sent, so it gains no fresh attempt. A legacy (pre-v2) cell has
+                # no ids to reference and is marked as such, never invented.
+                refs = tuple(a["id"] for a in cell.attempts) + tuple(cell.referenced_attempts)
                 self.matrix.record(*key, status=cell.status, reason=cell.reason,
                                    severity=cell.severity, confidence=cell.confidence,
-                                   validator=cell.validator, evidence=cell.evidence, executed=True)
+                                   validator=cell.validator, evidence=cell.evidence, executed=True,
+                                   referenced_attempts=refs or ("checkpoint:legacy",))
                 self.reused.add(key)
 
     def phase_ledger(self, *, compact: bool = True):
@@ -714,11 +767,16 @@ class CoverageTracker:
                          "queued": key in self.queued,
                          "policy": "allowed" if cell.executed else ("denied" if reason == "policy_blocked" else "not_established"),
                          "attempted": key in self.attempted, "sent": bool(cell.executed),
+                         # Batch 02: fresh sends in this run vs referenced prior execution.
+                         "fresh_sent": bool(cell.attempts),
+                         "fresh_sends": sum(a.get("sent") or 0 for a in cell.attempts),
+                         "referenced": bool(cell.referenced_attempts),
                          "conclusive": bool(conclusive), "resumed": key in self.reused,
                          "terminal_reason": reason, "detail": cell.reason})
         ledger = {"counts": {stage: sum(bool(row[stage]) for row in rows) for stage in
                              ("discovered", "captured", "shape_applicable", "implemented", "eligible",
-                              "queued", "attempted", "sent", "conclusive", "resumed")}, "cells": rows}
+                              "queued", "attempted", "sent", "fresh_sent", "referenced", "conclusive",
+                              "resumed")}, "cells": rows}
         if not compact:
             return ledger
         kept, omitted = [], {}
@@ -759,6 +817,7 @@ class CoverageTracker:
         s["audited"] = summarize_coverage(self.matrix)
         s["phase_ledger"] = self.phase_ledger(compact=compact)
         s["capability_schema_version"] = 1
+        s["attempt_schema_version"] = ATTEMPT_SCHEMA_VERSION
         s["capability_dispositions"] = [{"identity":k[0], "endpoint":k[1], "check":k[2], **v}
                                         for k,v in self.readiness.items()]
         s["checkpoint"] = self.checkpoint()
