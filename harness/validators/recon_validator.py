@@ -587,9 +587,7 @@ class ReconValidator(Validator):
                     capability=self.get_name(), max_redirects=self.max_redirects)
                 if not outcome.ok:
                     return None
-                return httpx.Response(
-                    outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=outcome.headers, request=httpx.Request(method, url))
+                return outcome.to_httpx_response(method, url)
             if not self.client:
                 self.client = httpx.AsyncClient(
                     timeout=self.timeout,

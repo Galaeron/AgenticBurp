@@ -572,9 +572,7 @@ class HttpRequestSmugglingValidator(Validator):
                     if failures is not None:
                         failures.outcome(SendFailures.label(method, url), outcome)
                     return None
-                return httpx.Response(
-                    outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=outcome.headers, request=httpx.Request(method, url))
+                return outcome.to_httpx_response(method, url)
             if not self.client:
                 self.client = httpx.AsyncClient(
                     timeout=self.timeout,

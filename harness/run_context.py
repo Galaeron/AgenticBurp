@@ -528,6 +528,23 @@ class ExecutionOutcome:
         """The exchange artifact this send recorded ("" when none was built)."""
         return getattr(self.artifact, "artifact_id", "") or ""
 
+    # Response contract: `body` is the DECODED text (the transport already
+    # undid Content-Encoding); `headers` are the ORIGINAL wire headers, kept
+    # as-is for evidence. The raw wire bytes are not carried here.
+    _FRAMING_HEADERS = ("content-encoding", "content-length", "transfer-encoding")
+
+    def to_httpx_response(self, method: str, url: str) -> "httpx.Response":
+        """Consumer view of an ok outcome: the decoded body with the framing
+        headers that describe the wire bytes dropped, so httpx does not decode
+        or length-check it a second time. Evidence keeps the original headers."""
+        import httpx
+        headers = {k: v for k, v in (self.headers or {}).items()
+                   if k.lower() not in self._FRAMING_HEADERS}
+        return httpx.Response(self.status or 0, headers=headers,
+                              content=(self.body or "").encode("utf-8"),
+                              request=httpx.Request(method, url),
+                              extensions={"harness_artifact_id": self.artifact_id})
+
 
 # Ticket 6 follow-up: the confirmation case a validator job runs for. The
 # orchestrator enters it around one validator dispatch, so every send that job

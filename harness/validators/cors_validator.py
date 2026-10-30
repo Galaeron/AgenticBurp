@@ -388,14 +388,7 @@ class CorsValidator(Validator):
                 if not outcome.ok:
                     _note_probe("error" if outcome.outcome == "error" else "blocked")
                     return None
-                # TargetTransport already decoded the body. Only this consumer
-                # view drops wire encoding/length; evidence keeps original headers.
-                decoded_headers = {k: v for k, v in (outcome.headers or {}).items()
-                                   if k.lower() not in {"content-encoding", "content-length"}}
-                response = httpx.Response(
-                    outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=decoded_headers, request=httpx.Request(method, url),
-                    extensions={"harness_artifact_id": outcome.artifact_id})
+                response = outcome.to_httpx_response(method, url)
                 _note_policy(headers, outcome.headers or {})
                 _note_probe("ok")
                 return response

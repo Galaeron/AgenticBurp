@@ -963,22 +963,9 @@ class SqlmapValidator(Validator):
                             capability="sqlmap_boolean_probe", session_ref=session_ref)
                         if not outcome.ok:
                             raise httpx.TransportError(outcome.error or outcome.outcome)
-                        # RunContext exposes decoded text. Reattaching the
-                        # origin's wire-level gzip/content-length headers to
-                        # those decoded bytes makes httpx decompress them a
-                        # second time ("incorrect header check") and turns a
-                        # valid comparison into a silent probe error.
-                        decoded_headers = {
-                            k: v for k, v in (outcome.headers or {}).items()
-                            if k.lower() not in (
-                                "content-encoding", "content-length",
-                                "transfer-encoding")
-                        }
-                        return httpx.Response(
-                            outcome.status or 0, content=(outcome.body or "").encode(),
-                            headers=decoded_headers,
-                            request=httpx.Request(exchange.method.upper(), url),
-                            extensions={"harness_artifact_id": outcome.artifact_id})
+                        # RunContext exposes decoded text; the consumer view
+                        # drops wire framing so httpx does not decode it twice.
+                        return outcome.to_httpx_response(exchange.method.upper(), url)
 
                     resp_a = await routed(target_a, body_a)
                     resp_b = await routed(target_b, body_b)
