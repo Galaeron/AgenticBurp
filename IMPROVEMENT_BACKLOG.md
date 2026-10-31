@@ -4310,3 +4310,55 @@ triggering / live soundness, not missing code. They map to
   unconfirmed; caller-level test; `full` green. **Source:** 2026-10-15 Part A deferral.
 - **Reconciled 2026-10-17 (I01):** live acceptance only. **Canonical owner → I13.** Establish
   collaborator reachability independently; a missing callback alone does not refute SSRF.
+
+## Architecture-repair follow-ups — 2026-10-31
+
+Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 02 (bcc2b95),
+04 (ea2aa1b) and 08 (56c04dc). Plan: `.test-work/assessment-integration-20261023/architecture-repair/IMPLEMENTATION_TASK.md`
+(main checkout). Handoffs live in the batch folders under `.test-work/` in the wt-cors-r1 worktree.
+
+### [ ] AR-08a — Persist the proof identity fingerprint on proof records
+- **Domain:** Issue accounting · **Effort:** M · **Depends on:** a reviewed schema migration ·
+  **Mode:** LOOP (offline), reviewer gate for the migration.
+- **Problem:** batch 08 groups equivalent proofs by a fingerprint computed at run time only. The
+  legacy-schema invariant forbids a new column/table without a reviewed migration, so proofs read
+  back from the store lose the fingerprint and are not grouped by route.
+- **Acceptance criteria:** versioned additive migration with legacy-read and rollback tests
+  (`test_observation_migration` stays green); store-only proofs group exactly as in-run proofs.
+
+### [ ] AR-08b — Route-independent issue identity beyond jwt_forge
+- **Domain:** Issue accounting · **Effort:** S-M · **Depends on:** AR-08a · **Mode:** LOOP.
+- **Problem:** only `jwt_forge` declares itself route-independent; `issues.py` `issue_key` (the
+  report path) is unchanged, so other equivalent mechanisms still split per route.
+- **Acceptance criteria:** decide per mechanism; each route-independent one groups through the real
+  report path with locations attached; distinct trust boundaries/policies stay separate.
+
+### [ ] AR-08c — Audit procedures for race, WebSocket and error-based claims
+- **Domain:** Audit truth · **Effort:** M · **Mode:** LOOP.
+- **Problem:** these claims have no replay audit procedure; batch 08 reports them as unsupported.
+- **Acceptance criteria:** a real claim-specific procedure per class, or each stays explicitly
+  unsupported; never counted as zero false positives.
+
+### [ ] AR-ID — Cookie-bearing captures match no supplied identity
+- **Domain:** Identity/session binding · **Effort:** M · **Mode:** LOOP (offline fixture first).
+- **Evidence:** run `7d6b115acbec` — six cookie-bearing captures matched neither the anonymous nor
+  the Authorization-based identities (`.test-work/capture-report-diagnosis-20261030/HANDOFF.md`,
+  main checkout). No identity-matching change has been made.
+- **Acceptance criteria:** cookie-session captures bind to the right declared identity, or are
+  reported as unbound; no credential is persisted; caller-level test with a mismatched control.
+
+### [ ] AR-PKG — Repackage and restart from the fixed source
+- **Domain:** Release/verification · **Effort:** S · **Mode:** OWNER.
+- **Problem:** run `7d6b115acbec` loaded an older separate source snapshot; no replacement package
+  or server restart has been done.
+- **Acceptance criteria:** follow `docs/FIXED_SOURCE_VERIFICATION_2026-10-30.md` (main checkout):
+  import-path and provenance checks prove the running server is the committed source.
+
+### [ ] AR-09 — Batch 09: iterative worker uses supported mechanisms
+- **Domain:** Planner/worker · **Effort:** L · **Depends on:** 03, 06, 07 (all accepted) ·
+  **Mode:** LOOP. Spec: "Batch 09" in IMPLEMENTATION_TASK.md.
+
+### [ ] AR-10 — Batch 10: integrated acceptance and model-evaluation specification
+- **Domain:** Evaluation · **Effort:** L · **Depends on:** all prior batches incl. AR-09 ·
+  **Mode:** LOOP for the spec; OWNER/LIVE for any target run or model A/B (each needs its own
+  execution task). Spec: "Batch 10" in IMPLEMENTATION_TASK.md.
