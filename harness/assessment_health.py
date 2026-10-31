@@ -263,6 +263,12 @@ def stored_proof_artifacts_resolve(proof):
     return all(ref in found for ref in refs)
 
 
+# Batch 08: mechanisms whose proven flaw is a host trust policy, not a route: the same
+# policy fingerprint on several routes is one issue with several locations.
+ROUTE_INDEPENDENT_MECHANISMS = frozenset({'jwt_forge'})
+_ORPHAN_REASONS = {'proof not found for case', 'proof belongs to another run', 'proof belongs to another case'}
+
+
 def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(), artifact_resolver=None):
     """Keep legacy case counts readable without presenting them as vulnerabilities.
 
@@ -271,6 +277,13 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
     grouping key never crosses principal, parameter or workflow boundaries.
     """
     proofs = {p.get('proof_id'): p for p in run_proofs if p.get('proof_id')}
+    # Batch 08: the policy a confirmation was decided under travels on the finding
+    # (Finding.header_fingerprint, set by the confirm path); stored rows that lost it
+    # read as unknown, which never merges routes.
+    policy_of = {}
+    for finding in findings:
+        if finding.get('proof_id') and finding.get('header_fingerprint'):
+            policy_of.setdefault(finding['proof_id'], finding['header_fingerprint'])
     referenced, excluded = {}, []
     cache = {}
     candidate_cases = set()
@@ -304,6 +317,13 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         excluded.append({'case_id': case_id, 'proof_id': proof_id, 'reason': reason})
 
     instances, groups, counted_cases = [], {}, set()
+    # A reused result carries the original attempt's artifacts; it is a reference,
+    # never a second execution (batch 08).
+    first_attempt = {}
+    for proof in sorted(proofs.values(), key=lambda p: (p.get('created_at') or 0, p.get('proof_id'))):
+        if (proof.get('case') or {}).get('run_id') == run_id and proof.get('executed')                 and proof.get('attack_artifact_id'):
+            first_attempt.setdefault((proof['attack_artifact_id'], proof.get('baseline_artifact_id') or ''),
+                                     proof['proof_id'])
     for proof_id, proof in sorted(proofs.items()):
         case = proof.get('case') or {}
         if case.get('run_id') != run_id:
@@ -323,7 +343,11 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         instance = {key: proof.get(key) for key in ('proof_id', 'validator', 'verdict', 'executed', 'legacy',
                     'baseline_artifact_id', 'attack_artifact_id', 'control_artifact_ids')}
         instance.update(case=dict(case), kind=kind, claimed_kind=claimed, artifacts_resolved=resolved,
-                        referenced=bool(finding), exclusion_reason=reason)
+                        referenced=bool(finding), exclusion_reason=reason,
+                        policy_fingerprint=policy_of.get(proof_id, ''))
+        original = first_attempt.get((proof.get('attack_artifact_id') or '', proof.get('baseline_artifact_id') or ''))
+        if original and original != proof_id:
+            instance['reuses_attempt_of'] = original
         if finding:
             counted_cases.add(case['case_id'])
             parts = urlsplit(finding.get('url') or '')
@@ -333,14 +357,27 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             instance['route'] = origin + parts.path
             # Site-policy observations may share a presentation group across routes;
             # vulnerability claims merge only with an explicit root-cause identifier.
-            root = ((finding.get('root_cause_id') or case['case_id']) if claimed == 'vulnerability'
-                    else (origin, validator, cls))
+            # Batch 08: a route-independent mechanism with a known policy fingerprint
+            # groups on (host, mechanism, boundary, check family, policy); an unknown
+            # policy never merges routes.
+            policy = policy_of.get(proof_id, '')
+            if claimed != 'vulnerability':
+                root = (origin, validator, cls)
+            elif finding.get('root_cause_id'):
+                root = finding['root_cause_id']
+            elif validator in ROUTE_INDEPENDENT_MECHANISMS and policy:
+                root = ('mechanism', validator, proof.get('validator_version') or '', policy)
+            else:
+                root = case['case_id']
             boundary = (case.get('principal_id', ''), case.get('parameter_location', ''),
                         case.get('parameter_name', ''), case.get('workflow_state_id', ''))
             key = json.dumps([run_id, kind, cls, validator, origin, root, boundary], sort_keys=True)
             group = groups.setdefault(key, {'group_id': hashlib.sha256(key.encode()).hexdigest()[:20],
                           'kind': kind, 'vulnerability_class': cls, 'principal_id': boundary[0],
-                          'proof_ids': [], 'case_ids': [], 'routes': []})
+                          'proof_ids': [], 'case_ids': [], 'routes': [],
+                          'identity': {'host': origin, 'mechanism': validator, 'check_family': cls,
+                                       'principal_boundary': list(boundary), 'policy_fingerprint': policy
+                                       if claimed == 'vulnerability' else ''}})
             group['proof_ids'].append(proof_id)
             group['case_ids'] = sorted(set([*group['case_ids'], case['case_id']]))
             group['routes'] = sorted(set([*group['routes'], instance['route']]))
@@ -351,6 +388,9 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
     counts = {kind: sum(g['kind'] == kind for g in groups.values())
               for kind in ('vulnerability', 'hardening', 'reconnaissance')}
     ledger_confirmed = [p for p in instances if p['verdict'] == 'confirmed']
+    orphans = [dict(e, repair='re-link the finding to a stored proof of this case and run, or re-run '
+                              'its check; the link is not shown as proof') for e in excluded
+               if e['reason'] in _ORPHAN_REASONS]
     return {'schema_version': 1, 'run_id': run_id,
             'units': {'confirmed_issues': 'unique proof-bound cases (compatibility count)',
                       'vulnerabilities': 'distinct structured, artifact-resolved vulnerability groups',
@@ -361,7 +401,11 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
                        'vulnerabilities': counts['vulnerability'],
                        'hardening_observations': counts['hardening'],
                        'reconnaissance': counts['reconnaissance'],
-                       'candidate_cases': len(candidate_cases), 'excluded_records': len(excluded)},
+                       'candidate_cases': len(candidate_cases), 'excluded_records': len(excluded),
+                       'executed_attempts': len(set(first_attempt.values())),
+                       'reused_proof_references': sum(bool(p.get('reuses_attempt_of')) for p in instances),
+                       'orphaned_proof_links': len(orphans)},
             'groups': list(groups.values()), 'proof_instances': instances, 'excluded': excluded,
+            'orphaned_proof_links': orphans,
             'limitations': ['Presentation grouping is not proof of a shared root cause.',
                            'Legacy confirmations are retained; they do not count as resolved vulnerabilities.']}

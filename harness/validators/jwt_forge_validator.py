@@ -287,6 +287,14 @@ class JwtForgeValidator(Validator):
         def _counted(result: ValidationResult) -> ValidationResult:
             note = f"probes sent: {probes}"
             result.evidence = f"{result.evidence} [{note}]" if result.evidence else note
+            if result.confirmed:
+                # Batch 08: the verification policy this token is judged under (algorithm,
+                # key id, issuer, audience), so equivalent routes group as one issue and a
+                # token from another issuer or key never merges with it.
+                from harness.validators.base import header_fingerprint
+                result.header_fingerprint = header_fingerprint(
+                    "jwt", header.get("alg"), header.get("kid"), header.get("typ"),
+                    payload.get("iss"), json.dumps(payload.get("aud"), sort_keys=True))
             return result
 
         # CHEAP DISCRIMINATOR FIRST: one tokenless request. When it already gets a
