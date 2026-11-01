@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = ["playwright>=1.40"]   # browser XSS validator (lazy; skips if absent)
-proxy = ["mitmproxy==12.2.3"]    # safety proxy addon
+proxy = ["mitmproxy==12.3.1", "brotli>=1.2.1"]    # safety proxy; CVE-2026-111497
 dev = ["pytest==9.1.1"]
 
 [tool.setuptools.packages.find]
