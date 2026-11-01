@@ -10,6 +10,8 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 from __future__ import annotations
 
 import contextlib
+import copy
+import time
 import uuid
 
 from harness import identity_compare
@@ -19,10 +21,13 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # investigate_engagement has a `run_context` parameter that would shadow the module;
 # `transport_for(run_context, ...)` then reads as "use this run's transport, or a
 # standalone one when it is None".
-from harness.run_context import transport_for, ExecutionOutcome
-# FR-6: need the module too, for `_CREDENTIAL_HEADERS` -- aliased for the same
-# shadowing reason as above (several methods below have a `run_context` parameter).
+from harness.run_context import transport_for, ExecutionOutcome, case_scope, count_sends
+from harness.execution_registry import ExecutionRegistry
+from harness import run_journal
+# FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
+# same shadowing reason as above (several methods below have a `run_context` parameter).
 from harness import run_context as _run_context_mod
+from harness.security import is_credential_header
 from harness import objective_completion as _objective_completion_mod
 from harness.objective_profiles import ObjectiveTask
 
@@ -30,6 +35,59 @@ from harness.objective_profiles import ObjectiveTask
 # FR-6 (F10) sentinel appended to a header value to make it a genuinely invalid
 # credential control -- see `_invalidated_headers` below.
 _FR6_INVALID_SENTINEL = "_fr6_invalid"
+
+
+class _ConfirmationCache:
+    """Within-run memo of confirmation results for investigate_engagement().
+
+    Delegates to the run's ExecutionRegistry (execution_registry.py), whose key
+    includes the IDENTITY (auth headers) and finding subtype, so a probe AS one
+    identity never returns a result computed AS another (R03), and which the
+    model-review path shares so one run does not repeat a check across paths.
+    Each entry also remembers the case its sends were recorded under."""
+
+    def __init__(self, run_context, case_for, registry=None):
+        self._run_context = run_context
+        self._case_for = case_for  # (vulnerability_class, exchange) -> case id
+        self._registry = registry if registry is not None else ExecutionRegistry(
+            budget=getattr(run_context, "budget", None))
+
+    async def validate(self, validator, finding_obj, exchange, case_ref=None):
+        """Wrapper around validator.validate() that caches results within this
+        run. A hit returns the previous ValidationResult without any
+        HTTP/container work.
+
+        The leg's sends are recorded under `case_ref` (default: the case
+        _apply builds for this class and exchange), so the exchanges its
+        result names resolve for that case's proof. A hit for the same case
+        returns the cached result. A hit for another case returns a copy
+        without the named exchanges, which were recorded under the first case
+        and do not resolve here: that proof stays a candidate. The cached
+        original is never changed."""
+        if case_ref is None:
+            try:
+                case_ref = self._case_for(getattr(finding_obj, "vulnerability_class", ""), exchange)
+            except Exception:
+                case_ref = ""
+        async def run_it():
+            # Answered run-transport sends of this dispatch (batch 02). Kept apart
+            # from sent_count, whose absence still means "decide from status"
+            # for validators that send through a host tool.
+            with case_scope(case_ref), count_sends() as sent:
+                result = await validator.validate(finding_obj, exchange)
+            if result is not None:
+                result.observed_sends = sent[0]
+            if result is not None and not getattr(result, "attempt_id", ""):
+                # Batch 02: the stable id of this one real execution.
+                from harness.coverage_tracker import new_attempt_id
+                result.attempt_id = new_attempt_id()
+            return result
+        result = await self._registry.run(validator, finding_obj, exchange,
+                                          case_ref=case_ref, call=run_it)
+        # A same-case hit is the cached object itself: it carries the original
+        # attempt id, which the matrix merges by id, so no fresh attempt is
+        # counted twice. A hit for another case is the registry's covered copy.
+        return result
 
 
 import re as _re
@@ -113,14 +171,14 @@ def _invalidated_headers(headers: dict) -> dict:
     """Return a copy of `headers` with the credential corrupted, for the
     invalid-token control probe in `_credential_grants_access`. Corrupts the
     VALUE of every header recognised as a credential header
-    (`run_context._CREDENTIAL_HEADERS`: authorization/cookie/proxy-authorization)
-    so the server should reject it. If none of the supplied headers are
-    recognised credential headers (e.g. a bespoke `X-Api-Key` scheme), corrupts
-    every supplied header's value instead, so the control is always genuinely
-    invalid rather than an accidental no-op. Header NAMES are always preserved
+    (`security.is_credential_header`: authorization/cookie, API-key and token
+    schemes, ...) so the server should reject it. If none of the supplied headers
+    are recognised credential headers (a scheme the classifier does not know),
+    corrupts every supplied header's value instead, so the control is always
+    genuinely invalid rather than an accidental no-op. Header NAMES are always preserved
     so routing/auth dispatch is unchanged -- only the value is corrupted."""
     out = dict(headers or {})
-    cred_keys = [k for k in out if k.lower() in _run_context_mod._CREDENTIAL_HEADERS]
+    cred_keys = [k for k in out if is_credential_header(k)]
     for k in (cred_keys or list(out.keys())):
         out[k] = f"{out[k]}{_FR6_INVALID_SENTINEL}"
     return out
@@ -154,6 +212,60 @@ def _responses_materially_same(a: ExecutionOutcome, b: ExecutionOutcome) -> bool
     a_body = (a.body or "") if a is not None else ""
     b_body = (b.body or "") if b is not None else ""
     return a_status == b_status and identity_compare.similarity(a_body, b_body) >= identity_compare.MATCH_THRESHOLD
+
+
+class _DriverBudget:
+    """Atomic child reservations spend the parent budget without replacing it."""
+    def __init__(self, parent, maximum):
+        import threading
+        self.parent, self.maximum, self.spent = parent, maximum, 0
+        self.lock = threading.Lock()
+
+    def reserve(self, n=1, label=""):
+        with self.lock:
+            # A parent that predates labels (no by_label) is reserved unlabelled.
+            if self.spent + n > self.maximum or not (
+                    self.parent.reserve(n, label=label) if hasattr(self.parent, "by_label")
+                    else self.parent.reserve(n)):
+                return False
+            self.spent += n
+            return True
+
+    @property
+    def by_label(self):
+        return self.parent.by_label
+
+    @property
+    def remaining(self):
+        remaining = self.parent.remaining
+        own = max(0, self.maximum - self.spent)
+        return own if remaining is None else min(own, remaining)
+
+    @property
+    def used(self):
+        return self.parent.used
+
+
+@contextlib.asynccontextmanager
+async def _driver_scope(run, maximum):
+    import copy
+    from dataclasses import replace
+    from harness.safety_gate import push_gate, pop_gate
+    child = copy.copy(run)
+    child.budget = run.budget if maximum is None else _DriverBudget(run.budget, maximum)
+    child.gate = copy.copy(run.gate)
+    child.gate.config = replace(run.gate.config, allow_mutating_replay=False)
+    gate_restore = push_gate(child.gate)
+    # Task-local binding: sibling drivers retain their own child budget.
+    token = _run_context_mod._ambient_run.set(child)
+    try:
+        yield child
+    finally:
+        _run_context_mod._ambient_run.reset(token)
+        pop_gate(gate_restore)
+        # A lazily opened default client belongs to this child, not its parent.
+        if child._default_client is not None and child._default_client is not run._default_client:
+            await child._default_client.aclose()
 
 
 class ChainMixin:
@@ -248,6 +360,9 @@ class ChainMixin:
             plan["note"] = "execution refused: engagement.driver_execute is disabled in config.yaml"
             return plan
 
+        driver_ceiling = (self.config.get("engagement", {}) or {}).get("driver_max_requests")
+        if driver_ceiling is not None and (type(driver_ceiling) is not int or driver_ceiling < 0):
+            raise ValueError("engagement.driver_max_requests must be a nonnegative integer")
         enclosing = _run_context_mod.current_run_context()
         owned = None
         if enclosing is None:
@@ -271,7 +386,7 @@ class ChainMixin:
         rounds: list[dict] = []
         seen_urls: set[str] = set()   # don't re-fetch the same target across rounds
 
-        async with (owned if owned is not None else contextlib.nullcontext(enclosing)) as run:
+        async with (owned if owned is not None else contextlib.nullcontext(enclosing)) as parent_run, _driver_scope(parent_run, driver_ceiling) as run:
             _tt = run.target_transport()
             for rnd in range(1, max(1, max_rounds) + 1):
                 stop = ("run cancelled" if run.cancel.cancelled else
@@ -319,8 +434,11 @@ class ChainMixin:
                     break
             remaining = run.budget.remaining
             run_info = {"run_id": run.run_id, "owned": owned is not None,
-                        "max_requests": None if remaining is None else run.budget.used + remaining,
+                        "max_requests": None if parent_run.budget.remaining is None else parent_run.budget.used + parent_run.budget.remaining,
                         "requests_used": run.budget.used, "cancelled": run.cancel.cancelled}
+            if driver_ceiling is not None:
+                run_info.update(driver_max_requests=driver_ceiling,
+                                driver_requests_used=getattr(run.budget, "spent", None))
 
         after = await self.plan_engagement(host, max_targets=max_targets, base_url=base_url)
         return {"host": host, "executed": True, "rounds": rounds, "run": run_info,
@@ -542,6 +660,156 @@ class ChainMixin:
         state.apply_semantic_model(asm)
         return asm
 
+    def _experiments_config(self) -> dict:
+        eng = (getattr(self, "config", {}) or {}).get("engagement", {}) or {}
+        return eng.get("experiments", {}) or {}
+
+    def _experiment_ownership(self, state, run_context, base_url):
+        """The engagement's ownership ledger for the experiment cycle: the one
+        `_configure_ownership` builds from the operator's `authz.owners`
+        declarations (cached on the run), so declared sharing governs the verdict
+        and the experiment's own ownership fact lands where CrossIdentityValidator
+        and the report read it. With nothing declared anywhere a run-scoped
+        ledger is filed under the same cache key, so every later
+        `_configure_ownership(...)` for this origin in the run finds it too."""
+        from harness.principals import OwnershipLedger
+        if run_context is None or not base_url:
+            return OwnershipLedger()
+        # `state.owners` is [] (not None) until an engagement declares some, and a
+        # non-None value makes `_configure_ownership` REBUILD the ledger and replace
+        # the cached one -- leaving every holder of the earlier ledger (the
+        # cross-identity validator) blind to what this cycle records.
+        ledger = self._configure_ownership(
+            base_url, engagement_owners=getattr(state, "owners", None) or None,
+            run_context=run_context, install=False)
+        if ledger is not None:
+            return ledger
+        from urllib.parse import urlsplit
+        from harness.protected_routes import _target_of
+        origin = (urlsplit(base_url).scheme.lower(), _target_of(base_url))
+        cached = getattr(run_context, "_declared_ownership", None)
+        cached = cached if isinstance(cached, dict) else {}
+        cached.setdefault(origin, OwnershipLedger())
+        run_context._declared_ownership = cached
+        return cached[origin]
+
+    async def _handoff_experiment(self, action, run_context):
+        """A closed selection of an existing hypothesis, never model-authored I/O."""
+        from harness import experiment, experiment_planner, task_graph, store
+        from harness.assessment_health import stored_proof_artifacts_resolve
+        def disposition(status, reason, **extra):
+            return dict(status=status, readiness=reason, fresh_attempt_ids=[],
+                        referenced_attempt_ids=[], budget_spent=0, **extra)
+        if set(action) != {"action", "kind", "hypothesis"}:
+            return disposition("rejected", "selection fields must be action, kind, hypothesis")
+        if not self._experiments_config().get("enabled", False):
+            return disposition("disabled", "experiments disabled")
+        context = getattr(run_context, "experiment_context", None)
+        if not context:
+            return disposition("needs_prerequisite", "owning engagement context unavailable")
+        state, asm = context["state"], context["asm"]
+        hypotheses = {h.id: h for h in getattr(asm, "chaining_hypotheses", [])}
+        if experiment_planner.validate_instantiation(action.get("kind"), action.get("hypothesis"), hypotheses):
+            return disposition("rejected", "unknown mechanism or hypothesis")
+        hid = action["hypothesis"]
+        hyp = hypotheses[hid]
+        if action["kind"] not in experiment.BROWSER_KINDS and (action["kind"] != experiment.KIND or not experiment.supports(hyp)):
+            return disposition("rejected", "hypothesis does not support this mechanism")
+        if run_context.cancel.cancelled:
+            return disposition("cancelled", "owning run cancelled")
+        if not run_context.scope.in_scope(context["base_url"]):
+            return disposition("blocked", "target outside owning scope")
+        gate = run_context.gate.config
+        if not gate.active_enabled or (action["kind"] != experiment.BROWSER_HASH and not gate.allow_mutating_replay):
+            return disposition("blocked", "active and mutating permissions required")
+        expectations = (self.config.get("engagement", {}) or {}).get("access_expectations", [])
+        sessions = experiment.run_sessions(run_context)
+        plan = (experiment.translate_browser(hid, asm, run_context, check_cost=False) if action['kind'] in experiment.BROWSER_KINDS else
+                experiment.translate_cross_account(hyp, asm, expectations, sessions,
+                    state.observed_values, base_url=context["base_url"]))
+        if not plan.ready:
+            return disposition("needs_prerequisite", "; ".join(plan.missing))
+        if plan.experiment.kind != action["kind"]:
+            return disposition("rejected", "declared mechanism does not match selection")
+        from harness.run_context import ScopePolicy
+        for step in (plan.experiment.setup_steps + plan.experiment.baseline_steps +
+                     plan.experiment.attack_steps + plan.experiment.control_steps + plan.experiment.cleanup_steps):
+            session = run_context.sessions.get(step.session_ref)
+            if (session is None or session.health == 'expired' or
+                    ScopePolicy.origin_of(step.url_template) not in session.allowed_origins or
+                    not run_context.scope.in_scope(step.url_template)):
+                return disposition("needs_prerequisite", "required identity is not authorized for step origin")
+        experiment._evaluate_browser(state, asm, run_context)
+        experiment.evaluate_experiments(state, asm, expectations, sessions,
+                    base_url=context["base_url"])
+        tasks = experiment.selected_experiment_tasks(state, {hid})
+        fingerprint = experiment.experiment_applicability(plan.experiment, run_context, state.observed_values)
+        for task in tasks:
+            if task.status == task_graph.DONE and task.meta.get("applicability") == fingerprint:
+                proof = next((p for p in store.proofs_for_run(run_context.run_id)
+                              if p['proof_id'] == task.evidence_ref), None)
+                if proof and proof['verdict'] in ('confirmed', 'controlled_negative') and stored_proof_artifacts_resolve(proof):
+                    out = disposition("reused", "matching completed attempt")
+                    out['referenced_attempt_ids'] = [task.evidence_ref]
+                    return out
+            if task.status == task_graph.FAILED and task.meta.get("applicability") == fingerprint:
+                if run_context.experiment_runs >= int(self._experiments_config().get("max_runs", 4)):
+                    return disposition("deferred", "engagement experiment max_runs exhausted")
+                return disposition("inconclusive", "unchanged failed attempt requires new evidence")
+            if task.status in (task_graph.DONE, task_graph.FAILED):
+                state.graph.mark(task.id, task_graph.READY)
+        if run_context.experiment_runs >= int(self._experiments_config().get("max_runs", 4)):
+            return disposition("deferred", "engagement experiment max_runs exhausted")
+        before = run_context.budget.used
+        outcome = await self._run_experiments(state, asm, run_context,
+            base_url=context["base_url"], captured=context.get("captured", ()), hypothesis_ids={hid})
+        entries = (outcome or {}).get("completed", []) + (outcome or {}).get("failed", [])
+        out = disposition("completed" if (outcome or {}).get("completed") else "inconclusive",
+                          "controller attempt completed" if entries else "controller produced no attempt",
+                          kind=action['kind'], hypothesis=hid, produced_values=sorted(state.observed_values))
+        out['fresh_attempt_ids'] = [e['proof_id'] for e in entries]
+        out['budget_spent'] = run_context.budget.used - before
+        return out
+
+    async def _run_experiments(self, state, asm, run_context, *, base_url="", captured=(),
+                               ownership=None, hypothesis_ids=None):
+        """Ticket G seam: run the graph -> experiment -> workflow -> proof -> graph
+        cycle (experiment.run_experiment_loop) over the hypotheses of `asm`.
+
+        Behind `engagement.experiments.enabled` (default off) and an owning
+        RunContext: otherwise returns None and sends nothing -- the engagement
+        behaves exactly as before (the negative control). The privacy expectations
+        come only from `engagement.access_expectations`; a hypothesis without one
+        is reported BLOCKED with the exact missing input, never guessed. Mutating
+        sends stay gated by validators.active_enabled / allow_mutating_replay.
+
+        Split out of investigate_engagement so the caller-level test can disable
+        this one connection and prove the cycle depends on it."""
+        eng = (getattr(self, "config", {}) or {}).get("engagement", {}) or {}
+        cfg = self._experiments_config()
+        if run_context is None or not cfg.get("enabled", False):
+            return None
+        from harness import experiment, experiment_planner
+        planner = None
+        # The planner reasons with the LOCAL agent model on the local client --
+        # never the coordinator's cloud settings. No local model configured: no planner.
+        local_model = ((self.config.get("agent_defaults") or {}).get("model") or "")
+        if cfg.get("planner", False) and local_model:
+            planner = experiment_planner.ExperimentPlanner(
+                experiment_planner.ollama_propose_fn(self.ollama, local_model),
+                captures=captured)
+        ledger = ownership if ownership is not None else self._experiment_ownership(
+            state, run_context, base_url)
+        remaining = max(0, int(cfg.get("max_runs", 4)) - run_context.experiment_runs)
+        result = await experiment.run_experiment_loop(
+            state, run_context, ledger=ledger,
+            expectations=eng.get("access_expectations", []) or [],
+            sessions=experiment.run_sessions(run_context),
+            max_runs=remaining, planner=planner, asm=asm, base_url=base_url,
+            **({"hypothesis_ids": hypothesis_ids} if hypothesis_ids is not None else {}))
+
+        return result
+
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
                                      discovery_max_endpoints: int = 150,
@@ -552,7 +820,7 @@ class ChainMixin:
                                      objective_class: str | None = None,
                                      objective_task: "ObjectiveTask | None" = None,
                                      objective_provider=None,
-                                     seed_exchanges=None) -> dict:
+                                     seed_exchanges=None, coverage_checkpoint=None) -> dict:
         """Milestone A+B, end to end: build the app model (active discovery ->
         per-role access matrix -> prioritised worklist), then drive the ITERATIVE
         agent top-down over that worklist -- each high-value node gets a bounded
@@ -568,15 +836,98 @@ class ChainMixin:
         from harness import worklist_investigator
         from harness import chain_linker
         from harness import role_crawl
-        state, rc = await engagement_builder.build_engagement(
-            base_url, roles, allowed_hosts=self.allowed_hosts,
-            crawl_max_pages=discovery_max_pages,
-            max_endpoints=discovery_max_endpoints,
-            active_discovery=active_discovery,
-            discovery_max_probes=discovery_max_probes, run_context=run_context,
-            **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
-            **({"driver_capture_config": self.config["driver_capture"]}
-               if (self.config.get("driver_capture") or {}).get("enabled") else {}))
+        from harness.instrumentation import RunInstrumentation
+        from harness.assessment_health import new_review_stats
+        # Stage reservations: the coverage drive runs last, so withhold its share of
+        # the one run ceiling from every earlier stage (released just before the
+        # drive), and bound the investigation stages by wall-clock time.
+        _investigation_deadline = (time.monotonic() + self.investigation_seconds
+                                   if self.investigation_seconds > 0 else None)
+        _run_budget = getattr(run_context or _run_context_mod.current_run_context(), "budget", None)
+        _coverage_hold = (_run_budget.hold(self.coverage_request_reserve)
+                          if self.coverage_request_reserve > 0 and hasattr(_run_budget, "hold") else 0)
+        # E9: observation only. Each `phases.begin(...)` below closes the previous
+        # phase and opens the next; nothing is reordered or skipped by it.
+        _instr = RunInstrumentation(self, run_context or _run_context_mod.current_run_context(),
+                                    _run_budget)
+        _instr.phases.begin("discovery")
+
+        # E7: with a journal on the run, each finished unit is written as it completes, and
+        # a journal that already holds units for this root job (an interrupted earlier
+        # run, or the same run's earlier attempt) is resumed from instead of repeated.
+        _journal = getattr(run_context, "run_journal", None)
+        _resumed_units = {"discovery": False, "worklist": 0, "review": 0, "coverage_checkpoint": False}
+
+        def _journal_read(read, default):
+            """A journal read that fails is a journal with nothing in it: the run goes on."""
+            try:
+                return read()
+            except Exception as e:
+                log.warning("investigate_engagement: journal read failed (%s)", type(e).__name__)
+                return default
+
+        _resuming = _journal is not None and _journal_read(_journal.has_any, False)
+
+        def _journal_put(unit, payload):
+            if _journal is None:
+                return
+            try:
+                _journal.put(unit, payload)
+            except Exception as e:  # losing a unit costs a repeat on resume, never the run
+                log.warning("investigate_engagement: journal write of %s failed: %s", unit, e)
+
+        def _journal_phase(name):
+            _journal_put(f"phase:{name}", {"finished_at": time.time()})
+
+        _stored_discovery = _journal_read(lambda: _journal.get("discovery"), None) if _resuming else None
+        if _stored_discovery is not None:
+            try:
+                state, rc = run_journal.restore_discovery(_stored_discovery, roles)
+                # Discovery registers the roles' sessions with the run; restoring it must too.
+                engagement_builder.register_role_sessions(run_context, base_url, roles)
+                _resumed_units["discovery"] = True
+            except Exception as e:
+                log.warning("investigate_engagement: journaled discovery unusable (%s); "
+                            "discovering again", type(e).__name__)
+        if not _resumed_units["discovery"]:
+            state, rc = await engagement_builder.build_engagement(
+                base_url, roles, allowed_hosts=self.allowed_hosts,
+                crawl_max_pages=discovery_max_pages,
+                max_endpoints=discovery_max_endpoints,
+                active_discovery=active_discovery,
+                discovery_max_probes=discovery_max_probes, run_context=run_context,
+                **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
+                **({"driver_capture_config": self.config["driver_capture"]}
+                   if (self.config.get("driver_capture") or {}).get("enabled") else {}))
+            if _journal is not None:
+                try:
+                    _journal_put("discovery", run_journal.discovery_payload(state, rc, roles))
+                    _journal_phase("discovery")
+                except Exception as e:
+                    log.warning("investigate_engagement: journaling discovery failed: %s", e)
+
+        # Units an earlier attempt finished, passed to the phases that skip them. Their
+        # findings come back marked `resumed_from`, a confirmation only while its proof
+        # still resolves (run_journal.resume_finding).
+        _worklist_kwargs: dict = {}
+        _review_kwargs: dict = {}
+        _review_summary: dict = {}
+        if _journal is not None:
+            _root = _journal.root_job_id
+            _worklist_kwargs = {
+                "completed": (_journal_read(lambda: {
+                    unit[len("worklist:"):]: run_journal.resume_outcome(payload, _root)
+                    for unit, payload in _journal.units("worklist:").items()}, {})
+                              if _resuming else None),
+                "on_outcome": lambda key, outcome: _journal_put(f"worklist:{key}", outcome)}
+            _review_kwargs = {
+                "resumed": (_journal_read(lambda: {
+                    unit[len("review:"):]: {"findings": [run_journal.resume_finding(f, _root)
+                                                         for f in payload.get("findings") or []]}
+                    for unit, payload in _journal.units("review:").items()}, {})
+                            if _resuming else None),
+                "on_review": lambda key, payload: _journal_put(f"review:{key}", payload),
+                "summary_out": _review_summary}
 
         # Operator/capture supplied shapes (for example the runner's successful
         # login setup exchange) are first-class evidence. They do not trigger new
@@ -591,11 +942,12 @@ class ChainMixin:
         # is recorded here and surfaced in the result as `errors` + `degraded`, so a
         # run that skipped a phase is declared incomplete rather than looking clean.
         _errors: list[dict] = [
-            {"phase": "browser_capture", "error": message}
+            {"phase": "discovery", "error": message}
             for message in getattr(rc, "errors", [])
-            if message.startswith(("browser capture incomplete:", "browser capture failed:",
-                                   "browser capture skipped:"))
+            if not message.startswith("[discovery] used spec ")
         ]
+        _reviewed_captures: set[str] = set()
+        _review_stats = new_review_stats()
         workflow_results: list[dict] = []
 
         # Preserve real request shapes before any worklist leg runs. Full model
@@ -642,7 +994,7 @@ class ChainMixin:
                 feature_caps = await engagement_builder.feature_crawl_captures(
                     base_url, roles, allowed_hosts=self.allowed_hosts,
                     submit_forms=_get_gate().config.allow_mutating_replay,
-                    seed_paths=discovered_paths, run_context=run_context)
+                    seed_paths=discovered_paths, run_context=run_context, errors=_errors)
                 # Make workflow routes and their real request shapes visible to
                 # prioritisation. Content-level model review remains deferred.
                 for ex in feature_caps:
@@ -652,6 +1004,17 @@ class ChainMixin:
                 log.warning("investigate_engagement: feature crawl failed: %s", e)
                 _errors.append({"phase": "feature_crawl", "error": f"{type(e).__name__}: {e}"})
 
+        # E4/E2: the run's one execution registry, made before the header audit so the
+        # audit's csp/cors checks are recorded in it and the model-review path (which
+        # reads it through run_context) does not run them again for the same route and
+        # identity, nor the worklist or the drive any other check.
+        _exec_registry = getattr(run_context, "execution_registry", None)
+        if not isinstance(_exec_registry, ExecutionRegistry):
+            _exec_registry = ExecutionRegistry(budget=getattr(run_context, "budget", None))
+            if run_context is not None:
+                run_context.execution_registry = _exec_registry
+
+        _instr.phases.begin("header_audit")
         # Universal header audit: run CORS, CSP, verbose-error validators
         # against EVERY captured exchange from discovery + feature_crawl.
         # This catches header-level issues the LLM agents never labelled.
@@ -726,6 +1089,14 @@ class ChainMixin:
                 # with different credentials must not overwrite each other under a
                 # shared `role` key. Role is still carried for privilege checks.
                 identity_headers.set_identity(host, r.principal_id(), dict(r.headers), r.role)
+        ownership = self._configure_ownership(base_url, engagement_owners=getattr(state, "owners", None),
+                                              run_context=run_context, install=False)
+        if (ownership is None and run_context is not None
+                and self._experiments_config().get("enabled", False)):
+            # Ticket G: share ONE ledger between the experiment cycle and the
+            # cross-identity validator, so an ownership fact an experiment
+            # establishes is what that validator consults.
+            ownership = self._experiment_ownership(state, run_context, base_url)
         _xid_cfg = (self.config.get("validators", {}) or {}).get("cross_identity", {}) or {}
         _xval = CrossIdentityValidator(
             allowed_hosts=self.allowed_hosts,
@@ -734,7 +1105,7 @@ class ChainMixin:
             run_context=run_context,
             # WL-04: the registry's declared-ownership source (D1 seam); None means
             # a cross-identity match is a `supported` lead, never a confirmation.
-            ownership=getattr(self.validator_registry, "ownership", None))
+            ownership=ownership)
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a
@@ -753,10 +1124,12 @@ class ChainMixin:
         _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts, run_context=run_context)
         _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts,
                                  run_context=run_context)
-        _ssrf = SsrfValidator(allowed_hosts=self.allowed_hosts)
-        _xxe = XxeValidator(allowed_hosts=self.allowed_hosts)
+        from harness.collaborator import ConfiguredCollaborator
+        _callbacks = getattr(getattr(self, "validator_registry", None), "collaborator", None) or ConfiguredCollaborator(self.config)
+        _ssrf = SsrfValidator(allowed_hosts=self.allowed_hosts, collaborator=_callbacks, oob_callbacks_enabled=bool((self.config.get("validators") or {}).get("oob_callbacks_enabled", True)))
+        _xxe = XxeValidator(allowed_hosts=self.allowed_hosts, collaborator=_callbacks, oob_callbacks_enabled=bool((self.config.get("validators") or {}).get("oob_callbacks_enabled", True)))
         _cmdi = CommandInjectionValidator(allowed_hosts=self.allowed_hosts,
-                                          run_context=run_context)
+                                          run_context=run_context, collaborator=_callbacks, oob_callbacks_enabled=bool((self.config.get("validators") or {}).get("oob_callbacks_enabled", True)))
         # Stored SSTI often writes a preference/editor value and evaluates it on
         # a separate public render.  Supply only GET pages already observed in
         # this engagement; the validator keeps the set bounded and same-origin.
@@ -804,26 +1177,16 @@ class ChainMixin:
         )
 
         # Memoisation cache: avoid re-running the same validator on the same
-        # endpoint during one investigate_engagement() call. Keyed by
-        # confirmation_cache_key() -- which includes the IDENTITY (auth headers)
-        # and finding subtype, not just (validator, method, url, body), so a probe
-        # AS one identity never returns a result computed AS another (R03).
-        from harness.validators.base import ValidationResult as _VR
-        _confirmation_cache: dict[tuple, _VR] = {}
-
-        async def _cached_validate(validator, finding_obj, exchange):
-            """Wrapper around validator.validate() that caches results within this
-            run. The key includes identity + finding class (R03) so cross-identity
-            / cross-subtype cases do not collide. A hit returns the previous
-            ValidationResult without any HTTP/container work."""
-            key = confirmation_cache_key(
-                validator.name, exchange,
-                getattr(finding_obj, "vulnerability_class", None))
-            if key in _confirmation_cache:
-                return _confirmation_cache[key]
-            result = await validator.validate(finding_obj, exchange)
-            _confirmation_cache[key] = result
-            return result
+        # endpoint during one investigate_engagement() call (see _ConfirmationCache).
+        from harness.validators.base import (
+            ValidationResult as _VR, observed_result_of, proof_artifact_kwargs)
+        # E4: `_exec_registry` (made before the header audit) is also read by the
+        # model-review path (orchestrator_confirm._validate_findings) through
+        # run_context, so a check that ran for the worklist is not run again for the
+        # review or the drive.
+        _cached_validate = _ConfirmationCache(
+            run_context, lambda cls, exchange: _rb4_case(cls, exchange).case_id,
+            registry=_exec_registry).validate
 
         # RB-4/INV-2: this path (worklist_investigator's confirm_fn for agent
         # findings, and its precondition_fn for every shape-driven leg dispatch
@@ -851,6 +1214,15 @@ class ChainMixin:
                     return str(pid()) if callable(pid) else (getattr(r, "role", None) or "")
             return ""
 
+        def _rb4_case(vulnerability_class, exchange):
+            """The case _apply binds a graph-loop confirmation to."""
+            check_id = _rb4_canon(vulnerability_class or "") or (vulnerability_class or "")
+            template_id = evidence._short(
+                (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
+            return evidence.TestCaseRef.make(
+                run_id=_rb4_run_id, request_template_id=template_id,
+                check_id=check_id, principal_id=_rb4_principal_for(exchange))
+
         async def _apply(finding, res, leg, floor, exchange):
             # I04: an unconfirmed check that leaves a human-verifiable candidate
             # puts its copy-ready steps in the finding's next step.
@@ -874,6 +1246,8 @@ class ChainMixin:
                 # here), and until now it stamped confirmation ONLY into the
                 # free-text evidence string, recoverable only by regex.
                 finding["confirmed_by_leg"] = leg.replace("-", "_")
+                if getattr(res, "header_fingerprint", ""):
+                    finding["header_fingerprint"] = res.header_fingerprint   # E2: issue grouping
                 # RB-4/INV-2: route this GENUINE confirmation through the SAME
                 # proof persistence + evidence_ledger emission PASS1's
                 # _validate_findings uses (ConfirmMixin._persist_confirmation_proof)
@@ -885,19 +1259,13 @@ class ChainMixin:
                 # -- a proof/ledger hiccup must never sink the graph loop or alter
                 # the confirmation this function already decided above.
                 try:
-                    check_id = (_rb4_canon(finding.get("vulnerability_class") or "")
-                               or (finding.get("vulnerability_class") or ""))
-                    template_id = evidence._short(
-                        (exchange.method or "").upper(), exchange.url or "",
-                        exchange.request_body or "")
-                    case = evidence.TestCaseRef.make(
-                        run_id=_rb4_run_id, request_template_id=template_id,
-                        check_id=check_id, principal_id=_rb4_principal_for(exchange))
+                    case = _rb4_case(finding.get("vulnerability_class") or "", exchange)
                     validator_name = leg.replace("-", "_")
                     ok, proof_dict, reason = await self._persist_confirmation_proof(
                         case=case, validator_name=validator_name,
                         status=res.status, confirmed=res.confirmed,
-                        observed_result=(res.summary or res.evidence or "")[:500],
+                        observed_result=observed_result_of(res),
+                        proof_artifacts=proof_artifact_kwargs(res),
                         finding_ref=case.case_id,
                         ledger_summary=(f"{validator_name}: {res.status} (confirmed)"
                                         + (f" -- {res.summary}" if res.summary else "")),
@@ -1229,6 +1597,7 @@ class ChainMixin:
         # is unchanged. It sends nothing and confirms nothing. Best-effort: an
         # ASM failure must never sink the engagement (same contract as the
         # additive phases above).
+        _instr.phases.begin("business_context")
         _asm = None
         try:
             _asm = self._apply_business_context(state, _all_captured, roles)
@@ -1236,6 +1605,23 @@ class ChainMixin:
             log.warning("investigate_engagement: business-context pass failed: %s", e)
             _errors.append({"phase": "business_context", "error": f"{type(e).__name__}: {e}"})
 
+        # Ticket G: the graph -> experiment -> workflow -> proof -> graph cycle for
+        # the business-context hypotheses. Default off (engagement.experiments);
+        # when off this returns None without a send. Best-effort like the passes
+        # around it: a failure is recorded as an "experiments" phase error.
+        if run_context is not None:
+            run_context.experiment_context = {"state": state, "asm": _asm, "base_url": base_url, "captured": _all_captured}
+        _instr.phases.begin("experiments")
+        _experiments = None
+        try:
+            _experiments = await self._run_experiments(
+                state, _asm, run_context, base_url=base_url, captured=_all_captured,
+                ownership=ownership)
+        except Exception as e:
+            log.warning("investigate_engagement: experiments phase failed: %s", e)
+            _errors.append({"phase": "experiments", "error": f"{type(e).__name__}: {e}"})
+
+        _instr.phases.begin("worklist")
         worklist_summary: dict = {}
 
         # Objective mode gets one deterministic pass over the real captured
@@ -1321,7 +1707,13 @@ class ChainMixin:
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
                 max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary,
-                stop_on_confirm=stop_on_confirm)
+                stop_on_confirm=stop_on_confirm, deadline=_investigation_deadline,
+                **_worklist_kwargs)
+            timed_out = (worklist_summary.get("skipped_by_reason") or {}).get("time_budget", 0)
+            if timed_out:
+                _errors.append({"phase": "worklist",
+                                "error": f"investigation time budget reached: {timed_out} "
+                                         "worklist node(s) not investigated"})
             return outs, [f for o in outs for f in o.get("findings_detail", [])]
 
         if _objective_outcomes:
@@ -1329,6 +1721,7 @@ class ChainMixin:
             all_findings = [f for o in outcomes for f in o["findings_detail"]]
         else:
             outcomes, all_findings = await _investigate(state, roles)
+            _journal_phase("worklist")
 
         # Phase 0.1 now runs after deterministic confirmation. Broad engagements
         # retain the full content review. Objective runners may stop once a
@@ -1339,15 +1732,32 @@ class ChainMixin:
             for o in outcomes
             for f in (o.get("findings_detail", []) or [])
         )
+        def _resume_report() -> dict:
+            """What this run took from the journal instead of running (E7); {} without one."""
+            if _journal is None:
+                return {}
+            _resumed_units["worklist"] = sum(1 for o in outcomes if o.get("resumed"))
+            _resumed_units["review"] = _review_summary.get("resumed", 0)
+            return {"resume": {"root_job_id": _journal.root_job_id, "resumed": _resuming,
+                               "resumed_units": dict(_resumed_units), "journal": _journal.stats()}}
+
         def _objective_result(stopped: bool) -> dict:
+            from harness.experiment import task_dispositions
             return {
+                "experiment_preflight": task_dispositions(state,run_context,
+                    enabled=bool(self._experiments_config().get('enabled',False)),
+                    max_runs=int(self._experiments_config().get('max_runs',4)),
+                    planner_enabled=bool(self._experiments_config().get('planner',False))),
+                **_resume_report(),
                 "summary": state.summary(),
-                "worklist": state.worklist(50),
+                "worklist": state.result_worklist(50),
                 "outcomes": outcomes,
                 "worklist_summary": worklist_summary,
                 "chains": [],
                 "chain_rounds": 0,
                 "application_semantic_model": _asm.to_dict() if _asm else None,
+                "experiments": _experiments,
+                "execution_registry": _exec_registry.stats(),
                 "coverage": {},
                 "workflows": workflow_results,
                 "task_graph": state.graph.to_dict(),
@@ -1357,8 +1767,10 @@ class ChainMixin:
                 "idor_candidates": rc.idor_candidates,
                 "idor_findings": rc.idor_findings,
                 "errors": _errors,
+                "review_stats": _review_stats,
                 "degraded": bool(_errors),
                 "stopped_on_confirmation": stopped,
+                "instrumentation": _instr.snapshot(),
             }
 
         if stop_on_confirm and _early_confirmed:
@@ -1374,15 +1786,20 @@ class ChainMixin:
             # negative result instead of silently changing the experiment into
             # an open-ended model review of unrelated vulnerability classes.
             return _objective_result(False)
+        _instr.phases.begin("capture_review")
+        # One review time budget covers this pass and every chain round's pass.
+        _review_deadline = (time.monotonic() + self.capture_review_seconds
+                            if self.capture_review_seconds > 0 else None)
+        if _investigation_deadline is not None:
+            _review_deadline = min(_review_deadline or _investigation_deadline,
+                                   _investigation_deadline)
         if not (stop_on_confirm and _early_confirmed):
             await review_captured_exchanges(
-                self, state, getattr(rc, "captured", None), run_context=run_context)
-            try:
-                if feature_caps:
-                    await review_captured_exchanges(
-                        self, state, feature_caps, run_context=run_context)
-            except NameError:
-                pass
+                self, state, _all_captured, run_context=run_context,
+                seen=_reviewed_captures, errors=_errors, stats=_review_stats,
+                max_reviews=self.capture_review_limit, deadline=_review_deadline,
+                **_review_kwargs)
+            _journal_phase("review")
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
         # credential (url -> {headers, body}), built from the real captured
@@ -1405,12 +1822,18 @@ class ChainMixin:
         except NameError:
             pass
 
+        _instr.phases.begin("chain_rounds")
         # Milestone C: link findings into escalation edges + composed chains, then
         # walk the closed loop -- re-test AS any credential a finding leaked.
         link = chain_linker.link_findings(state, all_findings, responses=_responses)
         chains = list(link["chain_findings"])
         creds, rounds, seen_ident = link["credential_caps"], 0, set()
         while creds and rounds < max_chain_rounds:
+            if _investigation_deadline is not None and time.monotonic() >= _investigation_deadline:
+                _errors.append({"phase": "chain_rounds",
+                                "error": f"investigation time budget reached: chain round "
+                                         f"{rounds + 1} of up to {max_chain_rounds} not started"})
+                break
             rounds += 1
             derived = [role_crawl.RoleSession(role="anonymous", headers={})]
             for c in creds:
@@ -1431,7 +1854,10 @@ class ChainMixin:
             outs2, new_findings = await _investigate(st2, derived)
             if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
                 await review_captured_exchanges(
-                    self, st2, getattr(rc2, "captured", None), run_context=run_context)
+                    self, st2, getattr(rc2, "captured", None), run_context=run_context,
+                    seen=_reviewed_captures, errors=_errors, stats=_review_stats,
+                    max_reviews=self.capture_review_limit, deadline=_review_deadline,
+                    **_review_kwargs)
             outcomes.extend(outs2)
             all_findings.extend(new_findings)
             # R19: merge the derived-identity state back into the primary state, so
@@ -1443,7 +1869,9 @@ class ChainMixin:
             link = chain_linker.link_findings(state, all_findings, responses=_responses)
             chains = list(link["chain_findings"])
             creds = link["credential_caps"]
+        _journal_phase("chain")
 
+        _instr.phases.begin("second_order")
         # Second-order auto-confirmation (V22 SQLi / V17 IDOR): actively run the
         # plant->trigger differential over each composed (A,B) pair. The plant is a
         # mutating write, so this is gated on allow_mutating_replay; inert by
@@ -1600,9 +2028,26 @@ class ChainMixin:
         # tested and why" is answerable. `investigated_keys` only phrases the skip
         # reason for legs that were never recorded as executed; it never infers a
         # not_detected. The coverage-driver path records live leg outcomes cell-by-cell.
+        _instr.phases.begin("coverage_drive")
+        _requests_before_coverage = getattr(_run_budget, "used", None)
+        if _coverage_hold:
+            _run_budget.release_hold()
+        _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds
+                              if self.coverage_drive_seconds > 0 else None)
         coverage: dict = {}
+        _prerequisite_blocks: dict = {}   # (endpoint, identity) -> grouped entry (E5b)
         try:
             from harness import coverage_tracker
+            # E7: a caller's checkpoint wins; otherwise the journal's, when an earlier attempt
+            # got far enough to write one. It is handed back every N legs of the drive.
+            _coverage_kwargs: dict = {}
+            if _journal is not None:
+                _coverage_kwargs = {"on_checkpoint": lambda cp: _journal_put("coverage:checkpoint", cp)}
+                _stored_checkpoint = (_journal_read(lambda: _journal.get("coverage:checkpoint"), None)
+                                      if _resuming and coverage_checkpoint is None else None)
+                if _stored_checkpoint is not None:
+                    coverage_checkpoint = _stored_checkpoint
+                    _resumed_units["coverage_checkpoint"] = True
             investigated_paths = {o.get("path") for o in outcomes if o.get("path")}
             investigated_keys = {k for k in state.endpoints
                                  if k.split(" ", 1)[-1] in investigated_paths}
@@ -1630,6 +2075,26 @@ class ChainMixin:
                 _sqlmap_inst = self.validator_registry.validators.get("sqlmap")
                 if _sqlmap_inst is not None:
                     _val_by_conf["sqlmap"] = _sqlmap_inst
+                # These registered validators have check-specific oracles. Do not
+                # wire generic recon/crypto here: their aggregate verdict cannot
+                # establish each individual header, metadata, method or TLS check.
+                for name in ("csp", "cors", "header_injection",
+                             "http_request_smuggling", "race_condition"):
+                    registered = self.validator_registry.validators.get(name)
+                    if registered is not None:
+                        _val_by_conf[name] = self.validator_registry.bind_run_context(
+                            [registered], run_context)[0]
+                # An explicit disabled setting also applies to locally assembled
+                # legs. Never advertise an unavailable validator as executable.
+                # cross_identity is the exception: its flag arms the registry's
+                # tester-fed instance (off in the committed config), while this leg
+                # is built above from the engagement's own identities whatever that
+                # flag says. Honouring it here dropped IDOR/BOLA from every drive.
+                _validator_config = self.config.get("validators", {})
+                _val_by_conf = {name: validator for name, validator in _val_by_conf.items()
+                                if _validator_config.get("enabled", True)
+                                and (name == "cross_identity"
+                                     or _validator_config.get(name, {}).get("enabled", True))}
                 # Key headers by DURABLE PRINCIPAL id (R02), matching the coverage
                 # identity, so two same-role accounts don't collapse/overwrite.
                 def _pid(r):
@@ -1637,28 +2102,68 @@ class ChainMixin:
                     return str(p()) if callable(p) else (getattr(r, "role", None) or "anonymous")
                 _role_headers = {_pid(r): dict(r.headers or {}) for r in roles}
 
-                async def _run_leg_core(identity, method, path, check, case_key=None):
+                def _capability_decision(check, exchange):
+                    resolve = getattr(self.validator_registry, "capability_for_check", None)
+                    if resolve is None:
+                        # Explicit compatibility for legacy injected registries.
+                        return {"status": "ready", "reason_code": "legacy_adapter",
+                                "reason": "legacy caller capability adapter",
+                                "finding_class": check.vulnerability_class,
+                                "mechanism_id": "legacy:" + check.confirmation}
+                    return resolve(check, exchange, run_context=run_context,
+                                   validator=_val_by_conf.get(check.confirmation, False))
+
+                def _known_capture_exchange(identity, node):
+                    # Readiness must never turn an unresolved route placeholder
+                    # into an allegedly observed id=1 (or repeat a single id for
+                    # several unrelated placeholders).
+                    template = node.get("template") or {}
+                    slots = (node.get("path") or "").count("{id}")
+                    ids = template.get("path_ids") or []
+                    complete = len(ids) == slots and all(v is not None and str(v) not in ("", "{id}") for v in ids)
+                    legacy = slots == 1 and template.get("object_id") is not None and str(template["object_id"]) not in ("", "{id}")
+                    if slots and not complete and not legacy:
+                        return None, {"status": "needs_prerequisite", "reason_code": "missing_object_id",
+                                      "reason": "route placeholders have no complete observed object identifiers", "finding_class": None}
+                    if legacy:
+                        node = dict(node, template=dict(template, object_id=str(template["object_id"])))
+                    return worklist_investigator._seed_exchange(
+                        base_url, node, _role_headers.get(identity, {}), ""), None
+
+                async def _run_captured_leg(identity, method, path, check, case_key=None, node=None):
                     validator = _val_by_conf.get(check.confirmation)
                     if validator is None:
                         return None  # e.g. sqlmap/race_condition -- not driven here
-                    node = {"method": method, "path": path}
+                    node = node or {"method": method, "path": path}
                     # R05: replay the captured template for this endpoint if we have
                     # one, so the coverage-driven leg sends the real shape too.
                     _ep_obj = state.endpoints.get(f"{method} {path}")
-                    if _ep_obj is not None and getattr(_ep_obj, "template", None):
+                    if "template" not in node and _ep_obj is not None and getattr(_ep_obj, "template", None):
                         node["template"] = _ep_obj.template
-                    ex = worklist_investigator._seed_exchange(
-                        base_url, node, _role_headers.get(identity, {}), "1")
+                    ex, problem = _known_capture_exchange(identity, node)
+                    capability = problem or _capability_decision(check, ex)
+                    if capability["status"] != "ready":
+                        from harness.validators.base import ValidationResult
+                        status = ("blocked" if capability["status"] == "policy_denied" else
+                                  "inconclusive" if capability["status"] == "needs_prerequisite" else "skipped")
+                        return ValidationResult(check.confirmation, status, check.vulnerability_class,
+                            summary=f"{capability['reason_code']}: {capability['reason']}")
+                    try:
+                        leg_case = self._coverage_case(identity=identity, check=check, exchange=ex,
+                                                       case_key=case_key, run_context=run_context)
+                    except Exception:
+                        leg_case = None
                     res = await _cached_validate(
-                        validator, _as_finding({"vulnerability_class": check.vulnerability_class},
-                                               check.vulnerability_class), ex)
+                        validator, _as_finding({"vulnerability_class": capability["finding_class"]},
+                                               capability["finding_class"]), ex,
+                        case_ref=leg_case.case_id if leg_case is not None else "")
                     # T05/R26: bind a case-bound structured proof to this driven leg
                     # (concrete parameter case when the driver fanned out to one),
                     # so a coverage-driven confirmation carries a stable case id to
                     # the T01 proof store -- not just a matrix cell.
                     proof_id, case_id = await self._coverage_proof(
                         identity=identity, check=check, exchange=ex, result=res,
-                        case_key=case_key, run_context=run_context)
+                        case_key=case_key, run_context=run_context, case=leg_case)
                     # R06: a coverage-driven CONFIRMATION enters the SAME finding
                     # pipeline as every other confirmed finding -- ingested into
                     # `state` (=> worklist, summary, report, persistence, chain
@@ -1672,6 +2177,104 @@ class ChainMixin:
                         all_findings.append(cf)
                     return res
 
+                # E5b: whether each (endpoint, identity) has a request to replay,
+                # worked out ONCE here rather than per check. Only requests that were
+                # observed as that identity count; nothing is built for an identity
+                # that was never probed or captured on the endpoint.
+                from harness.engagement import capture_identity_key, replayable_variants
+                _identity_role = {_pid(r): r.role for r in roles}
+                _replayable = {
+                    (ep_key, identity): replayable_variants(ep, capture_identity_key(headers))
+                    for ep_key, ep in state.endpoints.items() if ep.capture_variants
+                    for identity, headers in _role_headers.items()}
+
+                def _captured_readiness(identity, method, path, check):
+                    if check.id == "WSTG-CRYP-01":
+                        return _capability_decision(check, HttpExchange(url=base_url, method="GET"))
+                    preliminary = _capability_decision(check, None)
+                    if preliminary["status"] in {"unsupported", "disabled", "policy_denied"}:
+                        return preliminary
+                    ep_key = f"{method} {path}"
+                    ep = state.endpoints.get(ep_key)
+                    if ep is not None and ep.capture_variants:
+                        variants = _replayable.get((ep_key, identity))
+                        if variants is None:
+                            variants = replayable_variants(ep, capture_identity_key(_role_headers.get(identity, {})))
+                        if not variants:
+                            role = _identity_role.get(identity, identity)
+                            block = _prerequisite_blocks.setdefault((ep_key, identity), {
+                                "endpoint": ep_key, "identity": identity,
+                                "missing": "no request captured as this identity",
+                                "action": "capture this request signed in as " + role
+                                          + " (or add it to the role crawl seed)",
+                                "checks_affected": 0})
+                            block["checks_affected"] += 1
+                            return {"status": "needs_prerequisite", "reason_code": "missing_principal",
+                                    "reason": "capture the request as this identity", "finding_class": None}
+                        selected_roles = [r for r in roles if _pid(r) == identity]
+                        nodes = worklist_investigator.captured_nodes(
+                            dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles,
+                            include_probes=True)
+                    else:
+                        nodes = [{"method": method, "path": path,
+                                  "template": getattr(ep, "template", {}) if ep else {}}]
+                    decisions = []
+                    for node in nodes:
+                        problem = worklist_investigator.capture_problem(node) if node.get("capture") else None
+                        if problem:
+                            decisions.append({"status": "needs_prerequisite", "reason_code": problem.split(":",1)[0],
+                                              "reason": "supply a complete authorized capture", "finding_class": None})
+                            continue
+                        exchange, problem = _known_capture_exchange(identity, node)
+                        decision = problem or _capability_decision(check, exchange)
+                        if decision["status"] == "ready":
+                            return decision
+                        decisions.append(decision)
+                    return decisions[0] if decisions else preliminary
+
+                async def _run_leg_core(identity, method, path, check, case_key=None):
+                    ep_key = f"{method} {path}"
+                    ep = state.endpoints.get(ep_key)
+                    if ep is None or not ep.capture_variants:
+                        return await _run_captured_leg(identity, method, path, check, case_key)
+                    variants = _replayable.get((ep_key, identity))
+                    if variants is None:
+                        variants = replayable_variants(
+                            ep, capture_identity_key(_role_headers.get(identity, {})))
+                    if not variants:
+                        # The cell's reason stays "missing_principal"; the pair is
+                        # reported once, with how many checks it blocked.
+                        role = _identity_role.get(identity, identity)
+                        block = _prerequisite_blocks.setdefault((ep_key, identity), {
+                            "endpoint": ep_key, "identity": identity,
+                            "missing": "no request captured as this identity",
+                            "action": ("capture this request with no credentials"
+                                       if role == "anonymous" else
+                                       f"capture this request while signed in as {role}")
+                                      + " (or add it to the role crawl seed)",
+                            "checks_affected": 0})
+                        block["checks_affected"] += 1
+                        return _VR(check.confirmation, "inconclusive", check.vulnerability_class,
+                                   summary="missing_principal: capture the request as this identity")
+                    selected_roles = [r for r in roles if _pid(r) == identity]
+                    outcomes = []
+                    for node in worklist_investigator.captured_nodes(
+                            dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles,
+                            include_probes=True):
+                        problem = worklist_investigator.capture_problem(node)
+                        if problem:
+                            outcomes.append(_VR(check.confirmation, "inconclusive", check.vulnerability_class,
+                                                summary=problem + ": supply a complete authorized capture"))
+                        else:
+                            outcomes.append(await _run_captured_leg(identity, method, path, check, case_key, node))
+                    # Every proof instance was recorded above. A positive instance
+                    # does not turn another unanswered variant into a clean cell.
+                    incomplete = [r for r in outcomes if r is None or r.status not in
+                                  {"confirmed", "not_confirmed", "controlled_negative", "safe"}]
+                    if incomplete:
+                        return next((r for r in incomplete if r is not None), None)
+                    return next((r for r in outcomes if r.confirmed), outcomes[0] if outcomes else None)
+
                 async def _run_leg(identity, method, path, check):
                     return await _run_leg_core(identity, method, path, check, None)
 
@@ -1680,13 +2283,27 @@ class ChainMixin:
                     # the endpoint's concrete inputs so a confirmation binds to the
                     # exact parameter case and un-run inputs stay visibly pending.
                     coverage = await coverage_tracker.build_coverage_cases_driven(
-                        state, roles, _run_leg_core, budget=self.coverage_leg_budget,
+                        state, roles, _run_leg_core, budget=self.coverage_leg_budget, readiness=_captured_readiness,
                         per_cell_case_budget=self.coverage_case_budget,
-                        driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys)
+                        driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
+                        checkpoint=coverage_checkpoint,
+                        context_key=coverage_tracker.resume_context_key(self.config),
+                        deadline=_coverage_deadline, **_coverage_kwargs)
                 else:
                     coverage = await coverage_tracker.build_coverage_driven(
-                        state, roles, _run_leg, budget=self.coverage_leg_budget,
-                        driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys)
+                        state, roles, _run_leg, budget=self.coverage_leg_budget, readiness=_captured_readiness,
+                        driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
+                        checkpoint=coverage_checkpoint,
+                        context_key=coverage_tracker.resume_context_key(self.config),
+                        deadline=_coverage_deadline, **_coverage_kwargs)
+                if coverage.get("checkpoint"):
+                    _journal_put("coverage:checkpoint", coverage["checkpoint"])
+                    _journal_phase("coverage")
+                if coverage.get("drive_stopped_by") == "time budget":
+                    _errors.append({"phase": "coverage_drive",
+                                    "error": "coverage drive time budget reached: "
+                                             f"{coverage.get('queued_not_attempted', 0)} queued "
+                                             "leg(s) not attempted"})
             else:
                 coverage = coverage_tracker.build_coverage(state, roles,
                                                            investigated_keys=investigated_keys)
@@ -1694,6 +2311,19 @@ class ChainMixin:
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
 
+        from harness.experiment import project_proofs
+        try:
+            _experiment_projection = project_proofs(state, run_context)
+        except Exception as exc:
+            _errors.append({"phase":"experiment_projection", "error":type(exc).__name__})
+            _experiment_projection = {"cases":[{"status":"unresolved", "reason":"experiment projection unavailable"}], "findings":[]}
+        coverage["experiment_cases"] = _experiment_projection["cases"]
+        from harness.experiment import task_dispositions
+        _experiment_dispositions = task_dispositions(state, run_context,
+            enabled=bool(self._experiments_config().get('enabled', False)),
+            max_runs=int(self._experiments_config().get('max_runs', 4)),
+            planner_enabled=bool(self._experiments_config().get('planner',False)))
+        _instr.phases.begin("finalise")
         # RB-5/INV-3: re-link chains over the FINAL findings set. The passes at
         # ~741/771 above (kept as-is, not removed) compute `chains` from
         # `all_findings` as it stood BEFORE the second-order auto-confirm phase
@@ -1731,9 +2361,20 @@ class ChainMixin:
         except Exception as e:
             log.debug("investigate_engagement: circuit breaker check failed: %s", e)
 
+        from harness.assessment_health import assessment_health
+        try:
+            from harness.engagement import persist_surface
+            await asyncio.to_thread(persist_surface, state)
+        except Exception as exc:
+            _errors.append({"phase": "surface_persistence", "error": type(exc).__name__})
+        health = assessment_health(coverage, _errors)
         return {
+            "assessment": health,
+            "findings": [dict(f, url=f.get("url") or ep.path, method=ep.method)
+                         for ep in state.endpoints.values() for f in ep.findings] + _experiment_projection["findings"],
+            **_resume_report(),
             "summary": state.summary(),
-            "worklist": state.worklist(50),
+            "worklist": state.result_worklist(50),
             "outcomes": outcomes,
             # 2026-09-17 coverage-recovery plan, Step 2: eligible/investigated
             # counts + a named, reasoned list of every eligible node this run did
@@ -1748,7 +2389,26 @@ class ChainMixin:
             # inferred roles/objects/workflows/value-flows/sinks and the ranked
             # chaining hypotheses that drove the re-ranking.
             "application_semantic_model": _asm.to_dict() if _asm else None,
+            "experiments": _experiments,
+            "experiment_preflight": _experiment_dispositions,
+            # E4: how many validator executions the run's registry served without
+            # running again, and the requests that saved (by validator).
+            "execution_registry": _exec_registry.stats(),
             "coverage": coverage,
+            # E5b: each (endpoint, identity) the coverage drive could not replay
+            # because no request was observed as that identity, once, with the
+            # number of checks it blocked and what to supply.
+            "prerequisite_blocks": sorted(_prerequisite_blocks.values(),
+                                          key=lambda b: (b["endpoint"], b["identity"])),
+            # Stage reservations in effect: requests withheld for the coverage drive,
+            # what the earlier stages spent, and the stage time bounds (0 = none).
+            "stage_budgets": {"coverage_request_reserve": _coverage_hold,
+                              "requests_before_coverage": _requests_before_coverage,
+                              "requests_at_end": getattr(_run_budget, "used", None),
+                              "outer_wall_seconds": None, "outer_wall_owner": "caller",
+                              "capture_review_seconds": self.capture_review_seconds,
+                              "investigation_seconds": self.investigation_seconds,
+                              "coverage_drive_seconds": self.coverage_drive_seconds},
             "workflows": workflow_results,
             "task_graph": state.graph.to_dict(),
             "ready_tasks": state.pending(),
@@ -1759,5 +2419,7 @@ class ChainMixin:
             # R30: operational failures are surfaced, not swallowed -- a run that
             # skipped a phase is declared degraded rather than presented as clean.
             "errors": _errors,
-            "degraded": bool(_errors),
+            "review_stats": _review_stats,
+            "degraded": bool(_errors) or health["status"] == "incomplete",
+            "instrumentation": _instr.snapshot(),
         }

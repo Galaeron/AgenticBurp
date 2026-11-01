@@ -27,6 +27,8 @@ opt-in (`submit_forms`) and still pass through the caller's gated client.
 """
 from __future__ import annotations
 
+from harness import scope_lock
+
 import json
 import logging
 import re
@@ -325,7 +327,7 @@ async def crawl_features(
     seen_form: set[tuple] = set()
 
     async def _do(method, url, body, extra_headers=None):
-        if allowed_hosts and (urlsplit(url).hostname or "") not in allowed_hosts:
+        if not scope_lock.host_in_scope(url, allowed_hosts):
             return None
         try:
             request_headers = dict(headers or {})

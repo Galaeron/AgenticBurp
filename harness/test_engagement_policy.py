@@ -82,7 +82,9 @@ class EnumerationSafeDefaultsTests(unittest.TestCase):
             "engagement_driver_execute", "engagement_max_escalations",
             "engagement_feature_crawl", "engagement_coverage_drive",
             "coverage_leg_budget", "engagement_coverage_case_drive",
-            "coverage_case_budget",
+            "coverage_case_budget", "capture_review_limit",
+            "capture_review_seconds", "coverage_request_reserve",
+            "investigation_seconds", "coverage_drive_seconds",
         }
         self.assertEqual(set(d.keys()), expected_fields)
 
@@ -115,6 +117,14 @@ class ParityTests(unittest.TestCase):
             coverage_leg_budget=int(eng_cfg.get("coverage_leg_budget", 80)),
             engagement_coverage_case_drive=bool(eng_cfg.get("coverage_drive_cases", False)),
             coverage_case_budget=int(eng_cfg.get("coverage_case_budget", 8)),
+            # Added after the refactor: the former hard-coded 200-review cap,
+            # and no review time bound unless configured.
+            capture_review_limit=int(eng_cfg.get("capture_review_limit", 200)),
+            capture_review_seconds=float(eng_cfg.get("capture_review_seconds", 0)),
+            # Added after the refactor: stage reservations, none by default.
+            coverage_request_reserve=int(eng_cfg.get("coverage_request_reserve", 0)),
+            investigation_seconds=float(eng_cfg.get("investigation_seconds", 0)),
+            coverage_drive_seconds=float(eng_cfg.get("coverage_drive_seconds", 0)),
         )
 
     def test_parity_on_committed_config(self):
@@ -145,6 +155,11 @@ class ParityTests(unittest.TestCase):
                 "coverage_leg_budget": 5,
                 "coverage_drive_cases": True,
                 "coverage_case_budget": 3,
+                "capture_review_limit": "40",
+                "capture_review_seconds": "1800",
+                "coverage_request_reserve": "1500",
+                "investigation_seconds": "3600",
+                "coverage_drive_seconds": "900",
             },
         }
         policy = EngagementPolicy.from_config(config)
@@ -156,6 +171,11 @@ class ParityTests(unittest.TestCase):
         self.assertEqual(policy.adaptive_respin_max_rounds, 3)
         self.assertTrue(policy.engagement_driver_execute)
         self.assertEqual(policy.coverage_case_budget, 3)
+        self.assertEqual(policy.capture_review_limit, 40)
+        self.assertEqual(policy.capture_review_seconds, 1800.0)
+        self.assertEqual(policy.coverage_request_reserve, 1500)
+        self.assertEqual(policy.investigation_seconds, 3600.0)
+        self.assertEqual(policy.coverage_drive_seconds, 900.0)
 
     def test_parity_missing_engagement_section_entirely(self):
         """engagement: (present but empty/None) must behave like the old

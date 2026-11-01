@@ -83,13 +83,14 @@ class XxeValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None):
+                 collaborator=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
 
     def collab(self):
-        return self._collab or _collab.shared()
+        return _collab.resolve(self._collab)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         return super().applies(finding, exchange) or _looks_xml(exchange)
@@ -98,9 +99,9 @@ class XxeValidator(Validator):
         return ValidationResult(self.name, "skipped", "xxe", summary=why)
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
-        host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
-            return self._skip(f"host {host!r} out of scope")
+        from harness.scope_lock import host_in_scope
+        if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
+            return self._skip("target origin is out of scope")
         if not _looks_xml(exchange):
             return self._skip("endpoint does not take XML -- nothing to inject an external entity into")
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
@@ -108,6 +109,8 @@ class XxeValidator(Validator):
         headers.setdefault("Content-Type", "application/xml")
         method = (exchange.method or "POST").upper()
 
+        # Bind and validate configuration before even the in-band probe.
+        collab = self.collab() if self.oob_callbacks_enabled else None
         # 1) In-band file-read proof first: inject a SYSTEM entity for a
         #    world-readable file and detect its signature reflected in the
         #    response. Definitive, needs no collaborator, and is a read-only PoC.
@@ -135,7 +138,13 @@ class XxeValidator(Validator):
                           f"contents are redacted here; the read is non-destructive."))
 
         # 2) Out-of-band proof: catches BLIND XXE (no reflection) via a collaborator.
+        if not self.oob_callbacks_enabled:
+            return ValidationResult(self.name, "inconclusive", "xxe",
+                                    summary="Check incomplete: callback probes disabled by policy")
         collab = self.collab()
+        if collab is None:
+            return ValidationResult(self.name, "inconclusive", "xxe",
+                                    summary="In-band check did not confirm; callback probes disabled by policy")
         token = collab.token()
         try:
             await global_throttle.acquire()
@@ -155,6 +164,9 @@ class XxeValidator(Validator):
                         "attacker-controlled URL out-of-band.",
                 evidence=f"POSTed an XML document declaring an external entity pointing at a unique "
                          f"collaborator URL to {exchange.url}; the parser called back to it (blind-safe proof).")
+        unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "xxe")
+        if unavailable is not None:
+            return unavailable
         return ValidationResult(
             self.name, "not_confirmed", "xxe", confidence=0.0, confirmed=False,
             summary="No out-of-band callback observed -- external entities appear disabled",

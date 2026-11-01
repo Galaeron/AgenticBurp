@@ -92,6 +92,21 @@ _NOT_TESTED_REASONS = {
 }
 
 
+ATTEMPT_SCHEMA_VERSION = 2
+
+
+def _merge_facts(*groups) -> tuple:
+    """Union of attempt facts (dicts by id, or ids), first-seen order."""
+    out, seen = [], set()
+    for group in groups:
+        for item in group or ():
+            key = item.get("id") if isinstance(item, dict) else item
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+    return tuple(out)
+
+
 @dataclass
 class CellResult:
     """One cell in the coverage matrix: (identity, endpoint, check).
@@ -105,7 +120,15 @@ class CellResult:
     `drive_coverage_cases`); False for a purely agent-attributed result
     (`record_findings_from_state`). A validator NAME is provenance, not
     execution evidence -- callers that need "did this actually run" must
-    read `executed`, never infer it from `validator` being truthy."""
+    read `executed`, never infer it from `validator` being truthy.
+
+    Batch 02 attempt facts, append-only and independent of the verdict:
+    `attempts` are the fresh dispatches that sent requests for this cell in
+    this run, each {"id": stable attempt id, "sent": answered run-transport
+    sends, or None when unknown};
+    `referenced_attempts` are ids of prior executions this verdict reuses
+    (an execution-registry hit, a checkpoint resume) with zero new sends.
+    A verdict label never erases them."""
     status: CellStatus = CellStatus.PENDING
     reason: str = ""
     severity: str | None = None
@@ -113,6 +136,8 @@ class CellResult:
     validator: str | None = None
     evidence: str | None = None
     executed: bool = False
+    attempts: tuple = ()
+    referenced_attempts: tuple = ()
 
     def to_dict(self) -> dict:
         d: dict = {"status": self.status.value, "reason": self.reason}
@@ -126,6 +151,10 @@ class CellResult:
             d["evidence"] = self.evidence
         if self.executed:
             d["executed"] = self.executed
+        if self.attempts:
+            d["attempts"] = [dict(a) for a in self.attempts]
+        if self.referenced_attempts:
+            d["referenced_attempts"] = list(self.referenced_attempts)
         return d
 
     @classmethod
@@ -142,6 +171,9 @@ class CellResult:
             validator=d.get("validator"),
             evidence=d.get("evidence"),
             executed=bool(d.get("executed", False)),
+            # Legacy (pre-v2) cells carry no attempt facts: read as none.
+            attempts=tuple(dict(a) for a in d.get("attempts") or ()),
+            referenced_attempts=tuple(d.get("referenced_attempts") or ()),
         )
 
 
@@ -467,6 +499,7 @@ class Check:
     academy_url: str = ""                # optional full Academy topic URL (scenario reference)
     wstg_version: str = "4.2"            # the WSTG release a genuine WSTG id is anchored to
     external_refs: tuple[ExternalRef, ...] = ()   # independently-verified external sources
+    origin_scoped: bool = False  # A transport/deployment fact, not a response policy.
 
     def applies(self, endpoint: dict) -> tuple[bool, str]:
         """Deterministic applicability + the rationale for WHY it applies or doesn't."""
@@ -500,7 +533,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
     Check("WSTG-CRYP-01", "TLS/SSL configuration", Phase.DOMAIN,
           "crypto", _always_applicable, "crypto",
           "Verify TLS versions, cipher suites, certificate validity",
-          "Server-side TLS"),
+          "Server-side TLS", origin_scoped=True),
     Check("WSTG-CONF-07", "HTTP Strict Transport Security", Phase.DOMAIN,
           "misconfig", _always_applicable, "crypto",
           "Check HSTS header presence and configuration"),
@@ -536,7 +569,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
                           "4-Web_Application_Security_Testing/"
                           "02-Configuration_and_Deployment_Management_Testing/09-Test_File_Permission",
                           "Test File Permission", version="4.2"),
-          )),
+          ), origin_scoped=True),
 
     # === ENDPOINT phase ===
     Check("WSTG-ATHZ-04", "IDOR / Broken Object-Level Authorization", Phase.ENDPOINT,
@@ -572,7 +605,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "session_fixation", _has_auth_endpoint, "auth_sequence",
           "Test if session tokens are regenerated after login"),
     Check("WSTG-BUSL-09", "File upload", Phase.ENDPOINT,
-          "file_upload", _has_file_path_segment, "manual",
+          "file_upload", _has_file_path_segment, "file_upload",
           "Test file type/size/content validation on upload endpoints",
           "File upload vulnerabilities"),
     Check("WSTG-ATHZ-01", "Path traversal", Phase.ENDPOINT,
@@ -654,7 +687,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "Test redirect parameters for off-site redirection",
           "Open redirection"),
     Check("WSTG-INPV-06", "NoSQL injection", Phase.PARAMETER,
-          "nosql", _accepts_input, "agent",
+          "nosql", _accepts_input, "nosql",
           "Test for NoSQL query manipulation",
           "NoSQL injection"),
     Check("WSTG-CRYP-04", "JWT weaknesses", Phase.PARAMETER,
@@ -735,19 +768,32 @@ class CoverageMatrix:
     def record(self, identity: str, endpoint_key: str, check_id: str, *,
                status: CellStatus, reason: str = "", severity: str | None = None,
                confidence: float | None = None, validator: str | None = None,
-               evidence: str | None = None, executed: bool = False) -> CellResult:
+               evidence: str | None = None, executed: bool = False,
+               attempts=(), referenced_attempts=()) -> CellResult:
         """Record a check result. Does NOT overwrite a CONFIRMED cell.
 
         `executed` (R07) must be True only when a deterministic leg actually
         dispatched a request/comparison for this cell -- callers recording a
-        purely agent-attributed result (no leg ran) must leave it False."""
+        purely agent-attributed result (no leg ran) must leave it False.
+        Attempt facts (batch 02) are merged even where the verdict is locked,
+        and a later record never clears an earlier execution."""
         key = (identity, endpoint_key, check_id)
         existing = self._cells.get(key)
-        if existing and existing.status == CellStatus.CONFIRMED:
+        if existing and (existing.reason.startswith("origin_scoped:")
+                         or existing.status == CellStatus.CONFIRMED):
+            # Endpoint findings cannot recreate a host-level denominator, and a
+            # confirmed verdict stays; only the attempt facts are added.
+            existing.executed = existing.executed or executed
+            existing.attempts = _merge_facts(existing.attempts, attempts)
+            existing.referenced_attempts = _merge_facts(
+                existing.referenced_attempts, referenced_attempts)
             return existing
         result = CellResult(status=status, reason=reason, severity=severity,
                             confidence=confidence, validator=validator, evidence=evidence,
-                            executed=executed)
+                            executed=executed or bool(existing and existing.executed),
+                            attempts=_merge_facts(existing and existing.attempts, attempts),
+                            referenced_attempts=_merge_facts(
+                                existing and existing.referenced_attempts, referenced_attempts))
         self._cells[key] = result
         return result
 
@@ -791,7 +837,7 @@ class CoverageMatrix:
                     case_key: CaseKey, *, status: CellStatus, reason: str = "",
                     severity: str | None = None, confidence: float | None = None,
                     validator: str | None = None, evidence: str | None = None,
-                    executed: bool = False) -> CellResult:
+                    executed: bool = False, attempts=(), referenced_attempts=()) -> CellResult:
         """Record the outcome of ONE concrete case, then re-aggregate its parent
         cell. A CONFIRMED case is never overwritten (same monotonicity as `record`).
         Registers the case if `expand_cases` had not already."""
@@ -799,12 +845,19 @@ class CoverageMatrix:
         bucket = self._cases.setdefault(key, {})
         cid = case_key.coord_id()
         existing = bucket.get(cid)
-        if existing and existing[1].status == CellStatus.CONFIRMED:
+        prior = existing[1] if existing else None
+        if prior and prior.status == CellStatus.CONFIRMED:
+            prior.executed = prior.executed or executed
+            prior.attempts = _merge_facts(prior.attempts, attempts)
+            prior.referenced_attempts = _merge_facts(prior.referenced_attempts, referenced_attempts)
             self._aggregate_cell(key)
-            return existing[1]
+            return prior
         result = CellResult(status=status, reason=reason, severity=severity,
                             confidence=confidence, validator=validator, evidence=evidence,
-                            executed=executed)
+                            executed=executed or bool(prior and prior.executed),
+                            attempts=_merge_facts(prior and prior.attempts, attempts),
+                            referenced_attempts=_merge_facts(
+                                prior and prior.referenced_attempts, referenced_attempts))
         # Preserve the original replay spelling if the caller passed a bare key.
         stored_key = existing[0] if existing else case_key
         bucket[cid] = (stored_key, result)
@@ -872,8 +925,14 @@ class CoverageMatrix:
             agg, reason = CellStatus.ERROR, "a case attempt errored -- endpoint not marked complete"
         else:
             agg, reason = CellStatus.PENDING, "cases awaiting attempt"
-        # Never downgrade a locked CONFIRMED cell.
+        attempts = _merge_facts(prior and prior.attempts,
+                                *(r.attempts for _ck, r in bucket.values()))
+        referenced = _merge_facts(prior and prior.referenced_attempts,
+                                  *(r.referenced_attempts for _ck, r in bucket.values()))
+        # Never downgrade a locked CONFIRMED cell (its attempt facts still grow).
         if prior and prior.status == CellStatus.CONFIRMED and agg != CellStatus.CONFIRMED:
+            prior.executed = prior.executed or any(r.executed for _ck, r in bucket.values())
+            prior.attempts, prior.referenced_attempts = attempts, referenced
             return
         # R07: carry the representative child's executed/validator signal into
         # the rolled-up parent cell, so a matrix reader iterating top-level
@@ -881,17 +940,19 @@ class CoverageMatrix:
         # actually came from an executed leg -- never defaulting to
         # executed=False just because the parent cell itself never called
         # `record()` directly.
-        rep_executed = False
+        # Execution is a fact of any child send, independent of the rolled-up
+        # verdict. Pending siblings and prior risk must not erase that fact.
+        rep_executed = any(r.executed for _ck, r in bucket.values()) or bool(
+            prior and prior.executed)
         rep_validator: str | None = None
         for _ck, r in bucket.values():
             if r.status == agg:
-                rep_executed = rep_executed or bool(r.executed)
                 rep_validator = rep_validator or r.validator
         if prior and prior.status == agg:
-            rep_executed = rep_executed or bool(prior.executed)
             rep_validator = rep_validator or prior.validator
         self._cells[key] = CellResult(status=agg, reason=reason, validator=rep_validator,
-                                      executed=rep_executed)
+                                      executed=rep_executed, attempts=attempts,
+                                      referenced_attempts=referenced)
 
     # --- queries ---
 
@@ -1048,6 +1109,10 @@ class CoverageMatrix:
                 ]
                 for (i, e, c), bucket in self._cases.items()
             }
+        # Batch 02: versioned only when attempt facts exist, so a legacy matrix
+        # round-trips unchanged; a reader without the key sees none.
+        if any(r.attempts or r.referenced_attempts for r in self._cells.values()):
+            out["attempt_schema_version"] = ATTEMPT_SCHEMA_VERSION
         return out
 
     @classmethod

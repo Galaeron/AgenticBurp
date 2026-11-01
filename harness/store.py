@@ -7,8 +7,10 @@ import json
 import contextvars
 import functools
 import hmac
+import os
 import re
 import secrets
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -439,13 +441,74 @@ CREATE TABLE IF NOT EXISTS observation_attributions (
 _CONNECT_MAX_ATTEMPTS = 12
 _CONNECT_RETRY_BASE_SLEEP = 0.02
 
+# E9: the setup above is about 58 statements, several of them write-lock takers
+# (+0.33 ms per connection), and it re-ran on EVERY _connect(). This process now
+# runs it once per database file. The key is the absolute path plus the file's
+# identity after setup -- (st_dev, st_ino, st_ctime_ns) so a deleted or recreated
+# file never matches, and PRAGMA schema_version so any DDL since (a table dropped
+# by a test, a migration by another process) makes the next connect run the
+# idempotent setup again. busy_timeout is per connection and is set every time;
+# WAL mode persists in the file.
+_INITIALISED: dict[str, tuple] = {}
+_INIT_LOCK = threading.Lock()
+_STATS_LOCK = threading.Lock()
+_CONNECT_STATS = {"connects": 0, "initialisations": 0, "skipped_initialisations": 0,
+                  "connect_ms": 0.0, "init_ms": 0.0, "max_connect_ms": 0.0}
+_SAVE_ENGAGEMENT_STATS = {"calls": 0, "bytes": 0, "ms": 0.0, "max_bytes": 0, "max_ms": 0.0}
+_ENGAGEMENT_WRITE = threading.local()   # bytes of the snapshot _write_engagement just stored
+
+
+def _db_identity(conn: sqlite3.Connection) -> tuple[str, tuple] | None:
+    """(absolute path, file identity) for the database `conn` is open on, or None
+    when it cannot be read (no file yet, in-memory, or locked mid-setup)."""
+    try:
+        st = os.stat(_DB_PATH)
+        version = conn.execute("PRAGMA schema_version").fetchone()[0]
+    except (OSError, sqlite3.Error):
+        return None
+    return os.path.abspath(_DB_PATH), (st.st_dev, st.st_ino, st.st_ctime_ns, version)
+
+
+def timing_snapshot() -> dict:
+    """Plain-data view of connection and snapshot-write timing (E9)."""
+    with _STATS_LOCK:
+        connect = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in _CONNECT_STATS.items()}
+        save = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in _SAVE_ENGAGEMENT_STATS.items()}
+    return {**connect, "save_engagement": save}
+
 
 def _connect() -> sqlite3.Connection:
+    started = time.perf_counter()
+    try:
+        return _connect_counted()
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        with _STATS_LOCK:
+            _CONNECT_STATS["connects"] += 1
+            _CONNECT_STATS["connect_ms"] += elapsed_ms
+            _CONNECT_STATS["max_connect_ms"] = max(_CONNECT_STATS["max_connect_ms"], elapsed_ms)
+
+
+def _connect_counted() -> sqlite3.Connection:
     last_exc: sqlite3.OperationalError | None = None
     for attempt in range(_CONNECT_MAX_ATTEMPTS):
         conn = sqlite3.connect(_DB_PATH, timeout=10.0)
         try:
+            identity = _db_identity(conn)
+            if identity is not None and _INITIALISED.get(identity[0]) == identity[1]:
+                conn.execute("PRAGMA busy_timeout=10000")
+                with _STATS_LOCK:
+                    _CONNECT_STATS["skipped_initialisations"] += 1
+                return conn
+            init_started = time.perf_counter()
             _initialise_connection(conn)
+            after = _db_identity(conn)
+            if after is not None:
+                with _INIT_LOCK:
+                    _INITIALISED[after[0]] = after[1]
+            with _STATS_LOCK:
+                _CONNECT_STATS["initialisations"] += 1
+                _CONNECT_STATS["init_ms"] += (time.perf_counter() - init_started) * 1000.0
             return conn
         except sqlite3.OperationalError as exc:
             conn.close()
@@ -1473,6 +1536,61 @@ def get_lineage_attempts(category: str, source_exchange_hash: str) -> list[dict]
         for r in rows
     ]
 
+
+# sqlmap is a deterministic tool whose entire purpose is to
+# independently confirm SQL injection -- excluding it here
+# directly contradicts the project's own "known vs rediscover"
+# principle (trust deterministic tools over LLM reasoning) for
+# the one capability that is MOST deterministic. Verified live:
+# sqlmap genuinely confirmed a real SQLi on OWASP Juice Shop's
+# login endpoint in this session: excluding it from ever setting
+# confirmed=True would have silently discarded that result.
+#
+# Expanded this session after a real, live audit of every OTHER
+# active/Burp-plane capability's actual confirmation rigor (not a
+# decision folded into an unrelated bugfix -- this is exactly the
+# audit HANDOVER.md's §5i/§6.9 said had to happen before touching
+# this list). Each addition below independently replays a real
+# request/probe against the real target and compares it against a
+# real observed response -- the same deterministic shape as the
+# three original entries, not an LLM guess:
+# - cors_misconfiguration_detection: already found live, this
+#   session, to be exactly this deterministic -- a real Juice Shop
+#   run produced 10 genuine CORS confirmations (foreign Origin
+#   replayed, ACAO reflection + credentials checked in the real
+#   response) that this allowlist was silently discarding.
+# - reflection_context_validation (XSS): XssPayloadLogic.classify()
+#   requires the exact random canary string to survive unescaped in
+#   a live replayed response -- a real proof of execution context.
+# - open_redirect_validation: requires an exact Location header
+#   match to the injected external URL on a live replay.
+# - jwt_validation: requires a forged token to be accepted with a
+#   materially matching response to the original authenticated
+#   request.
+# command_injection_validation deliberately NOT added: its
+# differential-timing design (CommandInjectionTimingLogic) is
+# already calibrated to a lower confidence ceiling (0.75, vs 0.85+
+# elsewhere) specifically because timing evidence is inherently
+# noisier than content evidence -- left off pending a live
+# false-positive check this pass didn't have time for, not
+# forgotten.
+_CONFIRMATION_CAPABILITIES = frozenset({
+    "cross_identity_compare", "authorization_boundary_compare",
+    "sql_injection_validation",
+    "cors_misconfiguration_detection",
+    "reflection_context_validation",
+    "open_redirect_validation",
+    "jwt_validation",
+})
+
+
+def capability_can_confirm(capability: str) -> bool:
+    """The one confirmation policy: whether a plan's capability may mark a
+    vulnerability confirmed. Evidence-only capabilities (header, CSP and recon
+    observations) may still be recorded, as status "observed"."""
+    return capability in _CONFIRMATION_CAPABILITIES
+
+
 def persist_validation_submission(submission: ValidationSubmission) -> tuple[bool, str]:
     conn = _connect()
     try:
@@ -1494,55 +1612,13 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
         expected_executor = f"{row[3]}:{row[2]}"
         if submission.executor != expected_executor:
             return False, "executor does not match the registered capability"
-        # sqlmap is a deterministic tool whose entire purpose is to
-        # independently confirm SQL injection -- excluding it here
-        # directly contradicts the project's own "known vs rediscover"
-        # principle (trust deterministic tools over LLM reasoning) for
-        # the one capability that is MOST deterministic. Verified live:
-        # sqlmap genuinely confirmed a real SQLi on OWASP Juice Shop's
-        # login endpoint in this session: excluding it from ever setting
-        # confirmed=True would have silently discarded that result.
-        #
-        # Expanded this session after a real, live audit of every OTHER
-        # active/Burp-plane capability's actual confirmation rigor (not a
-        # decision folded into an unrelated bugfix -- this is exactly the
-        # audit HANDOVER.md's §5i/§6.9 said had to happen before touching
-        # this list). Each addition below independently replays a real
-        # request/probe against the real target and compares it against a
-        # real observed response -- the same deterministic shape as the
-        # three original entries, not an LLM guess:
-        # - cors_misconfiguration_detection: already found live, this
-        #   session, to be exactly this deterministic -- a real Juice Shop
-        #   run produced 10 genuine CORS confirmations (foreign Origin
-        #   replayed, ACAO reflection + credentials checked in the real
-        #   response) that this allowlist was silently discarding.
-        # - reflection_context_validation (XSS): XssPayloadLogic.classify()
-        #   requires the exact random canary string to survive unescaped in
-        #   a live replayed response -- a real proof of execution context.
-        # - open_redirect_validation: requires an exact Location header
-        #   match to the injected external URL on a live replay.
-        # - jwt_validation: requires a forged token to be accepted with a
-        #   materially matching response to the original authenticated
-        #   request.
-        # command_injection_validation deliberately NOT added: its
-        # differential-timing design (CommandInjectionTimingLogic) is
-        # already calibrated to a lower confidence ceiling (0.75, vs 0.85+
-        # elsewhere) specifically because timing evidence is inherently
-        # noisier than content evidence -- left off pending a live
-        # false-positive check this pass didn't have time for, not
-        # forgotten.
-        confirmation_capabilities = {
-            "cross_identity_compare", "authorization_boundary_compare",
-            "sql_injection_validation",
-            "cors_misconfiguration_detection",
-            "reflection_context_validation",
-            "open_redirect_validation",
-            "jwt_validation",
-        }
-        if submission.confirmed and row[2] not in confirmation_capabilities:
+        if submission.confirmed and not capability_can_confirm(row[2]):
             return False, "this capability may provide evidence but cannot mark the vulnerability confirmed"
         if submission.confirmed and submission.status != "confirmed":
             return False, "confirmed result has invalid status"
+        # Any other status is stored as given: "observed" is a capability that
+        # cannot confirm reporting what it saw (confirmed is False, so the
+        # coverage ledger reads it as supported evidence, never confirmed/refuted).
         conn.execute(
             """INSERT INTO validation_runs
                (plan_id, status, confidence, confirmed, summary, evidence, created_at)
@@ -1696,7 +1772,7 @@ def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int 
 
 def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_id: str = "",
                       captured_principal: str | None = None,
-                      include_chains: bool = False) -> list[dict]:
+                      include_chains: bool = False, run_id: str | None = None) -> list[dict]:
     """
     Full (not summarized) finding records for a host, for chain detection
     and report generation.
@@ -1737,8 +1813,10 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                WHERE f.host = ? AND f.engagement_id = ?
                  AND (? IS NULL OR f.captured_principal_id = ?)
+                 AND (? IS NULL OR f.run_id = ?)
                ORDER BY f.created_at ASC""",
-            (host, _engagement_partition(engagement_id), captured_principal, captured_principal),
+            (host, _engagement_partition(engagement_id), captured_principal, captured_principal,
+             run_id, run_id),
         ).fetchall()
     finally:
         conn.close()
@@ -1967,11 +2045,13 @@ def _read_engagement(conn, host: str, engagement_id: str) -> tuple[dict | None, 
 def _write_engagement(conn, host, engagement_id, state, revision):
     snapshot = dict(state)
     snapshot.update(host=host, _engagement_id=engagement_id, _snapshot_revision=revision)
+    state_json = json.dumps(snapshot)
+    _ENGAGEMENT_WRITE.bytes = len(state_json)   # ensure_ascii: one byte per char
     conn.execute(
         "INSERT INTO scoped_engagement_state (engagement_id,host,revision,state_json,updated_at) "
         "VALUES (?,?,?,?,?) ON CONFLICT(engagement_id,host) DO UPDATE SET "
         "revision=excluded.revision,state_json=excluded.state_json,updated_at=excluded.updated_at",
-        (engagement_id, host, revision, json.dumps(snapshot), time.time()))
+        (engagement_id, host, revision, state_json, time.time()))
     return snapshot
 
 
@@ -1987,6 +2067,8 @@ def save_engagement(host: str, state: dict, *, engagement_id: str = "",
         raise EngagementRevisionConflict("engagement snapshot belongs to another partition")
     if expected_revision is None:
         expected_revision = state.get("_snapshot_revision")
+    started = time.perf_counter()
+    _ENGAGEMENT_WRITE.bytes = 0
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2000,6 +2082,13 @@ def save_engagement(host: str, state: dict, *, engagement_id: str = "",
         if conn.in_transaction:
             conn.rollback()
         conn.close()
+        elapsed_ms, written = (time.perf_counter() - started) * 1000.0, _ENGAGEMENT_WRITE.bytes
+        with _STATS_LOCK:
+            _SAVE_ENGAGEMENT_STATS["calls"] += 1
+            _SAVE_ENGAGEMENT_STATS["bytes"] += written
+            _SAVE_ENGAGEMENT_STATS["ms"] += elapsed_ms
+            _SAVE_ENGAGEMENT_STATS["max_bytes"] = max(_SAVE_ENGAGEMENT_STATS["max_bytes"], written)
+            _SAVE_ENGAGEMENT_STATS["max_ms"] = max(_SAVE_ENGAGEMENT_STATS["max_ms"], elapsed_ms)
 
 
 def load_engagement(host: str, *, engagement_id: str = "") -> dict | None:
@@ -2148,6 +2237,8 @@ def mark_chain_detected(url: str, signature: str, *, engagement_id: str = "") ->
 # Status vocabulary:
 #   confirmed       - a validation_runs row with confirmed=1 exists
 #   supported       - positive evidence exists, but nothing independently confirmed it
+#                     (a validation_runs row of status "supported", or "observed": an
+#                     evidence-only capability's result, which can never confirm)
 #   blocked         - the only validation attempt errored out (tool missing, timeout, etc.)
 #   tested_clean    - independently tested and no evidence found
 #   not_tested      - a specialist flagged this category but no validation was ever run
@@ -2232,7 +2323,7 @@ def coverage_report(host: str) -> list[dict]:
 
         runs = by_category.get(category, [])
         confirmed_run = next((r for r in runs if r[2]), None)
-        supported_run = next((r for r in runs if r[1] == "supported"), None)
+        supported_run = next((r for r in runs if r[1] in ("supported", "observed")), None)
         error_run = next((r for r in runs if r[1] == "error"), None)
         clean_run = next((r for r in runs if r[1] in ("rejected", "not_confirmed")), None)
 
@@ -3207,5 +3298,17 @@ def wipe_engagement(host: str) -> dict:
 
         conn.commit()
         return counts
+    finally:
+        conn.close()
+
+
+def proofs_for_run(run_id: str) -> list[dict]:
+    """Read every immutable proof attempt for exact run-level accounting."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT {_PROOF_COLUMNS} FROM proof_records WHERE run_id = ? ORDER BY created_at ASC",
+            (run_id,)).fetchall()
+        return [_proof_row_to_dict(row) for row in rows]
     finally:
         conn.close()

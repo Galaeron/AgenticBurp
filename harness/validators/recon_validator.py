@@ -3,10 +3,16 @@ Recon Validator for Attack Surface Mapping
 
 This validator performs active reconnaissance to build comprehensive
 attack maps of the target application.
+
+Reconnaissance is evidence, not proof of a vulnerability: a finding is
+confirmed only when the map holds at least one item of the kind its class
+claims (a technology, a parameter, a sensitive endpoint), and the evidence
+lists those items. A class reconnaissance cannot speak to is skipped.
 """
 
 from __future__ import annotations
 import asyncio
+import copy
 import logging
 import re
 from dataclasses import dataclass, field
@@ -17,11 +23,41 @@ import httpx
 
 from harness import security
 from .base import Validator, ValidationResult
+from .send_failures import SendFailures
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
 
 log = logging.getLogger("harness.validators.recon")
+
+# The kind of item a finding class claims reconnaissance found, in the order
+# they are checked and listed; the keys are ReconResult attributes' labels.
+_CLAIM_PATTERNS = (
+    ("technology", re.compile(r"\b(?:technolog|fingerprint|version|banner)|\bserver\b(?! side)")),
+    ("parameter", re.compile(r"\bparameter")),
+    ("sensitive endpoint", re.compile(
+        r"directory listing|\bexpos|\bdisclos|\bsensitive|\bendpoint|attack surface|attack map")),
+)
+_CLAIM_LABELS = {"technology": "technologies", "parameter": "parameters",
+                 "sensitive endpoint": "sensitive endpoints"}
+_EVIDENCE_ITEMS = 10  # most items of one kind written into evidence
+
+
+def _claim_kinds(vulnerability_class: str) -> list[str]:
+    """The item kinds this class claims reconnaissance found; empty when
+    reconnaissance cannot speak to the class (so it cannot confirm it)."""
+    text = re.sub(r"[\s_\-/]+", " ", (vulnerability_class or "").lower()).strip()
+    return [kind for kind, pattern in _CLAIM_PATTERNS if pattern.search(text)]
+
+
+def _claim_items(result: "ReconResult", kind: str) -> list[str]:
+    """The items of one claimed kind in a recon result."""
+    if kind == "technology":
+        return [f"{t.name} {t.version}".strip() for t in result.technologies]
+    if kind == "parameter":
+        return sorted(result.parameters)
+    # These URLs are written into evidence: withhold secret-named query values.
+    return [security.redact_secrets_in_url(url) for url, info in result.endpoints.items() if info.sensitive]
 
 
 @dataclass
@@ -77,6 +113,9 @@ class ReconResult:
     attack_paths: list[AttackPath] = field(default_factory=list)
     priorities: list[tuple[str, str, str]] = field(default_factory=list)  # (endpoint, priority, reason)
     coverage: float = 0.0  # Percentage of attack surface covered
+    # Sends that got no response (transport error, malformed encoding, refusal):
+    # a map built with gaps cannot support a "found nothing" verdict.
+    send_failures: SendFailures = field(default_factory=SendFailures)
 
 
 class ReconValidator(Validator):
@@ -171,6 +210,15 @@ class ReconValidator(Validator):
                 validator=self.name, status="skipped",
                 finding_class=finding.vulnerability_class,
                 summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts))
+        # The map is evidence; the verdict is only whether it holds what the
+        # finding's class claims. A class reconnaissance cannot speak to is
+        # skipped before anything is sent.
+        kinds = _claim_kinds(finding.vulnerability_class)
+        if not kinds:
+            return ValidationResult(
+                validator=self.name, status="skipped",
+                finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
+                summary=f"not supported: reconnaissance cannot confirm {finding.vulnerability_class}")
         try:
             # Initialize
             base_url = self._get_base_url(exchange.url)
@@ -186,8 +234,8 @@ class ReconValidator(Validator):
                     raw_output="",
                 )
             
-            # Perform recon
-            recon_result = await self._perform_recon(base_url, exchange)
+            # Perform recon (once per host and identity in a run: E2)
+            recon_result, reused = await self._recon_once(base_url, exchange)
             
             # Build summary
             summary_parts = [
@@ -204,15 +252,35 @@ class ReconValidator(Validator):
             
             if sensitive_endpoints or sensitive_params:
                 summary_parts.append(f"Found {len(sensitive_endpoints)} sensitive endpoints, {len(sensitive_params)} sensitive parameters")
-            
+
+            missing = [k for k in kinds if not _claim_items(recon_result, k)]
+            if missing and recon_result.send_failures.failures:
+                # Batch 01 follow-up: an absent item is not a negative when
+                # sends failed; report the incomplete map visibly instead.
+                return recon_result.send_failures.result(
+                    self.name, finding.vulnerability_class, "Reconnaissance")
+            if missing:
+                status, confirmed, confidence = "not_confirmed", False, 0.0
+                verdict = ("not confirmed: reconnaissance found "
+                           + " and ".join(f"0 {_CLAIM_LABELS[k]}" for k in missing)
+                           + f" for {finding.vulnerability_class}")
+            else:
+                status, confirmed, confidence = "confirmed", True, 0.95
+                verdict = "reconnaissance found " + ", ".join(
+                    f"{len(_claim_items(recon_result, k))} {_CLAIM_LABELS[k]}" for k in kinds)
+            summary_parts.insert(0, verdict)
+
+            evidence = self._build_evidence(recon_result, kinds)
+            if reused:
+                evidence += f" | recon reused from first crawl of {base_url}"
             return ValidationResult(
                 validator=self.name,
-                status="confirmed",
+                status=status,
                 finding_class=finding.vulnerability_class,
-                confidence=0.95,
-                confirmed=True,
+                confidence=confidence,
+                confirmed=confirmed,
                 summary=" | ".join(summary_parts),
-                evidence=self._build_evidence(recon_result),
+                evidence=evidence,
                 raw_output=self._build_raw_output(recon_result),
             )
             
@@ -235,9 +303,40 @@ class ReconValidator(Validator):
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}"
     
+    async def _recon_once(self, base_url: str, exchange: HttpExchange) -> tuple[ReconResult, bool]:
+        """(map, reused): the crawl of a host re-fetches the same host-level paths for
+        every plan, so a run crawls each host once per identity. Without the run's
+        execution registry there is no cache. A later plan gets its own copy of the
+        first crawl plus its own exchange, and decides its own claim from that."""
+        registry = getattr(self.run_context, "execution_registry", None)
+        if not callable(getattr(registry, "memo", None)):
+            return await self._perform_recon(base_url, exchange), False
+        from harness.engagement import capture_identity_key
+
+        async def crawl():
+            return (await self._perform_recon(base_url, exchange),
+                    frozenset(self.visited_urls), frozenset(self.discovered_urls))
+        key = (base_url.lower(), capture_identity_key(exchange.request_headers), self.max_depth)
+        (crawled, visited, discovered), reused = await registry.memo(key, crawl, name=self.name)
+        if not reused:
+            return crawled, False
+        result = copy.deepcopy(crawled)
+        self.visited_urls, self.discovered_urls = set(visited), set(discovered)
+        self._failures = result.send_failures
+        self._analyze_exchange(exchange, result)
+        # The first crawl started from its own exchange; this plan's start page may
+        # lead to pages it never reached. Only pages not yet visited are fetched.
+        await self._crawl(base_url, exchange.url, 0, self.max_depth, result)
+        result.attack_paths, result.priorities = [], []
+        self._build_attack_paths(result)
+        self._prioritize_endpoints(result)
+        result.coverage = self._calculate_coverage(result)
+        return result, True
+
     async def _perform_recon(self, base_url: str, exchange: HttpExchange) -> ReconResult:
         """Perform comprehensive reconnaissance."""
         result = ReconResult()
+        self._failures = result.send_failures
         
         # Clear state
         self.visited_urls = set()
@@ -490,6 +589,9 @@ class ReconValidator(Validator):
         """Send an HTTP request."""
         headers = headers or {}
         headers['User-Agent'] = self.user_agent
+        failures = getattr(self, "_failures", None)
+        if failures is not None:
+            failures.attempted += 1
         
         try:
             if self.run_context is not None:
@@ -498,10 +600,10 @@ class ReconValidator(Validator):
                     TypedRequest(method, url, headers=headers),
                     capability=self.get_name(), max_redirects=self.max_redirects)
                 if not outcome.ok:
+                    if failures is not None:
+                        failures.outcome(SendFailures.label(method, url), outcome)
                     return None
-                return httpx.Response(
-                    outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=outcome.headers, request=httpx.Request(method, url))
+                return outcome.to_httpx_response(method, url)
             if not self.client:
                 self.client = httpx.AsyncClient(
                     timeout=self.timeout,
@@ -514,6 +616,8 @@ class ReconValidator(Validator):
             response = await self.client.request(method, url, headers=headers)
             return response
         except Exception as e:
+            if failures is not None:
+                failures.exception(SendFailures.label(method, url), e)
             log.debug(f"Request to {url} failed: {e}")
             return None
     
@@ -828,20 +932,22 @@ class ReconValidator(Validator):
         
         return visited / total if total > 0 else 0.0
     
-    def _build_evidence(self, result: ReconResult) -> str:
-        """Build evidence string."""
-        parts = []
-        
-        if result.endpoints:
-            parts.append(f"{len(result.endpoints)} endpoints")
-        if result.parameters:
-            parts.append(f"{len(result.parameters)} parameters")
-        if result.technologies:
-            tech_names = [t.name for t in result.technologies]
-            parts.append(f"Technologies: {', '.join(tech_names)}")
-        if result.attack_paths:
-            parts.append(f"{len(result.attack_paths)} attack paths")
-        
+    def _build_evidence(self, result: ReconResult, kinds: list[str] | None = None) -> str:
+        """Build evidence string: the counts, then the actual items of each
+        claimed kind (at most _EVIDENCE_ITEMS of each)."""
+        parts = [
+            f"{len(result.endpoints)} endpoints",
+            f"{len(result.parameters)} parameters",
+            f"{len(result.technologies)} technologies",
+            f"{len(_claim_items(result, 'sensitive endpoint'))} sensitive endpoints",
+            f"{len(result.attack_paths)} attack paths",
+        ]
+        for kind in kinds or ():
+            items = _claim_items(result, kind)
+            listed = ", ".join(item[:200] for item in items[:_EVIDENCE_ITEMS])
+            if len(items) > _EVIDENCE_ITEMS:
+                listed += f" (+{len(items) - _EVIDENCE_ITEMS} more)"
+            parts.append(f"{_CLAIM_LABELS[kind]} ({len(items)}): {listed or 'none'}")
         return " | ".join(parts)
     
     def _build_raw_output(self, result: ReconResult) -> str:

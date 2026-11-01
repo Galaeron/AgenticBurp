@@ -87,6 +87,11 @@ def _test_config() -> dict:
     validators = cfg.setdefault("validators", {})
     validators["active_enabled"] = True          # the legs send live (here: stubbed) requests
     validators["allow_mutating_replay"] = False
+    # This fixture supplies only a JWT response oracle (AsyncClient.get).
+    # Other coverage families have their own caller tests; leaving them enabled
+    # would send unmocked requests through AsyncClient.request to localhost.
+    for name in ("csp", "cors", "header_injection", "http_request_smuggling", "race_condition"):
+        validators.setdefault(name, {})["enabled"] = False
     cfg.setdefault("autonomous_discovery", {})["enabled"] = False
     cfg.setdefault("github_advisories", {})["enabled"] = False
     cfg.setdefault("kev_check", {})["enabled"] = False
@@ -277,10 +282,11 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         self.assertTrue(result.get("degraded"))
         self.assertTrue(any(e.get("phase") == "coverage_build" for e in result.get("errors", [])))
 
-    def test_clean_run_is_not_degraded(self):
+    def test_no_exception_does_not_hide_incomplete_assessment(self):
         result = self._run(vulnerable=True)
-        self.assertFalse(result.get("degraded"))
         self.assertEqual(result.get("errors"), [])
+        self.assertEqual(result["assessment"]["status"], "incomplete")
+        self.assertTrue(result["degraded"])
 
     def test_negative_control_secure_server_yields_no_confirmation(self):
         # A server that actually verifies signatures must NOT be confirmed -- proving

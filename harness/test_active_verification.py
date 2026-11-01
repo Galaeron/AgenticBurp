@@ -19,6 +19,11 @@ from harness.models import TestPlan, ValidationSubmission
 from harness.ollama_client import OllamaError
 
 
+# Escalation needs a model that the operator configured; there is no built-in
+# fallback model name (see active_verification._resolve_escalation_model).
+_ESCALATION_CONFIG = {"coordinator": {"model": "test-reasoning-model"}}
+
+
 def _make_plan(category="xss", severity="high", confidence=0.7, escalated=False,
                 plan_suffix="1"):
     return TestPlan(
@@ -149,6 +154,7 @@ class ActiveVerificationTests(unittest.IsolatedAsyncioTestCase):
         }
         final_step = await active_verification.decide_next_step(
             current_plan_row, current_submission, ollama_client=mock_client,
+            config=_ESCALATION_CONFIG,
         )
 
         self.assertIsNotNone(final_step.next_plan)
@@ -174,6 +180,7 @@ class ActiveVerificationTests(unittest.IsolatedAsyncioTestCase):
 
         final_step = await active_verification.decide_next_step(
             current_plan_row, current_submission, ollama_client=mock_client,
+            config=_ESCALATION_CONFIG,
         )
 
         self.assertIsNone(final_step.next_plan)
@@ -197,6 +204,7 @@ class ActiveVerificationTests(unittest.IsolatedAsyncioTestCase):
         mock_client.chat_json.return_value = {"payload": "<svg/onload=__CANARY__>", "rationale": "r"}
         escalated_step = await active_verification.decide_next_step(
             current_plan_row, current_submission, ollama_client=mock_client,
+            config=_ESCALATION_CONFIG,
         )
         escalated_submission = _submission(escalated_step.next_plan.id, "not_confirmed")
         self._persist_and_submit(escalated_step.next_plan, escalated_submission)

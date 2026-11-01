@@ -291,6 +291,13 @@ class ExecutionObservation:
     page_errors: list[str] = field(default_factory=list)  # uncaught JS errors
     load_error: str = ""                                 # navigation itself failed
 
+    marker_present: bool = False
+    navigation_status: int | None = None
+    final_url: str = ""
+    requests_sent: int = 0
+    blocked_requests: list[str] = field(default_factory=list)
+    cancelled: bool = False
+
     def all_text(self) -> str:
         return "\n".join(self.dialogs + self.console + self.page_errors)
 
@@ -425,6 +432,7 @@ class PlaywrightDriver:
                     cancel: "asyncio.Event | Callable[[], bool] | None" = None,
                     gate: "SafetyGate | None" = None,
                     budget: "RequestBudget | None" = None,
+                    observe_marker: str = "",
                     ) -> ExecutionObservation:
         """Navigate to `url` and report what executed.
 
@@ -450,6 +458,7 @@ class PlaywrightDriver:
         """
         obs = ExecutionObservation(url=url)
         if is_cancelled(cancel):
+            obs.cancelled = True
             obs.load_error = "cancelled before navigation"
             return obs
         run_origin = ScopePolicy.origin_of(url)
@@ -484,10 +493,11 @@ class PlaywrightDriver:
                     # evaluate_browser_request says the request is on the
                     # run's own origin.
                     _extra, _cookies = _extra_headers_and_cookies(headers, url)
-                    context = await browser.new_context()
+                    context = await browser.new_context(service_workers='block')
 
                     async def _handle_route(route, request):
                         if is_cancelled(cancel):
+                            obs.cancelled = True
                             try:
                                 await route.abort()
                             except Exception:
@@ -503,6 +513,7 @@ class PlaywrightDriver:
                             gate=gate,
                             budget=budget)
                         if not decision.allow:
+                            obs.blocked_requests.append(decision.reason)
                             log.info("browser_driver: blocked %s %s (%s)",
                                      request.method, request.url, decision.reason)
                             try:
@@ -510,6 +521,7 @@ class PlaywrightDriver:
                             except Exception:
                                 pass
                             return
+                        obs.requests_sent += 1
                         try:
                             if decision.attach_credentials and _extra:
                                 merged_headers = dict(request.headers)
@@ -527,6 +539,11 @@ class PlaywrightDriver:
                             await context.add_cookies(_cookies)
                         except Exception:
                             pass
+                    async def deny_websocket(socket):
+                        obs.blocked_requests.append('WebSocket denied by browser proof policy')
+                        await socket.close()
+                    # Install before page creation; HTTP routing does not cover WebSockets.
+                    await context.route_web_socket('**/*', deny_websocket)
                     page = await context.new_page()
 
                     async def _on_dialog(dialog):
@@ -537,14 +554,25 @@ class PlaywrightDriver:
                             pass
 
                     page.on("dialog", lambda d: __import__("asyncio").create_task(_on_dialog(d)))
-                    page.on("console", lambda msg: obs.console.append(msg.text))
+                    def on_console(msg):
+                        obs.console.append(msg.text)
+                        if 'Service Worker registration blocked' in msg.text:
+                            obs.blocked_requests.append('service worker denied by browser proof policy')
+                    page.on("console", on_console)
                     page.on("pageerror", lambda err: obs.page_errors.append(str(err)))
 
                     if is_cancelled(cancel):
                         obs.load_error = "cancelled before navigation"
                     else:
-                        await page.goto(url, timeout=self.launch_timeout_ms, wait_until="load")
+                        response = await page.goto(url, timeout=self.launch_timeout_ms, wait_until="load")
+                        obs.navigation_status = response.status if response else None
+                        obs.final_url = page.url
                         await page.wait_for_timeout(wait_ms)
+                        obs.cancelled = is_cancelled(cancel)
+                        obs.final_url = page.url
+                        if observe_marker:
+                            obs.marker_present = bool(await page.locator('body').evaluate(
+                                '(node, marker) => node.textContent.includes(marker) || node.innerHTML.includes(marker)', observe_marker))
                 finally:
                     if context is not None:
                         try:
@@ -910,3 +938,53 @@ class PlaywrightDriver:
         except Exception as e:
             obs.load_error = f"{e.__class__.__name__}: {e}"
         return obs
+
+
+async def execute_browser_step(step, url, run_context, case_ref, *, observe_marker=""):
+    """One typed browser tool invocation, owned by the existing workflow engine."""
+    from dataclasses import asdict
+    import json
+    from harness import evidence, evidence_ledger, store, security
+    from harness.workflow_engine import StepResult, StepStatus
+    session = run_context.sessions.get(step.session_ref)
+    if (session is None or session.health == 'expired' or
+            ScopePolicy.origin_of(url) not in session.allowed_origins):
+        return StepResult(step.id, StepStatus.BLOCKED, 'registered origin-authorized identity required')
+    if not run_context.scope.in_scope(url) or not run_context.gate.config.active_enabled:
+        return StepResult(step.id, StepStatus.BLOCKED, 'browser scope or active policy denied')
+    class IdentityScope:
+        def in_scope(self, candidate):
+            return run_context.scope.in_scope(candidate) and ScopePolicy.origin_of(candidate) == ScopePolicy.origin_of(url)
+    obs = await PlaywrightDriver().visit(url, wait_ms=150, headers=session.headers,
+        scope=IdentityScope(), cancel=run_context.cancel, gate=run_context.gate, budget=run_context.budget, observe_marker=observe_marker)
+    from urllib.parse import urldefrag
+    expected_navigation = obs.final_url == url if '#' in url else urldefrag(obs.final_url)[0] == urldefrag(url)[0]
+    complete = bool(expected_navigation and obs.requests_sent and obs.navigation_status is not None and
+        200 <= obs.navigation_status < 300 and not obs.load_error and not obs.blocked_requests
+        and not obs.cancelled and not obs.page_errors and session.health != 'expired')
+    outcome = 'ok' if complete else 'incomplete'
+    artifact = evidence.ExchangeArtifact.make(request_ref=security.sanitize_text(url),
+        response_ref='browser.observation', actual_destination=ScopePolicy.origin_of(obs.final_url or url),
+        transport_outcome=outcome, session_ref=step.session_ref)
+    # Tool I/O, not a fabricated HTTP exchange. Existing generic resolver verifies these blobs.
+    request = json.dumps({'tool':'browser.visit','url':security.sanitize_text(url),'session_ref':step.session_ref}).encode()
+    known_values = tuple(session.headers.values())
+    observation = security.sanitize_data(asdict(obs), known_values=known_values)
+    response = json.dumps({'tool':'browser.visit','observation':observation}).encode()
+    try:
+        request_blob=store.put_evidence_blob(request)
+        response_blob=store.put_evidence_blob(response)
+    except Exception as exc:
+        request_blob=response_blob=""
+        complete=False
+        outcome="incomplete"
+        observation["persistence_error"]=type(exc).__name__
+    evidence_ledger.emit(evidence_ledger.EventType.EXECUTION if obs.requests_sent else evidence_ledger.EventType.AUTHORIZATION_DECISION,
+        case_ref, 'browser tool observation', case_ref=case_ref,
+        data={'tool':'browser.visit','request':artifact.request_ref,'response':artifact.response_ref,
+              'artifact_id':artifact.artifact_id,'outcome':outcome,
+              'request_blob':request_blob,'response_blob':response_blob},
+        provenance=evidence_ledger.Provenance.capture(config=run_context.config))
+    return StepResult(step.id, StepStatus.PASSED if complete else StepStatus.BLOCKED,
+        'browser observation complete' if complete else 'browser observation incomplete',
+        obs.navigation_status, artifact.artifact_id, observation=observation, executed=bool(obs.requests_sent))

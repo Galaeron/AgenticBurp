@@ -30,7 +30,8 @@ class _Context:
 
 
 def _out(status=200, body="", headers=None, outcome="ok"):
-    return SimpleNamespace(ok=outcome == "ok", outcome=outcome, status=status,
+    from harness.run_context import ExecutionOutcome
+    return ExecutionOutcome(outcome=outcome, status=status,
                            body=body, headers=headers or {}, final_url="http://t.test/x",
                            error="", artifact=SimpleNamespace(artifact_id=f"a-{status}"))
 
@@ -100,6 +101,25 @@ class ExtractorTests(unittest.TestCase):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_execution_fact_is_independent_of_step_verdict(self):
+        for status, outcome, expected in ((200, 'ok', True), (403, 'ok', True),
+                                          (None, 'error', True), (None, 'blocked', False)):
+            with self.subTest(status=status, outcome=outcome):
+                workflow = Workflow('accounting', (WorkflowStep('read', 'GET', 'http://t.test/health', 'alice'),), version=2)
+                result = asyncio.run(execute_workflow(workflow, _Context([_out(status=status, outcome=outcome)])))
+                self.assertEqual(result.steps[0].executed, expected)
+                self.assertEqual(result.to_dict()['steps'][0]['executed'], expected)
+
+    def test_execution_retains_answered_request_before_refresh_denial(self):
+        workflow = Workflow('accounting', (WorkflowStep('read', 'GET', 'http://t.test/health', 'alice'),), version=2)
+        context = _Context([_out(401), _out(status=None, outcome='blocked')])
+        async def refresh(session, run_context):
+            return True
+        result = asyncio.run(execute_workflow(workflow, context, refresh_fn=refresh))
+        self.assertEqual(len(context._executor.calls), 2)
+        self.assertFalse(result.complete)
+        self.assertTrue(result.steps[0].executed)
+
     def _workflow(self):
         return Workflow("approval", (
             WorkflowStep("create", "POST", "http://t.test/items", "alice",
@@ -125,6 +145,8 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(by_id["create"].status, StepStatus.BLOCKED)
         self.assertEqual(by_id["approve"].status, StepStatus.BLOCKED)
         self.assertEqual(len(ctx._executor.calls), 1)
+        self.assertTrue(by_id["create"].executed)
+        self.assertFalse(by_id["approve"].executed)
 
     def test_cancelled_run_still_attempts_registered_cleanup(self):
         ctx = _Context([_out(201, '{"id":7}'), _out(outcome="cancelled"), _out(204)])

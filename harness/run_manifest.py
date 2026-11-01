@@ -33,12 +33,30 @@ def redact(value: Any) -> Any:
     return repr(value)
 
 
+def _counters(value: Any) -> Any:
+    """JSON-safe copy of a counters block (E9 model_metrics / phase_timings).
+    Unlike redact(), a number is kept under a key such as `prompt_tokens`: it is a
+    count, not a credential. A non-numeric value under a secret-looking key is
+    still withheld."""
+    if isinstance(value, dict):
+        return {str(k): ("[REDACTED]" if _is_secret_key(k) and not (v is None or isinstance(v, (int, float, bool)))
+                         else _counters(v)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_counters(v) for v in value]
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return redact(value)
+
+
 def config_fingerprint(config: dict) -> str:
     encoded = json.dumps(redact(config), sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _git_state(repo_root: Path) -> tuple[str | None, bool | None]:
+    # An exported package nested under another checkout is not that checkout.
+    if not (repo_root / ".git").exists():
+        return None, None
     try:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root, check=True,
                                   capture_output=True, text=True, timeout=5).stdout.strip()
@@ -48,6 +66,25 @@ def _git_state(repo_root: Path) -> tuple[str | None, bool | None]:
         return revision or None, dirty
     except (OSError, subprocess.SubprocessError):
         return None, None
+
+
+def source_fingerprint(root: Path) -> dict:
+    """Attest the source bytes, including dirty/untracked Python modules.
+
+    Local configuration and runtime artifacts are intentionally excluded.
+    The separately redacted config fingerprint identifies configuration.
+    """
+    digest = hashlib.sha256()
+    count = 0
+    for path in sorted((root / "harness").rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(root).as_posix().encode()
+        content = path.read_bytes()
+        digest.update(relative + b"\0" + hashlib.sha256(content).digest())
+        count += 1
+    return {"sha256": digest.hexdigest() if count else None, "files": count,
+            "scope": "harness/**/*.py"}
 
 
 class RunManifest:
@@ -70,6 +107,7 @@ class RunManifest:
         data = {
             "schema_version": SCHEMA_VERSION, "run_id": run_id,
             "git": {"revision": revision, "dirty": dirty},
+            "source": source_fingerprint(root),
             "config": redact(deepcopy(config)), "config_fingerprint": config_fingerprint(config),
             "cache_namespace": cache_namespace, "target_identifier": target_identifier,
             "model_versions": redact(model_versions or {}),
@@ -78,6 +116,7 @@ class RunManifest:
             "started_at": time.time(), "finished_at": None, "request_count": None,
             "confirmed_issues": None, "operational_errors": [],
             "completion_status": "running", "degraded": False, "model_metrics": None,
+            "phase_timings": None,
             "measurement": {"fixture_kind": "unscored", "precision": None, "recall": None,
                             "scoring_limitation": "No independent expected-case mapping supplied"},
         }
@@ -88,20 +127,35 @@ class RunManifest:
     def finish(self, status: str, *, result: dict | None = None, error: str | None = None) -> None:
         result = result or {}
         errors = list(result.get("errors") or [])
+        instrumentation = result.get("instrumentation") or {}
         if error:
             errors.append({"phase": "job", "error": error})
+        from harness.assessment_health import assessment_health
+        health = assessment_health(result.get("coverage"), errors,
+                                   stopped_on_confirmation=result.get("stopped_on_confirmation", False))
         self.data.update({"finished_at": time.time(), "completion_status": status,
                           "request_count": result.get("request_count"),
                           "confirmed_issues": result.get("confirmed_issues"),
                           "operational_errors": redact(errors),
-                          "degraded": bool(result.get("degraded") or errors),
+                          "degraded": bool(result.get("degraded") or errors or health["status"] == "incomplete"),
+                          "assessment": health,
+                          "finding_summary": redact(result.get("finding_summary")),
+                          "confirmed_issue_refs": redact(result.get("confirmed_issue_refs", [])),
+                          "confirmed_issues_unit": "proof_bound_cases",
+                          "issue_accounting": redact(result.get("issue_accounting")),
+                          "confirmed_vulnerabilities": (result.get("issue_accounting") or {}).get("counts", {}).get("vulnerabilities"),
+                          "worklist_summary": redact(result.get("worklist_summary")),
                           # R01/R07: the auditable executed-vs-inferred coverage
                           # breakdown (coverage_summary.summarize_coverage's
                           # output, already additive on CoverageTracker.report()),
                           # persisted here so a LATER reader (e.g. the MCP
                           # coverage resource) can see it without needing the
                           # live in-memory job result.
-                          "coverage_audited": (result.get("coverage") or {}).get("audited")})
+                          "coverage_audited": (result.get("coverage") or {}).get("audited"),
+                          # E9: per-stage model usage and phase walls, read from the
+                          # run's own instrumentation block (None when it has none).
+                          "model_metrics": _counters(instrumentation.get("model_metrics")),
+                          "phase_timings": _counters(instrumentation.get("phase_timings"))})
         self._persist(append_ledger=True)
 
     def _persist(self, *, append_ledger: bool) -> None:

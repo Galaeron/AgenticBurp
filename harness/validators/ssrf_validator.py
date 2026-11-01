@@ -24,7 +24,7 @@ import harness.collaborator as _collab
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
-from .base import Validator, ValidationResult
+from .base import SentAnswer, Validator, ValidationResult, artifact_id_of
 from harness.validators.sqlmap import (_mutate_query_param, _mutate_json_param, _mutate_form_param,
                                _looks_like_json, _content_type_of)
 
@@ -112,13 +112,14 @@ class SsrfValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None):
+                 collaborator=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
 
     def collab(self):
-        return self._collab or _collab.shared()
+        return _collab.resolve(self._collab)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         return super().applies(finding, exchange) and bool(_candidate_params(exchange))
@@ -153,13 +154,22 @@ class SsrfValidator(Validator):
                                         follow_redirects=False, verify=False) as client:
                 resp = await client.request(method, url, headers=headers or None,
                                             content=body or None)
-            return resp.status_code, (resp.text or "")
+            return SentAnswer((resp.status_code, (resp.text or "")), artifact_id_of(resp))
         except SafetyGateBlocked as e:
             if unsent is not None:
                 unsent.append(("blocked", f"{label}: refused ({e.decision.reason})"))
             return None
         except httpx.HTTPError as e:
             self._record_failure(unsent, label, e.__class__.__name__)
+            return None
+
+    async def _proof_send(self, method: str, url: str, headers: dict, body: str, label: str):
+        """One extra exchange a confirmation's proof names (Ticket 6): the answer,
+        or None when it got none. Best effort -- any failure leaves that artifact
+        unnamed and never changes the verdict the callback already established."""
+        try:
+            return await self._send(method, url, headers, body, None, label)
+        except Exception:
             return None
 
     @staticmethod
@@ -185,7 +195,7 @@ class SsrfValidator(Validator):
             method, url, capability=self.name, headers=dict(headers or {}), body=body or None,
             max_redirects=0)
         if outcome.ok:
-            return outcome.status or 0, (outcome.body or "")
+            return SentAnswer((outcome.status or 0, (outcome.body or "")), outcome.artifact_id)
         if outcome.outcome == "error":
             failure = getattr(outcome.artifact, "transport_outcome", "").partition(":")[2]
             self._record_failure(unsent, label, failure or "transport error")
@@ -196,12 +206,22 @@ class SsrfValidator(Validator):
         return None
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
-        host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
-            return self._skip(f"host {host!r} out of scope")
+        from harness.scope_lock import host_in_scope
+        if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
+            return self._skip("target origin is out of scope")
         cands = _candidate_params(exchange)
         if not cands:
             return self._skip("no URL-shaped parameter to redirect to a collaborator")
+        if not self.oob_callbacks_enabled:
+            # The in-band differential uses alternate loopback ports as fetch
+            # controls. Those are separate services outside an exact target
+            # origin's authorization too, so disabled callback policy skips the
+            # entire SSRF leg before sending any probes or opening a listener.
+            return ValidationResult(
+                self.name, "inconclusive", "ssrf", confidence=0.0, confirmed=False,
+                summary="SSRF check incomplete: its alternate-host probes and out-of-band callbacks are disabled by policy",
+                evidence=("This check requires a separately authorized internal-service or callback target. "
+                          "No SSRF probe was sent and no callback listener was opened."))
         collab = self.collab()
         method = (exchange.method or "GET").upper()
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
@@ -231,13 +251,24 @@ class SsrfValidator(Validator):
             if await collab.wait_for_hit(token, timeout=self.timeout):
                 lost = (f" The send itself got no response ({unsent[-1][1].rpartition(': ')[2]}), "
                         f"but the callback shows the request was delivered." if reply is None else "")
+                # Ticket 6 proof exchanges: the original request replayed (baseline)
+                # and the same parameter pointed at a closed loopback port, a URL
+                # that is not the collaborator (control). Neither is a verdict input.
+                baseline = control = None
+                if self.run_context is not None:  # outside a run they would name nothing
+                    baseline = await self._proof_send(method, exchange.url, headers,
+                                                      exchange.request_body or "", "proof baseline")
+                    ctrl_url, ctrl_body = self._mutated(exchange, loc, param, self._INBAND_CLOSED)
+                    # Rules out the request alone causing the callback; named only if answered.
+                    control = await self._proof_send(method, ctrl_url, headers, ctrl_body,
+                                                     "proof control")
                 return ValidationResult(
                     self.name, "confirmed", "ssrf", confidence=0.95, confirmed=True,
                     summary=f"SSRF confirmed: the server fetched an attacker-controlled URL placed in "
                             f"the {loc} parameter {param!r}.",
                     evidence=f"Set {loc} param {param!r} to a unique collaborator URL; the target called "
                              f"back to it out-of-band, proving server-side request forgery (blind-safe)."
-                             + lost)
+                             + lost).with_artifacts(baseline=baseline, attack=reply, controls=[control])
             if reply is None:
                 kind, why = unsent[-1]
                 unsent[-1] = (kind, f"{why} after the request was sent; no callback within "
@@ -263,6 +294,9 @@ class SsrfValidator(Validator):
                         f"({failed}); not a negative result",
                 evidence=f"Tried {len(cands)} URL-shaped parameter(s); no collaborator hit was seen, "
                          f"but a send that never reached the target cannot show one.")
+        unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "ssrf")
+        if unavailable is not None:
+            return unavailable
         return ValidationResult(
             self.name, "not_confirmed", "ssrf", confidence=0.0, confirmed=False,
             summary="No out-of-band callback and no in-band fetch differential observed",

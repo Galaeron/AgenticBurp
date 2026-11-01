@@ -21,12 +21,108 @@ integrate loop.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
+import time
 from urllib.parse import urlsplit
 
 from harness.models import HttpExchange
 from harness.safety_gate import SafetyGateBlocked
+
+
+def captured_nodes(node, base_url, roles, include_probes=False):
+    """Yield each observed shape under its own matching supplied identity.
+
+    Access-matrix probe variants (E5b) are replay templates for the coverage
+    drive; the worklist investigates full captures, so they are left out unless
+    `include_probes`."""
+    from harness.engagement import ACCESS_MATRIX_SOURCE, capture_identity_key
+    from harness.scope_lock import parse_scope_url
+    variants = [v for v in node.get("capture_variants") or []
+                if include_probes or v.get("source") != ACCESS_MATRIX_SOURCE]
+    if not variants:
+        yield node
+        return
+    origin = parse_scope_url(base_url)
+    for variant in variants:
+        target = parse_scope_url(variant.get("url", ""))
+        if target is None or origin is None or target.origin != origin.origin:
+            yield dict(node, capture_error="scope_rejected")
+            continue
+        matches = [r for r in roles if capture_identity_key(r.headers) == variant.get("identity_key")]
+        if not matches:
+            yield dict(node, capture_error="missing_principal")
+            continue
+        for role in matches:
+            yield dict(node, template=variant["template"], capture=variant,
+                       probe_session=role, reachable_roles=[role.role])
+
+
+def node_key(node) -> str:
+    """A worklist node's identity across runs (E7): method, normalized route, the
+    identity key and capture id of the capture it replays, and its principal. All
+    of them come from the discovery state, so the same state gives the same key."""
+    capture = node.get("capture") or {}
+    principal = getattr(node.get("probe_session"), "principal_id", None)
+    return "|".join([str(node.get("method") or "GET").upper(), str(node.get("path") or ""),
+                     str(capture.get("identity_key") or ""), str(capture.get("capture_id") or ""),
+                     str(principal() if callable(principal) else "")])
+
+
+def _sha256(text) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _capture_fingerprint(node):
+    """What makes one replayed capture the same investigation as another: the
+    route and method, the identity (credentials AND principal), the whole request
+    (query, object ids, content type, body) and the response it drew (status,
+    body hash). Response HEADERS are left out on purpose: a Date or ETag header is
+    the whole difference between most repeated captures of one request. None for
+    a node with no capture of its own, which is never a duplicate."""
+    capture = node.get("capture")
+    if not capture:
+        return None
+    template = capture.get("template") or {}
+    principal = getattr(node.get("probe_session"), "principal_id", None)
+    return (str(node.get("method") or "GET").upper(), node.get("path"),
+            capture.get("identity_key"), principal() if callable(principal) else None,
+            template.get("query") or "", tuple(template.get("path_ids") or ()),
+            template.get("object_id"), template.get("content_type") or "",
+            _sha256(template.get("body")), capture.get("response_status"),
+            capture.get("response_body_sha256") or _sha256(capture.get("response_body")))
+
+
+def _without_duplicate_captures(nodes, duplicates: list):
+    """Pass each node through once per distinct capture; a node whose capture is
+    identical to an earlier one is recorded in `duplicates` (with the capture that
+    covers it) instead of being investigated again."""
+    first_seen: dict = {}
+    for node in nodes:
+        fingerprint = _capture_fingerprint(node)
+        if fingerprint is not None:
+            if fingerprint in first_seen:
+                principal = getattr(node.get("probe_session"), "principal_id", None)
+                duplicates.append({"path": node.get("path"),
+                                   "method": node.get("method", "GET"),
+                                   "principal": principal() if callable(principal) else None,
+                                   "capture_id": node["capture"].get("capture_id"),
+                                   "covered_by": first_seen[fingerprint]})
+                continue
+            first_seen[fingerprint] = node["capture"].get("capture_id")
+        yield node
+
+
+def capture_problem(node):
+    if node.get("capture_error"):
+        return node["capture_error"]
+    if node.get("method", "GET").upper() not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
+        return "unsupported_method"
+    if node.get("capture") and node.get("method", "GET").upper() in {"POST", "PUT", "PATCH"}:
+        if not (node.get("template") or {}).get("body"):
+            return "missing_body"
+    return None
 
 log = logging.getLogger("harness.worklist_investigator")
 
@@ -170,7 +266,9 @@ def _seed_exchange(base_url: str, node: dict, headers: dict, id_fill: str,
     return HttpExchange(
         url=url, method=node.get("method", "GET"),
         request_headers=merged, request_body=body,
-        response_status=None, response_headers={}, response_body="",
+        response_status=(node.get("capture") or {}).get("response_status"),
+        response_headers=(node.get("capture") or {}).get("response_headers", {}),
+        response_body=(node.get("capture") or {}).get("response_body", ""),
     )
 
 
@@ -194,6 +292,7 @@ SKIP_BUDGET_EXHAUSTED = "budget_exhausted"
 SKIP_UNREACHABLE = "unreachable"
 SKIP_MISSING_TEMPLATE = "missing_template"
 SKIP_POLICY_BLOCKED = "policy_blocked"
+SKIP_TIME_BUDGET = "time_budget"
 
 
 def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
@@ -208,7 +307,9 @@ def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
         return SKIP_UNREACHABLE
     if eligible and investigated >= max_nodes:
         return SKIP_BUDGET_EXHAUSTED
-    return SKIP_MISSING_TEMPLATE
+    if not node.get("template"):
+        return SKIP_MISSING_TEMPLATE
+    return "no_applicable_hypothesis"
 
 
 async def investigate_worklist(
@@ -226,6 +327,9 @@ async def investigate_worklist(
     id_fill: str = "1",
     worklist_limit: int = 200,
     summary_out: dict | None = None,
+    deadline: float | None = None,
+    completed: dict[str, dict] | None = None,
+    on_outcome=None,
 ) -> list[dict]:
     """Drive `probe_fn` over the top `max_nodes` actionable worklist nodes.
 
@@ -265,6 +369,17 @@ async def investigate_worklist(
     with a nonempty `skipped_by_reason[budget_exhausted]` reached its node
     budget with eligible work still on the table.
 
+    `deadline`, a `time.monotonic()` value, stops the sweep starting work on a
+    node once passed; every later node that had work due is skipped as
+    `time_budget`, and one with nothing to run keeps its own reason.
+
+    `completed` (E7 resume) maps node_key(node) to the outcome an earlier,
+    interrupted run recorded for that node. Such a node is not run again: it uses the
+    budget it used, folds its stored findings into `state` and returns the stored
+    outcome marked `resumed`, without calling probe_fn, confirm_fn or precondition_fn.
+    `on_outcome(node_key, outcome)` is called as each node's outcome finishes (an
+    errored probe is not reported, so it runs again on resume).
+
     Returns a per-node outcome list; findings are folded back into `state`."""
     from harness.coverage_tracker import _principal_of
     from harness.engagement import principal_reached
@@ -274,8 +389,17 @@ async def investigate_worklist(
     precondition_run = 0
     eligible_count = 0
     skipped: list[dict] = []
+    duplicates: list[dict] = []
 
-    for node in state.worklist(worklist_limit):
+    nodes = _without_duplicate_captures(
+        (variant for node in state.worklist(worklist_limit)
+         for variant in captured_nodes(node, base_url, roles)), duplicates)
+    for node in nodes:
+        problem = capture_problem(node)
+        if problem:
+            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
+                            "reason": problem, "next_action": "Supply an in-scope complete capture and its owning identity"})
+            continue
         derived = _derive_probe(node)
         # R21: completion belongs to an (endpoint, check) case, not the whole
         # endpoint -- a "validated" endpoint may still hold UNRELATED vulnerabilities.
@@ -303,19 +427,43 @@ async def investigate_worklist(
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
                             "reason": _skip_reason(node, eligible, investigated, max_nodes, False)})
             continue  # no agent hypothesis AND no shape-driven leg to run -- skip
-
         reach = node.get("reachable_roles", []) or []
         # probe from the lowest-trust identity that can reach it (strongest proof).
         probe_role = min(reach, key=_trust) if reach else (roles[0].role if roles else "anonymous")
-        # WL-02: within that role, probe as a principal whose OWN cell reached the
-        # node, so a same-role principal that was denied is never the one used.
-        cells = node.get("access_by_principal") or {}
-        probe_session = next((r for r in roles if r.role == probe_role
-                              and principal_reached(cells, reach, _principal_of(r), r.role)), None)
+        # E5b: a capture variant carries the identity that made it; replay it as that
+        # identity. Otherwise (WL-02), within the probe role, probe as a principal whose
+        # OWN cell reached the node, so a same-role principal that was denied is never used.
+        probe_session = node.get("probe_session")
+        if probe_session is None:
+            cells = node.get("access_by_principal") or {}
+            probe_session = next((r for r in roles if r.role == probe_role
+                                  and principal_reached(cells, reach, _principal_of(r), r.role)), None)
         headers = (dict(probe_session.headers or {}) if probe_session is not None
                    else role_headers.get(probe_role, {}))
         parent_id = _parent_template_object_id(state, node)
         exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
+
+        # E7: a node an earlier run finished needs no work, so the deadline does not apply.
+        key = node_key(node) if (completed is not None or on_outcome is not None) else ""
+        if completed is not None and key in completed:
+            stored = completed[key]
+            if do_precond:
+                precondition_run += 1
+            if do_agent and not (stop_on_confirm and stored.get("confirmed")):
+                investigated += 1
+            node_findings = [dict(f) for f in stored.get("findings_detail") or []]
+            if node_findings:
+                state.ingest_findings(exchange.url, exchange.method, node_findings)
+            outcomes.append(dict(stored, findings_detail=node_findings, resumed=True))
+            if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
+                break
+            continue
+
+        if deadline is not None and time.monotonic() >= deadline:
+            # Work was due here but the investigation time budget is spent.
+            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
+                            "reason": SKIP_TIME_BUDGET})
+            continue
 
         node_findings: list[dict] = []
 
@@ -398,6 +546,11 @@ async def investigate_worklist(
             "confirmed": any(f.get("confirmed") for f in node_findings),
             "stop_reason": agent_stop,
         })
+        if on_outcome is not None:
+            try:
+                on_outcome(key, outcomes[-1])
+            except Exception as e:  # recording a unit never sinks the sweep
+                log.warning("investigate_worklist: on_outcome failed: %s", e)
         if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
             break
 
@@ -407,11 +560,22 @@ async def investigate_worklist(
     if summary_out is not None:
         by_reason: dict[str, int] = {}
         for s in skipped:
+            s.setdefault("next_action", {
+                "missing_template": "Capture the actual request and response",
+                "no_applicable_hypothesis": "Inspect deterministic coverage or add a supported check",
+                "budget_exhausted": "Resume with additional budget",
+                "time_budget": "Resume with additional time",
+                "policy_blocked": "Review the operation's authorization",
+                "unreachable": "Verify access with the supplied identity",
+            }.get(s["reason"], "Inspect the recorded prerequisite"))
             by_reason[s["reason"]] = by_reason.get(s["reason"], 0) + 1
         summary_out.update({
             "eligible": eligible_count,
             "investigated": investigated,
             "skipped": skipped,
             "skipped_by_reason": by_reason,
+            # E4: captures identical to an earlier one (same route, identity,
+            # request and response) that were not investigated a second time.
+            "duplicates_skipped": duplicates,
         })
     return outcomes

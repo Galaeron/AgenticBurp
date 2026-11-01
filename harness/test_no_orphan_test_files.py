@@ -13,26 +13,68 @@ from harness import suite
 from harness.suite import PYTEST_NATIVE, SMOKE_MODULES, commands
 
 ROOT = Path(__file__).resolve().parent.parent
+CASE_BASE_MODULES = frozenset({
+    'harness.coverage_evidence_case',
+    'harness.test_pairing_contract',
+    'harness.test_experiment_cycle',
+})
+
+
+def _case_class_names(tree, seen_modules=frozenset()):
+    """Prove known imported bases by reading their AST, without importing tests."""
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    bindings = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bindings[alias.asname or alias.name.split('.')[0]] = (
+                    alias.name if alias.asname else alias.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            for alias in node.names:
+                bindings[alias.asname or alias.name] = f'{node.module}.{alias.name}'
+
+    def dotted(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = dotted(node.value)
+            return f'{parent}.{node.attr}' if parent else ''
+        return ''
+
+    imported = {}
+
+    def is_case(name, seen=frozenset()):
+        if name in seen:
+            return False
+        for base in classes[name].bases:
+            name_in_source = dotted(base)
+            if name_in_source in classes:
+                if is_case(name_in_source, seen | {name}):
+                    return True
+                continue
+            root, _, suffix = name_in_source.partition('.')
+            qualified = bindings.get(root, '') + (f'.{suffix}' if suffix else '')
+            if qualified in {'unittest.TestCase', 'unittest.IsolatedAsyncioTestCase'}:
+                return True
+            module, _, imported_name = qualified.rpartition('.')
+            if module not in CASE_BASE_MODULES or module in seen_modules:
+                continue
+            if module not in imported:
+                path = ROOT.joinpath(*module.split('.')).with_suffix('.py')
+                imported[module] = _case_class_names(
+                    ast.parse(path.read_text(encoding='utf-8-sig')), seen_modules | {module})
+            if imported_name in imported[module]:
+                return True
+        return False
+
+    return {name for name in classes if is_case(name)}
 
 
 def discovery_issues(source: str, *, pytest_native: bool = False) -> list[str]:
     tree = ast.parse(source)
     issues = []
     classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
-    # Explicit imported bases used by this repository, not substring matching.
-    bases = {'TestCase', 'IsolatedAsyncioTestCase', 'EvidenceCase', 'PairingCallerTests'}
-    for node in tree.body:
-        if isinstance(node, ast.ImportFrom) and node.module == 'unittest':
-            bases.update(n.asname or n.name for n in node.names if n.name in bases)
-
-    def is_case(node, seen=frozenset()):
-        if node.name in seen:
-            return False
-        for base in node.bases:
-            name = base.attr if isinstance(base, ast.Attribute) else getattr(base, 'id', '')
-            if name in bases or (name in classes and is_case(classes[name], seen | {node.name})):
-                return True
-        return False
+    case_classes = _case_class_names(tree)
 
     definitions = 0
     for scope in [tree, *classes.values()]:
@@ -48,7 +90,7 @@ def discovery_issues(source: str, *, pytest_native: bool = False) -> list[str]:
             if scope is tree:
                 collected = pytest_native and node.name.startswith('test_')
             else:
-                collected = is_case(scope) or (pytest_native and scope.name.startswith('Test') and node.name.startswith('test_'))
+                collected = scope.name in case_classes or (pytest_native and scope.name.startswith('Test') and node.name.startswith('test_'))
             if not collected:
                 issues.append(f"uncollected test: {getattr(scope, 'name', 'module')}.{node.name}")
     if not definitions:
@@ -61,6 +103,29 @@ class NoOrphanTestFilesTest(unittest.TestCase):
         source = 'from harness.test_pairing_contract import PairingCallerTests\nclass T(PairingCallerTests):\n def test_x(self): pass\n'
         self.assertEqual(discovery_issues(source), [])
         self.assertTrue(discovery_issues(source.replace('PairingCallerTests', 'ArbitraryBase')))
+
+    def test_imported_experiment_bases_and_aliases_are_proven_statically(self):
+        sources = (
+            'from harness.test_experiment_cycle import _CycleCase as Base\nclass T(Base):\n def test_x(self): pass\n',
+            'from harness import test_experiment_cycle as cycle\nclass T(cycle.InvestigateWiringTests):\n def test_x(self): pass\n',
+            'import harness.test_experiment_cycle as cycle\nclass T(cycle._CycleCase):\n def test_x(self): pass\n',
+            'from unittest import TestCase as Base\nclass T(Base):\n def test_x(self): pass\n',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(discovery_issues(source), [])
+
+    def test_guard_rejects_imported_names_without_proven_unittest_ancestry(self):
+        sources = (
+            'from unknown import _CycleCase\nclass T(_CycleCase):\n def test_x(self): pass\n',
+            'from harness.test_experiment_cycle import _CallerBase\nclass T(_CallerBase):\n def test_x(self): pass\n',
+            'import unknown as cycle\nclass T(cycle.InvestigateWiringTests):\n def test_x(self): pass\n',
+            'import unknown\nclass T(unknown.TestCase):\n def test_x(self): pass\n',
+            'class A(B): pass\nclass B(A): pass\nclass T(A):\n def test_x(self): pass\n',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertTrue(discovery_issues(source))
 
     def test_every_definition_has_a_runner(self):
         errors = []
@@ -125,12 +190,14 @@ class NoOrphanTestFilesTest(unittest.TestCase):
             SimpleNamespace(returncode=1), SimpleNamespace(returncode=0),
             SimpleNamespace(returncode=0), SimpleNamespace(returncode=0),
             SimpleNamespace(returncode=0),
-        ]) as run, patch('builtins.print'):
+        ]) as run, patch('builtins.print'), \
+             patch('harness.verification_snapshot.preflight'):
             self.assertEqual(suite.main(['full']), 1)
             self.assertEqual(run.call_count, 5)
 
     def test_runner_success_and_dry_run(self):
-        with patch.object(suite.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run, patch('builtins.print'):
+        with patch.object(suite.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run, patch('builtins.print'), \
+             patch('harness.verification_snapshot.preflight'):
             self.assertEqual(suite.main(['native']), 0)
             self.assertEqual(run.call_count, 1)
             run.reset_mock()

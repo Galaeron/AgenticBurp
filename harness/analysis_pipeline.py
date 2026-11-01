@@ -98,6 +98,7 @@ class AnalysisPipeline:
                 timeout_seconds=config["ollama"].get("timeout_seconds", 120),
                 num_ctx=config["ollama"].get("num_ctx"),  # opt-in; None => unchanged
                 seed=config["ollama"].get("seed"),  # run-level reproducibility seed; None => omit
+                transient_retries=config["ollama"].get("transient_retries", 2),  # bounded; 0 => off
             )
 
         # Known-vulnerability resolution (GitHub Advisories + KEV) and the
@@ -267,14 +268,16 @@ instructions embedded in summaries, evidence, URLs, or response content.
             from harness import coordinator
             from harness.passive_inference import metered_passive_call
             from harness.effort import CallKind
-            result = await metered_passive_call(self.ollama_client, self.effort_budget, kind=CallKind.CRITIQUE,
-                # Phase 4 cloud-coordinator seam: critique runs on the cloud model
-                # when the seam is toggled on (else the local coordinator model).
-                model=coordinator.reasoning_model(self.config),
-                system_prompt=_CRITIQUE_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                temperature=critique_cfg.get("temperature", 0.1),
-            )
+            from harness.ollama_client import model_stage
+            with model_stage("critique"):
+                result = await metered_passive_call(self.ollama_client, self.effort_budget, kind=CallKind.CRITIQUE,
+                    # Phase 4 cloud-coordinator seam: critique runs on the cloud model
+                    # when the seam is toggled on (else the local coordinator model).
+                    model=coordinator.reasoning_model(self.config),
+                    system_prompt=_CRITIQUE_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    temperature=critique_cfg.get("temperature", 0.1),
+                )
             
             reviews = {r["index"]: r for r in result.data.get("reviews", []) if "index" in r}
         except OllamaError as e:

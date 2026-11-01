@@ -17,21 +17,94 @@ Usage:
     tok = c.token(); url = c.url(tok)        # embed url in the payload
     ... send the payload ...
     if await c.wait_for_hit(tok): CONFIRMED   # the target fetched our url
+    hit = await c.wait_for_any([tok1, tok2])  # one wait for a batch of probes
 """
 from __future__ import annotations
 
 import asyncio
 import atexit
 import http.server
+import ipaddress
+import os
+import re
 import secrets
 import threading
 import time
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+
+def _loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _target_origin(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("callback preflight needs an HTTP(S) target origin")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return f"{parsed.scheme}://{parsed.hostname.lower()}:{port}"
+
+
+@dataclass(frozen=True)
+class Settings:
+    bind_host: str = "127.0.0.1"
+    advertise_host: str = "127.0.0.1"
+    port: int = 0
+    approved_origin: str = ""
+
+    @classmethod
+    def load(cls, config=None, environ=None):
+        """One construction contract; explicit environment overrides local config."""
+        env = os.environ if environ is None else environ
+        cfg = (config or {}).get("collaborator", {})
+        if not isinstance(cfg, dict):
+            raise ValueError("collaborator must be a mapping")
+        values = {}
+        for name in ("bind_host", "advertise_host", "port", "approved_origin"):
+            key = "AGENTICVIBE_OOB_" + name.upper()
+            if key in env:
+                values[name] = env[key]
+            elif name in cfg:
+                values[name] = cfg[name]
+        if "advertise_host" not in values:
+            values["advertise_host"] = values.get("bind_host", "127.0.0.1")
+        port = values.get("port", 0)
+        if isinstance(port, bool) or not re.fullmatch(r"[0-9]+", str(port)):
+            raise ValueError("collaborator port must be an integer in 0..65535")
+        values["port"] = int(port)
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self):
+        if not 0 <= self.port <= 65535:
+            raise ValueError("collaborator port must be in 0..65535")
+        for host in (self.bind_host, self.advertise_host):
+            if not isinstance(host, str) or not re.fullmatch(r"[a-zA-Z0-9.-]+", host):
+                raise ValueError("collaborator host must be an IPv4 address or DNS name")
+        if self.advertise_host == "0.0.0.0":
+            raise ValueError("collaborator cannot advertise a wildcard address")
+        origin = f"http://{self.advertise_host}:{self.port}"
+        external = not (_loopback(self.bind_host) and _loopback(self.advertise_host))
+        if external and (not self.port or self.approved_origin != origin):
+            raise ValueError("non-loopback collaborator requires an exact approved_origin and explicit port")
+        if self.approved_origin and self.approved_origin != origin:
+            raise ValueError("collaborator approved_origin does not match advertised origin")
 
 
 class _Recorder(http.server.BaseHTTPRequestHandler):
     def _hit(self):
         try:
-            self.server.hits.append(self.path)  # type: ignore[attr-defined]
+            path = urlsplit(self.path).path
+            with self.server.hit_lock:  # type: ignore[attr-defined]
+                if path in self.server.tokens:  # type: ignore[attr-defined]
+                    self.server.hits.add(path)  # type: ignore[attr-defined]
         except Exception:
             pass
         try:
@@ -48,24 +121,65 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class _OwnedServer(http.server.ThreadingHTTPServer):
+    # HTTPServer enables SO_REUSEADDR, which permits competing binds on Windows.
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+
 class Collaborator:
     """A running loopback HTTP listener that records the paths it is hit on."""
 
-    def __init__(self, host: str = "127.0.0.1"):
-        self._srv = http.server.ThreadingHTTPServer((host, 0), _Recorder)
-        self._srv.hits = []  # type: ignore[attr-defined]
+    def __init__(self, host: str = "127.0.0.1", *, settings: Settings | None = None):
+        settings = settings or Settings(bind_host=host, advertise_host=host)
+        settings.validate()
+        self.settings = settings
+        self._srv = _OwnedServer((settings.bind_host, settings.port), _Recorder)
+        self._srv.hits = set()  # type: ignore[attr-defined]
+        self._srv.tokens = set()  # type: ignore[attr-defined]
+        self._srv.hit_lock = threading.Lock()  # type: ignore[attr-defined]
         self.host, self.port = self._srv.server_address
+        self.advertise_host = settings.advertise_host
+        self._stopped = False
+        self._reachable_targets: set[str] = set()
         self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
         self._thread.start()
 
     def token(self) -> str:
-        return "oob" + secrets.token_hex(8)
+        token = "oob" + secrets.token_hex(16)
+        with self._srv.hit_lock:
+            self._srv.tokens.add("/" + token)
+        return token
 
     def url(self, token: str) -> str:
-        return f"http://{self.host}:{self.port}/{token}"
+        return f"http://{self.advertise_host}:{self.port}/{token}"
 
     def was_hit(self, token: str) -> bool:
-        return any(token in p for p in list(self._srv.hits))  # type: ignore[attr-defined]
+        with self._srv.hit_lock:
+            return "/" + token in self._srv.hits
+
+    def record_preflight(self, token: str, target_url: str) -> bool:
+        """Call only after a probe from the owned target network, never the host."""
+        origin = _target_origin(target_url)
+        reached = self.was_hit(token)
+        if reached:
+            self._reachable_targets.add(origin)
+        else:
+            self._reachable_targets.discard(origin)
+        return reached
+
+    def health(self) -> dict:
+        return {"available": not self._stopped, "origin": self.url("").rstrip("/"),
+                "verified_target_origins": sorted(self._reachable_targets)}
+
+    def unavailable_reason(self, target_url: str) -> str:
+        if self._stopped:
+            return "callback listener is stopped"
+        if _target_origin(target_url) in self._reachable_targets:
+            return ""
+        # A loopback target URL can be a published container port. Its address
+        # alone never proves that the target can reach this listener.
+        return "callback reachability from the target network is unverified; assessment incomplete"
 
     async def wait_for_hit(self, token: str, timeout: float = 6.0) -> bool:
         """Poll for a callback carrying `token`, up to `timeout` seconds."""
@@ -76,10 +190,33 @@ class Collaborator:
             await asyncio.sleep(0.25)
         return False
 
+    def _first_hit(self, tokens) -> str | None:
+        with self._srv.hit_lock:
+            for token in tokens:
+                if "/" + token in self._srv.hits:
+                    return token
+        return None
+
+    async def wait_for_any(self, tokens, timeout: float = 6.0) -> str | None:
+        """One wait for a batch of probes: poll for a callback carrying ANY of
+        `tokens`, up to `timeout` seconds. Returns the first token (in the order
+        given) that was hit, or None."""
+        tokens = list(tokens)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            hit = self._first_hit(tokens)
+            if hit is not None:
+                return hit
+            await asyncio.sleep(0.25)
+        return None
+
     def stop(self) -> None:
         """Stop serving AND release the listening socket (idempotent). `shutdown()`
         alone only ends the serve loop; the bound socket stays open until
         `server_close()`, which leaked one loopback socket per stopped collaborator."""
+        if self._stopped:
+            return
+        self._stopped = True
         try:
             self._srv.shutdown()
         except Exception:
@@ -93,6 +230,67 @@ class Collaborator:
 
 _SHARED: Collaborator | None = None
 _ATEXIT_REGISTERED = False
+_SHARED_LOCK = threading.RLock()
+
+
+class ConfiguredCollaborator:
+    """Registry-owned lazy listener: validation now, bind before the first probe.
+
+    Separate registries never silently adopt each other's fixed-port listener.
+    """
+    def __init__(self, config):
+        self.settings = Settings.load(config)
+        self._listener = None
+        self._lock = threading.RLock()
+        atexit.register(self.stop)
+
+    def start(self):
+        with self._lock:
+            if self._listener is None:
+                self._listener = Collaborator(settings=self.settings)
+            return self._listener
+
+    def stop(self):
+        with self._lock:
+            if self._listener is not None:
+                self._listener.stop()
+
+    async def wait_for_any(self, tokens, timeout: float = 6.0) -> str | None:
+        return await self.start().wait_for_any(tokens, timeout=timeout)
+
+    def __getattr__(self, name):
+        return getattr(self.start(), name)
+
+
+def resolve(listener):
+    if isinstance(listener, ConfiguredCollaborator):
+        return listener.start()
+    return listener if listener is not None else shared()
+
+
+def listener_stopped(listener) -> bool:
+    """True when the listener can no longer record any callback, so a payload sent
+    for it cannot produce out-of-band evidence. An unverified target network is NOT
+    this: an exact registered callback proves its probe without a preflight, so a
+    validator still sends and only an absent callback stays inconclusive."""
+    health = getattr(listener, "health", None)
+    if health is None:
+        return False
+    try:
+        return not health().get("available", True)
+    except Exception:
+        return False
+
+
+def unavailable_result(listener, target_url, validator, vulnerability_class):
+    """Injected legacy fixtures have no health API; real listeners report uncertainty."""
+    check = getattr(listener, "unavailable_reason", None)
+    reason = check(target_url) if check is not None else ""
+    if reason:
+        from harness.validators.base import ValidationResult
+        return ValidationResult(validator, "inconclusive", vulnerability_class,
+                                confirmed=False, confidence=0.0, summary=reason)
+    return None
 
 
 def shared() -> Collaborator:
@@ -100,18 +298,20 @@ def shared() -> Collaborator:
     thread, but its listening socket is not released by the daemon dying: it is closed
     by `stop_shared()`, which is registered to run at interpreter exit."""
     global _SHARED, _ATEXIT_REGISTERED
-    if _SHARED is None:
-        _SHARED = Collaborator()
-        if not _ATEXIT_REGISTERED:
-            atexit.register(stop_shared)
-            _ATEXIT_REGISTERED = True
-    return _SHARED
+    with _SHARED_LOCK:
+        if _SHARED is None:
+            _SHARED = Collaborator(settings=Settings.load())
+            if not _ATEXIT_REGISTERED:
+                atexit.register(stop_shared)
+                _ATEXIT_REGISTERED = True
+        return _SHARED
 
 
 def stop_shared() -> None:
     """Stop and forget the process-wide collaborator (idempotent); the next `shared()`
     starts a fresh one."""
     global _SHARED
-    collaborator, _SHARED = _SHARED, None
-    if collaborator is not None:
-        collaborator.stop()
+    with _SHARED_LOCK:
+        collaborator, _SHARED = _SHARED, None
+        if collaborator is not None:
+            collaborator.stop()

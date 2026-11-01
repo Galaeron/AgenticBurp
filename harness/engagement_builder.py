@@ -37,6 +37,27 @@ def _host_of(base_url: str) -> str:
     return urlsplit(base_url).netloc or base_url
 
 
+def register_role_sessions(run_context, base_url: str, roles) -> list[str] | None:
+    """Register each role's credentials with the run, for `base_url`'s origin only, and
+    return their session refs (None without a run). build_engagement does this first,
+    and a run that restores its discovery from a journal does it instead."""
+    if run_context is None:
+        return None
+    from harness.run_context import ScopePolicy
+    permitted_origin = ScopePolicy.origin_of(base_url)
+    session_refs = []
+    for index, role in enumerate(roles):
+        principal_id = role.principal_id()
+        session_id = ("anonymous" if not role.headers and principal_id == "anonymous"
+                      else f"principal:{index}:{principal_id}")
+        run_context.sessions.register(
+            session_id, principal_id, dict(role.headers or {}),
+            allowed_origins=[permitted_origin], role=role.role,
+            name=role.name or principal_id, principal=role.to_principal())
+        session_refs.append(session_id)
+    return session_refs
+
+
 async def build_engagement(
     base_url: str,
     roles: list[RoleSession],
@@ -56,20 +77,7 @@ async def build_engagement(
 
     Returns (state, raw_role_crawl_result). `state.worklist()` is the prioritised
     ranking; the raw result carries the endpoints, candidates and IDOR findings."""
-    session_refs = None
-    if run_context is not None:
-        from harness.run_context import ScopePolicy
-        permitted_origin = ScopePolicy.origin_of(base_url)
-        session_refs = []
-        for index, role in enumerate(roles):
-            principal_id = role.principal_id()
-            session_id = ("anonymous" if not role.headers and principal_id == "anonymous"
-                          else f"principal:{index}:{principal_id}")
-            run_context.sessions.register(
-                session_id, principal_id, dict(role.headers or {}),
-                allowed_origins=[permitted_origin], role=role.role,
-                name=role.name or principal_id, principal=role.to_principal())
-            session_refs.append(session_id)
+    session_refs = register_role_sessions(run_context, base_url, roles)
     # Browser/Burp captures are observations, not guessed endpoints. Keep their
     # original method/body/query and identity; never relabel authenticated traffic
     # as anonymous or import another origin's traffic into this engagement.
@@ -163,6 +171,11 @@ async def build_engagement(
             ep.record_principal_observation(principal_id, **observation)
             access.record(principal_id, **observation)
         state.record_template(ex.url, ex.method, ex)
+    # E5b: every probe the crawl sent is a replayable request AS the identity that
+    # sent it, so a check on an identity whose body (or 401) was not kept as a
+    # capture still has its own request to replay.
+    for probe in getattr(result, "identity_probes", None) or []:
+        state.record_identity_probe(probe["url"], probe["method"], probe)
     for r in roles:
         state.ingest_identity(f"rolecrawl:{r.name or r.role}", r.role, source="seed")
 
@@ -183,6 +196,7 @@ async def feature_crawl_captures(
     max_captured: int = 200,
     seed_paths: list[str] | None = None,
     run_context=None,
+    errors=None,
 ) -> list:
     """Run the stateful feature-workflow crawl (feature_workflow.crawl_features) as
     each DISTINCT-feature role and union the captured exchanges.
@@ -228,8 +242,12 @@ async def feature_crawl_captures(
                 seed_paths=seed_paths,
                 max_steps=max_steps, max_depth=max_depth, max_captured=max_captured)
         except Exception as e:  # a role's feature crawl must not sink the build
+            if errors is not None:
+                errors.append({"phase": "feature_crawl", "error": f"{r.role}: {type(e).__name__}"})
             log.debug("feature_crawl_captures: role %r failed: %s", r.role, e)
             continue
+        if errors is not None:
+            errors.extend({"phase": "feature_crawl", "error": e} for e in res.errors)
         for ex in res.captured:
             sp = urlsplit(ex.url)
             hdrs = ex.request_headers or {}

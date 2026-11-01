@@ -131,6 +131,10 @@ class Finding(BaseModel):
     # I04: harness-owned guidance for a candidate that needs a manual check
     # (copy-ready steps). Not confirmation; agents can never set it.
     manual_verification: str = ""
+    # E2: header_fingerprint of the response-header policy a csp/cors finding was
+    # decided from, set by the harness (never an agent). Findings of one host-wide
+    # policy share it; routes with different policies do not.
+    header_fingerprint: str = ""
 
     @computed_field
     @property
@@ -196,6 +200,11 @@ class AgentReport(BaseModel):
     # finding/report show which tactical-guide version was loaded for this
     # dispatch, independent of the broader prompt_version hash above.
     guide_version: str = ""
+    # E8 -- body-character budget this agent's prompt actually used, recorded
+    # ONLY when it was lowered below the shared max_body_chars (a header-only
+    # agent such as cors/csp). None means the agent saw the normal budget, so
+    # a reviewer can tell a shortened body from a full one.
+    input_body_chars: Optional[int] = None
 
 
 class ObservationAttribution(BaseModel):

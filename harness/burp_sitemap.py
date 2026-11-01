@@ -26,6 +26,8 @@ applied on request.
 """
 from __future__ import annotations
 
+from harness import scope_lock
+
 import base64
 import binascii
 import logging
@@ -279,7 +281,7 @@ def _host_allowed(url: str, allowed_hosts: list[str] | None) -> bool:
     if not allowed_hosts:
         return True
     host = (urlsplit(url).hostname or "").lower()
-    return any(host == h.lower() or host.endswith("." + h.lower()) for h in allowed_hosts)
+    return scope_lock.host_in_scope(url, allowed_hosts)
 
 
 def load_exchanges(source: str, *, allowed_hosts: list[str] | None = None,

@@ -3,6 +3,7 @@ import asyncio
 import json as _json
 import os
 import re
+import secrets
 import tempfile
 import subprocess
 from pathlib import Path
@@ -28,6 +29,12 @@ from harness.safety_gate import get_default_gate
 # field names, as an earlier version of this module did for password/
 # email specifically, cannot generalize to "whatever parameters this
 # exchange happens to have").
+# Why the run stopped the tool's proxied traffic (ToolProxy.stop_reason), for summaries.
+_PROXY_STOP_WHY = {"budget_exhausted": "the run's request budget ran out",
+                   "session_expired": "the identity's session expired during the scan",
+                   "route_unavailable": "the route answered 5xx to every request and was paused"}
+
+
 def _looks_like_json(body: str, content_type: str) -> bool:
     if "json" in content_type.lower():
         return True
@@ -167,8 +174,8 @@ def _responses_differ(resp_a: httpx.Response, resp_b: httpx.Response) -> bool:
 # Error-based signal, complementary to the boolean-blind differential
 # above -- found necessary live, against a real target: Juice Shop's
 # product search (`GET /rest/products/search?q=`) wraps the parameter in
-# a LIKE '%...%' clause, where an OR-based tautology/contradiction pair
-# is not actually a true/false differential at all (the unconditional
+# a LIKE '%...%' clause, where an unprefixed OR-based tautology/contradiction
+# pair was not a true/false differential at all (the unconditional
 # `LIKE '%'` half of the OR already matches everything, so both the
 # "true" and "false" injected predicates return identical results -- a
 # real, confirmed injection point that the boolean-blind check alone
@@ -235,6 +242,105 @@ def _looks_like_auth_request(exchange: HttpExchange) -> bool:
         return True
     path = (urlsplit(exchange.url).path or "").lower()
     return any(seg in _AUTH_PATH_SEGMENTS for seg in path.split("/") if seg)
+
+
+# Ticket 2B: sqlmap's own report of WHERE it found injection. The block starts with
+# "sqlmap identified|resumed the following injection point(s)" and holds, per
+# parameter, a "Parameter: <name> (<place>)" line followed by repeated
+# Type/Title/Payload lines.
+_POINTS_HEADER_RE = re.compile(r"sqlmap (?:identified|resumed) the following injection point", re.I)
+_POINT_PARAM_RE = re.compile(r"^Parameter:\s*(?P<name>.+?)\s*\((?P<place>.+)\)\s*$")
+_POINT_FIELD_RE = re.compile(r"^(?P<key>Type|Title|Payload):\s*(?P<value>.*)$", re.I)
+_HEADER_PLACES = frozenset({"user-agent", "referer", "host", "x-forwarded-for", "x-forwarded-host"})
+# Where the harness's boolean differential can mutate a parameter (see
+# _boolean_probe_fallback's only_params).
+_DIFFERENTIAL_LOCATIONS = ("query", "body_form", "body_json")
+_MAX_REPRODUCED_POINTS = 3
+_MAX_LISTED_POINTS = 8
+_PAYLOAD_LINE_CAP = 200
+_TAIL_MARKER = "--- sqlmap output (tail) ---"
+
+
+def _point_location(place: str, name: str) -> tuple[str, str]:
+    """(harness parameter location, parameter name) for sqlmap's "(place)" label and
+    its parameter name ("JSON email" is the JSON body field "email")."""
+    label = place.strip().lower()
+    if label == "get":
+        return "query", name
+    if label == "post":
+        return "body_form", name
+    if label == "(custom) post":
+        return "body_json", name[5:].strip() if name[:5].lower() == "json " else name
+    if label == "uri":
+        return "path", name
+    if label == "cookie":
+        return "cookie", name
+    if label in _HEADER_PLACES or label.startswith("x-"):
+        return "header", name
+    return label, name
+
+
+def parse_injection_points(output: str) -> list[dict]:
+    """The injection points sqlmap reported in its output: one dict per
+    (parameter, type) with place (the harness's parameter location), parameter,
+    type, title and payload. Missing lines leave "" and Windows line endings are
+    fine. [] when the output has no injection-point block."""
+    points: list[dict] = []
+    in_block = False
+    param: tuple[str, str] | None = None
+    entry: dict | None = None
+    for raw in (output or "").splitlines():
+        line = raw.strip()
+        if _POINTS_HEADER_RE.search(line):
+            in_block, param, entry = True, None, None
+            continue
+        if not in_block:
+            continue
+        if line.startswith("[") and "] [" in line[:30]:
+            in_block, param, entry = False, None, None   # a log line ends the block
+            continue
+        found = _POINT_PARAM_RE.match(line)
+        if found:
+            param, entry = _point_location(found.group("place"), found.group("name").strip()), None
+            continue
+        field = _POINT_FIELD_RE.match(line)
+        if field is None or param is None:
+            continue
+        key, value = field.group("key").lower(), field.group("value").strip()
+        # A Type line, or a Title/Payload that repeats one this entry already has,
+        # starts a new entry for the parameter.
+        if entry is None or key == "type" or entry[key]:
+            entry = {"place": param[0], "parameter": param[1], "type": "", "title": "", "payload": ""}
+            points.append(entry)
+        entry[key] = value
+    unique: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for point in points:
+        ident = (point["place"], point["parameter"], point["type"])
+        if ident not in seen:
+            seen.add(ident)
+            unique.append(point)
+    return unique
+
+
+def _point_label(point: dict) -> str:
+    return f"{point['place']}:{point['parameter']}"
+
+
+def _points_evidence(points: list[dict], tail: str, differential: str = "") -> str:
+    """The evidence of a sqlmap confirmation: what it found where, then its payloads
+    (and the harness's own differential, when it reproduced one), then the output
+    tail (callers keep only the first 1000 characters)."""
+    if not points:
+        return tail
+    listed = points[:_MAX_LISTED_POINTS]
+    lines = [f"injection point: {_point_label(p)} — {p['type'] or 'injection'}"
+             + (f" ({p['title']})" if p["title"] else "") for p in listed]
+    lines += [f"payload ({_point_label(p)}): {p['payload'][:_PAYLOAD_LINE_CAP]}"
+              for p in listed if p["payload"]]
+    if differential:
+        lines.append(f"harness differential: {differential}")
+    return "\n".join(lines) + f"\n{_TAIL_MARKER}\n" + tail
 
 
 class SqlmapValidator(Validator):
@@ -466,6 +572,14 @@ class SqlmapValidator(Validator):
                 for code in _AUTH_REJECTION_CODES:
                     if code not in ignore_codes:
                         ignore_codes.append(code)
+                if exchange.response_status is not None and 200 <= exchange.response_status < 300:
+                    # live-v8: a successful login answers with a per-request token, so
+                    # two identical requests differ in content and sqlmap's stability
+                    # check passes or fails by timing. Failed, it compares page content
+                    # and never reads the 2xx-vs-401 flip (v8, 191 requests, nothing
+                    # found); passed, it picks --code itself (v7). Naming the success
+                    # status makes the flip the comparison either way.
+                    cmd += ["--code", str(exchange.response_status)]
             if ignore_codes:
                 cmd += ["--ignore-code", ",".join(ignore_codes)]
 
@@ -625,7 +739,8 @@ class SqlmapValidator(Validator):
                     why = ("the run's request budget is exhausted "
                            f"({proxy.forwarded} sqlmap request(s) were sent through the run)"
                            if proxy is not None and proxy.stop_reason == "budget_exhausted"
-                           else "the run was cancelled")
+                           else _PROXY_STOP_WHY.get(proxy.stop_reason if proxy is not None else "",
+                                                    "the run was cancelled"))
                     return ValidationResult(self.name, "skipped", finding.vulnerability_class,
                                             summary=f"sqlmap stopped: {why}", command=cmd)
                 return ValidationResult(self.name, "error", finding.vulnerability_class,
@@ -638,16 +753,10 @@ class SqlmapValidator(Validator):
             lower = output.lower()
             confirmed = proc.returncode == 0 and "is vulnerable" in lower
             if confirmed:
-                return ValidationResult(
-                    self.name, "confirmed", finding.vulnerability_class,
-                    confidence=0.98, confirmed=True,
-                    summary="sqlmap independently reported the target as injectable",
-                    evidence=output, raw_output=output, command=cmd,
-                )
+                return await self._sqlmap_confirmation(finding, exchange, output, cmd)
             if proxy is not None and proxy.stop_reason:
                 # The run refused part of the scan: an incomplete scan is not a negative.
-                why = ("the run's request budget ran out" if proxy.stop_reason == "budget_exhausted"
-                       else "the run was cancelled")
+                why = _PROXY_STOP_WHY.get(proxy.stop_reason, "the run was cancelled")
                 return ValidationResult(
                     self.name, "skipped", finding.vulnerability_class,
                     summary=f"sqlmap incomplete: {why} after {proxy.forwarded} request(s) "
@@ -677,6 +786,40 @@ class SqlmapValidator(Validator):
                 evidence=output, raw_output=output, command=cmd,
             )
 
+    async def _sqlmap_confirmation(self, finding: Finding, exchange: HttpExchange,
+                                   output: str, cmd: list[str]) -> ValidationResult:
+        """The confirmation for a sqlmap that reported the target injectable (Ticket 2B).
+
+        sqlmap stays the authority for the verdict. Its injection points lead the
+        evidence, and each boolean-based point the harness can mutate (up to
+        _MAX_REPRODUCED_POINTS) is replayed through the boolean differential
+        restricted to that parameter. The first one that reproduces gives the result
+        the differential's baseline/attack/control artifacts; otherwise the result is
+        marked tool-reported and names no exchanges, so its proof stays a candidate."""
+        points = parse_injection_points(output)
+        result = ValidationResult(
+            self.name, "confirmed", finding.vulnerability_class,
+            confidence=0.98, confirmed=True,
+            summary="sqlmap independently reported the target as injectable",
+            evidence=_points_evidence(points, output), raw_output=output, command=cmd,
+            injection_points=tuple(points),
+        )
+        eligible = [p for p in points
+                    if "boolean" in p["type"].lower() and p["place"] in _DIFFERENTIAL_LOCATIONS]
+        for point in eligible[:_MAX_REPRODUCED_POINTS]:
+            repro = await self._boolean_probe_fallback(
+                finding, exchange, only_params=[(point["place"], point["parameter"])])
+            if repro is None or not repro.confirmed:
+                continue
+            result.summary = (f"sqlmap reported injection at {_point_label(point)} ({point['type']}); "
+                              "the harness reproduced a true/false differential on the same parameter")
+            result.evidence = _points_evidence(points, output, repro.evidence)
+            return result.with_artifacts(
+                baseline=repro.baseline_artifact_id, attack=repro.attack_artifact_id,
+                controls=repro.control_artifact_ids)
+        result.summary = "tool-reported, not reproduced by the harness: " + result.summary
+        return result
+
     # Cap on how many parameters this fallback probes per exchange -- this
     # is a bounded, opt-in active check (same philosophy as
     # recon_validator.py's own request caps and scope_discovery.py's
@@ -688,7 +831,8 @@ class SqlmapValidator(Validator):
     _MAX_PROBE_PARAMS = 5
 
     async def _boolean_probe_fallback(
-        self, finding: Finding, exchange: HttpExchange
+        self, finding: Finding, exchange: HttpExchange,
+        only_params: list[tuple[str, str]] | None = None,
     ) -> ValidationResult | None:
         """Dependency-free confirmation for SQL injection when sqlmap isn't
         installed. NOT limited to credential/auth fields -- SQLi is not an
@@ -699,8 +843,12 @@ class SqlmapValidator(Validator):
         for each sends exactly two requests, identical to the original
         exchange except for that one parameter's value:
 
-          A (tautology):  ' OR '1'='1' --   -- same predicate either way
-          B (contradiction): ' OR '1'='2' -- -- same syntax, false predicate
+          A (tautology):  <marker>' OR '1'='1' --   -- true whatever the field holds
+          B (contradiction): <marker>' OR '1'='2' -- -- same syntax, false predicate
+
+        <marker> is a fresh random token shared by A and B. Without it B reduces
+        to `field = ''`, which a stored empty value matches: live-v8's target
+        held an account registered with an empty email, so both probes logged in.
 
         Confirmation is a response differential between A and B: a status-
         code difference is always meaningful; otherwise (most non-auth
@@ -712,6 +860,10 @@ class SqlmapValidator(Validator):
         with the truth value flipped changes the outcome, so it isn't the
         syntax alone (a broken query would fail both identically) that
         changed it.
+
+        `only_params` ((location, name) pairs with location query, body_form or
+        body_json) restricts the candidates to those parameters, so a tool's
+        reported injection point is replayed without probing the others.
 
         Returns None (not a ValidationResult) when there are no query or
         body parameters to mutate at all -- the caller falls back to a
@@ -732,6 +884,10 @@ class SqlmapValidator(Validator):
             ):
                 body_kind = "form"
                 candidates += [("body", p) for p in _form_top_level_params(body)]
+        if only_params is not None:
+            wanted = set(only_params)
+            candidates = [(loc, p) for loc, p in candidates
+                          if (("query" if loc == "query" else f"body_{body_kind}"), p) in wanted]
         candidates = candidates[: self._MAX_PROBE_PARAMS]
         if not candidates:
             return None
@@ -752,21 +908,24 @@ class SqlmapValidator(Validator):
         # shaped text for perfectly ordinary input doesn't get flagged
         # just for continuing to do so under a mutated value.
         baseline_already_errors = _text_has_db_error_markers(exchange.response_body or "")
+        error_anomalies = []
         attempts: list[str] = []
         errors: list[str] = []
         had_clean_comparison = False
+        marker = "zq" + secrets.token_hex(4)
+        true_payload, false_payload = f"{marker}' OR '1'='1' -- ", f"{marker}' OR '1'='2' -- "
 
         for location, param in candidates:
             if location == "query":
-                url_a = _mutate_query_param(exchange.url, param, "' OR '1'='1' -- ")
-                url_b = _mutate_query_param(exchange.url, param, "' OR '1'='2' -- ")
+                url_a = _mutate_query_param(exchange.url, param, true_payload)
+                url_b = _mutate_query_param(exchange.url, param, false_payload)
                 if url_a is None or url_b is None:
                     continue
                 target_a, target_b, body_a, body_b = url_a, url_b, body, body
             else:
                 mutate = _mutate_json_param if body_kind == "json" else _mutate_form_param
-                body_a = mutate(body, param, "' OR '1'='1' -- ")
-                body_b = mutate(body, param, "' OR '1'='2' -- ")
+                body_a = mutate(body, param, true_payload)
+                body_b = mutate(body, param, false_payload)
                 if body_a is None or body_b is None:
                     continue
                 target_a, target_b = exchange.url, exchange.url
@@ -804,21 +963,9 @@ class SqlmapValidator(Validator):
                             capability="sqlmap_boolean_probe", session_ref=session_ref)
                         if not outcome.ok:
                             raise httpx.TransportError(outcome.error or outcome.outcome)
-                        # RunContext exposes decoded text. Reattaching the
-                        # origin's wire-level gzip/content-length headers to
-                        # those decoded bytes makes httpx decompress them a
-                        # second time ("incorrect header check") and turns a
-                        # valid comparison into a silent probe error.
-                        decoded_headers = {
-                            k: v for k, v in (outcome.headers or {}).items()
-                            if k.lower() not in (
-                                "content-encoding", "content-length",
-                                "transfer-encoding")
-                        }
-                        return httpx.Response(
-                            outcome.status or 0, content=(outcome.body or "").encode(),
-                            headers=decoded_headers,
-                            request=httpx.Request(exchange.method.upper(), url))
+                        # RunContext exposes decoded text; the consumer view
+                        # drops wire framing so httpx does not decode it twice.
+                        return outcome.to_httpx_response(exchange.method.upper(), url)
 
                     resp_a = await routed(target_a, body_a)
                     resp_b = await routed(target_b, body_b)
@@ -839,11 +986,21 @@ class SqlmapValidator(Validator):
             had_clean_comparison = True
 
             evidence = (
-                f"{label}: tautology (' OR '1'='1' -- ) -> HTTP {resp_a.status_code} "
-                f"({len(resp_a.content)}b); contradiction (' OR '1'='2' -- ) -> "
+                f"{label}: tautology ({true_payload}) -> HTTP {resp_a.status_code} "
+                f"({len(resp_a.content)}b); contradiction ({false_payload}) -> "
                 f"HTTP {resp_b.status_code} ({len(resp_b.content)}b)"
             )
-            if _responses_differ(resp_a, resp_b):
+            both_db_errors = _looks_like_db_error(resp_a) and _looks_like_db_error(resp_b)
+            if _responses_differ(resp_a, resp_b) and not both_db_errors:
+                baseline = None
+                if self.run_context is not None:
+                    try:
+                        # The original value, replayed: the reference answer the
+                        # differential is audited against (Ticket 6 proof baseline).
+                        # Best effort: a proof send never changes the verdict.
+                        baseline = await routed(exchange.url, body)
+                    except Exception:
+                        baseline = None
                 return ValidationResult(
                     self.name, "confirmed", finding.vulnerability_class,
                     confidence=0.85, confirmed=True,
@@ -851,26 +1008,13 @@ class SqlmapValidator(Validator):
                             f"{label} parameter: flipping the injected predicate's truth "
                             f"value (same syntax, true vs. false) changed the response.",
                     evidence=evidence, command=cmd_desc,
-                )
-            # Error-based signal, checked whenever the boolean-blind check
-            # above doesn't fire: catches injection points where the value
-            # is wrapped in a way (e.g. LIKE '%...%') that makes an
-            # OR-based tautology/contradiction pair meaningless as a
-            # true/false test (both sides of a wildcard-matched OR return
-            # everything regardless of the injected predicate) -- verified
-            # live, against Juice Shop's product search, that this is a
-            # real gap the boolean-blind check alone misses even though
-            # the underlying injection is genuine and produces a visible
-            # raw DB error.
+                ).with_artifacts(baseline=baseline, attack=resp_a, controls=[resp_b])
+            # A changed database-error signature is worth retaining for review,
+            # but without a differential it cannot establish exploitable injection.
             if not baseline_already_errors and (_looks_like_db_error(resp_a) or _looks_like_db_error(resp_b)):
-                return ValidationResult(
-                    self.name, "confirmed", finding.vulnerability_class,
-                    confidence=0.8, confirmed=True,
-                    summary=f"Error-based probe confirmed SQL injection via the {label} "
-                            f"parameter: an injected quote/comment payload produced a raw "
-                            f"database error that the original, unmutated request did not.",
-                    evidence=evidence, command=cmd_desc,
-                )
+                # A raw error alone is an anomaly, not proof of exploitable SQLi.
+                # Keep testing other parameters for an independent differential.
+                error_anomalies.append(evidence)
             attempts.append(evidence)
 
         if not had_clean_comparison:
@@ -886,6 +1030,13 @@ class SqlmapValidator(Validator):
                         f"{'; '.join(errors)}",
             )
 
+        if error_anomalies:
+            return ValidationResult(
+                self.name, "inconclusive", finding.vulnerability_class,
+                confidence=0.3, confirmed=False,
+                summary="SQL injection candidate: payloads produced database errors without a "
+                        "independent truth-value differential; independent controlled evidence is required",
+                evidence="; ".join(error_anomalies), command=cmd_desc)
         return ValidationResult(
             self.name, "not_confirmed", finding.vulnerability_class,
             confidence=0.1, confirmed=False,

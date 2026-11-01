@@ -1,4 +1,6 @@
 from __future__ import annotations
+import hashlib
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -27,6 +29,103 @@ class ValidationResult:
     # I04: operator guidance when a check cannot confirm automatically but the
     # shape stays worth a human look (e.g. CSRF). Never confirmation authority.
     manual_verification: str = ""
+    # Ticket 6: the run-transport exchanges this verdict rests on. The
+    # orchestrator copies them onto the case's ProofRecord; strict accounting
+    # counts a vulnerability only when all three roles name distinct, case-bound,
+    # successfully executed exchanges with intact evidence blobs. Empty on a
+    # legacy result (its proof stays a candidate).
+    baseline_artifact_id: str = ""
+    attack_artifact_id: str = ""
+    control_artifact_ids: tuple[str, ...] = ()
+    # Ticket 2B: the injection points a tool reported (sqlmap), one dict per
+    # (parameter, type): {"place", "parameter", "type", "title", "payload"}, where
+    # place is the harness's parameter location (query, body_form, body_json, path,
+    # cookie, header). Empty for every other validator.
+    injection_points: tuple[dict, ...] = ()
+    # E2: sha256 of the normalized response-header policy a header check decided from
+    # (header_fingerprint below), so findings of one host-wide policy group as one
+    # issue. "" when the validator is not a header check or saw no response.
+    header_fingerprint: str = ""
+
+    def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
+        """Name the sends behind this verdict; each is an ExecutionOutcome, a
+        run-transport httpx.Response, an artifact id, or None. Returns self."""
+        self.baseline_artifact_id = artifact_id_of(baseline)
+        self.attack_artifact_id = artifact_id_of(attack)
+        self.control_artifact_ids = tuple(i for i in map(artifact_id_of, controls) if i)
+        return self
+
+
+def artifact_id_of(sent) -> str:
+    """The run's exchange artifact id behind one send: an ExecutionOutcome, an
+    httpx.Response built by the run transport (GatedAsyncClient), a SentAnswer,
+    or an id.
+    "" for a send that never went through a run (plain client, Burp, fakes), and
+    for an outcome that was refused or errored: nothing was sent and answered."""
+    if sent is None:
+        return ""
+    if isinstance(sent, str):
+        return sent
+    if not getattr(sent, "ok", True):
+        return ""
+    artifact_id = getattr(sent, "artifact_id", None)
+    if isinstance(artifact_id, str):
+        return artifact_id
+    extensions = getattr(sent, "extensions", None)
+    if isinstance(extensions, dict):
+        return extensions.get("harness_artifact_id", "") or ""
+    return ""
+
+
+class SentAnswer(tuple):
+    """A probe seam's plain tuple answer (e.g. (status, body)) that also carries
+    the run's exchange artifact id. Unpacks exactly like the tuple, so a test
+    stub returning a bare tuple keeps working (its artifact id is just "")."""
+    artifact_id = ""
+
+    def __new__(cls, values, artifact_id: str = ""):
+        answer = super().__new__(cls, values)
+        answer.artifact_id = artifact_id or ""
+        return answer
+
+
+def proof_artifact_kwargs(result) -> dict:
+    """ProofRecord.from_validation_result keyword arguments for the exchanges a
+    result names. Only a reached verdict (confirmed / not_confirmed) that names
+    at least one exchange declares executed=True; anything else stays legacy."""
+    if (getattr(result, "status", "") or "").lower() not in ("confirmed", "not_confirmed"):
+        return {}
+    baseline = getattr(result, "baseline_artifact_id", "") or ""
+    attack = getattr(result, "attack_artifact_id", "") or ""
+    controls = tuple(getattr(result, "control_artifact_ids", ()) or ())
+    if not (baseline or attack or controls):
+        return {}
+    return {"executed": True, "baseline_artifact_id": baseline,
+            "attack_artifact_id": attack, "control_artifact_ids": controls}
+
+
+def header_fingerprint(*values: str | None) -> str:
+    """sha256 of the normalized values of the response headers a policy is made of;
+    None is a header that was absent. Case and whitespace are folded and a CSP nonce
+    (new on every response) is dropped, so one policy has one fingerprint however
+    often it is fetched."""
+    parts = ["-" if v is None else re.sub(r"'nonce-[^']*'", "'nonce-'", " ".join(str(v).split()).lower())
+             for v in values]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8", errors="replace")).hexdigest()
+
+
+def observed_result_of(result, limit: int = 500) -> str:
+    """ProofRecord.observed_result for a result: its summary (else evidence), and
+    for a tool that reported injection points the "<location>:<parameter> <type>"
+    list, so a proof names what was tested even when the summary is long."""
+    base = getattr(result, "summary", "") or getattr(result, "evidence", "") or ""
+    points = getattr(result, "injection_points", ()) or ()
+    if not points:
+        return base[:limit]
+    listed = "; ".join(f"{p.get('place', '')}:{p.get('parameter', '')} {p.get('type', '')}".strip()
+                       for p in points)[:limit // 2]
+    tail = f" [injection points: {listed}]"
+    return base[:max(0, limit - len(tail))] + tail
 
 
 def _enclosing_run():
@@ -39,6 +138,9 @@ class Validator(ABC):
     name: str = "base"
     finding_classes: set[str] = set()
     active: bool = False
+    # Batch 04: bump when the oracle or executor changes what a verdict means; a
+    # result from another version is never reused.
+    mechanism_version: str = "1"
     _bound_run = None
 
     @property

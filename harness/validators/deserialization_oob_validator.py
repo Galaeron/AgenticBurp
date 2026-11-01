@@ -25,6 +25,7 @@ payloads are built -- those have no gadget-free in-process proof, so they stay w
 the passive format-confirmation validator.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import base64
 import os
@@ -120,7 +121,7 @@ class DeserializationOobValidator(Validator):
         self._collab = collaborator
 
     def collab(self):
-        return self._collab or _collab.shared()
+        return _collab.resolve(self._collab)
 
     def _sink_candidates(self, exchange: HttpExchange):
         """(location, name) points where a base64-pickle value currently lives --
@@ -177,7 +178,7 @@ class DeserializationOobValidator(Validator):
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         # Executing code on the target is strictly stronger than a read, so require
         # the mutating opt-in regardless of the HTTP method carrying the cookie.
@@ -240,6 +241,9 @@ class DeserializationOobValidator(Validator):
                 evidence=f"Overwrote {len(sinks)} pickle-shaped sink(s) with a benign beacon payload; "
                          f"{answered} answered beacon(s) drew no collaborator hit, but a beacon that "
                          f"never reached the target cannot call back.{waited}")
+        unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "deserialization")
+        if unavailable is not None:
+            return unavailable
         return ValidationResult(
             self.name, "not_confirmed", "deserialization", confidence=0.0, confirmed=False,
             summary="No out-of-band callback -- the pickle value does not appear to be deserialised unsafely",

@@ -11,8 +11,11 @@ the exact namespace orchestrator.py used to expose -- keeping existing
 """
 from __future__ import annotations
 import asyncio
+import functools
+import hashlib
 import logging
 import re
+import time
 from urllib.parse import urlparse, urlsplit
 
 import httpx
@@ -408,6 +411,7 @@ def coverage_confirmation_finding(res, check, url: str, identity: str) -> dict |
         # path never wrote, so a single provenance reader had to know which
         # path produced a given finding.
         "confirmed_by_leg": getattr(res, "validator", None) or check.confirmation,
+        "header_fingerprint": getattr(res, "header_fingerprint", "") or "",   # E2: issue grouping
         "url": url,
         "identity": identity,
         "basis": "derived",
@@ -660,7 +664,11 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
 
 
 async def review_captured_exchanges(orch, state, captured, *, max_reviews: int = 200,
-                                    run_context=None) -> int:
+                                    run_context=None, seen=None, errors=None,
+                                    deadline: float | None = None, stats: dict | None = None,
+                                    group_identical: bool = True,
+                                    resumed: dict | None = None, on_review=None,
+                                    summary_out: dict | None = None) -> int:
     """Phase 0.1: route every substantive 2xx captured during discovery through
     full content-level review and fold its findings into `state`.
 
@@ -677,15 +685,67 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     analysis must not cascade into another scope-discovery pass (that guard also
     keeps this bounded -- one analyze per capture, not a recursive fan-out).
 
+    `max_reviews` and `deadline` (a `time.monotonic()` value) bound the phase so a
+    slow model cannot hold back chaining and coverage driving indefinitely. The
+    bounds are checked before a capture is taken from the frontier, so an
+    unreviewed capture is never marked seen; any left over are reported in
+    `errors` as truncation, keeping the assessment incomplete rather than clean.
+
+    Order (E1): authenticated JSON/API and write captures first, then anonymous
+    ones, other non-HTML, and HTML last (see assessment_health.review_frontier).
+    With `group_identical`, captures whose response content, identity and security
+    headers match one already taken -- and that carry no input or object id of their
+    own -- are covered by that representative instead of being reviewed again: each
+    is marked in `seen` and recorded in `stats["grouped"]` as {capture, method,
+    identity, covered_by, reason}; it is never reported as reviewed or as a finding.
+
+    `stats`, when given, is added to (so one dict can span several calls):
+    reviewed, grouped (the entries above), unreviewed (left by a bound) and
+    by_tier (reviewed per tier name).
+
+    E7 resume: `resumed` maps a capture's observation key (review_frontier's) to the
+    findings an earlier, interrupted run got from it; such a capture skips
+    `orch.analyze` and contributes those findings. `on_review(key, {"findings": [...]})`
+    is called for each capture analyzed here, so a journal can record it. `summary_out`
+    gets the count of captures taken from `resumed` under "resumed".
+
     Returns the count of captured exchanges that yielded >=1 finding."""
     produced = 0
     reviewed = 0
-    for cap in list(captured or [])[:max_reviews]:
+    stopped_by = None
+    from harness import assessment_health
+    from harness.assessment_health import review_frontier
+    seen = seen if seen is not None else set()
+    grouped: list[dict] = []
+    grouped_keys: list[str] = []   # observation_key of each grouped entry, in order
+    tier_counts = dict.fromkeys(assessment_health.TIER_NAMES, 0)
+
+    def _grouped(member, representative):
+        grouped_keys.append(assessment_health.observation_key(member))
+        grouped.append({"capture": member.url, "method": member.method,
+                        "identity": assessment_health.identity_kind(member),
+                        "covered_by": representative.url,
+                        "reason": "identical response content, no input"})
+
+    frontier = review_frontier(captured, seen=seen, group_identical=group_identical,
+                               on_grouped=_grouped)
+    while True:
+        if reviewed >= max_reviews:
+            stopped_by = "capture review limit"
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            stopped_by = "capture review time budget"
+            break
+        grouped_before = len(grouped)
+        cap = next(frontier, None)
+        if cap is None:
+            break
         try:
             ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
         except Exception:
             continue
         reviewed += 1
+        tier_counts[assessment_health.TIER_NAMES[assessment_health.capture_tier(ex)]] += 1
         # R05: record the captured request template on its endpoint so the graph +
         # coverage replay the real body/query/content-type/object-id, not an empty
         # fabricated shape. Cheap and additive; failure must not sink the review.
@@ -693,19 +753,54 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             state.record_template(ex.url, ex.method, ex)
         except Exception:
             pass
-        try:
-            resp = await orch.analyze(ex, _from_discovery=True, run_context=run_context)
-        except Exception as e:  # one capture's failure must not sink the rest
-            log.debug("review_captured_exchanges: analyze failed on %s: %s",
-                      getattr(ex, "url", "?"), e)
-            continue
-        findings = [f.model_dump() for r in resp.agent_reports for f in r.findings]
+        key = assessment_health.observation_key(ex)
+        if resumed is not None and key in resumed:
+            findings = list(resumed[key].get("findings") or [])
+            if summary_out is not None:
+                summary_out["resumed"] = summary_out.get("resumed", 0) + 1
+        else:
+            try:
+                resp = await orch.analyze(ex, _from_discovery=True, run_context=run_context)
+            except Exception as e:  # one capture's failure must not sink the rest
+                # Captures grouped under this representative were not actually reviewed:
+                # unmark them, so a later review round (a chain round) can still take them.
+                for entry in grouped[grouped_before:]:
+                    entry["representative_review"] = "failed"
+                for grouped_key in grouped_keys[grouped_before:]:
+                    seen.discard(grouped_key)
+                if errors is not None:
+                    errors.append({"phase": "capture_review", "error": type(e).__name__})
+                log.debug("review_captured_exchanges: analyze failed on %s: %s",
+                          getattr(ex, "url", "?"), e)
+                continue
+            findings = [f.model_dump() for r in resp.agent_reports for f in r.findings]
+            if on_review is not None:
+                on_review(key, {"findings": findings})
         if findings:
             state.ingest_findings(ex.url, ex.method, findings)
             produced += 1
     if reviewed:
         log.info("review_captured_exchanges: reviewed %d captured 2xx exchanges, "
                  "%d produced findings", reviewed, produced)
+    remaining = 0
+    if stopped_by:
+        remaining = sum(1 for _ in review_frontier(captured, seen=set(seen)))
+        if remaining:
+            log.info("review_captured_exchanges: %s reached, %d captured exchange(s) "
+                     "not reviewed", stopped_by, remaining)
+            if errors is not None:
+                errors.append({"phase": "capture_review",
+                               "error": f"{stopped_by} reached: {remaining} captured "
+                                        "exchange(s) not reviewed"})
+    if stats is not None:
+        base = assessment_health.new_review_stats()
+        for name, empty in base.items():
+            stats.setdefault(name, empty)
+        stats["reviewed"] += reviewed
+        stats["grouped"].extend(grouped)
+        stats["unreviewed"] += remaining
+        for name, count in tier_counts.items():
+            stats["by_tier"][name] = stats["by_tier"].get(name, 0) + count
     return produced
 
 
@@ -737,7 +832,14 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
     )
 
     produced = 0
-    for cap in list(captured or [])[:max_exchanges]:
+    from itertools import islice
+    from harness.assessment_health import review_frontier
+    # E2: the run's execution registry records each template/identity this audit
+    # checked, so the model-review path does not fetch the same headers again.
+    registry = getattr(run_context, "execution_registry", None)
+    if not callable(getattr(registry, "run_audit", None)):
+        registry = None
+    for cap in islice(review_frontier(captured), max_exchanges):
         try:
             ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
         except Exception:
@@ -755,25 +857,48 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
             if v.name == "verbose_error_validator":
                 continue  # already ran above
             try:
-                dummy_finding = Finding(
-                    vulnerability_class=next(iter(v.finding_classes)),
-                    severity="medium", confidence=0.5,
-                    summary=f"Universal header audit: {v.name}",
-                    evidence="", suggested_test="", basis="derived",
-                )
-                result = await v.validate(dummy_finding, ex)
-                if result.confirmed:
-                    exchange_findings.append(Finding(
-                        vulnerability_class=result.finding_class,
-                        severity="medium",
-                        confidence=result.confidence,
-                        summary=result.summary,
-                        evidence=result.evidence,
-                        suggested_test="",
-                        basis="derived",
-                        confirmed=True,
-                        confirmation_method=v.get_name(),
-                    ))
+                # One case ref per exchange: a second exchange of the same route
+                # template and identity is a "covered by" hit, not another fetch.
+                case_ref = "header-audit:" + hashlib.sha256(
+                    f"{ex.method} {ex.url}".encode("utf-8", errors="replace")).hexdigest()[:12]
+                if callable(getattr(v, "audit", None)):
+                    # A validator that decides each class by its own check (CSP
+                    # vs framing) audits every class from ONE fetch of the
+                    # exchange; set iteration order is not a choice of class.
+                    classes = tuple(getattr(v, "audit_classes", None) or ())
+                    if registry is None or not classes:
+                        results = list((await v.audit(ex)).values())
+                    else:
+                        results = list((await registry.run_audit(
+                            v, ex, classes, case_ref=case_ref,
+                            call=functools.partial(v.audit, ex))).values())
+                else:
+                    dummy_finding = Finding(
+                        vulnerability_class=next(iter(v.finding_classes)),
+                        severity="medium", confidence=0.5,
+                        summary=f"Universal header audit: {v.name}",
+                        evidence="", suggested_test="", basis="derived",
+                    )
+                    if registry is None:
+                        results = [await v.validate(dummy_finding, ex)]
+                    else:
+                        results = [await registry.run(
+                            v, dummy_finding, ex, case_ref=case_ref,
+                            call=functools.partial(v.validate, dummy_finding, ex))]
+                for result in results:
+                    if result.confirmed:
+                        exchange_findings.append(Finding(
+                            vulnerability_class=result.finding_class,
+                            severity="medium",
+                            confidence=result.confidence,
+                            summary=result.summary,
+                            evidence=result.evidence,
+                            suggested_test="",
+                            basis="derived",
+                            confirmed=True,
+                            confirmation_method=v.get_name(),
+                            header_fingerprint=getattr(result, "header_fingerprint", "") or "",
+                        ))
             except Exception as e:
                 log.debug("universal_header_audit: %s failed on %s: %s",
                           v.get_name(), getattr(ex, "url", "?"), e)

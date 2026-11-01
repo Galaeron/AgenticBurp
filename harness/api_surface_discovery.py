@@ -33,6 +33,8 @@ sweep for Allow mining); it never sends a mutating body.
 """
 from __future__ import annotations
 
+from harness import scope_lock
+
 import hashlib
 import json
 import re
@@ -226,7 +228,7 @@ def _header_value(headers, name: str) -> str:
 def _host_in_scope(url: str, allowed_hosts) -> bool:
     if not allowed_hosts:
         return True
-    return (urlparse(url).hostname or "") in set(allowed_hosts)
+    return scope_lock.host_in_scope(url, allowed_hosts)
 
 
 class SurfaceDiscovery:
@@ -694,6 +696,7 @@ class SurfaceDiscovery:
                             if body else ""),
             "expected_structure": sensitive_artifact_class(path) or "",
             "structure": verdict.structure or "",
+            "contains_credentials": verdict.structure == "dotenv" and _dotenv_has_credentials(body),
             "confirmed": verdict.structure is not None,
             "outcome": verdict.outcome,
             "reason": verdict.reason,
@@ -1032,6 +1035,33 @@ _LOG_LINE = re.compile(
     r"|\w{3} [ \d]\d \d{2}:\d{2}:\d{2} ")                      # syslog
 
 
+def _dotenv_has_credentials(body: str) -> bool:
+    """Classify credential assignments without retaining values in evidence."""
+    for line in _content_lines(body):
+        if not _DOTENV_LINE.fullmatch(line):
+            continue
+        name, value = line.split("=", 1)
+        name = re.sub(r"^export\s+", "", name).strip()
+        value = value.strip()
+        if value.startswith(("'", '"')):
+            end = value.find(value[0], 1)
+            value = value[1:end] if end >= 1 else ""
+        else:
+            value = value.split("#", 1)[0]
+        if not value.strip():
+            continue
+        if re.search(r"PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY", name, re.I):
+            return True
+        # Connection URLs can hold credentials even without a secret-named key.
+        if "URL" in name.upper() or "DSN" in name.upper():
+            try:
+                if urlsplit(value).password:
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
 def _sig_dotenv(body):
     # Two or more assignments: a lone "status=ok" line is not a dotenv file.
     n = _matching_lines(_content_lines(body), _DOTENV_LINE, min_count=2)
@@ -1310,18 +1340,18 @@ def sensitive_file_finding(record: dict) -> dict:
     if record.get("fingerprint"):
         size += f", sha256 {record['fingerprint']}"
     if record.get("confirmed") and record.get("structure"):
-        return {"vulnerability_class": "sensitive_file_exposure", "severity": "high",
+        return {"vulnerability_class": "sensitive_file_exposure", "severity": ("high" if record["structure"] == "private_key" or
+                    (record["structure"] == "dotenv" and record.get("contains_credentials")) else "medium"),
                 "confidence": 0.95,
                 "summary": f"Sensitive file exposed: {path} ({record['structure']})",
                 "evidence": (f"{status_text} at {path}; "
                              f"{record.get('reason') or 'content signature matched'}; "
                              f"content-type {content_type}; {size}; file values redacted"),
                 "confirmed": True, "confirmation_method": "sensitive_file_probe"}
-    # A served, non-empty, non-HTML body that matched no signature still deserves
-    # review; a redirect, an empty body or an HTML page is weaker.
-    served = record.get("outcome") in ("unknown_type", "signature_mismatch")
+    # Existence-only 2xx responses are low; non-2xx and followed redirects are informational.
+    served = isinstance(status, int) and 200 <= status < 300 and not record.get("redirected_to")
     return {"vulnerability_class": "sensitive_file_exposure",
-            "severity": "medium" if served else "low",
+            "severity": "low" if served else "info",
             "confidence": 0.4 if served else 0.2,
             "summary": f"Possible sensitive file (existence only): {path}",
             "evidence": (f"existence only: {status_text} at {path}; "

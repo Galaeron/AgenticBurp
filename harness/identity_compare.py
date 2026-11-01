@@ -38,6 +38,9 @@ class Probe:
     """One observed HTTP outcome: status code + response body."""
     status: int
     body: str = ""
+    # The run's exchange artifact behind this outcome ("" when it was not sent
+    # through a run); never part of a comparison.
+    artifact_id: str = field(default="", compare=False)
 
     def __post_init__(self) -> None:
         if self.body is None:

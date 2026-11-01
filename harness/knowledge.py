@@ -161,7 +161,8 @@ def remember_finding(vulnerability_class: str, url: str, evidence: str = "",
         return False
 
 
-def retrieve(agent_name: str, exchange: HttpExchange, top_k: int = 2, engagement_id: str = "") -> str:
+def retrieve(agent_name: str, exchange: HttpExchange, top_k: int = 2, engagement_id: str = "",
+             *, include_external: bool = True) -> str:
     """
     Keyword-overlap retrieval (no embeddings): score the built-in corpus AND the
     tester's stored notes / remembered findings by how many of their tags/words
@@ -174,6 +175,8 @@ def retrieve(agent_name: str, exchange: HttpExchange, top_k: int = 2, engagement
     engagement's own PRIVATE notes -- never another engagement's (see
     _external_notes/store.list_knowledge_notes). The built-in corpus is always
     shared -- it carries no engagement-specific data at all.
+    `include_external=False` keeps only that built-in corpus. Passive analysis
+    uses this because stored notes lack captured-principal ownership.
     """
     query_tokens = _tokenize(agent_name) | _tokenize(exchange.url) | _tokenize(exchange.request_body[:500])
 
@@ -184,7 +187,7 @@ def retrieve(agent_name: str, exchange: HttpExchange, top_k: int = 2, engagement
         overlap = len(query_tokens & set(entry["tags"]))
         if overlap > 0:
             scored.append((overlap, 1, entry["note"]))
-    for entry in _external_notes(engagement_id=engagement_id):
+    for entry in (_external_notes(engagement_id=engagement_id) if include_external else []):
         overlap = len(query_tokens & entry["tags"])
         if overlap > 0:
             scored.append((overlap, 0, entry["note"]))

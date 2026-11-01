@@ -1,3 +1,7 @@
+import hashlib
+import json
+import secrets
+import sqlite3
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -329,13 +333,8 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "confirmed")
         self.assertIn("query:category", result.summary)
 
-    async def test_error_signature_confirms_when_boolean_differential_does_not(self):
-        """The exact real gap found live against Juice Shop's product
-        search: a LIKE '%...%'-wrapped parameter where OR-based tautology
-        and contradiction both return identical (all-matching) results --
-        no boolean differential -- but the tautology payload's trailing
-        syntax produces a genuine, visible database error. Must still
-        confirm via the error signature, not report not_confirmed."""
+    async def test_error_signature_is_candidate_without_boolean_differential(self):
+        """An identical error for both payloads is an anomaly, not SQLi proof."""
         v = self._validator()
         exchange = HttpExchange(
             url="http://localhost:3000/rest/products/search?q=apple", method="GET",
@@ -351,9 +350,9 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[resp_a, resp_b]):
             result = await v._boolean_probe_fallback(_finding(), exchange)
-        self.assertEqual(result.status, "confirmed")
-        self.assertTrue(result.confirmed)
-        self.assertIn("Error-based", result.summary)
+        self.assertEqual(result.status, "inconclusive")
+        self.assertFalse(result.confirmed)
+        self.assertIn("independent controlled evidence", result.summary)
 
     async def test_baseline_already_erroring_endpoint_is_not_flagged(self):
         """An endpoint that already returns DB-error-shaped text for
@@ -566,6 +565,104 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
              patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=same):
             result = await v.validate(_finding(), exchange)
         self.assertNotIn("--ignore-code", result.command)
+
+
+class _SqliteLogin:
+    """A JSON login over a real SQLite table: the query string-built (injectable) or
+    parameterized, the password hashed before it reaches SQL. The accounts persist
+    between requests, as on a target an earlier run has already written to. A login
+    answers with a long per-request token, so two successful logins differ in body."""
+
+    def __init__(self, accounts, *, parameterized=False):
+        self.db = sqlite3.connect(":memory:")
+        self.db.execute("CREATE TABLE Users (id INTEGER PRIMARY KEY, email TEXT, password TEXT)")
+        self.db.executemany("INSERT INTO Users (email, password) VALUES (?, ?)",
+                            [(e, self._hash(p)) for e, p in accounts])
+        self.parameterized = parameterized
+        self.answers = []   # (email sent, status)
+
+    @staticmethod
+    def _hash(password):
+        return hashlib.md5(password.encode()).hexdigest()
+
+    async def request(self, method, url, headers=None, content=None, **_):
+        creds = json.loads(content or "{}")
+        email, digest = creds.get("email", ""), self._hash(creds.get("password", ""))
+        try:
+            if self.parameterized:
+                row = self.db.execute("SELECT email FROM Users WHERE email = ? AND password = ?",
+                                      (email, digest)).fetchone()
+            else:
+                row = self.db.execute(f"SELECT email FROM Users WHERE email = '{email}' "
+                                      f"AND password = '{digest}'").fetchone()
+        except sqlite3.Error as e:
+            status, body = 500, {"error": f"SQLITE_ERROR: {e}"}
+        else:
+            status, body = ((200, {"umail": row[0], "token": secrets.token_hex(400)}) if row
+                            else (401, {"error": "Invalid email or password."}))
+        self.answers.append((email, status))
+        return httpx.Response(status, json=body, request=httpx.Request(method, url))
+
+
+class SqlmapLoginDiscriminationTests(unittest.IsolatedAsyncioTestCase):
+    """live-v8 (job f2a78499593e) missed the injectable login that v7 confirmed. sqlmap
+    judged its boolean tests by page content, and a login answer carries a fresh token,
+    so the page was 'not stable' and the 200<->401 flip went unread (v7's audit run got
+    a stable page and sqlmap chose --code=200 itself). The secondary differential's
+    false predicate reduced to email = '', which an account registered with an empty
+    email matches, so both of its probes logged in."""
+
+    _ACCOUNTS = [("admin@x.test", "admin123"), ("bob@bob.com", "bobbob"), ("", "")]
+
+    def setUp(self):
+        reset_default_gate()
+        get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                          "allowed_hosts": ["localhost"]})
+
+    def tearDown(self):
+        reset_default_gate()
+
+    async def _validate(self, login, exchange=None):
+        v = SqlmapValidator(binary="sqlmap")
+        with patch("harness.tool_runner.run_process",
+                   return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
+             patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=login.request):
+            return await v.validate(_finding(), exchange or _login_exchange())
+
+    async def test_sqlmap_judges_a_successful_login_by_its_status_code(self):
+        result = await self._validate(_SqliteLogin(self._ACCOUNTS, parameterized=True))
+        self.assertEqual(result.status, "not_confirmed")   # ran, not refused
+        self.assertIn("--code", result.command)
+        self.assertEqual(result.command[result.command.index("--code") + 1], "200")
+
+    async def test_control_no_status_code_without_a_successful_auth_baseline(self):
+        failed_login = _login_exchange()
+        failed_login.response_status = 401
+        result = await self._validate(_SqliteLogin(self._ACCOUNTS, parameterized=True), failed_login)
+        self.assertNotIn("--code", result.command)
+        url = "http://localhost/api/products?id=1"
+        same = httpx.Response(200, content=b"same", request=httpx.Request("GET", url))
+        v = SqlmapValidator(binary="sqlmap")
+        with patch("harness.tool_runner.run_process",
+                   return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
+             patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=same):
+            result = await v.validate(_finding(), HttpExchange(url=url, method="GET", response_status=200))
+        self.assertNotIn("--code", result.command)
+
+    async def test_differential_confirms_when_an_account_has_an_empty_email(self):
+        login = _SqliteLogin(self._ACCOUNTS)
+        result = await self._validate(login)
+        self.assertEqual(result.status, "confirmed")
+        self.assertTrue(result.confirmed)
+        self.assertIn("body:email", result.summary)
+        self.assertEqual([status for _, status in login.answers], [200, 401])
+
+    async def test_control_a_parameterized_login_with_the_same_accounts_is_not_confirmed(self):
+        login = _SqliteLogin(self._ACCOUNTS, parameterized=True)
+        result = await self._validate(login)
+        self.assertFalse(result.confirmed)
+        self.assertEqual(result.status, "not_confirmed")
+        self.assertEqual({status for _, status in login.answers}, {401})
 
 
 if __name__ == "__main__":

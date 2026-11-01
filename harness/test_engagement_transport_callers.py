@@ -35,6 +35,7 @@ from harness.ollama_client import OllamaResult
 from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext
+from harness.testing_fixtures.loopback_port import bind_browser_safe
 
 _HARNESS = Path(__file__).resolve().parent
 _PROBE_HEADER = "x-i03-probe"
@@ -109,7 +110,7 @@ class _Target:
                     sock = tls_context.wrap_socket(sock, server_side=True)
                 return sock, addr
 
-        self._server = Server(("127.0.0.1", 0), Handler)
+        self._server = bind_browser_safe(lambda: Server(("127.0.0.1", 0), Handler))
         scheme = "https" if tls_context is not None else "http"
         self.base = f"{scheme}://127.0.0.1:{self._server.server_address[1]}"
         threading.Thread(target=self._server.serve_forever, daemon=True).start()

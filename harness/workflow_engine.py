@@ -70,8 +70,25 @@ class WorkflowStep:
     assertions: tuple[Assertion, ...] = ()
     transition: str = ""
     cleanup: bool = False
+    # Ticket G (experiment cycle). All three default to the pre-existing behaviour.
+    # observe: record ANY HTTP status as PASSED with its status code and artifact
+    #   (no 401 refresh, no 401/403 failure, no assertions) so a caller that must
+    #   judge the response itself -- a denial is a result, not a failure -- sees it.
+    #   A send that never reached the target (blocked/out of scope/error) still
+    #   BLOCKS; observe never turns a non-send into a pass.
+    # case_ref: send under this case id instead of the per-step "<wf>:<ver>:<step>"
+    #   string, so the evidence ledger files the exchange under a proof's case.
+    # content_type: Content-Type request header for the body (none by default).
+    observe: bool = False
+    case_ref: str = ""
+    content_type: str = ""
+    action: str = "http"
+    observation_marker: str = ""
+    require_success: bool = False
 
     def __post_init__(self):
+        if self.action not in ("http", "browser_visit"):
+            raise ValueError("unknown workflow action")
         if not self.id or not self.url_template or not self.session_ref:
             raise ValueError("workflow step requires id, URL template, and session_ref")
 
@@ -84,6 +101,8 @@ class Workflow:
     invariant: str = ""
 
     def __post_init__(self):
+        if self.version == 1 and any(s.action != "http" or s.observation_marker or s.require_success for s in self.steps):
+            raise ValueError("browser actions require workflow version 2")
         ids = [s.id for s in self.steps]
         if not self.id or self.version < 1 or len(ids) != len(set(ids)):
             raise ValueError("workflow requires an id, positive version, and unique step ids")
@@ -103,6 +122,8 @@ class StepResult:
     status_code: int | None = None
     artifact_id: str = ""
     extracted: dict[str, str] = field(default_factory=dict)
+    observation: dict = field(default_factory=dict)
+    executed: bool = False
 
 
 @dataclass
@@ -127,7 +148,8 @@ class WorkflowResult:
             "cleanup_completed": list(self.cleanup_completed),
             "steps": [{"step_id": s.step_id, "status": s.status.value,
                        "reason": s.reason, "status_code": s.status_code,
-                       "artifact_id": s.artifact_id, "extracted": dict(s.extracted)}
+                       "artifact_id": s.artifact_id, "extracted": dict(s.extracted),
+                       **({"observation": s.observation, "executed": s.executed} if self.version >= 2 else {})}
                       for s in self.steps],
         }
 
@@ -229,13 +251,18 @@ def _assertions_hold(assertions: tuple[Assertion, ...], *, status: int | None,
 async def execute_workflow(workflow: Workflow, run_context, *, initial_values=None,
                            capability: str = "workflow", refresh_fn=None,
                            max_refresh_attempts: int = 1,
-                           resume: WorkflowResult | None = None) -> WorkflowResult:
+                           resume: WorkflowResult | None = None,
+                           case_ref: str = "") -> WorkflowResult:
     """Execute an explicit workflow through the run-scoped policy executor.
 
     Cleanup steps are deferred and registered as soon as their prerequisite step
     succeeds. They run in reverse registration order on success, failure, or
     cancellation. A 401 is classified as session expiry and may invoke the bounded
     refresh callback; a 403 is access denial and is never refreshed.
+
+    `case_ref`, when non-empty, is the send case for every step that does not carry
+    its own `WorkflowStep.case_ref`; a step's own ref wins, and with neither set the
+    per-step "<workflow>:<version>:<step>" string is used, as before.
     """
     from harness.run_context import TypedRequest
 
@@ -268,13 +295,24 @@ async def execute_workflow(workflow: Workflow, run_context, *, initial_values=No
             return StepResult(step.id, StepStatus.BLOCKED,
                               f"missing extracted values: {', '.join(missing)}")
         attempts = 0
+        send_case = step.case_ref or case_ref or f"{workflow.id}:{workflow.version}:{step.id}"
+        if step.action == "browser_visit":
+            from harness.browser_driver import execute_browser_step
+            marker, missing_marker = bind_template(step.observation_marker, result.values)
+            if missing_marker:
+                return StepResult(step.id, StepStatus.BLOCKED, "missing browser observation marker")
+            return await execute_browser_step(step, url, run_context, send_case, observe_marker=marker)
+        executed = False
         while True:
             outcome = await executor.execute(
-                TypedRequest(step.method, url, body=body or None), capability=capability,
-                session_ref=step.session_ref,
-                case_ref=f"{workflow.id}:{workflow.version}:{step.id}",
-                allow_cancelled_cleanup=is_cleanup)
-            if outcome.status != 401 or refresh_fn is None or attempts >= max_refresh_attempts:
+                TypedRequest(step.method, url, body=body or None,
+                             **({"headers": {"Content-Type": step.content_type}}
+                                if step.content_type else {})),
+                capability=capability, session_ref=step.session_ref,
+                case_ref=send_case, allow_cancelled_cleanup=is_cleanup)
+            executed = executed or outcome.executed
+            if (step.observe or outcome.status != 401 or refresh_fn is None
+                    or attempts >= max_refresh_attempts):
                 break
             attempts += 1
             refreshed = await refresh_fn(step.session_ref, run_context)
@@ -284,25 +322,37 @@ async def execute_workflow(workflow: Workflow, run_context, *, initial_values=No
         if not outcome.ok:
             status = StepStatus.CANCELLED if outcome.outcome == "cancelled" else StepStatus.BLOCKED
             return StepResult(step.id, status, outcome.error or outcome.outcome,
-                              outcome.status, artifact_id)
+                              outcome.status, artifact_id, executed=executed)
+        if step.require_success and not (outcome.status is not None and 200 <= outcome.status < 300):
+            return StepResult(step.id, StepStatus.FAILED, "required write did not return 2xx", outcome.status, artifact_id, executed=executed)
+        if step.observe:
+            # The response is data for the caller's verdict. Extractors are
+            # best-effort here: a missing value is information, not a block.
+            values, _ = extract_all(
+                step.extractors, body=outcome.body, headers=outcome.headers,
+                response_url=outcome.final_url or url)
+            result.values.update(values)
+            return StepResult(step.id, StepStatus.CLEANED if is_cleanup else StepStatus.PASSED,
+                              f"observed HTTP {outcome.status}", outcome.status,
+                              artifact_id, values, executed=executed)
         if outcome.status == 401:
-            return StepResult(step.id, StepStatus.FAILED, "session expired", 401, artifact_id)
+            return StepResult(step.id, StepStatus.FAILED, "session expired", 401, artifact_id, executed=executed)
         if outcome.status == 403:
-            return StepResult(step.id, StepStatus.FAILED, "access denied", 403, artifact_id)
+            return StepResult(step.id, StepStatus.FAILED, "access denied", 403, artifact_id, executed=executed)
         values, missing_extract = extract_all(
             step.extractors, body=outcome.body, headers=outcome.headers,
             response_url=outcome.final_url or url)
         if missing_extract:
             return StepResult(step.id, StepStatus.BLOCKED,
                               f"required extraction missing: {', '.join(missing_extract)}",
-                              outcome.status, artifact_id, values)
+                              outcome.status, artifact_id, values, executed=executed)
         holds, reason = _assertions_hold(step.assertions, status=outcome.status, body=outcome.body)
         if not holds:
             return StepResult(step.id, StepStatus.FAILED, reason, outcome.status,
-                              artifact_id, values)
+                              artifact_id, values, executed=executed)
         result.values.update(values)
         return StepResult(step.id, StepStatus.CLEANED if is_cleanup else StepStatus.PASSED,
-                          step.transition, outcome.status, artifact_id, values)
+                          step.transition, outcome.status, artifact_id, values, executed=executed)
 
     try:
         for step in normal_steps:
@@ -417,6 +467,8 @@ def workflow_from_dict(data: dict) -> Workflow:
             body_template=str(raw.get("body_template", "")),
             prerequisites=tuple(str(x) for x in raw.get("prerequisites", [])),
             extractors=extractors, assertions=assertions,
-            transition=str(raw.get("transition", "")), cleanup=bool(raw.get("cleanup", False))))
+            transition=str(raw.get("transition", "")), cleanup=bool(raw.get("cleanup", False)),
+            action=str(raw.get("action", "http")),
+            observation_marker=str(raw.get("observation_marker", "")), require_success=bool(raw.get("require_success", False))))
     return Workflow(str(data["id"]), tuple(steps), int(data.get("version", 1)),
                     str(data.get("invariant", "")))

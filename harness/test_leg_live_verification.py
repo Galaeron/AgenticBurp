@@ -41,6 +41,7 @@ from harness.validators.csrf_validator import CsrfValidator
 from harness import browser_driver
 from harness import driver_capture
 from harness.testing_fixtures.leg_fault import bound_test_names, outcomes_with_leg_severed
+from harness.testing_fixtures.loopback_port import bind_browser_safe
 
 _FIXTURE = (Path(__file__).resolve().parent.parent
             / "testing" / "leg-verification" / "vuln_fixture.py")
@@ -143,7 +144,7 @@ class LiveLegVerificationTest(EvidenceCase):
         global_throttle.configure(0)
         app = _load_make_app()()
         cls._counter = _RequestCounter(app)  # Rule 4: prove each leg reached the fixture
-        cls._server = make_server("127.0.0.1", 0, cls._counter, threaded=True)
+        cls._server = bind_browser_safe(lambda: make_server("127.0.0.1", 0, cls._counter, threaded=True))
         cls._port = cls._server.server_address[1]
         cls._thread = threading.Thread(target=cls._server.serve_forever, daemon=True)
         cls._thread.start()
@@ -158,6 +159,20 @@ class LiveLegVerificationTest(EvidenceCase):
                 time.sleep(0.05)
         else:
             raise RuntimeError("leg-verification fixture did not come up")
+        # A clean OOB negative requires proven reachability from this fixture,
+        # not an inference from its loopback address (which could be a published
+        # container port). Exercise the fixture's real fetch path before cases;
+        # each case's send counter still starts after this separate preflight.
+        from harness import collaborator
+        from urllib.parse import urlencode
+        listener = collaborator.shared()
+        preflight = listener.token()
+        with urllib.request.urlopen(
+                cls._base + "/ssrf/fetch?" + urlencode({"url": listener.url(preflight)}),
+                timeout=5) as response:
+            response.read()
+        if not listener.record_preflight(preflight, cls._base):
+            raise RuntimeError("leg-verification fixture cannot reach the callback listener")
         safety_gate.reset_default_gate()
         # Seed the gate's SCOPE too, not just the mode flags: the scope lock
         # (3c622c3) fails closed on an empty active scope, so without the
@@ -585,7 +600,7 @@ class LiveLegVerificationTest(EvidenceCase):
         res = self._run_ex(v, self._jwt_exchange("/jwt/public"), "jwt")
         self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
-        self._assert_controlled_negative(res, skipped_because="does not gate on the token")
+        self._assert_controlled_negative(res, skipped_because="token does not gate this route")
 
     # --- File upload via a CSRF-bound multipart form (PortSwigger-shaped) ------
     def _upload_exchange(self, action, referer):

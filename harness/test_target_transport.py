@@ -121,5 +121,111 @@ class SendCredsTests(unittest.TestCase):
         self.assertEqual(len(ctx.sessions.all()), before)         # no ephemeral duplicate
 
 
+class DecodedConsumerResponseTests(unittest.TestCase):
+    """Real compressed HTTP -> executor -> each validator's own send helper.
+
+    The transport decodes the body; a consumer response that still carries the
+    wire Content-Encoding makes httpx decompress it a second time."""
+
+    BODY = b"fixture shared response body"
+
+    def _serve(self, encoding):
+        import gzip
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import brotli
+        wire = {"plain": self.BODY, "gzip": gzip.compress(self.BODY),
+                "br": brotli.compress(self.BODY), "malformed": b"not gzip"}[encoding]
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.server.received.append(self.command)
+                self.send_response(200)
+                if encoding != "plain":
+                    self.send_header("Content-Encoding", "gzip" if encoding == "malformed" else encoding)
+                self.send_header("Content-Length", str(len(wire)))
+                self.end_headers()
+                self.wfile.write(wire)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.received = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def close():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.addCleanup(close)
+        return server, f"http://127.0.0.1:{server.server_port}/r"
+
+    def _senders(self):
+        from harness.validators.http_request_smuggling_validator import HttpRequestSmugglingValidator
+        from harness.validators.recon_validator import ReconValidator
+        from harness.validators.web_cache_poisoning_validator import WebCachePoisoningValidator
+        return {
+            "smuggling": lambda ctx, url: HttpRequestSmugglingValidator(
+                run_context=ctx, allowed_hosts=["127.0.0.1"])._send_raw_request("GET", url),
+            "recon": lambda ctx, url: ReconValidator(
+                run_context=ctx, allowed_hosts=["127.0.0.1"])._send_request(url),
+            "cache_poisoning": lambda ctx, url: WebCachePoisoningValidator(
+                run_context=ctx, allowed_hosts=["127.0.0.1"])._send(url),
+        }
+
+    def _send(self, sender, url, in_scope=True):
+        ctx = rc.RunContext.create(allowed_hosts=["127.0.0.1"] if in_scope else ["denied.invalid"],
+                                   max_requests=10, gate_config={"active_enabled": True})
+
+        async def run():
+            async with ctx:
+                return await sender(ctx, url)
+        return _run(run()), ctx
+
+    def test_compressed_and_plain_responses_read_the_same_body(self):
+        for name, sender in self._senders().items():
+            for encoding in ("plain", "gzip", "br"):
+                with self.subTest(caller=name, encoding=encoding):
+                    server, url = self._serve(encoding)
+                    response, ctx = self._send(sender, url)
+                    self.assertIsNotNone(response)
+                    self.assertEqual(response.text, self.BODY.decode())
+                    self.assertEqual(server.received, ["GET"])     # exactly one send
+                    self.assertTrue(response.extensions.get("harness_artifact_id"))
+
+    def test_original_wire_headers_survive_beside_the_consumer_view(self):
+        server, url = self._serve("gzip")
+        ctx = rc.RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=10,
+                                   gate_config={"active_enabled": True})
+
+        async def run():
+            async with ctx:
+                return await ctx.executor().execute(rc.TypedRequest("GET", url), capability="recon")
+        outcome = _run(run())
+        response = outcome.to_httpx_response("GET", url)
+        self.assertEqual(response.text, self.BODY.decode())
+        self.assertNotIn("content-encoding", {k.lower() for k in response.headers})
+        self.assertEqual({k.lower(): v for k, v in outcome.headers.items()}["content-encoding"], "gzip")
+        self.assertEqual(response.extensions["harness_artifact_id"], outcome.artifact_id)
+
+    def test_malformed_encoding_is_a_failure_not_a_response(self):
+        for name, sender in self._senders().items():
+            with self.subTest(caller=name):
+                server, url = self._serve("malformed")
+                response, ctx = self._send(sender, url)
+                self.assertIsNone(response)
+                self.assertEqual(server.received, ["GET"])         # no retry send
+
+    def test_blocked_send_reaches_no_server(self):
+        for name, sender in self._senders().items():
+            with self.subTest(caller=name):
+                server, url = self._serve("gzip")
+                response, ctx = self._send(sender, url, in_scope=False)
+                self.assertIsNone(response)
+                self.assertEqual(server.received, [])
+
+
 if __name__ == "__main__":
     unittest.main()

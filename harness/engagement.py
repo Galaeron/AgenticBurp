@@ -28,6 +28,8 @@ call and no network. Persistence is a JSON snapshot per host (see store).
 """
 from __future__ import annotations
 import re
+import hashlib
+import json
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -149,6 +151,97 @@ def template_from_exchange(ex) -> dict:
     return {"method": method, "query": parts.query or "", "body": body,
             "content_type": ctype or "", "object_id": obj_id,
             "path_ids": path_id_values(url)}
+
+
+def capture_identity_key(headers) -> str:
+    """Match observed credentials without storing another copy in the graph."""
+    public_headers = {"host", "content-type", "content-length", "accept", "accept-encoding",
+                      "accept-language", "user-agent", "connection", "referer", "origin",
+                      "cache-control", "pragma", "upgrade-insecure-requests"}
+    credentials = {k.lower(): v for k, v in (headers or {}).items()
+                   if k.lower() not in public_headers and not k.lower().startswith('sec-')}
+    return hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).hexdigest()
+
+
+def capture_variant(exchange) -> dict:
+    from harness import security
+    data = exchange if isinstance(exchange, dict) else exchange.model_dump()
+    variant = {"template": template_from_exchange(data), "url": data.get("url", ""),
+               "identity_key": capture_identity_key(data.get("request_headers")),
+               "response_status": data.get("response_status"),
+               "response_headers": security.redact_headers(data.get("response_headers") or {}),
+               "response_body": security.redact_secrets_in_body(data.get("response_body") or "")}
+    variant["capture_id"] = hashlib.sha256(json.dumps(variant, sort_keys=True).encode()).hexdigest()
+    return variant
+
+
+# Marks a variant built from an access-matrix probe rather than a full capture.
+ACCESS_MATRIX_SOURCE = "access_matrix"
+
+
+def identity_probe_variant(probe: dict) -> dict:
+    """A capture variant for one role-crawl probe (E5b), built with
+    capture_variant()'s semantics: the replayable request template, the identity
+    key computed from the probe's own credential headers, the response status and
+    redacted headers. The response body is NOT kept ("" plus its sha256 and
+    length); the deduped full capture already holds it, and bodies are most of a
+    snapshot. `source` and the digest fields make its capture_id differ from a full
+    capture's, so dedup by capture_id still tells the two apart."""
+    variant = capture_variant(dict(probe, response_body=""))
+    variant.update(response_body_sha256=probe.get("response_body_sha256") or "",
+                   response_body_len=int(probe.get("response_body_len") or 0),
+                   source=ACCESS_MATRIX_SOURCE)
+    variant.pop("capture_id", None)
+    variant["capture_id"] = hashlib.sha256(json.dumps(variant, sort_keys=True).encode()).hexdigest()
+    return variant
+
+
+def replayable_variants(ep, identity_key: str) -> list:
+    """The variants a check can replay AS this identity: its full captures, plus
+    its access-matrix probe unless a full capture already holds the same request
+    (the full one also carries the response). Empty when the identity was never
+    observed on this endpoint. Only observed requests count; nothing is built."""
+    mine = [v for v in (getattr(ep, "capture_variants", None) or [])
+            if v.get("identity_key") == identity_key]
+    shapes = lambda v: json.dumps(v.get("template"), sort_keys=True)   # noqa: E731
+    full = [v for v in mine if v.get("source") != ACCESS_MATRIX_SOURCE]
+    held = {shapes(v) for v in full}
+    return full + [v for v in mine if v.get("source") == ACCESS_MATRIX_SOURCE
+                   and shapes(v) not in held]
+
+
+_RESULT_BODY_HEAD = 200
+
+
+def compact_variant_bodies(entry: dict) -> dict:
+    """A COPY of a worklist entry whose capture_variants carry a digest of each
+    response body (sha256, length, a short head) instead of the body itself. The
+    job result is read, not replayed: the full bodies stay in the engagement
+    state and its snapshot, which `entry` (a live to_dict()) is never mutated by."""
+    variants = []
+    for variant in entry.get("capture_variants") or []:
+        if not isinstance(variant, dict) or "response_body" not in variant:
+            variants.append(variant)
+            continue
+        body = variant.get("response_body") or ""
+        slim = {k: v for k, v in variant.items() if k != "response_body"}
+        if variant.get("source") != ACCESS_MATRIX_SOURCE:
+            # (a probe variant already holds the digest of a body it never kept)
+            slim["response_body_sha256"] = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+            slim["response_body_len"] = len(body)
+        slim["response_body_head"] = body[:_RESULT_BODY_HEAD]
+        variants.append(slim)
+    return dict(entry, capture_variants=variants) if "capture_variants" in entry else dict(entry)
+
+
+def persist_surface(state):
+    """Atomically retain observed variants alongside existing concurrent findings."""
+    from harness import store
+    def merge(prior):
+        combined = EngagementState.from_dict(prior)
+        combined.merge_from(state)
+        return combined.to_dict()
+    return store.mutate_engagement(state.host, merge)
 
 
 # --- WL-02: principal-keyed access cells and the derived role view -----------
@@ -295,6 +388,7 @@ class SurfaceEndpoint:
     # view above is derived from these.
     access_by_principal: dict = field(default_factory=dict)
     reachable_principals: list = field(default_factory=list)
+    capture_variants: list = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -435,7 +529,7 @@ class SurfaceEndpoint:
         # the link survives ingestion into state and the report projection.)
         for k in ("evidence", "summary", "url", "confirmation_method",
                   "validator", "identity", "basis", "proof_id", "case_id",
-                  "confirmed_by_leg"):
+                  "confirmed_by_leg", "header_fingerprint"):
             if f.get(k):
                 slim[k] = f[k]
 
@@ -547,6 +641,7 @@ class SurfaceEndpoint:
             "access": self.access, "reachable_roles": self.reachable_roles,
             "object_scoped": self.object_scoped, "findings": self.findings,
             "template": self.template,
+            "capture_variants": self.capture_variants,
             "score": s, "reasons": reasons,
             # Step 2/3 (2026-09-17 coverage-recovery plan): surfaced so a
             # dict-based consumer (investigate_worklist) can preserve a bounded
@@ -573,6 +668,7 @@ class SurfaceEndpoint:
             access=d.get("access", {}) or {}, reachable_roles=d.get("reachable_roles", []) or [],
             object_scoped=bool(d.get("object_scoped", False)), findings=d.get("findings", []) or [],
             status=d.get("status", "discovered"), template=d.get("template"),
+            capture_variants=list(d.get("capture_variants") or []),
             business_score=d.get("business_score"),
             business_reasons=d.get("business_reasons", []) or [],
             access_by_principal={str(k): dict(v) for k, v in
@@ -721,6 +817,25 @@ def detect_capabilities(finding: dict, resp_headers: dict | None, resp_body: str
     return caps
 
 
+def add_chain_hypothesis_task(graph, hyp, *, needs="operator review (proposed chain -- not confirmed)",
+                              depends_on=None, extra_meta=None):
+    """The BLOCKED `chain-hypothesis` proposal task for one ChainingHypothesis. By
+    default it waits on the operator; the experiment cycle (experiment.py) instead
+    gates it on an experiment task. Either way it is a PROPOSAL: never auto-run,
+    never marked confirmed, and it selects no URL for a validator."""
+    meta = {"auto_runnable": False,
+            "rank": getattr(hyp, "rank", 0.0),
+            "classes": list(getattr(hyp, "classes", []) or []),
+            "proposed_only": True}
+    meta.update(extra_meta or {})
+    return graph.add(
+        "chain-hypothesis", getattr(hyp, "id", "") or "hypothesis",
+        reason=(getattr(hyp, "rationale", "") or
+                f"{getattr(hyp, 'source', '?')} -> {getattr(hyp, 'target', '?')}"),
+        needs=needs, depends_on=depends_on,
+        source=",".join(getattr(hyp, "endpoints", []) or [])[:200], meta=meta)
+
+
 @dataclass
 class EngagementState:
     host: str
@@ -735,6 +850,13 @@ class EngagementState:
     # derived from target content or a model writes here. The missing-auth leg
     # confirms only a route listed here or in config authz.protected_paths.
     protected_paths: list = field(default_factory=list)
+    owners: list = field(default_factory=list)
+    # Ticket G: values the experiment cycle observed (name -> value, e.g. the id of
+    # an object it created) and the ASM its tasks were derived from. Working state
+    # only: deliberately NOT part of to_dict(), so observed values are never
+    # persisted or logged with the surface.
+    observed_values: dict = field(default_factory=dict)
+    semantic_model: "object" = None
 
     def __post_init__(self):
         from harness import task_graph
@@ -783,12 +905,17 @@ class EngagementState:
             mine.merge_access_record(ep.access_by_principal, ep.access, ep.reachable_roles)
             if ep.template and not mine.template:
                 mine.template = ep.template
+            known = {v.get("capture_id") for v in mine.capture_variants}
+            mine.capture_variants.extend(v for v in ep.capture_variants if v.get("capture_id") not in known)
             # a proven endpoint status propagates upward, never downward
             if ep.status == "validated":
                 mine.status = "validated"
         for ident in getattr(other, "identities", []) or []:
             if not any(i.get("name") == ident.get("name") for i in self.identities):
                 self.identities.append(ident)
+        owners = getattr(other, "owners", None)
+        if isinstance(owners, list) and isinstance(self.owners, list):
+            self.owners.extend(entry for entry in owners if entry not in self.owners)
         theirs = getattr(other, "protected_paths", None)
         if isinstance(theirs, list) and isinstance(self.protected_paths, list):
             self.protected_paths.extend(p for p in theirs if p not in self.protected_paths)
@@ -841,6 +968,9 @@ class EngagementState:
         object-id beats an empty one)."""
         ep = self._ep(method, normalize_path(url))
         tmpl = template_from_exchange(exchange)
+        variant = capture_variant(exchange)
+        if not any(v.get("capture_id") == variant["capture_id"] for v in ep.capture_variants):
+            ep.capture_variants.append(variant)
 
         def _richness(t: dict | None) -> int:
             if not t:
@@ -850,6 +980,17 @@ class EngagementState:
 
         if _richness(tmpl) > _richness(ep.template):
             ep.template = tmpl
+
+    def record_identity_probe(self, url: str, method: str, probe: dict) -> None:
+        """Attach one role-crawl probe (E5b) to its endpoint as a replayable
+        variant AS the identity that sent it, whatever the response was. This
+        only adds a variant: the endpoint's template, status and ranking are
+        left to record_template, so what is applicable and prioritised is
+        unchanged. An identity that was never probed gets nothing."""
+        ep = self._ep(method, normalize_path(url))
+        variant = identity_probe_variant(dict(probe, url=url, method=method))
+        if not any(v.get("capture_id") == variant["capture_id"] for v in ep.capture_variants):
+            ep.capture_variants.append(variant)
 
     def ingest_findings(self, url: str, method: str, findings) -> int:
         """From /analyze (agents + validators): attach findings to the endpoint,
@@ -947,7 +1088,7 @@ class EngagementState:
                        needs=spec["needs"], source=url)
         return True
 
-    def apply_semantic_model(self, asm, *, ledger=None) -> int:
+    def apply_semantic_model(self, asm, *, ledger=None, experiments=None) -> int:
         """P2-1: fold an Application Semantic Model into the surface + graph.
 
         Two effects, both additive and reversible, NEITHER a confirmation:
@@ -964,9 +1105,17 @@ class EngagementState:
         `asm` is duck-typed (anything with `business_impact_for` +
         `chaining_hypotheses`), so this never hard-imports the ASM module.
         Returns the number of endpoints that received a positive business score.
-        Sends nothing."""
+        Sends nothing.
+
+        `experiments` (Ticket G, default None = off) is a dict {"expectations",
+        "sessions", optional "values"/"base_url"}. When given, each IDOR/BOLA
+        hypothesis is translated into a cross-account experiment (experiment.py)
+        instead of the blanket operator-review disposition: a READY or BLOCKED
+        `experiment` task, with the proposal's chain-hypothesis task gated on it.
+        Hypotheses of other classes keep the operator-review task either way."""
         if asm is None:
             return 0
+        self.semantic_model = asm
         scored = 0
         for ep in self.endpoints.values():
             try:
@@ -977,20 +1126,26 @@ class EngagementState:
             ep.business_reasons = list(reasons)
             if score > 0:
                 scored += 1
+        if experiments is not None:
+            from harness import experiment as _experiment
         for hyp in getattr(asm, "chaining_hypotheses", []) or []:
             try:
-                self.graph.add(
-                    "chain-hypothesis", getattr(hyp, "id", "") or "hypothesis",
-                    reason=(getattr(hyp, "rationale", "") or
-                            f"{getattr(hyp, 'source', '?')} -> {getattr(hyp, 'target', '?')}"),
-                    needs="operator review (proposed chain -- not confirmed)",
-                    source=",".join(getattr(hyp, "endpoints", []) or [])[:200],
-                    meta={"auto_runnable": False,
-                          "rank": getattr(hyp, "rank", 0.0),
-                          "classes": list(getattr(hyp, "classes", []) or []),
-                          "proposed_only": True})
+                if experiments is not None and _experiment.supports(hyp):
+                    continue   # evaluate_experiments below records it, gated on its experiment
+                add_chain_hypothesis_task(self.graph, hyp)
             except Exception:
                 continue
+        if experiments is not None:
+            try:
+                _experiment.evaluate_experiments(
+                    self, asm, experiments.get("expectations") or [],
+                    experiments.get("sessions") or [], experiments.get("values"),
+                    base_url=experiments.get("base_url", ""))
+            except Exception:
+                # Never lose a proposal: fall back to the blanket disposition.
+                for hyp in getattr(asm, "chaining_hypotheses", []) or []:
+                    if _experiment.supports(hyp):
+                        add_chain_hypothesis_task(self.graph, hyp)
         return scored
 
     # --- the fused output ---
@@ -998,6 +1153,11 @@ class EngagementState:
     def worklist(self, limit: int = 25) -> list:
         ranked = sorted(self.endpoints.values(), key=lambda e: e.fused_score()[0], reverse=True)
         return [e.to_dict() for e in ranked[:limit]]
+
+    def result_worklist(self, limit: int = 25) -> list:
+        """The worklist as the JOB RESULT carries it: the same ranked entries with
+        each capture variant's response body reduced to a digest (E11)."""
+        return [compact_variant_bodies(e) for e in self.worklist(limit)]
 
     def pending(self) -> list:
         """Ready-to-act tasks (all prerequisites satisfied)."""
@@ -1021,6 +1181,8 @@ class EngagementState:
              "endpoints": {k: v.to_dict() for k, v in self.endpoints.items()},
              "identities": self.identities,
              "task_graph": self.graph.to_dict()}
+        if self.owners:
+            d["owners"] = self.owners
         if self.protected_paths:
             d["protected_paths"] = self.protected_paths
         return d
@@ -1036,6 +1198,8 @@ class EngagementState:
             st.graph = task_graph.TaskGraph.from_dict(d["task_graph"])
         # Kept as stored, whatever its type: protected_routes ignores a malformed
         # value with a warning instead of this load guessing at it.
+        if d.get("owners") is not None:
+            st.owners = d["owners"]
         if d.get("protected_paths") is not None:
             st.protected_paths = d["protected_paths"]
         return st

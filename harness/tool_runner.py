@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
@@ -58,9 +59,50 @@ _LOOPBACK = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
 _HOST_ALIAS = "host.docker.internal"
 
 
+# E9 tool lifecycle. Measured on job 383f0ebff8e8: `docker version` ran before
+# every container launch and no tool run had a recorded duration, so sqlmap
+# startup could not be measured. Both stores are bounded and hold only counts
+# and timings (never argv, output or URLs).
+_LIFECYCLE: deque = deque(maxlen=500)     # one record per run()
+_CHECKS: deque = deque(maxlen=500)        # one record per available() call
+_STATE_LOCK = threading.Lock()
+# A positive docker check is reused for this long. A negative one is never kept,
+# so a stopped Docker Desktop is noticed on the very next call.
+AVAILABLE_TTL_SECONDS = 60.0
+_available_ok: tuple | None = None        # (docker path, monotonic stamp, reason)
+
+
+def _reset_available_cache() -> None:
+    """Forget the cached positive docker check (test seam)."""
+    global _available_ok
+    with _STATE_LOCK:
+        _available_ok = None
+
+
+def _remember_available(ok: bool, reason: str) -> None:
+    """Keep a positive docker check for AVAILABLE_TTL_SECONDS; forget a negative."""
+    global _available_ok
+    with _STATE_LOCK:
+        _available_ok = (DOCKER, time.monotonic(), reason) if ok else None
+
+
 def available(timeout: float = 8.0) -> tuple[bool, str]:
     """(usable, reason). Usable only when the docker daemon actually answers --
-    an installed CLI with a stopped Docker Desktop is NOT usable."""
+    an installed CLI with a stopped Docker Desktop is NOT usable. A positive
+    answer is cached for AVAILABLE_TTL_SECONDS; a negative one never is."""
+    started_wall, started = time.time(), time.monotonic()
+    cached = _available_ok
+    if cached and cached[0] == DOCKER and started - cached[1] < AVAILABLE_TTL_SECONDS:
+        _CHECKS.append({"at": started_wall, "ms": 0.0, "ok": True, "cached": True})
+        return True, cached[2]
+    ok, reason = _probe_docker(timeout)
+    _remember_available(ok, reason)
+    _CHECKS.append({"at": started_wall, "ms": round((time.monotonic() - started) * 1000.0, 3),
+                    "ok": ok, "cached": False})
+    return ok, reason
+
+
+def _probe_docker(timeout: float) -> tuple[bool, str]:
     if not DOCKER:
         return False, "docker CLI not found -- install Docker Desktop"
     try:
@@ -347,6 +389,13 @@ class _Win:
                                                       ctypes.c_void_p]
             k32.CloseHandle.restype = wintypes.BOOL
             k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.IsProcessInJob.restype = wintypes.BOOL
+            k32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE,
+                                           ctypes.POINTER(wintypes.BOOL)]
+            k32.WaitForSingleObject.restype = wintypes.DWORD
+            k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
             ntdll = ctypes.WinDLL("ntdll")
             ntdll.NtResumeProcess.restype = ctypes.c_long
             ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
@@ -411,7 +460,7 @@ class _Win:
         cls._load().TerminateJobObject(job, 1)
 
     @classmethod
-    def active_processes(cls, job) -> int:
+    def _accounting(cls, job):
         import ctypes
         from ctypes import wintypes
 
@@ -427,8 +476,64 @@ class _Win:
         info = _Accounting()
         if not cls._load().QueryInformationJobObject(job, 1, ctypes.byref(info),
                                                      ctypes.sizeof(info), None):
-            return 1    # cannot query: never claim the tree is empty
-        return int(info.ActiveProcesses)
+            return None
+        return info
+
+    @classmethod
+    def active_processes(cls, job) -> int:
+        info = cls._accounting(job)
+        return 1 if info is None else int(info.ActiveProcesses)   # cannot query: never empty
+
+    @classmethod
+    def total_processes(cls, job) -> int | None:
+        """Processes ever associated with the job (nested jobs included)."""
+        info = cls._accounting(job)
+        return None if info is None else int(info.TotalProcesses)
+
+    @classmethod
+    def member_pids(cls, job) -> list[int] | None:
+        """PIDs of the job's active members; None when the list cannot be read."""
+        import ctypes
+        from ctypes import wintypes
+        size = 64
+        while size <= 65536:
+            class _IdList(ctypes.Structure):
+                _fields_ = [("NumberOfAssignedProcesses", wintypes.DWORD),
+                            ("NumberOfProcessIdsInList", wintypes.DWORD),
+                            ("ProcessIdList", ctypes.c_size_t * size)]
+
+            info = _IdList()
+            if cls._load().QueryInformationJobObject(job, 3, ctypes.byref(info),
+                                                     ctypes.sizeof(info), None):
+                return [int(info.ProcessIdList[i]) for i in range(info.NumberOfProcessIdsInList)]
+            if ctypes.get_last_error() != 234:    # not ERROR_MORE_DATA
+                return None
+            size *= 4
+        return None
+
+    @classmethod
+    def hold_member(cls, job, pid: int):
+        """A SYNCHRONIZE handle to `pid` while it is still this job's member; 0 when that
+        member is already gone; None when this cannot be established."""
+        import ctypes
+        from ctypes import wintypes
+        k32 = cls._load()
+        handle = k32.OpenProcess(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED
+        if not handle:
+            # ERROR_INVALID_PARAMETER: no such process, so its object is already freed.
+            return 0 if ctypes.get_last_error() == 87 else None
+        member = wintypes.BOOL()
+        if not k32.IsProcessInJob(handle, job, ctypes.byref(member)):
+            k32.CloseHandle(handle)
+            return None
+        if not member.value:    # the PID was reused: the member it named is gone
+            k32.CloseHandle(handle)
+            return 0
+        return handle
+
+    @classmethod
+    def exited(cls, handle) -> bool:
+        return cls._load().WaitForSingleObject(handle, 0) == 0    # WAIT_OBJECT_0
 
     @classmethod
     def close(cls, job) -> None:
@@ -438,13 +543,16 @@ class _Win:
 class _OwnedTree:
     """Every process a launched tool starts. Windows: the tool starts suspended, is
     placed in a kill-on-close Job Object and only then resumed, so no descendant can
-    escape; the job's ActiveProcesses proves emptiness. Without a job the tool is
-    never resumed (ToolContainmentUnavailable). POSIX: a fresh session, so the
-    process group holds every descendant that does not create its own."""
+    escape; the job's ActiveProcesses and the stopped members' own handles prove
+    emptiness. Without a job the tool is never resumed (ToolContainmentUnavailable).
+    POSIX: a fresh session, so the process group holds every descendant that does
+    not create its own."""
 
     def __init__(self):
         self._proc = None
         self._job = None
+        self._held = []           # Windows: handles to the members a terminate stopped
+        self._unproved = False    # Windows: a stopped member could not be held
         self.kind = ""
 
     @staticmethod
@@ -472,7 +580,24 @@ class _OwnedTree:
 
     def terminate(self) -> None:
         if os.name == "nt":
+            # ActiveProcesses drops to 0 as soon as the job is terminated, while its
+            # members are still exiting, and the launched process may be only a
+            # launcher (a venv python.exe, a console-script shim) whose exit says
+            # nothing about the tool. Hold every member first, so emptiness is
+            # proved by the members' own exit.
+            total = _Win.total_processes(self._job)
+            pids = _Win.member_pids(self._job)
+            for pid in pids or ():
+                handle = _Win.hold_member(self._job, pid)
+                if handle is None:
+                    self._unproved = True
+                elif handle:
+                    self._held.append(handle)
             _Win.terminate_job(self._job)
+            # A member that joined after the snapshot is stopped too, but its exit
+            # cannot be awaited: never prove such a tree empty.
+            if pids is None or total is None or _Win.total_processes(self._job) != total:
+                self._unproved = True
             return
         import signal
         try:
@@ -483,7 +608,8 @@ class _OwnedTree:
     def alive(self) -> int:
         """Members still running; 0 means none is left."""
         if os.name == "nt":
-            return _Win.active_processes(self._job)
+            return (_Win.active_processes(self._job) + int(self._unproved)
+                    + sum(not _Win.exited(handle) for handle in self._held))
         try:
             os.killpg(self._proc.pid, 0)
         except ProcessLookupError:
@@ -493,6 +619,9 @@ class _OwnedTree:
         return 1
 
     def close(self) -> None:
+        for handle in self._held:
+            _Win.close(handle)
+        self._held = []
         if self._job is not None:
             _Win.close(self._job)
             self._job = None
@@ -609,7 +738,14 @@ async def call_cancellable(fn, *args, cancel=None, **kwargs):
     def poll() -> bool:
         return stop.is_set() or _is_cancelled(cancel)
 
-    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, cancel=poll, **kwargs))
+    # Keep the worker completion as a Future, not a Task: loop shutdown cancels
+    # every Task, which would mark a to_thread bridge done while its thread and
+    # process still run. Preserve to_thread's task-local context propagation.
+    import contextvars
+    import functools
+    context = contextvars.copy_context()
+    invoke = functools.partial(fn, *args, cancel=poll, **kwargs)
+    fut = asyncio.get_running_loop().run_in_executor(None, context.run, invoke)
     try:
         await asyncio.wait({fut})   # unlike shield/wait_for, never cancels `fut`
     except asyncio.CancelledError:
@@ -624,6 +760,38 @@ async def call_cancellable(fn, *args, cancel=None, **kwargs):
             raise exc
         raise
     return fut.result()
+
+
+def _record_lifecycle(image: str, outcome: str, started_wall: float, started: float,
+                      returncode, receipt: dict | None) -> None:
+    """Stamp the receipt with start/finish/duration and append the bounded
+    lifecycle record (image, outcome, duration, return code)."""
+    duration_ms = round((time.monotonic() - started) * 1000.0, 3)
+    finished_wall = started_wall + duration_ms / 1000.0
+    if receipt is not None:
+        receipt.update(started_at=started_wall, finished_at=finished_wall, duration_ms=duration_ms)
+    _LIFECYCLE.append({"image": image, "outcome": outcome, "duration_ms": duration_ms,
+                       "returncode": returncode, "started_at": started_wall})
+
+
+def lifecycle_snapshot(since: float | None = None) -> dict:
+    """Plain-data view of the tool lifecycle: the recent run records, per-image
+    counts and total milliseconds, and the docker availability checks (how many
+    ran, how many were served from the cache, and their total ms). `since` (a
+    time.time() stamp) limits it to records from that moment on."""
+    runs = [dict(r) for r in list(_LIFECYCLE) if since is None or r["started_at"] >= since]
+    checks = [c for c in list(_CHECKS) if since is None or c["at"] >= since]
+    by_image: dict[str, dict] = {}
+    for r in runs:
+        row = by_image.setdefault(r["image"], {"runs": 0, "total_ms": 0.0})
+        row["runs"] += 1
+        row["total_ms"] = round(row["total_ms"] + r["duration_ms"], 3)
+    return {"runs": runs, "by_image": by_image,
+            "total_ms": round(sum(r["duration_ms"] for r in runs), 3),
+            "availability_checks": {"checks": len(checks),
+                                    "cached": sum(1 for c in checks if c["cached"]),
+                                    "failed": sum(1 for c in checks if not c["ok"]),
+                                    "total_ms": round(sum(c["ms"] for c in checks), 3)}}
 
 
 def run(image: str, args: list[str], *, timeout: float = 120.0,
@@ -653,6 +821,7 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
             f"refusing to launch {image!r}: no egress policy configured for this run "
             "(PR-11/R02 fail-closed -- an uncontrolled-egress tool run is not allowed)")
     import uuid
+    started_wall, started = time.time(), time.monotonic()
     name = f"harness_{uuid.uuid4().hex[:12]}"
     cmd = docker_cmd(image, args, add_host=add_host,
                      extra=["--name", name] + list(extra or []), egress=egress)
@@ -669,6 +838,7 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
         _force_remove(name)   # nothing launched, but stay safe if a race left one
         if receipt is not None:
             receipt["outcome"] = "cancelled_before_launch"
+        _record_lifecycle(image, "cancelled_before_launch", started_wall, started, None, receipt)
         raise ToolRunCancelled(f"tool run cancelled before launch: {image!r}")
     try:
         result = run_process(cmd, timeout=timeout, cancel=cancel, max_output=max_output)
@@ -684,13 +854,22 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
             if partial is not None:
                 receipt.update(partial.receipt_fields())
         # the hung/killed workload must not outlive its client
-        if not _force_remove(name):
+        removed = _force_remove(name)
+        _record_lifecycle(image, outcome if removed else "cleanup_failed", started_wall, started,
+                          None, receipt)
+        if not removed:
             if receipt is not None:
                 receipt["cleanup"] = "cleanup_failed"
             raise ToolCleanupFailed(
                 f"container {name} could not be proved removed after {outcome}") from exc
         raise
+    if result.returncode == 125:
+        # docker itself failed (daemon gone, image missing): the cached positive
+        # check is stale, so the next caller re-checks and can fall back.
+        _reset_available_cache()
     if receipt is not None:
         receipt["outcome"] = f"exit={result.returncode}"
         receipt.update(result.receipt_fields())
+    _record_lifecycle(image, f"exit={result.returncode}", started_wall, started,
+                      result.returncode, receipt)
     return result.returncode, (result.stdout or ""), (result.stderr or "")

@@ -257,9 +257,9 @@ class SarifReportEndpointTests(unittest.TestCase):
             baseline, source_revision=doc_off["runs"][0]["properties"]["sourceRevision"])
         # The endpoint always enriches runs[0].properties with engagement_id and
         # state_partition (additive); with no engagement_id requested here that is
-        # "" / "legacy-host-only". Mirror it so the byte-identity check holds.
+        # "" / "shared-site-history". Mirror it so the byte-identity check holds.
         expected_off_doc["runs"][0]["properties"]["engagement_id"] = ""
-        expected_off_doc["runs"][0]["properties"]["state_partition"] = "legacy-host-only"
+        expected_off_doc["runs"][0]["properties"]["state_partition"] = "shared-site-history"
         self.assertEqual(doc_off, expected_off_doc)
 
         # Gate ON: the catch-all finding is omitted; the concrete sqli stays.

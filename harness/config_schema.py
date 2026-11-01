@@ -225,6 +225,8 @@ def validate_config(cfg: dict, *, strict: bool = False) -> ConfigValidationResul
         )
     # RV-S: a malformed protected-route entry is ignored, so it declares nothing
     # protected (fail closed). A warning, not an error: the rest of the list stands.
+    from harness import ownership_declarations
+    warnings.extend(ownership_declarations.config_problems(cfg))
     from harness import protected_routes
     for problem in protected_routes.config_problems(cfg):
         warnings.append(f"{problem}; a malformed entry declares no route protected.")
@@ -316,6 +318,7 @@ def config_fingerprint(cfg: dict) -> str:
 # (everything there except server.allowed_hosts, which is a scope declaration,
 # not an active/mutating/discovery/engagement/cloud toggle).
 _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
+    "privacy.external_lookups",
     "validators.active_enabled",
     "validators.allow_mutating_replay",
     "autonomous_discovery.enabled",
@@ -334,6 +337,12 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     # autonomous_discovery.enabled above; passive-only forces it off too.
     "driver_capture.enabled",
     "iterative_agent.enabled",
+    # Ticket G: the experiment cycle creates objects on the target and reads them
+    # back as two identities (GET reads count as SAFE to the gate, so only this
+    # flag stops them), and its planner is an extra model call. Passive-only
+    # ("just analyze captured traffic") forces both off.
+    "engagement.experiments.enabled",
+    "engagement.experiments.planner",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

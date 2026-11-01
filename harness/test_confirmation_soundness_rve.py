@@ -34,6 +34,7 @@ from harness.browser_driver import ExecutionObservation
 from harness.models import AgentReport, Finding, HttpExchange
 from harness.orchestrator import Orchestrator
 from harness.test_default_history_caller import _config, _exchange, _RecordingModel
+from harness.testing_fixtures.loopback_port import bind_browser_safe
 from harness.testing_fixtures.mass_assignment import MassAssignmentFixture
 from harness.validators import stored_xss_validator
 from harness.validators.api_security_validator import ApiSecurityValidator
@@ -300,7 +301,7 @@ class _NoteApp:
             def log_message(self, *args):
                 pass
 
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd = bind_browser_safe(lambda: ThreadingHTTPServer(("127.0.0.1", 0), Handler))
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/notes"
         self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self._thread.start()

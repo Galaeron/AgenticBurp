@@ -31,6 +31,7 @@ GETs, so it respects max_mutating_requests_per_finding. Scope-gated; the mutatin
 send is routed through the safety gate (needs validators.allow_mutating_replay).
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import json
 import re
@@ -183,7 +184,7 @@ class SequenceValidator(Validator):
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         method = (exchange.method or "").upper()
         kind, base_body = self._parse_body(exchange)

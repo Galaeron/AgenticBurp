@@ -31,7 +31,8 @@ from harness.workflow_packs import (
 # can be made to (mis)match. Same shape as test_workflow_engine._Executor.
 # --------------------------------------------------------------------------
 def _out(status=200, body="", headers=None, outcome="ok"):
-    return SimpleNamespace(ok=outcome == "ok", outcome=outcome, status=status,
+    from harness.run_context import ExecutionOutcome
+    return ExecutionOutcome(outcome=outcome, status=status,
                            body=body, headers=headers or {},
                            final_url="http://shop.test/x", error="",
                            artifact=SimpleNamespace(artifact_id=f"a-{status}"))

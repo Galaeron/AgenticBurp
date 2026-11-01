@@ -218,9 +218,7 @@ class WebCachePoisoningValidator(Validator):
                                 + (f": {outcome.error})" if outcome.error else ")")))
                     return None
                 record(("ok", label))
-                return httpx.Response(
-                    outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=outcome.headers, request=httpx.Request(method, url))
+                return outcome.to_httpx_response(method, url)
             async with httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
             ) as client:

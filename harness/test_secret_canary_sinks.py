@@ -156,6 +156,13 @@ class EvidenceBlobProducerSinkTests(unittest.IsolatedAsyncioTestCase):
             # behind validators.active_enabled (off by default) -- this test is
             # about blob redaction on the producer path, not the mutation gate,
             # so it uses a safe method that authorize() always allows.
+            # H1: X-Api-Key is a credential, so the send names the session that
+            # owns it (a sessionless one is refused before anything is stored).
+            run_context.sessions.register("canary-session", "canary-user",
+                                          headers={"X-Api-Key": CANARY},
+                                          allowed_origins=["https://a.test"])
+            run_context.sessions.get("canary-session")._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler))
             outcome = await run_context.target_transport().execute(
                 TypedRequest(
                     method="GET",
@@ -163,7 +170,7 @@ class EvidenceBlobProducerSinkTests(unittest.IsolatedAsyncioTestCase):
                     headers={"X-Api-Key": CANARY, "X-Trace-Id": "keep-this-header"},
                     body=json.dumps({"password": CANARY, "q": PAYLOAD}),
                 ),
-                capability="canary_probe", case_ref=case_ref)
+                capability="canary_probe", case_ref=case_ref, session_ref="canary-session")
         finally:
             await run_context.aclose()
         self.assertTrue(outcome.ok, f"the mocked send must have succeeded: {outcome}")

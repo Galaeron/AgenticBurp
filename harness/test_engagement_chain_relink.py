@@ -237,7 +237,8 @@ class ChainRelinkAfterLaterPhasesTest(unittest.TestCase):
             f"the initial pass + idor confirmed only in the second-order phase) "
             f"is absent from result['chains']={result.get('chains')!r} -- the "
             f"final re-link did not pick up the later-phase confirmation")
-        self.assertFalse(result.get("degraded"), f"unexpected errors: {result.get('errors')}")
+        self.assertFalse(result.get("errors"), f"unexpected errors: {result.get('errors')}")
+        self.assertIn("assessment", result)
 
     def test_negative_control_disabled_relink_loses_the_chain(self):
         """Defect injection: with Orchestrator._relink_chains patched to raise --

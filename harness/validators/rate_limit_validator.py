@@ -22,6 +22,7 @@ authorised once through the gate (needs allow_mutating_replay) then fired via a
 plain client, exactly like the race-condition leg.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import re
 from urllib.parse import urlsplit
@@ -77,7 +78,7 @@ class RateLimitValidator(Validator):
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         method = (exchange.method or "POST").upper()
 

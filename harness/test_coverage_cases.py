@@ -350,3 +350,36 @@ class TestCaseRefAlignmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecutionAggregationTests(unittest.TestCase):
+    KEY = ("alice", "GET /x", "WSTG-INPV-05")
+
+    def test_executed_child_survives_pending_sibling_and_prior_risk(self):
+        for prior in (None, CellStatus.DETECTED, CellStatus.CONFIRMED):
+            for child in (CellStatus.NOT_DETECTED, CellStatus.INCONCLUSIVE, CellStatus.ERROR):
+                with self.subTest(prior=prior, child=child):
+                    matrix = CoverageMatrix()
+                    if prior:
+                        matrix.record(*self.KEY, status=prior, reason="prior risk")
+                    sibling = CaseKey("query", "q")
+                    matrix.expand_cases(*self.KEY, [NO_PARAMETER_CASE, sibling])
+                    matrix.record_case(*self.KEY, NO_PARAMETER_CASE, status=child,
+                                       executed=True, validator="fixture")
+                    parent = matrix.get(*self.KEY)
+                    self.assertTrue(parent.executed)
+                    self.assertEqual(parent.status, prior or CellStatus.PENDING)
+                    children = matrix.cases_for_cell(*self.KEY)
+                    self.assertEqual(next(r.status for ck,r in children if ck == sibling), CellStatus.PENDING)
+                    wire = CoverageMatrix.from_dict(matrix.to_dict())
+                    self.assertTrue(wire.get(*self.KEY).executed)
+
+    def test_unsent_and_cached_references_do_not_acquire_execution(self):
+        for status in (CellStatus.PENDING, CellStatus.BLOCKED, CellStatus.INCONCLUSIVE,
+                       CellStatus.CONTROLLED_NEGATIVE):
+            with self.subTest(status=status):
+                matrix = CoverageMatrix()
+                matrix.expand_cases(*self.KEY, [NO_PARAMETER_CASE, CaseKey("query", "q")])
+                matrix.record_case(*self.KEY, NO_PARAMETER_CASE, status=status,
+                                   executed=False, reason="unsent or reference to prior proof")
+                self.assertFalse(matrix.get(*self.KEY).executed)

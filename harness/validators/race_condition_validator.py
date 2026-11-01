@@ -33,6 +33,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 import httpx
 
 from .base import Validator, ValidationResult
+from .send_failures import SendFailures
 from harness.safety_gate import get_default_gate
 
 if TYPE_CHECKING:
@@ -161,7 +162,11 @@ class RaceConditionValidator(Validator):
                 )
             effective_burst_size = gate_decision.allowed_burst_size
 
+            failures = SendFailures()
+            label = SendFailures.label(exchange.method, exchange.url)
+
             async def fire_one():
+                failures.attempted += 1
                 try:
                     if self.run_context is not None:
                         from types import SimpleNamespace
@@ -174,6 +179,7 @@ class RaceConditionValidator(Validator):
                                          body=exchange.request_body or None),
                             capability=self.get_name(), session_ref=session_ref)
                         if not result.ok:
+                            failures.outcome(label, result)
                             return None
                         return SimpleNamespace(status_code=result.status, text=result.body,
                                                headers=result.headers)
@@ -186,6 +192,7 @@ class RaceConditionValidator(Validator):
                             content=exchange.request_body.encode() if exchange.request_body else None,
                         )
                 except Exception as e:
+                    failures.exception(label, e)
                     log.debug(f"Burst request failed: {e}")
                     return None
 
@@ -197,6 +204,8 @@ class RaceConditionValidator(Validator):
             responses = [r for r in responses if r is not None]
 
             if len(responses) < 2:
+                if failures.refused or (responses and failures.failures):
+                    return failures.result(self.get_name(), finding.vulnerability_class, "Race burst")
                 return ValidationResult(
                     validator=self.get_name(), status="error",
                     finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
@@ -220,6 +229,8 @@ class RaceConditionValidator(Validator):
                     clean_successes += 1
 
             vulnerable = clean_successes >= 2
+            if failures.failures and not vulnerable:
+                return failures.result(self.get_name(), finding.vulnerability_class, "Race burst")
             if vulnerable:
                 detail = (
                     f"{clean_successes} of {len(responses)} concurrent requests came back looking like "
@@ -314,14 +325,28 @@ class RaceConditionValidator(Validator):
             return urlencode([(k, email_value if k.lower() == "email" else v)
                               for k, v in current_pairs])
 
+        failures = SendFailures()
+
+        async def execute(request, **kwargs):
+            failures.attempted += 1
+            label = SendFailures.label(request.method, request.url)
+            try:
+                result = await executor.execute(request, **kwargs)
+            except Exception as e:
+                failures.exception(label, e)
+                from types import SimpleNamespace
+                return SimpleNamespace(ok=False, body="")
+            failures.outcome(label, result)
+            return result
+
         async def send_change(email_value: str):
-            return await executor.execute(
+            return await execute(
                 TypedRequest(exchange.method, exchange.url,
                              headers=request_headers, body=body_for(email_value)),
                 capability=self.get_name(), session_ref=session_ref)
 
         async def fetch(url: str, *, bound: bool = False):
-            return await executor.execute(
+            return await execute(
                 TypedRequest("GET", url, headers=request_headers if bound else {}),
                 capability=self.get_name(), session_ref=session_ref if bound else None)
 
@@ -399,6 +424,8 @@ class RaceConditionValidator(Validator):
                         raw_output=str({"pairs": sent_pairs, "readback": True,
                                         "controlled_mailbox": "[REDACTED]"}))
 
+        if failures.failures:
+            return failures.result(self.get_name(), finding.vulnerability_class, "Email race")
         return ValidationResult(
             validator=self.get_name(), status="not_confirmed",
             finding_class=finding.vulnerability_class, confidence=0.1,

@@ -17,6 +17,7 @@ capture additionally need validators.allow_mutating_replay (safety gate).
 from __future__ import annotations
 
 import secrets
+import time
 from urllib.parse import urlsplit
 
 import httpx
@@ -25,7 +26,7 @@ import harness.collaborator as _collab
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
-from .base import Validator, ValidationResult
+from .base import SentAnswer, Validator, ValidationResult, artifact_id_of
 from .injection_targets import param_targets, mutate, replay_headers
 
 # Shell metacharacters that break out of the surrounding command, tried in order.
@@ -51,6 +52,24 @@ _INBAND = (";whoami;printf {a}%s {b}", "|whoami;printf {a}%s {b}",
            "& whoami & echo {a}^{b}")
 
 
+async def _wait_for_any(collab, tokens: list[str], timeout: float) -> str | None:
+    """The first of `tokens` the listener saw a callback for, after ONE wait of at
+    most `timeout` seconds. A listener without `wait_for_any` is polled token by
+    token against a shared deadline, each token getting an equal slice of what is
+    left, so the total stays within `timeout`."""
+    wait_any = getattr(collab, "wait_for_any", None)
+    if wait_any is not None:
+        return await wait_any(tokens, timeout=timeout)
+    deadline = time.monotonic() + timeout
+    for index, token in enumerate(tokens):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if await collab.wait_for_hit(token, timeout=remaining / (len(tokens) - index)):
+            return token
+    return None
+
+
 class CommandInjectionValidator(Validator):
     name = "command_injection"
     finding_classes = {"command_injection", "command injection", "os command injection",
@@ -58,14 +77,15 @@ class CommandInjectionValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None, run_context=None):
+                 collaborator=None, run_context=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
         self.run_context = run_context
 
     def collab(self):
-        return self._collab or _collab.shared()
+        return _collab.resolve(self._collab)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         return super().applies(finding, exchange) and bool(param_targets(exchange))
@@ -74,13 +94,13 @@ class CommandInjectionValidator(Validator):
         return ValidationResult(self.name, "skipped", "command_injection", summary=why)
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
-        host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
-            return self._skip(f"host {host!r} out of scope")
+        from harness.scope_lock import host_in_scope
+        if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
+            return self._skip("target origin is out of scope")
         targets = param_targets(exchange)[:_MAX_PARAMS]
         if not targets:
             return self._skip("no parameter to inject a shell payload into")
-        collab = self.collab()
+        collab = self.collab() if self.oob_callbacks_enabled else None
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
         session_ref = None
@@ -116,7 +136,7 @@ class CommandInjectionValidator(Validator):
                                .partition(":")[2] or outcome.error or "transport error")
                     unsent.append(("error", f"{label}: {failure}"))
                     return "error", ""
-                return "ok", outcome.body or ""
+                return SentAnswer(("ok", outcome.body or ""), outcome.artifact_id)
             try:
                 await global_throttle.acquire()
                 async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
@@ -129,7 +149,22 @@ class CommandInjectionValidator(Validator):
             except httpx.HTTPError as e:
                 unsent.append(("error", f"{label}: {e.__class__.__name__}"))
                 return "failed", ""
-            return "ok", resp.text
+            return SentAnswer(("ok", resp.text), artifact_id_of(resp))
+
+        async def proof_exchanges(loc: str, param: str, attack, marker_a: str, marker_b: str) -> dict:
+            """Ticket 6 proof exchanges, never verdict inputs. Control: the same
+            parameter given the marker pieces without shell syntax, named only when
+            its answer lacks the joined marker. Baseline: the original request
+            replayed, sent last so the target is left as captured. Outside a run
+            neither is sent: it would name nothing."""
+            if self.run_context is None:
+                return {"attack": attack}
+            url, body = mutate(exchange, loc, param, f"{marker_a}%s {marker_b}")
+            control = await send(url, body, "proof control")
+            if control[0] != "ok" or marker_a + marker_b in control[1]:
+                control = None
+            baseline = await send(exchange.url, exchange.request_body or "", "proof baseline")
+            return {"baseline": baseline, "attack": attack, "controls": [control]}
 
         def incomplete() -> ValidationResult:
             answered = sends - len(unsent)
@@ -155,10 +190,12 @@ class CommandInjectionValidator(Validator):
             for tmpl in _INBAND:
                 payload = tmpl.format(a=marker_a, b=marker_b)
                 url, body = mutate(exchange, loc, param, payload)
-                state, text = await send(url, body, f"in-band probe via {loc} {param!r}")
+                sent = await send(url, body, f"in-band probe via {loc} {param!r}")
+                state, text = sent
                 if state == "refused":
                     return incomplete()  # the run or the gate refuses the remaining sends too
                 if marker in text:
+                    proof = await proof_exchanges(loc, param, sent, marker_a, marker_b)
                     return ValidationResult(
                         self.name, "confirmed", "command_injection", confidence=0.95,
                         confirmed=True,
@@ -166,12 +203,16 @@ class CommandInjectionValidator(Validator):
                                 "executed a shell command.",
                         evidence=f"Injected `{tmpl.format(a='<nonce-a>', b='<nonce-b>')}` "
                                  f"into {param!r}; "
-                                 "the response contained the unique command-output marker.")
+                                 "the response contained the unique command-output marker."
+                    ).with_artifacts(**proof)
 
         # A loopback collaborator cannot be reached by a remote target. Avoid
         # multiplying the configured timeout across payloads when it cannot
         # produce evidence; explicit/external collaborators still cover blind
         # command injection.
+        if collab is None:
+            return ValidationResult(self.name, "inconclusive", "command_injection",
+                                    summary="In-band check did not confirm; callback probes disabled by policy")
         collab_host = urlsplit(collab.url("reachability-check")).hostname or ""
         target_host = urlsplit(exchange.url).hostname or ""
         if collab_host in {"127.0.0.1", "localhost", "::1"} and target_host not in {
@@ -179,32 +220,61 @@ class CommandInjectionValidator(Validator):
             if unsent:
                 return incomplete()
             return ValidationResult(
-                self.name, "not_confirmed", "command_injection", confidence=0.0,
+                self.name, "inconclusive", "command_injection", confidence=0.0,
                 confirmed=False,
-                summary="No in-band command-output marker observed",
+                summary="Command-injection check incomplete: no in-band marker and the callback "
+                        "listener is unreachable; not a negative result",
                 evidence=f"Tried {len(targets)} parameter(s) across {len(_INBAND)} "
                          "in-band shell forms; loopback collaborator was not reachable from the target.")
+        # A stopped listener can record nothing: sending would only spend requests.
+        # (Unverified reachability is different -- an exact callback still proves the
+        # probe -- so that case sends, and only an absent callback stays inconclusive.)
+        if _collab.listener_stopped(collab):
+            unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "command_injection")
+            if unavailable is not None:
+                return incomplete() if unsent else unavailable
+        # Send every out-of-band payload first, each with its own token, then wait
+        # ONCE for any callback instead of one timed wait per payload.
+        probes: dict[str, tuple[str, str, str, object]] = {}
+        refused = False
         for loc, param in targets:
             for tmpl in _TEMPLATES:
                 token = collab.token()
                 payload = tmpl.format(u=collab.url(token))
                 url, body = mutate(exchange, loc, param, payload)
-                state, _ = await send(url, body, f"out-of-band probe via {loc} {param!r}")
+                sent = await send(url, body, f"out-of-band probe via {loc} {param!r}")
+                state, _ = sent
                 if state == "refused":
-                    return incomplete()  # no point trying more templates
+                    # No point trying more templates, but the payloads already
+                    # delivered can still call back: wait for them below (the
+                    # refusal is in `unsent`, so no hit still ends incomplete).
+                    refused = True
+                    break
                 if state == "failed":
                     continue
-                if await collab.wait_for_hit(token, timeout=self.timeout):
-                    return ValidationResult(
-                        self.name, "confirmed", "command_injection", confidence=0.95, confirmed=True,
-                        summary=f"OS command injection confirmed: a shell payload placed in the {loc} "
-                                f"parameter {param!r} executed on the server.",
-                        evidence=f"Injected a metacharacter-prefixed fetch (`{tmpl.format(u='<collaborator>')}`) "
-                                 f"into {param!r}; the target ran it and called back out-of-band (blind-safe).")
+                probes[token] = (loc, param, tmpl, sent)
+            if refused:
+                break
+        hit = await _wait_for_any(collab, list(probes), self.timeout) if probes else None
+        if hit is not None:
+            loc, param, tmpl, sent = probes[hit]
+            nonce = secrets.token_hex(6)
+            proof = await proof_exchanges(loc, param, sent, f"HV{nonce[:6]}", nonce[6:])
+            return ValidationResult(
+                self.name, "confirmed", "command_injection", confidence=0.95, confirmed=True,
+                summary=f"OS command injection confirmed: a shell payload placed in the {loc} "
+                        f"parameter {param!r} executed on the server.",
+                evidence=f"Injected a metacharacter-prefixed fetch (`{tmpl.format(u='<collaborator>')}`) "
+                         f"into {param!r}; the target ran it and called back out-of-band (blind-safe)."
+            ).with_artifacts(**proof)
         if unsent:
             return incomplete()
+        unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "command_injection")
+        if unavailable is not None:
+            return unavailable
         return ValidationResult(
             self.name, "not_confirmed", "command_injection", confidence=0.0, confirmed=False,
             summary="No out-of-band callback observed -- parameters do not appear to reach a shell",
             evidence=f"Tried {len(targets)} parameter(s) x {len(_TEMPLATES)} shell payloads; "
-                     f"no collaborator hit within the window.")
+                     f"no collaborator hit within the window. Waited once for {len(probes)} "
+                     f"callback(s) (timeout {self.timeout:g} s).")

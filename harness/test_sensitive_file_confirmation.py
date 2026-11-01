@@ -275,7 +275,7 @@ class SensitiveFileConfirmationCallerTests(unittest.TestCase):
         self.assertFalse(local["confirmed"])
         self.assertIn("existence only: HTTP 302", local["evidence"])
         self.assertNotIn("HTTP 200", local["evidence"])
-        self.assertEqual(local["severity"], "low")
+        self.assertEqual(local["severity"], "info")
         # (c) an HTML shell at a dotenv path and (d) an empty 200 are not confirmed.
         self.assertFalse(by_path["/.env.production"]["confirmed"])
         self.assertIn("HTML page", by_path["/.env.production"]["evidence"])

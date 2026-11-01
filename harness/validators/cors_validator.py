@@ -15,9 +15,11 @@ Tests performed:
 """
 
 from __future__ import annotations
+from harness import scope_lock
 import asyncio
 import contextvars
 import logging
+import secrets
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -25,7 +27,7 @@ from urllib.parse import urlparse
 import httpx
 
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
-from .base import Validator, ValidationResult
+from .base import Validator, ValidationResult, artifact_id_of, header_fingerprint
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -69,6 +71,30 @@ def _note_probe(outcome: str) -> None:
         probes.append(outcome)
 
 
+# Per-validate() record of the CORS policy each Origin probe was answered with
+# (E2): (grant, Allow-Credentials, Vary). A grant equal to the probe's own origin is
+# written "<reflected>", so a server that echoes the origin has one policy however
+# many origins were tried.
+_POLICIES: contextvars.ContextVar[list | None] = contextvars.ContextVar("cors_policies", default=None)
+
+
+def _note_policy(sent: dict, received) -> None:
+    policies = _POLICIES.get()
+    origin = next((v for k, v in (sent or {}).items() if k.lower() == "origin"), None)
+    if policies is None or origin is None:
+        return
+    got = {str(k).lower(): v for k, v in received.items()}
+    grant = got.get("access-control-allow-origin", "")
+    policies.append((("<reflected>" if grant and grant == origin else grant),
+                     got.get("access-control-allow-credentials", ""), got.get("vary", "")))
+
+
+def _policy_fingerprint() -> str:
+    """header_fingerprint of the distinct policies this validate() saw ("" if none)."""
+    seen = sorted(set(_POLICIES.get() or ()))
+    return header_fingerprint(*(f"{g}|{c}|{v}" for g, c, v in seen)) if seen else ""
+
+
 @dataclass
 class CorsTestResult:
     """Result of a CORS test."""
@@ -78,6 +104,8 @@ class CorsTestResult:
     detail: str
     evidence: str
     vulnerable: bool = False
+    # The run exchange behind a vulnerable origin grant (Ticket 6 attack).
+    artifact_id: str = ""
     
     def to_dict(self) -> dict:
         return {
@@ -179,7 +207,7 @@ class CorsValidator(Validator):
         # Scope guard (defense-in-depth with the central backstop): never send
         # crafted-Origin probes to a host outside the configured engagement.
         host = urlparse(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
 
         # Extract base URL for testing
@@ -199,6 +227,7 @@ class CorsValidator(Validator):
         # Run all CORS tests
         probes: list[str] = []
         probe_scope = _PROBES.set(probes)
+        policy_scope = _POLICIES.set([])
         try:
             tests.append(await self._test_wildcard_origin(base_url, exchange))
             tests.append(await self._test_null_origin(base_url, exchange))
@@ -286,7 +315,8 @@ class CorsValidator(Validator):
                 summary=" ".join(summary_parts),
                 evidence=self._build_evidence(tests),
                 raw_output=self._build_raw_output(tests),
-            )
+                header_fingerprint=_policy_fingerprint(),
+            ).with_artifacts(**(await self._proof_exchanges(exchange, tests) if vulnerable else {}))
             
         except Exception as e:
             log.error(f"CORS validation error: {e}")
@@ -302,6 +332,32 @@ class CorsValidator(Validator):
             )
         finally:
             _PROBES.reset(probe_scope)
+            _POLICIES.reset(policy_scope)
+
+    async def _proof_exchanges(self, exchange: HttpExchange, tests: list) -> dict:
+        """Ticket 6: the exchanges a confirmed origin grant rests on. Attack: the
+        granting probe. Baseline: the same request without an Origin header.
+        Control: a second, random untrusted origin; for a reflection it is named
+        only when that origin was reflected too (any origin, not one configured
+        partner), for a null grant only when it was not granted (not every origin).
+        Empty when the grant was not sent through a run."""
+        grant = next((t for t in tests if t.vulnerable and t.test_name in _ORIGIN_GRANT_TESTS
+                      and t.artifact_id), None)
+        if grant is None:
+            return {}
+        baseline = await self._send_request(exchange.url, headers={})
+        origin = f"https://{secrets.token_hex(4)}.cors-control.invalid"
+        control = await self._send_request(exchange.url, headers={"Origin": origin})
+        if control is not None:
+            acao = control.headers.get("Access-Control-Allow-Origin", "").lower()
+            if grant.test_name == "Origin Reflection":
+                # Rules out one configured partner: the random origin must be reflected too.
+                if acao != origin:
+                    control = None
+            elif acao in (origin, "*"):
+                # Rules out a blanket grant: "null" must be trusted, not every origin.
+                control = None
+        return {"baseline": baseline, "attack": grant.artifact_id, "controls": [control]}
 
     def _get_base_url(self, url: str) -> str:
         """Extract base URL from a full URL."""
@@ -332,10 +388,10 @@ class CorsValidator(Validator):
                 if not outcome.ok:
                     _note_probe("error" if outcome.outcome == "error" else "blocked")
                     return None
+                response = outcome.to_httpx_response(method, url)
+                _note_policy(headers, outcome.headers or {})
                 _note_probe("ok")
-                return httpx.Response(
-                    outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=outcome.headers, request=httpx.Request(method, url))
+                return response
             from harness import global_throttle
             await global_throttle.acquire()
             # No run_context (e.g. the header-audit or a standalone path): route
@@ -350,6 +406,7 @@ class CorsValidator(Validator):
                 max_redirects=self.max_redirects,
             ) as client:
                 response = await client.request(method, url, headers=headers)
+            _note_policy(headers, response.headers)
             _note_probe("ok")
             return response
         except SafetyGateBlocked as e:
@@ -437,6 +494,7 @@ class CorsValidator(Validator):
                     detail=detail,
                     evidence=evidence,
                     vulnerable=True,
+                    artifact_id=artifact_id_of(response),
                 )
         
         return CorsTestResult(
@@ -474,6 +532,7 @@ class CorsValidator(Validator):
                     detail="Server allows null origin (can be exploited from sandboxed iframes)",
                     evidence=f"Origin: null -> Access-Control-Allow-Origin: {acao}",
                     vulnerable=True,
+                    artifact_id=artifact_id_of(response),
                 )
         
         return CorsTestResult(

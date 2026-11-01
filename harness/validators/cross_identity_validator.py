@@ -35,6 +35,7 @@ validators.active_enabled (it sends live requests), and scoped to
 server.allowed_hosts. GET-only.
 """
 from __future__ import annotations
+from harness import scope_lock
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
@@ -249,6 +250,10 @@ def _source_identity(idents: list, source_sig: tuple) -> dict | None:
     return None
 
 
+from contextvars import ContextVar
+_ownership_method = ContextVar("ownership_method", default="GET")
+
+
 class CrossIdentityValidator(Validator):
     name = "cross_identity"
     active = True  # sends live requests; only runs when validators.active_enabled
@@ -296,7 +301,7 @@ class CrossIdentityValidator(Validator):
                 raise RuntimeError(out.error or "probe transport error")
             if not out.executed:   # out_of_scope / blocked / budget / cancelled -> not reached
                 return _UnsentProbe(0, "", outcome=out.outcome or "not sent")
-            return identity_compare.Probe(out.status or 0, out.body or "")
+            return identity_compare.Probe(out.status or 0, out.body or "", artifact_id=out.artifact_id)
         from harness import global_throttle
         await global_throttle.acquire()
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
@@ -326,6 +331,23 @@ class CrossIdentityValidator(Validator):
             return await self._probe(url, ident["headers"])
         return await self._probe(url, ident["headers"], session_ref)
 
+    async def _matching_replay(self, url: str, ident: dict | None,
+                               against: "identity_compare.Probe"):
+        """`ident`'s own read of `url`, replayed, when it was reached and materially
+        matches `against`: the exchange a crossing's proof is audited against
+        (Ticket 6). None otherwise, so the proof names no exchange that does not
+        show what the verdict says. Outside a run it would name nothing: not sent."""
+        if ident is None or self.run_context is None:
+            return None
+        try:
+            probe = await self._probe_identity(url, ident)
+        except Exception:
+            return None
+        if _not_reached(probe) or identity_compare.similarity(
+                probe.body, against.body) < identity_compare.MATCH_THRESHOLD:
+            return None
+        return probe
+
     def _skip(self, fc: str, why: str) -> ValidationResult:
         return ValidationResult(validator=self.name, status="skipped", finding_class=fc, summary=why)
 
@@ -344,10 +366,14 @@ class CrossIdentityValidator(Validator):
         import harness.principals as _pr
         if self.ownership is None:
             return _pr.AuthzDecision.UNKNOWN
-        decision = self.ownership.authorization(principal, self._object_ref(url))
+        decision = self.ownership.authorization(principal, self._object_ref(url), _ownership_method.get())
         if decision == _pr.AuthzDecision.UNAUTHORIZED and getattr(principal, "provisional", False):
             return _pr.AuthzDecision.UNKNOWN
         return decision
+
+    def _ownership_provenance(self, exchange):
+        fact = self.ownership.lookup(self._object_ref(exchange.url), exchange.method) if self.ownership else None
+        return fact.provenance if fact else "no ownership provenance"
 
     def _undeclared_lead(self, fc: str, exchange: HttpExchange, ident: dict, detail: str,
                          function_level: bool = False) -> ValidationResult:
@@ -489,7 +515,8 @@ class CrossIdentityValidator(Validator):
                             evidence=f"{detail} The declared entitlement for "
                                      f"{self._object_ref(exchange.url)!r} does not include "
                                      f"{accessor.id!r}: a non-admin obtained the admin function's "
-                                     f"privileged data.")
+                                     f"privileged data. {self._ownership_provenance(exchange)}"
+                        ).with_artifacts(baseline=admin_probe, attack=attempt, controls=[anon])
                     if decision == _pr.AuthzDecision.AUTHORIZED:
                         authorized += 1
                         continue
@@ -566,13 +593,20 @@ class CrossIdentityValidator(Validator):
         return self._skip(fc, "function-level comparison inconclusive")
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
+        token = _ownership_method.set(exchange.method)
+        try:
+            return await self._validate_with_ownership_method(finding, exchange)
+        finally:
+            _ownership_method.reset(token)
+
+    async def _validate_with_ownership_method(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         fc = finding.vulnerability_class
         if (exchange.method or "GET").upper() != "GET":
             return self._skip(fc, "cross-identity replay is GET-only (safe); a mutating request is not replayed here")
         host = urlparse(exchange.url).hostname or ""
         if self.run_context is not None and not self.run_context.scope.in_scope(exchange.url):
             return self._skip(fc, f"host {host!r} is outside the run scope")
-        if self.run_context is None and self.allowed_hosts and host not in self.allowed_hosts:
+        if self.run_context is None and self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(fc, f"host {host!r} is outside server.allowed_hosts scope")
         object_scoped = has_object_identifier(exchange.url)
         function_level = not object_scoped and is_admin_namespaced(exchange.url)
@@ -668,17 +702,26 @@ class CrossIdentityValidator(Validator):
                 accessor = _principal_for(ident)
                 decision = self._ownership_decision(accessor, exchange.url)
                 if decision == _pr.AuthzDecision.UNAUTHORIZED:
+                    # Baseline: the source principal's own read, replayed live (the
+                    # comparison above used the captured response, not a run send).
+                    source_read = await self._matching_replay(
+                        exchange.url, _source_identity(idents, source_sig), attempt)
                     return ValidationResult(
                         validator=self.name, status="confirmed", finding_class=fc,
                         confidence=ev.confidence, confirmed=True,
                         summary=f"Cross-identity ({ident['name']}): {ev.summary}",
                         evidence=f"Declared ownership of {self._object_ref(exchange.url)!r} does not "
-                                 f"entitle {accessor.id!r} to it. {ev.detail}")
+                                 f"entitle {accessor.id!r} to it. {self._ownership_provenance(exchange)}. {ev.detail}"
+                    ).with_artifacts(baseline=source_read, attack=attempt, controls=[anon])
                 if decision == _pr.AuthzDecision.AUTHORIZED:
                     source_ident = _source_identity(idents, source_sig)
                     source = _principal_for(source_ident) if source_ident is not None else None
                     if source is not None and self._ownership_decision(source, exchange.url) \
                             == _pr.AuthzDecision.UNAUTHORIZED:
+                        # The crossing is the capture itself: the attack exchange is
+                        # the source principal's read replayed live, the entitled
+                        # principal's read its baseline.
+                        source_read = await self._matching_replay(exchange.url, source_ident, attempt)
                         return ValidationResult(
                             validator=self.name, status="confirmed", finding_class=fc,
                             confidence=ev.confidence, confirmed=True,
@@ -687,7 +730,8 @@ class CrossIdentityValidator(Validator):
                                     f"principal {accessor.id!r} sees, while anonymous was denied.",
                             evidence=f"Declared ownership of {self._object_ref(exchange.url)!r} does "
                                      f"not entitle the source principal {source.id!r}; the entitled "
-                                     f"principal's replay matched its captured response. {ev.detail}")
+                                     f"principal's replay matched its captured response. {self._ownership_provenance(exchange)}. {ev.detail}"
+                        ).with_artifacts(baseline=attempt, attack=source_read, controls=[anon])
                     authorized += 1
                     continue
                 if undeclared is None:

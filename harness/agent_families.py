@@ -190,6 +190,15 @@ class FamilyRunner:
     def _system_prompt(self) -> str:
         return compose_family_prompt(self.members)
 
+    def _body_budget(self, max_body_chars: int) -> int:
+        """E8: the body budget for the ONE shared family prompt. Every member
+        reads the same user prompt, so it must carry as much body as the most
+        demanding member needs: the largest of the members' own budgets. A
+        member with no `input_body_chars` budgets the full `max_body_chars`,
+        so a family that includes a body-reading agent (misconfig, ...) is
+        never shortened just because its primary member is header-only."""
+        return max(m._body_budget(max_body_chars) for m in self.members)
+
     async def run(self, exchange: "HttpExchange", max_body_chars: int,
                   prior_context: str = "", effort_budget=None) -> "AgentReport":
         from harness.agents.base_agent import required_findings
@@ -198,14 +207,18 @@ class FamilyRunner:
 
         agent = self._primary
         label = f"family:{self.family_name}"
+        body_budget = self._body_budget(max_body_chars)
+        reported_budget = agent._reported_body_budget(body_budget, max_body_chars)
         try:
-            user_prompt = agent._user_prompt(exchange, max_body_chars, prior_context)
+            user_prompt = agent._user_prompt(exchange, body_budget, prior_context)
             from harness.passive_inference import passive_chat_json
-            parsed = await passive_chat_json(
-                agent.ollama, effort_budget, model=agent.model,
-                system_prompt=self._system_prompt(), user_prompt=user_prompt,
-                temperature=agent.temperature,
-            )
+            from harness.ollama_client import model_stage
+            with model_stage(label):
+                parsed = await passive_chat_json(
+                    agent.ollama, effort_budget, model=agent.model,
+                    system_prompt=self._system_prompt(), user_prompt=user_prompt,
+                    temperature=agent.temperature,
+                )
             raw_findings = required_findings(parsed)
             # W-7/W-24/R02, same as BaseAgent.run: strip harness-owned
             # authority fields from untrusted model output before it
@@ -216,13 +229,16 @@ class FamilyRunner:
             raw_components = parsed.get("components", [])
             components = [ComponentCandidate(**c) for c in raw_components]
             return AgentReport(agent=label, model=agent.model,
-                                findings=findings, components=components)
+                                findings=findings, components=components,
+                                input_body_chars=reported_budget)
         except OllamaError as e:
-            return AgentReport(agent=label, model=agent.model, findings=[], raw_error=str(e))
+            return AgentReport(agent=label, model=agent.model, findings=[], raw_error=str(e),
+                                input_body_chars=reported_budget)
         except Exception as e:  # malformed model output, schema mismatch, etc.
             return AgentReport(
                 agent=label, model=agent.model, findings=[],
                 raw_error=f"Family call failed to parse model output: {e}",
+                input_body_chars=reported_budget,
             )
 
     def _emit_hypotheses(self, findings: list) -> None:

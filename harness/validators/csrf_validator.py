@@ -10,6 +10,7 @@ Ordinary token-stripping POST replays remain observations rather than confirmati
 because a successful status alone does not prove that the state changed.
 """
 from __future__ import annotations
+from harness import scope_lock
 
 import logging
 import re
@@ -303,7 +304,7 @@ class CsrfValidator(Validator):
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
 
         method = (exchange.method or "GET").upper()

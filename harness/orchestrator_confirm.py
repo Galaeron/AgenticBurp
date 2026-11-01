@@ -9,8 +9,11 @@ Orchestrator.__init__ and resolved across mixins via the MRO.
 """
 from __future__ import annotations
 
+import functools
+
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
-from harness.validators.base import ValidationResult
+from harness.execution_registry import ExecutionRegistry
+from harness.validators.base import ValidationResult, observed_result_of, proof_artifact_kwargs
 
 
 def _fallback_result_binds(result, routed) -> bool:
@@ -167,9 +170,12 @@ class ConfirmMixin:
             owned_ctx = standalone_context(self.allowed_hosts, config=self.config,
                                            gate=get_default_gate(), max_requests=ceiling)
             probe_ctx = owned_ctx
+        async def experiment_handoff(action):
+            return await self._handoff_experiment(action, probe_ctx)
         agent = IterativeAgent(
             self.ollama, chosen_model, self.allowed_hosts,
             max_steps=self.iterative_agent_max_steps, run_context=probe_ctx,
+            experiment_handoff=experiment_handoff,
         )
 
         # Publish each step to the live feed (V1), and still call any caller-
@@ -263,8 +269,27 @@ class ConfirmMixin:
             "best_finding": best.model_dump() if best else None,
         }
 
+    def _coverage_case(self, *, identity: str, check, exchange, case_key=None, run_context=None):
+        """The case a coverage-driven leg runs for, built before its sends so the
+        leg's exchanges are recorded under it (case_scope)."""
+        _template_id = evidence._short(
+            (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
+        from harness.categories import canonicalize as _canon
+        check_id = check.id or _canon(check.vulnerability_class) or (check.vulnerability_class or "")
+        ck = case_key
+        if run_context is None:
+            from harness.run_context import RunContext
+            run_context = RunContext.create(
+                config=self.config, allowed_hosts=self.allowed_hosts)
+        return evidence.TestCaseRef.make(
+            run_id=run_context.run_id, request_template_id=_template_id, check_id=check_id,
+            principal_id=identity or "",
+            parameter_location=(ck.parameter_location if ck else ""),
+            parameter_name=(ck.case_parameter_name() if ck else ""),
+            workflow_state_id=(ck.workflow_state_id if ck else ""))
+
     async def _coverage_proof(self, *, identity: str, check, exchange,
-                              result, case_key=None, run_context=None) -> tuple[str, str]:
+                              result, case_key=None, run_context=None, case=None) -> tuple[str, str]:
         """Build and persist a case-bound ProofRecord for a coverage-DRIVEN leg
         result (T05/R26), so a coverage-driven confirmation is evidence with a
         stable case id -- the same T01 contract the captured-exchange path uses --
@@ -274,26 +299,15 @@ class ConfirmMixin:
         proof could not be persisted. Best-effort: coverage is a report layer and
         never sinks the run."""
         try:
-            _template_id = evidence._short(
-                (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
-            from harness.categories import canonicalize as _canon
-            check_id = check.id or _canon(check.vulnerability_class) or (check.vulnerability_class or "")
-            ck = case_key
-            if run_context is None:
-                from harness.run_context import RunContext
-                run_context = RunContext.create(
-                    config=self.config, allowed_hosts=self.allowed_hosts)
-            case = evidence.TestCaseRef.make(
-                run_id=run_context.run_id, request_template_id=_template_id, check_id=check_id,
-                principal_id=identity or "",
-                parameter_location=(ck.parameter_location if ck else ""),
-                parameter_name=(ck.case_parameter_name() if ck else ""),
-                workflow_state_id=(ck.workflow_state_id if ck else ""))
+            if case is None:
+                case = self._coverage_case(identity=identity, check=check, exchange=exchange,
+                                           case_key=case_key, run_context=run_context)
             pr = evidence.ProofRecord.from_validation_result(
                 case=case, validator=result.validator,
                 validator_version=getattr(result, "version", "") or "",
                 status=result.status, confirmed=result.confirmed,
-                observed_result=(result.summary or result.evidence or "")[:500])
+                observed_result=observed_result_of(result),
+                **proof_artifact_kwargs(result))
             ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
             if ok:
                 return pr.proof_id, case.case_id
@@ -310,7 +324,7 @@ class ConfirmMixin:
         self, *, case, validator_name: str, status: str, confirmed: bool,
         finding_ref: str, ledger_summary: str, ledger_data: dict,
         validator_version: str = "", observed_result: str = "",
-        expected_invariant: str = "",
+        expected_invariant: str = "", proof_artifacts: dict | None = None,
     ) -> tuple[bool, dict | None, str]:
         """RB-4/INV-2 shared proof+ledger persistence.
 
@@ -329,6 +343,10 @@ class ConfirmMixin:
         persistence failure DOES propagate to the caller (ok=False, or an
         exception from a malformed case/ProofRecord), exactly as
         _validate_findings' own try/except around this step already expects.
+
+        `proof_artifacts` (validators.base.proof_artifact_kwargs) carries the
+        executed baseline/attack/control exchange ids a migrated validator
+        named; without it the proof stays legacy (a candidate, never counted).
         """
         from harness import evidence_ledger
         try:
@@ -343,7 +361,7 @@ class ConfirmMixin:
         pr = evidence.ProofRecord.from_validation_result(
             case=case, validator=validator_name, validator_version=validator_version,
             status=status, confirmed=confirmed, observed_result=observed_result,
-            expected_invariant=expected_invariant)
+            expected_invariant=expected_invariant, **(proof_artifacts or {}))
         ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
         if ok:
             return True, pr.to_dict(), reason
@@ -353,6 +371,14 @@ class ConfirmMixin:
     # single successful observation can confirm one of these active legs; a
     # flaky one-shot confirmation would not reproduce, inflating precision.
     _CONFIRM_REPLAY_SCOPE = frozenset({"ssrf", "ssti", "command_injection"})
+
+    @staticmethod
+    async def _in_case(case, job):
+        """Run one validator job inside its case's scope, so every send it makes
+        is a case-bound exchange artifact its result can name."""
+        from harness.run_context import case_scope
+        with case_scope(case.case_id):
+            return await job
 
     async def _maybe_replay(self, validator, finding, exchange):
         """ER-4: optional determinism gate wrapping validator.validate().
@@ -465,6 +491,9 @@ class ConfirmMixin:
                 config=_cfg,
                 gate_config=per_run_gate_config(_cfg, getattr(self, "validator_registry", None)))
         _run_id = run_context.run_id
+        registry = getattr(run_context, "execution_registry", None)
+        if not isinstance(registry, ExecutionRegistry):
+            registry = None
         _template_id = evidence._short(
             (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
         from harness.categories import canonicalize as _vf_canon
@@ -526,7 +555,16 @@ class ConfirmMixin:
                         if not applies(candidate, exchange):
                             continue
                         routed = candidate
-                    jobs.append(self._maybe_replay(validator, routed, exchange))
+                    if registry is None:
+                        work = self._maybe_replay(validator, routed, exchange)
+                    else:
+                        # E4: ask the run's registry first, so a check the worklist
+                        # or the coverage drive already ran on this shape is not run
+                        # again. The run still happens inside this case's scope.
+                        work = registry.run(
+                            validator, routed, exchange, case_ref=case.case_id,
+                            call=functools.partial(self._maybe_replay, validator, routed, exchange))
+                    jobs.append(self._in_case(case, work))
                     plan = validator.plan(routed, exchange)
                     if plan is not None and routed is not finding:
                         plan = plan.model_copy(update={"finding_class": finding.vulnerability_class})
@@ -669,8 +707,9 @@ class ConfirmMixin:
                     case=case, validator_name=result.validator,
                     validator_version=getattr(validator, "version", ""),
                     status=result.status, confirmed=result.confirmed,
-                    observed_result=(result.summary or result.evidence or "")[:500],
+                    observed_result=observed_result_of(result),
                     expected_invariant=getattr(validator, "expected_invariant", ""),
+                    proof_artifacts=proof_artifact_kwargs(result),
                     finding_ref=finding.finding_id,
                     ledger_summary=(
                         f"{result.validator}: {result.status}"
@@ -699,6 +738,9 @@ class ConfirmMixin:
                         # leg name, set at the exact same moment as proof_id/case_id
                         # -- not recovered later by regex-parsing evidence text.
                         finding.confirmed_by_leg = result.validator
+                        # E2: the header policy a csp/cors confirmation rests on (issue grouping).
+                        finding.header_fingerprint = (getattr(result, "header_fingerprint", "")
+                                                      or finding.header_fingerprint)
                         # P0.1-WIRE: oracle gate runs (or no-ops, per config)
                         # at the exact moment a finding is first confirmed.
                         if routed is finding:
@@ -725,12 +767,20 @@ class ConfirmMixin:
                 await asyncio.to_thread(
                     store.persist_test_plans, exchange, [plan]
                 )
+                # One confirmation policy (store.capability_can_confirm): a plan
+                # whose capability cannot confirm (CSP/header and recon
+                # validators) records what it saw as an observation. The proof
+                # record above is unchanged; the accounting labels it hardening
+                # or reconnaissance, so submitting confirmed=True here only
+                # produced a refusal warning per result.
+                observed = bool(result.confirmed) and not store.capability_can_confirm(
+                    plan.capability)
                 submission = ValidationSubmission(
                     plan_id=plan.id,
-                    status=result.status,
+                    status="observed" if observed else result.status,
                     confidence=result.confidence,
-                    confirmed=result.confirmed,
-                    summary=result.summary,
+                    confirmed=result.confirmed and not observed,
+                    summary=f"observation: {result.summary}" if observed else result.summary,
                     evidence=result.evidence or result.raw_output,
                     executor=f"{plan.execution_plane}:{plan.capability}",
                     source_exchange_hash=plan.source_exchange_hash,

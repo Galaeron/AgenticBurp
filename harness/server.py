@@ -519,7 +519,7 @@ async def report(url: str, authorization: str | None = Header(default=None),
         captured_principal=captured_principal_id,
     )
     if not engagement_id:
-        markdown = "> Legacy host-only records. Current passive analysis requires its returned engagement_id.\n\n" + markdown
+        markdown = "> Shared site history (unnamed engagement). Use engagement_id to select a named partition.\n\n" + markdown
     return PlainTextResponse(markdown, media_type="text/markdown")
 
 
@@ -565,7 +565,7 @@ async def report_sarif(url: str, authorization: str | None = Header(default=None
     source_revision = evidence_ledger.Provenance.capture().code_version
     doc = sarif_adapter.export_issues_to_sarif(exports, source_revision=source_revision)
     doc["runs"][0]["properties"]["engagement_id"] = engagement_id
-    doc["runs"][0]["properties"]["state_partition"] = "explicit-engagement" if engagement_id else "legacy-host-only"
+    doc["runs"][0]["properties"]["state_partition"] = "explicit-engagement" if engagement_id else "shared-site-history"
     return JSONResponse(doc)
 
 
@@ -601,6 +601,7 @@ async def validation_result(submission: ValidationSubmission, authorization: str
     if plan is not None:
         step = await active_verification.decide_next_step(
             plan, submission, ollama_client=orchestrator.ollama,
+            config=orchestrator.config,
         )
         if step.next_plan is not None:
             await __import__("asyncio").to_thread(store.persist_retry_plan, step.next_plan)
@@ -621,7 +622,9 @@ async def analyze(req: AnalysisRequest, authorization: str | None = Header(defau
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     try:
-        partition = {"engagement_id": req.engagement_id} if req.engagement_id else {}
+        # An omitted name selects the site's shared history. Generating a new
+        # partition per request makes prior observations impossible to retrieve.
+        partition = {"engagement_id": req.engagement_id or ""}
         if attribution:
             partition["observation_attribution"] = attribution
         return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery,
@@ -1316,7 +1319,7 @@ async def engagement_view(host: str, limit: int = 25, authorization: str | None 
     from harness import engagement
     snap = await __import__("asyncio").to_thread(store.load_engagement, host, engagement_id=engagement_id)
     partition_meta = {"engagement_id": engagement_id,
-                      "state_partition": "explicit-engagement" if engagement_id else "legacy-host-only"}
+                      "state_partition": "explicit-engagement" if engagement_id else "shared-site-history"}
     if not snap:
         return {**partition_meta, "host": host, "endpoint_count": 0, "worklist": [], "summary": {"host": host, "endpoint_count": 0}}
     st = engagement.EngagementState.from_dict(snap)
@@ -1397,10 +1400,11 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
 # --- Flagship graph investigation as a tracked, cancellable job (R18) ----------
 # Before this, server.py exposed run/advance/crawl but NEVER invoked
 # investigate_engagement, so the Burp UI could not reach the flagship path at all.
-# This runs it as a background asyncio job with status/result/cancel. NOTE: a
-# persisted mid-run RESUME cursor (SHOULD-tier) is not implemented -- investigate_
-# engagement is not internally checkpointed; that needs the execution ledger
-# (roadmap Phase 2) and is an explicit follow-up. Jobs live in-process.
+# This runs it as a background asyncio job with status/result/cancel. With
+# runs.journal on (default off), the run also writes each finished unit (discovery,
+# worklist nodes, capture reviews, coverage checkpoints) to a run journal
+# (run_journal.py), so an interrupted job -- which has no result -- can be resumed with
+# resume_job_id without repeating them. Job status lives in-process and in the job store.
 import uuid as _uuid
 import time as _time
 import harness.run_manifest as _run_manifest
@@ -1430,12 +1434,17 @@ def _job_store():
                           max_running=_MAX_RUNNING_JOBS)
 
 
+def _run_journal_path():
+    return Path(store._DB_PATH).with_name('harness_run_journal.db')
+
+
 def _save_job_status(job):
     try:
         _job_store().update(job)
         job['persistence_error'] = None
     except Exception as exc:
         job['persistence_error'] = 'durable job status unavailable; polling after restart may be incomplete'
+        job['delivery_error'] = 'complete result could not be durably stored'
         log.warning('job status persistence failed (%s)', type(exc).__name__)
 
 
@@ -1478,11 +1487,39 @@ def _job_public(job: dict, *, include_result: bool = False) -> dict:
     snapshot = JobStatusStore.public_snapshot(job)
     out = {k: snapshot.get(k) for k in ("job_id", "host", "base_url", "status",
                                     "started_at", "finished_at", "error", "manifest_path",
-                                    "recovered", "result_available")}
+                                    "recovered", "result_available", "result_ref", "result_size_bytes",
+                                    "result_sha256", "result_summary", "delivery_error")}
     out['persistence_error'] = job.get('persistence_error')
-    if include_result and snapshot['status'] == 'done':
+    if out.get('result_ref'):
+        try:
+            _job_store().read_result(job['job_id'])
+        except (ValueError, OSError, __import__('sqlite3').Error):
+            out.update(result_available=False, delivery_error='result artifact missing or corrupt')
+    if include_result and snapshot['status'] in _TERMINAL_STATUSES:
         out['result'] = snapshot['result']
     return out
+
+
+def _journal_context_key(config, req) -> str:
+    """E7: the run journal's context key. Source and configuration
+    (resume_context_key) plus the request inputs that shape what a run discovers
+    and investigates: the target URL, each role's identity (role, name, tenant,
+    expected permissions, credential header NAMES), the seed requests and the
+    limits. Credential VALUES are left out on purpose: a resumed run logs in again
+    and the journal fills each `$role:` placeholder from the new run's roles."""
+    import hashlib
+    import json
+    from harness.coverage_tracker import resume_context_key
+    roles = sorted(
+        (str(r.get("role", "user")), str(r.get("name") or ""), str(r.get("tenant") or ""),
+         sorted(str(p) for p in (r.get("expected_permissions") or [])),
+         sorted(str(k).lower() for k in (r.get("headers") or {})))
+        for r in (req.roles or []))
+    seeds = [(s.method, s.url, hashlib.sha256((s.request_body or "").encode()).hexdigest())
+             for s in (req.seed_exchanges or [])]
+    limits = req.model_dump(exclude={"base_url", "roles", "seed_exchanges", "resume_job_id"})
+    inputs = json.dumps([req.base_url, roles, seeds, limits], sort_keys=True, default=str)
+    return f"{resume_context_key(config)}:{hashlib.sha256(inputs.encode()).hexdigest()[:16]}"
 
 
 class InvestigateRequest(_BaseModel):
@@ -1493,6 +1530,11 @@ class InvestigateRequest(_BaseModel):
     max_chain_rounds: int = 2
     seed_exchanges: list[HttpExchange] = []
     active_discovery: bool = True
+    # Per-request cap on active-discovery probes, bounded at use exactly like
+    # the analysis request's field above (max(1, min(v, 20000))). The default
+    # equals investigate_engagement's own default, so omitting it changes nothing.
+    discovery_max_probes: int = 6000
+    resume_job_id: str | None = None
 
 
 @app.post("/engagement/{host}/investigate")
@@ -1537,10 +1579,11 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             status_code=400,
             detail=f"route host {host!r} does not match base_url host {target_host!r}")
     allowed_hosts = {(h or "").lower() for h in (orchestrator.allowed_hosts or [])}
-    if target_host not in allowed_hosts:
+    from harness.scope_lock import host_in_scope
+    if not host_in_scope(req.base_url, allowed_hosts, active_mode=True):
         raise HTTPException(
             status_code=403,
-            detail=f"host {target_host!r} is not in pre-authorized scope "
+            detail=f"target {req.base_url!r} is not in pre-authorized scope "
                    f"(server.allowed_hosts); investigate cannot grant new scope")
 
     # P1-8 admission bound -- an ADDITIONAL gate that runs strictly AFTER
@@ -1551,6 +1594,50 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     # simple hard rejection (no queue): a 503 with Retry-After, since the
     # server has finite job capacity and the caller can just retry later.
     _evict_expired_jobs()
+    coverage_checkpoint = None
+    journal_on = bool((config.get('runs', {}) or {}).get('journal', False))
+    journal_root = None
+    journal_key = _journal_context_key(config, req) if journal_on else ''
+
+    if req.resume_job_id:
+        journal = _job_store()
+        prior = journal.get(req.resume_job_id)
+        if not prior or _norm_host(prior['host']) != target_host:
+            raise HTTPException(status_code=404, detail='unknown prior job for this target')
+        def _origin(url):
+            parsed = urlsplit(url)
+            return parsed.scheme.lower(), parsed.hostname, parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+        if prior['status'] not in _TERMINAL_STATUSES or _origin(prior['base_url']) != _origin(req.base_url):
+            raise HTTPException(status_code=409, detail='prior job is not terminal or has a different target origin')
+        from harness.coverage_tracker import resume_context_key
+        prior_root = prior.get('journal_root') or req.resume_job_id
+        result_missing = False
+        try:
+            import json
+            prior_result = json.loads(await asyncio.to_thread(journal.read_result, req.resume_job_id))
+            coverage_checkpoint = (prior_result.get('coverage') or {}).get('checkpoint')
+        except (ValueError, OSError, __import__('sqlite3').Error, AttributeError):
+            result_missing = True
+        if not result_missing:
+            if not isinstance(coverage_checkpoint, dict) or coverage_checkpoint.get('context_key') != resume_context_key(config):
+                raise HTTPException(status_code=409, detail='prior coverage is unavailable or source/configuration changed')
+        else:
+            # An interrupted job has no result. With the run journal on, the units it
+            # journaled stand in for one, if this configuration is the one that wrote them;
+            # the coverage checkpoint then comes from the journal, inside the run.
+            if not journal_on:
+                raise HTTPException(status_code=409, detail='prior result is missing or corrupt')
+            from harness.run_journal import RunJournal
+            prior_units = RunJournal(_run_journal_path(), prior_root, journal_key)
+            if not await asyncio.to_thread(prior_units.has_any):
+                if await asyncio.to_thread(prior_units.has_any, any_context=True):
+                    raise HTTPException(status_code=409,
+                                        detail='prior coverage is unavailable or source, configuration '
+                                               'or request inputs changed')
+                raise HTTPException(status_code=409, detail='prior result is missing or corrupt')
+            # Only an interrupted job resumes from its journal; a finished one keeps
+            # the result-and-checkpoint path above.
+            journal_root = prior_root
     running_count = sum(1 for j in _INVESTIGATE_JOBS.values() if j["status"] in _RUNNING_STATUSES)
     if running_count >= _MAX_RUNNING_JOBS:
         raise HTTPException(
@@ -1567,11 +1654,23 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
         gate_config=_live_validators_gate_config(),
         max_requests=runs_cfg.get("max_requests"), config=config,
         timeout=float(runs_cfg.get("request_timeout_seconds", 15.0)))
+    # E7: the run's journal, rooted at this job, or at the prior job's root when resuming.
+    if journal_on:
+        try:
+            from harness.run_journal import RunJournal
+            run_context.run_journal = RunJournal(
+                _run_journal_path(), journal_root or job_id, journal_key, roles=roles)
+            await asyncio.to_thread(run_context.run_journal.prune)
+        except Exception as exc:
+            run_context.run_journal = None
+            log.warning('run journal unavailable (%s); this job is not journaled', type(exc).__name__)
     output_dir = Path(runs_cfg.get('output_dir') or Path(__file__).parent / 'run-output')
     job: dict = {"job_id": job_id, "host": host, "base_url": req.base_url,
                  "status": "running", "task": None, "result": None, "error": None,
                  "started_at": _time.time(), "finished_at": None,
-                 "manifest_path": str(output_dir / f'{job_id}.json'), "run_context": run_context}
+                 "manifest_path": str(output_dir / f'{job_id}.json'), "run_context": run_context,
+                 "journal_root": (run_context.run_journal.root_job_id
+                                  if run_context.run_journal is not None else None)}
     try:
         _, admitted = _job_store().create(job)
         if not admitted:
@@ -1586,6 +1685,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             run_id=job_id, target_identifier=host, config=security.sanitize_data(config),
             cache_namespace=run_context.cache_namespace, output_dir=runs_cfg.get("output_dir"),
             model_versions={"coordinator": orchestrator.coordinator_model,
+                        "critique": __import__("harness.coordinator", fromlist=["reasoning_model"]).reasoning_model(config),
+                        "surface_prioritization": (config.get("surface_prioritization") or {}).get("model", orchestrator.coordinator_model),
                         "agents": sorted({getattr(a, "model", "")
                                           for a in orchestrator.agent_manager.agents.values()
                                           if getattr(a, "model", "")}),
@@ -1610,13 +1711,16 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             # Artifact persistence loss is not an unhandled async task failure.
             # Keep cancellation visible, but never advertise a completed durable
             # record when its terminal manifest could not be written.
-            if job['status'] == 'done':
-                job['status'] = 'error'
-            job['error'] = 'manifest persistence failed; execution record is incomplete'
+            job['delivery_error'] = 'manifest persistence failed; execution record is incomplete'
             log.warning('job manifest persistence failed (%s)', type(exc).__name__)
 
     async def _run():
         try:
+            # Finding persistence and diagnostics use this task-local binding.
+            # The engagement job is a separate background task from /analyze,
+            # so it must establish the run coordinate itself.
+            from harness import telemetry
+            telemetry.bind_current_run(run_context.run_id)
             async with run_context:
                 job["result"] = await orchestrator.investigate_engagement(
                     req.base_url, roles,
@@ -1625,15 +1729,42 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                     max_chain_rounds=max(0, min(req.max_chain_rounds, 10)),
                     run_context=run_context,
                     seed_exchanges=req.seed_exchanges,
-                    active_discovery=req.active_discovery)
+                    active_discovery=req.active_discovery,
+                    discovery_max_probes=max(1, min(req.discovery_max_probes, 20000)),
+                    **({'coverage_checkpoint': coverage_checkpoint} if coverage_checkpoint is not None else {}))
             job["result"].setdefault("run_id", run_context.run_id)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
             job["result"].setdefault("request_count", run_context.budget.used)
+            # Use the persisted, proof-resolved projection and this run only.
+            # Raw model flags and repeated validator records are not issue counts.
+            rows = store.all_host_findings(req.base_url, run_id=run_context.run_id)
+            from harness.assessment_health import (confirmed_issue_inventory, confirmed_issue_accounting,
+                                                   stored_proof_artifacts_resolve)
+            proven = confirmed_issue_inventory(
+                [*rows, *job["result"].get("findings", [])], run_context.run_id, store.proofs_for_case)
+            job["result"]["confirmed_issues"] = len(proven)
+            job["result"]["confirmed_issue_refs"] = proven
+            accounting = confirmed_issue_accounting(
+                [*rows, *job['result'].get('findings', [])], run_context.run_id, store.proofs_for_case,
+                run_proofs=store.proofs_for_run(run_context.run_id),
+                artifact_resolver=stored_proof_artifacts_resolve)
+            job['result']['issue_accounting'] = accounting
+            job['result']['confirmed_vulnerabilities'] = accounting['counts']['vulnerabilities']
+            job['result']['confirmed_issues_unit'] = 'proof_bound_cases'
+            job["result"]["finding_summary"] = {
+                "records": len(rows), "proof_bound_confirmed_cases": len(proven),
+                "unproven_records": sum(not (r.get("confirmed") and r.get("proof_status") == "resolved") for r in rows),
+                "scoreboard_mapping": "not supplied", "issue_counts": accounting['counts']}
             job["status"] = "done"
             _finish_manifest("done", result=job["result"])
         except asyncio.CancelledError:
             job["status"] = "cancelled"
-            _finish_manifest("cancelled")
+            # Persist evidence already produced by this run even if the chain
+            # never returned its final result. Recovery never resumes execution.
+            job['result'] = {'partial': True, 'run_id': run_context.run_id,
+                             'request_count': run_context.budget.used,
+                             'findings': store.all_host_findings(req.base_url, run_id=run_context.run_id)}
+            _finish_manifest("cancelled", result=job['result'])
             raise
         except Exception as e:  # a failed job must report, never crash the server
             job["status"] = "error"
@@ -1699,6 +1830,36 @@ async def engagement_investigate_status(host: str, job_id: str,
         # single documented 404 rather than a distinct "410 Gone".
         raise HTTPException(status_code=404, detail="unknown job")
     return _job_public(job, include_result=True)
+
+
+@app.get("/engagement/{host}/investigate/{job_id}/result")
+async def engagement_investigate_result(host: str, job_id: str,
+                                        offset: int = Query(default=0, ge=0),
+                                        limit: int = Query(default=262144, ge=1, le=262144),
+                                        authorization: str | None = Header(default=None)):
+    """Authenticated byte chunks of canonical, redacted JSON (SHA256 over all bytes)."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    _evict_expired_jobs()
+    journal = _job_store()
+    job = journal.get(job_id)
+    if not job or job['host'] != host:
+        raise HTTPException(status_code=404, detail='unknown job')
+    if not job.get('result_ref'):
+        raise HTTPException(status_code=409, detail='result is not yet available')
+    try:
+        content = await asyncio.to_thread(journal.read_result, job_id)
+    except ValueError:
+        raise HTTPException(status_code=503, detail='result artifact missing or corrupt') from None
+    except (OSError, __import__('sqlite3').Error):
+        raise HTTPException(status_code=503, detail='result storage unavailable') from None
+    if offset > len(content):
+        raise HTTPException(status_code=416, detail='offset exceeds result size')
+    end = min(offset + limit, len(content))
+    import base64
+    return {'offset': offset, 'next_offset': end if end < len(content) else None,
+            'size_bytes': len(content), 'sha256': job['result_sha256'],
+            'encoding': 'base64', 'data': base64.b64encode(content[offset:end]).decode('ascii')}
 
 
 @app.post("/engagement/{host}/investigate/{job_id}/cancel")

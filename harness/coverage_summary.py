@@ -113,6 +113,17 @@ def summarize_coverage(matrix: CoverageMatrix) -> dict:
     applicable = total - not_applicable
     kind = KIND_UNKNOWN if applicable <= 0 else None
 
+    # Batch 02: fresh attempts (distinct ids, requests they sent) apart from
+    # cells whose verdict only references a prior execution.
+    fresh_ids: set = set()
+    fresh_sends = 0
+    for result in matrix.cells().values():
+        for attempt in result.attempts:
+            if attempt.get("id") not in fresh_ids:
+                fresh_ids.add(attempt.get("id"))
+                fresh_sends += attempt.get("sent") or 0
+    referenced = sum(1 for r in matrix.cells().values() if r.referenced_attempts)
+
     not_a_clean_negative["total"] = sum(not_a_clean_negative.values())
     not_a_clean_negative["executed_attempts"] = not_a_clean_negative_executed
 
@@ -123,4 +134,6 @@ def summarize_coverage(matrix: CoverageMatrix) -> dict:
         "executed": _metric(executed_n, applicable, kind or KIND_EXECUTED),
         "inferred": _metric(inferred_n, applicable, kind or KIND_INFERRED),
         "not_a_clean_negative": not_a_clean_negative,
+        "attempts": {"fresh": len(fresh_ids), "fresh_sends": fresh_sends,
+                     "referenced_cells": referenced},
     }

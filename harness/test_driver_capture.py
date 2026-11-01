@@ -20,6 +20,7 @@ import unittest
 
 from harness import browser_driver
 from harness import driver_capture
+from harness.testing_fixtures.loopback_port import CHROMIUM_RESTRICTED_PORTS, bind_browser_safe
 
 _PIXEL_GIF = bytes.fromhex(
     "47494638396101000100800000ffffff00000021f90401000000002c00000000"
@@ -69,7 +70,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 class DriverCaptureTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        cls._srv = bind_browser_safe(lambda: http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler))
         cls._port = cls._srv.server_address[1]
         cls._thread = threading.Thread(target=cls._srv.serve_forever, daemon=True)
         cls._thread.start()
@@ -147,6 +148,56 @@ class DriverCaptureTest(unittest.TestCase):
         before = len(rc.captured)
         asyncio.run(driver_capture.discover(rc, f"{self._base}/", wait_ms=800))
         self.assertEqual(len(rc.captured), before, "discover() duplicated an identical capture")
+
+
+class _FakeServer:
+    """What a server that bound `port` looks like to bind_browser_safe."""
+
+    def __init__(self, port):
+        self.server_address = ("127.0.0.1", port)
+        self.closed = False
+
+    def server_close(self):
+        self.closed = True
+
+
+class BrowserSafePortTests(unittest.TestCase):
+    """The helper behind the server above: Chromium refuses some ports (2049 came
+    up once as the OS's pick), so such a bind is closed and redone."""
+
+    @staticmethod
+    def _binder(ports):
+        made = []
+        pending = iter(ports)
+
+        def bind():
+            made.append(_FakeServer(next(pending)))
+            return made[-1]
+        return bind, made
+
+    def test_a_restricted_port_is_closed_and_rebound(self):
+        bind, made = self._binder([2049, 54321])
+        server = bind_browser_safe(bind)
+        self.assertIs(server, made[1])
+        self.assertEqual(server.server_address[1], 54321)
+        self.assertEqual([s.closed for s in made], [True, False])
+
+    def test_a_safe_port_is_kept_at_once(self):
+        bind, made = self._binder([54321, 2049])
+        self.assertIs(bind_browser_safe(bind), made[0])
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made[0].closed)
+
+    def test_retries_are_bounded_and_every_refused_bind_is_closed(self):
+        bind, made = self._binder([2049] * 5)
+        with self.assertRaises(RuntimeError):
+            bind_browser_safe(bind, attempts=3)
+        self.assertEqual(len(made), 3)
+        self.assertTrue(all(s.closed for s in made))
+
+    def test_the_list_holds_the_ports_that_failed_a_run_and_not_ordinary_ones(self):
+        self.assertTrue({2049, 4045, 6000, 6667} <= CHROMIUM_RESTRICTED_PORTS)
+        self.assertFalse({80, 3000, 8080, 8443, 54321} & CHROMIUM_RESTRICTED_PORTS)
 
 
 if __name__ == "__main__":

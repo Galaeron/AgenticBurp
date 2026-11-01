@@ -253,6 +253,69 @@ class ContainerRunnerLifecycleTests(_ToolFixture, unittest.TestCase):
         self.assertGreater(receipt.get("stdout_dropped", 0), 3 * 1024 * 1024)
 
 
+class _EarlyEmptyJob:
+    """Kernel timing, made deterministic (Windows). A terminated job reports no
+    active member at once, while the members are still exiting; under a venv
+    launcher the launched process is only the launcher. Here the launched process
+    stops at once and the job reports empty, while every other member (the
+    interpreter a launcher started, and its child) runs `delay` seconds longer --
+    as the full Python 3.12 suite observed under load."""
+
+    def __init__(self, delay: float = 1.0):
+        self.delay = delay
+        self._timers: list[threading.Thread] = []
+
+    def __enter__(self):
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.DuplicateHandle.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE,
+                                        ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD,
+                                        wintypes.BOOL, wintypes.DWORD]
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        real_resume, real_active = tool_runner._Win.resume, tool_runner._Win.active_processes
+        launched, stopping = [], set()
+
+        def resume(proc):
+            launched.append(proc)
+            real_resume(proc)
+
+        def terminate_job(job):
+            # Our own job handle keeps the members alive past the runner's close.
+            me, dup = k32.GetCurrentProcess(), wintypes.HANDLE()
+            if not k32.DuplicateHandle(me, job, me, ctypes.byref(dup), 0, False, 2):
+                raise ctypes.WinError(ctypes.get_last_error())
+            stopping.add(job)
+            launched[-1].kill()
+
+            def later():
+                time.sleep(self.delay)
+                k32.TerminateJobObject(dup, 1)
+                k32.CloseHandle(dup)
+
+            timer = threading.Thread(target=later, daemon=True)
+            self._timers.append(timer)
+            timer.start()
+
+        def active_processes(job):
+            return 0 if job in stopping else real_active(job)
+
+        self._patches = [patch.object(tool_runner._Win, "resume", resume),
+                         patch.object(tool_runner._Win, "terminate_job", terminate_job),
+                         patch.object(tool_runner._Win, "active_processes", active_processes)]
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in reversed(self._patches):
+            p.stop()
+        for timer in self._timers:
+            timer.join(self.delay + 5)
+
+
 # --- sqlmap on the host ----------------------------------------------------------------
 class SqlmapHostLifecycleTests(_ToolFixture, unittest.TestCase):
     def _validator(self, **kw):
@@ -292,6 +355,41 @@ class SqlmapHostLifecycleTests(_ToolFixture, unittest.TestCase):
             return self.survivors()
 
         self.assertEqual(asyncio.run(go()), [], "the task ended while the tool still ran")
+
+    def test_loop_shutdown_cancellation_waits_for_tool_cleanup(self):
+        """Runner shutdown cancels all Tasks, including any worker bridge Task."""
+        survivors_at_completion = []
+        async def validate():
+            try:
+                await self._validator(timeout_seconds=60).validate(_sqli(), _exchange())
+            finally:
+                survivors_at_completion.extend(self.survivors())
+
+        async def go():
+            asyncio.create_task(validate())
+            await asyncio.to_thread(self.wait_started)
+            # asyncio.run now cancels every pending task at once. Checking only
+            # after run() returns would hide leaks behind executor shutdown.
+
+        asyncio.run(go())
+        self.assertEqual(survivors_at_completion, [],
+                         "validator completed before shutdown stopped its tool")
+
+    @unittest.skipUnless(os.name == "nt", "Job Object accounting is Windows-only")
+    def test_task_cancellation_waits_for_members_the_job_counts_gone(self):
+        """The job reports empty and the launched process is gone; members still run."""
+        async def go():
+            task = asyncio.ensure_future(
+                self._validator(timeout_seconds=60).validate(_sqli(), _exchange()))
+            await asyncio.to_thread(self.wait_started)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return self.survivors()
+
+        with _EarlyEmptyJob():
+            self.assertEqual(asyncio.run(go()), [],
+                             "the task ended while the tool's other members still ran")
 
 
 # --- the server job: terminal only after cleanup -------------------------------------
@@ -495,6 +593,29 @@ class LifecycleFaultInjectionTests(_ToolFixture, unittest.TestCase):
             still_running = t.is_alive()
             t.join(15)
         self.assertTrue(still_running, "ignoring the cancel signal no longer matters")
+
+    @unittest.skipUnless(os.name == "nt", "Job Object accounting is Windows-only")
+    def test_job_accounting_alone_is_detected(self):
+        """Fault injection: proof by ActiveProcesses alone ends while members still run."""
+        token, box = CancelToken(), {}
+
+        def target():
+            try:
+                tool_runner.run_process([_FAKE_SQLMAP], timeout=30, cancel=token)
+            except BaseException as exc:          # noqa: BLE001
+                box["error"] = exc
+            box["survivors"] = self.survivors()
+
+        with _EarlyEmptyJob(delay=3.0), \
+                patch.object(tool_runner._Win, "member_pids", return_value=[]):
+            t = threading.Thread(target=target, daemon=True)
+            t.start()
+            self.wait_started()
+            token.cancel()
+            t.join(15)
+        self.assertIsInstance(box.get("error"), tool_runner.ToolRunCancelled, box)
+        self.assertTrue(box["survivors"],
+                        "job accounting alone no longer ends early -- the control is vacuous")
 
 
 if __name__ == "__main__":

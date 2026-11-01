@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from .base import Validator, ValidationResult
+from .send_failures import SendFailures
 
 if TYPE_CHECKING:
     from harness.models import Finding, HttpExchange
@@ -151,7 +152,8 @@ class HttpRequestSmugglingValidator(Validator):
                 )
             
             # Perform HRS tests
-            tests = await self._perform_hrs_tests(base_url, exchange)
+            failures = SendFailures()
+            tests = await self._perform_hrs_tests(base_url, exchange, failures)
             
             # Check results
             vulnerable_tests = [t for t in tests if t.vulnerable]
@@ -185,6 +187,8 @@ class HttpRequestSmugglingValidator(Validator):
             else:
                 summary_parts.append("No HTTP Request Smuggling anomalies detected")
 
+            if failures.failures and not vulnerable:
+                return failures.result(self.name, finding.vulnerability_class, "HTTP smuggling CL_TE/TE_CL/TE_TE")
             return ValidationResult(
                 validator=self.name,
                 status="not_confirmed",
@@ -216,7 +220,7 @@ class HttpRequestSmugglingValidator(Validator):
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}"
     
-    async def _perform_hrs_tests(self, base_url: str, exchange: HttpExchange) -> list[SmugglingTestResult]:
+    async def _perform_hrs_tests(self, base_url: str, exchange: HttpExchange, failures=None) -> list[SmugglingTestResult]:
         """Perform all HRS test types."""
         tests = []
         
@@ -229,17 +233,17 @@ class HttpRequestSmugglingValidator(Validator):
             )
         
         # Test CL.TE
-        tests.append(await self._test_cl_te(base_url, exchange))
+        tests.append(await self._test_cl_te(base_url, exchange, failures))
         
         # Test TE.CL
-        tests.append(await self._test_te_cl(base_url, exchange))
+        tests.append(await self._test_te_cl(base_url, exchange, failures))
         
         # Test TE.TE
-        tests.append(await self._test_te_te(base_url, exchange))
+        tests.append(await self._test_te_te(base_url, exchange, failures))
         
         return tests
     
-    async def _test_cl_te(self, base_url: str, exchange: HttpExchange) -> SmugglingTestResult:
+    async def _test_cl_te(self, base_url: str, exchange: HttpExchange, failures=None) -> SmugglingTestResult:
         """
         Test for CL.TE vulnerability.
         
@@ -265,6 +269,7 @@ class HttpRequestSmugglingValidator(Validator):
             response1 = await self._send_raw_request(
                 "POST",  # smuggling technique requires a body-bearing method; never replay the captured method
                 exchange.url,
+                failures=failures,
                 headers=headers,
                 body=body,
             )
@@ -292,6 +297,7 @@ class HttpRequestSmugglingValidator(Validator):
             response2 = await self._send_raw_request(
                 "GET",
                 exchange.url,
+                failures=failures,
                 headers=followup_headers,
                 body="",
             )
@@ -338,7 +344,7 @@ class HttpRequestSmugglingValidator(Validator):
                 confidence=0.0,
             )
     
-    async def _test_te_cl(self, base_url: str, exchange: HttpExchange) -> SmugglingTestResult:
+    async def _test_te_cl(self, base_url: str, exchange: HttpExchange, failures=None) -> SmugglingTestResult:
         """
         Test for TE.CL vulnerability.
         
@@ -375,6 +381,7 @@ class HttpRequestSmugglingValidator(Validator):
             response1 = await self._send_raw_request(
                 "POST",  # smuggling technique requires a body-bearing method; never replay the captured method
                 exchange.url,
+                failures=failures,
                 headers=headers,
                 body=body,
             )
@@ -400,6 +407,7 @@ class HttpRequestSmugglingValidator(Validator):
             response2 = await self._send_raw_request(
                 "GET",
                 exchange.url,
+                failures=failures,
                 headers=followup_headers,
                 body="",
             )
@@ -445,7 +453,7 @@ class HttpRequestSmugglingValidator(Validator):
                 confidence=0.0,
             )
     
-    async def _test_te_te(self, base_url: str, exchange: HttpExchange) -> SmugglingTestResult:
+    async def _test_te_te(self, base_url: str, exchange: HttpExchange, failures=None) -> SmugglingTestResult:
         """
         Test for TE.TE vulnerability.
         
@@ -470,6 +478,7 @@ class HttpRequestSmugglingValidator(Validator):
             response1 = await self._send_raw_request(
                 "POST",  # smuggling technique requires a body-bearing method; never replay the captured method
                 exchange.url,
+                failures=failures,
                 headers=headers,
                 body=body,
             )
@@ -494,6 +503,7 @@ class HttpRequestSmugglingValidator(Validator):
             response2 = await self._send_raw_request(
                 "POST",  # smuggling technique requires a body-bearing method; never replay the captured method
                 exchange.url,
+                failures=failures,
                 headers=headers2,
                 body=body,
             )
@@ -544,8 +554,11 @@ class HttpRequestSmugglingValidator(Validator):
         url: str,
         headers: dict = None,
         body: str = "",
+        failures=None,
     ) -> httpx.Response | None:
         """Send a raw HTTP request with custom headers and body."""
+        if failures is not None:
+            failures.attempted += 1
         headers = headers or {}
         headers['User-Agent'] = self.user_agent
         
@@ -556,10 +569,10 @@ class HttpRequestSmugglingValidator(Validator):
                     TypedRequest(method, url, headers=headers, body=body or None),
                     capability=self.get_name(), max_redirects=self.max_redirects)
                 if not outcome.ok:
+                    if failures is not None:
+                        failures.outcome(SendFailures.label(method, url), outcome)
                     return None
-                return httpx.Response(
-                    outcome.status or 0, content=(outcome.body or "").encode(),
-                    headers=outcome.headers, request=httpx.Request(method, url))
+                return outcome.to_httpx_response(method, url)
             if not self.client:
                 self.client = httpx.AsyncClient(
                     timeout=self.timeout,
@@ -575,6 +588,8 @@ class HttpRequestSmugglingValidator(Validator):
             )
             return response
         except Exception as e:
+            if failures is not None:
+                failures.exception(SendFailures.label(method, url), e)
             log.debug(f"Request to {url} failed: {e}")
             return None
     

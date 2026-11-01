@@ -26,10 +26,11 @@ import hashlib
 import logging
 from dataclasses import dataclass
 
+from harness import coordinator
 from harness import payload_library
 from harness import store
 from harness.models import TestPlan, ValidationSubmission
-from harness.ollama_client import OllamaClient, OllamaError
+from harness.ollama_client import OllamaClient, OllamaError, model_stage
 from harness.retry_policy import Action, Attempt, AttemptStatus, RetryPolicy
 
 log = logging.getLogger("harness.active_verification")
@@ -40,6 +41,7 @@ _STATUS_MAP = {
     "confirmed": AttemptStatus.CONFIRMED,
     "supported": AttemptStatus.SUPPORTED,
     "not_confirmed": AttemptStatus.NOT_CONFIRMED,
+    "observed": AttemptStatus.NOT_CONFIRMED,
     "inconclusive": AttemptStatus.INCONCLUSIVE,
     "error": AttemptStatus.ERROR,
     "blocked": AttemptStatus.ERROR,
@@ -63,6 +65,19 @@ def _to_attempt(row: dict) -> Attempt:
         payload=payload,
         confidence=row["result_confidence"] or 0.0,
     )
+
+
+def _resolve_escalation_model(escalation_model: str, config: dict | None) -> str:
+    """The model for the escalation LLM call: the caller's explicit choice, else
+    the configured reasoning model (coordinator.reasoning_model). Returns "" when
+    neither is available -- the caller then skips the escalation. Never a
+    hard-coded model name: this used to fall back to a built-in model tag,
+    silently sending payload requests to a model the operator never selected."""
+    if escalation_model:
+        return escalation_model
+    if config:
+        return coordinator.reasoning_model(config) or ""
+    return ""
 
 
 def is_retryable(plan: dict) -> bool:
@@ -94,11 +109,16 @@ async def decide_next_step(
     submission: ValidationSubmission,
     ollama_client: OllamaClient | None = None,
     escalation_model: str = "",
+    config: dict | None = None,
 ) -> NextStep:
     """
     `plan` is the row for submission.plan_id (store.get_test_plan's
     output). Assumes the submission has ALREADY been persisted -- this
     only decides what, if anything, comes next.
+
+    Escalation model: `escalation_model` if given, else the configured
+    reasoning model from `config` (coordinator.reasoning_model). With neither,
+    the escalation is skipped with a logged reason rather than guessing a model.
     """
     if submission.confirmed or submission.status == "confirmed":
         return NextStep()
@@ -130,6 +150,15 @@ async def decide_next_step(
                 plan["category"], plan["source_exchange_hash"],
             )
             return NextStep(note="escalation skipped: no LLM client available")
+        model = _resolve_escalation_model(escalation_model, config)
+        if not model:
+            log.warning(
+                "active_verification: escalation needed for lineage (category=%s, exchange=%s) "
+                "but no model is configured (no escalation_model and no coordinator.model in "
+                "config) -- skipping escalation instead of falling back to an unselected model.",
+                plan["category"], plan["source_exchange_hash"],
+            )
+            return NextStep(note="escalation skipped: no model configured")
         failure_notes = [
             f"{r['status']}: {r['mutation'].get('note', '')}".strip(": ") for r in history
         ]
@@ -139,11 +168,12 @@ async def decide_next_step(
             failure_notes=failure_notes,
         )
         try:
-            result = await ollama_client.chat_json(
-                model=escalation_model or "llama3.1:8b",
-                system_prompt="You are a focused security payload assistant. Respond with ONLY the requested JSON.",
-                user_prompt=prompt,
-            )
+            with model_stage("escalation"):
+                result = await ollama_client.chat_json(
+                    model=model,
+                    system_prompt="You are a focused security payload assistant. Respond with ONLY the requested JSON.",
+                    user_prompt=prompt,
+                )
             new_payload = str(result.get("payload", "")).strip()
             rationale = str(result.get("rationale", ""))
         except OllamaError as e:
