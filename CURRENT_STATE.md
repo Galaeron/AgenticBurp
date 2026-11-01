@@ -1,20 +1,18 @@
-# Current state — 2026-10-28 (branch `codex/assessment-integration`)
+# Current state — 2026-11-01 (branch `main`)
 
 ## Checkout
-- Integration worktree `.test-work/wt-assessment-integration`. The branch is based
-  on `9866784`. It carries the assessment-only port `b4bf1fb`, Tickets 1-8 through
-  `bc87804` (v7), the repair batches through `9d656d2` (v8), the iterative
-  response view `3acd392`, the sqlmap login repair `7203a44` and the coverage
-  capability reconciliation `1370b6f` (v10). Not pushed or merged.
-- The main checkout (`reconciliation-backlog`, PR Galaeron/AgenticBurp#1) keeps
-  uncommitted W1-W4 WIP; it is dispositioned in
-  docs/I01_CANDIDATE_MANIFEST_2026-10-17.md. Do not touch it from here.
-- Untracked here and never committed: `sitecustomize.py` (blocks the venv's
-  editable-install leak) and `.test-tmp/`. Safe `harness/config.yaml` is
-  unchanged; live settings live only in ignored config.local.yaml.
-- Plans: docs/ACTIVE_ASSESSMENT_REPAIR_PLAN_2026-10-21.md (Tickets 1-8). Repair
-  batches and owner notes: `.test-work/assessment-integration-20261023/
-  repair-batch-notes.md`. Handoff: HANDOFF.md in that directory.
+- `main`, `01-11` and `reconciliation-backlog` are one integration line. It merges
+  PR #2 (`aacabb8`), the local integration tip `codex/experiment-lifecycle-repair`
+  (`1e2c9f8`: assessment batches A-E, Tickets 1-8, the v8-v10 repairs, the architecture
+  repair milestone and batches 01, 02, 04 and 08, and the AR follow-ups in
+  IMPROVEMENT_BACKLOG.md), I05-D (`78ebfef`) and the brotli/mitmproxy update.
+  `codex/t08-final` is recorded as superseded (content not taken).
+- The main checkout's uncommitted W1-W4 WIP is on `main-checkout-snapshot-20261101`
+  (`2c0cf7f`, base `f563730`), NOT merged. About 70 of its files exist nowhere else:
+  W1-W4 code, 10 tests that need it and 27 never-committed docs. Split and review it per
+  docs/I01_CANDIDATE_MANIFEST_2026-10-17.md; its `/analyze` hunk already keeps the shared pile.
+- Plans: docs/ACTIVE_ASSESSMENT_REPAIR_PLAN_2026-10-21.md (Tickets 1-8). Architecture
+  repair: `.test-work/assessment-integration-20261023/architecture-repair/` (main checkout).
 
 ## Verification
 - `9d656d2` (v8) gates passed on venv 3.12 and system 3.14
@@ -71,7 +69,7 @@
    endpoint only).
 7. Still open from before this branch:
    - Code review 02 RV-K.
-   - I05 batch D on `i05d-browser-credentials`, waiting for the owner's review.
+   - I05 batch D: merged into `main` on 2026-11-01 with the rest of the local work.
    - I16 wiring: protected routes, ownership and `suggested_test`.
    - RV-O to RV-S residuals, listed in their `.test-work/rv-*-20261021/HANDOFF.md`.
    - docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md "Status" is the index.
