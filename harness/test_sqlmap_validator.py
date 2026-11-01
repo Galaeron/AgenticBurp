@@ -623,6 +623,7 @@ class SqlmapLoginDiscriminationTests(unittest.IsolatedAsyncioTestCase):
         reset_default_gate()
 
     async def _validate(self, login, exchange=None):
+        self.addCleanup(login.db.close)   # the fixture's in-memory table
         v = SqlmapValidator(binary="sqlmap")
         with patch("harness.tool_runner.run_process",
                    return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
