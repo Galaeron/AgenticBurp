@@ -15,6 +15,10 @@
   repair: `.test-work/assessment-integration-20261023/architecture-repair/` (main checkout).
 
 ## Verification
+- `main` 2026-11-01 (Linux, Python 3.13, Playwright 1.63.0 + Chromium), `a3681c5`: precondition
+  74 OK; full exit 0 (harness 5014 / 8 skips, native 38, evaluation 440 / 18 skips, integrity
+  59; 25 coverage gaps). Its 4 ResourceWarnings came from the sqlmap login fixture, closed in
+  `d07e28a`. Java 379 tests, 0 failures. CI's full job now installs Playwright + Chromium.
 - `9d656d2` (v8) gates passed on venv 3.12 and system 3.14
   (`integrated-v8-py312`/`-py314`, gates-v8.status). `3acd392` passed as
   `integrated-v9-py312`/`-py314` (precondition, smoke and full exit 0; gates-v9.status).
