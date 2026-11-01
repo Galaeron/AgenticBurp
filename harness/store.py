@@ -466,7 +466,14 @@ def _db_identity(conn: sqlite3.Connection) -> tuple[str, tuple] | None:
         version = conn.execute("PRAGMA schema_version").fetchone()[0]
     except (OSError, sqlite3.Error):
         return None
-    return os.path.abspath(_DB_PATH), (st.st_dev, st.st_ino, st.st_ctime_ns, version)
+    # A creation time tells a recreated file from the original. Windows reports it
+    # as st_ctime; macOS/BSD as st_birthtime. Linux has neither (st_ctime there is
+    # the inode CHANGE time, which moves on every write and would make the file
+    # look new on each connect); a recreated file still differs by inode or by
+    # schema_version (a fresh file reads 0).
+    born = (st.st_ctime_ns if os.name == "nt"
+            else getattr(st, "st_birthtime_ns", None) or int(getattr(st, "st_birthtime", 0) * 1e9))
+    return os.path.abspath(_DB_PATH), (st.st_dev, st.st_ino, born, version)
 
 
 def timing_snapshot() -> dict:
