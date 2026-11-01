@@ -30,8 +30,9 @@ python -m pip install -e ".[dev]" Flask==3.1.3
 ```
 
 Full discovery also imports the optional proxy tests, which require
-`mitmproxy==12.2.3`. Browser fixture checks require Playwright and Chromium and
-may skip without them. Missing dependencies must be reported as errors/skips;
+`mitmproxy==12.3.1`. Browser fixture checks require Playwright and Chromium; CI's
+full job installs `playwright==1.63.0` and its Chromium. `test_browser_experiments`
+fails without them, and the guarded browser tests skip. Missing dependencies must be reported as errors/skips;
 never stub them merely to turn the suite green.
 
 Python 3.12 caveat: mitmproxy 12.2.3 declares typing-extensions <=4.14, while the
