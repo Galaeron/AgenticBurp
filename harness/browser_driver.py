@@ -46,10 +46,11 @@ its own).
 from __future__ import annotations
 import asyncio
 import html
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, TYPE_CHECKING, runtime_checkable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from harness.run_context import ScopePolicy
 
@@ -350,10 +351,11 @@ class BrowserDriver(Protocol):
 
 
 def _extra_headers_and_cookies(headers: dict | None, url: str):
-    """Split an identity's request headers into Playwright's two channels (R25):
-    non-cookie headers go to extra_http_headers (carries Authorization), and the
-    Cookie header is parsed into add_cookies() entries scoped to the URL host, so
-    an AUTHENTICATED XSS sink is tested as that identity, not anonymously."""
+    """Split an identity's request headers into its non-cookie headers (carries
+    Authorization) and its cookies, parsed into add_cookies()-shaped entries for
+    the URL host (R25), so an AUTHENTICATED XSS sink is tested as that identity,
+    not anonymously. I05-D: neither goes to the browser any more; _IdentityRouter
+    adds both to the requests it sends to the exact run origin."""
     headers = headers or {}
     extra: dict = {}
     cookie_val = ""
@@ -372,6 +374,325 @@ def _extra_headers_and_cookies(headers: dict | None, url: str):
                 if name and host:
                     cookies.append({"name": name, "value": value, "domain": host, "path": "/"})
     return (extra or None), cookies
+
+
+# ---------------------------------------------------------------------------
+# I05-D: the captured identity never enters the browser.
+#
+# Playwright's route is not a complete boundary. It never sees a redirect hop
+# (Playwright continues each hop itself and re-applies the route's header
+# overrides to it), a speculation-rules prefetch, or service-worker traffic;
+# and a Cookie override is silently dropped, so identity cookies could only
+# travel in the context's jar, which scopes a cookie to the host (any port,
+# either scheme). Reproduced with owned servers: one redirect carried the
+# run's Authorization to an out-of-scope host, and the run's cookie reached
+# another port of the same host through a subresource, frame, popup or
+# prefetch.
+#
+# `_IdentityRouter` therefore sends every request the policy allows ITSELF,
+# through the run's pinned client (AddressPins and the run's TLS policy, as
+# every other send in the run), and fulfills the browser with the answer. The
+# identity's headers and cookies are added there, only for the exact run
+# origin; the browser holds none. A redirect answer comes back to the router
+# instead of being followed out of sight: each hop is checked by
+# evaluate_browser_request, a navigation hop is re-issued as a fresh routed
+# navigation, and a subresource hop is followed and accounted here. (Sending
+# everything also keeps Chromium's private-network checks out of the way: a
+# fulfilled document has no address space of its own, so Chromium refused its
+# native requests to a loopback or private target.) A locally launched
+# Chromium also resolves only in-scope names, each to the run's pinned address
+# (--host-resolver-rules), which bounds what the browser still sends on its own
+# (prefetches the route never sees) and refuses special-purpose answers. A
+# browser connected over CDP cannot take launch flags, so it has the routed
+# boundary only.
+# ---------------------------------------------------------------------------
+
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECT_HOPS = 10
+# Request headers the router does not copy from the browser's request when it
+# sends that request itself (connection-level, or rebuilt by the router).
+_UNFORWARDED_REQUEST_HEADERS = frozenset({
+    "host", "connection", "keep-alive", "proxy-connection", "upgrade", "te", "trailer",
+    "transfer-encoding", "content-length", "accept-encoding", "cookie"})
+# Response headers that no longer describe the decoded body handed to fulfill().
+_UNFORWARDED_RESPONSE_HEADERS = frozenset({
+    "content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"})
+
+
+def _redirect_method(status: int, method: str) -> str:
+    return "GET" if status == 303 or (status in (301, 302) and method == "POST") else method
+
+
+def _scope_hosts(scope) -> list[str]:
+    """The exact hosts a scope admits (wildcard/network entries grant the browser
+    nothing: it cannot pin a name it does not know)."""
+    from harness.scope_lock import configured_entries, parse_scope_entry
+    raw = getattr(scope, "hosts", None) or getattr(scope, "allowed_hosts", None) or ()
+    hosts = []
+    for value in configured_entries(raw):
+        entry = parse_scope_entry(value) if isinstance(value, str) else None
+        if entry is not None and entry.host and entry.network is None and not entry.subdomains:
+            hosts.append(entry.host)
+    return hosts
+
+
+def _cookie_pair(set_cookie: str) -> tuple[str, str, bool]:
+    """(name, value, deletes) for one Set-Cookie header value."""
+    pair, _, attrs = set_cookie.partition(";")
+    name, _, value = pair.partition("=")
+    attrs_l = attrs.lower().replace(" ", "")
+    return name.strip(), value.strip(), not value.strip() or "max-age=0" in attrs_l
+
+
+def _same_cookie_host(url: str, other: str) -> bool:
+    """Cookies are filed by host (any port), so fulfill() may hand the browser a
+    Set-Cookie only from the requested URL's own host."""
+    return ScopePolicy.host_of(url) == ScopePolicy.host_of(other)
+
+
+async def _quietly(awaitable) -> None:
+    try:
+        await awaitable
+    except Exception:
+        pass
+
+
+class _IdentityRouter:
+    """The route handler, browser launch flags and main-frame navigation shared
+    by `visit` and `capture_requests` (I05-D; see the block comment above)."""
+
+    def __init__(self, *, url: str, headers: dict | None, scope: ScopePolicy,
+                 cancel, gate, budget, timeout_s: float, label: str, obs=None):
+        from harness.run_context import AddressPins, current_run_context
+        from harness.tls_policy import TLSPolicy
+        self.run_origin = ScopePolicy.origin_of(url)
+        self.scope, self.cancel, self.gate, self.budget = scope, cancel, gate, budget
+        self.timeout_s = timeout_s
+        self.label = label
+        # visit()'s ExecutionObservation: what was sent, blocked or cancelled.
+        self.obs = obs
+        extra, cookies = _extra_headers_and_cookies(headers, url)
+        self.identity_headers = {k.lower(): v for k, v in (extra or {}).items()}
+        self.identity_cookies = {c["name"]: c["value"] for c in cookies}
+        # Inside a run: the run's pins (None when the run opted out) and trust.
+        # Standalone: pins of its own, so special-purpose answers are refused.
+        rc = current_run_context()
+        self.pins = rc.address_pins if rc is not None else AddressPins()
+        self.tls = rc.tls_policy if rc is not None else TLSPolicy.from_config()
+        self._clients: dict = {}
+        self.context = None
+        self.page = None
+        self._driving = False
+        self._main_hop: str | None = None
+
+    async def launch_args(self) -> list[str]:
+        """Chromium resolves only in-scope names, each to its run-pinned address."""
+        from harness.run_context import _is_ip_literal
+        maps, excluded = [], []
+        for host in sorted({ScopePolicy.host_of(self.run_origin), *_scope_hosts(self.scope)} - {""}):
+            if _is_ip_literal(host) or self.pins is None:
+                excluded.append(f"[{host}]" if ":" in host else host)
+                continue
+            try:
+                ip = await self.pins.address_for(host)
+            except Exception as e:   # unresolvable or refused: unreachable here too
+                log.info("%s: %s not mapped for the browser (%s)", self.label, host, e)
+                continue
+            maps.append(f"MAP {host} {f'[{ip}]' if ':' in ip else ip}")
+        rules = maps + ["MAP * ~NOTFOUND"] + [f"EXCLUDE {h}" for h in excluded]
+        return [f"--host-resolver-rules={', '.join(rules)}"]
+
+    async def install(self, context) -> None:
+        self.context = context
+        await context.route("**/*", self.handle)
+
+    async def goto(self, page, url: str, timeout_ms: int):
+        """Navigate the main frame; a redirect hop is re-issued here as a fresh
+        (routed) navigation instead of being followed by the browser. Returns
+        the final hop's response (None when the browser reports none)."""
+        self.page = page
+        target = url
+        self._driving = True
+        try:
+            for _ in range(_MAX_REDIRECT_HOPS + 1):
+                self._main_hop = None
+                response = await page.goto(target, timeout=timeout_ms, wait_until="load")
+                if self._main_hop is None:
+                    return response
+                target = self._main_hop
+            raise RuntimeError(f"more than {_MAX_REDIRECT_HOPS} redirects")
+        finally:
+            self._driving = False
+
+    async def aclose(self) -> None:
+        for client in self._clients.values():
+            await _quietly(client.aclose())
+        self._clients.clear()
+
+    def _decide(self, url: str, method: str, resource_type: str, is_navigation: bool,
+                *, account: bool) -> BrowserRequestDecision:
+        return evaluate_browser_request(
+            url=url, method=method, resource_type=resource_type, is_navigation=is_navigation,
+            run_origin=self.run_origin, scope=self.scope,
+            gate=self.gate if account else None, budget=self.budget if account else None)
+
+    def _blocked(self, reason: str) -> None:
+        if self.obs is not None:
+            self.obs.blocked_requests.append(reason)
+
+    async def handle(self, route, request) -> None:
+        if is_cancelled(self.cancel):
+            if self.obs is not None:
+                self.obs.cancelled = True
+            await _quietly(route.abort())
+            return
+        is_navigation = request.is_navigation_request()
+        decision = self._decide(request.url, request.method, request.resource_type,
+                                is_navigation, account=True)
+        if not decision.allow:
+            log.info("%s: blocked %s %s (%s)", self.label, request.method, request.url,
+                     decision.reason)
+            self._blocked(decision.reason)
+            await _quietly(route.abort())
+            return
+        if self.obs is not None:
+            self.obs.requests_sent += 1
+        try:
+            await self._send_and_fulfill(route, request, is_navigation)
+        except Exception as e:
+            log.info("%s: %s %s not sent (%s: %s)", self.label, request.method, request.url,
+                     e.__class__.__name__, e)
+            await _quietly(route.abort())
+
+    async def _send_and_fulfill(self, route, request, is_navigation: bool) -> None:
+        url, method = request.url, request.method.upper()
+        resource_type = request.resource_type
+        headers = dict(request.headers)
+        body = request.post_data_buffer
+        # Cookies set along a subresource redirect this router follows: sent on
+        # later hops to the same host, and handed to the browser only when set
+        # by the requested URL's own host, the final answer's included
+        # (fulfill() files every Set-Cookie under that host).
+        hop_cookies: dict = {}
+        hop_set_cookies: list = []
+        for _ in range(_MAX_REDIRECT_HOPS + 1):
+            response = await self._send(url, method, headers, body, hop_cookies)
+            fulfilled = self._response_headers(response, url)
+            location = response.headers.get("location")
+            if response.status_code not in _REDIRECT_STATUSES or not location:
+                final = fulfilled.pop("set-cookie", "")
+                if not _same_cookie_host(url, request.url):
+                    final = ""
+                if hop_set_cookies or final:
+                    fulfilled["set-cookie"] = "\n".join(hop_set_cookies + ([final] if final else []))
+                await route.fulfill(status=response.status_code, headers=fulfilled,
+                                    body=response.content)
+                return
+            next_url, next_method = urljoin(url, location), _redirect_method(response.status_code, method)
+            if is_navigation:
+                # Checked here; accounted when the browser re-issues it as a navigation.
+                hop = self._decide(next_url, next_method, resource_type, True, account=False)
+                if not hop.allow:
+                    log.info("%s: blocked redirect %s -> %s (%s)", self.label, url, next_url,
+                             hop.reason)
+                    self._blocked(hop.reason)
+                    await route.abort()
+                    return
+                await self._fulfill_navigation_hop(route, request, fulfilled, next_url)
+                return
+            hop = self._decide(next_url, next_method, resource_type, False, account=True)
+            if is_cancelled(self.cancel) or not hop.allow:
+                log.info("%s: blocked redirect %s -> %s (%s)", self.label, url, next_url,
+                         hop.reason)
+                if not hop.allow:
+                    self._blocked(hop.reason)
+                elif self.obs is not None:
+                    self.obs.cancelled = True
+                await route.abort()
+                return
+            host = ScopePolicy.host_of(url)
+            for value in fulfilled.get("set-cookie", "").split("\n"):
+                if not value:
+                    continue
+                name, cookie_value, deletes = _cookie_pair(value)
+                jar = hop_cookies.setdefault(host, {})
+                jar.pop(name, None) if deletes else jar.__setitem__(name, cookie_value)
+                if _same_cookie_host(url, request.url):
+                    hop_set_cookies.append(value)
+            if next_method != method:
+                body = None
+                headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+            url, method = next_url, next_method
+        await route.abort()
+
+    async def _send(self, url: str, method: str, request_headers: dict, body, hop_cookies: dict):
+        """One request the browser asked for, sent through the run's pinned
+        client. The identity's headers and cookies go only to the exact run origin."""
+        from harness.run_context import _target_client
+        exact = ScopePolicy.origin_of(url) == self.run_origin
+        headers = {k: v for k, v in request_headers.items()
+                   if k.lower() not in _UNFORWARDED_REQUEST_HEADERS and not k.startswith(":")}
+        headers["accept-encoding"] = "gzip, deflate"   # a body the client always decodes
+        cookies = dict(self.identity_cookies) if exact else {}
+        try:
+            jar = await self.context.cookies([url])
+        except Exception:
+            jar = []
+        cookies.update({c["name"]: c["value"] for c in jar})
+        cookies.update(hop_cookies.get(ScopePolicy.host_of(url), {}))
+        if cookies:
+            headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        if exact:
+            headers.update(self.identity_headers)
+        profile = self.tls.profile_for(url)
+        client = self._clients.get(profile.pool_key)
+        if client is None:
+            client = self._clients[profile.pool_key] = _target_client(
+                verify=profile.context, timeout=self.timeout_s, http2=False, pins=self.pins)
+        client.cookies.clear()   # the browser's jar is the only cookie store
+        return await client.send(client.build_request(method, url, headers=headers,
+                                                      content=body or None))
+
+    def _response_headers(self, response, url: str) -> dict:
+        """Response headers for fulfill(). The identity's own cookie, re-issued by
+        the run origin, updates the identity and stays out of the browser's jar."""
+        exact = ScopePolicy.origin_of(url) == self.run_origin
+        out: dict = {}
+        for key, value in response.headers.multi_items():
+            k = key.lower()
+            if k in _UNFORWARDED_RESPONSE_HEADERS:
+                continue
+            if k == "set-cookie" and exact:
+                name, cookie_value, deletes = _cookie_pair(value)
+                if name in self.identity_cookies:
+                    if deletes:
+                        self.identity_cookies.pop(name)
+                    else:
+                        self.identity_cookies[name] = cookie_value
+                    continue
+            out[k] = f"{out[k]}{chr(10) if k == 'set-cookie' else ', '}{value}" if k in out else value
+        return out
+
+    async def _fulfill_navigation_hop(self, route, request, fulfilled: dict, next_url: str) -> None:
+        """Answer a redirected navigation with a page that leads to `next_url` as a
+        new navigation, so the hop is routed (checked, accounted, credentialed only
+        on the run origin). The driver's own main-frame load follows it in goto()."""
+        headers = {"content-type": "text/html; charset=utf-8", "cache-control": "no-store"}
+        if "set-cookie" in fulfilled:
+            headers["set-cookie"] = fulfilled["set-cookie"]
+        main_frame = False
+        try:
+            main_frame = (self._driving and self.page is not None
+                          and request.frame == self.page.main_frame)
+        except Exception:
+            pass
+        if main_frame:
+            self._main_hop = next_url
+            body = "<!doctype html><title>redirect</title>"
+        else:
+            target = json.dumps(next_url).replace("<", "\\u003c")
+            body = f"<!doctype html><script>location.replace({target})</script>"
+        await route.fulfill(status=200, headers=headers, body=body)
 
 
 def playwright_available() -> bool:
@@ -440,9 +761,10 @@ class PlaywrightDriver:
         request the browser makes -- navigation, redirects, subresources,
         fetch/XHR -- is checked against it via `evaluate_browser_request`
         through Playwright request interception, and credentials (the
-        captured identity's Authorization, split out by
+        captured identity's Authorization and cookies, split out by
         `_extra_headers_and_cookies`) are attached only to requests on the
-        exact origin `url` itself is on. When `scope` is omitted, the visit is
+        exact origin `url` itself is on -- by `_IdentityRouter`, which sends
+        every allowed request itself (I05-D). When `scope` is omitted, the visit is
         conservatively restricted to that same origin -- a caller that does
         not pass a scope gets "same-origin only", never "everywhere".
 
@@ -461,7 +783,6 @@ class PlaywrightDriver:
             obs.cancelled = True
             obs.load_error = "cancelled before navigation"
             return obs
-        run_origin = ScopePolicy.origin_of(url)
         effective_scope = scope if scope is not None else ScopePolicy(
             allowed_hosts=frozenset({ScopePolicy.host_of(url)}))
         try:
@@ -469,6 +790,18 @@ class PlaywrightDriver:
         except Exception as e:  # pragma: no cover - guarded by available()
             obs.load_error = f"playwright import failed: {e}"
             return obs
+        # R25: load the page AS the supplied identity (auth headers + cookies),
+        # not anonymously, so authenticated XSS sinks are reachable. None ->
+        # anonymous, as before. R01: credentials are never handed to the context
+        # wholesale (extra_http_headers projected Authorization onto every
+        # request the page went on to make, any origin). I05-D: nor are they
+        # put in its cookie jar, which scopes a cookie to the host on any port.
+        # The browser holds no identity at all; _IdentityRouter adds it to the
+        # requests it sends itself, only on the exact origin `url` is on.
+        router = _IdentityRouter(url=url, headers=headers, scope=effective_scope,
+                                 cancel=cancel, gate=gate, budget=budget,
+                                 timeout_s=self.launch_timeout_ms / 1000,
+                                 label="browser_driver", obs=obs)
         try:
             async with async_playwright() as p:
                 # Connect to a containerised browser over CDP, or launch locally.
@@ -479,66 +812,14 @@ class PlaywrightDriver:
                     browser = await p.chromium.connect_over_cdp(
                         self.cdp_endpoint, timeout=self.launch_timeout_ms)
                 else:
-                    browser = await p.chromium.launch(headless=True)
+                    browser = await p.chromium.launch(headless=True,
+                                                      args=await router.launch_args())
                 context = None
                 try:
-                    # R25: load the page AS the supplied identity (auth headers +
-                    # cookies), not anonymously, so authenticated XSS sinks are
-                    # reachable. None -> anonymous, as before. R01: credentials
-                    # are NO LONGER handed to the context wholesale via
-                    # extra_http_headers (that projected Authorization onto
-                    # every request the page went on to make, any origin). The
-                    # context starts with none; the route handler below adds
-                    # `_extra` back in per-request, only when
-                    # evaluate_browser_request says the request is on the
-                    # run's own origin.
-                    _extra, _cookies = _extra_headers_and_cookies(headers, url)
-                    context = await browser.new_context(service_workers='block')
+                    # Service-worker fetches bypass Playwright route interception.
+                    context = await browser.new_context(service_workers="block")
+                    await router.install(context)
 
-                    async def _handle_route(route, request):
-                        if is_cancelled(cancel):
-                            obs.cancelled = True
-                            try:
-                                await route.abort()
-                            except Exception:
-                                pass
-                            return
-                        decision = evaluate_browser_request(
-                            url=request.url,
-                            method=request.method,
-                            resource_type=request.resource_type,
-                            is_navigation=request.is_navigation_request(),
-                            run_origin=run_origin,
-                            scope=effective_scope,
-                            gate=gate,
-                            budget=budget)
-                        if not decision.allow:
-                            obs.blocked_requests.append(decision.reason)
-                            log.info("browser_driver: blocked %s %s (%s)",
-                                     request.method, request.url, decision.reason)
-                            try:
-                                await route.abort()
-                            except Exception:
-                                pass
-                            return
-                        obs.requests_sent += 1
-                        try:
-                            if decision.attach_credentials and _extra:
-                                merged_headers = dict(request.headers)
-                                merged_headers.update(_extra)
-                                await route.continue_(headers=merged_headers)
-                            else:
-                                await route.continue_()
-                        except Exception:
-                            pass
-
-                    await context.route("**/*", _handle_route)
-
-                    if _cookies:
-                        try:
-                            await context.add_cookies(_cookies)
-                        except Exception:
-                            pass
                     async def deny_websocket(socket):
                         obs.blocked_requests.append('WebSocket denied by browser proof policy')
                         await socket.close()
@@ -564,7 +845,7 @@ class PlaywrightDriver:
                     if is_cancelled(cancel):
                         obs.load_error = "cancelled before navigation"
                     else:
-                        response = await page.goto(url, timeout=self.launch_timeout_ms, wait_until="load")
+                        response = await router.goto(page, url, self.launch_timeout_ms)
                         obs.navigation_status = response.status if response else None
                         obs.final_url = page.url
                         await page.wait_for_timeout(wait_ms)
@@ -588,6 +869,8 @@ class PlaywrightDriver:
                         pass
         except Exception as e:
             obs.load_error = f"{e.__class__.__name__}: {e}"
+        finally:
+            await router.aclose()
         return obs
 
     async def capture_requests(self, url: str, *, wait_ms: int = 1500,
@@ -626,7 +909,6 @@ class PlaywrightDriver:
         if is_cancelled(cancel):
             obs.load_error = "cancelled before navigation"
             return obs
-        run_origin = ScopePolicy.origin_of(url)
         effective_scope = scope if scope is not None else ScopePolicy(
             allowed_hosts=frozenset({ScopePolicy.host_of(url)}))
         try:
@@ -634,6 +916,11 @@ class PlaywrightDriver:
         except Exception as e:  # pragma: no cover - guarded by available()
             obs.load_error = f"playwright import failed: {e}"
             return obs
+        # The same identity router as visit(): one boundary for both (I05-D).
+        router = _IdentityRouter(url=url, headers=headers, scope=effective_scope,
+                                 cancel=cancel, gate=gate, budget=budget,
+                                 timeout_s=self.launch_timeout_ms / 1000,
+                                 label="browser_driver.capture_requests")
         try:
             async with async_playwright() as p:
                 connected = bool(self.cdp_endpoint)
@@ -641,54 +928,13 @@ class PlaywrightDriver:
                     browser = await p.chromium.connect_over_cdp(
                         self.cdp_endpoint, timeout=self.launch_timeout_ms)
                 else:
-                    browser = await p.chromium.launch(headless=True)
+                    browser = await p.chromium.launch(headless=True,
+                                                      args=await router.launch_args())
                 context = None
                 try:
-                    _extra, _cookies = _extra_headers_and_cookies(headers, url)
                     # Service-worker fetches bypass Playwright route interception.
                     context = await browser.new_context(service_workers="block")
-
-                    async def _handle_route(route, request):
-                        if is_cancelled(cancel):
-                            try:
-                                await route.abort()
-                            except Exception:
-                                pass
-                            return
-                        decision = evaluate_browser_request(
-                            url=request.url,
-                            method=request.method,
-                            resource_type=request.resource_type,
-                            is_navigation=request.is_navigation_request(),
-                            run_origin=run_origin,
-                            scope=effective_scope,
-                            gate=gate,
-                            budget=budget)
-                        if not decision.allow:
-                            log.info("browser_driver.capture_requests: blocked %s %s (%s)",
-                                     request.method, request.url, decision.reason)
-                            try:
-                                await route.abort()
-                            except Exception:
-                                pass
-                            return
-                        try:
-                            if decision.attach_credentials and _extra:
-                                merged_headers = dict(request.headers)
-                                merged_headers.update(_extra)
-                                await route.continue_(headers=merged_headers)
-                            else:
-                                await route.continue_()
-                        except Exception:
-                            pass
-
-                    await context.route("**/*", _handle_route)
-
-                    if _cookies:
-                        try:
-                            await context.add_cookies(_cookies)
-                        except Exception:
-                            pass
+                    await router.install(context)
                     page = await context.new_page()
 
                     async def _record(request) -> None:
@@ -736,7 +982,7 @@ class PlaywrightDriver:
                     if is_cancelled(cancel):
                         obs.load_error = "cancelled before navigation"
                     else:
-                        await page.goto(url, timeout=self.launch_timeout_ms, wait_until="load")
+                        await router.goto(page, url, self.launch_timeout_ms)
                         await page.wait_for_timeout(wait_ms)
                 finally:
                     if context is not None:
@@ -750,6 +996,8 @@ class PlaywrightDriver:
                         pass
         except Exception as e:
             obs.load_error = f"{e.__class__.__name__}: {e}"
+        finally:
+            await router.aclose()
         return obs
 
     async def cross_site_submit(self, *, attacker_url: str, victim_url: str,
