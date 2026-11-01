@@ -106,10 +106,11 @@ class SsrfValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None):
+                 collaborator=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
 
     def collab(self):
         return self._collab or _collab.shared()
@@ -153,13 +154,22 @@ class SsrfValidator(Validator):
             return None
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
-        host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
-            return self._skip(f"host {host!r} out of scope")
+        from harness.scope_lock import host_in_scope
+        if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
+            return self._skip("target origin is out of scope")
         cands = _candidate_params(exchange)
         if not cands:
             return self._skip("no URL-shaped parameter to redirect to a collaborator")
-        collab = self.collab()
+        if not self.oob_callbacks_enabled:
+            # The in-band differential uses alternate loopback ports as fetch
+            # controls. Those are separate services outside an exact target
+            # origin's authorization too, so disabled callback policy skips the
+            # entire SSRF leg before sending any probes or opening a listener.
+            return ValidationResult(
+                self.name, "inconclusive", "ssrf", confidence=0.0, confirmed=False,
+                summary="SSRF check incomplete: its alternate-host probes and out-of-band callbacks are disabled by policy",
+                evidence=("This check requires a separately authorized internal-service or callback target. "
+                          "No SSRF probe was sent and no callback listener was opened."))
         method = (exchange.method or "GET").upper()
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("host", "content-length")}
@@ -173,6 +183,7 @@ class SsrfValidator(Validator):
         sends = 0
         inband = await self._inband_differential(exchange, cands, method, headers, unsent)
         sends += 2 * len(cands[:2])
+        collab = self.collab()
         # 2) Out-of-band proof: the target calling back to a unique collaborator
         #    URL is independent fetch evidence (blind SSRF included).
         for loc, param in cands:

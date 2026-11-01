@@ -23,6 +23,7 @@ public class AnalysisModels {
     }
 
     public static class AnalysisRequest {
+        public String engagement_id; // optional; reuse explicitly for a shared report partition
         public HttpExchange exchange;
         public List<String> force_agents;
         public boolean attempt_rediscovery;
@@ -96,6 +97,8 @@ public class AnalysisModels {
     }
 
     public static class AnalysisResponse {
+        public String engagement_id; // returned report partition; nullable on older servers
+        public String captured_principal_id; // opaque captured authentication context
         public String coordinator_model;
         public List<String> dispatched_agents;
         public List<AgentReport> agent_reports;

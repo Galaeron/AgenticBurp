@@ -24,6 +24,8 @@ GET-only and scope-gated, like the other replay legs. Deterministic; no LLM.
 """
 from __future__ import annotations
 
+from harness import scope_lock
+
 import base64
 import hashlib
 import hmac
@@ -216,7 +218,7 @@ class JwtForgeValidator(Validator):
         if (exchange.method or "GET").upper() != "GET":
             return self._skip("jwt-forge replay is GET-only (safe)")
         host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         found = _extract_jwt(exchange.request_headers or {})
         if not found:

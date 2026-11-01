@@ -92,6 +92,16 @@ def _ctx(**over):
 
 
 class ScopeAndIsolationTests(unittest.TestCase):
+    def test_explicit_target_port_allows_only_that_service(self):
+        allowed = ["127.0.0.1:3000"]
+        ctx = RunContext.create(allowed_hosts=allowed,
+                                gate_config={"active_enabled": True})
+        self.assertTrue(ctx.scope.in_scope("http://127.0.0.1:3000/in-scope"))
+        self.assertFalse(ctx.scope.in_scope("http://127.0.0.1:3001/same-host-other-port"))
+        denied = ctx.gate.authorize(validator_name="probe", method="GET",
+                                    url="http://127.0.0.1:3001/same-host-other-port")
+        self.assertFalse(denied.allowed)
+
     def test_two_contexts_do_not_contaminate(self):
         c1 = RunContext.create(allowed_hosts=["a.test"], max_requests=1)
         c2 = RunContext.create(allowed_hosts=["b.test"], max_requests=9)

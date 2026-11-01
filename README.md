@@ -3,7 +3,10 @@
 A Burp Suite copilot that uses locally-hosted LLMs to analyze captured HTTP traffic for security vulnerabilities, then confirms or refutes those findings with deterministic validators.
 
 > **Status: working research prototype, effectiveness unproven.** The software
-> runs and ~2,400 Python / ~230 Java tests pass, but nothing in the repo
+> has recorded component/build test passes; older ~2,400 Python / ~230 Java
+> counts are historical reports, not a fresh verification of this checkout.
+> The current remediation's [register](docs/RECONCILED_REMEDIATION_REGISTER.json)
+> records bounded caller checks and open release gates. Nothing in the repo
 > measures how well it finds real bugs on an unfamiliar app, and its tuning
 > corpora ship with answer keys. Read **[docs/LIMITATIONS.md](docs/LIMITATIONS.md)**
 > before trusting any result, and **[docs/USER_MANUAL.md](docs/USER_MANUAL.md)**
@@ -12,9 +15,10 @@ A Burp Suite copilot that uses locally-hosted LLMs to analyze captured HTTP traf
 > **Out of the box it is passive and deliberately quiet:** active testing,
 > autonomous discovery and the cloud seams are OFF and no scope is set, so it
 > only reviews the exact traffic you send it with a small local model. If it
-> "finds almost nothing," that is why — check `GET /health` first (it reports
-> whether Ollama is reachable and the model is pulled), then enable active
-> testing on a scoped host per the user manual.
+> finds few issues, check `GET /health`, analysis completion/error state and
+> evidence limitations before interpreting that result. Passive review is not
+> proof of target safety. Follow the [passive operator workflow](docs/PASSIVE_OPERATOR_WORKFLOW.md)
+> for pairing, privacy boundaries and current package/build limitations.
 
 ## How It Works
 
@@ -134,7 +138,7 @@ Mutating validators are gated by `safety_gate.py` -- hard ceilings on burst size
 |---|---|
 | `safety_gate.py` | Checkpoint for mutating/amplifying requests. Hard ceilings baked into code; config can only restrict further. Every gated decision is logged. |
 | `run_context.py` | Per-run isolation: own safety gate, scope, budget, cancellation. `TargetTransport` wraps httpx with manual redirect loop -- scope enforced before every hop, credentials not forwarded across origins. |
-| `scope_lock.py` | Single `host_in_scope()` function shared by all validators and the gate. Fail-open when unconfigured; fail-closed once `allowed_hosts` is set. Hostname check only (no DNS pinning). |
+| `scope_lock.py` | `host_in_scope()` is the shared scope check for the gate and the migrated validators. **Fail-closed in active mode even when `allowed_hosts` is unset** -- an empty scope only retains standalone admission for passive, non-sending checks; malformed URLs fail closed. Some validators' own inline scope checks are still being migrated onto this one contract (see [CURRENT_STATE.md](CURRENT_STATE.md)), so it is not yet literally a single backstop for every validator. Hostname check only (no DNS pinning). |
 
 ### Burp Suite Extension (`burp-extension/`)
 

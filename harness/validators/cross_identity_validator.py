@@ -28,6 +28,8 @@ validators.active_enabled (it sends live requests), and scoped to
 server.allowed_hosts. GET-only.
 """
 from __future__ import annotations
+
+from harness import scope_lock
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
@@ -447,7 +449,7 @@ class CrossIdentityValidator(Validator):
         host = urlparse(exchange.url).hostname or ""
         if self.run_context is not None and not self.run_context.scope.in_scope(exchange.url):
             return self._skip(fc, f"host {host!r} is outside the run scope")
-        if self.run_context is None and self.allowed_hosts and host not in self.allowed_hosts:
+        if self.run_context is None and self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(fc, f"host {host!r} is outside server.allowed_hosts scope")
         object_scoped = has_object_identifier(exchange.url)
         function_level = not object_scoped and is_admin_namespaced(exchange.url)

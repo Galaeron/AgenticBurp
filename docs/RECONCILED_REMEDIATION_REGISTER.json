@@ -1,0 +1,1522 @@
+{
+  "schema_version": "reconciled-remediation-register/v1",
+  "prepared_date": "2026-10-05",
+  "work_brief": "docs/RECONCILED_REMEDIATION_LOOP.md",
+  "baseline_status": "established_bounded_source_manifest",
+  "historical_audit_head": "bca3ff3c68f90cbbdda9d8b66bb6a28eb65c08a7",
+  "goal": "Fix and verify accepted in-scope defects; evidence-backed disposition for every finding; do not falsely close blocked release gates.",
+  "allowed_statuses": [
+    "todo",
+    "investigating",
+    "in_progress",
+    "verification_pending",
+    "fixed_verified",
+    "not_reproduced_with_evidence",
+    "already_satisfied_verified",
+    "optional_evaluated",
+    "blocked_external"
+  ],
+  "required_finding_aliases": [
+    "SEC-01",
+    "INT-01",
+    "REL-01",
+    "PERF-01",
+    "VAL-01",
+    "RES-01",
+    "TOK-01",
+    "BLD-01",
+    "CMP-01",
+    "DED-01",
+    "EXP-01",
+    "REPRO-01",
+    "REPRO-02",
+    "DX-01",
+    "TEST-01",
+    "C-01",
+    "ARCH-01",
+    "ARCH-02",
+    "ARCH-03",
+    "ARCH-04",
+    "ARCH-05",
+    "ARCH-06",
+    "EF-01",
+    "EF-02",
+    "EF-03",
+    "EF-04",
+    "EF-05",
+    "TF-01",
+    "TF-02",
+    "TF-03",
+    "XR-01",
+    "XR-02",
+    "XR-03"
+  ],
+  "tickets": [
+    {
+      "id": "R00",
+      "title": "Establish a trustworthy, non-destructive baseline",
+      "priority": "P0",
+      "source_findings": [
+        "REL-01",
+        "REPRO-01",
+        "test_environment_disagreement"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [],
+      "dependency_note": "none",
+      "planning_estimate": "1–2 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": {
+        "head": "bca3ff3c68f90cbbdda9d8b66bb6a28eb65c08a7",
+        "branch": "reconciliation-backlog",
+        "source_content_id": "sha256:b0893108d35ea37f2e055f08b62a1f13f46d65abf631d50a005c1682962af0a1",
+        "manifest": "C:\\Users\\arthu\\Documents\\AgenticVibe\\reviews\\2026-10-05-reconciled-remediation\\r00-7d615f0100444018b20ebbb3a54a3f79\\source-manifest.json"
+      },
+      "owner": "root / baseline agent",
+      "evidence": [
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\reviews\\2026-10-05-reconciled-remediation\\r00-7d615f0100444018b20ebbb3a54a3f79\\baseline.json",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\reviews\\2026-10-05-reconciled-remediation\\r00-7d615f0100444018b20ebbb3a54a3f79\\commands.json",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\reviews\\2026-10-05-reconciled-remediation\\r00-7d615f0100444018b20ebbb3a54a3f79\\source-manifest.json"
+      ],
+      "changes": [],
+      "commands": [
+        {
+          "argv": [
+            "git",
+            "branch",
+            "--show-current"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "rev-parse",
+            "HEAD"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "rev-parse",
+            "HEAD^{tree}"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "rev-parse",
+            "--symbolic-full-name",
+            "@{u}"
+          ],
+          "exit_code": 128
+        },
+        {
+          "argv": [
+            "git",
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/remotes"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "diff",
+            "--cached",
+            "--name-status"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "diff",
+            "--name-status"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "merge-base",
+            "HEAD",
+            "refs/heads/main"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "merge-base",
+            "HEAD",
+            "refs/remotes/origin/main"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "harness",
+            "burp-extension",
+            "pyproject.toml",
+            "AGENTS.md",
+            "CURRENT_STATE.md",
+            "README.md",
+            "docs"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "git",
+            "diff",
+            "--",
+            "harness/config.yaml"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "C:\\Users\\arthu\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+            "-c",
+            "import sys,json,importlib.metadata as m; names=['fastapi','uvicorn','httpx','pydantic','PyYAML','pytest','setuptools','build','playwright']; print(json.dumps({'executable':sys.executable,'version':sys.version,'prefix':sys.prefix,'base_prefix':sys.base_prefix,'packages':{n:(m.version(n) if m.packages_distributions() and any(d.metadata['Name'].lower()==n.lower() for d in m.distributions()) else None) for n in names}}))"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "C:\\Users\\arthu\\Documents\\AgenticVibe\\.venv-rationalisation\\Scripts\\python.exe",
+            "-c",
+            "import sys,json,importlib.metadata as m; names=['fastapi','uvicorn','httpx','pydantic','PyYAML','pytest','setuptools','build','playwright']; print(json.dumps({'executable':sys.executable,'version':sys.version,'prefix':sys.prefix,'base_prefix':sys.base_prefix,'packages':{n:(m.version(n) if m.packages_distributions() and any(d.metadata['Name'].lower()==n.lower() for d in m.distributions()) else None) for n in names}}))"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "C:\\Program Files\\Git\\cmd\\git.EXE",
+            "--version"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.EXE",
+            "--version"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "metadata",
+            "C:\\Users\\arthu\\AppData\\Local\\Programs\\Ollama\\ollama.exe"
+          ],
+          "exit_code": null
+        },
+        {
+          "argv": [
+            "C:\\Users\\arthu\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+            "-m",
+            "harness.suite",
+            "smoke",
+            "--list"
+          ],
+          "exit_code": 0
+        },
+        {
+          "argv": [
+            "C:\\Users\\arthu\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+            "-m",
+            "harness.suite",
+            "full",
+            "--list"
+          ],
+          "exit_code": 0
+        }
+      ],
+      "positive_caller_control": "baseline metadata/content manifest established; runner --list executed without tests",
+      "negative_control": "forbidden/secret/local config paths filtered before file reads; smoke/full active fixture gates blocked after runner source inspection",
+      "acceptance_result": "baseline established; bounded production manifest and exact git identity recorded; missing tooling/dependencies and suite restrictions remain separate release blockers",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "inventory is bounded source/config scope, not secret/runtime content identity",
+        "tool search bounded; missing PATH is not proof of global absence",
+        "source can drift during other tickets; rehash touched paths against manifest before edits",
+        "historical CURRENT_STATE test/model claims not revalidated"
+      ]
+    },
+    {
+      "id": "R01",
+      "title": "Reproducible candidate release and WIP ownership",
+      "priority": "P0",
+      "source_findings": [
+        "REL-01",
+        "REPRO-01"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R00"
+      ],
+      "dependency_note": "R00",
+      "planning_estimate": "2–5 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "root",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r01-candidate-20261005a/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/r01-candidate-20261005a/candidate-baseline-v2.manifest.json",
+        "reviews/2026-10-05-reconciled-remediation/r01-candidate-20261005a/command-baseline-v2.json"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": "Snapshot hashes match copied content; static imports resolve within candidate.",
+      "negative_control": "Changing copied pyproject.toml is rejected by integrity verifier; original restored and rechecked.",
+      "acceptance_result": "Source-preparation contract verified: 512-file exact R00 content candidate plus required resource, static import closure and tamper controls. R19/R28 runtime/build/final-candidate gates remain open.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Intermediate snapshot predates completion of R02/R04/R08; regenerate final candidate.",
+        "Static import analysis does not establish startup or installed-wheel behavior."
+      ]
+    },
+    {
+      "id": "R02",
+      "title": "Authenticated Java/Python pairing and usable error reporting",
+      "priority": "P0",
+      "source_findings": [
+        "INT-01",
+        "ARCH-01"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R00"
+      ],
+      "dependency_note": "R00",
+      "planning_estimate": "2–4 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "pairing agent",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r02-1e1df0c45f4d43fba12714dc4e8db0a2/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/r02-1e1df0c45f4d43fba12714dc4e8db0a2/root-review.log",
+        "reviews/2026-10-05-reconciled-remediation/r02-python-java/R02-integration.md",
+        "reviews/2026-10-05-reconciled-remediation/r02-python-java/commands.json"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Actual Java HarnessClient -> production Python HTTP routes passed benign analysis, persisted SARIF read, missing/wrong credentials and owned-server restart with rotated credentials. Four Java pairing tests and five Python controls separately passed.",
+      "blocker": "No actual Java compile or client-to-production-Python passive integration evidence.",
+      "minimal_prerequisite": "Provisioned compatible JDK/Gradle and dependencies, then compile and run benign integration with fake inference.",
+      "residual_risks": [
+        "Fake passive orchestrator; no model effectiveness or interactive Burp UI claim.",
+        "Final package release gate remains separate."
+      ]
+    },
+    {
+      "id": "R03",
+      "title": "Sensitive-read authorization and shared inference redaction",
+      "priority": "P0",
+      "source_findings": [
+        "ARCH-02",
+        "EF-04",
+        "zero_egress_claim"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R02"
+      ],
+      "dependency_note": "R02",
+      "planning_estimate": "3–6 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "redaction/privacy agent; final review by orchestrator 2026-10-08",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r03-56c1a4fbf9ee42b7ad9771a55e945119/",
+        "reviews/2026-10-05-reconciled-remediation/r03-finish/R03-resume.md",
+        "reviews/2026-10-05-reconciled-remediation/r03-finish/caller-tests.log",
+        "reviews/2026-10-05-reconciled-remediation/r03-finish/hashes.json",
+        "reviews/2026-10-05-reconciled-remediation/r03-finish/commands.json",
+        "reviews/2026-10-05-reconciled-remediation/r02-python-java/R02-integration.md"
+      ],
+      "changes": [
+        "harness/server.py (sensitive-read auth + Host-defense)",
+        "harness/coordinator.py + harness/agents/base_agent.py (prompt sanitization)",
+        "harness/report_generator.py + harness/sarif_adapter.py (export redaction)",
+        "harness/test_privacy_contract.py (new); see r03-finish/hashes.json for inspected file set"
+      ],
+      "commands": [
+        {
+          "command": ".venv-rationalisation/Scripts/python.exe reviews/2026-10-05-reconciled-remediation/r03-finish/run_safe_tests.py",
+          "exit_code": 0,
+          "tests": 156,
+          "failures": 0,
+          "errors": 0,
+          "skips": 0,
+          "reviewer": "orchestrator 2026-10-08 (independent re-run; network denied, config.local empty, token/audit disposable)"
+        },
+        {
+          "command": "root attempt-3/final (same runner)",
+          "exit_code": 0,
+          "note": "2026-10-08 07:08 and 07:12 UTC; caller-tests.log"
+        }
+      ],
+      "positive_caller_control": "Authorized sensitive GET returns 200 over fake-provider engagement store; redaction present across Markdown/SARIF/structured exports; fake egress recorder documents an offline/passive configuration (test_privacy_contract + export controls).",
+      "negative_control": "Unauthorized/missing-token sensitive GETs denied (401) across every registered sensitive route; Host-defense returns 400; real HTTP diagnostic control removes the installed privacy filter and observes the encoded URL sentinel in the diagnostic log (the positive routes require that sentinel ABSENT with the filter installed) -- proves the sanitizer actually strips nested URLs.",
+      "acceptance_result": "156 guarded passive caller controls pass; mandatory sensitive-read auth and recognized-secret sanitization verified through inference/log/export callers and removal controls. Actual Java/Python authenticated sensitive-read compatibility verified.",
+      "blocker": "Actual Java client -> production Python sensitive-read integration (R02/R19) and a comprehensive production privacy/egress audit are not performed; this verifies the passive caller contract only.",
+      "minimal_prerequisite": "R02 Java-to-Python sensitive-read integration and a production egress review for full P0 privacy closure.",
+      "residual_risks": [
+        "Recognized structures only: arbitrary prose, opaque/binary secrets and path secrets remain unsupported.",
+        "Raw storage/retention/ACLs remain R14; no blanket zero-egress or compliance claim."
+      ]
+    },
+    {
+      "id": "R04",
+      "title": "One scope contract that preserves restrictions",
+      "priority": "P0",
+      "source_findings": [
+        "SEC-01",
+        "XR-01"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R00"
+      ],
+      "dependency_note": "R00",
+      "planning_estimate": "2–4 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "scope agent; strict/extended discrepancy adjudicated + closed by orchestrator 2026-10-08",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r04-21f830fcff5f4d8d9e23503f6b0366dd/R04.md",
+        "reviews/2026-10-05-reconciled-remediation/r04-21f830fcff5f4d8d9e23503f6b0366dd/ticket-after-review-scope-final.json",
+        "docs/SCOPE_POLICY.md"
+      ],
+      "changes": [
+        "harness/scope_lock.py, harness/run_context.py, harness/scope_discovery.py, harness/safety_gate.py (shared strict parser/matcher)",
+        "harness/test_target_transport.py (migrated stale explicit-wildcard expectation to the documented strict contract; coverage preserved)",
+        "docs/SCOPE_POLICY.md (authoritative profile/migration contract)"
+      ],
+      "commands": [
+        {
+          "command": ".venv-rationalisation/Scripts/python.exe -m unittest harness.test_remediation_scope harness.test_run_context.ScopeAndIsolationTests harness.test_offscope_host_lock.* harness.test_target_transport.{Naming,StandaloneContext,SendCreds,HostAllowScope}Tests harness.test_scope_discovery.IsHostAllowedTests",
+          "exit_code": 0,
+          "tests": 56,
+          "skips": 0,
+          "reviewer": "orchestrator 2026-10-08 (independent re-run; initially caught a drift failure, see below)"
+        }
+      ],
+      "positive_caller_control": "Actual TargetTransport checks run scope and gate on three benign MockTransport redirect hops; ordinary allowed response survives; synthetic session credential only on allowed origin; exact host/literal address entries authorize.",
+      "negative_control": "Off-scope/subdomain/userinfo redirect or malformed initial URL never reaches a second/first send (safety_gate BLOCKED trace); empty active scope fails closed; direct adapters reject dict/string/bytes/falsey malformed scope; disabling the shared check lets the off-scope request reach MockTransport (sensitivity).",
+      "acceptance_result": "Strict/extended discrepancy ADJUDICATED and CLOSED: the reviewed contract (docs/SCOPE_POLICY.md) is strict-everywhere -- wildcard/CIDR/scheme/port entries are denied in every adapter including HostAllowScope (a tightening, never a widening). Orchestrator re-run initially caught a drift failure (test_target_transport.py:44 still asserted the superseded permissive wildcard expectation); migrated that stale expectation to the documented strict contract (assertFalse, coverage preserved). 56 tests now pass.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Port/scheme/CIDR/wildcard entries authorize NO destination by design; supporting them would require a separate reviewed capability decision that preserves prior denials.",
+        "Textual normalization (IDNA/case/default-port/IPv6 brackets) is not hostname-alias resolution; connect-time DNS/address pinning remains a separate optional policy.",
+        "Captured-only transport enforcement (passive admission may accept an unset scope but that is not authorization to fetch) is the separate R05 gate."
+      ]
+    },
+    {
+      "id": "R05",
+      "title": "Captured-only operation and endpoint constraint semantics",
+      "priority": "P0",
+      "source_findings": [
+        "ARCH-05"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R04"
+      ],
+      "dependency_note": "R04",
+      "planning_estimate": "2–4 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "root agent (implementation); verified by orchestrator 2026-10-08",
+      "evidence": [
+        "harness/test_captured_only_policy.py",
+        "docs/SCOPE_POLICY.md (captured-only transport boundary is the R05 gate)"
+      ],
+      "changes": [
+        "harness/run_context.py + harness/safety_gate.py (captured_only target policy, excluded_path_prefixes, deny-before-I/O)",
+        "harness/server.py (_require_target_fetch admission rejects fetch endpoints; target_fetching status)",
+        "harness/test_captured_only_policy.py (new: 11 no-I/O caller controls)"
+      ],
+      "commands": [
+        {
+          "command": ".venv-rationalisation/Scripts/python.exe -m unittest harness.test_captured_only_policy -v",
+          "exit_code": 0,
+          "tests": 11,
+          "skips": 0,
+          "reviewer": "orchestrator 2026-10-08 (independent run)"
+        }
+      ],
+      "positive_caller_control": "Actual orchestrator analyzes a supplied captured response with ZERO target transports (transport patched with side_effect=AssertionError if called); benign captured analysis path completes; target_fetching status reports 'blocked'.",
+      "negative_control": "Direct GET blocked before client/budget with 'captured-only' error; captured_only cannot be overridden by transport.captured_only=False, active_enabled or allow_mutating_replay; excluded path prefixes deny nominally-safe methods and an excluded redirect before the second mock hop; malformed policy raises ValueError before any client; snapshot immutable; server _require_target_fetch and bulk adapter reject before adapters.",
+      "acceptance_result": "Captured-only passive operation is explicit and caller-verified: benign captured analysis invokes zero target transports, disabled active/capture features stay disabled, synthetic disallowed endpoints deny before I/O, and status distinguishes blocked fetching from untested capture. 11 controls pass; no policy weakened.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Exclusion/admission verified with synthetic policies and MockTransport; no live capture pipeline or real target exercised.",
+        "Default-OFF active/capture features remain OFF by design (not a defect); enabling them is out of scope for this loop.",
+        "smoke/full remain blocked by active fixtures."
+      ]
+    },
+    {
+      "id": "R06",
+      "title": "HTTPS trust policy",
+      "priority": "P1",
+      "source_findings": [
+        "ARCH-06"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R04"
+      ],
+      "dependency_note": "R04",
+      "planning_estimate": "1–3 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "baseline agent / root review",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r06-738f5ab9d1fd418e988ea2fe529c6428/",
+        "reviews/2026-10-05-reconciled-remediation/root-review-20261008.json"
+      ],
+      "changes": [
+        "Verified default TLS, additive PEM CA policy, isolated explicit loopback exceptions and trust provenance."
+      ],
+      "commands": [
+        {
+          "command": [
+            "C:\\Users\\arthu\\Documents\\AgenticVibe\\.venv-rationalisation\\Scripts\\python.exe",
+            "-m",
+            "unittest",
+            "-v",
+            "harness.test_remediation_tls",
+            "harness.test_remediation_inference_budget",
+            "harness.test_remediation_inference_usage"
+          ],
+          "start_utc": "2026-10-08T07:08:56.440975+00:00",
+          "end_utc": "2026-10-08T07:08:59.789182+00:00",
+          "duration_seconds": 3.360000000000582,
+          "exit_code": 0
+        }
+      ],
+      "positive_caller_control": "Real TargetTransport client paths exercise synthetic MemoryBIO TLS chain and hostname verification.",
+      "negative_control": "Unknown CA/wrong hostname fail; disabling verification defeats rejection; separate fixture client pools preserve verified policy.",
+      "acceptance_result": "Verified-by-default TLS trust accepted: 12 TLS controls pass (orchestrator re-ran harness.test_remediation_tls independently 2026-10-08, exit 0). Both client types share one verified RunContext/CA identity; isolated fixture exceptions are loopback-only and operator-visible; missing/invalid bundle fails without insecure fallback. R04 dependency now CLOSED (fixed_verified).",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "No live proxy / OS certificate-store integration exercised; synthetic MemoryBIO fixtures only.",
+        "smoke/full remain blocked by active fixtures; no full-suite claim."
+      ]
+    },
+    {
+      "id": "R07",
+      "title": "Run-owned inference budget propagation",
+      "priority": "P0",
+      "source_findings": [
+        "EF-01"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R00"
+      ],
+      "dependency_note": "R00",
+      "planning_estimate": "2–4 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": {
+        "head": "bca3ff3c68f90cbbdda9d8b66bb6a28eb65c08a7",
+        "branch": "reconciliation-backlog",
+        "source_content_id": "sha256:b0893108d35ea37f2e055f08b62a1f13f46d65abf631d50a005c1682962af0a1",
+        "manifest": "C:\\Users\\arthu\\Documents\\AgenticVibe\\reviews\\2026-10-05-reconciled-remediation\\r00-7d615f0100444018b20ebbb3a54a3f79\\source-manifest.json"
+      },
+      "owner": "budget agent; reviewed by root",
+      "evidence": [
+        "reviews\\2026-10-05-reconciled-remediation\\r07-budget\\EVIDENCE.md",
+        "reviews\\2026-10-05-reconciled-remediation\\r07-budget\\source-hashes.json",
+        "reviews\\2026-10-05-reconciled-remediation\\r07-budget\\regression-final.log",
+        "reviews\\2026-10-05-reconciled-remediation\\r07-budget\\root-review.log",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/r07.json",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/r08.json",
+        "docs/PASSIVE_INFERENCE_OWNERSHIP.md"
+      ],
+      "changes": [
+        "harness/agent_manager.py",
+        "harness/agents/base_agent.py",
+        "harness/agent_families.py",
+        "harness/passive_inference.py",
+        "harness/test_remediation_inference_budget.py",
+        "harness/test_agent_concurrency.py"
+      ],
+      "commands": [
+        {
+          "command": ".venv-rationalisation/Scripts/python.exe -m unittest harness.test_remediation_inference_budget -v",
+          "exit_code": 0,
+          "tests": 8,
+          "reviewer": "root"
+        },
+        {
+          "command": ".venv-rationalisation/Scripts/python.exe -m unittest harness.test_remediation_inference_budget harness.test_agent_concurrency harness.test_effort -v",
+          "exit_code": 0,
+          "tests": 38,
+          "reviewer": "budget agent"
+        }
+      ],
+      "positive_caller_control": "AnalysisPipeline -> actual manager -> actual specialist/family with fake provider; per-run accounting and concurrent reservation assertions.",
+      "negative_control": "Injected dropped budget switches to unmetered fake provider and fails accounting expectations; admission denial plus failure/cancellation refunds.",
+      "acceptance_result": "Root Oct9 source review and fresh25 passive controls verify actual run ownership, cumulative admission and nullable attempt accounting. Bounded architecture contract; no full-suite, active-path or model-quality claim.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Admission reserves estimates, not hard provider output ceilings.",
+        "Excluded active workflows and full regression release gates remain separate."
+      ]
+    },
+    {
+      "id": "R08",
+      "title": "Complete, trustworthy usage and timing instrumentation",
+      "priority": "P0",
+      "source_findings": [
+        "EF-02",
+        "PERF-01",
+        "TOK-01"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R07"
+      ],
+      "dependency_note": "R07",
+      "planning_estimate": "2–3 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "budget agent / root review",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r08-usage/",
+        "reviews/2026-10-05-reconciled-remediation/root-review-20261008.json",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/r07.json",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/r08.json",
+        "docs/PASSIVE_INFERENCE_OWNERSHIP.md"
+      ],
+      "changes": [
+        "Run-owned per-attempt nullable consumption and monotonic timing.",
+        "EffortStatus, RUN_SUMMARY, audit and AnalysisResponse expose unknown/lower-bound usage."
+      ],
+      "commands": [
+        {
+          "command": [
+            "C:\\Users\\arthu\\Documents\\AgenticVibe\\.venv-rationalisation\\Scripts\\python.exe",
+            "-m",
+            "unittest",
+            "-v",
+            "harness.test_remediation_tls",
+            "harness.test_remediation_inference_budget",
+            "harness.test_remediation_inference_usage"
+          ],
+          "start_utc": "2026-10-08T07:08:56.440975+00:00",
+          "end_utc": "2026-10-08T07:08:59.789182+00:00",
+          "duration_seconds": 3.360000000000582,
+          "exit_code": 0
+        }
+      ],
+      "positive_caller_control": "Real passive Orchestrator.analyze with no-network provider exports known tokens and incomplete-usage marker.",
+      "negative_control": "Dropped usage receipt, malformed result, cancellation, unknown counts and run-budget drop controls retain distinct outcomes.",
+      "acceptance_result": "Root Oct9 source review and fresh25 passive controls verify actual run ownership, cumulative admission and nullable attempt accounting. Bounded architecture contract; no full-suite, active-path or model-quality claim.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Provider connection timing unavailable is explicitly null.",
+        "Excluded active/optional workflows are outside verified accounting scope.",
+        "No measured model quality or savings claim."
+      ]
+    },
+    {
+      "id": "R09",
+      "title": "Deterministic SQLite resource cleanup",
+      "priority": "P1",
+      "source_findings": [
+        "RES-01",
+        "XR-03"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R00"
+      ],
+      "dependency_note": "R00",
+      "planning_estimate": "1–3 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "root",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r09-sqlite-20261005a/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/r09-sqlite-20261005a/verification-final.json"
+      ],
+      "changes": [
+        "harness/cache.py",
+        "harness/store.py",
+        "harness/test_remediation_sqlite_lifetime.py"
+      ],
+      "commands": [],
+      "positive_caller_control": "Public cache write/read/stats/clear and store reads release held connections; transactions commit and roll back.",
+      "negative_control": "Injected original nonclosing context detected; setup and BEGIN exceptions close; borrowed connection remains open.",
+      "acceptance_result": "15 permitted tests passed including 8 new controls. Source ownership inventory reviewed; full suite remains blocked.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Python 3.12 warning coverage supplemented by live-handle assertions.",
+        "47 store acquisition source traces are not exhaustive runtime coverage."
+      ]
+    },
+    {
+      "id": "R10",
+      "title": "Atomic snapshots and engagement/session isolation",
+      "priority": "P1",
+      "source_findings": [
+        "ARCH-03",
+        "session_isolation_gap"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R09"
+      ],
+      "dependency_note": "R09",
+      "planning_estimate": "3–6 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "state_resume; verified at engagement-state caller level by orchestrator 2026-10-08",
+      "evidence": [
+        "harness/test_engagement_atomic_passive.py",
+        "reviews/2026-10-05-reconciled-remediation/R10-R13-oct9-api-ownership.txt",
+        "reviews/2026-10-05-reconciled-remediation/r02-python-java-oct9/commands.json"
+      ],
+      "changes": [
+        "harness/store.py (mutate_engagement atomic compare/retry, engagement_id partition keys, wipe covers partitions)",
+        "harness/server.py (_update_engagement caller + /engagement read partition)",
+        "harness/test_engagement_atomic_passive.py (new: 14 caller controls)"
+      ],
+      "commands": [
+        {
+          "command": ".venv-rationalisation/Scripts/python.exe -m unittest harness.test_engagement_atomic_passive -v",
+          "exit_code": 0,
+          "tests": 14,
+          "skips": 0,
+          "reviewer": "orchestrator 2026-10-08 (independent run)"
+        }
+      ],
+      "positive_caller_control": "Two concurrent server _update_engagement calls on the same host/engagement retain both identity sets and bump _snapshot_revision to 2; /engagement reads are partitioned by engagement_id (eng-A vs eng-B return different state); a failed caller mutation rolls back and preserves the prior revision.",
+      "negative_control": "The pre-fix load/save pattern (patched in) loses one of two concurrent updates (proves the atomic mutate is necessary); stale-revision and cross-partition replacements are rejected; a legacy unpartitioned snapshot never seeds an explicit partition; host wipe counts both scoped partitions.",
+      "acceptance_result": "Bounded HTTP passive contract: atomic snapshots, request-owned default API engagement IDs, explicit scoped findings/prior context/evidence/report reads, recognized principal labels. External direct-analyze host-only compatibility preserved explicitly; Java receives/displays returned IDs and real Java/Python stored SARIF read passes.",
+      "blocker": "Broader cross-run/export session-data isolation (cookies/session artifacts not appearing in another run's export) is not demonstrated here; that export-level isolation overlaps R13 (cache context) and R14 (export redaction).",
+      "minimal_prerequisite": "Caller-level export/session-isolation controls once R13/R14 land, to close the 'cannot appear in another run/export' clause.",
+      "residual_risks": [
+        "Legacy direct Python calls without engagement_id remain host-only; use explicit IDs for isolation.",
+        "One bearer-token operator boundary, not multi-tenant authorization; custom credential schemes and excluded active callers unsupported.",
+        "Final candidate/regression and package gates remain open."
+      ]
+    },
+    {
+      "id": "R11",
+      "title": "Durable job status, interrupted-state recovery and cancellation visibility",
+      "priority": "P1",
+      "source_findings": [
+        "ARCH-04"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R10",
+        "R15"
+      ],
+      "dependency_note": "R10,R15",
+      "planning_estimate": "4–8 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "root / provenance agent",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r11-durable-jobs/caller-controls.json",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/r11-independent-review-2026-10-09/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/r11-independent-review-2026-10-09/verification.json"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Durable bounded job lifecycle independently verified with16 fresh inert HTTP caller controls, root source review, process-loss recovery, live/durable redaction, admission-before-manifest and visible cancellation/outages. No automatic resume.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "No submission idempotency guarantee; inaccessible/reused PIDs conservatively retain capacity.",
+        "Total journal outage returns503; source/package/UI release gates separate."
+      ]
+    },
+    {
+      "id": "R12",
+      "title": "Failure containment and visible degraded states",
+      "priority": "P1",
+      "source_findings": [
+        "failure_cancellation_throttle_gap"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R02",
+        "R07",
+        "R10"
+      ],
+      "dependency_note": "R02,R07,R10",
+      "planning_estimate": "3–5 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": null,
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r12-java-failure/",
+        "reviews/2026-10-05-reconciled-remediation/r12-java-failure/commands-oct9.json",
+        "reviews/2026-10-05-reconciled-remediation/r12-java-failure/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/health.log",
+        "reviews/2026-10-05-reconciled-remediation/r02-python-java-oct9/commands.json"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Fresh16 selected Java tests plus shadowJar, Python health controls and real Java/Python pairing/report/restart controls verify explicit malformed/auth/throttle/timeout/disconnect/degraded outcomes.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Timeout/interruption does not establish server cancellation; no automatic retry.",
+        "No live Burp UI/model-effectiveness or full-suite claim."
+      ]
+    },
+    {
+      "id": "R13",
+      "title": "Cache correctness and context isolation",
+      "priority": "P1",
+      "source_findings": [
+        "cache_isolation_gap"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R08",
+        "R10"
+      ],
+      "dependency_note": "R08,R10",
+      "planning_estimate": "2–4 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "state_resume",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/R10-R13-oct9-api-ownership.txt"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Passive cache caller controls cover context/provider/config identities, expiry/corruption/failed results, eight poisoned proof-authority fields, and read-guard defect injection. Unattributed external knowledge is excluded from analysis; policy namespace invalidates prior entries.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Legacy direct calls without explicit engagement share the documented host compatibility partition.",
+        "No active proof replay/revalidation or arbitrary custom credential equivalence claim."
+      ]
+    },
+    {
+      "id": "R14",
+      "title": "Data lifecycle, export redaction and supported maintenance",
+      "priority": "P1",
+      "source_findings": [
+        "retention_acl_deletion_backup_gap"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R03",
+        "R09",
+        "R15"
+      ],
+      "dependency_note": "R03,R09,R15",
+      "planning_estimate": "3–6 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "privacy_resume",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r14-maintenance/commands.json",
+        "reviews/2026-10-05-reconciled-remediation/r14-maintenance/ITERATION.md",
+        "docs/DATA_LIFECYCLE.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Bounded lifecycle: verified private token/backup ACL, explicit SQLite snapshot/restore, attributed engagement-subset deletion, surviving shared/orphan-ledger blob protection and honest expired-reference consumers.17 fresh synthetic maintenance controls pass.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Unowned proof/observation/run records and external caches/logs/exports remain; no whole-application or physical erasure claim.",
+        "Default keep-forever and manual operator retention policy explicit; production backup rehearsal remains operator work."
+      ]
+    },
+    {
+      "id": "R15",
+      "title": "Evidence content provenance and durable-write failures",
+      "priority": "P1",
+      "source_findings": [
+        "REPRO-02",
+        "evidence_persistence_gap"
+      ],
+      "status": "blocked_external",
+      "explicit_dependencies": [
+        "R01"
+      ],
+      "dependency_note": "R01",
+      "planning_estimate": "2–3 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "provenance agent / independent review",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r15-provenance/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/r15-independent-review-2026-10-08/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/r15-package-oct8/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/r15-package-oct8/caller-controls.json",
+        "reviews/2026-10-05-reconciled-remediation/r15-installed-diagnostic/DISPOSITION.md"
+      ],
+      "changes": [
+        "Scoped process-lifetime source content identity.",
+        "Sanitized persistence loss and per-failed-event durable degradation markers."
+      ],
+      "commands": [],
+      "positive_caller_control": "BaseAgent passive hypothesis emitter reaches real temporary store; content identity changes at same HEAD.",
+      "negative_control": "Independent two-finding persistence-loss control failed before fix; tampered stored blob fails integrity.",
+      "acceptance_result": "Ledger/source contract plus authenticated API/Markdown loss controls pass (27 tests). Git-free source hashing implemented, but actual wheel-installed source is unreadable after Windows Defender detection; provenance correctly stays unavailable.",
+      "blocker": "Windows Defender detects/quarantines an existing copied source file during wheel installation; no security bypass or file omission authorized.",
+      "minimal_prerequisite": "Owner security review and an approved intact package/source artifact; then repeat clean install and provenance controls.",
+      "residual_risks": [
+        "Total storage outage followed by process loss requires external warning retention.",
+        "Scoped/process-lifetime identity is not full release/environment identity."
+      ]
+    },
+    {
+      "id": "R16",
+      "title": "Consistent priority for unverified/no-leg findings",
+      "priority": "P1",
+      "source_findings": [
+        "VAL-01",
+        "XR-02"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R03",
+        "R15"
+      ],
+      "dependency_note": "R03,R15",
+      "planning_estimate": "1–3 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": {
+        "head": "26d01b1fe782cdd1596776f7e3fa0e688488eaf5",
+        "branch": "reconciliation-backlog"
+      },
+      "owner": "R16 coding agent (sonnet); reviewed by orchestrator 2026-10-08",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r16-dfb897/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/r16-dfb897/hashes.json",
+        "reviews/2026-10-05-reconciled-remediation/r16-dfb897/after_stderr.log",
+        "reviews/2026-10-05-reconciled-remediation/r16-dfb897/defect_before_stderr.log",
+        "reviews/2026-10-05-reconciled-remediation/r16-dfb897/junit_adhoc_enUS_stdout.log",
+        "reviews/2026-10-05-reconciled-remediation/r16-dfb897/residual_impact_severity.txt"
+      ],
+      "changes": [
+        "harness/sarif_adapter.py",
+        "harness/test_unverified_priority_consistency.py",
+        "burp-extension/src/main/java/com/harness/llm/ui/FindingPresentation.java",
+        "burp-extension/src/main/java/com/harness/llm/ui/HarnessPanel.java",
+        "burp-extension/src/test/java/com/harness/llm/FindingPresentationTest.java"
+      ],
+      "commands": [
+        {
+          "command": ".venv-rationalisation/Scripts/python.exe -m unittest harness.test_unverified_priority_consistency -v",
+          "exit_code": 0,
+          "tests": 9,
+          "skips": 0,
+          "reviewer": "orchestrator 2026-10-08 (independent re-run)"
+        },
+        {
+          "command": "defect-before on unpatched sarif_adapter: .venv .../python.exe -m unittest harness.test_unverified_priority_consistency",
+          "exit_code": 1,
+          "tests": 9,
+          "failures": 7,
+          "errors": 1,
+          "note": "negative control: surfaces disagree / proof-authority hole open before fix"
+        },
+        {
+          "command": "after: 218 targeted tests across sarif_adapter/report_generator/issues/confirmation_gate/triage_policy + server privacy/report/engagement modules",
+          "exit_code": 0,
+          "tests": 218,
+          "skips": 0,
+          "reviewer": "R16 agent"
+        },
+        {
+          "command": "ad-hoc javac + JUnit (repo-local .audit-external JDK 17) on FindingPresentation/HarnessPanel/FindingPresentationTest; NOT gradle",
+          "exit_code": 0,
+          "note": "7 Java tests pass under -Duser.language=en -Duser.country=US; superseded by the real Gradle run below"
+        },
+        {
+          "command": "gradle -p burp-extension --no-daemon --offline --rerun-tasks clean test shadowJar (JDK17/Gradle8.7 repo-local toolchain, host default locale, WITH R16 edits)",
+          "exit_code": 0,
+          "tests": 240,
+          "failures": 0,
+          "errors": 0,
+          "skips": 0,
+          "note": "Real build: FindingPresentationTest(7)+HarnessClientPairingTest(4)+all logic tests; shadowJar sha256 af62bae96e96433ebf85f1889a926631205f69b2b3af9013cab41bae04a6a2ec (includes R16 edits; differs from root pre-R16 jar 920729d7)",
+          "reviewer": "orchestrator 2026-10-08 (complementary Java gate)"
+        }
+      ],
+      "positive_caller_control": "Real /report and /report/sarif routes over temp SQLite: high-impact no-leg + unknown-class findings (critical, conf 0.99) stay under Markdown 'Unconfirmed Findings' and carry SARIF level=error with message '[UNVERIFIED...'; maturity/priority/impact agree across wire, Markdown and SARIF; confirmed CORS stays confirmed_observation, confirmed SQLi stays confirmed_exploit.",
+      "negative_control": "Unpatched adapter fails the agreement predicate (defect_before: 7 failures/1 error). In-suite injection patches _message_marker to '' and the agreement predicate must raise (non-vacuous). Export boundary refuses a self-declared confirmed maturity when the harness confirmed flag is false. Foreign SARIF claiming confirmation stays unverified through real import+export. Java mutant removing the confirmed-flag guard fails the fail-safe test.",
+      "acceptance_result": "Python/SARIF surfaces unified and caller-verified: unverified/no-leg (incl. unknown classes) read as UNVERIFIED in SARIF message text, observation type and fail-safe maturity, with impact severity preserved separately (critical stays error). Model/export text cannot set proof authority. Java display/export unified and built: real Gradle clean test shadowJar WITH the R16 edits passes 240/0/0/0 incl. FindingPresentationTest(7), shadowJar produced (reviews/.../r16-java-gradle-20261008).",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "impact_severity disagrees for gate-capped LEG-class findings (wire shows original, store-backed Markdown/SARIF show capped) because store.py does not persist original_severity; this is NOT a no-leg case and needs a shared store-schema change (see residual_impact_severity.txt).",
+        "Burp confidence detail uses default-locale String.format('%.2f'); passes on this host (JVM default en-US) but a comma-decimal JVM default would render '0,xx' and fail the panel test -- cosmetic display, one-line Locale.ROOT hardening if BE-locale CI is added.",
+        "With opt-in gate_uncorroborated_catchall/quarantine ON, Markdown keeps a labelled leads section while SARIF/MCP omit it (existing RA-6 behaviour, left as a policy decision).",
+        "potential-attack-chain hypotheses render in Markdown but are not exported to SARIF (pre-existing).",
+        "Confidence is not calibrated by this ticket; smoke/full remain blocked by active fixtures."
+      ]
+    },
+    {
+      "id": "R17",
+      "title": "Scoring contract and evaluation eligibility",
+      "priority": "P1",
+      "source_findings": [
+        "EF-03"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R15",
+        "R16"
+      ],
+      "dependency_note": "R15,R16",
+      "planning_estimate": "1–3 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": {
+        "head": "26d01b1fe782cdd1596776f7e3fa0e688488eaf5",
+        "branch": "reconciliation-backlog"
+      },
+      "owner": "R17 coding agent (sonnet); reviewed by orchestrator 2026-10-08",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r17-546013a6/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/r17-546013a6/hashes.json",
+        "reviews/2026-10-05-reconciled-remediation/r17-546013a6/characterize_before.json",
+        "reviews/2026-10-05-reconciled-remediation/r17-546013a6/characterize_after.json",
+        "reviews/2026-10-05-reconciled-remediation/r17-546013a6/mutation_report.json",
+        "reviews/2026-10-05-reconciled-remediation/r17-546013a6/final_modules_stdout.log"
+      ],
+      "changes": [
+        "testing/web_objective_benchmark.py",
+        "testing/run_web_objective_efficacy.py",
+        "testing/test_remediation_scoring_eligibility.py",
+        "testing/web-objective-benchmark/README.md"
+      ],
+      "commands": [
+        {
+          "command": ".venv-rationalisation/Scripts/python.exe -m unittest testing.test_remediation_scoring_eligibility testing.test_web_objective_benchmark testing.test_run_web_objective_efficacy",
+          "exit_code": 0,
+          "tests": 51,
+          "skips": 0,
+          "note": "31 new synthetic + 20 pre-existing",
+          "reviewer": "orchestrator 2026-10-08 (independent re-run)"
+        },
+        {
+          "command": "mutation_check.py: 20 single-guard mutants each fail their named tests; pre-fix scorer fails 20/31 new tests (11 already-satisfied pass); unmutated tree 31/0",
+          "exit_code": 0,
+          "note": "proves negative controls are non-vacuous"
+        }
+      ],
+      "positive_caller_control": "Well-formed synthetic run scores eligible with exact rates (first 0.5, within-budget 1.0, repeatable 0.5, control 0.5) and None rates for empty denominators; resolvable artifacts give artifact_integrity=resolved; the real efficacy caller (run_web_objective_efficacy.orchestrate) with written artifacts is eligible.",
+      "negative_control": "Each asserts the specific signal (named gate / event list / contract error), not just not-eligible, and fails if its guard is removed (20 mutants). Covers: wrong-class confirmation on positive/fixed-control/autonomous-oracle; 11 malformed + dangling + missing + directory + root-escaping artifact refs; 6 corrupt findings shapes + 5 corrupt resource values + offsetting interventions; error/infrastructure-stage/invalid status; missing attempts and zero-applicable mode; efficacy caller wrong-class reaching the scorecard; CLI exit codes 2/0/0.",
+      "acceptance_result": "Five genuine scorer defects fixed (D1 wrong-class on positive left eligible; D2 unrelated-class confirmation silently dropped; D3 zero-applicable-mode scored complete+eligible; D4 corrupt findings/resource values/offsetting interventions scored clean; D5 artifact refs checked by string presence only). New gate zero_wrong_class_confirmations and opt-in artifact_root resolution added; execution completeness kept separate from clean-correctness eligibility; wrong-class positives surfaced in denominators and cannot count as clean correctness. 51 tests pass (independently re-verified); mutation testing confirms non-vacuous negatives.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Strictness decision (kept strict, matches acceptance): any confirmed unrelated-class finding on a vulnerable case makes the run ineligible even beside the correct confirmation; relax to event-only if multi-vuln corpora are introduced.",
+        "Artifact integrity = well-formed path + opt-in existing-file-in-root; no hashing/schema (run schema has no hash field); CLI does not default --artifact-root so exit 0 with unresolved refs stays possible (result reports format_only).",
+        "Run-level model/checkout/config_hash remain string-presence only (R15 scope).",
+        "In captured mode a timeout/failure attempt with a confirmed expected-class finding is still credited; only error/infrastructure makes a run ineligible.",
+        "Offline synthetic verification only; no model/target/Java; does not establish scoring validity on real runs. smoke/full remain blocked by active fixtures."
+      ]
+    },
+    {
+      "id": "R18",
+      "title": "Deterministic report clock",
+      "priority": "P1",
+      "source_findings": [
+        "TEST-01",
+        "LB-FLAKE"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R00"
+      ],
+      "dependency_note": "R00",
+      "planning_estimate": "0",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "root",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r18-clock-20261005a/ITERATION.md",
+        "reviews/2026-10-05-reconciled-remediation/r18-clock-20261005a/verification.json"
+      ],
+      "changes": [
+        "testing/blind-target-2/run_blind_eval.py",
+        "testing/test_blind_eval_harness.py",
+        "testing/test_remediation_report_clock.py"
+      ],
+      "commands": [],
+      "positive_caller_control": "run_once and build_scorecard forward aware datetime to real renderer; fixed minute-boundary equality.",
+      "negative_control": "Omitted timestamp still changes at minute boundary; genuine stored content change remains unequal.",
+      "acceptance_result": "Four report-only tests pass; original equality and exchange-attribution assertions preserved.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Full blind evaluation test module not executed; no recall claim."
+      ]
+    },
+    {
+      "id": "R19",
+      "title": "Packaging, supported environment and Java build",
+      "priority": "P0",
+      "source_findings": [
+        "DX-01",
+        "BLD-01"
+      ],
+      "status": "blocked_external",
+      "explicit_dependencies": [
+        "R01",
+        "R02",
+        "R03"
+      ],
+      "dependency_note": "R01,R02,R03",
+      "planning_estimate": "3–6 days excluding unavailable tools",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "root",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r19-packaging-20261005a/install-verification-final.json",
+        "reviews/2026-10-05-reconciled-remediation/r19-packaging-20261005a/java-build-utf8.json",
+        "reviews/2026-10-05-reconciled-remediation/r02-python-java/R02-integration.md",
+        "reviews/2026-10-05-reconciled-remediation/r15-installed-diagnostic/DISPOSITION.md",
+        "reviews/2026-10-05-reconciled-remediation/r16-java-gradle-20261008/ITERATION.md"
+      ],
+      "changes": [
+        "Wheel includes safe YAML and workflow pack resources, excludes local/runtime files.",
+        "Java compiler explicitly uses UTF-8 on Windows."
+      ],
+      "commands": [],
+      "positive_caller_control": "Installed intermediate wheel starts outside checkout; actual JDK17 Gradle8.7 compile, four pairing tests and shadowJar passed.",
+      "negative_control": "Installed API rejects missing credentials; Java wrong/rotated/origin-change credential controls pass.",
+      "acceptance_result": "Actual Java compile/pairing/shadowJar and intermediate wheel startup/auth reads verified. Java/Python integration passed. Intact clean package installation/provenance remains blocked by Defender detection; final candidate still required.",
+      "blocker": "Windows Defender detects/quarantines an existing copied source file during wheel installation; no security bypass or file omission authorized.",
+      "minimal_prerequisite": "Owner security review and an approved intact package/source artifact; then repeat clean install and provenance controls.",
+      "residual_risks": [
+        "Pinned dependencies reused from provisioned environment; fresh dependency resolution/matrix not verified.",
+        "Independent Oct15 full regression passed for c9218e7b plus the isolated routing-context fix; this does not verify all main-checkout WIP or the final installed package.",
+        "Intermediate wheel predates later patches; exact final candidate needs rebuild."
+      ]
+    },
+    {
+      "id": "R20",
+      "title": "Operator/developer docs and honest claims",
+      "priority": "P1",
+      "source_findings": [
+        "DX-01",
+        "documentation_claim_gaps"
+      ],
+      "status": "blocked_external",
+      "explicit_dependencies": [
+        "R02",
+        "R03",
+        "R19"
+      ],
+      "dependency_note": "R02,R03,R19",
+      "planning_estimate": "2–4 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": null,
+      "evidence": [
+        "docs/PASSIVE_OPERATOR_WORKFLOW.md",
+        "docs/PAIRING.md",
+        "docs/REMEDIATION_RELEASE_GATES.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Source-aligned passive setup/pairing/privacy/failure/upgrade/rollback guidance and historical-claim corrections implemented. Final new-operator candidate walkthrough unavailable.",
+      "blocker": "Intact candidate installation and actual supported Burp/operator walkthrough remain unverified.",
+      "minimal_prerequisite": "Package/security owner approves intact package after Defender review; operator validates documented workflow in declared Python/Burp environment.",
+      "residual_risks": []
+    },
+    {
+      "id": "R21",
+      "title": "Measured passive inference efficiency",
+      "priority": "P2",
+      "source_findings": [
+        "PERF-01",
+        "TOK-01",
+        "TF-01",
+        "TF-02",
+        "TF-03"
+      ],
+      "status": "blocked_external",
+      "explicit_dependencies": [
+        "R08",
+        "R13",
+        "R25"
+      ],
+      "dependency_note": "R08,R13,R25",
+      "planning_estimate": "4–8 days plus study capacity",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": null,
+      "evidence": [
+        "docs/PASSIVE_EFFECTIVENESS_STUDY.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "No performance default changes; measurement protocol and explicit quality tolerance documented, but practical R25 corpus/model measurements unavailable.",
+      "blocker": "R25 practical study unavailable.",
+      "minimal_prerequisite": "Study owner provisions frozen approved corpus, model/hardware and repeats with evidence/quality gates; compare existing passive options only.",
+      "residual_risks": []
+    },
+    {
+      "id": "R22",
+      "title": "Modern application captured-data contracts",
+      "priority": "P2",
+      "source_findings": [
+        "CMP-01",
+        "modern_application_coverage_gap"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R03",
+        "R05",
+        "R13"
+      ],
+      "dependency_note": "R03,R05,R13",
+      "planning_estimate": "3–5 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": null,
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/R22-oct9-state.md",
+        "reviews/2026-10-05-reconciled-remediation/R22-oct9-captured-shapes-rerun.txt",
+        "docs/CAPTURED_TEXT_CONTRACT.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Four supplied text shapes traverse actual authenticated API/passive pipeline/storage/evidence/Markdown/SARIF. Body-loss negative control detects dropped input; unsupported WebSocket/binary/streaming fidelity documented.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "No live browser/proxy capture, target sends, binary/frame decoding, role authority or model-coverage claim."
+      ]
+    },
+    {
+      "id": "R23",
+      "title": "Verify existing deduplication and retest identity",
+      "priority": "P2",
+      "source_findings": [
+        "DED-01"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R10",
+        "R15",
+        "R16"
+      ],
+      "dependency_note": "R10,R15,R16",
+      "planning_estimate": "2–4 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": null,
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r23-independent-review-2026-10-09/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/r23-independent-review-2026-10-09/verification.json",
+        "docs/ISSUE_IDENTITY.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Demonstrated passive coordinate/ownership/export-history defects fixed additively.38 inspected controls pass at recorded revision; additional scoped two-case caller control verifies both proof attempts remain under one issue.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "Old discarded coordinates cannot be reconstructed; new scoped IDs/fingerprints may require deliberate reference/suppression reconciliation.",
+        "Observation history stores run/exchange references rather than every changed prose snapshot; empty-ID legacy grouping retained."
+      ]
+    },
+    {
+      "id": "R24",
+      "title": "Reporting parity and optional readable formats",
+      "priority": "P2",
+      "source_findings": [
+        "EXP-01"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R03",
+        "R14",
+        "R15",
+        "R16",
+        "R23"
+      ],
+      "dependency_note": "R03,R14,R15,R16,R23",
+      "planning_estimate": "2–5 days for core parity, optional format work estimated separately after requirement check",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": null,
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/R24-oct9-before.txt",
+        "reviews/2026-10-05-reconciled-remediation/R24-oct9-verified.txt",
+        "reviews/2026-10-05-reconciled-remediation/R24-oct9-state.md",
+        "docs/CORE_EXPORT_CONTRACT.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Core parity fixes preserve stored original impact severity and mark orphan proof references unavailable/non-replayable. Positive/defect controls and legacy migration checked;20 regression passes plus1 focused corrected migration pass. Optional PDF/DOCX evaluated as operator conversion of sanitized Markdown, not implemented or a release gate.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": [
+        "No PDF/DOCX endpoint or layout-verified conversion; raw traffic must not be passed to external converters.",
+        "Final package and broad regression gates remain open."
+      ]
+    },
+    {
+      "id": "R25",
+      "title": "Passive effectiveness and analyst-value evidence",
+      "priority": "P1",
+      "source_findings": [
+        "EF-05",
+        "C-01",
+        "practitioner_effectiveness_gap"
+      ],
+      "status": "blocked_external",
+      "explicit_dependencies": [
+        "R02",
+        "R03",
+        "R08",
+        "R13",
+        "R16",
+        "R17",
+        "R19"
+      ],
+      "dependency_note": "R02,R03,R08,R13,R16,R17,R19",
+      "planning_estimate": "5–10 evaluation days plus participants/model availability",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "root; practical study owner required",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/r25-r26.json",
+        "docs/PASSIVE_EFFECTIVENESS_STUDY.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Protocol and offline synthetic accounting implemented;6 CLI/accounting controls pass. No practical model or paired analyst results available.",
+      "blocker": "Study inputs and verified candidate not supplied/established.",
+      "minimal_prerequisite": "Study owner supplies approved sanitized corpus, independent annotation custodian, declared model/hardware and counterbalanced analyst participants; satisfy R13/R19 candidate gates.",
+      "residual_risks": []
+    },
+    {
+      "id": "R26",
+      "title": "Correct competitive positioning",
+      "priority": "P2",
+      "source_findings": [
+        "C-01",
+        "competitor_claim_gaps"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [
+        "R20",
+        "R25"
+      ],
+      "dependency_note": "R20,R25 for effectiveness claims",
+      "planning_estimate": "1–3 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": "root",
+      "evidence": [
+        "docs/COMPETITIVE_COMPARISON_2026-10-09.md",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/r25-r26.json"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Documentation-only correction: exactly8 cited primary-source alternatives, editions/deployment/data boundaries/unknown prices, no efficacy or superiority claim. R20 operator verification and R25 effectiveness remain open independently.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": []
+    },
+    {
+      "id": "R27",
+      "title": "Targeted architecture/ownership cleanup",
+      "priority": "P2",
+      "source_findings": [
+        "cross_mixin_coupling"
+      ],
+      "status": "fixed_verified",
+      "explicit_dependencies": [],
+      "dependency_note": "relevant completed tickets",
+      "planning_estimate": "3–6 days",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": null,
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/REVIEW.md",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/r07.json",
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/r08.json",
+        "docs/PASSIVE_INFERENCE_OWNERSHIP.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Root Oct9 source review and fresh25 passive controls verify actual run ownership, cumulative admission and nullable attempt accounting. Bounded architecture contract; no full-suite, active-path or model-quality claim.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": []
+    },
+    {
+      "id": "R28",
+      "title": "Release adjudication and complete handoff",
+      "priority": "P0",
+      "source_findings": [
+        "release_readiness_gaps"
+      ],
+      "status": "in_progress",
+      "explicit_dependencies": [],
+      "dependency_note": "all required fixes above",
+      "planning_estimate": "2–4 days plus blocked external prerequisites",
+      "scope": "defensive/passive/synthetic; see work brief",
+      "baseline": null,
+      "owner": null,
+      "evidence": [
+        "docs/REMEDIATION_RELEASE_GATES.md"
+      ],
+      "changes": [],
+      "commands": [],
+      "positive_caller_control": null,
+      "negative_control": null,
+      "acceptance_result": "Independent Oct15 isolated routing-context fix on c9218e7b passes full regression (3115 harness, 38 pytest, 291 testing passed plus 17 skips, 42 integrity). New caller controls detect forwarding/plan/validate mutations; evidence: reviews/2026-10-15-routing-fix/VERIFICATION.md. Tested patch committed and pushed as 06a128fc; hosted PR CI passed. Separate main-checkout WIP remains excluded. Required final-package, operator and practical-study gates remain open; no release/ALL FIXED claim.",
+      "blocker": null,
+      "minimal_prerequisite": null,
+      "residual_risks": []
+    }
+  ],
+  "release_gates": [
+    {
+      "id": "source_snapshot",
+      "status": "unverified",
+      "evidence": [],
+      "blocker": null
+    },
+    {
+      "id": "authenticated_passive_java_python",
+      "status": "verification_pending",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r02-python-java-oct9/commands.json"
+      ],
+      "blocker": "Fresh generated-engagement SARIF and restart controls pass on current source; final source snapshot reconciliation pending."
+    },
+    {
+      "id": "scope_privacy_budget_controls",
+      "status": "unverified",
+      "evidence": [],
+      "blocker": null
+    },
+    {
+      "id": "state_resource_evidence_contracts",
+      "status": "unverified",
+      "evidence": [],
+      "blocker": null
+    },
+    {
+      "id": "wheel_outside_checkout",
+      "status": "blocked_external",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r15-installed-diagnostic/DISPOSITION.md"
+      ],
+      "blocker": "Defender detection prevents verified intact installed provenance; approved owner/security resolution and repeat install required."
+    },
+    {
+      "id": "java_build_and_compatibility",
+      "status": "verification_pending",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/r12-java-failure/commands-oct9.json"
+      ],
+      "blocker": "Fresh selected JDK17/Gradle8.7 build passed; exact candidate/UI compatibility still open."
+    },
+    {
+      "id": "required_regression_commands",
+      "status": "blocked_external",
+      "evidence": [
+        "reviews/2026-10-05-reconciled-remediation/root-oct9-review/REVIEW.md"
+      ],
+      "blocker": "Required smoke/full/precondition include excluded active confirmation fixtures. No broad green claim; separately authorized verification context required."
+    },
+    {
+      "id": "documented_operator_workflow",
+      "status": "blocked_external",
+      "evidence": [
+        "docs/PASSIVE_OPERATOR_WORKFLOW.md"
+      ],
+      "blocker": "Intact package and supported Burp/new-operator walkthrough required."
+    },
+    {
+      "id": "passive_effectiveness_study",
+      "status": "blocked_external",
+      "evidence": [
+        "docs/PASSIVE_EFFECTIVENESS_STUDY.md"
+      ],
+      "blocker": "Approved captures/annotation custodian/model setup/analyst participants unavailable."
+    }
+  ],
+  "validation": {
+    "tickets": 29,
+    "required_aliases_covered": 33,
+    "explicit_dependency_graph": "acyclic",
+    "note": "Free-text dependency conditions must also be satisfied; graph validation does not verify fixes."
+  }
+}

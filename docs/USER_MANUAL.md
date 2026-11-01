@@ -3,6 +3,11 @@
 Operator guide for running AgenticVibe. Read [the honest limitations](LIMITATIONS.md)
 too — this tool is an unproven research prototype, not a drop-in scanner.
 
+For the current remediation's bounded supplied-capture workflow and release
+blockers, read [PASSIVE_OPERATOR_WORKFLOW.md](PASSIVE_OPERATOR_WORKFLOW.md).
+Older broad verification counts are historical reports; the remediation register
+contains revision-bound evidence and open gates.
+
 ## 1. First run — and why it may "find nothing"
 
 ```bash
@@ -29,7 +34,9 @@ The committed defaults are **passive and safe**: active validators, autonomous
 discovery, the oracle, cloud routing and cloud reasoning are all OFF, and
 `server.allowed_hosts` is empty. In this mode the harness only reviews the
 exact traffic you send it, with a small local model — so "it ran and found
-almost nothing" is expected until you enable active testing on a scoped target.
+almost nothing" needs interpretation alongside model errors, input coverage and
+evidence limitations. It does not establish a clean target or require enabling
+active testing to make this passive workflow useful.
 
 ## 2. Scope — required before any active traffic
 

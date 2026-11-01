@@ -9,16 +9,26 @@ the coverage ledger never guesses).
 
 Pt 7 -- the path-traversal leg's shape-decoupled fallback must not fire active
 probes off the back of a finding whose class is a response-header/transport
-concern with no file-read relationship (CSP/CORS/crypto).
+concern with no file-read relationship (CSP/CORS/crypto) OR a strong, distinct
+class the agent named with confidence (SQL injection, IDOR, business-logic).
+
+Pt 6 (second pass) -- a finding whose class the agent writes as a human label
+with spaces ("Verbose Error", "Stack Trace", "Broken Access Control") must reach
+the validator that declares its snake_case class. Lowercasing alone left the
+space in, so "verbose error" never matched "verbose_error". These tests use the
+SPACED label form on purpose -- the earlier suite only used underscore labels,
+so it stayed green while the real natural labels missed.
 """
 from __future__ import annotations
 import unittest
 
 from harness.models import Finding, HttpExchange
 from harness.categories import canonicalize, distinctive_token
+from harness.validators.base import Validator, ValidationResult
 from harness.validators.verbose_error_validator import VerboseErrorValidator
 from harness.validators.csrf_validator import CsrfValidator
 from harness.validators.path_traversal_validator import PathTraversalValidator
+from harness.validators.sequence_validator import SequenceValidator
 
 
 def _finding(cls: str, severity: str = "high") -> Finding:
@@ -42,6 +52,18 @@ class TestDistinctiveToken(unittest.TestCase):
     def test_conflicting_tokens_return_none(self):
         # Two different class tokens -> do not guess which one.
         self.assertIsNone(distinctive_token("XSS and SQLi combined"))
+
+    def test_callback_validators_honor_explicit_oob_policy(self):
+        from harness.validators.registry import ValidatorRegistry
+        defaults = ValidatorRegistry({"server": {"allowed_hosts": ["127.0.0.1:3000"]},
+                                      "validators": {"active_enabled": True}})
+        for name in ("ssrf", "xxe", "command_injection"):
+            self.assertTrue(defaults.validators[name].oob_callbacks_enabled, name)
+        disabled = ValidatorRegistry({"server": {"allowed_hosts": ["127.0.0.1:3000"]},
+                                      "validators": {"active_enabled": True,
+                                                     "oob_callbacks_enabled": False}})
+        for name in ("ssrf", "xxe", "command_injection"):
+            self.assertFalse(disabled.validators[name].oob_callbacks_enabled, name)
 
     def test_canonicalize_stays_strict(self):
         # The routing aid must NOT leak into canonicalize()'s contract.
@@ -67,6 +89,53 @@ class TestSynonymCanonicalRouting(unittest.TestCase):
     def test_unrelated_class_does_not_match(self):
         self.assertFalse(self.ve.applies(_finding("sqli"), self.ex))
         self.assertFalse(self.ve.applies(_finding("xss"), self.ex))
+
+
+class _SnakeOnlyValidator(Validator):
+    """A validator that declares ONLY snake_case classes -- the shape the
+    normalization must bridge to from a spaced human label."""
+    name = "snake_only"
+    finding_classes = {"verbose_error", "broken_access_control"}
+
+    async def validate(self, finding, exchange):  # pragma: no cover - not exercised
+        return ValidationResult(self.name, "skipped", "x")
+
+
+class TestLabelNormalization(unittest.TestCase):
+    """Pt 6 (second pass): a spaced/hyphenated human label must reach the
+    validator that declares its snake_case class. Regression for the bug where
+    'Verbose Error' / 'Stack Trace' / 'Broken Access Control' routed nowhere."""
+
+    def setUp(self):
+        self.ex = HttpExchange(url="http://t/x", method="GET")
+
+    def test_spaced_label_matches_snake_class(self):
+        v = _SnakeOnlyValidator()
+        for label in ("Verbose Error", "verbose error", "Verbose-Error", "VERBOSE ERROR"):
+            self.assertTrue(v.applies(_finding(label), self.ex), label)
+        for label in ("Broken Access Control", "broken-access-control"):
+            self.assertTrue(v.applies(_finding(label), self.ex), label)
+
+    def test_normalization_does_not_overmatch(self):
+        v = _SnakeOnlyValidator()
+        for label in ("sqli", "SQL Injection", "xss", "open redirect"):
+            self.assertFalse(v.applies(_finding(label), self.ex), label)
+
+    def test_verbose_error_validator_accepts_spaced_labels(self):
+        # Integration: verbose_error uses the base applies() (no shape gate), so
+        # these are exactly the labels the reviewer saw route to nothing.
+        ve = VerboseErrorValidator()
+        for label in ("Verbose Error", "Stack Trace"):
+            self.assertTrue(ve.applies(_finding(label), self.ex), label)
+
+    def test_broken_access_control_reaches_sequence_validator(self):
+        # sequence declares 'broken_access_control'; the spaced label now reaches
+        # it. A state-changing exchange so sequence's own gate is satisfied.
+        ex = HttpExchange(url="http://t/users/5", method="PATCH",
+                          request_headers={"Content-Type": "application/json"},
+                          request_body='{"role":"admin"}')
+        self.assertTrue(SequenceValidator(allowed_hosts=["t"]).applies(
+            _finding("Broken Access Control"), ex))
 
 
 class TestTitleRouting(unittest.TestCase):

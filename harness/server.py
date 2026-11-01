@@ -416,8 +416,9 @@ async def health():
     def _is_present(model: str) -> bool:
         if model in present:
             return True
-        base = model.split(":")[0]
-        return any(tag == model or tag.split(":")[0] == base for tag in present)
+        # An untagged Ollama model denotes :latest. Another quantization or
+        # size with the same family name cannot satisfy an explicit model tag.
+        return ":" not in model.rsplit("/", 1)[-1] and model + ":latest" in present
 
     configured = {orchestrator.coordinator_model}
     configured.update(a.model for a in orchestrator.agent_manager.agents.values())
@@ -430,14 +431,14 @@ async def health():
     reachable = bool(probe.get("reachable"))
     status = "ok" if (reachable and not missing) else "degraded"
     ollama_detail = {
-        "base_url": orchestrator.ollama.base_url,
+        "base_url": security.redact_secrets_in_url(orchestrator.ollama.base_url),
         "reachable": reachable,
         "models_present": sorted(present),
         "configured_local_models": local_models,
         "missing_models": missing,
     }
     if not reachable:
-        ollama_detail["error"] = probe.get("error")
+        ollama_detail["error"] = "Ollama unavailable; backend diagnostics withheld"
         ollama_detail["hint"] = "start Ollama (`ollama serve`) and confirm ollama.base_url in config.yaml"
     elif missing:
         ollama_detail["hint"] = ("pull the configured model(s), e.g. "
@@ -494,7 +495,8 @@ async def telemetry(run_id: str | None = None, authorization: str | None = Heade
 @app.get("/report")
 async def report(url: str, authorization: str | None = Header(default=None),
                  engagement_id: str = Query(default="", max_length=128),
-                 captured_principal_id: str | None = Query(default=None, max_length=128)):
+                 captured_principal_id: str | None = Query(default=None, max_length=128),
+                 run_id: str | None = Query(default=None, max_length=128)):
     """
     Analyst-facing Markdown writeup of everything found for `url`'s host
     so far -- report_generator.py, wired here for the first time. The
@@ -517,6 +519,7 @@ async def report(url: str, authorization: str | None = Header(default=None),
         config=config,
         engagement_id=engagement_id,
         captured_principal=captured_principal_id,
+        run_id=run_id,
     )
     if not engagement_id:
         markdown = "> Legacy host-only records. Current passive analysis requires its returned engagement_id.\n\n" + markdown
@@ -526,7 +529,8 @@ async def report(url: str, authorization: str | None = Header(default=None),
 @app.get("/report/sarif")
 async def report_sarif(url: str, authorization: str | None = Header(default=None),
                        engagement_id: str = Query(default="", max_length=128),
-                       captured_principal_id: str | None = Query(default=None, max_length=128)):
+                       captured_principal_id: str | None = Query(default=None, max_length=128),
+                       run_id: str | None = Query(default=None, max_length=128)):
     """
     RA-3: the SAME findings /report renders as Markdown, as a SARIF 2.1.0
     JSON document (sarif_adapter.py) instead -- so findings are portable
@@ -561,10 +565,13 @@ async def report_sarif(url: str, authorization: str | None = Header(default=None
     from harness import report_generator, sarif_adapter
     from harness import evidence_ledger
     exports = await asyncio.to_thread(report_generator.export_issues_for_host, url, config=config,
-                                      engagement_id=engagement_id, captured_principal=captured_principal_id)
+                                      engagement_id=engagement_id, captured_principal=captured_principal_id,
+                                      run_id=run_id)
     source_revision = evidence_ledger.Provenance.capture().code_version
     doc = sarif_adapter.export_issues_to_sarif(exports, source_revision=source_revision)
     doc["runs"][0]["properties"]["engagement_id"] = engagement_id
+    if run_id:
+        doc["runs"][0]["properties"]["run_id"] = run_id
     doc["runs"][0]["properties"]["state_partition"] = "explicit-engagement" if engagement_id else "legacy-host-only"
     return JSONResponse(doc)
 
@@ -621,7 +628,9 @@ async def analyze(req: AnalysisRequest, authorization: str | None = Header(defau
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     try:
-        partition = {"engagement_id": req.engagement_id} if req.engagement_id else {}
+        # An omitted name selects the site's shared history. Generating a new
+        # partition per request makes prior observations impossible to retrieve.
+        partition = {"engagement_id": req.engagement_id or ""}
         if attribution:
             partition["observation_attribution"] = attribution
         return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery,
@@ -1521,10 +1530,11 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             status_code=400,
             detail=f"route host {host!r} does not match base_url host {target_host!r}")
     allowed_hosts = {(h or "").lower() for h in (orchestrator.allowed_hosts or [])}
-    if target_host not in allowed_hosts:
+    from harness.scope_lock import host_in_scope
+    if not host_in_scope(req.base_url, allowed_hosts, active_mode=True):
         raise HTTPException(
             status_code=403,
-            detail=f"host {target_host!r} is not in pre-authorized scope "
+            detail=f"target {req.base_url!r} is not in pre-authorized scope "
                    f"(server.allowed_hosts); investigate cannot grant new scope")
 
     # P1-8 admission bound -- an ADDITIONAL gate that runs strictly AFTER
@@ -1575,6 +1585,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             run_id=job_id, target_identifier=host, config=security.sanitize_data(config),
             cache_namespace=run_context.cache_namespace, output_dir=runs_cfg.get("output_dir"),
             model_versions={"coordinator": orchestrator.coordinator_model,
+                        "critique": __import__("harness.coordinator", fromlist=["reasoning_model"]).reasoning_model(config),
+                        "surface_prioritization": (config.get("surface_prioritization") or {}).get("model", orchestrator.coordinator_model),
                         "agents": sorted({getattr(a, "model", "")
                                           for a in orchestrator.agent_manager.agents.values()
                                           if getattr(a, "model", "")}),
@@ -1606,6 +1618,11 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
 
     async def _run():
         try:
+            # Finding persistence and diagnostics use this task-local binding.
+            # The engagement job is a separate background task from /analyze,
+            # so it must establish the run coordinate itself.
+            from harness import telemetry
+            telemetry.bind_current_run(run_context.run_id)
             async with run_context:
                 job["result"] = await orchestrator.investigate_engagement(
                     req.base_url, roles,
@@ -1618,6 +1635,18 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             job["result"].setdefault("run_id", run_context.run_id)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
             job["result"].setdefault("request_count", run_context.budget.used)
+            # Use the persisted, proof-resolved projection and this run only.
+            # Raw model flags and repeated validator records are not issue counts.
+            rows = store.all_host_findings(req.base_url, run_id=run_context.run_id)
+            from harness.assessment_health import confirmed_issue_inventory
+            proven = confirmed_issue_inventory(
+                [*rows, *job["result"].get("findings", [])], run_context.run_id, store.proofs_for_case)
+            job["result"]["confirmed_issues"] = len(proven)
+            job["result"]["confirmed_issue_refs"] = proven
+            job["result"]["finding_summary"] = {
+                "records": len(rows), "proof_bound_confirmed_cases": len(proven),
+                "unproven_records": sum(not (r.get("confirmed") and r.get("proof_status") == "resolved") for r in rows),
+                "scoreboard_mapping": "not supplied"}
             job["status"] = "done"
             _finish_manifest("done", result=job["result"])
         except asyncio.CancelledError:

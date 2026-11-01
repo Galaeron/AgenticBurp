@@ -46,6 +46,10 @@ log = logging.getLogger(__name__)
 class ValidatorRegistry:
     def __init__(self, config: dict):
         cfg = config.get("validators", {})
+        # Blind proof callbacks create a listener and cause target-side egress.
+        # They therefore require an explicit policy opt-in, independent of the
+        # active-testing switch and the target host allowlist.
+        oob_callbacks_enabled = bool(cfg.get("oob_callbacks_enabled", True))
         self.enabled = bool(cfg.get("enabled", True))
         self.active_enabled = bool(cfg.get("active_enabled", False))
         # Seed the process-wide safety gate from the real config now,
@@ -191,18 +195,21 @@ class ValidatorRegistry:
         ssrf_cfg = cfg.get("ssrf", {})
         if ssrf_cfg.get("enabled", True):
             self.validators["ssrf"] = SsrfValidator(
-                allowed_hosts=_allowed, timeout=float(ssrf_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(ssrf_cfg.get("timeout", 10.0)),
+                oob_callbacks_enabled=oob_callbacks_enabled)
         # XXE leg -- OOB via the collaborator (external entity -> callback). Active.
         xxe_cfg = cfg.get("xxe", {})
         if xxe_cfg.get("enabled", True):
             self.validators["xxe"] = XxeValidator(
-                allowed_hosts=_allowed, timeout=float(xxe_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(xxe_cfg.get("timeout", 10.0)),
+                oob_callbacks_enabled=oob_callbacks_enabled)
         # Command-injection leg -- OOB via the collaborator (shell payload -> callback).
         # Active; a non-GET replay also needs allow_mutating_replay.
         cmdi_cfg = cfg.get("command_injection", {})
         if cmdi_cfg.get("enabled", True):
             self.validators["command_injection"] = CommandInjectionValidator(
-                allowed_hosts=_allowed, timeout=float(cmdi_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(cmdi_cfg.get("timeout", 10.0)),
+                oob_callbacks_enabled=oob_callbacks_enabled)
         # SSTI leg -- in-band arithmetic differential (proves template evaluation). Active.
         ssti_cfg = cfg.get("ssti", {})
         if ssti_cfg.get("enabled", True):

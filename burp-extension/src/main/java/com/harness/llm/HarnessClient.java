@@ -247,6 +247,9 @@ public class HarnessClient {
             HttpResponse<String> resp = sendBounded(req);
             if (resp.statusCode() == 200) {
                 var health = responseObject(resp.body());
+                if (stringField(health, "status") && "degraded".equals(health.get("status").getAsString())) {
+                    throw failed("model-unavailable", "Harness is reachable but model inference is unavailable; check the configured model locally. Details withheld.");
+                }
                 if (!stringField(health, "status") || !"ok".equals(health.get("status").getAsString())) {
                     throw failed("malformed", "Harness liveness response is incomplete or malformed.");
                 }

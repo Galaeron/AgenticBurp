@@ -388,6 +388,11 @@ public class HarnessPanel extends JPanel {
         }
         AnalysisResponse r = entry.response();
         StringBuilder sb = new StringBuilder();
+        sb.append("Engagement ID: ").append(r.engagement_id == null || r.engagement_id.isBlank()
+                ? "unavailable (older server)" : r.engagement_id).append('\n');
+        if (r.captured_principal_id != null && !r.captured_principal_id.isBlank()) {
+            sb.append("Captured principal ID: ").append(r.captured_principal_id).append('\n');
+        }
         sb.append("Coordinator model: ").append(r.coordinator_model).append('\n');
         sb.append("Dispatched agents: ").append(String.join(", ", r.dispatched_agents)).append('\n');
         sb.append('\n').append(r.summary).append("\n\n");

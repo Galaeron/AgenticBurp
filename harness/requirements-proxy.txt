@@ -2,4 +2,6 @@
 # required for the core harness (server.py, orchestrator.py, agents,
 # validators) -- kept separate so the main install stays light for
 # anyone not running the forced-egress proxy. See PROXY_SETUP.md.
-mitmproxy>=11.0
+mitmproxy>=12.3.1
+# CVE-2026-111497: mitmproxy's transitive decoder must be patched.
+brotli>=1.2.1

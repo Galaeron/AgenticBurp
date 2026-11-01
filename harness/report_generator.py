@@ -285,9 +285,12 @@ def _dedup_key(f: "ReportFinding") -> tuple:
     distinct issues. It is exactly `issues.issue_key`, so the report's collapse and
     the issue export agree by construction."""
     from harness import issues
+    if f.issue_id:
+        return ('stable-issue', f.issue_id)
     return issues.issue_key({
         "url": f.url, "method": f.method, "vulnerability_class": f.vulnerability_class,
-        "parameter_location": f.parameter_location, "parameter_name": f.parameter_name})
+        "parameter_location": f.parameter_location, "parameter_name": f.parameter_name,
+        "finding_id": f.finding_id, "fingerprint": f.fingerprint})
 
 
 def _rank_tuple(f: "ReportFinding") -> tuple:
@@ -685,8 +688,11 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
                 lines.append(f"_Evidence chain: `{f.finding_id}` ({verdict} verdict; {repro}; "
                               f"{recon['event_count']} recorded event(s)) -- reconstructable via "
                               f"the findings API without re-reading server logs._")
+            else:
+                lines.append(f"_Evidence chain: `{f.finding_id}` unavailable; no persisted ledger events. "
+                             "This finding is NOT independently reproducible from the stored record._")
         except Exception:
-            pass
+            lines.append(f"_Evidence chain: `{f.finding_id}` unavailable; reconstruction failed._")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -695,7 +701,8 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
 
 def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None,
                              *, config: dict | None = None, engagement_id: str = "",
-                             captured_principal: str | None = None) -> str:
+                             captured_principal: str | None = None,
+                             run_id: str | None = None) -> str:
     """
     Convenience entry point: pulls findings from store.py for the given
     host's URL. `effort_ledger`: optional, forwarded to
@@ -716,9 +723,10 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     """
     from harness import store
     findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal,
-                                       include_chains=True)
+                                       include_chains=True, run_id=run_id)
     all_including_suppressed = store.all_host_findings(url, include_suppressed=True, engagement_id=engagement_id,
-                                                     captured_principal=captured_principal, include_chains=True)
+                                                     captured_principal=captured_principal, include_chains=True,
+                                                     run_id=run_id)
     suppressed_count = len(all_including_suppressed) - len(findings)
     host = store.host_of(url)
     reporting = (config or {}).get("reporting") or {}
@@ -784,7 +792,8 @@ def _demoted_by_reporting_gates(finding: dict, reporting: dict) -> bool:
 
 
 def export_issues_for_host(url: str, *, config: dict | None = None, engagement_id: str = "",
-                          captured_principal: str | None = None) -> list[dict]:
+                          captured_principal: str | None = None,
+                          run_id: str | None = None) -> list[dict]:
     """Convenience: pull a host's findings from store.py and return their T06 issue
     exports, enriched with the FULL append-only proof-attempt history per case
     (store.proofs_for_case) -- so every attempt, including a patched-fixture retest,
@@ -802,10 +811,12 @@ def export_issues_for_host(url: str, *, config: dict | None = None, engagement_i
     byte-for-byte unaffected."""
     from harness import store
     findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal,
-                                       include_chains=True)
+                                       include_chains=True, run_id=run_id)
     reporting = (config or {}).get("reporting") or {}
     if reporting:
         findings = [f for f in findings if not _demoted_by_reporting_gates(f, reporting)]
+    observations = store.finding_observation_history([f['fingerprint'] for f in findings])
+    findings = [{**f, 'observations': observations.get(f['fingerprint'], [])} for f in findings]
     proofs_by_case: dict = {}
     for f in findings:
         cid = f.get("case_id")
@@ -813,7 +824,8 @@ def export_issues_for_host(url: str, *, config: dict | None = None, engagement_i
             attempts = store.proofs_for_case(cid)   # every recorded attempt, append-only
             if engagement_id:
                 owned_runs = {row.get("run_id") for row in findings if row.get("case_id") == cid}
-                attempts = [attempt for attempt in attempts if attempt.get("run_id") in owned_runs]
+                attempts = [attempt for attempt in attempts
+                            if (attempt.get('case') or {}).get('run_id') in owned_runs]
             if attempts:
                 proofs_by_case[cid] = attempts
     # Legacy host-wide overrides have no engagement authority.

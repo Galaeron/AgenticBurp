@@ -58,11 +58,12 @@ class CommandInjectionValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None, run_context=None):
+                 collaborator=None, run_context=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
         self.run_context = run_context
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
 
     def collab(self):
         return self._collab or _collab.shared()
@@ -74,13 +75,12 @@ class CommandInjectionValidator(Validator):
         return ValidationResult(self.name, "skipped", "command_injection", summary=why)
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
-        host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
-            return self._skip(f"host {host!r} out of scope")
+        from harness.scope_lock import host_in_scope
+        if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
+            return self._skip("target origin is out of scope")
         targets = param_targets(exchange)[:_MAX_PARAMS]
         if not targets:
             return self._skip("no parameter to inject a shell payload into")
-        collab = self.collab()
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
         session_ref = None
@@ -136,6 +136,16 @@ class CommandInjectionValidator(Validator):
                                  f"into {param!r}; "
                                  "the response contained the unique command-output marker.")
 
+        if not self.oob_callbacks_enabled:
+            return ValidationResult(
+                self.name, "inconclusive", "command_injection", confidence=0.0,
+                confirmed=False,
+                summary="Command-injection check incomplete: out-of-band callbacks are disabled by policy",
+                evidence=(f"Tried {len(targets)} parameter(s) across {len(_INBAND)} in-band shell forms; "
+                          "blind confirmation requires a separately authorized callback service. "
+                          "No callback listener was opened."))
+
+        collab = self.collab()
         # A loopback collaborator cannot be reached by a remote target. Avoid
         # multiplying the configured timeout across payloads when it cannot
         # produce evidence; explicit/external collaborators still cover blind

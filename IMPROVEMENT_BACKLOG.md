@@ -751,6 +751,11 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 - Distributed execution workers / multi-user server mode (before P0-3 efficacy).
 - More validators or specialist agents (before P2-2 ablation).
 - Additional overlapping engagement concepts (consolidate first).
+- Observed-ID reuse probe — replay object IDs seen in one response against other
+  id-bearing endpoints to surface BOLA/IDOR/BFLA (the cross-request gap behind the
+  crAPI IDOR/BFLA misses). Deterministic step on the existing engagement graph +
+  worklist, **not** a swarm/blackboard. Defer until the decisive crAPI run confirms
+  the gap is what it's for.
 
 Rationale: the review found the leverage is in **proving and auditing** what exists,
 not adding surface area. Prefer changes that reduce components over ones that add a

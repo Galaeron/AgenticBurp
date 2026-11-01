@@ -238,7 +238,7 @@ class CrossRunHypothesisReuseTests(_HypothesisCacheTestBase):
         rc1 = _fresh_run_context(orch, host)
         await orch.analyze(exchange, run_context=rc1, engagement_id=host)
 
-        exchange_hash = cache.ExchangeCache.compute_exchange_hash(exchange, namespace=json.dumps([host, hashlib.sha256(b"").hexdigest()]))
+        exchange_hash = cache.ExchangeCache.compute_exchange_hash(exchange, namespace=json.dumps(["owned-context-v2", host, hashlib.sha256(b"").hexdigest()]))
         conn = sqlite3.connect(str(cache.get_cache()._DB_PATH))
         try:
             row = conn.execute(

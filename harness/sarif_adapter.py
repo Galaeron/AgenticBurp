@@ -162,6 +162,7 @@ def export_issues_to_sarif(issue_exports: list[dict], *, source_revision: str = 
                 "captured_auth_contexts": exp.get("captured_auth_contexts", []),
                 "observation_type": _observation_type(exp),
                 "evidence_refs": exp.get("proof_references", []),
+                "artifacts": exp.get("artifacts", {}),
                 "sourceRevision": source_revision,
                 # R09: fields SARIF's own result schema has no first-class slot
                 # for, preserved as versioned properties instead of silently

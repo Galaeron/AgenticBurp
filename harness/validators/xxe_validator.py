@@ -83,10 +83,11 @@ class XxeValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 collaborator=None):
+                 collaborator=None, oob_callbacks_enabled: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self._collab = collaborator
+        self.oob_callbacks_enabled = bool(oob_callbacks_enabled)
 
     def collab(self):
         return self._collab or _collab.shared()
@@ -98,9 +99,9 @@ class XxeValidator(Validator):
         return ValidationResult(self.name, "skipped", "xxe", summary=why)
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
-        host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
-            return self._skip(f"host {host!r} out of scope")
+        from harness.scope_lock import host_in_scope
+        if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
+            return self._skip("target origin is out of scope")
         if not _looks_xml(exchange):
             return self._skip("endpoint does not take XML -- nothing to inject an external entity into")
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
@@ -133,6 +134,15 @@ class XxeValidator(Validator):
                           f"{exchange.url}; the response contained a /etc/passwd-format line "
                           f"(matched `root:*:0:0:`), proving external-entity file retrieval. The file "
                           f"contents are redacted here; the read is non-destructive."))
+
+        # Blind XXE needs a separately authorized callback service. Never create
+        # its listener when policy disables out-of-band traffic.
+        if not self.oob_callbacks_enabled:
+            return ValidationResult(
+                self.name, "inconclusive", "xxe", confidence=0.0, confirmed=False,
+                summary="XXE check incomplete: out-of-band callbacks are disabled by policy",
+                evidence=("The in-band file-read check ran without confirming. Blind XXE requires a "
+                          "separately authorized callback service; no callback listener was opened."))
 
         # 2) Out-of-band proof: catches BLIND XXE (no reflection) via a collaborator.
         collab = self.collab()

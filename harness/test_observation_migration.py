@@ -47,6 +47,13 @@ class ObservationMigrationTests(unittest.TestCase):
         conn = sqlite3.connect(self.db)
         try:
             conn.executescript(_LEGACY_SQL.read_text(encoding="utf-8"))
+            # The frozen I02 fixture predates these independent finding-column
+            # migrations. Include their exact accepted schema in the baseline so
+            # these controls isolate observation migration/rollback, while still
+            # detecting any other legacy schema or data change.
+            conn.execute("ALTER TABLE findings ADD COLUMN original_severity TEXT")
+            for coordinate in ("parameter_location", "parameter_name", "principal_id"):
+                conn.execute(f"ALTER TABLE findings ADD COLUMN {coordinate} TEXT NOT NULL DEFAULT ''")
             conn.execute("INSERT INTO state_metadata VALUES ('principal-hmac-v1', ?)", ("11" * 32,))
             # Legacy default-pile finding: empty captured principal, as before I02-B.
             conn.execute(

@@ -1,5 +1,9 @@
 # Competitive & Architectural Landscape — where this harness stands
 
+> Current comparison: [eight alternatives, researched 2026-10-09](docs/COMPETITIVE_COMPARISON_2026-10-09.md).
+> The older research below is preserved as historical context. Its prices,
+> deployment assertions and comparative conclusions are not current verified claims.
+
 > **What this is:** a differential teardown of the agentic-AI-pentesting field
 > (~35 projects) and an honest placement of *this* project within it. Written
 > to be handed to a future agent so it doesn't re-derive the comparison from

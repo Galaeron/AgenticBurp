@@ -22,6 +22,8 @@ Bounded and safe:
     whole validator is exercised in tests via an injected fake driver.
 """
 from __future__ import annotations
+
+from harness import scope_lock
 import logging
 import secrets
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -94,7 +96,7 @@ class BrowserXssValidator(Validator):
         if not self.allowed_hosts:
             return True
         host = (urlsplit(url).hostname or "").lower()
-        return any(host == h.lower() or host.endswith("." + h.lower()) for h in self.allowed_hosts)
+        return scope_lock.host_in_scope(url, self.allowed_hosts)
 
     def _candidate_urls(self, exchange: HttpExchange, nonce: str, a: int, b: int) -> list[str]:
         """One URL per (query param, payload): the captured URL with a single

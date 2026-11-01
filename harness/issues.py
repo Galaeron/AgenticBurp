@@ -267,11 +267,17 @@ def issue_key(finding: dict) -> tuple:
     vc = finding.get("vulnerability_class", "") or ""
     canon = canonicalize(vc) or vc.strip().lower()
     if _is_dependency_class(vc):
-        return (host, "", "", canon, "", "read", "")
+        ownership = finding.get('engagement_id') or ''
+        return (host, "", "", canon, "", "read", _short(ownership) if ownership else "")
     family = normalize_path(url) if url else ""
     affected = _affected_input(finding)
     # Unknown input is not a wildcard: keep distinct findings distinct.
     disambiguator = "" if affected else (finding.get("finding_id") or finding.get("fingerprint") or "")
+    # Explicit engagement ownership also scopes issue identity, independently
+    # of run identity. Keep the empty-id legacy grouping contract intact.
+    if finding.get('engagement_id'):
+        disambiguator = _short('engagement-ownership/v1', finding['engagement_id'], finding.get('captured_principal_id'),
+                               finding.get('principal_id'), disambiguator)
     return (host, family, method, canon, affected, _boundary_for(method), disambiguator)
 
 
@@ -451,6 +457,9 @@ def _member_evidence(issue: Issue) -> list[dict]:
             "proof_id": m.get("proof_id") or "",
             "confirmed": bool(m.get("confirmed")),
             "proof_status": m.get("proof_status") or "none",
+            "run_id": m.get("run_id") or "",
+            "exchange_id": m.get("exchange_id") or "",
+            "observations": m.get("observations") or [],
             "evidence": redact((m.get("evidence") or "")[:400]),
         })
     return out

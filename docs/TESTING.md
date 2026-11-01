@@ -3,6 +3,12 @@
 Run from the repository root. `harness/suite.py` is the single selection source
 for local runs and CI; inspect a tier with `python -m harness.suite full --list`.
 
+The reconciled remediation loop excludes active fixture execution. Its selected
+passive controls must never be called the full suite: `smoke` and `full` remain
+open release gates in that context. Historical counts and old build artifacts
+do not establish a pass for a newer source snapshot. See its register and command
+artifacts for actual interpreter, scope, failures, skips and source hashes.
+
 | Command | What runs | What a pass establishes |
 |---|---|---|
 | `python -m harness.suite smoke` | Pipeline smoke, real discovery gate, confirmation-leg fixtures, discovery/async guards and evidence gate | Selected caller paths still work under controlled inputs |
@@ -30,7 +36,7 @@ python -m pip install -e ".[dev]" Flask==3.1.3
 ```
 
 Full discovery also imports the optional proxy tests, which require
-`mitmproxy==12.2.3`. Browser fixture checks require Playwright and Chromium and
+`mitmproxy==12.3.1` and patched `brotli==1.2.1` (CVE-2026-111497). Browser fixture checks require Playwright and Chromium and
 may skip without them. Missing dependencies must be reported as errors/skips;
 never stub them merely to turn the suite green.
 

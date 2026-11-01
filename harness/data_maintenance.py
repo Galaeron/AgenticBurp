@@ -1,4 +1,4 @@
-"""Explicit SQLite snapshot maintenance. No implicit paths or destructive commands."""
+"""Explicit-path SQLite backup, restore and attributed-context deletion."""
 from __future__ import annotations
 
 import argparse
@@ -18,7 +18,7 @@ def maintenance_plan() -> dict:
             "actions": [
                 {"store": "main SQLite", "supported": "explicit verified backup/restore to new path",
                  "retention": "explicit global evidence-blob expiry only; default keep forever",
-                 "deletion": "opt-in host subset only; no context-wide erasure"},
+                 "deletion": "explicit wipe-context for engagement-owned subset; opt-in host-wide subset remains separate"},
                 {"store": "cache SQLite", "supported": "explicit SQLite backup/restore to new path",
                  "retention": "cache clear/expiry APIs; no age-based physical erasure guarantee"},
                 {"store": "logs", "supported": "operator-owned sink rotation and closed-file handling",

@@ -24,6 +24,8 @@ validators.allow_mutating_replay (safety gate).
 """
 from __future__ import annotations
 
+from harness import scope_lock
+
 import secrets
 from dataclasses import replace
 from urllib.parse import urlsplit
@@ -121,7 +123,7 @@ class SstiValidator(Validator):
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         targets = param_targets(exchange)[:_MAX_PARAMS]
         if not targets:

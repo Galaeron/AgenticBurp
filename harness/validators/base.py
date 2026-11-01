@@ -1,9 +1,23 @@
 from __future__ import annotations
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from harness.models import Finding, HttpExchange, TestPlan
 from harness.categories import canonicalize, distinctive_token
+
+# Review pt 6 (second pass): an agent routinely writes a human-readable label
+# ("Verbose Error", "Stack Trace", "Missing CSRF Token") whose snake_case form
+# IS a declared finding class, but lowercasing alone leaves the spaces in, so
+# "verbose error" never matched "verbose_error". Collapse runs of whitespace,
+# hyphens and slashes to a single underscore so the natural label reaches the
+# validator that declares its snake_case class. canonicalize() stays strict and
+# is unchanged -- this only adds a literal snake_case candidate.
+_LABEL_SEP_RE = re.compile(r"[\s/\\-]+")
+
+
+def _snake_label(raw: str) -> str:
+    return _LABEL_SEP_RE.sub("_", raw).strip("_")
 
 
 @dataclass
@@ -67,17 +81,20 @@ class Validator(ABC):
         # categories.py's synonym table (e.g. "sql injection" itself)
         # still works during the transition.
         raw = finding.vulnerability_class.lower()
+        norm = _snake_label(raw)  # "verbose error" -> "verbose_error" (pt 6)
         category = canonicalize(finding.vulnerability_class)
         fcs = self.finding_classes
-        if raw in fcs or (category is not None and category in fcs):
+        if raw in fcs or norm in fcs or (category is not None and category in fcs):
             return True
         # Review pt 6 -- synonym/canonical spelling mismatch: a validator may
         # declare a SYNONYM in finding_classes (e.g. verbose_error lists
         # "information_disclosure") while the agent writes the CANONICAL class
         # ("info_disclosure"), or vice-versa. Compare on canonical identity so
         # the two spellings of the same class never silently fail to route.
+        # The snake_case label is also compared here so a validator that only
+        # declares a synonym still catches the spaced natural label.
         canon_fcs = {canonicalize(fc) or fc for fc in fcs}
-        if category is not None and category in canon_fcs:
+        if (category is not None and category in canon_fcs) or norm in canon_fcs:
             return True
         # Review pt 6 -- embedded-title token: the model often writes a
         # specific finding TITLE that embeds an unambiguous class token

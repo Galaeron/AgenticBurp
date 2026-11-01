@@ -1,4 +1,5 @@
 from __future__ import annotations
+from contextlib import closing
 import sqlite3
 import time
 import random
@@ -136,6 +137,9 @@ CREATE TABLE IF NOT EXISTS findings (
     run_id TEXT NOT NULL DEFAULT '',
     engagement_id TEXT NOT NULL DEFAULT '',
     captured_principal_id TEXT NOT NULL DEFAULT '',
+    parameter_location TEXT NOT NULL DEFAULT '',
+    parameter_name TEXT NOT NULL DEFAULT '',
+    principal_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_findings_host ON findings(host);
@@ -515,6 +519,20 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE proof_records ADD COLUMN finding_ref TEXT NOT NULL DEFAULT ''")
 
     cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)")}
+    if "original_severity" not in cols:
+        try:
+            conn.execute("ALTER TABLE findings ADD COLUMN original_severity TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
+    # Passive findings have no proof record from which to recover coordinates.
+    for coordinate in ('parameter_location', 'parameter_name', 'principal_id'):
+        if coordinate not in cols:
+            try:
+                conn.execute(f"ALTER TABLE findings ADD COLUMN {coordinate} TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
     if "confirmed" not in cols:
         conn.execute("ALTER TABLE findings ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
     if "fingerprint" not in cols:
@@ -744,7 +762,9 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
                 host, exchange.method, exchange.url, f.vulnerability_class,
                 parameter_location=getattr(f, "parameter_location", "") or "",
                 parameter_name=getattr(f, "parameter_name", "") or "",
-                principal_id=(captured_principal if engagement_id else getattr(f, "principal_id", "") or ""),
+                principal_id=(json.dumps([captured_principal, f.principal_id])
+                              if engagement_id and f.principal_id else
+                              captured_principal if engagement_id else f.principal_id or ""),
                 engagement_id=engagement_id,
             )
             fingerprints.append(fingerprint)
@@ -754,15 +774,17 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
                          model, prompt_version, f.finding_id, f.case_id, f.proof_id,
                          int(getattr(f, "oracle_verified", False)),
                          getattr(f, "verification_state", "candidate") or "candidate",
-                         getattr(f, "oracle_capsule_id", "") or "", exchange_id, run_id, engagement_id, captured_principal, now))
+                         getattr(f, "oracle_capsule_id", "") or "", exchange_id, run_id, engagement_id, captured_principal,
+                         f.parameter_location, f.parameter_name, f.principal_id, f.original_severity, now))
         conn.executemany(
             """INSERT OR IGNORE INTO findings
                (host, url, method, agent, vulnerability_class, severity,
                 confidence, summary, basis, evidence, suggested_test, owasp_category,
                 review_verdict, confirmed, fingerprint, model, prompt_version,
                 finding_id, case_id, proof_id, oracle_verified, verification_state,
-                oracle_capsule_id, exchange_id, run_id, engagement_id, captured_principal_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                oracle_capsule_id, exchange_id, run_id, engagement_id, captured_principal_id,
+                parameter_location, parameter_name, principal_id, original_severity, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
         # AR-3: one observation row per (finding, exchange), regardless of
         # whether the findings INSERT above was a fresh row or an IGNOREd
         # duplicate -- a deduped finding still records this exchange as a
@@ -777,6 +799,27 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
         conn.commit()
     finally:
         conn.close()
+
+
+def finding_observation_history(fingerprints: list[str]) -> dict[str, list[dict]]:
+    """Read existing append-only sightings for explicitly selected findings.
+
+    Unlike finding_observations, this export view retains the run coordinate;
+    identical captures observed in distinct runs remain distinct sightings.
+    It describes passive observations, never a validation attempt/verdict.
+    """
+    if not fingerprints:
+        return {}
+    with closing(_connect()) as conn:
+        placeholders = ','.join('?' for _ in fingerprints)
+        rows = conn.execute(
+            f'SELECT fingerprint, run_id, exchange_id, created_at FROM finding_observations '
+            f'WHERE fingerprint IN ({placeholders}) ORDER BY created_at', fingerprints).fetchall()
+    result: dict[str, list[dict]] = {}
+    for fingerprint, run_id, exchange_id, created_at in rows:
+        result.setdefault(fingerprint, []).append(dict(run_id=run_id, exchange_id=exchange_id,
+                                                       created_at=created_at))
+    return result
 
 
 def finding_observations(fingerprints: list[str] | None = None) -> dict[str, list[str]]:
@@ -1696,7 +1739,7 @@ def prior_findings_summary(url: str, exclude_url: str | None = None, limit: int 
 
 def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_id: str = "",
                       captured_principal: str | None = None,
-                      include_chains: bool = False) -> list[dict]:
+                      include_chains: bool = False, run_id: str | None = None) -> list[dict]:
     """
     Full (not summarized) finding records for a host, for chain detection
     and report generation.
@@ -1727,18 +1770,23 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                       f.evidence, f.suggested_test, f.owasp_category, f.basis, f.confirmed,
                       f.agent, f.fingerprint, f.finding_id, f.case_id, f.proof_id,
                       f.method, f.review_verdict,
-                      (SELECT parameter_location FROM proof_records WHERE case_id = f.case_id LIMIT 1),
-                      (SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1),
-                      (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1),
+                      COALESCE(NULLIF(f.parameter_location, ''),
+                        (SELECT parameter_location FROM proof_records WHERE case_id = f.case_id LIMIT 1)),
+                      COALESCE(NULLIF(f.parameter_name, ''),
+                        (SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1)),
+                      COALESCE(NULLIF(f.principal_id, ''),
+                        (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1)),
                       s.fingerprint IS NOT NULL AS suppressed,
                       f.oracle_verified, f.verification_state, f.oracle_capsule_id,
-                      f.exchange_id, f.run_id, f.captured_principal_id
+                      f.exchange_id, f.run_id, f.captured_principal_id, f.original_severity
                FROM findings f
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                WHERE f.host = ? AND f.engagement_id = ?
                  AND (? IS NULL OR f.captured_principal_id = ?)
+                 AND (? IS NULL OR f.run_id = ?)
                ORDER BY f.created_at ASC""",
-            (host, _engagement_partition(engagement_id), captured_principal, captured_principal),
+            (host, _engagement_partition(engagement_id), captured_principal, captured_principal,
+             run_id, run_id),
         ).fetchall()
     finally:
         conn.close()
@@ -1747,7 +1795,8 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
     # export -- additive keys; existing consumers read by name and are unaffected.
     from harness import confirmation_gate
     results = [
-        {"url": u, "vulnerability_class": vc, "severity": sev, "confidence": conf, "summary": s,
+        {"url": u, "vulnerability_class": vc, "severity": sev, "original_severity": original_severity,
+         "confidence": conf, "summary": s,
          "evidence": ev, "suggested_test": st, "owasp_category": oc, "basis": basis,
          "confirmed": bool(confirmed), "agent": agent, "fingerprint": fp,
          "finding_id": finding_id, "case_id": case_id, "proof_id": proof_id,
@@ -1771,7 +1820,7 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
          "exchange_id": exchange_id or "", "run_id": run_id or "", "engagement_id": engagement_id}
         for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
              finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed,
-             oracle_verified, vstate, capsule_id, exchange_id, run_id, captured_principal_id) in rows
+             oracle_verified, vstate, capsule_id, exchange_id, run_id, captured_principal_id, original_severity) in rows
     ]
     _resolve_confirmation_proofs(results)
     if not include_suppressed:

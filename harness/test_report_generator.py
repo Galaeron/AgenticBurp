@@ -246,6 +246,26 @@ class TestStoreIntegrationRoundTrip(unittest.TestCase):
         self.assertIn("A03:2021-Injection", report)
         self.assertIn("parameterized queries", report)
 
+    def test_run_id_binding_and_filter_keep_an_investigation_report_run_scoped(self):
+        from harness import telemetry
+        def persist(path, run_id, summary):
+            telemetry.bind_current_run(run_id)
+            store.persist_findings(
+                HttpExchange(url=f"https://shop.example.com/{path}", method="GET"),
+                "synthetic", [Finding(vulnerability_class="xss", confidence=0.5,
+                                       summary=summary, evidence="candidate",
+                                       suggested_test="review response", basis="derived")])
+
+        persist("first", "run-first", "first run candidate")
+        persist("second", "run-second", "second run candidate")
+        telemetry.bind_current_run(None)
+
+        first = store.all_host_findings("https://shop.example.com", run_id="run-first")
+        second = store.all_host_findings("https://shop.example.com", run_id="run-second")
+        self.assertEqual([f["summary"] for f in first], ["first run candidate"])
+        self.assertEqual([f["run_id"] for f in first], ["run-first"])
+        self.assertEqual([f["summary"] for f in second], ["second run candidate"])
+
 
 class TestCostAwareRankingOfUnconfirmedFindings(unittest.TestCase):
     """

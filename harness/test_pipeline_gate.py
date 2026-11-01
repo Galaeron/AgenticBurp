@@ -98,10 +98,11 @@ class _PipelineRun:
     boundary stubbed and ffuf disabled. `defect` optionally patches a piece of the
     real pipeline to reintroduce a known regression."""
 
-    def __init__(self, mode: str, *, probes: int = DISCOVERY_PROBES, defect=None):
+    def __init__(self, mode: str, *, probes: int = DISCOVERY_PROBES, defect=None, exact_port=False):
         self.mode = mode
         self.probes = probes
         self.defect = defect
+        self.exact_port = exact_port
 
     def run(self) -> tuple[dict, DiscoveryPipelineFixture]:
         """Run and tear down before returning: store._DB_PATH/cache._cache are
@@ -139,8 +140,11 @@ class _PipelineRun:
         global_throttle.configure(0)
         fx = DiscoveryPipelineFixture(self.mode)
         try:
-            orch = Orchestrator(_gate_config())
-            orch.allowed_hosts = list(ALLOWED)
+            cfg = _gate_config()
+            allowed = [fx.base.split("//", 1)[1]] if self.exact_port else list(ALLOWED)
+            cfg["server"]["allowed_hosts"] = allowed
+            orch = Orchestrator(cfg)
+            orch.allowed_hosts = allowed
             _install_silent_model(orch)   # the only stubbed boundary
             orch.run_active_probe = AsyncMock(return_value={
                 "iterative_result": {"stop_reason": "gave_up", "findings": []},
@@ -243,7 +247,9 @@ class RealPipelineGateTest(unittest.TestCase):
         project."""
         result, fx = _PipelineRun("vulnerable").run()
         try:
-            self.assertFalse(result.get("degraded"), f"run degraded: {result.get('errors')}")
+            self.assertFalse(result.get("errors"), f"operational errors: {result.get('errors')}")
+            self.assertEqual(result["assessment"]["status"], "incomplete")
+            self.assertTrue(result["degraded"])
             surface = _surface(result)
             obj = _node(result, "GET", "/api/notes/{id}")
             self.assertIsNotNone(

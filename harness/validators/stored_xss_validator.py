@@ -30,6 +30,8 @@ validators.allow_mutating_replay and routes through the safety gate.
 """
 from __future__ import annotations
 
+from harness import scope_lock
+
 import json
 import secrets
 from urllib.parse import urlsplit, urlunsplit
@@ -248,7 +250,7 @@ class StoredXssValidator(Validator):
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
-        if self.allowed_hosts and host not in self.allowed_hosts:
+        if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         gate = self.run_context.gate if self.run_context is not None else get_default_gate()
         if not gate.config.allow_mutating_replay:

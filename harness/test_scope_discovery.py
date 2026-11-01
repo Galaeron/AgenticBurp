@@ -61,8 +61,8 @@ class IsHostAllowedTests(unittest.TestCase):
         self.assertTrue(scope_discovery.is_host_allowed("http://localhost:5002/x", ["localhost"]))
         self.assertTrue(scope_discovery.is_host_allowed("http://localhost:11434/x", ["localhost"]))
 
-    def test_host_port_entry_is_denied_in_shared_intersection(self):
-        self.assertFalse(scope_discovery.is_host_allowed("http://localhost:5002/x", ["localhost:5002"]))
+    def test_host_port_entry_matches_only_explicitly_named_service(self):
+        self.assertTrue(scope_discovery.is_host_allowed("http://localhost:5002/x", ["localhost:5002"]))
         # A scope pinned to :5002 must NOT authorize Ollama on :11434 or the
         # harness itself on :8787 -- the "localhost authorizes all local
         # services" gap W-17 closes.
@@ -70,8 +70,10 @@ class IsHostAllowedTests(unittest.TestCase):
         self.assertFalse(scope_discovery.is_host_allowed("http://localhost:8787/x", ["localhost:5002"]))
 
     def test_host_port_entry_default_port_is_still_denied(self):
+        # A host-only URL does not explicitly select the configured service port.
         self.assertFalse(scope_discovery.is_host_allowed("https://target.invalid/x", ["target.invalid:443"]))
         self.assertFalse(scope_discovery.is_host_allowed("https://target.invalid/x", ["target.invalid:8443"]))
+        self.assertTrue(scope_discovery.is_host_allowed("https://target.invalid:443/x", ["target.invalid:443"]))
 
     # --- W-17: scheme precision ---
     def test_scheme_qualified_entry_is_denied_in_shared_intersection(self):

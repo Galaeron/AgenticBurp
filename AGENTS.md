@@ -70,6 +70,13 @@ Most usage is long contexts (>150k), so keep sessions short:
   summary file; read that, and grep only failures.
 - Read the plan/guide by ticket section (grep the heading, read that range).
 - At most 3 sessions in parallel. Sonnet for tests-only/mechanical batches.
+- Start a fresh session when switching topics; use `/clear` where supported.
+- Compact early where supported, keeping decisions, file list, verification and
+  exact next step; do not wait for automatic compaction.
+- Prefer a lighter model for routine edits; reserve heavy reasoning for hard bugs
+  and planning. Do not claim to change models or session state without doing so.
+- Handoffs must name the exact files, requested change, acceptance checks and next
+  command. Update NOTES.md at session end; link batch HANDOFF.md for details.
 
 ## Keep onboarding bounded
 
