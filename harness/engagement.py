@@ -246,6 +246,19 @@ def role_view_from_cells(cells: dict, prior_access: dict | None = None,
     return access, reachable
 
 
+def principal_reached(cells: dict | None, reachable_roles, principal_id: str, role: str) -> bool:
+    """Whether ONE principal reached an operation, for readers that pick or
+    skip an identity (coverage, the worklist probe, the JWT leg). The
+    principal's own cell decides when it has one: a principal denied with 403
+    never counts as reaching because another principal of its role -- or one
+    NAMED like its role -- did. A principal with no cell (a legacy role-only
+    record, or one this matrix never probed) falls back to the role view."""
+    cell = (cells or {}).get(principal_id)
+    if isinstance(cell, dict):
+        return bool(cell.get("reachable"))
+    return (role or principal_id) in (reachable_roles or [])
+
+
 def _status_values(v) -> list:
     return list(v) if isinstance(v, (list, tuple)) else [v]
 

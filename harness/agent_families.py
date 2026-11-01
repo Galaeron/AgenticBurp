@@ -192,6 +192,7 @@ class FamilyRunner:
 
     async def run(self, exchange: "HttpExchange", max_body_chars: int,
                   prior_context: str = "", effort_budget=None) -> "AgentReport":
+        from harness.agents.base_agent import required_findings
         from harness.models import AgentReport, Finding, ComponentCandidate, sanitize_agent_finding
         from harness.ollama_client import OllamaError
 
@@ -205,7 +206,7 @@ class FamilyRunner:
                 system_prompt=self._system_prompt(), user_prompt=user_prompt,
                 temperature=agent.temperature,
             )
-            raw_findings = parsed.get("findings", [])
+            raw_findings = required_findings(parsed)
             # W-7/W-24/R02, same as BaseAgent.run: strip harness-owned
             # authority fields from untrusted model output before it
             # becomes a Finding. vulnerability_class itself is preserved

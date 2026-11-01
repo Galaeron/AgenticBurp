@@ -136,6 +136,8 @@ public class ProgressPanel extends JPanel {
                 progressBar.setForeground(Color.RED);
             } else if (status.getStatus() == AnalysisStatus.Status.CANCELLED) {
                 progressBar.setForeground(Color.GRAY);
+            } else if (status.getStatus() == AnalysisStatus.Status.DEGRADED) {
+                progressBar.setForeground(Color.ORANGE);
             } else {
                 progressBar.setForeground(new Color(0, 128, 0));
             }
@@ -182,6 +184,7 @@ public class ProgressPanel extends JPanel {
                 case QUEUED -> "⏳";
                 case ANALYZING -> "🔄";
                 case COMPLETED -> "✅";
+                case DEGRADED -> "⚠️";
                 case ERROR -> "❌";
                 case CANCELLED -> "⏹️";
             };

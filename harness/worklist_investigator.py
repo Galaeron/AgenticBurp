@@ -266,6 +266,8 @@ async def investigate_worklist(
     budget with eligible work still on the table.
 
     Returns a per-node outcome list; findings are folded back into `state`."""
+    from harness.coverage_tracker import _principal_of
+    from harness.engagement import principal_reached
     role_headers = {r.role: dict(r.headers or {}) for r in roles}
     outcomes: list[dict] = []
     investigated = 0
@@ -305,7 +307,13 @@ async def investigate_worklist(
         reach = node.get("reachable_roles", []) or []
         # probe from the lowest-trust identity that can reach it (strongest proof).
         probe_role = min(reach, key=_trust) if reach else (roles[0].role if roles else "anonymous")
-        headers = role_headers.get(probe_role, {})
+        # WL-02: within that role, probe as a principal whose OWN cell reached the
+        # node, so a same-role principal that was denied is never the one used.
+        cells = node.get("access_by_principal") or {}
+        probe_session = next((r for r in roles if r.role == probe_role
+                              and principal_reached(cells, reach, _principal_of(r), r.role)), None)
+        headers = (dict(probe_session.headers or {}) if probe_session is not None
+                   else role_headers.get(probe_role, {}))
         parent_id = _parent_template_object_id(state, node)
         exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
 
@@ -383,6 +391,7 @@ async def investigate_worklist(
             "path": node.get("path"),
             "specialty": derived[0] if derived else None,
             "probe_role": probe_role,
+            "probe_principal": _principal_of(probe_session) if probe_session is not None else None,
             "findings": len(node_findings),
             "findings_detail": node_findings,
             "precondition_findings": len(precond_findings),

@@ -10,6 +10,9 @@ public class AnalysisStatus {
         QUEUED("Queued", "Waiting in queue"),
         ANALYZING("Analyzing", "Analysis in progress"),
         COMPLETED("Completed", "Analysis finished"),
+        // X08: the harness returned a result but flagged it degraded -- some
+        // model agents or stages failed, so an absent finding is not a clean miss.
+        DEGRADED("Degraded", "Analysis finished, but model agents or stages failed"),
         ERROR("Error", "Analysis failed"),
         CANCELLED("Cancelled", "Analysis was cancelled");
         
@@ -23,6 +26,22 @@ public class AnalysisStatus {
         
         public String getDisplayName() { return displayName; }
         public String getDescription() { return description; }
+
+        public boolean isTerminal() {
+            return this == COMPLETED || this == DEGRADED || this == ERROR || this == CANCELLED;
+        }
+    }
+
+    /**
+     * Terminal status for a returned analysis: DEGRADED when the harness flagged
+     * the result degraded or partial (X08), otherwise COMPLETED. An older server
+     * that sends neither field reads as COMPLETED, as before.
+     */
+    public static Status completionStatus(com.harness.llm.model.AnalysisModels.AnalysisResponse response) {
+        if (response != null && (response.degraded || response.partial_inference)) {
+            return Status.DEGRADED;
+        }
+        return Status.COMPLETED;
     }
     
     private final String requestLabel;
@@ -109,7 +128,7 @@ public class AnalysisStatus {
     }
     
     public String getEstimatedTimeRemaining() {
-        if (status == Status.COMPLETED || status == Status.ERROR || status == Status.CANCELLED) {
+        if (status.isTerminal()) {
             return "";
         }
         if (agentsCompleted == 0) {

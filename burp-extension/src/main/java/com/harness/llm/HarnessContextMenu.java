@@ -353,7 +353,9 @@ public class HarnessContextMenu implements ContextMenuItemsProvider {
                                     }
                                 }
                                 for (int i = 0; i < findingCount; i++) analysisTracker.addFinding(requestId);
-                                analysisTracker.updateStatus(requestId, com.harness.llm.ui.AnalysisStatus.Status.COMPLETED);
+                                // X08: a degraded/partial result is not shown as a clean completion.
+                                analysisTracker.updateStatus(requestId,
+                                        com.harness.llm.ui.AnalysisStatus.completionStatus(analysis));
                             }
                             onSuccess.accept(label, result);
                         } else {
