@@ -591,6 +591,9 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
             f"a fix means the {boundary_word} attempt no longer succeeds. This retest "
             f"maps to issue {issue.issue_id} (stable id), so the result links to this "
             f"issue -- and is appended as a new attempt -- instead of opening a new one."),
+        # I16 (I04 parity): the representative finding's next step, as the API,
+        # Burp "Next step" and the Markdown report already show it.
+        "suggested_test": redact((best.get("suggested_test") or "")[:1200]),
     })
 
 
