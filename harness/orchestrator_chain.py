@@ -693,44 +693,48 @@ class ChainMixin:
         run_context._declared_ownership = cached
         return cached[origin]
 
-    async def _handoff_experiment(self, action, run_context):
-        """A closed selection of an existing hypothesis, never model-authored I/O."""
-        from harness import experiment, experiment_planner, task_graph, store
-        from harness.assessment_health import stored_proof_artifacts_resolve
+    def _experiment_selection_readiness(self, action, run_context):
+        """AR-09: every check a selection must pass before the controller may send,
+        with no send and no graph change. Returns (refusal, ready); exactly one is
+        None. `refusal` is a typed disposition; `ready` carries what the handoff
+        needs to run the selected hypothesis."""
+        from harness import experiment, experiment_planner
         def disposition(status, reason, **extra):
             return dict(status=status, readiness=reason, fresh_attempt_ids=[],
                         referenced_attempt_ids=[], budget_spent=0, **extra)
+        def refuse(status, reason):
+            return disposition(status, reason), None
         if set(action) != {"action", "kind", "hypothesis"}:
-            return disposition("rejected", "selection fields must be action, kind, hypothesis")
+            return refuse("rejected", "selection fields must be action, kind, hypothesis")
         if not self._experiments_config().get("enabled", False):
-            return disposition("disabled", "experiments disabled")
+            return refuse("disabled", "experiments disabled")
         context = getattr(run_context, "experiment_context", None)
         if not context:
-            return disposition("needs_prerequisite", "owning engagement context unavailable")
+            return refuse("needs_prerequisite", "owning engagement context unavailable")
         state, asm = context["state"], context["asm"]
         hypotheses = {h.id: h for h in getattr(asm, "chaining_hypotheses", [])}
         if experiment_planner.validate_instantiation(action.get("kind"), action.get("hypothesis"), hypotheses):
-            return disposition("rejected", "unknown mechanism or hypothesis")
+            return refuse("rejected", "unknown mechanism or hypothesis")
         hid = action["hypothesis"]
         hyp = hypotheses[hid]
         if action["kind"] not in experiment.BROWSER_KINDS and (action["kind"] != experiment.KIND or not experiment.supports(hyp)):
-            return disposition("rejected", "hypothesis does not support this mechanism")
+            return refuse("rejected", "hypothesis does not support this mechanism")
         if run_context.cancel.cancelled:
-            return disposition("cancelled", "owning run cancelled")
+            return refuse("cancelled", "owning run cancelled")
         if not run_context.scope.in_scope(context["base_url"]):
-            return disposition("blocked", "target outside owning scope")
+            return refuse("blocked", "target outside owning scope")
         gate = run_context.gate.config
         if not gate.active_enabled or (action["kind"] != experiment.BROWSER_HASH and not gate.allow_mutating_replay):
-            return disposition("blocked", "active and mutating permissions required")
+            return refuse("blocked", "active and mutating permissions required")
         expectations = (self.config.get("engagement", {}) or {}).get("access_expectations", [])
         sessions = experiment.run_sessions(run_context)
         plan = (experiment.translate_browser(hid, asm, run_context, check_cost=False) if action['kind'] in experiment.BROWSER_KINDS else
                 experiment.translate_cross_account(hyp, asm, expectations, sessions,
                     state.observed_values, base_url=context["base_url"]))
         if not plan.ready:
-            return disposition("needs_prerequisite", "; ".join(plan.missing))
+            return refuse("needs_prerequisite", "; ".join(plan.missing))
         if plan.experiment.kind != action["kind"]:
-            return disposition("rejected", "declared mechanism does not match selection")
+            return refuse("rejected", "declared mechanism does not match selection")
         from harness.run_context import ScopePolicy
         for step in (plan.experiment.setup_steps + plan.experiment.baseline_steps +
                      plan.experiment.attack_steps + plan.experiment.control_steps + plan.experiment.cleanup_steps):
@@ -738,7 +742,46 @@ class ChainMixin:
             if (session is None or session.health == 'expired' or
                     ScopePolicy.origin_of(step.url_template) not in session.allowed_origins or
                     not run_context.scope.in_scope(step.url_template)):
-                return disposition("needs_prerequisite", "required identity is not authorized for step origin")
+                return refuse("needs_prerequisite", "required identity is not authorized for step origin")
+        return None, dict(state=state, asm=asm, hid=hid, plan=plan, context=context,
+                          expectations=expectations, sessions=sessions)
+
+    def _experiment_catalog(self, run_context) -> dict:
+        """AR-09: the mechanisms the iterative worker may be offered right now.
+        `ready` passes every pre-send check; `unavailable` names each declared
+        candidate that does not, with its typed reason. Pure: nothing is sent."""
+        from harness import experiment, security
+        context = getattr(run_context, "experiment_context", None)
+        if not context or not self._experiments_config().get("enabled", False):
+            return {"ready": [], "unavailable": []}
+        candidates = [(experiment.KIND, h.id) for h in getattr(context["asm"], "chaining_hypotheses", [])
+                      if experiment.supports(h)]
+        bindings = ((run_context.config or {}).get("engagement", {}) or {}).get("browser_bindings", []) or []
+        candidates += [(b.get("mechanism"), b.get("hypothesis_id")) for b in bindings
+                       if b.get("mechanism") in experiment.BROWSER_KINDS]
+        catalog = {"ready": [], "unavailable": []}
+        for kind, hid in dict.fromkeys(candidates):
+            refusal, _ = self._experiment_selection_readiness(
+                {"action": "experiment", "kind": kind, "hypothesis": hid}, run_context)
+            entry = {"kind": kind, "hypothesis": hid}
+            if refusal is None:
+                catalog["ready"].append(entry)
+            else:
+                catalog["unavailable"].append(dict(entry, reason=security.sanitize_text(refusal["readiness"])))
+        return catalog
+
+    async def _handoff_experiment(self, action, run_context):
+        """A closed selection of an existing hypothesis, never model-authored I/O."""
+        from harness import experiment, task_graph, store
+        from harness.assessment_health import stored_proof_artifacts_resolve
+        def disposition(status, reason, **extra):
+            return dict(status=status, readiness=reason, fresh_attempt_ids=[],
+                        referenced_attempt_ids=[], budget_spent=0, **extra)
+        refusal, ready = self._experiment_selection_readiness(action, run_context)
+        if refusal is not None:
+            return refusal
+        state, asm, hid, plan, context = (ready[k] for k in ("state", "asm", "hid", "plan", "context"))
+        expectations, sessions = ready["expectations"], ready["sessions"]
         experiment._evaluate_browser(state, asm, run_context)
         experiment.evaluate_experiments(state, asm, expectations, sessions,
                     base_url=context["base_url"])

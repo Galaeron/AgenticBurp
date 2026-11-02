@@ -42,6 +42,7 @@ import httpx  # noqa: F401 -- HTTP transport site; sends now go via run_context.
 
 from harness import global_throttle
 from harness.models import Finding, HttpExchange, sanitize_agent_finding
+from harness.ollama_client import OllamaInvalidJSONError
 from harness.safety_gate import get_default_gate
 from harness.security import SECRET_HEADER_NAMES  # the one classifier behind redact_headers
 from harness.run_context import transport_for  # W-16: the single TargetTransport
@@ -84,6 +85,12 @@ _PRIOR_ATTEMPTS_WINDOW = 25     # attempt lines carried in each prompt
 _VALUE_EXCERPT_CHARS = 60       # payload value shown per attempt line
 _TARGET_RENDER_CHARS = 160      # normalized target shown per attempt line
 _OUTCOME_RENDER_CHARS = 100     # outcome (status+length, or block reason) per line
+
+
+def _attempt_id(key: str) -> str:
+    """AR-09: the stable ID of a distinct request, derived from its attempt key,
+    so a duplicate proposal cites the same ID the first send carried."""
+    return "req:" + key[:16]
 
 
 def _excerpt(text: object, limit: int = _VALUE_EXCERPT_CHARS) -> str:
@@ -237,6 +244,10 @@ class AttemptRecord:
     outcome: str       # "HTTP <status>, <n> bytes" or the block reason
     key: str = ""
 
+    @property
+    def attempt_id(self) -> str:
+        return _attempt_id(self.key)
+
     def line(self) -> str:
         return (f"- step {self.step}: {self.kind} {self.location}:{_excerpt(self.name)}"
                 f"={json.dumps(self.value)} | {self.method} "
@@ -299,6 +310,7 @@ class IterativeStep:
     response_status: int | None
     response_summary: str
     blocked: str | None = None
+    attempt_id: str = ""     # AR-09: request attempt ID, or the proof ID a mechanism produced/reused
 
 
 @dataclass
@@ -307,7 +319,7 @@ class IterativeResult:
     findings: list[Finding] = field(default_factory=list)
     handoff_note: str = ""
     steps_used: int = 0
-    stop_reason: str = ""            # found|exhausted_steps|gave_up|budget|error|target_distress|no_progress|repeated_duplicates
+    stop_reason: str = ""            # found|exhausted_steps|gave_up|refused|budget|error|target_distress|no_progress|repeated_duplicates
     transcript: list[IterativeStep] = field(default_factory=list)
     # Ticket D: proposals rejected before transport because the built request
     # was already attempted, and distinct requests actually tried (sent, or
@@ -315,6 +327,13 @@ class IterativeResult:
     duplicate_proposals: int = 0
     mechanism_results: list[dict] = field(default_factory=list)
     distinct_requests: int = 0
+    # AR-09: progress accounting, counts and IDs only (never prompt or payload
+    # text). A refusal is only the model's explicit `verdict: "refused"`; an
+    # empty object is a parse error and a failed send is a blocked attempt.
+    diagnostics: dict = field(default_factory=lambda: {
+        "parse_errors": 0, "refusals": 0, "rejected_proposals": 0,
+        "unavailable_selections": 0, "duplicate_proposals": 0, "blocked_attempts": 0,
+        "useful_unique_actions": 0, "evidence_attempt_ids": []})
 
     def to_dict(self) -> dict:
         return {
@@ -326,9 +345,11 @@ class IterativeResult:
             "stop_reason": self.stop_reason,
             "duplicate_proposals": self.duplicate_proposals,
             "distinct_requests": self.distinct_requests,
+            "diagnostics": dict(self.diagnostics, duplicate_proposals=self.duplicate_proposals),
             "transcript": [
                 {"n": s.n, "action": s.action, "request": s.request_summary,
-                 "status": s.response_status, "response": s.response_summary, "blocked": s.blocked}
+                 "status": s.response_status, "response": s.response_summary, "blocked": s.blocked,
+                 "attempt_id": s.attempt_id}
                 for s in self.transcript
             ],
         }
@@ -345,10 +366,10 @@ Each turn, respond with ONLY a JSON object choosing exactly one action:
         this is how you ENUMERATE an object id to test IDOR/BOLA on a path like /tickets/1.
   {{"action":"set_header","name":"<header>","value":"<value>","thought":"<one line>"}}
      -- resend with a request header set/overridden (persists for later steps).
-  {{"action":"stop","verdict":"found|not_found","thought":"<one line>",
+  {{"action":"stop","verdict":"found|not_found|refused","thought":"<one line>",
     "finding":{{"vulnerability_class":"...","confidence":0.0-1.0,"severity":"info|low|medium|high|critical",
                "summary":"...","evidence":"...","suggested_test":"...","basis":"derived"}}}}
-     -- stop. Include "finding" ONLY when verdict is "found".
+     -- stop. Include "finding" ONLY when verdict is "found". Use "refused" only if you decline the task.
 
 Rules:
 - You cannot choose the URL, host, or method -- only payload values and which bounded knob to turn.
@@ -361,7 +382,8 @@ Rules:
 
 class IterativeAgent:
     def __init__(self, ollama, model: str, allowed_hosts: list[str], *, temperature: float = 0.2,
-                 max_steps: int = 250, run_context=None, experiment_handoff=None):
+                 max_steps: int = 250, run_context=None, experiment_handoff=None,
+                 experiment_catalog=None):
         self.ollama = ollama
         self.model = model
         self.allowed_hosts = allowed_hosts or []
@@ -376,6 +398,9 @@ class IterativeAgent:
         # that no parent accounting ever covered. The agent BORROWS the context;
         # ownership (and aclose) stays with the caller (see run_active_probe).
         self._experiment_handoff = experiment_handoff
+        # AR-09: the owner's pure readiness view (ready / unavailable mechanisms),
+        # re-read every step so only selections that can run now are offered.
+        self._experiment_catalog = experiment_catalog
         self._run_context = run_context
         # P2.6: idempotency guard, scoped to THIS active-probe session -- one
         # IterativeAgent is constructed fresh per run_active_probe() call
@@ -491,6 +516,29 @@ class IterativeAgent:
             if _ctx is not None:
                 await _ctx.aclose()
 
+    def _mechanisms_block(self) -> str:
+        """AR-09: the typed mechanisms on offer this step. Only selections that
+        pass the owner's pre-send readiness are offered; declared ones that do not
+        are listed with their reason so the model does not promise them. Without
+        a handoff and a readiness view nothing is offered."""
+        if self._experiment_handoff is None or self._experiment_catalog is None:
+            return ""
+        try:
+            catalog = self._experiment_catalog() or {}
+        except Exception as exc:  # a broken readiness view offers nothing, never everything
+            log.warning("experiment catalog failed: %s", type(exc).__name__)
+            return ""
+        ready, unavailable = catalog.get("ready") or [], catalog.get("unavailable") or []
+        lines = []
+        if ready:
+            lines += [f"MECHANISMS READY: {json.dumps(ready)}",
+                      "Select a ready mechanism with exactly " + json.dumps(
+                          {"action": "experiment", "kind": "<kind>", "hypothesis": "<hypothesis>"})]
+        if unavailable:
+            lines += [f"MECHANISMS UNAVAILABLE: {json.dumps(unavailable)}",
+                      "Do not select an unavailable mechanism; its reason names the missing prerequisite."]
+        return ("\n\n" + "\n".join(lines)) if lines else ""
+
     def _find_duplicate(self, key: str, sig: str,
                         attempt_by_key: "dict[str, AttemptRecord]") -> tuple:
         """Ticket D: has this built request already been attempted? Returns
@@ -550,13 +598,7 @@ class IterativeAgent:
         headers_state.setdefault("User-Agent", "harness-iterative-agent/1.0")
 
         system = _SYSTEM_PROMPT.format(specialty=specialty)
-        context = getattr(self._run_context, "experiment_context", None)
-        if self._experiment_handoff and context:
-            from harness import experiment
-            bindings = ((self._run_context.config or {}).get('engagement', {}) or {}).get('browser_bindings', [])
-            catalog = [{'hypothesis': h.id, 'kind': experiment.KIND} for h in getattr(context['asm'], 'chaining_hypotheses', []) if experiment.supports(h)]
-            catalog += [{'hypothesis': b.get('hypothesis_id'), 'kind': b.get('mechanism')} for b in bindings if b.get('mechanism') in experiment.BROWSER_KINDS]
-            system += '\nYou may select a declared mechanism with exactly ' + json.dumps({"action":"experiment", "kind":"<registered kind>", "hypothesis":"<existing id>"}) + '\nExisting selections: ' + json.dumps(catalog)
+        diag = result.diagnostics
         history: list[str | tuple[str, str]] = [
             f"HYPOTHESIS: {hypothesis}",
             f"ENDPOINT: {exchange.method} {exchange.url}",
@@ -581,7 +623,7 @@ class IterativeAgent:
                     result.handoff_note = f"Halted by effort budget at step {step}: {reason}"
                     break
 
-            user = (_render_history(history) +
+            user = (_render_history(history) + self._mechanisms_block() +
                     "\n\n" + _prior_attempts_block(attempts, result.duplicate_proposals) +
                     "\n\nChoose your next action as a single JSON object.")
             try:
@@ -597,15 +639,20 @@ class IterativeAgent:
                     with model_stage("iterative"):
                         action = await self.ollama.chat_json(
                             model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
+            except OllamaInvalidJSONError:
+                # AR-09: unparseable model output is a counted, bounded step, not
+                # a run-ending error. Its text is never echoed (it may carry secrets).
+                action = None
             except Exception as e:
                 result.stop_reason = "error"
                 result.handoff_note = f"LLM call failed at step {step}: {e}"
                 break
 
-            if not isinstance(action, dict):
-                history.append(f"[step {step}] invalid action (not an object); try again.")
+            if not isinstance(action, dict) or "action" not in action:
+                diag["parse_errors"] += 1
+                history.append(f"[step {step}] output was not a JSON action object; try again.")
                 consecutive_no_progress += 1
-                emit(IterativeStep(step, {}, "(rejected)", None, "invalid action", blocked="invalid action"))
+                emit(IterativeStep(step, {}, "(rejected)", None, "parse error", blocked="parse error"))
                 continue
 
             kind = action.get("action")
@@ -621,15 +668,28 @@ class IterativeAgent:
                         log.warning("experiment handoff failed: %s", type(exc).__name__)
                         outcome = {"status": "inconclusive", "readiness": "controller failure"}
                 result.mechanism_results.append(outcome)
-                consecutive_no_progress = 0 if outcome['status'] == 'completed' else consecutive_no_progress + 1
-                if outcome['status'] == 'reused':
+                status = outcome['status']
+                consecutive_no_progress = 0 if status == 'completed' else consecutive_no_progress + 1
+                if status == 'reused':
                     result.duplicate_proposals += 1
+                elif status == 'completed':
+                    diag["useful_unique_actions"] += 1
+                    diag["evidence_attempt_ids"] += outcome.get('fresh_attempt_ids', [])
+                elif status == 'rejected':
+                    diag["rejected_proposals"] += 1
+                else:
+                    diag["unavailable_selections"] += 1
+                ids = outcome.get('fresh_attempt_ids') or outcome.get('referenced_attempt_ids') or []
                 history.append(f"[step {step}] mechanism result: {json.dumps(outcome)}")
                 emit(IterativeStep(step, {"action":"experiment", "kind":outcome.get('kind','<rejected>'),
-                     "hypothesis":outcome.get('hypothesis','<rejected>')}, "(controller selection)", None, json.dumps(outcome)))
+                     "hypothesis":outcome.get('hypothesis','<rejected>')}, "(controller selection)", None,
+                     json.dumps(outcome), attempt_id=ids[0] if ids else ""))
                 continue
             if kind == "stop":
-                result.stop_reason = "found" if action.get("verdict") == "found" else "gave_up"
+                verdict = action.get("verdict")
+                result.stop_reason = {"found": "found", "refused": "refused"}.get(verdict, "gave_up")
+                if verdict == "refused":
+                    diag["refusals"] += 1
                 fd = action.get("finding")
                 if result.stop_reason == "found" and isinstance(fd, dict):
                     try:
@@ -641,8 +701,11 @@ class IterativeAgent:
                 emit(IterativeStep(step, action, "(stop)", None, ""))
                 return result
 
-            built, err = self._build_request(exchange, action, headers_state)
+            built, err = ((None, f"unsupported action {_excerpt(kind, 40)!r}")
+                          if kind not in ("mutate", "set_header")
+                          else self._build_request(exchange, action, headers_state))
             if err:
+                diag["rejected_proposals"] += 1
                 consecutive_no_progress += 1
                 history.append(f"[step {step}] action rejected: {err}")
                 emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
@@ -666,13 +729,15 @@ class IterativeAgent:
                 ref = (f"step {prior.step} (outcome {_excerpt(prior.outcome, _OUTCOME_RENDER_CHARS)})"
                        if prior is not None
                        else "an earlier run's request on this agent (outcome unknown)")
-                note = f"DUPLICATE of {ref}: choose a different supported action or stop"
+                note = (f"DUPLICATE of {ref}: choose a different supported action or stop "
+                        f"[attempt {_attempt_id(key)}]")
                 history.append(f"[step {step}] {note}")
                 log.info(
                     "iterative_agent: skipping duplicate request already sent this "
                     "active-probe session: %s %s", method, url)
                 blocked = f"{_DUP_BLOCK} ({note})"
-                emit(IterativeStep(step, action, req_summary, None, blocked, blocked=blocked))
+                emit(IterativeStep(step, action, req_summary, None, blocked, blocked=blocked,
+                                   attempt_id=_attempt_id(key)))
                 if consecutive_duplicates >= _MAX_CONSECUTIVE_DUPLICATES:
                     result.stop_reason = "repeated_duplicates"
                     result.handoff_note = (
@@ -701,9 +766,11 @@ class IterativeAgent:
             attempts.append(rec)
             attempt_by_key[key] = rec
             if status is None:
+                diag["blocked_attempts"] += 1
                 consecutive_no_progress += 1
-                history.append(f"[step {step}] {req_summary} -> {text}")
-                emit(IterativeStep(step, action, req_summary, None, text, blocked=text))
+                history.append(f"[step {step}] {req_summary} -> {text} [attempt {rec.attempt_id}]")
+                emit(IterativeStep(step, action, req_summary, None, text, blocked=text,
+                                   attempt_id=rec.attempt_id))
                 # A transport failure (or safety/scope block that returned None)
                 # counts toward target-distress only when it is an actual send
                 # failure, not a pre-send policy block.
@@ -713,15 +780,18 @@ class IterativeAgent:
                     consecutive_trouble = 0
             else:
                 consecutive_no_progress = 0
+                diag["useful_unique_actions"] += 1
+                diag["evidence_attempt_ids"].append(rec.attempt_id)
                 view, signals = _response_view(
                     text, headers=self._last_response_headers,
                     baseline=exchange.response_body or None,
                     probe=None if kind == "set_header" else action.get("value"))
                 line = f"[step {step}] {req_summary} -> HTTP {status}, {len(text)} bytes"
                 # Shown in full while among the latest _DETAILED_STEPS, then as the short line.
-                history.append((line + (f" [{', '.join(signals)}]" if signals else ""),
-                                f"{line}:\n{view}"))
-                emit(IterativeStep(step, action, req_summary, status, view))
+                tag = f" [attempt {rec.attempt_id}]"
+                history.append((line + (f" [{', '.join(signals)}]" if signals else "") + tag,
+                                f"{line}{tag}:\n{view}"))
+                emit(IterativeStep(step, action, req_summary, status, view, attempt_id=rec.attempt_id))
                 consecutive_trouble = consecutive_trouble + 1 if status in _DISTRESS_STATUSES else 0
 
             # Abort if the target is clearly in trouble -- stop piling on a
