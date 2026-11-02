@@ -142,7 +142,10 @@ def _conditions(validator, finding=None) -> dict:
     return {"mechanism_version": str(getattr(validator, "mechanism_version", "1") or "1"),
             "state": str(getattr(finding, "workflow_state_id", "") or ""),
             "parameter": (str(getattr(finding, "parameter_location", "") or "").strip().lower(),
-                          str(getattr(finding, "parameter_name", "") or "").strip())}
+                          str(getattr(finding, "parameter_name", "") or "").strip())
+                         # A parameter-only run tests nothing else, so it never
+                         # stands in for a named-first run (or the reverse).
+                         + (("only",) if getattr(finding, "parameter_only", False) else ())}
 
 
 class ExecutionRegistry:

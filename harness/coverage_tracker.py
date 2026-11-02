@@ -126,6 +126,7 @@ def resume_context_key(config):
     return hashlib.sha256((source['sha256'] + config_fingerprint(config)).encode()).hexdigest()
 
 from harness.categories import canonicalize
+from harness.validators.injection_targets import PER_PARAMETER_FIELD_CAP, case_target
 from harness.coverage_model import (
     ATTEMPT_SCHEMA_VERSION, CHECK_CATALOG, CHECKS_BY_ID, Check, CellStatus, CellResult, CoverageMatrix,
 )
@@ -148,6 +149,11 @@ _LEG_STATUS = {
     "error": CellStatus.ERROR,
 }
 _LEG_STATUS_UNKNOWN = CellStatus.INCONCLUSIVE
+# The case driver's mapping: it keeps a validator's controlled_negative distinct.
+_CASE_STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.NOT_DETECTED,
+                "controlled_negative": CellStatus.CONTROLLED_NEGATIVE,
+                "blocked": CellStatus.BLOCKED, "inconclusive": CellStatus.INCONCLUSIVE,
+                "skipped": CellStatus.SKIPPED, "error": CellStatus.ERROR}
 # Cell statuses that mean the leg actually dispatched its comparison (an errored
 # attempt was dispatched; a blocked/skipped/no-verdict one was not).
 _LEG_EXECUTED = frozenset({CellStatus.CONFIRMED, CellStatus.NOT_DETECTED,
@@ -578,7 +584,8 @@ class CoverageTracker:
         return total
 
     async def drive_coverage_cases(self, run_case, *, driveable: set[str] | None = None,
-                                   budget: int = 80, deadline: float | None = None, readiness=None) -> int:
+                                   budget: int = 80, deadline: float | None = None, readiness=None,
+                                   field_cap: int = PER_PARAMETER_FIELD_CAP) -> int:
         """Fire each PENDING child case via the injected async
         `run_case(identity, method, path, check, case_key) -> result` (result
         exposing .status/.summary/..., or None when the leg produced no send),
@@ -586,23 +593,22 @@ class CoverageTracker:
         of `drive_coverage_legs`: confirming one input marks only THAT case, never
         its siblings.
 
-        The leg is driven ONCE PER CELL, on the request-level (no-parameter)
-        representative, and the result binds to THAT case (R01): a deterministic leg
-        tests the whole request, so its verdict is NOT stamped onto each enumerated
-        parameter. Every other (parameter) case in the cell is recorded INCONCLUSIVE
-        with an explicit "no per-parameter attribution" reason -- visible, but never
-        credited with the request-level verdict, proof, or a separate execution.
+        A leg that cannot test one input on its own is driven ONCE PER CELL, on the
+        request-level (no-parameter) representative, and the result binds to THAT
+        case (R01): its verdict is NOT stamped onto each enumerated parameter. Every
+        other (parameter) case in the cell is recorded INCONCLUSIVE with an explicit
+        "no per-parameter attribution" reason -- visible, but never credited with the
+        request-level verdict, proof, or a separate execution. A leg that can (see
+        `case_target`) is driven once per parameter case instead, at most
+        `field_cap` inputs per cell (`_drive_parameter_cases`).
 
-        `budget` bounds DISPATCH ATTEMPTS -- one per driven cell (R05). A callback
+        `budget` bounds DISPATCH ATTEMPTS -- one per `run_case` call, so a cell driven
+        per parameter spends one unit per input it dispatches (R05). A callback
         that RAISES records the representative ERROR (visible, never swallowed); one
         that returns None records INCONCLUSIVE (dispatched, no usable send). An
         unknown status fails conservatively to INCONCLUSIVE, not an optimistic
         NOT_DETECTED (R06). `deadline`, a `time.monotonic()` value, stops new
         dispatches once passed. Returns the number of dispatch attempts made."""
-        _STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.NOT_DETECTED,
-                   "controlled_negative": CellStatus.CONTROLLED_NEGATIVE,
-                   "blocked": CellStatus.BLOCKED, "inconclusive": CellStatus.INCONCLUSIVE,
-                   "skipped": CellStatus.SKIPPED, "error": CellStatus.ERROR}
         # group pending cases by cell so each leg is driven once, at request level
         self.evaluate_readiness(readiness)
         cells: dict[tuple[str, str, str], list] = {}
@@ -615,13 +621,6 @@ class CoverageTracker:
             if driveable is not None and check.confirmation not in driveable:
                 continue
             cells.setdefault((ident, ep_key, check_id), []).append(ck)
-
-        def _mark_siblings_inconclusive(ident, ep_key, check_id, cks, target, reason):
-            for c in cks:
-                if c.coord_id() == target.coord_id():
-                    continue
-                self.matrix.record_case(ident, ep_key, check_id, c,
-                                        status=CellStatus.INCONCLUSIVE, reason=reason)
 
         attempts = 0
         self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
@@ -636,47 +635,163 @@ class CoverageTracker:
                 break
             self._checkpoint_after(attempts)
             check = CHECKS_BY_ID[check_id]
-            method, _, path = ep_key.partition(" ")
             # the request-level representative the whole-request result binds to
             rep = next((c for c in cks if c.is_no_parameter), cks[0])
-            no_attr_reason = (f"{check.confirmation} ran at request level; this leg does not "
-                              f"attribute per-parameter evidence, so this input is untested")
-            attempts += 1
             self.attempted.add((ident, ep_key, check_id))
-            try:
-                res = await run_case(ident, method, path, check, rep)
-            except Exception as e:  # a leg blowing up is recorded, never swallowed
-                log.debug("drive_coverage_cases: %s on %s failed: %s", check.confirmation, ep_key, e)
-                # An attempt was actually dispatched (run_case was invoked and
-                # failed mid-flight) -- executed=True distinguishes this from
-                # the "no send at all" branch below (R07).
+            targets = ([c for c in cks if c is not rep and case_target(check.confirmation, c)]
+                       if rep.is_no_parameter else [])
+            if targets:
+                attempts += await self._drive_parameter_cases(
+                    run_case, ident, ep_key, check, cks, rep, targets, deadline,
+                    budget - attempts, field_cap)
+            else:
+                attempts += 1
+                await self._drive_request_level(run_case, ident, ep_key, check, cks, rep)
+        return attempts
+
+    async def _drive_request_level(self, run_case, ident, ep_key, check, cks, rep) -> None:
+        """Drive the leg once on the request-level representative; its verdict
+        binds to that case only, and every other case in `cks` is recorded
+        INCONCLUSIVE (R01: no per-parameter attribution)."""
+        check_id = check.id
+        method, _, path = ep_key.partition(" ")
+        no_attr_reason = (f"{check.confirmation} ran at request level; this leg does not "
+                          f"attribute per-parameter evidence, so this input is untested")
+
+        def _mark_siblings_inconclusive(reason):
+            for c in cks:
+                if c.coord_id() != rep.coord_id():
+                    self.matrix.record_case(ident, ep_key, check_id, c,
+                                            status=CellStatus.INCONCLUSIVE, reason=reason)
+
+        try:
+            res = await run_case(ident, method, path, check, rep)
+        except Exception as e:  # a leg blowing up is recorded, never swallowed
+            log.debug("drive_coverage_cases: %s on %s failed: %s", check.confirmation, ep_key, e)
+            # An attempt was actually dispatched (run_case was invoked and
+            # failed mid-flight) -- executed=True distinguishes this from
+            # the "no send at all" branch below (R07).
+            self.matrix.record_case(
+                ident, ep_key, check_id, rep, status=CellStatus.ERROR,
+                reason=f"{check.confirmation} attempt errored: {type(e).__name__}: {e}"[:180],
+                validator=check.confirmation, executed=False)
+            _mark_siblings_inconclusive(f"{check.confirmation} attempt errored at request level")
+            return
+        if res is None:
+            # No request was ever sent (declined/unsupported) -- NOT an
+            # execution, however loudly the validator name is attached.
+            self.matrix.record_case(
+                ident, ep_key, check_id, rep, status=CellStatus.INCONCLUSIVE,
+                reason=f"{check.confirmation} produced no send (declined/unsupported)",
+                validator=check.confirmation, executed=False)
+            _mark_siblings_inconclusive(no_attr_reason)
+            return
+        self._record_case_result(ident, ep_key, check, rep, res,
+                                 f"{check.confirmation} driven at request level")
+        _mark_siblings_inconclusive(no_attr_reason)
+
+    def _record_case_result(self, ident, ep_key, check, case, res, default_reason) -> None:
+        status = _covered_status(res, _CASE_STATUS.get(getattr(res, "status", ""), CellStatus.INCONCLUSIVE))
+        if status in (CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE) and (
+                getattr(res, "control_outcome", "") or "") not in ("", "control_held"):
+            # The leg itself says this negative does not cover the case (a
+            # named parameter it never reached, or inputs it left untested).
+            status = CellStatus.INCONCLUSIVE
+        executed, fresh, referenced = _attempt_facts(res, status)
+        self.matrix.record_case(
+            ident, ep_key, check.id, case, status=status,
+            reason=(getattr(res, "summary", "") or default_reason)[:180],
+            confidence=getattr(res, "confidence", None),
+            validator=getattr(res, "validator", None) or check.confirmation,
+            evidence=(getattr(res, "evidence", "") or "")[:200], executed=executed,
+            attempts=fresh, referenced_attempts=referenced)
+
+    async def _drive_parameter_cases(self, run_case, ident, ep_key, check, cks, rep,
+                                     targets, deadline, remaining, field_cap) -> int:
+        """Per-parameter dispatch (owner option b): drive the leg once per input it
+        can test alone, so each parameter's verdict binds to that parameter's case
+        and concludes nothing else. At most `field_cap` inputs per cell; inputs over
+        the cap, the case budget, the leg budget (`remaining` dispatches) or the
+        deadline stay inconclusive. When any input was not tested on its own, the
+        request-level representative is ALSO driven as before (detection
+        unchanged, one more dispatch), bound to itself only. Returns the number of
+        dispatches made."""
+        check_id = check.id
+        method, _, path = ep_key.partition(" ")
+        tested: set[str] = set()
+        timed_out = out_of_budget = False
+        used = 0
+        for n, case in enumerate(targets):
+            if n >= field_cap:
                 self.matrix.record_case(
-                    ident, ep_key, check_id, rep, status=CellStatus.ERROR,
+                    ident, ep_key, check_id, case, status=CellStatus.INCONCLUSIVE,
+                    reason=f"{check.confirmation}: per-parameter field cap "
+                           f"({field_cap}) reached before this input; untested")
+                continue
+            if used >= remaining:
+                out_of_budget = True
+                self.stopped_by = "leg budget"
+                self.matrix.record_case(
+                    ident, ep_key, check_id, case, status=CellStatus.INCONCLUSIVE,
+                    reason=f"{check.confirmation}: leg budget reached before this input; untested")
+                continue
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                self.stopped_by = "time budget"
+                self.matrix.record_case(
+                    ident, ep_key, check_id, case, status=CellStatus.INCONCLUSIVE,
+                    reason=f"{check.confirmation}: time budget reached before this input; untested")
+                continue
+            tested.add(case.coord_id())
+            used += 1
+            try:
+                res = await run_case(ident, method, path, check, case)
+            except Exception as e:  # recorded on this input only
+                log.debug("drive_coverage_cases: %s on %s %s failed: %s",
+                          check.confirmation, ep_key, case.label(), e)
+                self.matrix.record_case(
+                    ident, ep_key, check_id, case, status=CellStatus.ERROR,
                     reason=f"{check.confirmation} attempt errored: {type(e).__name__}: {e}"[:180],
                     validator=check.confirmation, executed=False)
-                _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep,
-                                            f"{check.confirmation} attempt errored at request level")
                 continue
             if res is None:
-                # No request was ever sent (declined/unsupported) -- NOT an
-                # execution, however loudly the validator name is attached.
                 self.matrix.record_case(
-                    ident, ep_key, check_id, rep, status=CellStatus.INCONCLUSIVE,
-                    reason=f"{check.confirmation} produced no send (declined/unsupported)",
+                    ident, ep_key, check_id, case, status=CellStatus.INCONCLUSIVE,
+                    reason=f"{check.confirmation} produced no send for {case.label()}",
                     validator=check.confirmation, executed=False)
-                _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
                 continue
-            status = _covered_status(res, _STATUS.get(getattr(res, "status", ""), CellStatus.INCONCLUSIVE))
-            executed, fresh, referenced = _attempt_facts(res, status)
+            self._record_case_result(ident, ep_key, check, case, res,
+                                     f"{check.confirmation} driven on {case.label()}")
+        others = [(c, r) for c, r in self.matrix.cases_for_cell(ident, ep_key, check_id)
+                  if c.coord_id() != rep.coord_id()]
+        if (not timed_out and not out_of_budget
+                and any(c.coord_id() not in tested for c, _r in others)):
+            # Some input was not tested alone (a location this leg cannot target,
+            # the field cap, the case budget): keep today's request-level attempt
+            # while the leg budget allows one more dispatch. Inputs tested alone
+            # keep their own verdicts.
+            if used < remaining:
+                rest = [c for c in cks if c.coord_id() not in tested]
+                await self._drive_request_level(run_case, ident, ep_key, check, rest, rep)
+                return used + 1
+            out_of_budget = True
+            self.stopped_by = "leg budget"
+        negatives = (CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE)
+        if (not timed_out and not out_of_budget and others
+                and all(r.status in negatives for _c, r in others)):
             self.matrix.record_case(
-                ident, ep_key, check_id, rep, status=status,
-                reason=(getattr(res, "summary", "") or f"{check.confirmation} driven at request level")[:180],
-                confidence=getattr(res, "confidence", None),
-                validator=getattr(res, "validator", None) or check.confirmation,
-                evidence=(getattr(res, "evidence", "") or "")[:200], executed=executed,
-                attempts=fresh, referenced_attempts=referenced)
-            _mark_siblings_inconclusive(ident, ep_key, check_id, cks, rep, no_attr_reason)
-        return attempts
+                ident, ep_key, check_id, rep, status=CellStatus.NOT_DETECTED,
+                reason=f"{check.confirmation}: every input ({len(others)}) tested on its own, "
+                       f"none detected",
+                validator=check.confirmation, executed=True,
+                referenced_attempts=tuple(a.get("id") if isinstance(a, dict) else a
+                                          for _c, r in others for a in r.attempts))
+        else:
+            self.matrix.record_case(
+                ident, ep_key, check_id, rep, status=CellStatus.INCONCLUSIVE,
+                reason=f"{check.confirmation} ran per parameter; the request as a whole is "
+                       f"concluded only when every input is", validator=check.confirmation)
+        return used
 
     def finalize_pending_reasons(self, investigated_keys: set[str] | None = None) -> int:
         """Give remaining applicable-pending cells an explicit reason so the
@@ -966,6 +1081,7 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
 
 async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[str] | None = None,
                                       budget: int = 80, per_cell_case_budget: int = 8,
+                                      parameter_field_cap: int = PER_PARAMETER_FIELD_CAP,
                                       investigated_keys: set[str] | None = None,
                                       checkpoint=None, context_key="",
                                       deadline: float | None = None, on_checkpoint=None, readiness=None) -> dict:
@@ -989,7 +1105,8 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     enumerated = tracker.expand_parameter_cases(
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
     driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget,
-                                                deadline=deadline, readiness=None)
+                                                deadline=deadline, readiness=None,
+                                                field_cap=parameter_field_cap)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["cases_enumerated"] = enumerated
