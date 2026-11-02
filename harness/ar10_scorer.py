@@ -21,8 +21,9 @@ Inputs (all JSON):
   "repeats": [{"repeat_id": "A1", "arm": "A", "export_dir": "<dir, relative to the
   manifest>", "files": {"replay-audit.json": "<sha256>", "result.json": "<sha256>",
   ...}}]}. replay-audit.json (the AR-08c `replay_audit.py` output) and result.json
-  are required in every repeat; acceptance.json ({"L1": "pass"|"fail", ...}, the
-  part-B criteria) is optional.
+  are required in every repeat; acceptance.json ({"L1": "pass"|"fail"|"unknown",
+  ...}, the part-B criteria computed by harness.ar10_acceptance and frozen by
+  harness.ar10_freeze) is optional.
 - mapping: {"schema": "ar10-mapping/1", "challenges_total": <int, optional>,
   "mechanisms": [{"id": "...", "available": true, "match": {"validator": "...",
   "class": "...", "route": "/path"}, "equivalents": [{...match...}]}]}. A match field
