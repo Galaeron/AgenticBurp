@@ -283,6 +283,69 @@ def _findings_from_outcome(outcome: dict) -> list[dict]:
     return out
 
 
+# AR-10 P1: the AR-09 per-probe counts a run sums. Counts and attempt IDs only;
+# prompt, payload and response text never leave the iterative result.
+DIAGNOSTIC_COUNTS = ("parse_errors", "refusals", "rejected_proposals",
+                     "unavailable_selections", "duplicate_proposals", "blocked_attempts",
+                     "useful_unique_actions")
+_MAX_PROBE_ATTEMPT_IDS = 16
+_MAX_RUN_ATTEMPT_IDS = 50
+
+
+def _bounded_ids(ids, limit: int) -> list[str]:
+    return [i for i in ids if isinstance(i, str) and len(i) <= 64][:limit]
+
+
+def _probe_diagnostics(outcome: dict) -> dict | None:
+    """The counts of one probe's `iterative_result.diagnostics`, with its evidence
+    attempt IDs as a count plus a bounded list; None when the result has none."""
+    diag = ((outcome or {}).get("iterative_result") or {}).get("diagnostics")
+    if not isinstance(diag, dict):
+        return None
+    out = {}
+    for k in DIAGNOSTIC_COUNTS:
+        try:
+            out[k] = max(0, int(diag.get(k) or 0))
+        except (TypeError, ValueError):
+            out[k] = 0
+    ids = diag.get("evidence_attempt_ids")
+    ids = list(ids) if isinstance(ids, (list, tuple)) else []
+    out["evidence_attempts"] = len(ids)
+    out["evidence_attempt_ids"] = _bounded_ids(ids, _MAX_PROBE_ATTEMPT_IDS)
+    return out
+
+
+def iterative_diagnostics(outcomes: list[dict]) -> dict:
+    """AR-10 P1: sum the per-probe diagnostics over a run, in total and per stop
+    reason. `probes` counts agent probes whose outcome recorded diagnostics (resumed
+    ones included); `probes_without_diagnostics` counts agent probes that ran but
+    recorded none (an errored probe, or a result without the AR-09 block), so a
+    missing count is never reported as a zero. A run with no probe reports zeros."""
+    def zeros() -> dict:
+        return {**{k: 0 for k in DIAGNOSTIC_COUNTS}, "evidence_attempts": 0}
+
+    totals = dict(zeros(), evidence_attempt_ids=[])
+    by_reason: dict[str, dict] = {}
+    probes = unreported = 0
+    for o in outcomes:
+        diag = o.get("diagnostics")
+        if not isinstance(diag, dict):
+            if o.get("error") or o.get("stop_reason"):
+                unreported += 1
+            continue
+        probes += 1
+        row = by_reason.setdefault(str(o.get("stop_reason") or "unknown"), dict(zeros(), probes=0))
+        row["probes"] += 1
+        for k in (*DIAGNOSTIC_COUNTS, "evidence_attempts"):
+            totals[k] += diag.get(k, 0)
+            row[k] += diag.get(k, 0)
+        totals["evidence_attempt_ids"].extend(diag.get("evidence_attempt_ids") or [])
+    totals["evidence_attempt_ids"] = _bounded_ids(totals["evidence_attempt_ids"],
+                                                  _MAX_RUN_ATTEMPT_IDS)
+    return {"probes": probes, "probes_without_diagnostics": unreported,
+            "totals": totals, "by_stop_reason": by_reason}
+
+
 # 2026-09-17 coverage-recovery plan, Step 2: the four honest reasons a
 # high-priority, applicable node can go uninvestigated. Exhaustive by
 # construction -- every skip in investigate_worklist maps to exactly one of
@@ -367,7 +430,9 @@ async def investigate_worklist(
     missing_template, policy_blocked) plus `skipped_by_reason` counts. This is
     what makes a "max coverage" claim checkable instead of asserted: a run
     with a nonempty `skipped_by_reason[budget_exhausted]` reached its node
-    budget with eligible work still on the table.
+    budget with eligible work still on the table. It also gets
+    `iterative_diagnostics` (AR-10 P1): the agent probes' AR-09 counts summed per
+    run and per stop reason; see `iterative_diagnostics()`.
 
     `deadline`, a `time.monotonic()` value, stops the sweep starting work on a
     node once passed; every later node that had work due is skipped as
@@ -500,7 +565,7 @@ async def investigate_worklist(
         #    agent budget remains. Objective-style runs can stop after a
         #    deterministic confirmation instead of spending their remaining
         #    wall-clock budget on a model pass that cannot improve that verdict.
-        agent_stop = None
+        agent_stop = agent_diag = None
         if do_agent and not (stop_on_confirm and precondition_confirmed):
             specialty, hypothesis = derived
             investigated += 1
@@ -526,6 +591,7 @@ async def investigate_worklist(
                         log.debug("confirm_fn failed on %s: %s", exchange.url, e)
             node_findings.extend(agent_findings)
             agent_stop = (outcome or {}).get("iterative_result", {}).get("stop_reason")
+            agent_diag = _probe_diagnostics(outcome)
 
         if not do_agent and not precond_findings:
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
@@ -546,6 +612,8 @@ async def investigate_worklist(
             "confirmed": any(f.get("confirmed") for f in node_findings),
             "stop_reason": agent_stop,
         })
+        if agent_diag is not None:
+            outcomes[-1]["diagnostics"] = agent_diag
         if on_outcome is not None:
             try:
                 on_outcome(key, outcomes[-1])
@@ -577,5 +645,7 @@ async def investigate_worklist(
             # E4: captures identical to an earlier one (same route, identity,
             # request and response) that were not investigated a second time.
             "duplicates_skipped": duplicates,
+            # AR-10 P1: the run's summed AR-09 probe diagnostics.
+            "iterative_diagnostics": iterative_diagnostics(outcomes),
         })
     return outcomes
