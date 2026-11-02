@@ -4341,11 +4341,16 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
   `.test-work/ar08b-issue-identity-20261102/BATCH.md`; crypto/TLS fingerprint is a follow-up).
   Gates green on 3.12/3.14.
 
-### [ ] AR-08c — Audit procedures for race, WebSocket and error-based claims
+### [x] AR-08c — Audit procedures for race, WebSocket and error-based claims
 - **Domain:** Audit truth · **Effort:** M · **Mode:** LOOP.
 - **Problem:** these claims have no replay audit procedure; batch 08 reports them as unsupported.
 - **Acceptance criteria:** a real claim-specific procedure per class, or each stays explicitly
   unsupported; never counted as zero false positives.
+- **Done 2026-11-02 (`a219659`):** WebSocket (CSWSH) and verbose-error claims now have
+  replay procedures. Race/TOCTOU claims stay `unsupported_audit`, with the reason recorded on
+  each claim. The replay audit script and its caller-level tests are committed in
+  `.test-work/ar08c-audit-procedures-20261102/` (BATCH.md, HANDOFF.md). Gates passed on 3.14
+  and 3.12.
 
 ### [ ] AR-ID — Cookie-bearing captures match no supplied identity
 - **Domain:** Identity/session binding · **Effort:** M · **Mode:** LOOP (offline fixture first).
