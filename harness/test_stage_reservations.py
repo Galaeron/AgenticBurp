@@ -212,7 +212,8 @@ class CoverageDeadlineTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(report["cases_driven"], 1)
         self.assertEqual(report["drive_stopped_by"], "time budget")
-        self.assertEqual(report["queued_not_attempted"], len(unbounded) - 1)
+        # a cell may be dispatched once per parameter: the queue counts cells
+        self.assertEqual(report["queued_not_attempted"], len(set(unbounded)) - 1)
 
     def test_control_a_drive_ignoring_its_deadline_sends_after_it(self):
         """Defect injection: the former driver had no deadline; the test above sees it."""

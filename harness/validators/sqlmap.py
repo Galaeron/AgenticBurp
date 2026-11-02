@@ -427,6 +427,25 @@ class SqlmapValidator(Validator):
             return ValidationResult(self.name, "skipped", finding.vulnerability_class,
                                     summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts))
 
+        # Per-parameter dispatch (coverage case driver): test the named parameter
+        # alone, so a clean result is bound to it and to nothing else.
+        only = None
+        if getattr(finding, "parameter_only", False):
+            from .injection_targets import NAMED_PARAMETER_UNTESTED  # (cycle: it imports us)
+            loc = (finding.parameter_location or "").strip().lower()
+            name = (finding.parameter_name or "").strip()
+            present = (_query_top_level_params(exchange.url) if loc == "query" else
+                       _form_top_level_params(exchange.request_body or "")
+                       if loc == "body_form" and not _looks_like_json(
+                           exchange.request_body or "", _content_type_of(exchange)) else [])
+            if name not in present:
+                return ValidationResult(
+                    self.name, "skipped", finding.vulnerability_class,
+                    summary=f"the {loc or 'unnamed'} parameter {name!r} is not a query or form "
+                            "parameter of the replayed request, so it was not tested",
+                    control_outcome=NAMED_PARAMETER_UNTESTED)
+            only = [(loc, name)]
+
         if exchange.method.upper() != "GET":
             # sqlmap fuzzes a parameter by sending many requests with
             # different payloads to the SAME endpoint via the SAME
@@ -460,7 +479,7 @@ class SqlmapValidator(Validator):
         # This also keeps external authorized targets testable when a container
         # runtime's network policy cannot route directly to that hostname.
         if exchange.method.upper() == "GET":
-            quick = await self._boolean_probe_fallback(finding, exchange)
+            quick = await self._boolean_probe_fallback(finding, exchange, only_params=only)
             if quick is not None and quick.confirmed:
                 quick.summary = "Bounded boolean preflight confirmed SQL injection: " + quick.summary
                 return quick
@@ -512,6 +531,8 @@ class SqlmapValidator(Validator):
                    "--level", str(self.level), "--risk", str(self.risk),
                    "--threads", "1", "--timeout", "10", "--retries", "1",
                    "--flush-session", "--disable-coloring"]
+            if only:
+                cmd += ["-p", only[0][1]]
             # Deliberately no --smart: verified directly against a live
             # target (OWASP Juice Shop's login endpoint, a genuinely
             # injectable, well-known case) that --smart's cheap "is this
@@ -697,7 +718,7 @@ class SqlmapValidator(Validator):
                 # differential probe over every query/body parameter
                 # (not just auth fields -- see _boolean_probe_fallback's
                 # own docstring) rather than doing nothing.
-                fallback = await self._boolean_probe_fallback(finding, exchange)
+                fallback = await self._boolean_probe_fallback(finding, exchange, only_params=only)
                 if fallback is not None:
                     return fallback
                 return ValidationResult(self.name, "error", finding.vulnerability_class,
@@ -772,12 +793,20 @@ class SqlmapValidator(Validator):
             # for extra probes. The mutating method (if any) was already authorised
             # by the safety gate above before sqlmap ran.
             if _looks_like_auth_request(exchange):
-                secondary = await self._boolean_probe_fallback(finding, exchange)
+                secondary = await self._boolean_probe_fallback(finding, exchange, only_params=only)
                 if secondary is not None and secondary.confirmed:
                     secondary.summary = ("sqlmap did not confirm, but a boolean-differential probe did "
                                          "(auth endpoint): " + secondary.summary)
                     secondary.raw_output = (secondary.raw_output or "") + "\n\n--- sqlmap output ---\n" + output
                     return secondary
+            if only and "not present within" in lower:
+                # A `-p` sqlmap could not find tested nothing: never a negative.
+                return ValidationResult(
+                    self.name, "inconclusive", finding.vulnerability_class,
+                    summary=f"sqlmap did not find parameter {only[0][1]!r} to test "
+                            "-- not a negative result",
+                    evidence=output, raw_output=output, command=cmd,
+                    control_outcome=NAMED_PARAMETER_UNTESTED)
             return ValidationResult(
                 self.name, "not_confirmed", finding.vulnerability_class,
                 confidence=0.2 if proc.returncode == 0 else 0.0,

@@ -130,7 +130,11 @@ class AttemptFactTests(unittest.TestCase):
 
     def test_executed_representative_with_pending_sibling_is_executed_but_incomplete(self):
         run = _Run(self.target)
-        report = run.drive(build_coverage_cases_driven, _state(self.target.base, "/items/1?q=1&sort=a"))
+        # A case budget of 0 leaves both inputs budget-skipped, so the sqlmap leg
+        # keeps its single request-level dispatch (per-parameter dispatch needs a
+        # pending parameter case).
+        report = run.drive(build_coverage_cases_driven, _state(self.target.base, "/items/1?q=1&sort=a"),
+                           per_cell_case_budget=0)
         matrix, parent = _cell(report)
         self.assertEqual(self.target.requests, 1)
         self.assertEqual(parent.status, CellStatus.PENDING)       # not endpoint-complete

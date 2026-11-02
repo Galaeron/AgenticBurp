@@ -23,6 +23,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # standalone one when it is None".
 from harness.run_context import transport_for, ExecutionOutcome, case_scope, count_sends
 from harness.execution_registry import ExecutionRegistry
+from harness.validators.injection_targets import case_target
 from harness import run_journal
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
 # same shadowing reason as above (several methods below have a `run_context` parameter).
@@ -2266,9 +2267,17 @@ class ChainMixin:
                                                        case_key=case_key, run_context=run_context)
                     except Exception:
                         leg_case = None
+                    leg_finding = _as_finding({"vulnerability_class": capability["finding_class"]},
+                                              capability["finding_class"])
+                    # Per-parameter dispatch: the driver hands a parameter case only
+                    # to a leg that can test that input alone; bind the leg to it.
+                    target = case_target(check.confirmation, case_key) if case_key is not None else None
+                    if target is not None:
+                        leg_finding = leg_finding.model_copy(update={
+                            "parameter_location": target[0], "parameter_name": target[1],
+                            "parameter_only": True})
                     res = await _cached_validate(
-                        validator, _as_finding({"vulnerability_class": capability["finding_class"]},
-                                               capability["finding_class"]), ex,
+                        validator, leg_finding, ex,
                         case_ref=leg_case.case_id if leg_case is not None else "")
                     # T05/R26: bind a case-bound structured proof to this driven leg
                     # (concrete parameter case when the driver fanned out to one),

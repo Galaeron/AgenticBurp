@@ -113,6 +113,9 @@ class Finding(BaseModel):
     request_template_id: str = ""
     parameter_location: str = ""
     parameter_name: str = ""
+    # Set only by the coverage case driver: the leg tests the named parameter and
+    # nothing else, so its negative is bound to that parameter (never by a model).
+    parameter_only: bool = False
     workflow_state_id: str = ""
     proof_id: str = ""
     case_id: str = ""
@@ -170,7 +173,7 @@ AGENT_AUTHORITY_FIELDS = frozenset({
     "original_confidence", "original_severity", "original_vulnerability_class",
     "shape_inconsistent", "confirmed_by_leg",
     "oracle_verified", "verification_state", "oracle_capsule_id", "oracle_reason",
-    "manual_verification",
+    "manual_verification", "parameter_only",
 })
 
 
