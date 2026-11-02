@@ -51,11 +51,9 @@ Q1, Q2, Q3, Q7: accepted as implemented; no code.
 - Defect injection (`inject.sh`): every injected defect was caught. Two first escapes
   (digest masked by size; dropped orphan masked by count) got dedicated cases.
 
-## Gates
-Gate run on 3.12 after merging main: precondition 74 OK, focused 80 OK, full suite parts
-OK (harness, native 38, evaluation 440/17 skipped, integrity 59), diff-check 0. Smoke failed
-on test_no_orphan_test_files: RunCostsTests was not a TestCase, so its 5 tests were never
-collected. Fixed in the last commit (that module plus the orphan check: 21 OK on 3.12).
-NOT DONE (usage limit): rerun smoke + full on 3.12 and 3.14 after that fix. The 3.14 run
-started before the fix, so it will show the same orphan failure.
-Runner: `bash .test-work/pr12-followup-20261102/gates.sh <label> <python>`.
+## Gates (final tree, PYTHONPATH=worktree; all exit 0 on 3.12 venv and 3.14 system)
+- precondition 74 OK; focused 80 OK; smoke 149 OK; diff-check 0.
+- full: harness 5139 OK, evaluation 440 OK (17 skipped), integrity 59 OK.
+- An earlier smoke run failed test_no_orphan_test_files because RunCostsTests was not a
+  TestCase. Fixed in ddd2f0f before this run.
+- Runner: `bash .test-work/pr12-followup-20261102/gates.sh <label> <python>`.
