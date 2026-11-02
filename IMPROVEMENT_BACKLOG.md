@@ -2486,7 +2486,7 @@ caller test + negative control, `full` green before close).
   recall not materially down. `full` green.
 - **Impact:** High (directly lifts the measured pooled precision).
 
-### [ ] BM-2 — Same-class secure-vs-vulnerable discriminator (stop firing on clean controls)
+### [~] BM-2 — Same-class secure-vs-vulnerable discriminator (stop firing on clean controls)  — **PARTIAL (2026-11-02)**
 - **Domain:** Detection precision - **Effort:** L - **Mode:** LOOP (harder; may be partly research)
 - **Evidence (VERIFIED):** across corpora, `fp_on_tested_negative_control ≥ 1` for sqli/xss/idor/
   command_injection/path_traversal — the model flags a SECURE endpoint of a class as vulnerable.
@@ -2495,6 +2495,20 @@ caller test + negative control, `full` green before close).
 - **Acceptance:** caller test — a tested-secure exchange paired with its vulnerable twin: the secure one
   produces no confirmed finding, the vulnerable one still does. `full` green.
 - **Impact:** High.
+- **Result (2026-11-02, branch `claude/bm2-discriminator-afa402`, commit `628cdb0`):** PARTIAL.
+  Only a validator leg sets `confirmed`; three leg oracles lacked a control and are fixed:
+  command_injection (the in-band marker needs a no-separator control without it), path_traversal
+  (a probe needs a file-signature match the captured baseline lacks), sqli boolean probe (the
+  true/false pair is repeated in reverse order and must reproduce). xss (browser/stored) was
+  already sound (computed-product execution oracle); idor's single-principal leg never confirms
+  and cross_identity is an ownership oracle, so neither changed. Caller test
+  `harness/test_bm2_secure_twin_callers.py` (loopback twins through `_validate_findings`) fails on
+  the base for cmdi/path_traversal/sqli. Precondition, smoke and full exit 0 on 3.12 and 3.14.
+  **Still open:** the measured `fp_on_tested_negative_control` counts *unconfirmed passive*
+  hypotheses (strict_benchmark runs no active legs); surfacing them is governed by the OFF-by-default
+  FR-4/quarantine gates, which need an owner decision and a re-measure. Residuals: path traversal
+  with an empty captured body has no baseline; a WAF that blocks only the tautology text still
+  passes the sqli repeat. Detail: `.test-work/bm2-discriminator-20261102/HANDOFF.md`.
 
 ### [ ] BM-3 — Reasoning-heavy class recall (auth_bypass / business_logic / ssrf)  — **Mode: OWNER/LIVE (skip)**
 - **Evidence (VERIFIED):** these three classes are missed (R=0) on BOTH PixelMart and Juice Shop — the
