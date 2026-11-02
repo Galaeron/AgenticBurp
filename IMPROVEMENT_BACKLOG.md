@@ -4354,9 +4354,10 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
 - **Acceptance criteria:** follow `docs/FIXED_SOURCE_VERIFICATION_2026-10-30.md` (main checkout):
   import-path and provenance checks prove the running server is the committed source.
 
-### [ ] AR-09 — Batch 09: iterative worker uses supported mechanisms
+### [x] AR-09 — Batch 09: iterative worker uses supported mechanisms
 - **Domain:** Planner/worker · **Effort:** L · **Depends on:** 03, 06, 07 (all accepted) ·
   **Mode:** LOOP. Spec: "Batch 09" in IMPLEMENTATION_TASK.md.
+- **Landed:** dd179bb (2026-11-02). Ready/unavailable mechanism catalog in the prompt, stable attempt IDs, counted parse errors and explicit refusals, diagnostics. Full suite green on 3.12 and 3.14. Handoff: `.test-work/ar09-worker-mechanisms-20261102/HANDOFF.md`.
 
 ### [x] AR-FP — Bounded final re-evaluation pass for experiment tasks
 - **Domain:** Experiment controller · **Effort:** M · **Depends on:** AR-09 · **Mode:** LOOP.
