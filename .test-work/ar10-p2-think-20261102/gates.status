@@ -1,0 +1,8 @@
+py312 precondition 0
+py312 smoke 0
+py312 full 0
+py314 precondition 0
+py314 smoke 0
+py314 full 0
+diff-check 0
+DONE

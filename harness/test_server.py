@@ -705,6 +705,8 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         self.assertEqual(manifest["completion_status"], "done")
         self.assertEqual(manifest["cache_namespace"], f"test-isolated:{job_id}")
         self.assertEqual(manifest["request_count"], 0)
+        # AR-10 P2: the manifest says whether this run measured reasoning mode.
+        self.assertEqual(manifest["model_versions"]["think"], {"setting": "off", "stages": []})
 
     def test_manifest_id_is_passed_in_an_invocation_local_context(self):
         from unittest.mock import patch

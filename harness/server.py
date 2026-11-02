@@ -1695,7 +1695,11 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                         # remote provider. Read from config, not from a live
                         # provider object, so this never touches an API key.
                         "coordinator_provider": (config.get("coordinator") or {}).get("provider", "ollama"),
-                        "critique_provider": (config.get("critique") or {}).get("provider", "ollama")})
+                        "critique_provider": (config.get("critique") or {}).get("provider", "ollama"),
+                        # AR-10 P2: whether Ollama calls ran with thinking on
+                        # (ollama.think); "off" means no reasoning-mode result.
+                        "think": __import__("harness.ollama_client", fromlist=["think_setting"]).think_setting(
+                            (config.get("ollama") or {}).get("think"))})
     except Exception:
         job.update(status='error', finished_at=_time.time(),
                    error='job manifest initialization failed; no work was scheduled')

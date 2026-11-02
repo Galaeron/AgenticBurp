@@ -59,6 +59,11 @@ ollama:
   # JSON) are never retried. Only the final failure counts toward the circuit
   # breaker. 0 turns retrying off. Capped at 5 in code.
   transient_retries: 2
+  # Thinking mode (AR-10 P2) is OFF unless `think` is set, and it is left unset
+  # here. Set it only in config.local.yaml for a think-on arm: `true` for every
+  # call, or a list of model_stage labels (e.g. [iterative, critique]). The run
+  # manifest records the setting under model_versions.think; the reasoning
+  # trace is never parsed or stored, only its length.
 
 # How many specialist agents are allowed to run concurrently against
 # Ollama through one AgentManager. The application orchestrator shares that
