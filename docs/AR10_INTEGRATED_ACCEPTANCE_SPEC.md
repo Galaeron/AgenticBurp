@@ -120,9 +120,10 @@ What the stages cover, per batch:
 | pipeline gate | test_pipeline_gate (defect-injection controls) |
 
 Partial evidence already gathered (probe tree `7d1549e`, 3.14.7 only, not frozen, not a pass of
-this part): A1 subset of 12 new or changed modules plus precondition, 197 OK; A2, 14 OK. The
-full-suite result for the probe tree is in `.test-work/wt-ar10-merge-probe/.test-work/ar10-probe/`
-in the main checkout, if that run finished.
+this part): A1 subset of 12 new or changed modules plus precondition, 197 OK; A2, 14 OK;
+`harness.suite full` exit 0 in 3190 s (harness 5056 OK, native 38 passed, evaluation 440 OK /
+17 skips, integrity 59 OK). Logs: `.test-work/wt-ar10-merge-probe/.test-work/ar10-probe/` in the
+main checkout. 3.12, A3 and the freeze are still to do.
 
 ### 2.3 Deliverables of part A
 
