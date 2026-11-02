@@ -189,6 +189,56 @@ def _loads_lenient(s: str) -> dict:
         return json.loads(_repair_json_escapes(s))
 
 
+# A thinking model can also put its trace inline, ahead of the answer, as a
+# <think>...</think> block in `content` (Ollama's separate `message.thinking`
+# field is the other shape). Only a LEADING block is the trace; braces inside it
+# would otherwise be picked up by _strip_json_fence's `{.*}` as the answer.
+_INLINE_THINK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
+
+
+def _strip_inline_thinking(content: str) -> tuple[str, int]:
+    """(content without a leading <think> block, length of the removed trace)."""
+    m = _INLINE_THINK.match(content)
+    if not m:
+        return content, 0
+    return content[m.end():], m.end()
+
+
+def parse_think_setting(value) -> bool | frozenset[str]:
+    """AR-10 P2: the `ollama.think` config key, normalised.
+
+    Unset, null, false or an empty list => False: every call sends
+    `"think": False`, exactly as before this key existed. `true` => every call
+    sends `"think": True`. A list of model_stage labels (e.g. `[iterative,
+    critique]`) => only calls made inside a `with model_stage(label)` block for
+    one of those labels send `"think": True`, so a reasoning-stage arm can run
+    with its trace while agents and routing stay fast. Strict on purpose, like
+    privacy.external_lookups: a quoted "true"/"false" or any other type raises
+    at startup instead of being read as truthy."""
+    if value is None or value is False:
+        return False
+    if value is True:
+        return True
+    if isinstance(value, (list, tuple)) and all(
+            isinstance(label, str) and label.strip() for label in value):
+        return frozenset(label.strip() for label in value) or False
+    raise ValueError(
+        "invalid ollama config: ollama.think must be true, false (unquoted) or a "
+        f"list of model_stage labels, got {type(value).__name__}")
+
+
+def think_setting(value) -> dict:
+    """Plain-data description of a think setting for run provenance:
+    {"setting": "off" | "on" | "stages", "stages": [labels]}. Accepts the raw
+    config value or an already-parsed one."""
+    parsed = parse_think_setting(value if not isinstance(value, frozenset) else sorted(value))
+    if parsed is True:
+        return {"setting": "on", "stages": []}
+    if parsed:
+        return {"setting": "stages", "stages": sorted(parsed)}
+    return {"setting": "off", "stages": []}
+
+
 def _chat_options(temperature, num_ctx, seed) -> dict:
     """Build Ollama's `options` for a chat call.
 
@@ -213,8 +263,13 @@ class OllamaClient:
 
     def __init__(self, base_url: str, timeout_seconds: float = 120.0,
                  num_ctx: int | None = None, seed: int | None = None,
-                 transient_retries: int | None = DEFAULT_TRANSIENT_RETRIES):
+                 transient_retries: int | None = DEFAULT_TRANSIENT_RETRIES,
+                 think: bool | list[str] | None = None):
         self.base_url = base_url.rstrip("/")
+        # AR-10 P2: opt-in thinking mode (`ollama.think`, see
+        # parse_think_setting). Default off, so every payload keeps
+        # `"think": False` byte-identical unless a config sets it.
+        self.think = parse_think_setting(think)
         self.timeout_seconds = timeout_seconds
         # Max retries (not attempts) after a transient failure; 0 disables.
         # Clamped to [0, _MAX_TRANSIENT_RETRIES] so the retry is always bounded.
@@ -271,6 +326,11 @@ class OllamaClient:
         # per LOGICAL call so run accounting is unchanged by retries.
         self.model_retry_count = 0
         self.model_retry_recovered_count = 0
+        # AR-10 P2: calls that sent `"think": True`, and the reasoning traces
+        # that came back. Counts and lengths only -- the trace text is dropped.
+        self.model_think_call_count = 0
+        self.model_thinking_trace_count = 0
+        self.model_thinking_trace_chars = 0
         # E9: the same usage, split by the active model_stage label. Pure
         # bookkeeping read off values this client already has -- it adds no
         # request and changes no result.
@@ -341,7 +401,20 @@ class OllamaClient:
                            "cancelled": self.model_cancelled_count,
                            "retries": self.model_retry_count,
                            "retry_recovered": self.model_retry_recovered_count,
-                           "unknown_usage": self.model_unknown_usage_count}}
+                           "unknown_usage": self.model_unknown_usage_count},
+                # Whether this run measured reasoning mode: the configured
+                # setting plus the calls that actually sent think on.
+                "think": {**think_setting(self.think),
+                          "think_calls": self.model_think_call_count,
+                          "traces": self.model_thinking_trace_count,
+                          "trace_chars": self.model_thinking_trace_chars}}
+
+    def _think_for_call(self) -> bool:
+        """The `think` value for a call made now: on for every call, or only
+        inside a model_stage block whose label is listed."""
+        if self.think is True:
+            return True
+        return bool(self.think) and _MODEL_STAGE.get() in self.think
 
     async def _chat(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         """Keep consumption independent of successful JSON parsing."""
@@ -414,6 +487,9 @@ class OllamaClient:
             user_prompt=validated_user,
         )
         
+        think = self._think_for_call()
+        if think:
+            self.model_think_call_count += 1
         payload = {
             "model": model,
             "messages": [
@@ -448,7 +524,9 @@ class OllamaClient:
             # being disabled. Harmless no-op for non-thinking models
             # (llama3.1:8b, gemma2:9b) -- verified directly too, identical
             # output and latency with or without it.
-            "think": False,
+            # AR-10 P2: True only when `ollama.think` opts this call in (all
+            # calls, or listed model_stage labels); False otherwise, as before.
+            "think": think,
         }
         url = f"{self.base_url}/api/chat"
 
@@ -602,6 +680,23 @@ class OllamaClient:
         if prompt_tokens is None or completion_tokens is None:
             self.model_unknown_usage_count += 1
         self.rate_limiter.record_usage(prompt_tokens, completion_tokens)
+        # AR-10 P2: a reasoning trace is never the answer and is never kept.
+        # Ollama returns it as message.thinking (think on) or, for some models,
+        # inline as a leading <think> block in content. Drop it from the raw
+        # envelope handed back to callers and keep only its length.
+        message = data.get("message")
+        trace_chars = 0
+        if isinstance(message, dict):
+            thinking = message.pop("thinking", None)
+            if isinstance(thinking, str):
+                trace_chars += len(thinking)
+            if isinstance(message.get("content"), str):
+                message["content"], inline_chars = _strip_inline_thinking(message["content"])
+                trace_chars += inline_chars
+        if trace_chars:
+            measurement["thinking_chars"] = trace_chars
+            self.model_thinking_trace_count += 1
+            self.model_thinking_trace_chars += trace_chars
         content = data.get("message", {}).get("content", "")
         if not content:
             self.audit_logger.log_llm_error(

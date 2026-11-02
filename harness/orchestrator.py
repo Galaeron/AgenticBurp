@@ -134,6 +134,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             num_ctx=config["ollama"].get("num_ctx"),  # opt-in; None => unchanged
             seed=config["ollama"].get("seed"),  # run-level reproducibility seed; None => omit
             transient_retries=config["ollama"].get("transient_retries", 2),  # bounded; 0 => off
+            think=config["ollama"].get("think"),  # AR-10 P2 opt-in; unset => think off
         )
         
         # Configuration
