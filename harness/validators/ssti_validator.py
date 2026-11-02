@@ -35,7 +35,7 @@ from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult, artifact_id_of
-from .injection_targets import param_targets, mutate, replay_headers
+from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
 
 # Two 2-digit primes -> a distinctive 4-digit product unlikely to appear by
 # chance, and one no reasonable page computes for an unrelated reason.
@@ -124,7 +124,7 @@ class SstiValidator(Validator):
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
-        targets = param_targets(exchange)[:_MAX_PARAMS]
+        targets, coverage = select_targets(finding, param_targets(exchange), _MAX_PARAMS)
         if not targets:
             return self._skip("no parameter to inject a template expression into")
         method = (exchange.method or "GET").upper()
@@ -337,4 +337,6 @@ class SstiValidator(Validator):
             self.name, "not_confirmed", "ssti", confidence=0.0, confirmed=False,
             summary="No template expression was evaluated -- parameters are reflected literally, if at all",
             evidence=f"Tried {len(targets)} parameter(s) across {len(_SYNTAXES)} engine syntaxes; "
-                     f"the arithmetic product never appeared between the nonce boundaries."))
+                     f"the arithmetic product never appeared between the nonce boundaries."
+                     + coverage_note(coverage, finding),
+            control_outcome=coverage))

@@ -27,7 +27,7 @@ from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import SentAnswer, Validator, ValidationResult, artifact_id_of
-from .injection_targets import param_targets, mutate, replay_headers
+from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
 
 # Shell metacharacters that break out of the surrounding command, tried in order.
 # `{u}` is the collaborator URL. Covers POSIX (`;`, `|`, `$()`, backticks,
@@ -97,7 +97,7 @@ class CommandInjectionValidator(Validator):
         from harness.scope_lock import host_in_scope
         if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
             return self._skip("target origin is out of scope")
-        targets = param_targets(exchange)[:_MAX_PARAMS]
+        targets, coverage = select_targets(finding, param_targets(exchange), _MAX_PARAMS)
         if not targets:
             return self._skip("no parameter to inject a shell payload into")
         collab = self.collab() if self.oob_callbacks_enabled else None
@@ -277,4 +277,5 @@ class CommandInjectionValidator(Validator):
             summary="No out-of-band callback observed -- parameters do not appear to reach a shell",
             evidence=f"Tried {len(targets)} parameter(s) x {len(_TEMPLATES)} shell payloads; "
                      f"no collaborator hit within the window. Waited once for {len(probes)} "
-                     f"callback(s) (timeout {self.timeout:g} s).")
+                     f"callback(s) (timeout {self.timeout:g} s)." + coverage_note(coverage, finding),
+            control_outcome=coverage)

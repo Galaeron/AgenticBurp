@@ -336,14 +336,16 @@ def _identity_signature(request_headers: dict | None) -> str:
 
 
 def confirmation_cache_key(validator_name: str, exchange: HttpExchange,
-                           finding_class: str | None = None) -> tuple:
+                           finding_class: str | None = None,
+                           parameter: tuple[str, str] = ("", "")) -> tuple:
     """The within-run memoisation key for a confirmation leg (R03).
 
     Includes the IDENTITY (auth headers) and the finding CLASS/subtype, not just
     (validator, method, url, body): different cookies/bearer tokens, and different
     hypothesised subclasses, are DIFFERENT cases. Keying only on url/body replayed
     an administrator's confirmation into another identity's cell, or a skip into a
-    valid request."""
+    valid request. The named (location, parameter) is part of the case too: a leg
+    tests a named parameter first, so one parameter's result is not another's."""
     import hashlib
     method = (exchange.method or "GET").upper()
     url = exchange.url or ""
@@ -351,7 +353,7 @@ def confirmation_cache_key(validator_name: str, exchange: HttpExchange,
     body_hash = hashlib.md5(body.encode("utf-8", errors="replace")).hexdigest()
     identity_sig = _identity_signature(exchange.request_headers)
     fc = (finding_class or "").lower()
-    return (validator_name, method, url, body_hash, identity_sig, fc)
+    return (validator_name, method, url, body_hash, identity_sig, fc, tuple(parameter))
 
 
 async def bounded_gather(coros, limit: int, *, return_exceptions: bool = True):

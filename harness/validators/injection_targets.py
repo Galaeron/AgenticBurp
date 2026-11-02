@@ -40,6 +40,54 @@ def param_targets(exchange: HttpExchange) -> list[tuple[str, str]]:
     return out
 
 
+# control_outcome markers for a not_confirmed that is NOT a controlled negative for
+# the finding's own case. The confirmation gate only counts "" / "control_held" as
+# refuting, so either marker lands the finding as inconclusive, never refuted.
+NAMED_PARAMETER_UNTESTED = "named_parameter_untested"
+PARTIAL_COVERAGE = "partial_coverage"
+
+_LOCATION_ALIASES = {"query": QUERY, "url": QUERY, "body": BODY, "json": BODY, "form": BODY}
+# Named locations these legs never inject into: a same-named query/body parameter
+# is a different input, so it must not stand in for the one the finding names.
+_UNREACHABLE_LOCATIONS = {"header", "cookie", "path"}
+
+
+def select_targets(finding, candidates: list[tuple[str, str]], limit: int,
+                   *, available: list[tuple[str, str]] | None = None
+                   ) -> tuple[list[tuple[str, str]], str]:
+    """Bound a leg's injection points without dropping the one the agent named.
+
+    `candidates` is the leg's own ordered choice (e.g. file-shaped params first);
+    `available` is every point the leg could inject into (defaults to candidates),
+    so a named parameter outside the leg's shape heuristic is still tested.
+    Returns (targets, coverage): coverage is "" when a negative over `targets` is a
+    controlled negative for this finding's case, else a marker for control_outcome.
+    """
+    available = list(candidates if available is None else available)
+    named = (getattr(finding, "parameter_name", "") or "").strip()
+    if named:
+        raw_loc = (getattr(finding, "parameter_location", "") or "").strip().lower()
+        loc = _LOCATION_ALIASES.get(raw_loc)
+        hit = None
+        if raw_loc not in _UNREACHABLE_LOCATIONS:
+            hit = next((t for t in available if t[1] == named and (loc is None or t[0] == loc)), None)
+        if hit is None:
+            return list(candidates[:limit]), NAMED_PARAMETER_UNTESTED
+        rest = [t for t in candidates if t != hit]
+        return [hit] + rest[:max(limit - 1, 0)], ""
+    return list(candidates[:limit]), ("" if len(candidates) <= limit else PARTIAL_COVERAGE)
+
+
+def coverage_note(coverage: str, finding) -> str:
+    """One evidence sentence saying why a negative does not refute this finding."""
+    if coverage == NAMED_PARAMETER_UNTESTED:
+        return (f" The parameter the finding names ({finding.parameter_name!r}) is not an "
+                f"injectable point this leg can reach, so this is not a negative for it.")
+    if coverage == PARTIAL_COVERAGE:
+        return " Not every parameter was tested, so this is not a negative for the endpoint."
+    return ""
+
+
 def mutate(exchange: HttpExchange, loc: str, param: str, value: str) -> tuple[str, str]:
     """(url, body) with `param` at `loc` replaced by `value`; the other of the
     pair is returned unchanged. Falls back to the original on a mutator miss so a

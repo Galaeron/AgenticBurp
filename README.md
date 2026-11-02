@@ -46,11 +46,11 @@ This is the core path. When the Burp extension sends an HTTP exchange to `POST /
 9. **Adaptive re-spin** -- if nothing actionable survived and cloud reasoning is enabled, asks the coordinator for follow-up agents and dispatches another round (up to `max_rounds`).
 10. **Credential detection** -- flags credential endpoints in the exchange.
 11. **Shape precondition** -- deterministic findings from endpoint shape (e.g. missing security headers).
-12. **Validation** -- `ValidatorRegistry.for_finding()` matches findings to validators. Each validator sends targeted probes and returns machine-verifiable results. Active validators only run when `validators.active_enabled` is set.
+12. **Validation** -- `ValidatorRegistry.for_finding()` matches findings to validators. Each validator sends targeted probes and returns machine-verifiable results. Active validators only run when `validators.active_enabled` is set. Agents name the parameter a finding is about (`parameter_location` / `parameter_name`); the SSTI, command-injection, path-traversal and open-redirect validators test that parameter first, even past their parameter cap. A negative that did not cover the named parameter, or every input, is marked `named_parameter_untested` / `partial_coverage` and is not a controlled negative (see `harness/validators/README.md`).
 13. **Confirmation gate** -- classifies each unconfirmed finding:
     - **CONFIRMED** -- a validator proved it. Ships at true severity.
     - **REFUTED** -- a live-verified validator ran, produced a controlled negative. Demoted to "low", confidence <= 0.35.
-    - **UNVERIFIED** -- a live-verified validator ran but produced no controlled negative. Demoted to "low".
+    - **UNVERIFIED** -- a live-verified validator ran but produced no controlled negative (including a negative that never tested the finding's parameter). Demoted to "low", labelled inconclusive rather than a likely false positive.
     - **UNPROVEN** -- the validator is only smoke-tested (not proven against live targets). Capped at "medium", confidence <= 0.5.
 14. **Known-vulnerability resolution** -- extracts software components from agent reports, verifies against exchange text, looks up GitHub Advisories + CISA KEV.
 15. **Supplemental scans** -- confidential info (regex-based secrets/PII), verbose error detection, secret disclosure.

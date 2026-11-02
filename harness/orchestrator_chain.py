@@ -1428,7 +1428,9 @@ class ChainMixin:
                            severity=finding.get("severity") or "medium",
                            summary=finding.get("summary") or default_class,
                            evidence=finding.get("evidence") or "",
-                           suggested_test=finding.get("suggested_test") or "", basis="derived")
+                           suggested_test=finding.get("suggested_test") or "", basis="derived",
+                           parameter_location=str(finding.get("parameter_location") or ""),
+                           parameter_name=str(finding.get("parameter_name") or ""))
 
         _protected: list = []   # RV-S: this target's declared routes, built on first use
 
