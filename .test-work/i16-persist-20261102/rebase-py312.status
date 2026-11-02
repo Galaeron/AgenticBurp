@@ -1,0 +1,8 @@
+label=rebase-py312 python=C:/Users/arthu/Documents/AgenticVibe/.venv-rationalisation/Scripts/python.exe head=1446237 mode=quick started=2026-11-02T17:07:32+01:00
+worktree-diff-sha256=e3b0c44298fc1c14
+Python 3.12.14
+precondition=0
+i16=0
+smoke=0
+worktree-diff-sha256-after=e3b0c44298fc1c14
+finished=2026-11-02T17:10:07+01:00
