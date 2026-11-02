@@ -4339,13 +4339,17 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
 - **Acceptance criteria:** a real claim-specific procedure per class, or each stays explicitly
   unsupported; never counted as zero false positives.
 
-### [ ] AR-ID — Cookie-bearing captures match no supplied identity
+### [x] AR-ID — Cookie-bearing captures match no supplied identity
 - **Domain:** Identity/session binding · **Effort:** M · **Mode:** LOOP (offline fixture first).
 - **Evidence:** run `7d6b115acbec` — six cookie-bearing captures matched neither the anonymous nor
   the Authorization-based identities (`.test-work/capture-report-diagnosis-20261030/HANDOFF.md`,
   main checkout). No identity-matching change has been made.
 - **Acceptance criteria:** cookie-session captures bind to the right declared identity, or are
   reported as unbound; no credential is persisted; caller-level test with a mismatched control.
+- **Done:** `c327796` (2026-11-02). `build_engagement` compares Cookie headers as name=value pairs
+  (declared cookies must all be present; no-cookie roles still need a cookie-free capture);
+  unbound captures report header names only. Regression `harness/test_seed_capture_identity.py`.
+  A capture with a role's bearer plus an undeclared cookie stays unbound by design.
 
 ### [ ] AR-PKG — Repackage and restart from the fixed source
 - **Domain:** Release/verification · **Effort:** S · **Mode:** OWNER.
