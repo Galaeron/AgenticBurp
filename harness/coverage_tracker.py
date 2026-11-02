@@ -742,6 +742,10 @@ class CoverageTracker:
                 reason = next(marker for marker in ("missing_principal", "missing_body", "scope_rejected") if marker in cell.reason)
             elif "did not reach this endpoint" in cell.reason:
                 reason = "unreachable_identity"
+            elif key in self.attempted and representative.status == CellStatus.SKIPPED:
+                # The leg ran and declined on its own precondition (no JWT, no
+                # object id, ...): not an unfinished dispatch, and never a negative.
+                reason = "leg_precondition_unmet"
             elif key in self.attempted:
                 reason = "incomplete_attempt"
             elif check and check.confirmation == "manual":

@@ -101,7 +101,7 @@ class EngagementCapabilityTests(unittest.TestCase):
     def restore(old):
         store._DB_PATH, cache._cache = old
 
-    def run_caller(self, enabled, case_drive):
+    def run_caller(self, enabled, case_drive, status='blocked'):
         from harness import test_smoke_investigate as smoke
         from harness.orchestrator import Orchestrator
         from harness.coverage_tracker import _LEG_CONFIRMATIONS
@@ -117,7 +117,7 @@ class EngagementCapabilityTests(unittest.TestCase):
         orch.run_active_probe = AsyncMock(return_value={
             'iterative_result': {'stop_reason': 'gave_up', 'findings': []}, 'integration': {}})
         validator = orch.validator_registry.validators.get('csp')
-        calls = AsyncMock(return_value=ValidationResult('csp_validator', 'blocked', 'csp'))
+        calls = AsyncMock(return_value=ValidationResult('csp_validator', status, 'csp'))
         if validator:
             validator.validate = calls
         with patch('harness.engagement_builder.build_engagement', side_effect=_declared_html_state), \
@@ -138,6 +138,26 @@ class EngagementCapabilityTests(unittest.TestCase):
                 calls, rows = self.run_caller(False, case_drive)
                 calls.assert_not_called()
                 self.assertTrue(all(r['terminal_reason'] == 'validator_unavailable' for r in rows), rows)
+
+    def test_leg_precondition_refusal_is_not_an_incomplete_attempt(self):
+        """live-v8 f2a78499593e: 1068 of 1270 `incomplete_attempt` cells were legs that
+        ran and declined on their own precondition (no JWT, no object id, ...). The
+        drive had dispatched every queued cell, so the label misread as throughput.
+        Control: a leg that answers without a verdict stays an incomplete attempt,
+        and neither outcome is a clean negative."""
+        for case_drive in (False, True):
+            with self.subTest(case_drive=case_drive):
+                calls, rows = self.run_caller(True, case_drive, status='skipped')
+                self.assertGreater(calls.await_count, 0)
+                self.assertTrue(rows)
+                self.assertTrue(all(r['attempted'] and r['terminal_reason'] == 'leg_precondition_unmet'
+                                    for r in rows), rows)
+                self.assertFalse(any(r['sent'] or r['conclusive'] for r in rows), rows)
+                calls, rows = self.run_caller(True, case_drive, status='inconclusive')
+                self.assertGreater(calls.await_count, 0)
+                self.assertTrue(all(r['attempted'] and r['terminal_reason'] == 'incomplete_attempt'
+                                    for r in rows), rows)
+                self.assertFalse(any(r['sent'] or r['conclusive'] for r in rows), rows)
 
     def test_catalog_aliases_and_registered_families_reach_engagement_dispatch(self):
         from harness import test_smoke_investigate as smoke
