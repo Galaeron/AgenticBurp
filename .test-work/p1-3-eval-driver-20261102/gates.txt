@@ -1,0 +1,4 @@
+smoke312 exit=0
+smoke314 exit=0
+full312 exit=0
+full314 exit=0
