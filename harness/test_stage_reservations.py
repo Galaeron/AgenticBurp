@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, patch
 from harness import (cache, coverage_tracker, engagement_builder, evidence_ledger, role_crawl,
                      safety_gate, store, worklist_investigator)
 from harness import worklist_investigator as wi
+from harness.coverage_model import CellStatus, CoverageMatrix
 from harness.coverage_tracker import CoverageTracker, build_coverage_driven
 from harness.engagement import EngagementState
 from harness.models import HttpExchange
@@ -160,19 +161,21 @@ class CoverageDeadlineTests(unittest.TestCase):
                 _coverage_endpoints(), ["user"], run_leg, budget=budget, deadline=deadline))
         return sent, report
 
-    def _cases(self, deadline, *, clock=None, advance=0.0):
+    def _cases(self, deadline, *, clock=None, advance=0.0, driveable=None, state=None):
         sent = []
 
         async def run_case(identity, method, path, check, case_key):
             sent.append((identity, method, path, check.id))
+            self.case_names.append(case_key.parameter_name)
             if clock is not None:
                 clock.now += advance
             return _Negative()
 
+        self.case_names = []
         with patch.object(coverage_tracker, "time", clock or time):
             report = asyncio.run(coverage_tracker.build_coverage_cases_driven(
-                _coverage_endpoints(), [SimpleNamespace(role="user")], run_case, budget=100,
-                deadline=deadline))
+                state or _coverage_endpoints(), [SimpleNamespace(role="user")], run_case,
+                budget=100, deadline=deadline, driveable=driveable))
         return sent, report
 
     def test_unexpired_deadline_drives_every_leg(self):
@@ -204,16 +207,50 @@ class CoverageDeadlineTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(report["drive_stopped_by"], "leg budget")
 
-    def test_case_drive_honours_the_deadline(self):
-        unbounded, base = self._cases(None)
-        self.assertGreaterEqual(len(unbounded), 2)
+    def test_case_drive_honours_the_deadline_between_parameter_dispatches(self):
+        """sqlmap is dispatched once per parameter case; a deadline passed after the
+        first dispatch stops the second one inside the same cell, and that input
+        stays inconclusive (never a clean negative)."""
+        def search_only():
+            state = _coverage_endpoints()
+            del state.endpoints["GET /api/tickets/{id}"]
+            return state
+
+        unbounded, base = self._cases(None, driveable={"sqlmap"}, state=search_only())
+        self.assertEqual(self.case_names, ["search", "sort"])     # one dispatch per input
+        self.assertEqual(len(set(unbounded)), 1)                   # all in one cell
         self.assertIsNone(base["drive_stopped_by"])
-        sent, report = self._cases(130.0, clock=_Clock(), advance=45.0)
+        sent, report = self._cases(130.0, clock=_Clock(), advance=45.0, driveable={"sqlmap"},
+                                   state=search_only())
+        self.assertEqual(self.case_names, ["search"])
+        self.assertEqual(report["cases_driven"], 1)
+        self.assertEqual(report["drive_stopped_by"], "time budget")
+        matrix = CoverageMatrix.from_dict(report["checkpoint"]["matrix"])
+        cases = {ck.parameter_name: r for ck, r in
+                 matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-05")}
+        self.assertEqual(cases["sort"].status, CellStatus.INCONCLUSIVE)
+        self.assertIn("time budget", cases["sort"].reason)
+        self.assertNotEqual(matrix.get("user", "POST /api/search", "WSTG-INPV-05").status,
+                            CellStatus.NOT_DETECTED)
+        # the queue counts cells: the one cell was attempted
+        self.assertEqual(report["queued_not_attempted"], 0)
+
+    def test_control_request_level_case_drive_honours_the_deadline_per_cell(self):
+        """Control: with no parameter inputs every cell is one request-level
+        dispatch, and the deadline stops the drive before the next cell, as before."""
+        state = _coverage_endpoints()
+        state.endpoints["POST /api/search"].template = None
+        unbounded, base = self._cases(None, state=state)
+        self.assertGreaterEqual(len(unbounded), 2)
+        self.assertEqual(len(set(unbounded)), len(unbounded))      # one dispatch per cell
+        self.assertTrue(all(name == "" for name in self.case_names))
+        state = _coverage_endpoints()
+        state.endpoints["POST /api/search"].template = None
+        sent, report = self._cases(130.0, clock=_Clock(), advance=45.0, state=state)
         self.assertEqual(len(sent), 1)
         self.assertEqual(report["cases_driven"], 1)
         self.assertEqual(report["drive_stopped_by"], "time budget")
-        # a cell may be dispatched once per parameter: the queue counts cells
-        self.assertEqual(report["queued_not_attempted"], len(set(unbounded)) - 1)
+        self.assertEqual(report["queued_not_attempted"], len(unbounded) - 1)
 
     def test_control_a_drive_ignoring_its_deadline_sends_after_it(self):
         """Defect injection: the former driver had no deadline; the test above sees it."""

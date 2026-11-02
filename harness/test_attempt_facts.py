@@ -23,6 +23,7 @@ from harness.orchestrator_chain import _ConfirmationCache
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext, TypedRequest
 from harness.validators.base import ValidationResult
+from harness.validators.injection_targets import case_target
 
 ROLES = [RoleSession("anonymous", {})]
 CHECK = "WSTG-INPV-05"          # SQL injection, a parameter (case-driven) check
@@ -86,8 +87,8 @@ def _state(base, *paths):
 class _Run:
     """A run context plus the production confirmation cache over it."""
 
-    def __init__(self, target, status="not_confirmed"):
-        self.target, self.status = target, status
+    def __init__(self, target, status="not_confirmed", bind_cases=False):
+        self.target, self.status, self.bind_cases = target, status, bind_cases
         self.ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=50,
                                      gate_config={"active_enabled": True})
         self.cache = _ConfirmationCache(self.ctx, lambda *args: "case:shared")
@@ -100,6 +101,11 @@ class _Run:
                                 response_headers={}, response_body="")
         finding = Finding(vulnerability_class=check.vulnerability_class, confidence=0.5,
                           summary="coverage", evidence="", suggested_test="", basis="derived")
+        target = case_target(check.confirmation, case_key) if self.bind_cases and case_key else None
+        if target is not None:
+            # As the production case leg does: bind the leg to the parameter case.
+            finding = finding.model_copy(update={"parameter_location": target[0],
+                                                 "parameter_name": target[1], "parameter_only": True})
         return await self.cache.validate(_OneSend(self.ctx, self.status), finding, exchange,
                                          case_ref="case:shared")
 
@@ -128,11 +134,34 @@ class AttemptFactTests(unittest.TestCase):
         self.target = _Target()
         self.addCleanup(self.target.close)
 
-    def test_executed_representative_with_pending_sibling_is_executed_but_incomplete(self):
+    def test_sqlmap_per_parameter_dispatch_records_one_fresh_attempt_per_input(self):
+        """Per-parameter dispatch: sqlmap is sent once for `q`, once for `sort` and
+        once at request level for the path id it cannot target alone. Each send is
+        a fresh attempt on its own case; the untargetable sibling keeps the cell
+        executed but incomplete."""
+        run = _Run(self.target, bind_cases=True)
+        report = run.drive(build_coverage_cases_driven, _state(self.target.base, "/items/1?q=1&sort=a"))
+        matrix, parent = _cell(report)
+        self.assertEqual(self.target.requests, 3)
+        self.assertEqual(parent.status, CellStatus.PENDING)       # not endpoint-complete
+        self.assertTrue(parent.executed)
+        self.assertEqual(len(parent.attempts), 3)
+        cases = {ck.parameter_name: r for ck, r in matrix.cases_for_cell("anonymous", ITEMS, CHECK)}
+        for name in ("q", "sort", ""):
+            self.assertEqual(cases[name].status, CellStatus.NOT_DETECTED, name)
+            self.assertEqual(len(cases[name].attempts), 1, name)
+            self.assertEqual(cases[name].attempts[0]["sent"], 1, name)
+        self.assertEqual(len({cases[n].attempts[0]["id"] for n in ("q", "sort", "")}), 3)
+        self.assertEqual(cases["object_id"].status, CellStatus.INCONCLUSIVE)
+        self.assertFalse(cases["object_id"].attempts or cases["object_id"].executed)
+        row = _row(report)
+        self.assertTrue(row["fresh_sent"])
+        self.assertFalse(row["conclusive"])
+
+    def test_control_request_level_representative_with_pending_sibling_is_executed_but_incomplete(self):
+        """Control: with no parameter case pending (a case budget of 0 leaves both
+        inputs budget-skipped) sqlmap keeps its single request-level dispatch."""
         run = _Run(self.target)
-        # A case budget of 0 leaves both inputs budget-skipped, so the sqlmap leg
-        # keeps its single request-level dispatch (per-parameter dispatch needs a
-        # pending parameter case).
         report = run.drive(build_coverage_cases_driven, _state(self.target.base, "/items/1?q=1&sort=a"),
                            per_cell_case_budget=0)
         matrix, parent = _cell(report)
