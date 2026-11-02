@@ -114,6 +114,25 @@ async def build_engagement(
     def credentials(headers):
         return {k.lower(): v for k, v in (headers or {}).items()
                 if k.lower() in identity_header_names}
+    def cookie_pairs(value):
+        pairs = set()
+        for part in str(value or "").split(";"):
+            name, sep, val = part.strip().partition("=")
+            if sep and name.strip():
+                pairs.add((name.strip(), val.strip()))
+        return pairs
+    def owns(role_headers, capture_headers):
+        # AR-ID: a browser sends the declared session cookie next to cookies it or
+        # the server set, in any order. A role that declares cookies owns a capture
+        # carrying all of them; a role that declares none (anonymous, bearer-only)
+        # still needs a cookie-free capture, so an undeclared session is never
+        # relabelled. Every other identity header must match exactly.
+        declared, seen = credentials(role_headers), credentials(capture_headers)
+        declared_cookies = cookie_pairs(declared.pop("cookie", ""))
+        seen_cookies = cookie_pairs(seen.pop("cookie", ""))
+        if declared != seen:
+            return False
+        return declared_cookies <= seen_cookies if declared_cookies else not seen_cookies
     for item in supplied:
         try:
             ex = item if isinstance(item, HttpExchange) else HttpExchange(**item)
@@ -121,9 +140,18 @@ async def build_engagement(
                 seed_errors.append("capture ignored: outside engagement origin/scope")
                 continue
             owners = [(index, r) for index, r in enumerate(roles)
-                      if credentials(r.headers) == credentials(ex.request_headers)]
+                      if owns(r.headers, ex.request_headers)]
+            if owners:
+                # The most specific declaration wins when one role's cookies are a
+                # subset of another's (e.g. session-only vs session+csrf).
+                most = max(len(cookie_pairs(credentials(r.headers).get("cookie"))) for _, r in owners)
+                owners = [(i, r) for i, r in owners
+                          if len(cookie_pairs(credentials(r.headers).get("cookie"))) == most]
             if not owners:
-                seed_errors.append("capture ignored: no matching supplied identity")
+                # Header NAMES only: never a cookie or token value.
+                names = sorted(credentials(ex.request_headers)) or ["none"]
+                seed_errors.append("capture unbound: identity headers (" + ", ".join(names)
+                                   + ") match no supplied identity")
                 continue
             seeds.append((ex, owners))
         except (TypeError, ValueError):
