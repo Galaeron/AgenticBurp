@@ -65,8 +65,8 @@
    on host, mechanism, principal and check family. Other routes become affected
    locations. Today 44 jwt proofs yield 20 vulnerabilities, under mixed classes.
 3. Coverage drive throughput: 110 of 1380 queued sent, 1270 incomplete attempts.
-4. Redaction false positive: metric keys "csrf" and "auth" become
-   [REDACTED-SECRET].
+4. Redaction false positive: fixed in `dec3828` (2026-11-02, branch
+   `claude/arid-redaction-6b6000`, not merged). Open: `redact_headers` has no X-CSRF-Token entry.
 5. 3acd392 has had no live run yet. The live check is whether the iterative agent
    adapts to errors deep in a page.
 6. harness/active_verification.py:143 falls back to llama3.1:8b (Burp validation

@@ -211,5 +211,62 @@ class EvidenceBlobProducerSinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("keep-this-header", resp_text)
 
 
+class MetricKeyBoundaryTests(unittest.TestCase):
+    """CURRENT_STATE item 4: a COUNT or FLAG the harness itself keys by check family
+    ("csrf", "auth") is a metric, not a secret, so structured sanitization keeps it.
+    Paired controls: a token, header value, numeric-string token or container under the
+    SAME key is still withheld, the exemption names only those two keys, and target
+    data reaching a text/body sink is redacted as before."""
+
+    METRICS = {"by_family": {"csrf": 3, "auth": 0, "sqli": 7}, "csrf": 2.5, "auth": True}
+
+    def test_numeric_and_boolean_metrics_under_csrf_and_auth_survive(self):
+        self.assertEqual(security.sanitize_data(self.METRICS), self.METRICS)
+
+    def test_secret_values_under_the_same_keys_are_still_redacted(self):
+        for value in (CANARY, f"Bearer {CANARY}", "839201", {"token": CANARY}, [CANARY]):
+            for key in ("csrf", "auth", "CSRF", "Auth"):
+                out = security.sanitize_data({"by_family": {key: value}})
+                self.assertEqual(out["by_family"][key], security.SECRET_VALUE_PLACEHOLDER,
+                                 f"{key}={value!r} was kept")
+
+    def test_other_secret_names_keep_numeric_values_redacted(self):
+        out = security.sanitize_data({"password": 123456, "sid": 987654, "csrf_token": 42})
+        self.assertEqual(set(out.values()), {security.SECRET_VALUE_PLACEHOLDER})
+
+    def test_target_data_in_text_and_body_sinks_is_still_redacted(self):
+        body = json.dumps({"csrf": 839201, "auth": 1, "q": PAYLOAD})
+        for out in (security.redact_secrets_in_body(body), security.sanitize_text(body),
+                    security.sanitize_text(f"response was {body} after login")):
+            self.assertNotIn("839201", out)
+            self.assertIn(PAYLOAD, out)
+
+    def test_auth_and_csrf_cookie_headers_still_redacted(self):
+        # (redact_headers has no X-CSRF-Token entry; that pre-existing gap is out of scope here.)
+        out = json.dumps(security.redact_headers({
+            "Authorization": f"Basic {CANARY}", "Cookie": f"csrf={CANARY}", "X-Trace-Id": "keep"}))
+        self.assertNotIn(CANARY, out)
+        self.assertIn("keep", out)
+
+    def test_job_result_sink_keeps_metrics_and_withholds_tokens(self):
+        from harness.job_status import JobStatusStore
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        journal = JobStatusStore(Path(tmp) / "jobs.sqlite3", "canary-owner")
+        result = {"run_id": "r1", "coverage": {"csrf": 3, "auth": 2},
+                  "observed": {"csrf": CANARY, "auth": f"Bearer {CANARY}"}}
+        job = dict(job_id="metric-job", host="captured.example", base_url="https://captured.example",
+                   status="done", started_at=1.0, finished_at=2.0, result=result)
+        journal.create(job)
+        stored = json.loads(journal.read_result("metric-job"))
+        self.assertEqual(stored["coverage"], {"csrf": 3, "auth": 2})
+        self.assertEqual(stored["observed"], {"csrf": security.SECRET_VALUE_PLACEHOLDER,
+                                             "auth": security.SECRET_VALUE_PLACEHOLDER})
+        snapshot = json.dumps(JobStatusStore.public_snapshot(job))
+        self.assertNotIn(CANARY, snapshot)
+        with open(Path(tmp) / "jobs.sqlite3", "rb") as handle:
+            self.assertNotIn(CANARY.encode(), handle.read())
+
+
 if __name__ == "__main__":
     unittest.main()
