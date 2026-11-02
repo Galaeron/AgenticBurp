@@ -115,6 +115,11 @@ Rules:
   in Burp Repeater (what to change, what response to look for) -- not a
   generic "test for X" restatement of the vulnerability class.
 - validation_hints is optional and MUST contain only capability names from the harness validator registry that naturally apply to this finding. "sqlmap" is ONLY appropriate when your vulnerability_class is itself a SQL injection hypothesis -- for every other category, either leave validation_hints empty or name a capability that actually matches this finding's own category (e.g. an IDOR finding might reference "cross_identity_compare", never "sqlmap"). Never put a command, URL, shell syntax, or model-generated target in validation_hints.
+- parameter_name is the exact name of the request parameter the finding is
+  about, as it appears in this request (e.g. "q", "redirect_uri"), and
+  parameter_location is where it sits: "query", "body", "path", "header" or
+  "cookie". Leave both "" when the finding is not about one parameter. Never
+  invent a parameter that is not in the request.
 - If nothing relevant to your specialty is present, return an empty
   findings list. Do not manufacture a finding to seem useful.
 - severity must be one of: "info", "low", "medium", "high", "critical" --
@@ -141,6 +146,7 @@ Rules:
     {"vulnerability_class": "...", "confidence": 0.0-1.0, "severity": "info|low|medium|high|critical",
      "owasp_category": "..." or null, "summary": "...",
      "evidence": "...", "suggested_test": "...", "basis": "derived|recalled|assumed",
+     "parameter_location": "query|body|path|header|cookie" or "", "parameter_name": "...",
      "validation_hints": []}
   ],
   "components": [

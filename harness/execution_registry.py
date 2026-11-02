@@ -94,10 +94,16 @@ def _header_claim(validator_name: str, finding_class: str | None) -> tuple:
 
 
 def execution_key(validator_name: str, exchange, finding_class: str | None = None, *,
-                  mechanism_version: str = "1", state: str = "") -> tuple:
-    """The within-run key for one validator execution (see the module docstring)."""
-    return _base_key(validator_name, exchange, finding_class) + (
+                  mechanism_version: str = "1", state: str = "",
+                  parameter: tuple[str, str] = ("", "")) -> tuple:
+    """The within-run key for one validator execution (see the module docstring).
+
+    A named (location, parameter) is part of the case: a parameter leg tests the
+    parameter the agent named first, so one parameter's result is not another's.
+    It is appended only when named, so unnamed keys keep their shape."""
+    key = _base_key(validator_name, exchange, finding_class) + (
         ("mechanism", str(mechanism_version)), ("state", state or ""))
+    return key + (("parameter", tuple(parameter)),) if any(parameter) else key
 
 
 def _base_key(validator_name: str, exchange, finding_class: str | None) -> tuple:
@@ -134,7 +140,9 @@ class _Stored:
 
 def _conditions(validator, finding=None) -> dict:
     return {"mechanism_version": str(getattr(validator, "mechanism_version", "1") or "1"),
-            "state": str(getattr(finding, "workflow_state_id", "") or "")}
+            "state": str(getattr(finding, "workflow_state_id", "") or ""),
+            "parameter": (str(getattr(finding, "parameter_location", "") or "").strip().lower(),
+                          str(getattr(finding, "parameter_name", "") or "").strip())}
 
 
 class ExecutionRegistry:

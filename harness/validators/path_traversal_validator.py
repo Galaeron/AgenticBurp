@@ -34,7 +34,7 @@ from harness.categories import canonicalize
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked, ActionRiskTier
 from .base import Validator, ValidationResult
-from .injection_targets import param_targets, mutate, replay_headers
+from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
 
 _FILE_PARAM_NAMES = {"file", "filename", "path", "filepath", "page", "template", "doc",
                      "document", "download", "load", "read", "include", "view", "img",
@@ -139,11 +139,17 @@ class PathTraversalValidator(Validator):
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "path_traversal", summary=why)
 
-    def _targets(self, exchange: HttpExchange) -> list[tuple[str, str]]:
-        targets = list((_file_shaped(exchange) or param_targets(exchange))[:_MAX_PARAMS])
-        if _last_segment_index(exchange.url) is not None:
+    def _targets(self, exchange: HttpExchange, finding: Finding) -> tuple[list[tuple[str, str]], str]:
+        params = param_targets(exchange)
+        has_segment = _last_segment_index(exchange.url) is not None
+        if has_segment and (finding.parameter_location or "").strip().lower() == "path":
+            # The path segment is always tried, so a path-located finding is covered.
+            finding = finding.model_copy(update={"parameter_name": ""})
+        targets, coverage = select_targets(
+            finding, _file_shaped(exchange) or params, _MAX_PARAMS, available=params)
+        if has_segment:
             targets.append((_PATHSEG, ""))
-        return targets
+        return targets, coverage
 
     def _mutated(self, exchange: HttpExchange, loc: str, param: str, value: str) -> tuple[str, str]:
         if loc == _PATHSEG:
@@ -154,7 +160,7 @@ class PathTraversalValidator(Validator):
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
-        targets = self._targets(exchange)
+        targets, coverage = self._targets(exchange, finding)
         if not targets:
             return self._skip("no file/path-shaped parameter or path segment to inject a traversal into")
         method = (exchange.method or "GET").upper()
@@ -257,4 +263,5 @@ class PathTraversalValidator(Validator):
             self.name, "not_confirmed", "path_traversal", confidence=0.0, confirmed=False,
             summary="No system-file contents returned -- traversal appears blocked or not a file read",
             evidence=f"Tried {len(targets)} injection point(s) across {len(_PREFIXES)} traversal encodings; "
-                     f"neither /etc/passwd nor win.ini contents appeared.{skipped}")
+                     f"neither /etc/passwd nor win.ini contents appeared.{skipped}" + coverage_note(coverage, finding),
+            control_outcome=coverage)
