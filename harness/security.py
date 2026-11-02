@@ -420,7 +420,7 @@ def sanitize_text(text, *, known_values=()):
         except ValueError:
             offset = brace + 1
             continue
-        clean = sanitize_data(parsed)
+        clean = sanitize_data(parsed, _keep_metrics=False)
         if clean != parsed:
             replacements.append((brace, brace + length, json.dumps(clean)))
         offset = brace + length
@@ -439,13 +439,29 @@ def sanitize_text(text, *, known_values=()):
     return result
 
 
-def sanitize_data(value, *, known_values=()):
+# Secret names the harness also uses as check-family labels ({"csrf": 3} in a
+# coverage summary). Under these keys only, a number or boolean in the harness's OWN
+# structured data is a metric, not a credential; strings, containers and every other
+# secret name stay withheld. JSON decoded from text (target data) gets no exemption.
+_METRIC_LABEL_SECRET_NAMES = frozenset({"auth", "csrf"})
+
+
+def _is_metric_value(key, value) -> bool:
+    return (isinstance(value, (bool, int, float))
+            and str(key).strip().lower().replace("-", "_").replace(" ", "_")
+            in _METRIC_LABEL_SECRET_NAMES)
+
+
+def sanitize_data(value, *, known_values=(), _keep_metrics=True):
     """Return a sanitized structural copy; never mutate authoritative input."""
     if isinstance(value, dict):
-        return {key: SECRET_VALUE_PLACEHOLDER if _is_secret_field_name(str(key))
-                else sanitize_data(child, known_values=known_values) for key, child in value.items()}
+        return {key: (child if _keep_metrics and _is_metric_value(key, child)
+                      else SECRET_VALUE_PLACEHOLDER) if _is_secret_field_name(str(key))
+                else sanitize_data(child, known_values=known_values, _keep_metrics=_keep_metrics)
+                for key, child in value.items()}
     if isinstance(value, (list, tuple)):
-        return [sanitize_data(child, known_values=known_values) for child in value]
+        return [sanitize_data(child, known_values=known_values, _keep_metrics=_keep_metrics)
+                for child in value]
     return sanitize_text(value, known_values=known_values) if isinstance(value, str) else value
 
 
