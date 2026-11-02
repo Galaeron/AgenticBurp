@@ -14,7 +14,6 @@ testing/score.py in, once per seed.
 """
 from __future__ import annotations
 
-import statistics
 from dataclasses import dataclass, field
 
 # Above this per-metric stdev, the mean is too unstable to trust on its own.
@@ -41,12 +40,17 @@ class EvalReport:
     precision_floor: float | None = None
 
     def _agg(self, select) -> dict:
+        # P1-3: mean/pstdev arithmetic lives once in testing.eval_metrics.summarize;
+        # this driver keeps its own 4dp rounding, min/max, empty-run convention and
+        # high-variance flag (on the ROUNDED stdev) so its output stays byte-identical.
+        from testing import eval_metrics
         vals = [select(r) for r in self.runs]
         if not vals:
             return {"mean": None, "stdev": None, "min": None, "max": None, "n": 0, "high_variance": False}
-        stdev = round(statistics.pstdev(vals), 4) if len(vals) > 1 else 0.0
+        s = eval_metrics.summarize(vals)
+        stdev = round(s["pstdev"], 4) if len(vals) > 1 else 0.0
         return {
-            "mean": round(statistics.fmean(vals), 4),
+            "mean": round(s["mean"], 4),
             "stdev": stdev,
             "min": round(min(vals), 4),
             "max": round(max(vals), 4),
