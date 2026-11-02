@@ -1464,29 +1464,25 @@ class ChainMixin:
                             engagement_paths=getattr(state, "protected_paths", None)))
                     declared = _protected[0].match(method, exchange.url)
                     baseline = exchange.request_headers
-                    if declared is not None:
-                        # The probe strips only the credential headers it knows by
-                        # name; any other header a supplied identity sets (a custom
-                        # session header) would ride along on the "anonymous"
-                        # replay. Drop those, so a listed route is replayed with no
-                        # identity at all (fail closed: the baseline may then fail).
-                        supplied = {k.lower() for r in roles for k in (r.headers or {})}
-                        baseline = {k: v for k, v in (baseline or {}).items()
-                                    if k.lower() in missing_auth_probe._AUTH_HEADERS
-                                    or k.lower() not in supplied}
-                    if declared is not None and not any(
-                            k.lower() in missing_auth_probe._AUTH_HEADERS for k in (baseline or {})):
+                    # The anonymous replay keeps only public headers, so a supplied
+                    # identity's custom header (X-Tenant) never rides along on it;
+                    # the same names count as the baseline's credentials, so an app
+                    # that authenticates only through one can confirm (RV-S
+                    # residuals 2 and 3).
+                    supplied = {k.lower() for r in roles for k in (r.headers or {})}
+
+                    def _credential(name):
+                        return missing_auth_probe.credential_header(name, supplied)
+
+                    if declared is not None and not any(_credential(k) for k in (baseline or {})):
                         # The probe identity of an anonymously reached node is
                         # anonymous, so the baseline borrows the highest-trust
-                        # supplied identity's credentials: only the headers the
-                        # probe strips, so none can reach the anonymous replay.
-                        authed = [r for r in roles if any(
-                            k.lower() in missing_auth_probe._AUTH_HEADERS for k in (r.headers or {}))]
+                        # supplied identity's credential headers.
+                        authed = [r for r in roles if any(_credential(k) for k in (r.headers or {}))]
                         if authed:
                             top = max(authed, key=lambda r: role_crawl._trust(r.role))
                             baseline = {**(baseline or {}), **{
-                                k: v for k, v in top.headers.items()
-                                if k.lower() in missing_auth_probe._AUTH_HEADERS}}
+                                k: v for k, v in top.headers.items() if _credential(k)}}
                     outcome = await missing_auth_probe.probe(
                         base_url, (method, path),
                         allowed_hosts=self.allowed_hosts,
@@ -1494,7 +1490,8 @@ class ChainMixin:
                         send_garbage_token=False,
                         expected_protected=declared is not None,
                         protected_baseline=True,
-                        run_context=run_context)
+                        run_context=run_context,
+                        identity_headers=supplied)
                     if outcome.finding is not None:
                         proof = outcome.finding
                         why = (f" Route declared protected by {declared.describe()}."

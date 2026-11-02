@@ -453,5 +453,56 @@ class MissingAuthPreconditionTests(_RouteFixture):
         self.assertTrue(any(f["confirmed"] for f in out["findings"]), out)
 
 
+class MissingAuthCustomHeaderTests(_RouteFixture):
+    """RV-S residual 3: the anonymous replay keeps only public headers (the set
+    `engagement.capture_identity_key` ignores), not "everything but the credential
+    names the probe knows". A caller's custom identity header never reaches it,
+    whether the credential rule (H1) recognises its name (X-Tenant-Session) or
+    not (X-Tenant); public headers (Accept, User-Agent) still do, so only the
+    auth dimension changes."""
+
+    _REPORT = MissingAuthPreconditionTests._REPORT
+    _probe = MissingAuthPreconditionTests._probe
+    _PUBLIC = {"Accept": "application/json", "User-Agent": "tenant-app/2"}
+
+    def _tenant_site(self, header: str):
+        def tenant_report(headers):
+            if headers.get(header.lower()) == "t-1":
+                return 200, {}, self._REPORT
+            return 401, {}, "login required"
+        return self.target(routes={"/api/tenant-report": tenant_report,
+                                   "/api/report": _page(self._REPORT)})
+
+    def _sent(self, site, path):
+        return [h for _, p, h in site.requests if p == path]
+
+    def test_custom_identity_header_never_reaches_the_anonymous_replay(self):
+        for header in ("X-Tenant", "X-Tenant-Session"):
+            with self.subTest(header=header):
+                site = self._tenant_site(header)
+                caller = {"Authorization": "Bearer real-session", header: "t-1", **self._PUBLIC}
+                out = self._probe(site, ["/api/tenant-report"], expected_protected=True,
+                                  headers=caller, send_garbage_token=False)
+                self.assertEqual(out["findings"], [], out)
+                self.assertEqual(out["outcomes"][0]["classification"], "protected", out)
+                sent = self._sent(site, "/api/tenant-report")
+                self.assertEqual(len(sent), 1, "no baseline after an anonymous denial")
+                self.assertFalse({"authorization", header.lower(), "cookie"} & set(sent[0]))
+                # Control: public headers are not credentials and are not stripped.
+                self.assertEqual(sent[0].get("accept"), "application/json")
+                self.assertEqual(sent[0].get("user-agent"), "tenant-app/2")
+
+    def test_leaking_endpoint_with_a_custom_header_caller_still_confirms(self):
+        site = self._tenant_site("X-Tenant")
+        caller = {"Authorization": "Bearer real-session", "X-Tenant": "t-1", **self._PUBLIC}
+        out = self._probe(site, ["/api/report"], expected_protected=True,
+                          headers=caller, send_garbage_token=False)
+        self.assertEqual([f["confirmed"] for f in out["findings"]], [True])
+        sent = self._sent(site, "/api/report")
+        self.assertEqual([h.get("authorization") for h in sent], [None, "Bearer real-session"])
+        self.assertNotIn("x-tenant", sent[0])
+        self.assertEqual(sent[0].get("accept"), "application/json")
+
+
 if __name__ == "__main__":
     unittest.main()
