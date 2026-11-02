@@ -107,10 +107,15 @@ def _attempt_facts(result, status):
             result._attempt_claimed = True
         except AttributeError:
             pass
-    if not executed:
-        return False, (), ()
     sent = next((n for n in (getattr(result, "sent_count", None), getattr(result, "observed_sends", None))
                  if isinstance(n, int) and not isinstance(n, bool)), None)
+    if not executed:
+        # A leg that drove requests but ended without a conclusive status is still
+        # a fresh attempt for the drive-volume figure; it stays unexecuted, so it
+        # never counts as tested.
+        if sent:
+            return False, ({"id": attempt_id or new_attempt_id(), "sent": sent},), ()
+        return False, (), ()
     return True, ({"id": attempt_id or new_attempt_id(), "sent": sent},), ()
 
 
@@ -201,7 +206,31 @@ def _listed_in_compact_ledger(row: dict) -> bool:
     non-default state -- a not-applicable cell that was queued, attempted, sent or
     resumed must stay visible, or a real attempt would be hidden in a count."""
     return bool(row["shape_applicable"] or row["queued"] or row["attempted"]
-                or row["sent"] or row["resumed"])
+                or row["sent"] or row["fresh_sent"] or row["resumed"])
+
+
+# What the funnel's count names mean. `sent` keeps its key for compatibility but
+# counts cells with a recorded execution, not requests.
+DRIVE_LABELS = {
+    "requests_driven": "requests sent by this run's fresh attempts (deduplicated by attempt id)",
+    "conclusive": "cells with an executed conclusive verdict",
+    "driven_not_conclusive": "cells whose fresh attempts sent requests but reached no conclusive verdict",
+    "sent": "cells with a recorded execution (CellResult.executed); not a request count",
+}
+
+
+def _drive_volume(matrix, rows) -> dict:
+    """Requests driven next to conclusive cells, so effort and answers read apart."""
+    seen, requests = set(), 0
+    for cell in matrix.cells().values():
+        for attempt in cell.attempts:
+            if attempt.get("id") not in seen:
+                seen.add(attempt.get("id"))
+                requests += attempt.get("sent") or 0
+    return {"requests_driven": requests,
+            "conclusive": sum(bool(row["conclusive"]) for row in rows),
+            "driven_not_conclusive": sum(bool(row["fresh_sends"] and not row["conclusive"]) for row in rows),
+            "labels": DRIVE_LABELS}
 
 
 class CoverageTracker:
@@ -780,6 +809,7 @@ class CoverageTracker:
                              ("discovered", "captured", "shape_applicable", "implemented", "eligible",
                               "queued", "attempted", "sent", "fresh_sent", "referenced", "conclusive",
                               "resumed")}, "cells": rows}
+        ledger["drive"] = _drive_volume(self.matrix, rows)
         if not compact:
             return ledger
         kept, omitted = [], {}

@@ -221,6 +221,8 @@ def assessment_health(coverage, errors=(), *, stopped_on_confirmation=False):
             reasons.append("some executed checks did not reach a conclusive result")
     return {"status": "incomplete" if reasons else "complete",
             "reasons": reasons, "applicable": applicable, "executed": executed,
+            "requests_driven": (audited.get("drive") or {}).get("requests_driven"),
+            "conclusive": (audited.get("drive") or {}).get("conclusive"),
             "objective_only": bool(stopped_on_confirmation)}
 
 

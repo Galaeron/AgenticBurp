@@ -41,6 +41,12 @@ _CONCLUSIVE = frozenset({
     CellStatus.CONTROLLED_NEGATIVE,
 })
 
+# An executed verdict the coverage funnel calls conclusive (coverage_tracker's
+# phase ledger uses the same set).
+_EXECUTED_CONCLUSIVE = frozenset({
+    CellStatus.CONFIRMED, CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE,
+})
+
 # Statuses that are executed but produced no usable verdict, or were denied --
 # NEVER a "clean negative" (Q03/Q11's rule, mirrored here at the summary level):
 # a target that errored, was skipped, or was blocked by the safety gate must
@@ -123,6 +129,8 @@ def summarize_coverage(matrix: CoverageMatrix) -> dict:
                 fresh_ids.add(attempt.get("id"))
                 fresh_sends += attempt.get("sent") or 0
     referenced = sum(1 for r in matrix.cells().values() if r.referenced_attempts)
+    conclusive_n = sum(1 for r in matrix.cells().values()
+                       if r.executed and r.status in _EXECUTED_CONCLUSIVE)
 
     not_a_clean_negative["total"] = sum(not_a_clean_negative.values())
     not_a_clean_negative["executed_attempts"] = not_a_clean_negative_executed
@@ -136,4 +144,7 @@ def summarize_coverage(matrix: CoverageMatrix) -> dict:
         "not_a_clean_negative": not_a_clean_negative,
         "attempts": {"fresh": len(fresh_ids), "fresh_sends": fresh_sends,
                      "referenced_cells": referenced},
+        # Effort next to answers: requests this run drove versus cells that
+        # reached an executed conclusive verdict (different units, by design).
+        "drive": {"requests_driven": fresh_sends, "conclusive": conclusive_n},
     }

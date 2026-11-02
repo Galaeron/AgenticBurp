@@ -22,6 +22,12 @@ and one terminal reason. Routes and identities are interleaved; starting checks
 rotate across groups. Parameter cases without separate proof remain untested.
 Dispatch exceptions do not prove a send. Transport-observed replies are counted
 per task, avoiding another concurrent caller's activity granting execution credit.
+The ledger's `drive` block (and `audited.drive`, the run manifest's
+`coverage_audited`, and `assessment.requests_driven`/`conclusive`) reports
+requests driven next to conclusive cells: a leg that sent requests but ended
+inconclusive is a fresh attempt with its send count, yet stays unexecuted. The
+ledger key `sent` is kept for compatibility; it counts cells with a recorded
+execution, not requests (`drive.labels` names each unit).
 
 Completed coverage results include a checkpoint. `resume_job_id` accepts only a
 managed, hash-verified result from the same origin and unchanged source/config.
