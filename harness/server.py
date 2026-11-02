@@ -694,7 +694,7 @@ async def prioritize(req: PrioritizeRequest, authorization: str | None = Header(
     return PrioritizeResponse(results=results, engagement_id=engagement_partition)
 
 
-from pydantic import BaseModel as _BaseModel, ConfigDict, StrictBool
+from pydantic import BaseModel as _BaseModel, ConfigDict, Field, StrictBool
 
 
 class CrawlRequest(_BaseModel):
@@ -1517,8 +1517,16 @@ def _journal_context_key(config, req) -> str:
         for r in (req.roles or []))
     seeds = [(s.method, s.url, hashlib.sha256((s.request_body or "").encode()).hexdigest())
              for s in (req.seed_exchanges or [])]
-    limits = req.model_dump(exclude={"base_url", "roles", "seed_exchanges", "resume_job_id"})
-    inputs = json.dumps([req.base_url, roles, seeds, limits], sort_keys=True, default=str)
+    limits = req.model_dump(exclude={"base_url", "roles", "seed_exchanges", "resume_job_id",
+                                     "protected_paths", "owners"})
+    key_inputs = [req.base_url, roles, seeds, limits]
+    # I16: declarations change what confirms, so a declared list is part of the key;
+    # none declared leaves the key exactly as it was before these fields existed.
+    declared = {name: value for name, value in (("protected_paths", req.protected_paths),
+                                                ("owners", req.owners)) if value}
+    if declared:
+        key_inputs.append(declared)
+    inputs = json.dumps(key_inputs, sort_keys=True, default=str)
     return f"{resume_context_key(config)}:{hashlib.sha256(inputs.encode()).hexdigest()[:16]}"
 
 
@@ -1535,6 +1543,12 @@ class InvestigateRequest(_BaseModel):
     # equals investigate_engagement's own default, so omitting it changes nothing.
     discovery_max_probes: int = 6000
     resume_job_id: str | None = None
+    # I16: the operator's engagement declarations, for this run only (not stored).
+    # protected_paths: patterns in docs/PROTECTED_ROUTES.md syntax for this target;
+    # owners: authz.owners entries ({path, owner | public | authenticated,
+    # shared_with}). Malformed entries are ignored with a warning, never confirm.
+    protected_paths: list[str] = Field(default_factory=list, max_length=1000)
+    owners: list[dict] = Field(default_factory=list, max_length=1000)
 
 
 @app.post("/engagement/{host}/investigate")
@@ -1731,6 +1745,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                     seed_exchanges=req.seed_exchanges,
                     active_discovery=req.active_discovery,
                     discovery_max_probes=max(1, min(req.discovery_max_probes, 20000)),
+                    **({'protected_paths': req.protected_paths} if req.protected_paths else {}),
+                    **({'owners': req.owners} if req.owners else {}),
                     **({'coverage_checkpoint': coverage_checkpoint} if coverage_checkpoint is not None else {}))
             job["result"].setdefault("run_id", run_context.run_id)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)

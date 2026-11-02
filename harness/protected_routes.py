@@ -314,3 +314,19 @@ class ProtectedRoutes:
             if _path_matches(p.segments, path):
                 return RouteMatch(pattern=p.text, source=p.source, where=p.where)
         return None
+
+    def declaration_hint(self, method: str, url: str) -> str:
+        """How the operator declares (method, url) protected, for the next step of an
+        unlisted route's candidate (RV-S follow-up, I16). Empty for another target."""
+        target = _target_of(self.target_url)
+        if target is None or _target_of(url) != target:
+            return ""
+        scheme = (urlsplit(self.target_url).scheme or "").lower()
+        host = f"[{target[0]}]" if ":" in target[0] else target[0]
+        key = host if target[1] == _DEFAULT_PORTS.get(scheme) else f"{host}:{target[1]}"
+        route = f"{(method or 'GET').upper()} {normalize_path(url)}"
+        return (f"Not confirmed because this route is not declared protected. If it should "
+                f"require authentication, declare it and re-run: add {route!r} under "
+                f"{CONFIG_SECTION}.{CONFIG_KEY}[{key!r}] in harness/config.local.yaml, or "
+                f"pass it in the investigate request's {CONFIG_KEY} list "
+                f"(docs/PROTECTED_ROUTES.md).")

@@ -16,8 +16,10 @@ declaration. Owner decision of 2026-10-21; implemented by batch RV-S
 - A bare host means the default port only (80 for http, 443 for https), so `127.0.0.1` does not
   cover `127.0.0.1:8080`. IPv6 is written `[::1]:8443`.
 - The engagement's own list (`EngagementState.protected_paths`) applies to that engagement's
-  target and combines with the config list. Nothing sets it from the Burp UI or the API yet
-  (I16 follow-up).
+  target and combines with the config list. Set it per run with the `protected_paths` field of
+  `POST /engagement/{host}/investigate` (a list of patterns, at most 1000; I16). The request's
+  `owners` field does the same for `authz.owners` entries. Neither is stored: each run declares
+  its own. The Burp panel does not send them yet (a Java change, RV-K).
 
 ```yaml
 authz:
@@ -59,7 +61,9 @@ where}`.
 
 ## What does not confirm
 
-- An unlisted route, even one that serves data anonymously (a candidate).
+- An unlisted route, even one that serves data anonymously (a candidate). Its next step
+  (`suggested_test`) says how to declare it: the route, the `authz.protected_paths` key for this
+  target, and the request's `protected_paths` field.
 - On a listed route: an anonymous replay that is refused (no finding); an anonymous answer that
   differs from the baseline, such as a public help page; a baseline with no payload; no identity
   supplying a known credential header; a malformed entry.
