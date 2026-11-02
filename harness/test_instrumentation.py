@@ -538,7 +538,8 @@ class PhaseRecorderTests(unittest.TestCase):
 
 
 _EXPECTED_PHASES = ["discovery", "header_audit", "business_context", "experiments", "worklist",
-                    "capture_review", "chain_rounds", "second_order", "coverage_drive", "finalise"]
+                    "capture_review", "chain_rounds", "second_order", "coverage_drive", "experiments_final",
+                    "finalise"]
 
 
 class _InvestigateBase(unittest.TestCase):

@@ -125,7 +125,7 @@ class _RecordingAgent:
     last_experiment_handoff = "unset"
 
     def __init__(self, ollama, model, allowed_hosts, *, max_steps=250, run_context=None,
-                 experiment_handoff=None):
+                 experiment_handoff=None, experiment_catalog=None):
         type(self).last_run_context = run_context
         type(self).last_experiment_handoff = experiment_handoff
 
