@@ -264,8 +264,9 @@ def stored_proof_artifacts_resolve(proof):
 
 
 # Batch 08: mechanisms whose proven flaw is a host trust policy, not a route: the same
-# policy fingerprint on several routes is one issue with several locations.
-ROUTE_INDEPENDENT_MECHANISMS = frozenset({'jwt_forge'})
+# policy fingerprint on several routes is one issue with several locations. AR-08b:
+# one set, shared with the report path's issue key (issues.py).
+from harness.issues import ROUTE_INDEPENDENT_MECHANISMS  # noqa: E402
 _ORPHAN_REASONS = {'proof not found for case', 'proof belongs to another run', 'proof belongs to another case'}
 
 

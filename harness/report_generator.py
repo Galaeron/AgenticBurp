@@ -33,7 +33,7 @@ throughout the rest of this project:
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from harness import risk_allocator, security
@@ -145,6 +145,14 @@ class ReportFinding:
     triage_priority: str = "manual_verification"
     impact_severity: str = "info"
     captured_principal_id: str = ""
+    # AR-08b: the issue-key inputs of a route-independent mechanism (issues.py), so
+    # the Markdown collapse groups exactly as the issue export, and the locations a
+    # collapsed survivor stands for.
+    validator: str = ""
+    policy_fingerprint: str = ""
+    principal_id: str = ""
+    workflow_state_id: str = ""
+    locations: list[str] = field(default_factory=list)
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
@@ -179,6 +187,10 @@ def _from_store_dict(d: dict) -> ReportFinding:
                       fromlist=["derive_verification_state"]).derive_verification_state(d),
         finding_id=d.get("finding_id", "") or "",
         captured_principal_id=d.get("captured_principal_id", "") or "",
+        validator=d.get("validator", "") or "",
+        policy_fingerprint=issues._policy_of(d),
+        principal_id=d.get("principal_id", "") or "",
+        workflow_state_id=d.get("workflow_state_id", "") or "",
         **finding_triage(d),
     )
 
@@ -287,7 +299,9 @@ def _dedup_key(f: "ReportFinding") -> tuple:
     from harness import issues
     return issues.issue_key({
         "url": f.url, "method": f.method, "vulnerability_class": f.vulnerability_class,
-        "parameter_location": f.parameter_location, "parameter_name": f.parameter_name})
+        "parameter_location": f.parameter_location, "parameter_name": f.parameter_name,
+        "validator": f.validator, "policy_fingerprint": f.policy_fingerprint,
+        "principal_id": f.principal_id, "workflow_state_id": f.workflow_state_id})
 
 
 def _rank_tuple(f: "ReportFinding") -> tuple:
@@ -309,12 +323,15 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
         cur = groups.get(k)
         if cur is None:
             f.duplicate_count = 1
+            f.locations = [f.url] if f.url else []
             groups[k] = f
             order.append(k)
         else:
             total = cur.duplicate_count + 1
+            locations = cur.locations + ([f.url] if f.url and f.url not in cur.locations else [])
             winner = f if _rank_tuple(f) > _rank_tuple(cur) else cur
             winner.duplicate_count = total
+            winner.locations = locations
             groups[k] = winner
     survivors = [groups[k] for k in order]
     return survivors, len(findings) - len(survivors)
@@ -608,7 +625,13 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
     if f.evidence_maturity == "unverified_no_leg":
         lines.append("_Unverified: no deterministic confirmation leg exists for this class. "
                      "Preserve the captured observation and verify manually; impact and model confidence do not prove it._")
-    if f.duplicate_count > 1:
+    if f.duplicate_count > 1 and issues._route_independent_identity(
+            {"validator": f.validator, "policy_fingerprint": f.policy_fingerprint}):
+        # AR-08b: one host trust policy proven on several routes.
+        lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** under the same "
+                     f"{f.validator} policy -- collapsed into this one finding. Locations: "
+                     + ", ".join(f"`{issues.redact_url(u)}`" for u in f.locations))
+    elif f.duplicate_count > 1:
         lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** of this endpoint "
                      f"family (same class, different object id) -- collapsed into this one finding.")
     if f.owasp_category:

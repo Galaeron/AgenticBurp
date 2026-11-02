@@ -84,6 +84,31 @@ def _is_dependency_class(vulnerability_class: str) -> bool:
 # policy are one issue listing 30 routes; routes with different policies stay apart.
 _HEADER_POLICY_CLASSES = frozenset({"csp", "cors"})
 
+# Batch 08 / AR-08b: confirmation mechanisms whose proven flaw is a host trust policy,
+# not a route (a token verifier accepting forgeries). One policy fingerprint on several
+# routes is one issue listing every route. The per-mechanism decisions and reasons are
+# in .test-work/ar08b-issue-identity-20261102/BATCH.md; assessment_health reads this set.
+ROUTE_INDEPENDENT_MECHANISMS = frozenset({"jwt_forge"})
+
+
+def _policy_of(finding: dict) -> str:
+    """The policy fingerprint a confirmation was decided under: the one persisted
+    with its proof (AR-08a, surfaced by store.all_host_findings) wins over the
+    in-run Finding.header_fingerprint. "" (unknown) never merges routes."""
+    return finding.get("policy_fingerprint") or finding.get("header_fingerprint") or ""
+
+
+def _route_independent_identity(finding: dict) -> str:
+    """The trust-boundary identity of a route-independent mechanism's finding, or ""
+    when it is not one (or its policy is unknown). Mechanism, policy fingerprint,
+    principal and workflow state: a different policy or principal is another issue."""
+    validator = finding.get("validator") or ""
+    policy = _policy_of(finding)
+    if validator not in ROUTE_INDEPENDENT_MECHANISMS or not policy:
+        return ""
+    return "\x1f".join(("mechanism", validator, policy, finding.get("principal_id") or "",
+                        finding.get("workflow_state_id") or ""))
+
 
 # --------------------------------------------------------------------------- #
 # Redaction -- an export/replay must never carry a live secret
@@ -271,7 +296,14 @@ def issue_key(finding: dict) -> tuple:
     ONE issue regardless of which exchange first surfaced them.
 
     E2 exception: a header-policy finding (csp, cors; see `_HEADER_POLICY_CLASSES`)
-    groups by host + class + `header_fingerprint`, with no endpoint family or method."""
+    groups by host + class + the policy fingerprint (`_policy_of`), with no endpoint
+    family or method.
+
+    AR-08b exception: a finding confirmed by a route-independent mechanism (see
+    `ROUTE_INDEPENDENT_MECHANISMS`) with a known policy groups by host + class +
+    affected input (the carrier) + read/write boundary + `_route_independent_identity`
+    (mechanism, policy, principal, workflow state), with no endpoint family or method.
+    The read/write boundary is kept so a read and a write never merge."""
     url = finding.get("url", "")
     host = _host_of(url)
     method = (finding.get("method") or "").upper()
@@ -279,12 +311,16 @@ def issue_key(finding: dict) -> tuple:
     canon = canonicalize(vc) or vc.strip().lower()
     if _is_dependency_class(vc):
         return (host, "", "", canon, "", "read", "")
-    # Without a fingerprint (a stored or model finding) nothing says the policy is the
-    # same, so it keeps the endpoint-family key below rather than matching every route.
-    if canon in _HEADER_POLICY_CLASSES and finding.get("header_fingerprint"):
-        return (host, "", "", canon, "", "read", finding["header_fingerprint"])
-    family = normalize_path(url) if url else ""
+    # Without a fingerprint (a model finding, or a proof stored before AR-08a) nothing
+    # says the policy is the same, so it keeps the endpoint-family key below rather
+    # than matching every route.
+    if canon in _HEADER_POLICY_CLASSES and _policy_of(finding):
+        return (host, "", "", canon, "", "read", _policy_of(finding))
     affected = _affected_input(finding)
+    identity = _route_independent_identity(finding)
+    if identity:
+        return (host, "", "", canon, affected, _boundary_for(method), identity)
+    family = normalize_path(url) if url else ""
     # Unknown input is not a wildcard: keep distinct findings distinct.
     disambiguator = "" if affected else (finding.get("finding_id") or finding.get("fingerprint") or "")
     return (host, family, method, canon, affected, _boundary_for(method), disambiguator)
@@ -544,7 +580,8 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "affected_instances": [redact_url(u) for u in issue.affected_instances],
         "instances_count": len(issue.members),
         **({"affected_routes": sorted({normalize_path(u) for u in issue.affected_instances})}
-           if issue.vulnerability_class in _HEADER_POLICY_CLASSES else {}),
+           if issue.vulnerability_class in _HEADER_POLICY_CLASSES
+           or any(_route_independent_identity(m) for m in issue.members) else {}),
         "captured_auth_contexts": sorted({member.get("captured_principal_id") for member in issue.members
                                           if member.get("captured_principal_id")}),
         "artifacts": {"replayable": has_proof, "missing": missing_artifacts},

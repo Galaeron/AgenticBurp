@@ -4329,12 +4329,17 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
   gates green on 3.12/3.14. Migration awaits reviewer sign-off:
   `.test-work/ar08a-proof-fingerprint-20261102/HANDOFF.md`.
 
-### [ ] AR-08b — Route-independent issue identity beyond jwt_forge
+### [x] AR-08b — Route-independent issue identity beyond jwt_forge
 - **Domain:** Issue accounting · **Effort:** S-M · **Depends on:** AR-08a · **Mode:** LOOP.
 - **Problem:** only `jwt_forge` declares itself route-independent; `issues.py` `issue_key` (the
   report path) is unchanged, so other equivalent mechanisms still split per route.
 - **Acceptance criteria:** decide per mechanism; each route-independent one groups through the real
   report path with locations attached; distinct trust boundaries/policies stay separate.
+- **Done 2026-11-02 (`aaf166f`, on top of unmerged AR-08a):** `issue_key` groups jwt_forge on
+  host/class/carrier/read-write boundary/mechanism/policy/principal/workflow; stored csp/cors read
+  the persisted proof fingerprint. All other mechanisms are route-scoped (reasons in
+  `.test-work/ar08b-issue-identity-20261102/BATCH.md`; crypto/TLS fingerprint is a follow-up).
+  Gates green on 3.12/3.14.
 
 ### [ ] AR-08c — Audit procedures for race, WebSocket and error-based claims
 - **Domain:** Audit truth · **Effort:** M · **Mode:** LOOP.
