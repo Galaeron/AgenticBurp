@@ -4089,6 +4089,14 @@ firing autonomously end-to-end "during real engagements".
   through `RunContext` + the safety gate, defaulting to `objective_not_attempted`. Destructive
   objectives stay OFF and owner-gated; an arithmetic-only SSTI must remain
   `confirmed + objective_not_completed`.
+- **Progress (2026-11-02, LOOP half, branch `claude/lb6-objective-69375f`, not merged):**
+  `ObjectiveDeclaration` (typed profile; may narrow, never widen, a registered profile);
+  `run_web_objective_smoke --objective-profile` / `--allow-destructive-objective` put the task
+  on `RunContext.objective_task`, which `investigate_engagement` reads; `attempt_completion`
+  refuses a destructive profile without opt-in. `testing/test_run_web_objective_profile.py`
+  runs the runner against an in-process loopback vulnerable/fixed fixture; 3 defect injections
+  fail it (VERIFIED). Left `[ ]`: turning it on against a live lab is OWNER/LIVE. Gates:
+  `.test-work/lb6-objective-20261102/HANDOFF.md`.
 - **Acceptance criteria:** against an owned vulnerable/fixed fixture, a declared NON-destructive
   objective completes and the fixed control does not; a destructive objective returns
   `objective_not_attempted` without an explicit opt-in; `full` green.
