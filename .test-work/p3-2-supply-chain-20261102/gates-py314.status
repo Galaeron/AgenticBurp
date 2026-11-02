@@ -1,0 +1,5 @@
+precondition exit=0
+new exit=0
+smoke exit=0
+full exit=0
+done
