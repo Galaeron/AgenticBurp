@@ -371,18 +371,24 @@ class CommandInjectionProofTests(_ProofCallerBase):
         run_id, url, proof = self._run(_shell)
         self._assert_counted(run_id, proof, url, "command_injection")
 
-    def test_control_that_also_shows_the_marker_is_not_named(self):
+    def test_control_that_also_shows_the_marker_does_not_confirm(self):
         # A target that joins the pieces without any shell syntax: the control
-        # shows the same marker, so it proves nothing and the proof stays a candidate.
+        # shows the same marker, so the attack's marker proves nothing (BM-2;
+        # before it, this confirmed with an unnamed control as a candidate).
         def joins_anything(method, path, headers, body):
             host = _query(path).get("host", "")
             if "%s " in host:
                 fmt, _, arg = host.rpartition(";printf ")[2].partition(" ")
                 return 200, json.dumps({"output": fmt.replace("%s", arg, 1)})
             return 200, json.dumps({"output": f"pinged {host}"})
-        run_id, url, proof = self._run(joins_anything)
-        self.assertEqual(proof["control_artifact_ids"], [])
-        self._assert_candidate(run_id, proof, url, "command_injection")
+        target = _Target(joins_anything)
+        self.addCleanup(target.close)
+        validator = CommandInjectionValidator(allowed_hosts=list(self.HOSTS), timeout=5.0,
+                                              oob_callbacks_enabled=False)
+        _run_id, reports, _proofs = self._confirm(
+            "command_injection", validator, _finding("command_injection"),
+            _exchange(target.origin + "/stock?host=127.0.0.1"))
+        self.assertNotIn("confirmed", [r.status for r in reports], _verdicts(reports))
 
 
 class UsernameEnumerationProofTests(_ProofCallerBase):

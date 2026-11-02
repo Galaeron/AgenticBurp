@@ -242,8 +242,9 @@ class SqlmapPointsCallerTests(_ProofCallerBase, unittest.TestCase):
                               ("attack", proof["attack_artifact_id"]),
                               ("control", proof["control_artifact_ids"][0]))}
         self.assertEqual(rows, {"baseline": 1, "attack": 40, "control": 0})
-        self.assertEqual(dict(app.payload_hits), {"q": 2})            # 1 true + 1 false, +1 baseline
-        self.assertEqual(app.requests, 3)
+        # true, false, then the BM-2 repeat (false, true), +1 baseline
+        self.assertEqual(dict(app.payload_hits), {"q": 4})
+        self.assertEqual(app.requests, 5)
 
     def test_proof_observed_result_lists_the_points(self):
         _, _, _, _, proof = self._run(_search_app(blind={"q"}), self._post, _JSON_Q_BOOLEAN)
@@ -266,7 +267,7 @@ class SqlmapPointsCallerTests(_ProofCallerBase, unittest.TestCase):
         app = _search_app(blind={"q", "r"})
         _, _, _, reports, proof = self._run(app, self._post, _JSON_R_BOOLEAN)
         self.assertIn("body_json:r", reports[0].summary)
-        self.assertEqual(dict(app.payload_hits), {"r": 2})            # q is never mutated
+        self.assertEqual(dict(app.payload_hits), {"r": 4})            # q is never mutated
 
     def test_control_without_the_restriction_probes_the_other_parameter(self):
         original = SqlmapValidator._boolean_probe_fallback
@@ -276,7 +277,7 @@ class SqlmapPointsCallerTests(_ProofCallerBase, unittest.TestCase):
         app = _search_app(blind={"q", "r"})
         with patch.object(SqlmapValidator, "_boolean_probe_fallback", unrestricted):
             self._run(app, self._post, _JSON_R_BOOLEAN)
-        self.assertEqual(dict(app.payload_hits), {"q": 2})            # the first candidate, not r
+        self.assertEqual(dict(app.payload_hits), {"q": 4})            # the first candidate, not r
 
     def test_time_based_only_point_sends_no_differential(self):
         app = _search_app(blind={"q"})
@@ -296,7 +297,7 @@ class SqlmapPointsCallerTests(_ProofCallerBase, unittest.TestCase):
         _, exchange, run_id, reports, proof = self._run(app, make, _GET_Q_BOOLEAN)
         self.assertIn("sqlmap reported injection at query:q", reports[0].summary)
         self._assert_counted(run_id, proof, exchange.url, "sqli")
-        self.assertEqual(dict(app.payload_hits), {"a": 2, "b": 2, "c": 2, "d": 2, "e": 2, "q": 2})
+        self.assertEqual(dict(app.payload_hits), {"a": 2, "b": 2, "c": 2, "d": 2, "e": 2, "q": 4})
 
     def test_control_without_the_parser_sends_no_differential_and_names_no_artifacts(self):
         app = _search_app(blind={"q"})                                 # the same blind fixture

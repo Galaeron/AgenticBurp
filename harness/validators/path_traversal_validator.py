@@ -180,6 +180,12 @@ class PathTraversalValidator(Validator):
         unsendable: list[str] = []
         errors: list[str] = []
         refused = ""
+        # BM-2: the captured answer is the benign baseline for this endpoint. A
+        # file signature it already carries (a default page quoting a passwd line,
+        # a viewer that ignores the parameter) is not a read the payload caused, so
+        # a probe confirms only with a signature match the baseline lacks.
+        baseline = {t: set(m.findall(exchange.response_body or "")) for t, m in _TARGETS.items()}
+        baseline_echoes = 0
         for loc, param in targets:
             if refused:
                 break
@@ -236,7 +242,10 @@ class PathTraversalValidator(Validator):
                         errors.append(f"{label}: {e.__class__.__name__}")
                         continue
                     answered += 1
-                    if marker.search(text):
+                    found = set(marker.findall(text))
+                    if found and not found - baseline[target]:
+                        baseline_echoes += 1
+                    elif found:
                         where = "path segment" if loc == _PATHSEG else f"{loc} parameter {param!r}"
                         return ValidationResult(
                             self.name, "confirmed", "path_traversal", confidence=0.95, confirmed=True,
@@ -259,6 +268,9 @@ class PathTraversalValidator(Validator):
                          f"probe that never answered cannot show them.")
         skipped = (f" {len(unsendable)} payload(s) could not be sent at all (e.g. {unsendable[0]})."
                    if unsendable else "")
+        if baseline_echoes:
+            skipped += (f" {baseline_echoes} response(s) carried only file signatures the captured "
+                        f"baseline already shows, which is not a read the payload caused.")
         return ValidationResult(
             self.name, "not_confirmed", "path_traversal", confidence=0.0, confirmed=False,
             summary="No system-file contents returned -- traversal appears blocked or not a file read",

@@ -50,6 +50,11 @@ _MAX_PARAMS = 6
 # `%s`; Windows cmd removes the caret escape before echoing.
 _INBAND = (";whoami;printf {a}%s {b}", "|whoami;printf {a}%s {b}",
            "& whoami & echo {a}^{b}")
+# BM-2: the same two pieces with the joining syntax but no command separator. A
+# target that answers this with the joined marker transforms text (a sanitiser
+# stripping `^`, a formatter expanding `%s`) instead of running a shell, so an
+# in-band marker only confirms when its control comes back without it.
+_INBAND_CONTROL = {_INBAND[0]: "{a}%s {b}", _INBAND[1]: "{a}%s {b}", _INBAND[2]: "{a}^{b}"}
 
 
 async def _wait_for_any(collab, tokens: list[str], timeout: float) -> str | None:
@@ -151,18 +156,21 @@ class CommandInjectionValidator(Validator):
                 return "failed", ""
             return SentAnswer(("ok", resp.text), artifact_id_of(resp))
 
-        async def proof_exchanges(loc: str, param: str, attack, marker_a: str, marker_b: str) -> dict:
-            """Ticket 6 proof exchanges, never verdict inputs. Control: the same
-            parameter given the marker pieces without shell syntax, named only when
-            its answer lacks the joined marker. Baseline: the original request
-            replayed, sent last so the target is left as captured. Outside a run
-            neither is sent: it would name nothing."""
+        async def proof_exchanges(loc: str, param: str, attack, marker_a: str, marker_b: str,
+                                  control=None) -> dict:
+            """Ticket 6 proof exchanges. Control: the same parameter given the
+            marker pieces without shell syntax, named only when its answer lacks
+            the joined marker; an in-band confirmation passes the control its
+            verdict already used (BM-2). Baseline: the original request replayed,
+            sent last so the target is left as captured. Outside a run neither is
+            sent: it would name nothing."""
             if self.run_context is None:
                 return {"attack": attack}
-            url, body = mutate(exchange, loc, param, f"{marker_a}%s {marker_b}")
-            control = await send(url, body, "proof control")
-            if control[0] != "ok" or marker_a + marker_b in control[1]:
-                control = None
+            if control is None:
+                url, body = mutate(exchange, loc, param, f"{marker_a}%s {marker_b}")
+                control = await send(url, body, "proof control")
+                if control[0] != "ok" or marker_a + marker_b in control[1]:
+                    control = None
             baseline = await send(exchange.url, exchange.request_body or "", "proof baseline")
             return {"baseline": baseline, "attack": attack, "controls": [control]}
 
@@ -195,7 +203,14 @@ class CommandInjectionValidator(Validator):
                 if state == "refused":
                     return incomplete()  # the run or the gate refuses the remaining sends too
                 if marker in text:
-                    proof = await proof_exchanges(loc, param, sent, marker_a, marker_b)
+                    url, body = mutate(exchange, loc, param,
+                                       _INBAND_CONTROL[tmpl].format(a=marker_a, b=marker_b))
+                    control = await send(url, body, f"in-band control via {loc} {param!r}")
+                    if control[0] == "refused":
+                        return incomplete()
+                    if control[0] != "ok" or marker in control[1]:
+                        continue  # no differential: the text joined without a shell
+                    proof = await proof_exchanges(loc, param, sent, marker_a, marker_b, control)
                     return ValidationResult(
                         self.name, "confirmed", "command_injection", confidence=0.95,
                         confirmed=True,
