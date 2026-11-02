@@ -840,7 +840,8 @@ class SqlmapValidator(Validator):
         sort/filter, search-box parameters are at least as common a real
         injection point). Enumerates query-string parameters and top-level
         JSON/form body parameters (capped at _MAX_PROBE_PARAMS total), and
-        for each sends exactly two requests, identical to the original
+        for each sends two requests (four when they differ: the pair is
+        repeated in reverse order, BM-2), identical to the original
         exchange except for that one parameter's value:
 
           A (tautology):  <marker>' OR '1'='1' --   -- true whatever the field holds
@@ -967,19 +968,31 @@ class SqlmapValidator(Validator):
                         # drops wire framing so httpx does not decode it twice.
                         return outcome.to_httpx_response(exchange.method.upper(), url)
 
-                    resp_a = await routed(target_a, body_a)
-                    resp_b = await routed(target_b, body_b)
                 else:
                     from harness import global_throttle
-                    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
-                        await global_throttle.acquire()
-                        resp_a = await client.request(
-                            exchange.method.upper(), target_a, headers=headers, content=body_a,
-                        )
-                        await global_throttle.acquire()
-                        resp_b = await client.request(
-                            exchange.method.upper(), target_b, headers=headers, content=body_b,
-                        )
+
+                    async def routed(url, probe_body):
+                        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                            await global_throttle.acquire()
+                            return await client.request(
+                                exchange.method.upper(), url, headers=headers, content=probe_body,
+                            )
+
+                resp_a = await routed(target_a, body_a)
+                resp_b = await routed(target_b, body_b)
+                # BM-2: two sequential answers also differ when the endpoint
+                # changes between calls (a notice or lockout after the first
+                # request, rotating content). Repeat the pair in reverse order:
+                # the differential counts only when each probe answers as it
+                # did the first time and the repeats still differ.
+                stable = True
+                if _responses_differ(resp_a, resp_b) and not (
+                        _looks_like_db_error(resp_a) and _looks_like_db_error(resp_b)):
+                    resp_b2 = await routed(target_b, body_b)
+                    resp_a2 = await routed(target_a, body_a)
+                    stable = (not _responses_differ(resp_a, resp_a2)
+                              and not _responses_differ(resp_b, resp_b2)
+                              and _responses_differ(resp_a2, resp_b2))
             except httpx.HTTPError as e:
                 errors.append(f"{label}: probe failed ({e})")
                 continue
@@ -991,7 +1004,9 @@ class SqlmapValidator(Validator):
                 f"HTTP {resp_b.status_code} ({len(resp_b.content)}b)"
             )
             both_db_errors = _looks_like_db_error(resp_a) and _looks_like_db_error(resp_b)
-            if _responses_differ(resp_a, resp_b) and not both_db_errors:
+            if not stable:
+                evidence += "; the repeated pair did not reproduce it (unstable endpoint)"
+            elif _responses_differ(resp_a, resp_b) and not both_db_errors:
                 baseline = None
                 if self.run_context is not None:
                     try:

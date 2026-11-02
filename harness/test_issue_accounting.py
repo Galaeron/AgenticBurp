@@ -128,7 +128,9 @@ class SqlErrorOnlyCallerTests(_CallerBase, unittest.TestCase):
         self.assertFalse(reports[0].confirmed)
 
     def test_true_false_differential_still_confirms(self):
-        reports=self.run_probe([(200,'matching rows '*80),(200,'no matching rows')])
+        # BM-2: the differential is repeated in reverse order before it confirms.
+        reports=self.run_probe([(200,'matching rows '*80),(200,'no matching rows'),
+                                (200,'no matching rows'),(200,'matching rows '*80)])
         self.assertEqual(reports[0].status,'confirmed')
         self.assertTrue(reports[0].confirmed)
 

@@ -184,14 +184,16 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
             allowed_hosts=["x.test"], max_requests=2,
             gate_config={"active_enabled": True})
         transport = AsyncMock()
-        transport.execute = AsyncMock(side_effect=[
+        answers = [
             ExecutionOutcome(
                 outcome="ok", status=200, body="x" * 1000,
                 headers={"Content-Encoding": "gzip", "Content-Length": "29"}),
             ExecutionOutcome(
                 outcome="ok", status=200, body="x" * 10,
                 headers={"Content-Encoding": "gzip", "Content-Length": "23"}),
-        ])
+        ]
+        # BM-2: a differential is repeated in reverse order before it confirms.
+        transport.execute = AsyncMock(side_effect=answers + answers[::-1])
         ctx.executor = lambda: transport
         validator = SqlmapValidator(binary="sqlmap", run_context=ctx)
         exchange = HttpExchange(
@@ -268,7 +270,7 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         resp_a = httpx.Response(200, content=b"x" * 500, request=httpx.Request("POST", exchange.url))
         resp_b = httpx.Response(401, content=b"y" * 5, request=httpx.Request("POST", exchange.url))
         with patch("httpx.AsyncClient.request", new_callable=AsyncMock,
-                   side_effect=[resp_a, resp_b]) as mock_req:
+                   side_effect=[resp_a, resp_b, resp_b, resp_a]) as mock_req:
             result = await v._boolean_probe_fallback(_finding(), exchange)
         self.assertEqual(result.status, "confirmed")
         # Every replayed request must carry the JSON Content-Type.
@@ -289,7 +291,7 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         resp_a = httpx.Response(200, content=b"x" * 500, request=httpx.Request("POST", exchange.url))
         resp_b = httpx.Response(200, content=b"x" * 5, request=httpx.Request("POST", exchange.url))
         with patch("httpx.AsyncClient.request", new_callable=AsyncMock,
-                   side_effect=[resp_a, resp_b]) as mock_req:
+                   side_effect=[resp_a, resp_b, resp_b, resp_a]) as mock_req:
             await v._boolean_probe_fallback(_finding(), exchange)
         headers = mock_req.call_args_list[0].kwargs.get("headers", {})
         ct = next((val for k, val in headers.items() if k.lower() == "content-type"), None)
@@ -302,7 +304,7 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         exchange = _login_exchange(body='{"query":"widgets"}', url="http://localhost:3000/api/search")
         resp_a = httpx.Response(200, content=b"x" * 500, request=httpx.Request("POST", exchange.url))
         resp_b = httpx.Response(200, content=b"x" * 5, request=httpx.Request("POST", exchange.url))
-        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[resp_a, resp_b]):
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[resp_a, resp_b, resp_b, resp_a]):
             result = await v._boolean_probe_fallback(_finding(), exchange)
         self.assertEqual(result.status, "confirmed")
         self.assertTrue(result.confirmed)
@@ -315,7 +317,7 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         exchange = HttpExchange(url="https://x.test/api/products?id=1", method="GET")
         resp_a = httpx.Response(200, request=httpx.Request("GET", exchange.url))
         resp_b = httpx.Response(500, request=httpx.Request("GET", exchange.url))
-        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[resp_a, resp_b]):
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[resp_a, resp_b, resp_b, resp_a]):
             result = await v._boolean_probe_fallback(_finding(), exchange)
         self.assertEqual(result.status, "confirmed")
         self.assertIn("query:id", result.summary)
@@ -328,7 +330,7 @@ class BooleanProbeFallbackTests(unittest.IsolatedAsyncioTestCase):
         cat_a = httpx.Response(200, request=httpx.Request("GET", exchange.url))
         cat_b = httpx.Response(401, request=httpx.Request("GET", exchange.url))
         with patch("httpx.AsyncClient.request", new_callable=AsyncMock,
-                   side_effect=[id_a, id_b, cat_a, cat_b]):
+                   side_effect=[id_a, id_b, cat_a, cat_b, cat_b, cat_a]):
             result = await v._boolean_probe_fallback(_finding(), exchange)
         self.assertEqual(result.status, "confirmed")
         self.assertIn("query:category", result.summary)
@@ -425,7 +427,7 @@ class SqlmapValidatorFallsBackWhenBinaryMissingTests(unittest.IsolatedAsyncioTes
         exchange = _login_exchange()
         resp_a = httpx.Response(200, request=httpx.Request("POST", exchange.url))
         resp_b = httpx.Response(401, request=httpx.Request("POST", exchange.url))
-        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[resp_a, resp_b]):
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[resp_a, resp_b, resp_b, resp_a]):
             result = await v.validate(_finding(), exchange)
         self.assertEqual(result.status, "confirmed")
         self.assertTrue(result.confirmed)
@@ -449,7 +451,7 @@ class SqlmapValidatorFallsBackWhenBinaryMissingTests(unittest.IsolatedAsyncioTes
             200, content=b"y" * 10,
             request=httpx.Request("GET", exchange.url))
         with patch("httpx.AsyncClient.request", new_callable=AsyncMock,
-                   side_effect=[large, small]), \
+                   side_effect=[large, small, small, large]), \
              patch("harness.tool_runner.run_process") as sqlmap_run:
             result = await v.validate(_finding(), exchange)
         self.assertTrue(result.confirmed)
@@ -537,7 +539,7 @@ class SqlmapAuthLoginTuningTests(unittest.IsolatedAsyncioTestCase):
         small = httpx.Response(401, content=b"y" * 5, request=httpx.Request("POST", exchange.url))
         with patch("harness.tool_runner.run_process",
                    return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
-             patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[big, small]):
+             patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=[big, small, small, big]):
             result = await v.validate(_finding(), exchange)
         self.assertEqual(result.status, "confirmed")
         self.assertTrue(result.confirmed)
@@ -656,7 +658,8 @@ class SqlmapLoginDiscriminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "confirmed")
         self.assertTrue(result.confirmed)
         self.assertIn("body:email", result.summary)
-        self.assertEqual([status for _, status in login.answers], [200, 401])
+        # The BM-2 repeat sends the pair again in reverse order.
+        self.assertEqual([status for _, status in login.answers], [200, 401, 401, 200])
 
     async def test_control_a_parameterized_login_with_the_same_accounts_is_not_confirmed(self):
         login = _SqliteLogin(self._ACCOUNTS, parameterized=True)
