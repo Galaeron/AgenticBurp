@@ -15,6 +15,7 @@ import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from harness import coverage_tracker, engagement
+from harness.assessment_health import assessment_health
 from harness.coverage_model import CellStatus, CoverageMatrix
 from harness.coverage_tracker import (CoverageTracker, build_coverage,
                                       build_coverage_cases_driven, build_coverage_driven)
@@ -255,6 +256,50 @@ class AttemptFactTests(unittest.TestCase):
         self.assertEqual(report["phase_ledger"]["counts"]["fresh_sent"], len(ids))
         self.assertEqual(report["audited"]["attempts"]["fresh"], len(ids))
         self.assertEqual(report["audited"]["attempts"]["fresh_sends"], sends)
+
+
+class DriveVolumeFunnelTests(unittest.TestCase):
+    """The funnel shows requests driven next to conclusive cells: a leg that sent
+    but ended inconclusive is drive effort, never a conclusive answer."""
+
+    def setUp(self):
+        self.target = _Target()
+        self.addCleanup(self.target.close)
+
+    def _report(self, status):
+        state = _state(self.target.base, "/items/1?q=1")
+        run = _Run(self.target, status)
+        return json.loads(json.dumps(run.drive(build_coverage_driven, state), default=str)), run
+
+    def test_inconclusive_send_is_driven_but_not_conclusive(self):
+        report, run = self._report("inconclusive")
+        self.assertEqual(self.target.requests, 1)
+        _m, cell = _cell(report)
+        self.assertFalse(cell.executed)                    # still not counted as tested
+        row = _row(report)
+        self.assertEqual((row["fresh_sends"], row["conclusive"], row["sent"]), (1, False, False))
+        drive = report["phase_ledger"]["drive"]
+        self.assertEqual(drive["requests_driven"], run.ctx.budget.used)
+        self.assertGreater(drive["requests_driven"], drive["conclusive"])
+        self.assertEqual(drive["conclusive"], report["phase_ledger"]["counts"]["conclusive"])
+        self.assertEqual(drive["driven_not_conclusive"], 1)
+        self.assertIn("not a request count", drive["labels"]["sent"])
+        self.assertEqual(report["audited"]["drive"],
+                         {"requests_driven": 1, "conclusive": drive["conclusive"]})
+        health = assessment_health(report)
+        self.assertGreater(health["requests_driven"], health["conclusive"])
+
+    def test_control_every_send_conclusive(self):
+        report, run = self._report("not_confirmed")
+        self.assertEqual(self.target.requests, 1)
+        row = _row(report)
+        self.assertEqual((row["fresh_sends"], row["conclusive"], row["sent"]), (1, True, True))
+        drive = report["phase_ledger"]["drive"]
+        self.assertEqual(drive["requests_driven"], run.ctx.budget.used)
+        self.assertEqual(drive["driven_not_conclusive"], 0)
+        self.assertEqual(drive["conclusive"], report["phase_ledger"]["counts"]["conclusive"])
+        self.assertEqual(report["audited"]["drive"],
+                         {"requests_driven": 1, "conclusive": drive["conclusive"]})
 
 
 class EngagementExportAgreementTests(unittest.TestCase):
