@@ -15,6 +15,7 @@ import time
 import uuid
 
 from harness import identity_compare
+from harness import identity_headers
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 from harness.circuit_breaker import get_ollama_circuit_breaker
 # W-16: the single TargetTransport. Imported by name (not as the module) because
@@ -921,6 +922,9 @@ class ChainMixin:
                     task.meta["final_pass"] = {"status": "deferred", "reason": result["stopped_by"]}
         return result
 
+    # Roles registered as replay identities below are owned by this engagement
+    # and released when it ends (never leak into a later engagement on the host).
+    @identity_headers.leased
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
                                      discovery_max_endpoints: int = 150,

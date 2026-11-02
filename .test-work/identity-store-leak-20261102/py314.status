@@ -1,0 +1,5 @@
+unittest harness.test_orchestrator_precondition exit=0
+unittest harness.test_identity_store_lease exit=0
+harness.suite smoke exit=0
+harness.suite full exit=0
+git diff --check exit=0
