@@ -1,0 +1,10 @@
+label=persist-py314 python=C:/Users/arthu/AppData/Local/Python/pythoncore-3.14-64/python.exe head=c9dee9a mode=full started=2026-11-02T17:16:40+01:00
+worktree-diff-sha256=2ac96b0ceadf4833
+Python 3.14.7
+precondition=0
+i16=0
+persist=0
+smoke=0
+full=0
+worktree-diff-sha256-after=2ac96b0ceadf4833
+finished=2026-11-02T18:10:05+01:00

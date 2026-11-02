@@ -26,7 +26,7 @@ from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
-from .injection_targets import param_targets, mutate, replay_headers
+from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
 
 _REDIRECT_PARAM_NAMES = {"url", "redirect", "redirect_uri", "redirect_url", "redirecturl",
                          "next", "return", "returnurl", "return_url", "returnto", "return_to",
@@ -124,7 +124,11 @@ class OpenRedirectValidator(Validator):
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
-        targets = _redirect_params(exchange)
+        shaped = _redirect_params(exchange)
+        # No cap here: every redirect-shaped parameter is tried, plus the one the
+        # finding names when it is not redirect-shaped.
+        targets, coverage = select_targets(finding, shaped, len(shaped) + 1,
+                                           available=param_targets(exchange))
         if not targets:
             return self._skip("no redirect-shaped parameter to point off-origin")
         method = (exchange.method or "GET").upper()
@@ -207,4 +211,6 @@ class OpenRedirectValidator(Validator):
         return ValidationResult(
             self.name, "not_confirmed", "open_redirect", confidence=0.0, confirmed=False,
             summary="No off-origin redirect observed -- the redirect target is not attacker-controlled",
-            evidence=f"Tried {len(targets)} redirect-shaped parameter(s); no Location pointed at the sentinel host.")
+            evidence=f"Tried {len(targets)} redirect-shaped parameter(s); no Location pointed at the sentinel host."
+                     + coverage_note(coverage, finding),
+            control_outcome=coverage)

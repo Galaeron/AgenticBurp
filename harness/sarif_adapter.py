@@ -173,6 +173,8 @@ def export_issues_to_sarif(issue_exports: list[dict], *, source_revision: str = 
                 "evidence_maturity": maturity,
                 "triage_priority": priority,
                 "impact_severity": exp.get("impact_severity", exp.get("severity", "info")),
+                # I16: the issue's next step (no SARIF slot; advisory text only).
+                "suggestedTest": exp.get("suggested_test", ""),
                 "propertiesSchemaVersion": "1",
             },
         })
@@ -220,7 +222,8 @@ def import_sarif_to_findings(sarif_doc: dict) -> list[dict]:
                 "method": props.get("requestMethod", ""),
                 "affected_input": props.get("affectedInput", ""),
                 "basis": "imported",
-                "evidence": "", "suggested_test": "", "confidence": 0.0,
+                "evidence": "", "suggested_test": props.get("suggestedTest", "") or "",
+                "confidence": 0.0,
                 # P2.4: unconditionally advisory -- never promoted by an import,
                 # regardless of what the source SARIF's own properties claim.
                 "confirmed": False,

@@ -181,7 +181,15 @@ def sanitize_agent_finding(raw: dict) -> dict:
     rejecting them, so an unlisted field the model invents is harmless on
     its own; this only removes the specific REAL fields that would
     otherwise grant unearned authority."""
-    return {k: v for k, v in raw.items() if k not in AGENT_AUTHORITY_FIELDS}
+    clean = {k: v for k, v in raw.items() if k not in AGENT_AUTHORITY_FIELDS}
+    # The parameter a finding names steers which injection point a leg tests
+    # first. A model writing null or a non-string there must not fail the whole
+    # report on Finding's str type, so anything unusable becomes "unnamed".
+    for key in ("parameter_location", "parameter_name"):
+        if key in clean:
+            value = clean[key]
+            clean[key] = value.strip()[:200] if isinstance(value, str) else ""
+    return clean
 
 
 class AgentReport(BaseModel):
@@ -328,7 +336,9 @@ class ValidationReport(BaseModel):
     # marks a not_confirmed that is NOT a genuine executed negative control
     # (e.g. cross-identity reached-but-unproven); the suppression gate must not
     # treat it as a refutation. Empty = legacy validator (not_confirmed is a
-    # negative); "control_held" = genuine held control.
+    # negative); "control_held" = genuine held control. "named_parameter_untested"
+    # / "partial_coverage" (validators/injection_targets.py) mark a parameter
+    # leg's negative that did not cover the finding's parameter or every input.
     control_outcome: str = ""
     # I04: manual-check guidance carried from ValidationResult (empty if none).
     manual_verification: str = ""

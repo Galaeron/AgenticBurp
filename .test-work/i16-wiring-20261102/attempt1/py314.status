@@ -1,0 +1,9 @@
+label=py314 python=C:/Users/arthu/AppData/Local/Python/pythoncore-3.14-64/python.exe head=ff6f7a0 started=2026-11-02T12:14:52+01:00
+worktree-diff-sha256=cbd40c7c0af2107b
+Python 3.14.7
+precondition=0
+i16=0
+smoke=1
+full=1
+worktree-diff-sha256-after=6ea3d332daee1008
+finished=2026-11-02T13:10:56+01:00

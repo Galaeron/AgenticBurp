@@ -20,12 +20,14 @@ from harness import store
 from harness.models import HttpExchange
 
 _LEGACY_SQL = Path(__file__).resolve().parent / "testing_fixtures" / "state_schema_pre_i02c.sql"
-# AR-08a's proof_identity side table is the other object added since this fixture
-# (its own legacy-read and rollback tests: test_proof_identity_migration).
+# AR-08a's proof_identity and I16's engagement_declarations side tables are the
+# other objects added since this fixture (their own legacy-read and rollback tests:
+# test_proof_identity_migration, test_i16_persist).
 _NEW_OBJECTS = {"exchange_observations", "observation_attributions",
                 "idx_exchange_observations_scope", "idx_exchange_observations_endpoint",
-                "proof_identity"}
-_NEW_MARKERS = [repr(("observation-schema", "1")), repr(("proof-identity-schema", "1"))]
+                "proof_identity", "engagement_declarations"}
+_NEW_MARKERS = sorted([repr(("observation-schema", "1")), repr(("proof-identity-schema", "1")),
+                       repr(("engagement-declarations-schema", "1"))])
 _LEGACY_URL = "https://legacy.example/api/orders/7"
 
 
@@ -145,7 +147,9 @@ class ObservationMigrationTests(unittest.TestCase):
             conn.execute("DROP TABLE exchange_observations")
             conn.execute("DROP TABLE observation_attributions")
             conn.execute("DROP TABLE proof_identity")
-            conn.execute("DELETE FROM state_metadata WHERE name IN ('observation-schema', 'proof-identity-schema')")
+            conn.execute("DROP TABLE engagement_declarations")
+            conn.execute("DELETE FROM state_metadata WHERE name IN ('observation-schema', 'proof-identity-schema', "
+                         "'engagement-declarations-schema')")
             conn.commit()
             after = _legacy_identity(conn)
         finally:
