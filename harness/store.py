@@ -1851,15 +1851,18 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                       (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       s.fingerprint IS NOT NULL AS suppressed,
                       f.oracle_verified, f.verification_state, f.oracle_capsule_id,
-                      f.exchange_id, f.run_id, f.captured_principal_id
+                      f.exchange_id, f.run_id, f.captured_principal_id,
+                      p.validator, p.workflow_state_id, i.policy_fingerprint
                FROM findings f
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
+               LEFT JOIN proof_records p ON p.proof_id = f.proof_id AND f.proof_id != ''
+               LEFT JOIN proof_identity i ON i.proof_id = p.proof_id AND i.identity_version = ?
                WHERE f.host = ? AND f.engagement_id = ?
                  AND (? IS NULL OR f.captured_principal_id = ?)
                  AND (? IS NULL OR f.run_id = ?)
                ORDER BY f.created_at ASC""",
-            (host, _engagement_partition(engagement_id), captured_principal, captured_principal,
-             run_id, run_id),
+            (_PROOF_IDENTITY_VERSION, host, _engagement_partition(engagement_id),
+             captured_principal, captured_principal, run_id, run_id),
         ).fetchall()
     finally:
         conn.close()
@@ -1889,10 +1892,16 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
          "oracle_capsule_id": capsule_id or "",
          # AR-3 (LOOP half): exact finding->exchange/run provenance. Additive
          # keys; '' for legacy rows persisted before this column existed.
-         "exchange_id": exchange_id or "", "run_id": run_id or "", "engagement_id": engagement_id}
+         "exchange_id": exchange_id or "", "run_id": run_id or "", "engagement_id": engagement_id,
+         # AR-08b: the linked proof's mechanism, workflow state and persisted policy
+         # fingerprint (AR-08a), so issues.issue_key can group a route-independent
+         # mechanism from the store alone. '' when unlinked or never fingerprinted.
+         "validator": validator or "", "workflow_state_id": workflow_state_id or "",
+         "policy_fingerprint": policy_fingerprint or ""}
         for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
              finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed,
-             oracle_verified, vstate, capsule_id, exchange_id, run_id, captured_principal_id) in rows
+             oracle_verified, vstate, capsule_id, exchange_id, run_id, captured_principal_id,
+             validator, workflow_state_id, policy_fingerprint) in rows
     ]
     _resolve_confirmation_proofs(results)
     if not include_suppressed:
