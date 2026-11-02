@@ -251,6 +251,26 @@ CREATE INDEX IF NOT EXISTS idx_proof_case ON proof_records(case_id);
 CREATE INDEX IF NOT EXISTS idx_proof_run ON proof_records(run_id);
 """
 
+# AR-08a: the policy fingerprint a proof was decided under (ProofRecord.
+# policy_fingerprint), so proofs read back from the store group exactly as in-run
+# proofs do. Versioned additive migration: a NEW side table keyed on proof_id plus
+# the 'proof-identity-schema' marker in state_metadata. proof_records itself is not
+# altered and PRAGMA user_version stays the finding-fingerprint re-key's, so the
+# legacy schema is unchanged (test_observation_migration). Nothing is backfilled:
+# a proof without a row here (written before this table, or by a validator with no
+# policy) reads as policy "" -- unknown, which never merges routes. A row of
+# another identity_version also reads as "". Rollback: DROP TABLE proof_identity
+# and delete the marker; the previous build never reads either.
+_PROOF_IDENTITY_VERSION = 1
+_PROOF_IDENTITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS proof_identity (
+    proof_id TEXT PRIMARY KEY,
+    policy_fingerprint TEXT NOT NULL,
+    identity_version INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+"""
+
 # P0-1: the durable stream for harness.evidence_ledger.EvidenceLedger. Append-only
 # (event_id is the primary key and every write is INSERT OR IGNORE -- a caller
 # re-persisting the same event, e.g. after a retry, is a no-op, never an overwrite)
@@ -541,6 +561,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_COVERAGE_SCHEMA)
     conn.executescript(_IDENTITY_SCHEMA)
     conn.executescript(_EVIDENCE_SCHEMA)
+    conn.executescript(_PROOF_IDENTITY_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
@@ -552,6 +573,8 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     # I02-C schema marker. PRAGMA user_version is reserved for the fingerprint
     # re-key below; bumping it here would make a future re-key skip.
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('observation-schema', '1')")
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('proof-identity-schema', ?)",
+                 (str(_PROOF_IDENTITY_VERSION),))
     ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
@@ -1646,6 +1669,12 @@ _PROOF_COLUMNS = (
     "verdict, executed, legacy, baseline_artifact_id, attack_artifact_id, "
     "control_artifact_ids_json, expected_invariant, observed_result, limitation, created_at"
 )
+# AR-08a: every proof read joins its persisted policy fingerprint ("" when absent).
+_PROOF_SELECT = (
+    ", ".join(f"p.{col.strip()}" for col in _PROOF_COLUMNS.split(","))
+    + ", COALESCE(i.policy_fingerprint, '') FROM proof_records p LEFT JOIN proof_identity i"
+    f" ON i.proof_id = p.proof_id AND i.identity_version = {_PROOF_IDENTITY_VERSION}"
+)
 
 
 def persist_proof_record(proof) -> tuple[bool, str]:
@@ -1675,6 +1704,11 @@ def persist_proof_record(proof) -> tuple[bool, str]:
              proof.expected_invariant, proof.observed_result, proof.limitation,
              proof.created_at),
         )
+        if proof.policy_fingerprint:
+            conn.execute(
+                "INSERT OR IGNORE INTO proof_identity (proof_id, policy_fingerprint, identity_version, "
+                "created_at) VALUES (?,?,?,?)",
+                (proof.proof_id, proof.policy_fingerprint, _PROOF_IDENTITY_VERSION, proof.created_at))
         conn.commit()
         return True, "accepted"
     finally:
@@ -1686,7 +1720,8 @@ def _proof_row_to_dict(row) -> dict:
     (proof_id, run_id, case_id, principal_id, request_template_id, check_id,
      parameter_location, parameter_name, workflow_state_id, finding_ref, validator, validator_version,
      verdict, executed, legacy, baseline_artifact_id, attack_artifact_id,
-     control_artifact_ids_json, expected_invariant, observed_result, limitation, created_at) = row
+     control_artifact_ids_json, expected_invariant, observed_result, limitation, created_at,
+     policy_fingerprint) = row
     return {
         "proof_id": proof_id,
         "case": {"run_id": run_id, "case_id": case_id, "principal_id": principal_id,
@@ -1699,6 +1734,7 @@ def _proof_row_to_dict(row) -> dict:
         "control_artifact_ids": json.loads(control_artifact_ids_json or "[]"),
         "expected_invariant": expected_invariant, "observed_result": observed_result,
         "limitation": limitation, "created_at": created_at,
+        "policy_fingerprint": policy_fingerprint or "",
     }
 
 
@@ -1707,7 +1743,7 @@ def proofs_for_case(case_id: str) -> list[dict]:
     conn = _connect()
     try:
         rows = conn.execute(
-            f"SELECT {_PROOF_COLUMNS} FROM proof_records WHERE case_id = ? ORDER BY created_at ASC",
+            f"SELECT {_PROOF_SELECT} WHERE p.case_id = ? ORDER BY p.created_at ASC",
             (case_id,)).fetchall()
         return [_proof_row_to_dict(r) for r in rows]
     finally:
@@ -3049,6 +3085,7 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #                                are real columns on this table; a row
 #                                matching any of them belongs to one of the
 #                                target host's findings)
+#     proof_identity         -- proof_id no longer in proof_records (AR-08a)
 #     ledger_events          -- finding_ref (sizes case_ids UNION finding_ids
 #                                of the target host's findings -- see the
 #                                blob-guard comment below for why)
@@ -3242,6 +3279,10 @@ def wipe_engagement(host: str) -> dict:
             counts["proof_records"] = cur.rowcount
         else:
             counts["proof_records"] = 0
+        # AR-08a: a proof's persisted fingerprint goes with the proof.
+        counts["proof_identity"] = conn.execute(
+            "DELETE FROM proof_identity WHERE proof_id NOT IN (SELECT proof_id FROM proof_records)"
+        ).rowcount
 
         # (f) finding_observations -- fingerprint IN fingerprints.
         if target_fingerprints:
@@ -3314,7 +3355,7 @@ def proofs_for_run(run_id: str) -> list[dict]:
     conn = _connect()
     try:
         rows = conn.execute(
-            f"SELECT {_PROOF_COLUMNS} FROM proof_records WHERE run_id = ? ORDER BY created_at ASC",
+            f"SELECT {_PROOF_SELECT} WHERE p.run_id = ? ORDER BY p.created_at ASC",
             (run_id,)).fetchall()
         return [_proof_row_to_dict(row) for row in rows]
     finally:

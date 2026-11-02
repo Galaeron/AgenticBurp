@@ -240,6 +240,11 @@ class ProofRecord:
     executed: bool = False
     legacy: bool = False
     created_at: float = 0.0
+    # AR-08a: the verification/header policy the validator judged this attempt under
+    # (ValidationResult.header_fingerprint). Persisted beside the record (store's
+    # proof_identity table) so proofs read back from the store group like in-run
+    # ones; "" means unknown, which never merges routes.
+    policy_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if isinstance(self.verdict, str) and not isinstance(self.verdict, Verdict):
@@ -268,7 +273,8 @@ class ProofRecord:
                                limitation: str = "", blocked: bool = False,
                                executed: bool | None = None, controlled: bool = False,
                                baseline_artifact_id: str = "", attack_artifact_id: str = "",
-                               control_artifact_ids: tuple[str, ...] = ()) -> "ProofRecord":
+                               control_artifact_ids: tuple[str, ...] = (),
+                               policy_fingerprint: str = "") -> "ProofRecord":
         """Build a proof from a validator compatibility result.
 
         Legacy validators did not report whether the comparison and its controls
@@ -300,7 +306,7 @@ class ProofRecord:
                    expected_invariant=expected_invariant, limitation=limitation,
                    baseline_artifact_id=baseline_artifact_id, attack_artifact_id=attack_artifact_id,
                    control_artifact_ids=control_artifact_ids, executed=record_executed,
-                   legacy=legacy)
+                   legacy=legacy, policy_fingerprint=policy_fingerprint)
 
     @classmethod
     def legacy_confirmed(cls, *, case: TestCaseRef, validator: str, observed_result: str = "",
@@ -322,7 +328,7 @@ class ProofRecord:
                 "control_artifact_ids": list(self.control_artifact_ids),
                 "expected_invariant": self.expected_invariant, "observed_result": self.observed_result,
                 "limitation": self.limitation, "executed": self.executed, "legacy": self.legacy,
-                "created_at": self.created_at}
+                "created_at": self.created_at, "policy_fingerprint": self.policy_fingerprint}
 
     @classmethod
     def from_dict(cls, d: dict) -> "ProofRecord":
@@ -335,7 +341,8 @@ class ProofRecord:
                    expected_invariant=d.get("expected_invariant", ""),
                    observed_result=d.get("observed_result", ""), limitation=d.get("limitation", ""),
                    executed=bool(d.get("executed", False)), legacy=bool(d.get("legacy", False)),
-                   created_at=d.get("created_at", 0.0))
+                   created_at=d.get("created_at", 0.0),
+                   policy_fingerprint=d.get("policy_fingerprint", "") or "")
 
 
 class ProofLedger:

@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import unittest
 
-from harness import store
+from harness import store, telemetry
 from harness.assessment_health import confirmed_issue_accounting, stored_proof_artifacts_resolve
 from harness.evidence import ProofRecord
 from harness.models import AgentReport
@@ -80,6 +81,11 @@ class ProofIdentityCallerTests(_CallerBase, unittest.TestCase):
                     # The finding as the confirm path left it (proof link, policy).
                     confirmed = reports_findings[-1]
                     out.extend((url, p, confirmed.model_dump()) for p in proofs)
+                    # AR-08a: also persist it the way analyze does, so a later read
+                    # (store.all_host_findings) sees only what the store kept.
+                    telemetry.bind_current_run(run.run_id)
+                    store.persist_findings(exchange, "jwt_forge", [confirmed])
+                telemetry.bind_current_run(None)
                 return run.run_id, out
         return asyncio.run(go())
 
@@ -107,6 +113,52 @@ class ProofIdentityCallerTests(_CallerBase, unittest.TestCase):
         run_id, legs = self._confirm_routes([("/api/me", _JWT), ("/api/orders", _OTHER_JWT)])
         acc = self._account(run_id, self._findings(legs))
         self.assertEqual(acc["counts"]["vulnerabilities"], 2, json.dumps(acc["groups"], indent=1))
+
+    def _stored_account(self, run_id):
+        """AR-08a: the accounting server.py computes from the store alone: findings
+        read back with store.all_host_findings (no header_fingerprint column) and
+        proofs read back with store.proofs_for_run."""
+        rows = store.all_host_findings(self.target.origin, run_id=run_id)
+        self.assertTrue(rows and all(not r.get("header_fingerprint") for r in rows))
+        return self._account(run_id, rows)
+
+    @staticmethod
+    def _shape(acc):
+        return sorted((g["group_id"], sorted(g["proof_ids"]), g["routes"], g["identity"])
+                      for g in acc["groups"])
+
+    def test_store_only_proofs_group_exactly_as_in_run_proofs(self):
+        for second in (_JWT, _OTHER_JWT):
+            with self.subTest(same_policy=second == _JWT):
+                run_id, legs = self._confirm_routes([("/api/me", _JWT), ("/api/orders", second)])
+                in_run = self._account(run_id, self._findings(legs))
+                stored = self._stored_account(run_id)
+                self.assertEqual(stored["counts"]["vulnerabilities"], 1 if second == _JWT else 2,
+                                 json.dumps(stored["groups"], indent=1))
+                self.assertEqual(self._shape(stored), self._shape(in_run))
+                self.assertEqual(stored["counts"], in_run["counts"])
+                policies = {i["policy_fingerprint"] for i in stored["proof_instances"]}
+                self.assertTrue(all(policies), policies)
+
+    def test_legacy_proof_without_fingerprint_degrades_and_never_merges(self):
+        # Control: the same two equivalent routes, but one proof predates AR-08a
+        # (no persisted fingerprint) and its finding was read back from the store.
+        run_id, legs = self._confirm_routes([("/api/me", _JWT), ("/api/orders", _JWT)])
+        legacy_id = legs[1][1]["proof_id"]
+        conn = sqlite3.connect(store._DB_PATH)
+        try:
+            self.assertEqual(conn.execute("DELETE FROM proof_identity WHERE proof_id = ?",
+                                          (legacy_id,)).rowcount, 1)
+            conn.commit()
+        finally:
+            conn.close()
+        stored = self._stored_account(run_id)
+        self.assertEqual(stored["counts"]["vulnerabilities"], 2, json.dumps(stored["groups"], indent=1))
+        legacy = next(i for i in stored["proof_instances"] if i["proof_id"] == legacy_id)
+        self.assertEqual(legacy["policy_fingerprint"], "")
+        # Still a counted, artifact-resolved proof: degraded identity, not dropped.
+        self.assertTrue(legacy["artifacts_resolved"] and legacy["referenced"])
+        self.assertEqual(len(stored["proof_instances"]), 2)
 
     def test_distinct_principals_stay_separate(self):
         run_id, legs = self._confirm_routes([("/api/me", _JWT), ("/api/orders", _JWT)])

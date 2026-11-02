@@ -4317,7 +4317,7 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
 04 (ea2aa1b) and 08 (56c04dc). Plan: `.test-work/assessment-integration-20261023/architecture-repair/IMPLEMENTATION_TASK.md`
 (main checkout). Handoffs live in the batch folders under `.test-work/` in the wt-cors-r1 worktree.
 
-### [ ] AR-08a — Persist the proof identity fingerprint on proof records
+### [x] AR-08a — Persist the proof identity fingerprint on proof records
 - **Domain:** Issue accounting · **Effort:** M · **Depends on:** a reviewed schema migration ·
   **Mode:** LOOP (offline), reviewer gate for the migration.
 - **Problem:** batch 08 groups equivalent proofs by a fingerprint computed at run time only. The
@@ -4325,6 +4325,9 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
   back from the store lose the fingerprint and are not grouped by route.
 - **Acceptance criteria:** versioned additive migration with legacy-read and rollback tests
   (`test_observation_migration` stays green); store-only proofs group exactly as in-run proofs.
+- **Done 2026-11-02 (`37bcb62`):** side table `proof_identity` + marker `proof-identity-schema=1`;
+  gates green on 3.12/3.14. Migration awaits reviewer sign-off:
+  `.test-work/ar08a-proof-fingerprint-20261102/HANDOFF.md`.
 
 ### [ ] AR-08b — Route-independent issue identity beyond jwt_forge
 - **Domain:** Issue accounting · **Effort:** S-M · **Depends on:** AR-08a · **Mode:** LOOP.
