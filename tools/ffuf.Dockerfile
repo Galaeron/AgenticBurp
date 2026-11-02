@@ -10,6 +10,10 @@
 # the harness's own vocabulary), so the fuzz candidate set is versioned + auditable
 # with the image. Scope (target URL) and identity headers are passed by the harness
 # at run time, never baked in.
+# P3-2 OWNER/LIVE: base images are NOT digest-pinned yet (no digest was invented or
+# pulled offline). On a docker host, resolve each tag and pin it in place, e.g.
+#   docker buildx imagetools inspect golang:1.22-bookworm   ->   FROM golang:1.22-bookworm@sha256:<digest>
+# then confirm `python -m harness.supply_chain images --require-digest` exits 0.
 FROM golang:1.22-bookworm AS build
 RUN go install github.com/ffuf/ffuf/v2@v2.1.0
 
