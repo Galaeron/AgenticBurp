@@ -20,6 +20,7 @@ therefore tests the SAME target the host means by localhost, transparently.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,6 +128,115 @@ def image_present(image: str, timeout: float = 10.0) -> bool:
         return r.returncode == 0
     except Exception:
         return False
+
+
+# P3-2: image references pinned by content digest. `name[:tag]@sha256:<64 hex>`
+# makes docker run exactly that content (a moved tag cannot swap the tool), and a
+# bare `sha256:<64 hex>` is a local image ID -- the only way to pin a locally BUILT
+# image such as harness/sqlmap, which has no registry RepoDigest. A reference that
+# claims a digest but does not carry a well-formed one is refused before launch
+# rather than handed to docker to interpret.
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+class ImageReferenceError(ValueError):
+    """Raised for a malformed digest, or a missing one when a digest is required."""
+
+
+@dataclass(frozen=True)
+class ImageRef:
+    name: str              # "" for a bare image ID
+    tag: str | None
+    digest: str | None     # "sha256:<64 hex>" when pinned
+
+    @property
+    def pinned(self) -> bool:
+        return self.digest is not None
+
+    @property
+    def is_image_id(self) -> bool:
+        return self.pinned and not self.name
+
+
+def parse_image_ref(ref: str) -> ImageRef:
+    """Split an image reference into name/tag/digest. Pure; raises
+    ImageReferenceError for an empty reference or a malformed digest."""
+    ref = (ref or "").strip()
+    if not ref:
+        raise ImageReferenceError("empty image reference")
+    if _DIGEST_RE.match(ref):
+        return ImageRef(name="", tag=None, digest=ref)
+    name, sep, digest = ref.partition("@")
+    if sep:
+        if not _DIGEST_RE.match(digest):
+            raise ImageReferenceError(
+                f"image reference {ref!r} has a malformed digest "
+                "(expected @sha256:<64 lowercase hex>)")
+        if not name:
+            raise ImageReferenceError(f"image reference {ref!r} has no name")
+    if ref.startswith("sha256:"):
+        raise ImageReferenceError(f"image ID {ref!r} is not sha256:<64 lowercase hex>")
+    # a ':' after the last '/' is a tag; one before it is a registry port
+    tag = None
+    slash = name.rfind("/")
+    colon = name.rfind(":")
+    if colon > slash:
+        name, tag = name[:colon], name[colon + 1:]
+        if not tag:
+            raise ImageReferenceError(f"image reference {ref!r} has an empty tag")
+    return ImageRef(name=name, tag=tag, digest=digest if sep else None)
+
+
+def validate_image_ref(ref: str, *, require_digest: bool = False) -> ImageRef:
+    """parse_image_ref, plus (when `require_digest`) refuse an unpinned reference."""
+    parsed = parse_image_ref(ref)
+    if require_digest and not parsed.pinned:
+        raise ImageReferenceError(
+            f"image reference {ref!r} is not pinned by digest "
+            "(use name@sha256:<digest>, or sha256:<image id> for a local build)")
+    return parsed
+
+
+def local_image_digests(image: str, timeout: float = 10.0) -> tuple[str, list[str]] | None:
+    """(image ID, RepoDigests) of a LOCAL image via `docker image inspect` (no pull),
+    or None when it is absent or docker cannot answer."""
+    try:
+        r = subprocess.run([DOCKER, "image", "inspect", "--format",
+                            "{{json .Id}} {{json .RepoDigests}}", image],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    import json
+    try:
+        id_part, _, digests_part = (r.stdout or "").strip().partition(" ")
+        image_id = json.loads(id_part)
+        repo_digests = json.loads(digests_part) if digests_part else []
+    except ValueError:
+        return None
+    return str(image_id or ""), [str(d) for d in (repo_digests or [])]
+
+
+def verify_pinned_digest(image: str, timeout: float = 10.0) -> tuple[bool, str]:
+    """(ok, reason): does the local image the pinned reference names carry that
+    digest? An unpinned reference is reported, not checked. Never pulls."""
+    try:
+        parsed = parse_image_ref(image)
+    except ImageReferenceError as exc:
+        return False, str(exc)
+    if not parsed.pinned:
+        return False, f"{image!r} is not pinned by digest"
+    found = local_image_digests(image, timeout=timeout)
+    if found is None:
+        return False, f"{image!r} is not present locally (no pull attempted)"
+    image_id, repo_digests = found
+    if parsed.is_image_id:
+        ok = image_id == parsed.digest
+    else:
+        ok = any(d.rpartition("@")[2] == parsed.digest and d.rpartition("@")[0] == parsed.name
+                 for d in repo_digests)
+    return (True, "digest matches") if ok else (False, f"local image does not carry {parsed.digest}")
 
 
 def localhost_url(url: str) -> str:
@@ -798,7 +908,8 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
         add_host: bool = True, extra: list[str] | None = None,
         egress: "EgressPolicy | None" = None, enforce_egress: bool = False,
         cancel=None, receipt: dict | None = None,
-        max_output: int = DEFAULT_MAX_OUTPUT) -> tuple[int, str, str]:
+        max_output: int = DEFAULT_MAX_OUTPUT,
+        require_digest: bool = False) -> tuple[int, str, str]:
     """Run `image` with `args` in a throwaway container. Returns
     (returncode, stdout, stderr). Raises subprocess.TimeoutExpired on timeout so
     the caller can treat a hung tool distinctly from a clean non-zero exit.
@@ -815,7 +926,13 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
     terminated and the exact container removed before ToolRunCancelled is raised.
     Output is bounded to `max_output` bytes per stream while it is read. When the
     container cannot be proved removed, ToolCleanupFailed is raised. `receipt`, when
-    supplied, is populated with tool/image/argv/egress/outcome/cleanup fields."""
+    supplied, is populated with tool/image/argv/egress/outcome/cleanup fields.
+
+    P3-2: the image reference is validated before launch. A malformed
+    `@sha256:` digest is refused (ImageReferenceError), as is an unpinned one when
+    `require_digest`; a pinned digest is passed to docker unchanged, so docker
+    runs exactly that content, and the receipt records it."""
+    image_ref = validate_image_ref(image, require_digest=require_digest)
     if enforce_egress and egress is None:
         raise EgressPolicyRequired(
             f"refusing to launch {image!r}: no egress policy configured for this run "
@@ -828,6 +945,7 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
     if receipt is not None:
         receipt.update({
             "tool_image": image,
+            "tool_image_digest": image_ref.digest,
             "container_name": name,
             "argv": list(cmd),
             "egress_applied": egress is not None,

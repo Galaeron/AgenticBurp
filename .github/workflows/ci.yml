@@ -75,6 +75,47 @@ jobs:
       - name: Evaluation contracts and score plumbing
         run: python -m harness.suite evaluation
 
+  # P3-2: supply chain. Emits the offline CycloneDX SBOM (harness.supply_chain, stdlib
+  # only) and reports whether tool base images are digest-pinned -- both blocking only
+  # on a script error. The pip-audit vulnerability check is ADVISORY
+  # (continue-on-error): a CVE published upstream must not turn an unrelated PR red,
+  # and the advisory database is a network dependency. Its JSON report and the SBOM
+  # are uploaded on every run. --no-deps --disable-pip audits the exact lock pins
+  # without resolving or installing them, so Windows-only pins audit here too.
+  dependency-audit:
+    name: Dependency audit + SBOM (pip-audit advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Emit the CycloneDX SBOM (offline, deterministic)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m harness.supply_chain sbom --out sbom.cdx.json
+      - name: Report tool base-image digest pinning
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m harness.supply_chain images
+      - name: Install pip-audit
+        run: python -m pip install pip-audit==2.9.0
+      - name: Audit the lock for known vulnerabilities (advisory)
+        continue-on-error: true
+        run: >-
+          pip-audit -r harness/requirements.lock --no-deps --disable-pip
+          --progress-spinner off --desc on
+          --format json --output pip-audit.json
+      - name: Upload SBOM + audit report (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-${{ github.run_id }}
+          path: |
+            sbom.cdx.json
+            pip-audit.json
+          if-no-files-found: warn
+
   # P0.10: CPU-only precision/recall plumbing check, nightly (+ on-demand). Distinct
   # from `scored` below -- this NEVER calls a real model and needs no GPU/self-hosted
   # runner, so it runs on every stock windows-latest runner. It proves the SCORING

@@ -695,6 +695,17 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
 - **Recommendation:** Emit an SBOM, pin the sqlmap/browser image by digest, and add
   a dependency-vulnerability check to CI.
 - **Impact:** Medium.
+- **Progress (2026-11-02, offline half, branch `claude/p3-2-supply-chain-c706a9`):**
+  `harness/supply_chain.py` emits a deterministic CycloneDX 1.5 SBOM (lock + proxy
+  requirements + Dockerfile base images) and reports base-image digest pinning;
+  `tool_runner` validates `image@sha256:` / `sha256:<id>` references (malformed digest
+  refused before launch, opt-in `require_digest`, digest in the receipt,
+  `verify_pinned_digest` via local inspect); CI `dependency-audit` job runs pip-audit
+  on the lock (advisory) and uploads the SBOM. Tests: `harness/test_supply_chain.py`.
+  **Remaining (why still `[ ]`, OWNER/LIVE):** real digests -- pin the Dockerfile
+  `FROM` lines and set `validators.sqlmap.container_image` in `config.local.yaml` to
+  `sha256:<image id>` of the locally built sqlmap image; there is no browser image
+  the harness launches (CDP endpoint only). Decide whether pip-audit becomes blocking.
 
 ### [ ] P3-3 — Team mode groundwork (shared findings DB, RBAC, audit log, resume)
 - **Domain:** Product / Enterprise · **Effort:** XL · **Depends on:** P0-1, P3-1

@@ -8,6 +8,10 @@
 #
 # The harness invokes it via tool_runner.run("harness/sqlmap:1.10.9", [...]); the
 # image tag matches validators.sqlmap.container_image in the local config overrides.
+# P3-2 OWNER/LIVE: base images are NOT digest-pinned yet (no digest was invented or
+# pulled offline). On a docker host, resolve each tag and pin it in place, e.g.
+#   docker buildx imagetools inspect python:3.12-slim   ->   FROM python:3.12-slim@sha256:<digest>
+# then confirm `python -m harness.supply_chain images --require-digest` exits 0.
 FROM python:3.12-slim
 RUN pip install --no-cache-dir sqlmap==1.10.9
 # Non-root: the tool never needs host privileges.
