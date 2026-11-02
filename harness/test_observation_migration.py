@@ -20,8 +20,12 @@ from harness import store
 from harness.models import HttpExchange
 
 _LEGACY_SQL = Path(__file__).resolve().parent / "testing_fixtures" / "state_schema_pre_i02c.sql"
+# AR-08a's proof_identity side table is the other object added since this fixture
+# (its own legacy-read and rollback tests: test_proof_identity_migration).
 _NEW_OBJECTS = {"exchange_observations", "observation_attributions",
-                "idx_exchange_observations_scope", "idx_exchange_observations_endpoint"}
+                "idx_exchange_observations_scope", "idx_exchange_observations_endpoint",
+                "proof_identity"}
+_NEW_MARKERS = [repr(("observation-schema", "1")), repr(("proof-identity-schema", "1"))]
 _LEGACY_URL = "https://legacy.example/api/orders/7"
 
 
@@ -81,8 +85,7 @@ class ObservationMigrationTests(unittest.TestCase):
             rows = _legacy_identity(conn)["rows"]
             marker = rows.pop("state_metadata")
             expected = dict(self.before["rows"])
-            self.assertEqual(sorted(set(marker) - set(expected.pop("state_metadata"))),
-                             [repr(("observation-schema", "1"))])
+            self.assertEqual(sorted(set(marker) - set(expected.pop("state_metadata"))), _NEW_MARKERS)
             self.assertEqual(rows, expected)
             self.assertEqual(conn.execute("SELECT count(*) FROM exchange_observations").fetchone()[0], 0,
                              "nothing is backfilled from legacy findings")
@@ -141,7 +144,8 @@ class ObservationMigrationTests(unittest.TestCase):
         try:
             conn.execute("DROP TABLE exchange_observations")
             conn.execute("DROP TABLE observation_attributions")
-            conn.execute("DELETE FROM state_metadata WHERE name = 'observation-schema'")
+            conn.execute("DROP TABLE proof_identity")
+            conn.execute("DELETE FROM state_metadata WHERE name IN ('observation-schema', 'proof-identity-schema')")
             conn.commit()
             after = _legacy_identity(conn)
         finally:

@@ -100,8 +100,13 @@ def proof_artifact_kwargs(result) -> dict:
     controls = tuple(getattr(result, "control_artifact_ids", ()) or ())
     if not (baseline or attack or controls):
         return {}
-    return {"executed": True, "baseline_artifact_id": baseline,
-            "attack_artifact_id": attack, "control_artifact_ids": controls}
+    kwargs = {"executed": True, "baseline_artifact_id": baseline,
+              "attack_artifact_id": attack, "control_artifact_ids": controls}
+    # AR-08a: the policy the verdict was decided under travels on the proof itself.
+    policy = getattr(result, "header_fingerprint", "") or ""
+    if policy:
+        kwargs["policy_fingerprint"] = policy
+    return kwargs
 
 
 def header_fingerprint(*values: str | None) -> str:

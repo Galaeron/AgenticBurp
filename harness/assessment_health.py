@@ -278,8 +278,10 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
     """
     proofs = {p.get('proof_id'): p for p in run_proofs if p.get('proof_id')}
     # Batch 08: the policy a confirmation was decided under travels on the finding
-    # (Finding.header_fingerprint, set by the confirm path); stored rows that lost it
-    # read as unknown, which never merges routes.
+    # (Finding.header_fingerprint, set by the confirm path). AR-08a: it is also
+    # persisted with the proof (store.proof_identity), which wins, so store-only
+    # proofs group as in-run ones; a proof and finding that both lack it read as
+    # unknown, which never merges routes.
     policy_of = {}
     for finding in findings:
         if finding.get('proof_id') and finding.get('header_fingerprint'):
@@ -344,7 +346,7 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
                     'baseline_artifact_id', 'attack_artifact_id', 'control_artifact_ids')}
         instance.update(case=dict(case), kind=kind, claimed_kind=claimed, artifacts_resolved=resolved,
                         referenced=bool(finding), exclusion_reason=reason,
-                        policy_fingerprint=policy_of.get(proof_id, ''))
+                        policy_fingerprint=proof.get('policy_fingerprint') or policy_of.get(proof_id, ''))
         original = first_attempt.get((proof.get('attack_artifact_id') or '', proof.get('baseline_artifact_id') or ''))
         if original and original != proof_id:
             instance['reuses_attempt_of'] = original
@@ -360,7 +362,7 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             # Batch 08: a route-independent mechanism with a known policy fingerprint
             # groups on (host, mechanism, boundary, check family, policy); an unknown
             # policy never merges routes.
-            policy = policy_of.get(proof_id, '')
+            policy = instance['policy_fingerprint']
             if claimed != 'vulnerability':
                 root = (origin, validator, cls)
             elif finding.get('root_cause_id'):
