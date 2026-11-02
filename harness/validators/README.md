@@ -31,6 +31,25 @@ All are `active` (send live requests, gated by `validators.active_enabled`) exce
 whole registry via `ValidatorRegistry.for_finding`; the engagement graph loop's
 `_confirm` dispatcher uses the six legs only.
 
+## Parameter binding
+
+Agents return `parameter_location` (query/body/path/header/cookie) and
+`parameter_name` for a finding about one parameter, or "" for both. The
+parameter-mutating legs (SSTI, command injection, path traversal, open
+redirect) choose injection points with `injection_targets.select_targets`:
+
+- the named parameter is tested first, even past the leg's cap (six) and even
+  when it does not match the leg's shape heuristic (file- or redirect-shaped);
+- a named parameter the leg cannot reach (header, cookie, absent from the
+  request) is reported as `control_outcome="named_parameter_untested"`;
+- an unnamed finding whose inputs exceed the cap is `"partial_coverage"`.
+
+The confirmation gate counts only `""` / `"control_held"` negatives as
+controlled, so either marker leaves the finding inconclusive, not refuted.
+The engagement `_confirm` path carries the parameter, and the within-run
+confirmation cache keys on it. The sqlmap, SSRF, XXE and XSS legs do not use
+it yet.
+
 Active validators are disabled by default. When enabled, they must:
 
 1. operate on the captured exchange, not model-generated targets;
