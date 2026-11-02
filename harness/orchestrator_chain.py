@@ -931,7 +931,8 @@ class ChainMixin:
                                      objective_class: str | None = None,
                                      objective_task: "ObjectiveTask | None" = None,
                                      objective_provider=None,
-                                     seed_exchanges=None, coverage_checkpoint=None) -> dict:
+                                     seed_exchanges=None, coverage_checkpoint=None,
+                                     protected_paths=None, owners=None) -> dict:
         """Milestone A+B, end to end: build the app model (active discovery ->
         per-role access matrix -> prioritised worklist), then drive the ITERATIVE
         agent top-down over that worklist -- each high-value node gets a bounded
@@ -942,7 +943,10 @@ class ChainMixin:
 
         `roles` is a list of role_crawl.RoleSession. Requires iterative_agent
         enabled (run_active_probe enforces it). `max_chain_rounds` bounds the
-        Milestone-C closed loop (re-test AS a credential learned from a finding)."""
+        Milestone-C closed loop (re-test AS a credential learned from a finding).
+        `protected_paths` and `owners` are the operator's engagement declarations
+        (I16): merged into the state after discovery, where the missing-auth (RV-S)
+        and ownership (RV-T) confirmations read them. None or empty changes nothing."""
         from harness import engagement_builder
         from harness import worklist_investigator
         from harness import chain_linker
@@ -1016,6 +1020,14 @@ class ChainMixin:
                     _journal_phase("discovery")
                 except Exception as e:
                     log.warning("investigate_engagement: journaling discovery failed: %s", e)
+
+        # I16: the operator's declarations for this engagement, added after discovery
+        # (built or restored) so both paths carry them. Malformed entries are left to
+        # the readers, which ignore them with a warning (fail closed).
+        for _field, _declared in (("protected_paths", protected_paths), ("owners", owners)):
+            if _declared:
+                _have = getattr(state, _field)
+                _have.extend(entry for entry in _declared if entry not in _have)
 
         # Units an earlier attempt finished, passed to the phases that skip them. Their
         # findings come back marked `resumed_from`, a confirmation only while its proof
@@ -1496,6 +1508,15 @@ class ChainMixin:
                             "missing-auth", 0.85, exchange)
                         if proof.confirmed and declared is not None:
                             finding["protected_route"] = declared.to_dict()
+                        elif declared is None and not finding.get("confirmed"):
+                            # The route served data anonymously but is not declared:
+                            # say how to declare it (I16), in the next step only, so
+                            # the summary and evidence stay as they were.
+                            _hint = _protected[0].declaration_hint(method, exchange.url)
+                            _previous = (finding.get("suggested_test") or "").strip()
+                            if _hint and _hint not in _previous:
+                                finding["suggested_test"] = (
+                                    f"{_hint}\n\n{_previous}" if _previous else _hint)
                 except Exception:
                     return
             elif access_control_gate._is_access_control_class(vc):

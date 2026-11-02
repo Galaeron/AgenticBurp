@@ -271,6 +271,31 @@ CREATE TABLE IF NOT EXISTS proof_identity (
 );
 """
 
+# I16 persistence: the operator's per-target declarations (protected_paths and
+# authz.owners-shaped entries), saved only by an explicit save and read only when a
+# request opts in (server: PUT /engagement/{host}/declarations, investigate's
+# use_saved_declarations). Paths and identity labels only -- entries are validated
+# against the RV-S/RV-T grammars before they are written, so no header, cookie,
+# token or body can be stored. Versioned additive migration in AR-08a's pattern: a
+# NEW side table plus the 'engagement-declarations-schema' marker in state_metadata;
+# no legacy table is altered and PRAGMA user_version stays the fingerprint re-key's.
+# Keyed on (lower-cased host, effective port), so two services on one host never
+# share declarations. A row of another declarations_version reads as nothing saved.
+# Rollback: DROP TABLE engagement_declarations and delete the marker; the previous
+# build never reads either.
+_DECLARATIONS_VERSION = 1
+_DECLARATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS engagement_declarations (
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    protected_paths_json TEXT NOT NULL DEFAULT '[]',
+    owners_json TEXT NOT NULL DEFAULT '[]',
+    declarations_version INTEGER NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (host, port)
+);
+"""
+
 # P0-1: the durable stream for harness.evidence_ledger.EvidenceLedger. Append-only
 # (event_id is the primary key and every write is INSERT OR IGNORE -- a caller
 # re-persisting the same event, e.g. after a retry, is a no-op, never an overwrite)
@@ -562,6 +587,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_IDENTITY_SCHEMA)
     conn.executescript(_EVIDENCE_SCHEMA)
     conn.executescript(_PROOF_IDENTITY_SCHEMA)
+    conn.executescript(_DECLARATIONS_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
@@ -575,6 +601,8 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('observation-schema', '1')")
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('proof-identity-schema', ?)",
                  (str(_PROOF_IDENTITY_VERSION),))
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('engagement-declarations-schema', ?)",
+                 (str(_DECLARATIONS_VERSION),))
     ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
@@ -3095,6 +3123,7 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #                                matching any of them belongs to one of the
 #                                target host's findings)
 #     proof_identity         -- proof_id no longer in proof_records (AR-08a)
+#     engagement_declarations -- host, or host:port (I16 persistence)
 #     ledger_events          -- finding_ref (sizes case_ids UNION finding_ids
 #                                of the target host's findings -- see the
 #                                blob-guard comment below for why)
@@ -3352,11 +3381,56 @@ def wipe_engagement(host: str) -> dict:
         counts["engagement_state"] = cur.rowcount
         cur = conn.execute("DELETE FROM scoped_engagement_state WHERE host = ?", (host,))
         counts["scoped_engagement_state"] = cur.rowcount
+        # I16: the operator's saved declarations for this host (any port when the
+        # caller names the bare host, one port when it names host:port).
+        cur = conn.execute(
+            "DELETE FROM engagement_declarations WHERE host = lower(?) OR host || ':' || port = lower(?)",
+            (host, host))
+        counts["engagement_declarations"] = cur.rowcount
 
         conn.commit()
         return counts
     finally:
         conn.close()
+
+
+def save_engagement_declarations(host: str, port: int, *, protected_paths: list[str],
+                                 owners: list[dict]) -> None:
+    """Replace the saved declarations for one target (I16). Callers validate the
+    entries first (server.py does, against the RV-S/RV-T grammars); empty lists
+    for both delete the row, so "save nothing" leaves nothing to opt in to."""
+    host = (host or "").lower()
+    if not host or not isinstance(port, int) or not 0 < port < 65536:
+        raise ValueError("a declarations target needs a host and a port")
+    conn = _connect()
+    try:
+        if not protected_paths and not owners:
+            conn.execute("DELETE FROM engagement_declarations WHERE host = ? AND port = ?", (host, port))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO engagement_declarations (host, port, protected_paths_json, "
+                "owners_json, declarations_version, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (host, port, json.dumps(list(protected_paths)), json.dumps(list(owners)),
+                 _DECLARATIONS_VERSION, time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_engagement_declarations(host: str, port: int) -> dict | None:
+    """The saved declarations for exactly this (host, port), or None when nothing
+    of this version is saved. Never consulted unless a request opts in."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT protected_paths_json, owners_json, updated_at FROM engagement_declarations "
+            "WHERE host = ? AND port = ? AND declarations_version = ?",
+            ((host or "").lower(), port, _DECLARATIONS_VERSION)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {"protected_paths": json.loads(row[0]), "owners": json.loads(row[1]), "updated_at": row[2]}
 
 
 def proofs_for_run(run_id: str) -> list[dict]:

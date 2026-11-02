@@ -1,0 +1,9 @@
+F1 state merge dropped: CAUGHT (FAILED (failures=1))
+F2 owners not merged: CAUGHT (FAILED (failures=1))
+F3 hint not produced: CAUGHT (FAILED (failures=1))
+F4 route does not forward: CAUGHT (FAILED (errors=1))
+F5 empty list always forwarded: CAUGHT (FAILED (failures=2))
+F6 journal key always includes lists: CAUGHT (FAILED (failures=1))
+F7 issue export drops suggested_test: CAUGHT (FAILED (errors=1))
+F8 sarif import ignores it: CAUGHT (FAILED (failures=1))
+8 of 8 caught, sources restored
