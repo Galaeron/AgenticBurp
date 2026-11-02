@@ -35,7 +35,7 @@ import secrets
 from dataclasses import dataclass, field
 
 from harness.models import Finding, HttpExchange
-from harness.objective_profiles import ObjectiveTask
+from harness.objective_profiles import READ_ONLY, ObjectiveTask
 from harness.run_context import TypedRequest
 from harness.safety_gate import SafetyGateBlocked
 from harness.validators.base import ValidationResult
@@ -168,6 +168,19 @@ async def attempt_completion(task: ObjectiveTask | None, finding: Finding,
         return CompletionResult(NOT_ATTEMPTED,
                                  summary=f"action_class {profile.action_class!r} has no "
                                          f"registered completion template")
+    if profile.mutation_level != READ_ONLY and not task.destructive_opt_in:
+        # LB-6: a destructive objective stays OFF unless the run's caller opted
+        # in explicitly; the safety gate authorizing mutating replay is not enough.
+        return CompletionResult(NOT_ATTEMPTED, action_class=profile.action_class,
+                                 summary=f"{profile.mutation_level} objective "
+                                         f"{profile.action_class!r} needs an explicit "
+                                         f"destructive opt-in; none was given")
+    needed = 1 + (1 if profile.oracle and task.oracle_url else 0)
+    if profile.max_completion_requests < needed:
+        return CompletionResult(NOT_ATTEMPTED, action_class=profile.action_class,
+                                 summary=f"the action and its oracle need {needed} request(s); "
+                                         f"the declared ceiling is "
+                                         f"{profile.max_completion_requests}")
     if run_context is None:
         return CompletionResult(POLICY_BLOCKED, action_class=profile.action_class,
                                  summary="objective completion requires a RunContext; "

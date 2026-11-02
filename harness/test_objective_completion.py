@@ -150,7 +150,7 @@ class ObjectiveNotAttemptedTests(unittest.TestCase):
 
     def test_not_attempted_unless_already_confirmed(self):
         unconfirmed = ValidationResult("ssti", "not_confirmed", "ssti", confirmed=False)
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt",
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt",
                              oracle_url="http://t.test/status?file=/tmp/disposable.txt")
         r = asyncio.run(attempt_completion(task, _finding(), _exchange(), unconfirmed,
                                            run_context=_ctx()))
@@ -175,7 +175,7 @@ class ObjectiveNotAttemptedTests(unittest.TestCase):
 class ObjectiveCompletionPositiveTests(unittest.TestCase):
     def test_completes_and_independent_oracle_confirms_deletion(self):
         fixture = _FakeFixture(vulnerable=True)
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt",
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt",
                              oracle_url="http://t.test/status?file=/tmp/disposable.txt")
         ctx = _ctx()
         with patch("httpx.AsyncClient.request", fixture):
@@ -187,7 +187,7 @@ class ObjectiveCompletionPositiveTests(unittest.TestCase):
 
     def test_llm_proposal_outside_contract_is_rejected_and_fallback_used(self):
         fixture = _FakeFixture(vulnerable=True)
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt",
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt",
                              oracle_url="http://t.test/status?file=/tmp/disposable.txt")
 
         class _RogueProvider:
@@ -207,7 +207,7 @@ class ObjectiveCompletionPositiveTests(unittest.TestCase):
 
     def test_llm_proposal_matching_contract_is_used_verbatim(self):
         fixture = _FakeFixture(vulnerable=True)
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt",
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt",
                              oracle_url="http://t.test/status?file=/tmp/disposable.txt")
 
         class _GoodProvider:
@@ -231,7 +231,7 @@ class ObjectiveFixedControlTests(unittest.TestCase):
         # still exercise completion directly to prove it cannot be tricked
         # into "completed" by a template that only echoes the payload.
         fixture = _FakeFixture(vulnerable=False)
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt",
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt",
                              oracle_url="http://t.test/status?file=/tmp/disposable.txt")
         ctx = _ctx()
         with patch("httpx.AsyncClient.request", fixture):
@@ -244,7 +244,7 @@ class ObjectiveFixedControlTests(unittest.TestCase):
 class ObjectivePolicyGateTests(unittest.TestCase):
     def test_zero_budget_blocks_and_preserves_file(self):
         fixture = _FakeFixture(vulnerable=True)
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt",
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt",
                              oracle_url="http://t.test/status?file=/tmp/disposable.txt")
         ctx = _ctx(max_requests=0)
         with patch("httpx.AsyncClient.request", fixture):
@@ -257,7 +257,7 @@ class ObjectivePolicyGateTests(unittest.TestCase):
 
     def test_mutating_replay_not_authorized_blocks(self):
         fixture = _FakeFixture(vulnerable=True)
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt",
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt",
                              oracle_url="http://t.test/status?file=/tmp/disposable.txt")
         ctx = _ctx(allow_mutating=False)
         with patch("httpx.AsyncClient.request", fixture) as send:
@@ -267,7 +267,7 @@ class ObjectivePolicyGateTests(unittest.TestCase):
         self.assertIn("/tmp/disposable.txt", fixture.files)
 
     def test_no_run_context_blocks(self):
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt")
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt")
         r = asyncio.run(attempt_completion(task, _finding(), _exchange(), _confirmed(),
                                            run_context=None))
         self.assertEqual(r.status, POLICY_BLOCKED)
@@ -279,8 +279,8 @@ class DestructiveObjectiveNotAttemptedTests(unittest.TestCase):
     above -- pinned here as one explicit, named reference point:
 
       - no task declared at all (the runner's committed default, per
-        `testing/run_web_objective_smoke.py`, which never passes
-        `objective_task`) -> `ObjectiveNotAttemptedTests.test_no_task_never_attempted`
+        `testing/run_web_objective_smoke.py`, which passes none unless
+        `--objective-profile` is given) -> `ObjectiveNotAttemptedTests.test_no_task_never_attempted`
         returns NOT_ATTEMPTED and never sends anything;
       - a destructive SSTI_FILE_DELETE task IS declared but
         `validators.allow_mutating_replay` is off ->
@@ -296,7 +296,7 @@ class DestructiveObjectiveNotAttemptedTests(unittest.TestCase):
 
     def test_declared_destructive_task_without_opt_in_never_completes(self):
         fixture = _FakeFixture(vulnerable=True)
-        task = ObjectiveTask(profile=SSTI_FILE_DELETE, target_path="/tmp/disposable.txt",
+        task = ObjectiveTask(profile=SSTI_FILE_DELETE, destructive_opt_in=True, target_path="/tmp/disposable.txt",
                              oracle_url="http://t.test/status?file=/tmp/disposable.txt")
         ctx = _ctx(allow_mutating=False)
         with patch("httpx.AsyncClient.request", fixture):

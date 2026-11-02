@@ -1,0 +1,8 @@
+label=py312 python=/c/Users/arthu/Documents/AgenticVibe/.venv-rationalisation/Scripts/python.exe head=5c9c086 started=2026-11-02T20:15:20+01:00
+Python 3.12.14
+precondition=0
+new_tests=0
+smoke=0
+full=0
+diff_check=0
+finished=2026-11-02T21:18:08+01:00

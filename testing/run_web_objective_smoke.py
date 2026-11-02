@@ -76,6 +76,39 @@ def _findings(result: dict) -> list[dict]:
     return findings
 
 
+def _objective_declaration(spec: str | None):
+    """LB-6: the typed objective profile from `--objective-profile` (a JSON file
+    path or an inline JSON object), or None when the run declares no objective."""
+    if not spec:
+        return None
+    from harness.objective_profiles import ObjectiveDeclaration
+    text = spec if spec.lstrip().startswith("{") else Path(spec).read_text(encoding="utf-8")
+    try:
+        return ObjectiveDeclaration.from_mapping(json.loads(text))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid --objective-profile: {exc}") from exc
+
+
+def _objective_summary(result: dict, declaration, task) -> dict:
+    """The run's objective outcome. `objective_not_attempted` unless the
+    completion stage itself reported a status for a declared objective."""
+    from harness.objective_completion import NOT_ATTEMPTED
+    summary = {"declared": declaration.describe() if declaration else None,
+               "destructive_opt_in": bool(getattr(task, "destructive_opt_in", False)),
+               "status": NOT_ATTEMPTED,
+               "summary": ("no objective declared for this run" if declaration is None
+                           else "no confirmed finding reached the objective stage")}
+    for outcome in (result or {}).get("outcomes", []) or []:
+        completion = outcome.get("objective_completion")
+        if isinstance(completion, dict):
+            summary["status"] = completion.get("status") or NOT_ATTEMPTED
+            summary["summary"] = completion.get("summary", "")
+            summary["requests_used"] = completion.get("requests_used", 0)
+            summary["path"] = outcome.get("path")
+            break
+    return summary
+
+
 def _login_form_data(html: str, page_url: str, username: str, password: str
                      ) -> tuple[str | None, str, dict]:
     """Pure part of the login flow: from a login page, pick the form that has a
@@ -228,6 +261,17 @@ async def _run(args: argparse.Namespace) -> int:
     host = urlsplit(target).hostname or ""
     if not host:
         raise SystemExit("target must include a URL hostname")
+    declaration = _objective_declaration(args.objective_profile)
+    objective_class = args.objective_class
+    if declaration is not None:
+        declared_class = declaration.profile.vulnerability_class
+        if objective_class and objective_class != declared_class:
+            raise SystemExit(f"--objective-class {objective_class!r} does not match the "
+                             f"objective profile's class {declared_class!r}")
+        objective_class = declared_class
+    objective_class = objective_class or "sqli"
+    objective_task = (declaration.to_task(allow_destructive=args.allow_destructive_objective)
+                      if declaration is not None else None)
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     run_id = args.run_id or f"smoke-{uuid.uuid4().hex[:12]}"
@@ -292,6 +336,7 @@ async def _run(args: argparse.Namespace) -> int:
         max_requests=args.max_requests,
         config=config,
         timeout=args.request_timeout,
+        objective_task=objective_task,
     )
     status = "done"
     error = None
@@ -312,7 +357,7 @@ async def _run(args: argparse.Namespace) -> int:
                     max_chain_rounds=0,
                     run_context=ctx,
                     stop_on_confirm=True,
-                    objective_class=args.objective_class,
+                    objective_class=objective_class,
                     seed_exchanges=seed_exchanges,
                 )
             )
@@ -368,6 +413,7 @@ async def _run(args: argparse.Namespace) -> int:
         "config_hash": hashlib.sha256(config_json.encode()).hexdigest(),
         "auth": auth_info,
         "findings": _findings(result),
+        "objective": _objective_summary(result, declaration, objective_task),
         "result": result,
     }
     (output / "attempt.json").write_text(
@@ -380,6 +426,7 @@ async def _run(args: argparse.Namespace) -> int:
         "duration_seconds": artifact["duration_seconds"],
         "requests": artifact["requests"],
         "findings": len(artifact["findings"]),
+        "objective_status": artifact["objective"]["status"],
         "degraded": bool(result.get("degraded")),
         "output": str(output / "attempt.json"),
         "error": error,
@@ -405,7 +452,17 @@ def main() -> int:
     parser.add_argument("--max-requests", type=int, default=1200)
     parser.add_argument("--request-timeout", type=float, default=15.0)
     parser.add_argument("--wall-timeout", type=float, default=900.0)
-    parser.add_argument("--objective-class", default="sqli")
+    parser.add_argument("--objective-class", default=None,
+                        help="Vulnerability class to confirm (default sqli, or the "
+                             "--objective-profile's class).")
+    parser.add_argument("--objective-profile", default=None,
+                        help="Typed objective profile (JSON file or inline JSON): profile, "
+                             "required_end_state {target_path, oracle_url, oracle_marker}, "
+                             "action_class, mutation_level, oracle, ceilings. Without it the "
+                             "objective is reported objective_not_attempted.")
+    parser.add_argument("--allow-destructive-objective", action="store_true",
+                        help="Explicit opt-in for a destructive objective profile. Without "
+                             "it a destructive objective returns objective_not_attempted.")
     parser.add_argument("--auth", default=None,
                         help="USER:PASS to establish an authenticated session via the "
                              "app's own login form before the attempt (e.g. wiener:peter).")

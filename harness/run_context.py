@@ -1250,11 +1250,17 @@ class RunContext:
     # E7: the run's durable journal of finished units (run_journal.RunJournal), set by the
     # server when runs.journal is on; None means the run is not journaled or resumed.
     run_journal: object = field(default=None, repr=False, compare=False)
+    # LB-6: the run's caller-declared objective (objective_profiles.ObjectiveTask),
+    # or None, which means objective completion is never attempted. Set only by
+    # the code that creates the run (a benchmark runner, a test), never by a model
+    # or from observed content.
+    objective_task: object = field(default=None, repr=False, compare=False)
 
     @classmethod
     def create(cls, *, run_id: str | None = None, allowed_hosts=None, gate_config: dict | None = None,
                gate: "SafetyGate | None" = None, max_requests: int | None = None,
-               config: dict | None = None, timeout: float = 15.0) -> "RunContext":
+               config: dict | None = None, timeout: float = 15.0,
+               objective_task=None) -> "RunContext":
         # A FRESH gate per run (never the process-global default) -- the #3 isolation
         # fix: authorization state is per run, so two runs cannot contaminate each
         # other's mutation budgets or audit log. Pass `gate` to reuse an existing
@@ -1284,7 +1290,8 @@ class RunContext:
             address_pins=_address_pins_from_config(config_snapshot),
             target_policy=target_policy,
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
-                             if configured_namespace else resolved_run_id), timeout=timeout)
+                             if configured_namespace else resolved_run_id), timeout=timeout,
+            objective_task=objective_task)
 
     def default_client(self, *, destination: str | None = None) -> httpx.AsyncClient:
         profile = self.tls_policy.profile_for(destination)

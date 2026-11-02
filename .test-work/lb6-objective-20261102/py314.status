@@ -1,0 +1,8 @@
+label=py314 python=/c/Users/arthu/AppData/Local/Python/pythoncore-3.14-64/python.exe head=5c9c086 started=2026-11-02T20:15:20+01:00
+Python 3.14.7
+precondition=0
+new_tests=0
+smoke=0
+full=0
+diff_check=0
+finished=2026-11-02T21:19:51+01:00

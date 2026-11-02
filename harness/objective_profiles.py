@@ -16,7 +16,15 @@ explicit `target_path`. `objective_completion.attempt_completion` must return
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+# How much an objective's action may change the target. A DESTRUCTIVE objective
+# is never attempted unless the run's caller opted in explicitly
+# (`ObjectiveTask.destructive_opt_in`), even when the safety gate itself would
+# authorize the mutating send.
+READ_ONLY = "read_only"
+DESTRUCTIVE = "destructive"
+MUTATION_LEVELS = (READ_ONLY, DESTRUCTIVE)
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,7 @@ class ObjectiveProfile:
     oracle: str = ""
     max_completion_requests: int = 2
     requires_mutating_authorization: bool = True
+    mutation_level: str = DESTRUCTIVE
 
 
 # SSTI's declared destructive objective: delete a caller-named disposable
@@ -68,11 +77,19 @@ ACCESS_ADMIN_READ = ObjectiveProfile(
     action_class="http_get",
     oracle="content_present",
     requires_mutating_authorization=False,
+    mutation_level=READ_ONLY,
 )
 
 _REGISTRY: dict[str, ObjectiveProfile] = {
     SSTI_FILE_DELETE.vulnerability_class: SSTI_FILE_DELETE,
     ACCESS_ADMIN_READ.vulnerability_class: ACCESS_ADMIN_READ,
+}
+
+
+# Names a runner/benchmark declaration may use to pick a registered profile.
+PROFILES_BY_NAME: dict[str, ObjectiveProfile] = {
+    "ssti_file_delete": SSTI_FILE_DELETE,
+    "access_admin_read": ACCESS_ADMIN_READ,
 }
 
 
@@ -108,3 +125,84 @@ class ObjectiveTask:
     # HTTP 200 check on its own (still never trusting the action send's own
     # response body).
     oracle_marker: str = ""
+    # The caller's explicit opt-in for a DESTRUCTIVE profile. Off by default:
+    # without it `attempt_completion` returns `objective_not_attempted` before
+    # anything is sent.
+    destructive_opt_in: bool = False
+
+
+@dataclass(frozen=True)
+class ObjectiveDeclaration:
+    """LB-6: the typed objective profile a benchmark/smoke runner accepts.
+
+    Every field restates the registered profile it names, so a declaration can
+    narrow a profile (a lower request ceiling) but never widen it: a different
+    action class, mutation level or oracle adapter is rejected, not honoured.
+    The declared end state (`target_path`, `oracle_url`, `oracle_marker`) is the
+    only run-specific data. `to_task` turns it into the `ObjectiveTask` the run
+    carries on its `RunContext`."""
+
+    profile_name: str
+    target_path: str
+    action_class: str
+    mutation_level: str
+    oracle: str
+    oracle_url: str = ""
+    oracle_marker: str = ""
+    max_completion_requests: int = 2
+
+    @property
+    def profile(self) -> ObjectiveProfile:
+        return PROFILES_BY_NAME[self.profile_name]
+
+    @classmethod
+    def from_mapping(cls, data: dict) -> "ObjectiveDeclaration":
+        if not isinstance(data, dict):
+            raise ValueError("objective profile must be a JSON object")
+        name = str(data.get("profile") or "").strip().lower()
+        profile = PROFILES_BY_NAME.get(name)
+        if profile is None:
+            raise ValueError(f"unknown objective profile {name!r}; registered: "
+                             f"{sorted(PROFILES_BY_NAME)}")
+        end_state = data.get("required_end_state") or {}
+        if not isinstance(end_state, dict):
+            raise ValueError("required_end_state must be an object")
+        target_path = str(end_state.get("target_path") or "").strip()
+        if not target_path:
+            raise ValueError("required_end_state.target_path is required")
+        declared = {
+            "action_class": str(data.get("action_class") or ""),
+            "mutation_level": str(data.get("mutation_level") or ""),
+            "oracle": str(data.get("oracle") or ""),
+        }
+        for key, value in declared.items():
+            if value != getattr(profile, key):
+                raise ValueError(f"objective profile {name!r} has {key} "
+                                 f"{getattr(profile, key)!r}; the declaration says {value!r}")
+        ceilings = data.get("ceilings") or {}
+        if not isinstance(ceilings, dict):
+            raise ValueError("ceilings must be an object")
+        ceiling = ceilings.get("max_completion_requests", profile.max_completion_requests)
+        if (isinstance(ceiling, bool) or not isinstance(ceiling, int)
+                or not 1 <= ceiling <= profile.max_completion_requests):
+            raise ValueError(f"ceilings.max_completion_requests must be an integer from 1 "
+                             f"to {profile.max_completion_requests}")
+        return cls(profile_name=name, target_path=target_path,
+                   oracle_url=str(end_state.get("oracle_url") or ""),
+                   oracle_marker=str(end_state.get("oracle_marker") or ""),
+                   max_completion_requests=ceiling, **declared)
+
+    def to_task(self, *, allow_destructive: bool = False) -> ObjectiveTask:
+        profile = replace(self.profile, max_completion_requests=self.max_completion_requests)
+        return ObjectiveTask(
+            profile=profile, target_path=self.target_path, oracle_url=self.oracle_url,
+            oracle_marker=self.oracle_marker,
+            destructive_opt_in=bool(allow_destructive) and self.mutation_level == DESTRUCTIVE)
+
+    def describe(self) -> dict:
+        return {"profile": self.profile_name,
+                "vulnerability_class": self.profile.vulnerability_class,
+                "action_class": self.action_class, "mutation_level": self.mutation_level,
+                "oracle": self.oracle, "target_path": self.target_path,
+                "oracle_url": self.oracle_url,
+                "max_completion_requests": self.max_completion_requests}

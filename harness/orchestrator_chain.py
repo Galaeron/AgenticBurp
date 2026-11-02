@@ -954,6 +954,10 @@ class ChainMixin:
         from harness import engagement_builder
         from harness import worklist_investigator
         from harness import chain_linker
+        # LB-6: a runner declares its objective on the RunContext it owns; an
+        # explicit `objective_task` argument still takes precedence.
+        if objective_task is None and run_context is not None:
+            objective_task = getattr(run_context, "objective_task", None)
         from harness import role_crawl
         from harness.instrumentation import RunInstrumentation
         from harness.assessment_health import new_review_stats
