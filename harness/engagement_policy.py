@@ -31,6 +31,15 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 
 
+def _field_cap(value) -> int:
+    """engagement.coverage_parameter_field_cap, strictly: a real nonnegative
+    integer (no bool, float or quoted number), like the run ceiling."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("engagement.coverage_parameter_field_cap must be a nonnegative "
+                         f"integer, got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class EngagementPolicy:
     """Active/engagement toggles read by Orchestrator.__init__.
@@ -62,6 +71,9 @@ class EngagementPolicy:
     coverage_leg_budget: int = 80
     engagement_coverage_case_drive: bool = False
     coverage_case_budget: int = 8
+    # Per-parameter dispatch field cap (added after the refactor). The default
+    # equals injection_targets.PER_PARAMETER_FIELD_CAP, the former constant.
+    coverage_parameter_field_cap: int = 6
     # Capture review bounds (added after the refactor). The defaults keep the
     # former hard-coded 200-review cap and add no time bound.
     capture_review_limit: int = 200
@@ -99,6 +111,7 @@ class EngagementPolicy:
                 eng_cfg.get("coverage_drive_cases", False)
             ),
             coverage_case_budget=int(eng_cfg.get("coverage_case_budget", 8)),
+            coverage_parameter_field_cap=_field_cap(eng_cfg.get("coverage_parameter_field_cap", 6)),
             capture_review_limit=int(eng_cfg.get("capture_review_limit", 200)),
             capture_review_seconds=float(eng_cfg.get("capture_review_seconds", 0)),
             coverage_request_reserve=int(eng_cfg.get("coverage_request_reserve", 0)),

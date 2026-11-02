@@ -2407,6 +2407,7 @@ class ChainMixin:
                     coverage = await coverage_tracker.build_coverage_cases_driven(
                         state, roles, _run_leg_core, budget=self.coverage_leg_budget, readiness=_captured_readiness,
                         per_cell_case_budget=self.coverage_case_budget,
+                        parameter_field_cap=self.coverage_parameter_field_cap,
                         driveable=set(_val_by_conf.keys()), investigated_keys=investigated_keys,
                         checkpoint=coverage_checkpoint,
                         context_key=coverage_tracker.resume_context_key(self.config),

@@ -110,7 +110,7 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
         store._DB_PATH, cache._cache = cls._orig_store_db, cls._orig_cache
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
-    def _run(self, path, body, case_budget=8):
+    def _run(self, path, body, case_budget=8, engagement_cfg=None, disable=()):
         base = self.base
 
         def canned(base_url, roles, **kw):
@@ -128,7 +128,11 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
             return state, SimpleNamespace(auth_bypass_candidates=[], idor_candidates=[],
                                           idor_findings=[])
 
-        orch = Orchestrator(_config())
+        cfg = _config()
+        cfg["engagement"].update(engagement_cfg or {})
+        for name in disable:
+            cfg["validators"].setdefault(name, {})["enabled"] = False
+        orch = Orchestrator(cfg)
         orch.engagement_coverage_drive = True
         orch.engagement_coverage_case_drive = True
         orch.coverage_case_budget = case_budget
@@ -143,6 +147,7 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
         key = lambda check: ("anonymous", f"POST {path}", check)  # noqa: E731
         cases = lambda check: {ck.parameter_name: r for ck, r in  # noqa: E731
                                matrix.cases_for_cell(*key(check))}
+        self.coverage = coverage
         return matrix, key, cases
 
     def test_vulnerable_parameter_confirmed_beside_clean_one(self):
@@ -183,6 +188,71 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
             self.assertFalse(redirect[name].executed)
         # SSTI on the same endpoint is per parameter.
         self.assertEqual(cases(SSTI)["a"].status, CellStatus.NOT_DETECTED)
+
+    # -- engagement.coverage_parameter_field_cap, read from the config
+    def _field_cap_run(self):
+        return self._run("/echo", "a=1&b=2", engagement_cfg={"coverage_parameter_field_cap": 1},
+                         disable=("open_redirect",))
+
+    def test_configured_field_cap_bounds_the_parameters_dispatched(self):
+        matrix, key, cases = self._field_cap_run()
+        ssti = cases(SSTI)
+        self.assertEqual(ssti["a"].status, CellStatus.NOT_DETECTED, ssti["a"].reason)
+        # Over the configured cap: not dispatched alone, never a clean negative;
+        # the request-level attempt covers it and leaves it inconclusive.
+        self.assertEqual(ssti["b"].status, CellStatus.INCONCLUSIVE)
+        self.assertFalse(ssti["b"].executed)
+        self.assertTrue(ssti[""].executed)
+        self.assertEqual(self.coverage["cases_driven"], 2)    # `a`, then request level
+        self.assertNotEqual(matrix.get(*key(SSTI)).status, CellStatus.NOT_DETECTED)
+
+    def test_control_a_drive_ignoring_the_configured_cap_concludes_both(self):
+        """Defect injection: a caller that drops the configured cap (the former
+        constant of 6 applies) dispatches `b` too, so the test above sees it."""
+        from harness import coverage_tracker
+        original = coverage_tracker.build_coverage_cases_driven
+
+        async def ignores_cap(*args, parameter_field_cap=None, **kwargs):
+            return await original(*args, **kwargs)
+
+        with patch.object(coverage_tracker, "build_coverage_cases_driven", ignores_cap):
+            _matrix, _key, cases = self._field_cap_run()
+        self.assertEqual(cases(SSTI)["b"].status, CellStatus.NOT_DETECTED)
+
+    # -- engagement.coverage_leg_budget counts per dispatch
+    def _leg_budget_run(self):
+        return self._run("/echo", "a=1&b=2", engagement_cfg={"coverage_leg_budget": 1},
+                         disable=("open_redirect",))
+
+    def test_leg_budget_counts_each_parameter_dispatch(self):
+        matrix, key, cases = self._leg_budget_run()
+        ssti = cases(SSTI)
+        self.assertEqual(self.coverage["cases_driven"], 1)
+        self.assertEqual(self.coverage["drive_stopped_by"], "leg budget")
+        self.assertEqual(ssti["a"].status, CellStatus.NOT_DETECTED, ssti["a"].reason)
+        # The one unit went to `a`: `b` and the request-level attempt are not sent.
+        self.assertEqual(ssti["b"].status, CellStatus.INCONCLUSIVE)
+        self.assertIn("leg budget", ssti["b"].reason)
+        self.assertFalse(ssti["b"].executed)
+        self.assertFalse(ssti[""].executed)
+        self.assertNotEqual(matrix.get(*key(SSTI)).status, CellStatus.NOT_DETECTED)
+
+    def test_control_a_budget_counted_per_cell_dispatches_both(self):
+        """Defect injection: counting one unit per cell lets a budget of 1 dispatch
+        every parameter of the cell, so the test above sees it."""
+        from harness.coverage_tracker import CoverageTracker
+        original = CoverageTracker._drive_parameter_cases
+
+        async def per_cell(self, run_case, ident, ep_key, check, cks, rep, targets, deadline,
+                           remaining, field_cap):
+            await original(self, run_case, ident, ep_key, check, cks, rep, targets, deadline,
+                           10**6, field_cap)
+            return 1
+
+        with patch.object(CoverageTracker, "_drive_parameter_cases", per_cell):
+            _matrix, _key, cases = self._leg_budget_run()
+        self.assertEqual(cases(SSTI)["b"].status, CellStatus.NOT_DETECTED)
+        self.assertEqual(self.coverage["cases_driven"], 1)
 
 
 class SqlmapParameterOnlyTest(unittest.TestCase):

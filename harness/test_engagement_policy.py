@@ -82,7 +82,7 @@ class EnumerationSafeDefaultsTests(unittest.TestCase):
             "engagement_driver_execute", "engagement_max_escalations",
             "engagement_feature_crawl", "engagement_coverage_drive",
             "coverage_leg_budget", "engagement_coverage_case_drive",
-            "coverage_case_budget", "capture_review_limit",
+            "coverage_case_budget", "coverage_parameter_field_cap", "capture_review_limit",
             "capture_review_seconds", "coverage_request_reserve",
             "investigation_seconds", "coverage_drive_seconds",
         }
@@ -117,6 +117,9 @@ class ParityTests(unittest.TestCase):
             coverage_leg_budget=int(eng_cfg.get("coverage_leg_budget", 80)),
             engagement_coverage_case_drive=bool(eng_cfg.get("coverage_drive_cases", False)),
             coverage_case_budget=int(eng_cfg.get("coverage_case_budget", 8)),
+            # Added after the refactor: the former PER_PARAMETER_FIELD_CAP constant
+            # (strictly an int, so no coercion to reproduce).
+            coverage_parameter_field_cap=eng_cfg.get("coverage_parameter_field_cap", 6),
             # Added after the refactor: the former hard-coded 200-review cap,
             # and no review time bound unless configured.
             capture_review_limit=int(eng_cfg.get("capture_review_limit", 200)),
@@ -155,6 +158,7 @@ class ParityTests(unittest.TestCase):
                 "coverage_leg_budget": 5,
                 "coverage_drive_cases": True,
                 "coverage_case_budget": 3,
+                "coverage_parameter_field_cap": 2,
                 "capture_review_limit": "40",
                 "capture_review_seconds": "1800",
                 "coverage_request_reserve": "1500",
@@ -185,6 +189,29 @@ class ParityTests(unittest.TestCase):
         policy = EngagementPolicy.from_config(config)
         self.assertEqual(policy.as_dict(), self._old_inline_reads(config))
         self.assertFalse(policy.engagement_auto_escalate)
+
+
+class ParameterFieldCapTests(unittest.TestCase):
+    """engagement.coverage_parameter_field_cap: the committed default keeps the
+    former constant, and anything but a real nonnegative integer is refused."""
+
+    def test_committed_default_is_the_former_constant(self):
+        from harness.validators.injection_targets import PER_PARAMETER_FIELD_CAP
+        committed = EngagementPolicy.from_config(_load_committed_config())
+        self.assertEqual(committed.coverage_parameter_field_cap, PER_PARAMETER_FIELD_CAP)
+        self.assertEqual(EngagementPolicy.from_config({}).coverage_parameter_field_cap,
+                         PER_PARAMETER_FIELD_CAP)
+
+    def test_nonnegative_integer_is_kept(self):
+        for value in (0, 1, 12):
+            policy = EngagementPolicy.from_config(
+                {"engagement": {"coverage_parameter_field_cap": value}})
+            self.assertEqual(policy.coverage_parameter_field_cap, value)
+
+    def test_anything_else_is_refused(self):
+        for value in (True, False, -1, 2.0, "3", None, [3]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                EngagementPolicy.from_config({"engagement": {"coverage_parameter_field_cap": value}})
 
 
 class OverridePrecedenceTests(unittest.TestCase):

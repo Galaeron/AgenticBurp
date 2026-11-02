@@ -360,6 +360,8 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         # (finer fan-out = more leg traffic); bounded per cell by coverage_case_budget.
         self.engagement_coverage_case_drive = self.engagement_policy.engagement_coverage_case_drive
         self.coverage_case_budget = self.engagement_policy.coverage_case_budget
+        # How many parameters of one cell the case drive dispatches one by one.
+        self.coverage_parameter_field_cap = self.engagement_policy.coverage_parameter_field_cap
         # Capture review runs before chaining and coverage driving; these bound it
         # by count and by wall-clock seconds (0 = unbounded) so the later stages
         # are reached. Unreviewed captures are reported as truncation.

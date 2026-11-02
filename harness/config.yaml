@@ -312,6 +312,12 @@ engagement:
   # validators.active_enabled + scope; mutating legs also by allow_mutating_replay.
   coverage_drive_legs: false
   coverage_leg_budget: 80
+  # Case-granular driving (coverage_drive_cases) dispatches ssti, command injection
+  # and sqlmap once per parameter; coverage_parameter_field_cap caps how many
+  # parameters of one cell are dispatched that way (the rest stay inconclusive and
+  # get the request-level attempt). Each dispatch spends one coverage_leg_budget
+  # unit. A nonnegative integer; 0 keeps every cell request-level.
+  coverage_parameter_field_cap: 6
   # Full model review of the exchanges an engagement captured runs, one capture at
   # a time, before chaining and coverage driving. capture_review_limit caps how many
   # captures it reviews; capture_review_seconds (0 = no time bound) caps how long the
