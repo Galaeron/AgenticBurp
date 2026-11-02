@@ -4395,3 +4395,6 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
 - **Domain:** Evaluation · **Effort:** L · **Depends on:** all prior batches incl. AR-09 ·
   **Mode:** LOOP for the spec; OWNER/LIVE for any target run or model A/B (each needs its own
   execution task). Spec: "Batch 10" in IMPLEMENTATION_TASK.md.
+- **Spec:** [docs/AR10_INTEGRATED_ACCEPTANCE_SPEC.md](docs/AR10_INTEGRATED_ACCEPTANCE_SPEC.md)
+  (2026-11-02, 2081d70). Open: merge + frozen offline acceptance (part A), prerequisites P1–P3,
+  and the OWNER/LIVE live run and model A/B (parts B, C).
