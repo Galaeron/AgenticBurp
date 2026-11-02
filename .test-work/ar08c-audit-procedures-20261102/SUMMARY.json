@@ -1,0 +1,147 @@
+{
+  "revision": "ff6f7a0782540360771307cf36c9b40226187df7",
+  "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "runs": [
+    {
+      "label": "py314",
+      "stage": "precondition",
+      "identity": [
+        "3.14.7",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\__init__.py"
+      ],
+      "exit_code": 0,
+      "seconds": 2.2,
+      "counts": [
+        "Ran 74 tests in 0.939s",
+        "OK"
+      ],
+      "failures": [],
+      "source_unchanged": true
+    },
+    {
+      "label": "py314",
+      "stage": "smoke",
+      "identity": [
+        "3.14.7",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\__init__.py"
+      ],
+      "exit_code": 0,
+      "seconds": 117.5,
+      "counts": [
+        "Ran 149 tests in 115.078s",
+        "OK"
+      ],
+      "failures": [],
+      "source_unchanged": true
+    },
+    {
+      "label": "py314",
+      "stage": "audit",
+      "identity": [
+        "3.14.7",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\__init__.py"
+      ],
+      "exit_code": 0,
+      "seconds": 6.0,
+      "counts": [
+        "Ran 14 tests in 5.610s",
+        "OK"
+      ],
+      "failures": [],
+      "source_unchanged": true
+    },
+    {
+      "label": "py314",
+      "stage": "full",
+      "identity": [
+        "3.14.7",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\__init__.py"
+      ],
+      "exit_code": 0,
+      "seconds": 2731.8,
+      "counts": [
+        "Ran 5014 tests in 2661.827s",
+        "OK",
+        "OK   C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\workflow_pack_data\\bola_order_approve.pack.json",
+        "38 passed in 3.72s",
+        "Ran 440 tests in 44.461s",
+        "OK (skipped=17)",
+        "Ran 59 tests in 0.197s",
+        "OK"
+      ],
+      "failures": [],
+      "source_unchanged": true
+    },
+    {
+      "label": "py312",
+      "stage": "precondition",
+      "identity": [
+        "3.12.14",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\__init__.py"
+      ],
+      "exit_code": 0,
+      "seconds": 2.1,
+      "counts": [
+        "Ran 74 tests in 1.039s",
+        "OK"
+      ],
+      "failures": [],
+      "source_unchanged": true
+    },
+    {
+      "label": "py312",
+      "stage": "smoke",
+      "identity": [
+        "3.12.14",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\__init__.py"
+      ],
+      "exit_code": 0,
+      "seconds": 116.2,
+      "counts": [
+        "Ran 149 tests in 114.117s",
+        "OK"
+      ],
+      "failures": [],
+      "source_unchanged": true
+    },
+    {
+      "label": "py312",
+      "stage": "audit",
+      "identity": [
+        "3.12.14",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\__init__.py"
+      ],
+      "exit_code": 0,
+      "seconds": 5.8,
+      "counts": [
+        "Ran 14 tests in 5.471s",
+        "OK"
+      ],
+      "failures": [],
+      "source_unchanged": true
+    },
+    {
+      "label": "py312",
+      "stage": "full",
+      "identity": [
+        "3.12.14",
+        "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\__init__.py"
+      ],
+      "exit_code": 0,
+      "seconds": 2820.5,
+      "counts": [
+        "Ran 5014 tests in 2751.443s",
+        "OK",
+        "OK   C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\ar-08c-audit-procedures-8c425b\\harness\\workflow_pack_data\\bola_order_approve.pack.json",
+        "38 passed in 2.63s",
+        "Ran 440 tests in 44.538s",
+        "OK (skipped=17)",
+        "Ran 59 tests in 0.143s",
+        "OK"
+      ],
+      "failures": [],
+      "source_unchanged": true
+    }
+  ],
+  "status": "all gates passed"
+}
