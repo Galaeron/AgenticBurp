@@ -143,12 +143,14 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
              match_codes: str = "all", filter_codes: str = "404",
              auto_calibrate: bool = True, cancel=None) -> FfufResult:
     """Run ffuf in a container and return parsed routes.  Synchronous (blocks).
-    I05-C: `cancel` stops a running container (see tool_runner.run)."""
+    I05-C: `cancel` stops a running container (see tool_runner.run). SC-9: the run
+    goes through a ToolBroker, so an unboundable image/timeout launches nothing."""
     args = build_args(target_url, wordlist=wordlist, threads=threads,
                       headers=headers, match_codes=match_codes,
                       filter_codes=filter_codes, auto_calibrate=auto_calibrate)
     try:
-        rc, stdout, stderr = tool_runner.run(image, args, timeout=timeout, cancel=cancel)
+        broker = tool_runner.ToolBroker(image=image, timeout=timeout)
+        rc, stdout, stderr = broker.run(args, cancel=cancel)
     except tool_runner.ToolCleanupFailed:
         raise   # a container that may still run is not an ordinary ffuf error
     except Exception as e:

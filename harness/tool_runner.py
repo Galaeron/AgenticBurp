@@ -318,6 +318,37 @@ class EgressPolicy:
         return {"network": self.network, "proxy": self.proxy_url,
                 "allowed_hosts": list(self.allowed_hosts)}
 
+    def confinement(self) -> dict:
+        """What this policy actually constrains, stated without overclaiming (SC-9).
+
+        Proxy variables are advisory: a tool may ignore HTTP(S)_PROXY or open raw
+        sockets, and ``allowed_hosts`` lands in NO_PROXY -- hosts that BYPASS the
+        proxy, not a firewall allowlist. Nothing here enforces a destination, and
+        even ``--network none`` is docker's claim until the OWNER/LIVE NC-O1 proof
+        runs against a real container."""
+        if self.network == "none":
+            mode = "no_network"
+        elif self.proxy_url:
+            mode = "advisory_proxy_env"
+        else:
+            mode = "unconfined"
+        if not self.allowed_hosts:
+            hosts_role = "none"
+        elif self.proxy_url and self.network != "none":
+            hosts_role = "no_proxy_bypass"
+        else:
+            hosts_role = "declared_only"
+        return {"mode": mode, "destinations_enforced": False,
+                "allowed_hosts_role": hosts_role, "proven": False}
+
+
+def _egress_confinement(egress: "EgressPolicy | None") -> dict:
+    """The receipt's confinement record; a run without a policy is unconfined."""
+    if egress is None:
+        return {"mode": "unconfined", "destinations_enforced": False,
+                "allowed_hosts_role": "none", "proven": False}
+    return egress.confinement()
+
 
 def _is_cancelled(cancel) -> bool:
     """Normalise the accepted cancel-signal shapes -- an ``asyncio.Event``, a
@@ -950,12 +981,14 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
             "argv": list(cmd),
             "egress_applied": egress is not None,
             "egress": (egress.describe() if egress is not None else None),
+            "egress_confinement": _egress_confinement(egress),
             "outcome": "launching",
         })
     if _is_cancelled(cancel):
         _force_remove(name)   # nothing launched, but stay safe if a race left one
         if receipt is not None:
             receipt["outcome"] = "cancelled_before_launch"
+            receipt["container_cleanup"] = "not_launched"
         _record_lifecycle(image, "cancelled_before_launch", started_wall, started, None, receipt)
         raise ToolRunCancelled(f"tool run cancelled before launch: {image!r}")
     try:
@@ -973,6 +1006,8 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
                 receipt.update(partial.receipt_fields())
         # the hung/killed workload must not outlive its client
         removed = _force_remove(name)
+        if receipt is not None:
+            receipt["container_cleanup"] = "force_removed" if removed else "cleanup_failed"
         _record_lifecycle(image, outcome if removed else "cleanup_failed", started_wall, started,
                           None, receipt)
         if not removed:
@@ -988,6 +1023,128 @@ def run(image: str, args: list[str], *, timeout: float = 120.0,
     if receipt is not None:
         receipt["outcome"] = f"exit={result.returncode}"
         receipt.update(result.receipt_fields())
+        # the container's own exit runs `--rm`; that removal is not re-checked here
+        receipt["container_cleanup"] = "rm_on_exit_unverified"
     _record_lifecycle(image, f"exit={result.returncode}", started_wall, started,
                       result.returncode, receipt)
     return result.returncode, (result.stdout or ""), (result.stderr or "")
+
+
+# ---------------------------------------------------------------------------
+# SC-9: per-tool bounded execution broker
+# ---------------------------------------------------------------------------
+# A ToolBroker is one tool's execution contract, fixed before anything launches:
+# a validated image reference (digest when pinned), a finite timeout, an output
+# cap and a network policy. Anything the broker cannot bound -- host networking,
+# a privileged or mounted container, a docker flag that would replace the owned
+# container name -- is rejected at construction, so a refused tool never starts.
+# Each run goes through `run` above (owned CLI tree, exact-name container removal
+# on cancel/timeout/error) and its receipt names what the run owned and what the
+# network policy does and does not confine.
+
+MAX_BROKER_TIMEOUT = 6 * 3600.0
+MAX_BROKER_OUTPUT = 16 * 1024 * 1024
+# Extra docker flags that only narrow the hardened sandbox. Anything else that
+# looks like a flag is rejected: an allowlist, because a denylist misses aliases.
+_BROKER_EXTRA_FLAGS = {"--read-only": False, "--tmpfs": True, "--workdir": True,
+                       "-w": True, "--user": True}
+
+
+class ToolBrokerRejected(ValueError):
+    """The broker cannot bound what this tool spec asks for; nothing was launched."""
+
+
+def _check_broker_extra(extra) -> tuple[str, ...]:
+    out: list[str] = []
+    tokens = [str(t) for t in (extra or ())]
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        flag, eq, _ = token.partition("=")
+        if flag not in _BROKER_EXTRA_FLAGS:
+            raise ToolBrokerRejected(f"unsupported docker option {flag!r} for a brokered tool")
+        out.append(token)
+        if _BROKER_EXTRA_FLAGS[flag] and not eq:
+            if i + 1 >= len(tokens):
+                raise ToolBrokerRejected(f"docker option {flag!r} needs a value")
+            out.append(tokens[i + 1])
+            i += 1
+        i += 1
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class ToolBroker:
+    """Bounded execution contract for one containerised tool (SC-9).
+
+    Construction validates every bound and raises ToolBrokerRejected (or
+    ImageReferenceError for the image) before any launch. `run` returns
+    (returncode, stdout, stderr) like `run` above and fills the receipt with a
+    `broker` block (bounds, owned identity, network confinement); an exception
+    leaves that receipt on `exc.receipt`."""
+    image: str
+    timeout: float
+    max_output: int = DEFAULT_MAX_OUTPUT
+    egress: "EgressPolicy | None" = None
+    enforce_egress: bool = False
+    require_digest: bool = False
+    extra: tuple = ()
+
+    def __post_init__(self):
+        image_ref = validate_image_ref(self.image, require_digest=self.require_digest)
+        object.__setattr__(self, "_image_ref", image_ref)
+        if isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float)):
+            raise ToolBrokerRejected(f"timeout must be a number of seconds, not {self.timeout!r}")
+        if not 0 < self.timeout <= MAX_BROKER_TIMEOUT:   # also refuses nan and inf
+            raise ToolBrokerRejected(
+                f"timeout {self.timeout!r} is outside (0, {MAX_BROKER_TIMEOUT:g}] seconds")
+        if (isinstance(self.max_output, bool) or not isinstance(self.max_output, int)
+                or not 0 < self.max_output <= MAX_BROKER_OUTPUT):
+            raise ToolBrokerRejected(
+                f"max_output {self.max_output!r} is outside (0, {MAX_BROKER_OUTPUT}] bytes")
+        if self.egress is not None:
+            network = str(self.egress.network or "")
+            if not network or network == "host" or network.startswith("container:"):
+                raise ToolBrokerRejected(
+                    f"network {network!r} shares a namespace the broker cannot bound")
+        if self.enforce_egress and self.egress is None:
+            raise EgressPolicyRequired(f"refusing to broker {self.image!r}: no egress policy")
+        object.__setattr__(self, "extra", _check_broker_extra(self.extra))
+
+    def describe(self) -> dict:
+        return {"image": self.image, "image_digest": self._image_ref.digest,
+                "pinned": self._image_ref.pinned, "timeout_seconds": float(self.timeout),
+                "max_output_bytes": self.max_output,
+                "network_policy": self.egress.describe() if self.egress is not None else None,
+                "confinement": _egress_confinement(self.egress), "extra": list(self.extra)}
+
+    def run(self, args, *, cancel=None, receipt: dict | None = None) -> tuple[int, str, str]:
+        receipt = {} if receipt is None else receipt
+        receipt["broker"] = self.describe()
+        try:
+            out = run(self.image, [str(a) for a in args], timeout=self.timeout,
+                      extra=list(self.extra), egress=self.egress,
+                      enforce_egress=self.enforce_egress, cancel=cancel, receipt=receipt,
+                      max_output=self.max_output, require_digest=self.require_digest)
+        except BaseException as exc:
+            self._stamp_owned(receipt)
+            try:
+                exc.receipt = receipt
+            except AttributeError:
+                pass
+            raise
+        self._stamp_owned(receipt)
+        return out
+
+    @staticmethod
+    def _stamp_owned(receipt: dict) -> None:
+        """What this run owned and what became of it: the exact container name
+        and the docker CLI process tree (the only things cleanup ever touches)."""
+        receipt["broker"]["owned"] = {
+            "container_name": receipt.get("container_name"),
+            "cli_pid": receipt.get("pid"),
+            "containment": receipt.get("containment"),
+            "process_cleanup": receipt.get("cleanup"),
+            "container_cleanup": receipt.get("container_cleanup"),
+        }
+        receipt["broker"]["outcome"] = receipt.get("outcome")
