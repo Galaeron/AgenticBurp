@@ -3317,7 +3317,21 @@ report polish.
 - **Impact:** Medium-High. Related to (not duplicated by) FR-7.
 - **Source:** REVIEW.md A8.
 
-### [ ] SC-9 — Per-tool bounded execution broker (reinforces PR-11 / NC-O1) (A6)
+### [~] SC-9 — Per-tool bounded execution broker (reinforces PR-11 / NC-O1) (A6)
+- **Progress (2026-11-02, LOOP half, `0102932`, not pushed):** `tool_runner.ToolBroker` fixes image
+  ref/digest, finite timeout (≤6 h), output cap (≤16 MiB) and egress policy before launch; host /
+  `container:` networks and docker options outside a narrowing allowlist are rejected at
+  construction (nothing launches). Runs reuse `run` → `run_process` (I05-C owned tree + exact-name
+  `docker rm -f`); the receipt gains a `broker` block (bounds, owned container name / CLI pid, both
+  cleanup results) and every `run` receipt gains `egress_confinement` (`unconfined` /
+  `advisory_proxy_env` / `no_network`, `destinations_enforced: false`, `proven: false`;
+  `allowed_hosts` reported as a NO_PROXY bypass list). ffuf routes through the broker; sqlmap not
+  yet (PR #11 owns that file). The "cancellation only before execution" evidence above was stale:
+  I05-C already polls cancel mid-run. `harness/test_tool_broker.py` (18): real-subprocess cancel /
+  timeout / output cap / ffuf caller / rejection / receipt honesty + fault injections; source-level
+  removal of `tree.terminate()` or `_force_remove` fails 3 lifecycle tests. Gates exit 0 on venv
+  3.12 and system 3.14 (`.test-work/sc9-broker-20261102/`). Open: malformed-output-inconclusive
+  criterion (validator side), sqlmap routing, NC-O1 live confinement proof (OWNER).
 - **Domain:** Security / Safety · **Effort:** M · **Depends on:** PR-11 · **Mode:** LOOP (offline broker/args); container-confinement proof = OWNER/LIVE (see NC-O1)
 - **Evidence (SUPPORTED — review source-verified; not re-read this session):** `tool_runner.EgressPolicy`
   defaults to Docker's bridge network and places `allowed_hosts` in `NO_PROXY` (not a firewall allowlist);
