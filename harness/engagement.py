@@ -153,13 +153,25 @@ def template_from_exchange(ex) -> dict:
             "path_ids": path_id_values(url)}
 
 
+# Request headers that never say who is calling. Every other header may carry an
+# identity: capture_identity_key hashes them, and the missing-auth probe's anonymous
+# replay drops them (RV-S residual 3).
+PUBLIC_REQUEST_HEADERS = frozenset({
+    "host", "content-type", "content-length", "accept", "accept-encoding",
+    "accept-language", "user-agent", "connection", "referer", "origin",
+    "cache-control", "pragma", "upgrade-insecure-requests"})
+
+
+def is_public_request_header(name) -> bool:
+    """True for a request header that carries no identity (Sec-* included)."""
+    lowered = (name or "").lower()
+    return lowered in PUBLIC_REQUEST_HEADERS or lowered.startswith('sec-')
+
+
 def capture_identity_key(headers) -> str:
     """Match observed credentials without storing another copy in the graph."""
-    public_headers = {"host", "content-type", "content-length", "accept", "accept-encoding",
-                      "accept-language", "user-agent", "connection", "referer", "origin",
-                      "cache-control", "pragma", "upgrade-insecure-requests"}
     credentials = {k.lower(): v for k, v in (headers or {}).items()
-                   if k.lower() not in public_headers and not k.lower().startswith('sec-')}
+                   if not is_public_request_header(k)}
     return hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).hexdigest()
 
 

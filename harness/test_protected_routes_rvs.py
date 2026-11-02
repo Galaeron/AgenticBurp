@@ -325,6 +325,80 @@ class ListedRouteDeniedTests(_ChainCase):
         self._assert_anonymous_then_baseline(server.sent_to("/admin/report"))
 
 
+# ------------------------------------------------------------------ S3c
+class CustomHeaderIdentityTests(_ChainCase):
+    """RV-S residual 2: an identity that authenticates only through a custom header
+    can confirm a listed route. The baseline borrows the identity's own credential
+    headers (the H1 rule, plus any non-public header the identity sets), and the
+    anonymous replay carries none of them. Public headers are never credentials."""
+
+    _ACCEPT = "application/json"
+
+    @staticmethod
+    def _sessions(header):
+        def route(path, headers):
+            if headers.get(header.lower()) == "t-1":
+                return 200, _REPORT
+            return 401, '{"error": "login required"}'
+        return route
+
+    def _assert_custom_anonymous_then_baseline(self, sent, header):
+        self.assertEqual([h.get(header.lower()) for h in sent], [None, "t-1"],
+                         "an anonymous replay, then one authenticated baseline")
+        self.assertFalse({"authorization", "cookie"} & set(sent[0]))
+
+    def test_custom_header_identity_confirms_a_leaking_listed_route(self):
+        for header in ("X-Tenant-Session", "X-Tenant"):
+            for via, run in (("shape", False), ("label", False), ("shape", True)):
+                with self.subTest(header=header, via=via, run_context=run):
+                    found, server = self._run_chain(
+                        _leak, ["/admin/report"], roles=_roles({header: "t-1"}), via=via,
+                        use_run_context=run, authz=lambda s: _authz({s.key: ["/admin/**"]}))
+                    self._assert_confirmed(found["/admin/report"], "/admin/**", "config")
+                    self._assert_custom_anonymous_then_baseline(
+                        server.sent_to("/admin/report"), header)
+
+    def test_custom_header_exchange_on_a_leaking_listed_route_confirms(self):
+        # The node was reached as the user: the probe exchange carries the header.
+        user = {"X-Tenant": "t-1", "Accept": self._ACCEPT}
+        found, server = self._run_chain(
+            _leak, ["/admin/report"], roles=_roles(user), exchange_headers=user,
+            authz=lambda s: _authz({s.key: ["/admin/**"]}))
+        self._assert_confirmed(found["/admin/report"], "/admin/**", "config")
+        sent = server.sent_to("/admin/report")
+        self._assert_custom_anonymous_then_baseline(sent, "X-Tenant")
+        self.assertEqual(sent[0].get("accept"), self._ACCEPT, "a public header is kept")
+
+    def test_custom_header_listed_route_that_denies_has_no_finding(self):
+        for header in ("X-Tenant-Session", "X-Tenant"):
+            user = {header: "t-1"}
+            for exchange in (None, user):
+                with self.subTest(header=header, reached_as_user=exchange is not None):
+                    found, server = self._run_chain(
+                        self._sessions(header), ["/admin/report"], roles=_roles(user),
+                        exchange_headers=exchange,
+                        authz=lambda s: _authz({s.key: ["/admin/**"]}))
+                    self.assertEqual(found["/admin/report"], [])
+                    sent = server.sent_to("/admin/report")
+                    self.assertEqual(len(sent), 1, "no baseline after an anonymous denial")
+                    self.assertNotIn(header.lower(), sent[0])
+
+    def test_public_headers_alone_are_not_credentials(self):
+        # An identity whose only headers are public ones has nothing to authenticate
+        # a baseline with: not confirmed, no baseline sent, and the headers kept.
+        user = {"Accept": self._ACCEPT, "User-Agent": "tenant-app/2"}
+        for via in ("shape", "label"):
+            with self.subTest(via=via):
+                found, server = self._run_chain(
+                    _leak, ["/admin/report"], roles=_roles(user), exchange_headers=user,
+                    via=via, authz=lambda s: _authz({s.key: ["/admin/**"]}))
+                self._assert_not_confirmed(found["/admin/report"], via)
+                sent = server.sent_to("/admin/report")
+                self.assertEqual(len(sent), 1, "no baseline without a credential")
+                self.assertEqual(sent[0].get("accept"), self._ACCEPT)
+                self.assertEqual(sent[0].get("user-agent"), "tenant-app/2")
+
+
 # ------------------------------------------------------------------ S4
 class ListedRouteDiffersFromBaselineTests(_ChainCase):
     """S4: a listed route whose anonymous answer is a public page while the

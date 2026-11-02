@@ -45,18 +45,18 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from harness import global_throttle
+from harness import global_throttle, security
+from harness.engagement import is_public_request_header
 from harness.js_endpoint_extractor import CallShape
 from harness.models import Finding
 from harness.safety_gate import SafetyGate, get_default_gate
 
 log = logging.getLogger("harness.missing_auth_probe")
 
-# Request headers that carry identity/credentials. When we reconstruct a request
-# to probe it unauthenticated, every one of these is dropped; the whole point is
-# that NONE of them are present. (Content-negotiation / tracing headers are left
-# alone -- stripping them would change what the endpoint returns for reasons
-# unrelated to auth.)
+# Well-known credential header names. The probe itself no longer decides with this
+# list (RV-S residuals 2 and 3): the anonymous replay keeps only public headers, and
+# the baseline's credentials follow security.is_credential_header (H1). Kept for the
+# validators that still import it.
 _AUTH_HEADERS = frozenset({
     "authorization", "cookie", "x-api-key", "api-key", "apikey",
     "x-auth-token", "x-access-token", "x-session-token", "authentication",
@@ -149,10 +149,23 @@ def _substantive(status: int | None, body: str) -> bool:
     return True
 
 
+def credential_header(name: str, identity_headers: Iterable[str] = ()) -> bool:
+    """True when a request header carries a credential for the authenticated
+    baseline: one the H1 rule names (Authorization, Cookie, X-Tenant-Session ...),
+    or one the caller says its identities set (`identity_headers`, lower-cased),
+    which covers a custom scheme H1 cannot name (X-Tenant). A public header
+    (Accept, User-Agent) is never a credential."""
+    if is_public_request_header(name):
+        return False
+    return security.is_credential_header(name) or name.lower() in identity_headers
+
+
 def _strip_auth(headers: dict[str, str] | None) -> dict[str, str]:
-    """Drop every identity/credential-bearing header, keeping the rest (Accept,
-    User-Agent, content negotiation) so only the auth dimension changes."""
-    out = {k: v for k, v in (headers or {}).items() if k.lower() not in _AUTH_HEADERS}
+    """Keep only the public headers (Accept, User-Agent, content negotiation), so
+    only the auth dimension changes. Every other header may say who is calling,
+    including a custom session header no list names, so none of them rides along
+    on the "anonymous" replay (RV-S residual 3)."""
+    out = {k: v for k, v in (headers or {}).items() if is_public_request_header(k)}
     out.setdefault("User-Agent", "harness-missing-auth-probe/1.0")
     return out
 
@@ -218,7 +231,8 @@ def _finding(kind: str, method: str, url: str, outcome: ProbeOutcome,
 
 async def _unconfirmed_reason(method: str, url: str, unauth_body: str, outcome: ProbeOutcome, *,
                               baseline_headers: dict[str, str] | None, expected_protected: bool,
-                              protected_baseline: bool, timeout: float, run_context=None) -> str:
+                              protected_baseline: bool, timeout: float, run_context=None,
+                              identity_headers: frozenset = frozenset()) -> str:
     """Why an anonymous substantive response does NOT confirm missing
     authentication, or "" when it does (RV-G R15).
 
@@ -230,10 +244,11 @@ async def _unconfirmed_reason(method: str, url: str, unauth_body: str, outcome: 
         return "the endpoint was not declared protected (expected_protected is false)"
     if not protected_baseline:
         return ""
-    credentials = {k: v for k, v in (baseline_headers or {}).items() if k.lower() in _AUTH_HEADERS}
+    credentials = {k: v for k, v in (baseline_headers or {}).items()
+                   if credential_header(k, identity_headers)}
     if not credentials:
         return "no credentials were supplied for an authenticated baseline"
-    plain = {k: v for k, v in (baseline_headers or {}).items() if k.lower() not in _AUTH_HEADERS}
+    plain = {k: v for k, v in (baseline_headers or {}).items() if k not in credentials}
     baseline_ref = None
     if run_context is not None:
         from harness.run_context import ScopePolicy
@@ -272,6 +287,7 @@ async def probe(
     gate: SafetyGate | None = None,
     run_context=None,
     protected_baseline: bool = False,
+    identity_headers: Iterable[str] = (),
 ) -> ProbeOutcome:
     """Probe one endpoint for missing authentication.
 
@@ -285,8 +301,11 @@ async def probe(
     without it an anonymous payload is an unconfirmed `unauthenticated_access`
     candidate. `protected_baseline=True` additionally requires the same payload
     from an authenticated baseline request (one extra send, only after an
-    anonymous payload). Read-only unless `include_mutating` and the safety gate
-    allow the method.
+    anonymous payload). `identity_headers` names headers the caller's identities
+    set; they count as baseline credentials even when H1 does not recognise the
+    name (RV-S residual 2). Every non-public header is stripped from the
+    anonymous replay either way. Read-only unless `include_mutating` and the
+    safety gate allow the method.
     """
     method = (shape.method if isinstance(shape, CallShape) else shape[0]).upper()
     path = shape.path if isinstance(shape, CallShape) else shape[1]
@@ -323,7 +342,8 @@ async def probe(
         reason = await _unconfirmed_reason(
             method, url, body, outcome, baseline_headers=baseline_headers,
             expected_protected=expected_protected, protected_baseline=protected_baseline,
-            timeout=timeout, run_context=run_context)
+            timeout=timeout, run_context=run_context,
+            identity_headers=frozenset(h.lower() for h in identity_headers))
         outcome.classification = "unauthenticated_access" if reason else "missing_auth"
         outcome.note = reason
         outcome.finding = _finding("missing_auth", method, url, outcome, expected_protected,
