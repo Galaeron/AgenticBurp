@@ -115,6 +115,21 @@ def numeric_delta(before, after):
     return after
 
 
+def run_costs(instrumentation: dict | None, wall_seconds) -> dict:
+    """The job result's top-level `costs` block (AR-10 P3, spec 3.4/4.4), read from
+    this run's model-client counters in its `instrumentation` block. model_calls is
+    every call started (failed ones included; a transient retry is not a new call,
+    it is counted in retries). A counter the client did not report is None, never 0."""
+    client = ((instrumentation or {}).get("model_metrics") or {}).get("client") or {}
+
+    def counter(key):
+        value = client.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    return {"model_calls": counter("attempted"), "model_errors": counter("errors"),
+            "retries": counter("retries"), "wall_seconds": wall_seconds}
+
+
 class RunInstrumentation:
     """The instrumentation of ONE `investigate_engagement` call.
 
@@ -130,6 +145,7 @@ class RunInstrumentation:
         self._client = getattr(orchestrator, "ollama", None)
         self._run_context = run_context
         self._started_wall = time.time()
+        self._started_monotonic = time.monotonic()
         self._model_baseline = self._model_snapshot()
         self._store_baseline = self._store_snapshot()
         self.phases = PhaseRecorder(
@@ -174,3 +190,10 @@ class RunInstrumentation:
             except Exception:
                 log.debug("health_report failed", exc_info=True)
         return out
+
+    def result_blocks(self) -> dict:
+        """{instrumentation, costs} for the job result, from one snapshot so the two
+        blocks agree. wall_seconds runs from this object's creation."""
+        block = self.snapshot()
+        wall = round(max(0.0, time.monotonic() - self._started_monotonic), 1)
+        return {"instrumentation": block, "costs": run_costs(block, wall)}

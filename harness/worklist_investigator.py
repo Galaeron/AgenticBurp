@@ -312,6 +312,11 @@ def _probe_diagnostics(outcome: dict) -> dict | None:
     ids = list(ids) if isinstance(ids, (list, tuple)) else []
     out["evidence_attempts"] = len(ids)
     out["evidence_attempt_ids"] = _bounded_ids(ids, _MAX_PROBE_ATTEMPT_IDS)
+    # AR-10 P3: the probe's model turns, one transcript entry each (parse errors,
+    # duplicates, rejections and the stop decision included), the denominator of
+    # duplicate share and parse-error rate. None when no transcript was kept.
+    transcript = (outcome.get("iterative_result") or {}).get("transcript")
+    out["steps"] = len(transcript) if isinstance(transcript, list) else None
     return out
 
 
@@ -320,9 +325,11 @@ def iterative_diagnostics(outcomes: list[dict]) -> dict:
     reason. `probes` counts agent probes whose outcome recorded diagnostics (resumed
     ones included); `probes_without_diagnostics` counts agent probes that ran but
     recorded none (an errored probe, or a result without the AR-09 block), so a
-    missing count is never reported as a zero. A run with no probe reports zeros."""
+    missing count is never reported as a zero. A run with no probe reports zeros.
+    `steps` is None wherever one summed probe kept no step count (an older journal
+    entry), so a partial sum is never reported as the run's step count."""
     def zeros() -> dict:
-        return {**{k: 0 for k in DIAGNOSTIC_COUNTS}, "evidence_attempts": 0}
+        return {**{k: 0 for k in DIAGNOSTIC_COUNTS}, "evidence_attempts": 0, "steps": 0}
 
     totals = dict(zeros(), evidence_attempt_ids=[])
     by_reason: dict[str, dict] = {}
@@ -339,6 +346,10 @@ def iterative_diagnostics(outcomes: list[dict]) -> dict:
         for k in (*DIAGNOSTIC_COUNTS, "evidence_attempts"):
             totals[k] += diag.get(k, 0)
             row[k] += diag.get(k, 0)
+        steps = diag.get("steps")
+        for acc in (totals, row):
+            acc["steps"] = (acc["steps"] + steps if isinstance(acc["steps"], int)
+                            and isinstance(steps, int) and not isinstance(steps, bool) else None)
         totals["evidence_attempt_ids"].extend(diag.get("evidence_attempt_ids") or [])
     totals["evidence_attempt_ids"] = _bounded_ids(totals["evidence_attempt_ids"],
                                                   _MAX_RUN_ATTEMPT_IDS)

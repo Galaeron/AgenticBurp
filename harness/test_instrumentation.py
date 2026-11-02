@@ -606,6 +606,9 @@ class _NoInstrumentation:
     def snapshot(self):
         return {}
 
+    def result_blocks(self):
+        return {"instrumentation": {}}
+
 
 class InvestigatePhaseTimingTests(_InvestigateBase):
     def _check_phases_and_model_metrics(self, result):
