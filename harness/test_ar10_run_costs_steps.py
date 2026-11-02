@@ -104,7 +104,7 @@ def _wire(*statuses):
     return handler, seen
 
 
-class RunCostsTests(ti._InvestigateBase):
+class RunCostsTests(ti._InvestigateBase, unittest.TestCase):
     def setUp(self):
         super().setUp()
         sleep = patch.object(ti.oc, "_backoff_sleep", ti.AsyncMock())
