@@ -593,11 +593,21 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
     leg, never a source of unconfirmed noise.
 
     Only the legs that need a real captured body/param belong here: XXE (an
-    XML-accepting body) and SSRF (a URL-shaped param). idor/jwt shape-routing
-    lives in the graph path (`shape_precondition_legs`) where the seed
-    identities needed to replay/forge are known; analyze() has just the one
-    captured request and identity."""
+    XML-accepting body) and SSRF (a URL-shaped param). idor shape-routing lives
+    in the graph path (`shape_precondition_legs`) where the seed identities
+    needed to replay are known; analyze() has just the one captured request and
+    identity. The jwt leg needs only that one request: a captured GET carrying a
+    JWT is forged from its own token (DET-JWT-SCOPE). The graph path seeds from
+    supplied roles and never replays a capture's own headers, so this is also
+    the route for a JWT that only a capture carries (capture review runs each
+    capture through analyze()). GET only: the forge leg replays the request
+    several times, and on a write that is several writes."""
     out: list[Finding] = []
+    if (exchange.method or "GET").upper() == "GET" and _carries_jwt(exchange.request_headers):
+        out.append(Finding(
+            vulnerability_class="jwt", confidence=0.3, severity="high",
+            summary=f"JWT precondition: the captured request to {exchange.url} carries a JWT",
+            evidence="", suggested_test="", basis="derived"))
     if _accepts_xml(exchange):
         out.append(Finding(
             vulnerability_class="xxe", confidence=0.3, severity="high",

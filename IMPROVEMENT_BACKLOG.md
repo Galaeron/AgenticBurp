@@ -4279,7 +4279,7 @@ triggering / live soundness, not missing code. They map to
   does not (`harness/test_det_shape_dispatch_callers.py`). The Authorization-header case was
   already covered by `test_smoke_investigate`. The uncovered cases are re-filed as DET-JWT-SCOPE.
 
-### [ ] DET-JWT-SCOPE — JWT forge dispatch beyond role-carried JWTs on GET
+### [x] DET-JWT-SCOPE — JWT forge dispatch beyond role-carried JWTs on GET
 - **Domain:** Deterministic-first coverage · **Effort:** S-M · **Depends on:** DET-JWT-DETECT ·
   **Mode:** LOOP (offline caller test). **Canonical owner → I09.**
 - **Uncovered (source, HEAD after I09):** (1) non-GET methods: `shape_precondition_legs` adds `jwt`
@@ -4289,6 +4289,13 @@ triggering / live soundness, not missing code. They map to
 - **Acceptance criteria:** decide per case whether it is in scope. Each in-scope case dispatches
   with no model label through the real caller, with a non-JWT negative control. Out-of-scope
   cases are documented as such.
+- **Closed 2026-11-02 (`e68d929`):** (2) analyze() and (3) capture-only JWT are in scope:
+  `shape_precondition_findings` adds a derived jwt leg for a JWT-bearing captured GET, and the
+  engagement's capture review runs each capture through analyze(). (1) Non-GET is out of scope:
+  the forge leg replays the request 3-6 times, and the per-finding mutating ceiling allows one
+  write. `harness/test_det_jwt_scope_callers.py` covers each case through the real caller with an
+  opaque-token control. A JWT-bearing write sends no forged token, mutating replay off or on.
+  Decisions: `.test-work/det-jwt-scope-20261102/BATCH.md`.
 
 ### [ ] DET-SSRF — Resolve SSRF collaborator reachability for live confirmation
 - **Domain:** Deterministic-first validator soundness · **Effort:** M · **Depends on:** an
