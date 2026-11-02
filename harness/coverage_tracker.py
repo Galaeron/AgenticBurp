@@ -555,7 +555,8 @@ class CoverageTracker:
         return total
 
     async def drive_coverage_cases(self, run_case, *, driveable: set[str] | None = None,
-                                   budget: int = 80, deadline: float | None = None, readiness=None) -> int:
+                                   budget: int = 80, deadline: float | None = None, readiness=None,
+                                   field_cap: int = PER_PARAMETER_FIELD_CAP) -> int:
         """Fire each PENDING child case via the injected async
         `run_case(identity, method, path, check, case_key) -> result` (result
         exposing .status/.summary/..., or None when the leg produced no send),
@@ -563,14 +564,17 @@ class CoverageTracker:
         of `drive_coverage_legs`: confirming one input marks only THAT case, never
         its siblings.
 
-        The leg is driven ONCE PER CELL, on the request-level (no-parameter)
-        representative, and the result binds to THAT case (R01): a deterministic leg
-        tests the whole request, so its verdict is NOT stamped onto each enumerated
-        parameter. Every other (parameter) case in the cell is recorded INCONCLUSIVE
-        with an explicit "no per-parameter attribution" reason -- visible, but never
-        credited with the request-level verdict, proof, or a separate execution.
+        A leg that cannot test one input on its own is driven ONCE PER CELL, on the
+        request-level (no-parameter) representative, and the result binds to THAT
+        case (R01): its verdict is NOT stamped onto each enumerated parameter. Every
+        other (parameter) case in the cell is recorded INCONCLUSIVE with an explicit
+        "no per-parameter attribution" reason -- visible, but never credited with the
+        request-level verdict, proof, or a separate execution. A leg that can (see
+        `case_target`) is driven once per parameter case instead, at most
+        `field_cap` inputs per cell (`_drive_parameter_cases`).
 
-        `budget` bounds DISPATCH ATTEMPTS -- one per driven cell (R05). A callback
+        `budget` bounds DISPATCH ATTEMPTS -- one per `run_case` call, so a cell driven
+        per parameter spends one unit per input it dispatches (R05). A callback
         that RAISES records the representative ERROR (visible, never swallowed); one
         that returns None records INCONCLUSIVE (dispatched, no usable send). An
         unknown status fails conservatively to INCONCLUSIVE, not an optimistic
@@ -604,14 +608,15 @@ class CoverageTracker:
             check = CHECKS_BY_ID[check_id]
             # the request-level representative the whole-request result binds to
             rep = next((c for c in cks if c.is_no_parameter), cks[0])
-            attempts += 1
             self.attempted.add((ident, ep_key, check_id))
             targets = ([c for c in cks if c is not rep and case_target(check.confirmation, c)]
                        if rep.is_no_parameter else [])
             if targets:
-                await self._drive_parameter_cases(run_case, ident, ep_key, check, cks, rep,
-                                                  targets, deadline)
+                attempts += await self._drive_parameter_cases(
+                    run_case, ident, ep_key, check, cks, rep, targets, deadline,
+                    budget - attempts, field_cap)
             else:
+                attempts += 1
                 await self._drive_request_level(run_case, ident, ep_key, check, cks, rep)
         return attempts
 
@@ -673,23 +678,33 @@ class CoverageTracker:
             attempts=fresh, referenced_attempts=referenced)
 
     async def _drive_parameter_cases(self, run_case, ident, ep_key, check, cks, rep,
-                                     targets, deadline) -> None:
+                                     targets, deadline, remaining, field_cap) -> int:
         """Per-parameter dispatch (owner option b): drive the leg once per input it
         can test alone, so each parameter's verdict binds to that parameter's case
-        and concludes nothing else. At most PER_PARAMETER_FIELD_CAP inputs per cell;
-        inputs over the cap, the case budget or the deadline stay inconclusive.
-        When any input was not tested on its own, the request-level representative
-        is ALSO driven as before (detection unchanged), bound to itself only."""
+        and concludes nothing else. At most `field_cap` inputs per cell; inputs over
+        the cap, the case budget, the leg budget (`remaining` dispatches) or the
+        deadline stay inconclusive. When any input was not tested on its own, the
+        request-level representative is ALSO driven as before (detection
+        unchanged, one more dispatch), bound to itself only. Returns the number of
+        dispatches made."""
         check_id = check.id
         method, _, path = ep_key.partition(" ")
         tested: set[str] = set()
-        timed_out = False
+        timed_out = out_of_budget = False
+        used = 0
         for n, case in enumerate(targets):
-            if n >= PER_PARAMETER_FIELD_CAP:
+            if n >= field_cap:
                 self.matrix.record_case(
                     ident, ep_key, check_id, case, status=CellStatus.INCONCLUSIVE,
                     reason=f"{check.confirmation}: per-parameter field cap "
-                           f"({PER_PARAMETER_FIELD_CAP}) reached before this input; untested")
+                           f"({field_cap}) reached before this input; untested")
+                continue
+            if used >= remaining:
+                out_of_budget = True
+                self.stopped_by = "leg budget"
+                self.matrix.record_case(
+                    ident, ep_key, check_id, case, status=CellStatus.INCONCLUSIVE,
+                    reason=f"{check.confirmation}: leg budget reached before this input; untested")
                 continue
             if deadline is not None and time.monotonic() >= deadline:
                 timed_out = True
@@ -699,6 +714,7 @@ class CoverageTracker:
                     reason=f"{check.confirmation}: time budget reached before this input; untested")
                 continue
             tested.add(case.coord_id())
+            used += 1
             try:
                 res = await run_case(ident, method, path, check, case)
             except Exception as e:  # recorded on this input only
@@ -719,15 +735,21 @@ class CoverageTracker:
                                      f"{check.confirmation} driven on {case.label()}")
         others = [(c, r) for c, r in self.matrix.cases_for_cell(ident, ep_key, check_id)
                   if c.coord_id() != rep.coord_id()]
-        if not timed_out and any(c.coord_id() not in tested for c, _r in others):
+        if (not timed_out and not out_of_budget
+                and any(c.coord_id() not in tested for c, _r in others)):
             # Some input was not tested alone (a location this leg cannot target,
-            # the field cap, the case budget): keep today's request-level attempt.
-            # Inputs tested alone keep their own verdicts.
-            rest = [c for c in cks if c.coord_id() not in tested]
-            await self._drive_request_level(run_case, ident, ep_key, check, rest, rep)
-            return
+            # the field cap, the case budget): keep today's request-level attempt
+            # while the leg budget allows one more dispatch. Inputs tested alone
+            # keep their own verdicts.
+            if used < remaining:
+                rest = [c for c in cks if c.coord_id() not in tested]
+                await self._drive_request_level(run_case, ident, ep_key, check, rest, rep)
+                return used + 1
+            out_of_budget = True
+            self.stopped_by = "leg budget"
         negatives = (CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE)
-        if not timed_out and others and all(r.status in negatives for _c, r in others):
+        if (not timed_out and not out_of_budget and others
+                and all(r.status in negatives for _c, r in others)):
             self.matrix.record_case(
                 ident, ep_key, check_id, rep, status=CellStatus.NOT_DETECTED,
                 reason=f"{check.confirmation}: every input ({len(others)}) tested on its own, "
@@ -740,6 +762,7 @@ class CoverageTracker:
                 ident, ep_key, check_id, rep, status=CellStatus.INCONCLUSIVE,
                 reason=f"{check.confirmation} ran per parameter; the request as a whole is "
                        f"concluded only when every input is", validator=check.confirmation)
+        return used
 
     def finalize_pending_reasons(self, investigated_keys: set[str] | None = None) -> int:
         """Give remaining applicable-pending cells an explicit reason so the
@@ -1024,6 +1047,7 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
 
 async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[str] | None = None,
                                       budget: int = 80, per_cell_case_budget: int = 8,
+                                      parameter_field_cap: int = PER_PARAMETER_FIELD_CAP,
                                       investigated_keys: set[str] | None = None,
                                       checkpoint=None, context_key="",
                                       deadline: float | None = None, on_checkpoint=None, readiness=None) -> dict:
@@ -1047,7 +1071,8 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     enumerated = tracker.expand_parameter_cases(
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
     driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget,
-                                                deadline=deadline, readiness=None)
+                                                deadline=deadline, readiness=None,
+                                                field_cap=parameter_field_cap)
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["cases_enumerated"] = enumerated
