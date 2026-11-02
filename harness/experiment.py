@@ -36,6 +36,7 @@ import hashlib
 import json
 import re
 import secrets
+import time
 from dataclasses import asdict, dataclass, field, replace
 
 from harness import task_graph
@@ -201,6 +202,10 @@ def missing_value(name: str) -> str:
 MISSING_TAG = "the create body needs a per-identity {tag} field to distinguish the two objects"
 MISSING_SECOND_IDENTITY = "no second identity distinct from the owner"
 MISSING_OWNER_IDENTITY = "no authenticated session for the owner"
+STAGE_DEADLINE = "stage deadline reached"
+# Why a READY experiment was left unrun: each is a named bound, never a negative.
+BUDGET_REASONS = ("owning run cancelled", "engagement experiment max_runs exhausted",
+                  "owning request budget exhausted", STAGE_DEADLINE)
 
 
 def _snake(name: str) -> str:
@@ -1016,7 +1021,8 @@ def _replan(state, asm, ctx: dict) -> dict:
 
 
 async def run_experiment_loop(state, run_context, *, ledger, expectations, sessions, max_runs,
-                              planner=None, asm=None, base_url: str = "", hypothesis_ids=None) -> dict:
+                              planner=None, asm=None, base_url: str = "", hypothesis_ids=None,
+                              deadline: float | None = None) -> dict:
     """Run READY experiment tasks, feeding each outcome back into the graph.
 
     Per run: execute (compile, send, judge, persist the proof); mark the task DONE
@@ -1024,7 +1030,8 @@ async def run_experiment_loop(state, run_context, *, ledger, expectations, sessi
     evidence; record the extracted values in `state.observed_values` and the
     ownership fact in `ledger`; then re-evaluate the BLOCKED experiment tasks with
     the new values, so a dependent experiment becomes READY and runs in this same
-    loop. Stops when no READY experiment remains or `max_runs` have run.
+    loop. Stops when no READY experiment remains, `max_runs` have run, the run is
+    cancelled or the optional `deadline` (time.monotonic()) has passed.
 
     Returns {"completed", "failed", "blocked", "deferred", "runs", "planner"}:
     `blocked` maps each blocked task id to its exact missing inputs."""
@@ -1043,7 +1050,10 @@ async def run_experiment_loop(state, run_context, *, ledger, expectations, sessi
     if await _consult_planner(state, planner, asm, ctx, counts, asked, hypothesis_ids):
         _replan(state, asm, ctx)
 
-    while runs < max_runs and not run_context.cancel.cancelled:
+    def past_deadline():
+        return deadline is not None and time.monotonic() >= deadline
+
+    while runs < max_runs and not run_context.cancel.cancelled and not past_deadline():
         selected = {t.id for t in selected_experiment_tasks(state, hypothesis_ids)}
         task = next((t for t in state.graph.ready_by_value()
                      if t.kind == "experiment" and t.id in selected), None)
@@ -1123,6 +1133,7 @@ async def run_experiment_loop(state, run_context, *, ledger, expectations, sessi
 
     stopped_by = ('owning run cancelled' if run_context.cancel.cancelled else
                   'experiment max_runs exhausted' if runs >= max_runs else
+                  STAGE_DEADLINE if past_deadline() else
                   'no ready selected experiment; prerequisites or selection remain')
     return {"stopped_by": stopped_by, "completed": completed, "failed": failed,
             "blocked": {t.id: list(t.meta.get("missing") or [t.needs])
@@ -1407,10 +1418,34 @@ def preflight_authority(plan, run_context):
     return ''
 
 
+def _blocked_on(task, status, reason):
+    """AR-FP: the typed reason a task did not complete. `operator_input` names each
+    declaration, binding, session or permission only the operator can supply;
+    `awaiting_value` a value no phase observed; `budget` the bound that left it
+    unrun; `failed_unchanged` an inconclusive attempt not re-run without new evidence."""
+    if status == 'completed':
+        return None
+    if reason == 'engagement experiments disabled':
+        return {'category': 'disabled', 'inputs': [reason]}
+    if status == 'deferred':
+        return {'category': 'budget', 'inputs': [reason]}
+    if task.status == task_graph.FAILED:
+        final = task.meta.get('final_pass') or {}
+        if final.get('status') == 'failed_unchanged':
+            return {'category': 'failed_unchanged', 'inputs': [final['reason']]}
+        return {'category': 'inconclusive', 'inputs': [reason]}
+    if task.status == task_graph.BLOCKED:
+        inputs = [m for m in (task.meta.get('missing') or [task.needs]) if m]
+        operator = [m for m in inputs if not m.startswith("value '")]
+        return {'category': 'operator_input' if operator else 'awaiting_value', 'inputs': inputs}
+    return {'category': status, 'inputs': [reason]}
+
+
 def task_dispositions(state, run_context, *, enabled, max_runs, planner_enabled=False):
     """Bounded final case state; a pending proposal never becomes a clean negative."""
     tasks=[]
     for task in experiment_tasks(state):
+        final = task.meta.get('final_pass') or {}
         if not enabled:
             status,reason='disabled','engagement experiments disabled'
         elif task.status == task_graph.DONE:
@@ -1422,6 +1457,8 @@ def task_dispositions(state, run_context, *, enabled, max_runs, planner_enabled=
             status=('deferred' if 'budget' in reason or 'allowance' in reason else
                     'policy_denied' if 'permission' in reason or 'scope' in reason else
                     'disabled' if 'disabled' in reason else 'missing_prerequisite')
+        elif final.get('status') == 'deferred':
+            status,reason='deferred',final['reason']
         elif run_context is not None and run_context.cancel.cancelled:
             status,reason='deferred','owning run cancelled'
         elif run_context is not None and run_context.experiment_runs >= max_runs:
@@ -1431,13 +1468,14 @@ def task_dispositions(state, run_context, *, enabled, max_runs, planner_enabled=
         else:
             status,reason='advisory','ready experiment not selected before stage termination'
         tasks.append({'task_id':task.id,'hypothesis_id':task.meta.get('hypothesis_id'),
-            'status':status,'reason':reason,'attempt_ids':list(task.meta.get('attempt_ids',[])),
+            'status':status,'reason':reason,'blocked_on':_blocked_on(task, status, reason),
+            'attempt_ids':list(task.meta.get('attempt_ids',[])),
             'readiness':dict(task.meta.get('readiness',{})),
             'cost':dict((task.meta.get('experiment') or {}).get('cost',{}))})
     advisory = [{'task_id':t.id,'kind':t.kind,'status':'advisory',
                  'reason':'no registered experiment compiler attached to this proposal'}
                 for t in state.graph.tasks.values() if t.kind == 'chain-hypothesis' and not t.meta.get('experiment')]
-    return {'schema_version':1,'enabled':enabled,'planner_enabled':planner_enabled,
+    return {'schema_version':2,'enabled':enabled,'planner_enabled':planner_enabled,
             'supported_mechanisms':list(SUPPORTED_KINDS),'advisory_tasks':advisory,'max_runs':max_runs,
             'attempts_reserved':getattr(run_context,'experiment_runs',0),
             'request_budget_remaining':run_context.budget.remaining if run_context else None,

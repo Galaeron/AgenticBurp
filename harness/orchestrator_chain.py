@@ -815,7 +815,7 @@ class ChainMixin:
         return out
 
     async def _run_experiments(self, state, asm, run_context, *, base_url="", captured=(),
-                               ownership=None, hypothesis_ids=None):
+                               ownership=None, hypothesis_ids=None, deadline=None):
         """Ticket G seam: run the graph -> experiment -> workflow -> proof -> graph
         cycle (experiment.run_experiment_loop) over the hypotheses of `asm`.
 
@@ -849,8 +849,76 @@ class ChainMixin:
             expectations=eng.get("access_expectations", []) or [],
             sessions=experiment.run_sessions(run_context),
             max_runs=remaining, planner=planner, asm=asm, base_url=base_url,
-            **({"hypothesis_ids": hypothesis_ids} if hypothesis_ids is not None else {}))
+            **({"hypothesis_ids": hypothesis_ids} if hypothesis_ids is not None else {}),
+            **({"deadline": deadline} if deadline is not None else {}))
 
+        return result
+
+    async def _final_experiment_pass(self, state, asm, run_context, *, base_url="",
+                                     captured=(), ownership=None, deadline=None):
+        """AR-FP seam: the bounded final re-evaluation of experiment tasks, after the
+        coverage phase and before their dispositions are taken.
+
+        The experiments phase runs once, early. Later phases can change what an
+        experiment needs: an iterative-worker hand-off runs only its selected
+        hypothesis yet observes values that make other tasks READY, and a session
+        refresh changes an attempt's applicability. This re-evaluates every task
+        (`evaluate_experiments`, `_evaluate_browser`) against the final values and
+        sessions, re-queues a FAILED task only when its applicability changed, and
+        runs the READY ones through the same `_run_experiments` loop -- within the
+        remaining max_runs, the run's request budget, `deadline` and the cancel
+        token; no bound is raised. A READY task left unrun is marked deferred with
+        the bound that stopped it. Disabled experiments or no owning run: None, and
+        nothing is sent. Split out of investigate_engagement so a test can unplug it
+        (the RB-5 `_relink_chains` precedent)."""
+        cfg = self._experiments_config()
+        if run_context is None or asm is None or not cfg.get("enabled", False):
+            return None
+        from harness import experiment, task_graph
+        eng = (getattr(self, "config", {}) or {}).get("engagement", {}) or {}
+        expectations = eng.get("access_expectations", []) or []
+        sessions = experiment.run_sessions(run_context)
+        experiment._evaluate_browser(state, asm, run_context)
+        experiment.evaluate_experiments(state, asm, expectations, sessions, base_url=base_url)
+        requeued, unchanged = [], []
+        for task in experiment.experiment_tasks(state):
+            if task.status != task_graph.FAILED:
+                continue
+            plan = (experiment.translate_browser(task.meta.get("hypothesis_id"), asm, run_context)
+                    if task.meta.get("kind") in experiment.BROWSER_KINDS else
+                    experiment.translate_cross_account(task, asm, expectations, sessions,
+                                                       state.observed_values, base_url=base_url))
+            if plan.ready and experiment.experiment_applicability(
+                    plan.experiment, run_context, state.observed_values) != task.meta.get("applicability"):
+                state.graph.mark(task.id, task_graph.READY)
+                requeued.append(task.id)
+            else:
+                task.meta["final_pass"] = {"status": "failed_unchanged",
+                                           "reason": "unchanged failed attempt requires new evidence"}
+                unchanged.append(task.id)
+        ready = [t.id for t in experiment.experiment_tasks(state) if t.status == task_graph.READY]
+        max_runs = int(cfg.get("max_runs", 4))
+        stopped_by = ("owning run cancelled" if run_context.cancel.cancelled else
+                      "engagement experiment max_runs exhausted"
+                      if run_context.experiment_runs >= max_runs else
+                      "owning request budget exhausted" if run_context.budget.remaining == 0 else
+                      experiment.STAGE_DEADLINE
+                      if deadline is not None and time.monotonic() >= deadline else "")
+        result = {"ready": ready, "requeued": requeued, "failed_unchanged": unchanged,
+                  "completed": [], "failed": [], "runs": 0,
+                  "stopped_by": stopped_by or "no ready experiment"}
+        if ready and not stopped_by:
+            loop = await self._run_experiments(state, asm, run_context, base_url=base_url,
+                                               captured=captured, ownership=ownership,
+                                               deadline=deadline) or {}
+            result.update(completed=loop.get("completed", []), failed=loop.get("failed", []),
+                          runs=loop.get("runs", 0), stopped_by=loop.get("stopped_by", ""))
+            if result["stopped_by"] == "experiment max_runs exhausted":
+                result["stopped_by"] = "engagement experiment max_runs exhausted"
+        if result["stopped_by"] in experiment.BUDGET_REASONS:
+            for task in experiment.experiment_tasks(state):
+                if task.status == task_graph.READY:
+                    task.meta["final_pass"] = {"status": "deferred", "reason": result["stopped_by"]}
         return result
 
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
@@ -2354,6 +2422,20 @@ class ChainMixin:
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
 
+        # AR-FP: the bounded final re-evaluation of experiment tasks over the values
+        # and sessions every later phase left, before proofs are projected and the
+        # dispositions taken. Inside the coverage stage's deadline; best-effort like
+        # the experiments phase.
+        _instr.phases.begin("experiments_final")
+        _experiment_final_pass = None
+        try:
+            _experiment_final_pass = await self._final_experiment_pass(
+                state, _asm, run_context, base_url=base_url, captured=_all_captured,
+                ownership=ownership, deadline=_coverage_deadline)
+        except Exception as e:
+            log.warning("investigate_engagement: final experiment pass failed: %s", e)
+            _errors.append({"phase": "experiments_final", "error": f"{type(e).__name__}: {e}"})
+
         from harness.experiment import project_proofs
         try:
             _experiment_projection = project_proofs(state, run_context)
@@ -2434,6 +2516,7 @@ class ChainMixin:
             "application_semantic_model": _asm.to_dict() if _asm else None,
             "experiments": _experiments,
             "experiment_preflight": _experiment_dispositions,
+            "experiment_final_pass": _experiment_final_pass,
             # E4: how many validator executions the run's registry served without
             # running again, and the requests that saved (by validator).
             "execution_registry": _exec_registry.stats(),

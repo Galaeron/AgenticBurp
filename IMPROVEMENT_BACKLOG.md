@@ -4358,6 +4358,21 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
 - **Domain:** Planner/worker · **Effort:** L · **Depends on:** 03, 06, 07 (all accepted) ·
   **Mode:** LOOP. Spec: "Batch 09" in IMPLEMENTATION_TASK.md.
 
+### [x] AR-FP — Bounded final re-evaluation pass for experiment tasks
+- **Domain:** Experiment controller · **Effort:** M · **Depends on:** AR-09 · **Mode:** LOOP.
+- **Problem:** the experiments phase ran once, early. An iterative-worker hand-off runs only its
+  selected hypothesis, yet its observed values (or a refreshed session) make other experiment tasks
+  READY; nothing re-tried them, and `task_dispositions` reported them as `advisory`.
+- **Done (2026-11-02, branch `codex/ar-fp-final-experiment-pass`):** `ChainMixin._final_experiment_pass`
+  runs after the coverage phase, before proof projection and dispositions. It re-evaluates the tasks,
+  re-queues a FAILED one only on changed applicability, and runs the READY ones through
+  `_run_experiments` within the remaining max_runs, request budget, coverage-stage deadline and cancel.
+  Dispositions (schema 2) carry a typed `blocked_on`: `operator_input`, `awaiting_value`, `budget`,
+  `failed_unchanged`. Caller-level regression and controls: `harness/test_experiment_final_pass.py`.
+  Handoff: `.test-work/ar-fp-final-experiment-pass-20261102/HANDOFF.md` in that worktree.
+- **Not covered:** the objective-mode early return (`stop_on_confirm`) takes its dispositions without
+  the final pass; the coverage-drive incomplete attempts stay a separate item.
+
 ### [ ] AR-10 — Batch 10: integrated acceptance and model-evaluation specification
 - **Domain:** Evaluation · **Effort:** L · **Depends on:** all prior batches incl. AR-09 ·
   **Mode:** LOOP for the spec; OWNER/LIVE for any target run or model A/B (each needs its own
