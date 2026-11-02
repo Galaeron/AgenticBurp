@@ -1,0 +1,9 @@
+label=py312 python=C:/Users/arthu/Documents/AgenticVibe/.venv-rationalisation/Scripts/python.exe head=ff6f7a0 started=2026-11-02T12:14:52+01:00
+worktree-diff-sha256=cbd40c7c0af2107b
+Python 3.12.14
+precondition=0
+i16=0
+smoke=1
+full=1
+worktree-diff-sha256-after=cbd40c7c0af2107b
+finished=2026-11-02T13:10:09+01:00
