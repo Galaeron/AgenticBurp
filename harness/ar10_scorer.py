@@ -28,6 +28,8 @@ Inputs (all JSON):
   "class": "...", "route": "/path"}, "equivalents": [{...match...}]}]}. A match field
   left out is a wildcard, but every match must name at least one field. A claim
   counts through `equivalents` only because the mapping records that equivalence.
+  Entries must be disjoint: a confirmed claim matching two entries (through `match`
+  or `equivalents`, available or not) is bad input, never a double count.
 
 Exit codes: 0 scored, 2 refused (nothing written), 3 bad input after the freeze check.
 Offline only: it never contacts a target or a model.
@@ -227,6 +229,15 @@ def score_repeat(rid: str, blobs: dict[str, bytes], mapping: dict) -> dict:
     verified = [c for c in claims if c.get("verdict") in VERIFIED_VERDICTS]
 
     entries = mapping["mechanisms"]
+    # Entries must be disjoint (owner decision, 2026-11-02): a confirmed claim that
+    # satisfies two entries would count one proof twice, so the run is refused. The
+    # message names no entry, index or match field.
+    for c in verified:
+        hits = sum(any(_claim_matches(c, s) for s in [e["match"], *(e.get("equivalents") or [])])
+                   for e in entries)
+        if hits > 1:
+            raise BadInput(f"repeat {rid}: a confirmed claim matches {hits} sealed mapping "
+                           "entries; the entries must be disjoint")
     available = [e for e in entries if e.get("available", True)]
     boundaries = {"no_matching_claim": 0, "claim_not_audited": 0, "audited_not_confirmed": 0}
     direct = via_equivalence = 0

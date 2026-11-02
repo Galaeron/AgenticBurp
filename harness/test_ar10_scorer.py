@@ -312,6 +312,42 @@ class ScorerCliTests(unittest.TestCase):
         sealed = fx.mapping_path.read_text(encoding="utf-8")
         self.assertTrue(all(c in sealed for c in CANARIES))
 
+    def test_overlapping_entries_refuse_instead_of_double_counting(self):
+        # Q6: a second entry whose match (or recorded equivalent) also covers the
+        # confirmed login SQLi claim would count that one proof twice.
+        overlaps = {
+            "match": {"id": "CANARY-ID-overlap-6c6c", "available": True,
+                      "match": {"validator": "sqlmap"}},
+            "equivalent": {"id": "CANARY-ID-overlap-6c6c", "available": True,
+                           "match": {"validator": "ssti"},
+                           "equivalents": [{"route": LOGIN}]},
+            "unavailable entry": {"id": "CANARY-ID-overlap-6c6c", "available": False,
+                                  "match": {"route": LOGIN}},
+        }
+        for label, extra in overlaps.items():
+            with self.subTest(label):
+                self.reset()
+                doc = mapping()
+                doc["mechanisms"].append(extra)
+                fx = self.fixture(mapping_doc=doc)
+                code, out, err = fx.run()
+                self.assertEqual(code, ar10_scorer.EXIT_BAD_INPUT, label)
+                self.assertIn("must be disjoint", err)
+                self.assertNotIn("CANARY", out + err)
+                self.assertNotIn(LOGIN, out + err)
+                self.assertFalse(fx.out.exists())
+
+        # Control: the same overlapping mapping scores when no confirmed claim falls
+        # in the overlap (the login SQLi is only inconclusive), and nothing doubles.
+        self.reset()
+        doc = mapping()
+        doc["mechanisms"].append(overlaps["match"])
+        repeats = {rid: (arm, [JWT, SQLI_INCONCLUSIVE], acc)
+                   for rid, (arm, _, acc) in better_repeats().items()}
+        fx = self.fixture(repeats, doc)
+        self.assertEqual(fx.run()[0], 0)
+        self.assertEqual({r["primary_verified_mechanisms"] for r in fx.report()["repeats"]}, {1})
+
     def test_malformed_mapping_error_does_not_echo_entries(self):
         doc = mapping()
         doc["mechanisms"][0]["match"] = {"route": "", "secret": "CANARY-ID-jwt-7f3a"}
