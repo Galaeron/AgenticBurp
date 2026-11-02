@@ -18,8 +18,16 @@ declaration. Owner decision of 2026-10-21; implemented by batch RV-S
 - The engagement's own list (`EngagementState.protected_paths`) applies to that engagement's
   target and combines with the config list. Set it per run with the `protected_paths` field of
   `POST /engagement/{host}/investigate` (a list of patterns, at most 1000; I16). The request's
-  `owners` field does the same for `authz.owners` entries. Neither is stored: each run declares
-  its own. The Burp panel does not send them yet (a Java change, RV-K).
+  `owners` field does the same for `authz.owners` entries. The Burp panel does not send them
+  yet (a Java change, RV-K).
+- Saved lists (I16 persistence): `PUT /engagement/{host}/declarations` with `base_url`,
+  `protected_paths` and `owners` saves (replaces) both lists for that target, keyed on host and
+  effective port; `GET` with `?base_url=` reads them; saving two empty lists clears them. Entries
+  must parse as patterns / ownership entries (422 otherwise), so only paths and identity labels
+  are stored. Saved lists are never applied by default: an investigate request uses them only
+  with `"use_saved_declarations": true`. Per field, a non-empty request list replaces the saved
+  list (never merged); an empty request field takes the saved one. The job result's
+  `declarations_source` says which applied (`request`, `saved` or `none`).
 
 ```yaml
 authz:

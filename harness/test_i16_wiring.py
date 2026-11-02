@@ -189,7 +189,7 @@ class InvestigateRouteForwardsDeclarationsTests(unittest.TestCase):
         bare = server.InvestigateRequest(base_url="https://captured.example/app")
         # The key as it was computed before the declaration fields existed.
         limits = bare.model_dump(exclude={"base_url", "roles", "seed_exchanges", "resume_job_id",
-                                          "protected_paths", "owners"})
+                                          "protected_paths", "owners", "use_saved_declarations"})
         inputs = json.dumps([bare.base_url, [], [], limits], sort_keys=True, default=str)
         before = f"{resume_context_key(config)}:{hashlib.sha256(inputs.encode()).hexdigest()[:16]}"
         empty = server.InvestigateRequest(base_url=bare.base_url, protected_paths=[], owners=[])

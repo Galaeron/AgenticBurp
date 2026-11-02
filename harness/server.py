@@ -1518,7 +1518,7 @@ def _journal_context_key(config, req) -> str:
     seeds = [(s.method, s.url, hashlib.sha256((s.request_body or "").encode()).hexdigest())
              for s in (req.seed_exchanges or [])]
     limits = req.model_dump(exclude={"base_url", "roles", "seed_exchanges", "resume_job_id",
-                                     "protected_paths", "owners"})
+                                     "protected_paths", "owners", "use_saved_declarations"})
     key_inputs = [req.base_url, roles, seeds, limits]
     # I16: declarations change what confirms, so a declared list is part of the key;
     # none declared leaves the key exactly as it was before these fields existed.
@@ -1543,12 +1543,92 @@ class InvestigateRequest(_BaseModel):
     # equals investigate_engagement's own default, so omitting it changes nothing.
     discovery_max_probes: int = 6000
     resume_job_id: str | None = None
-    # I16: the operator's engagement declarations, for this run only (not stored).
+    # I16: the operator's engagement declarations for this run (saved lists apply
+    # only through use_saved_declarations below).
     # protected_paths: patterns in docs/PROTECTED_ROUTES.md syntax for this target;
     # owners: authz.owners entries ({path, owner | public | authenticated,
     # shared_with}). Malformed entries are ignored with a warning, never confirm.
     protected_paths: list[str] = Field(default_factory=list, max_length=1000)
     owners: list[dict] = Field(default_factory=list, max_length=1000)
+    # I16 persistence: opt in to the declarations saved for this target with
+    # PUT /engagement/{host}/declarations. Off by default: saved lists never apply
+    # to a request that did not ask. Per field, a non-empty request list REPLACES
+    # the saved one (never merged); an empty request field takes the saved list.
+    use_saved_declarations: StrictBool = False
+
+
+class DeclarationsRequest(_BaseModel):
+    base_url: str
+    protected_paths: list[str] = Field(default_factory=list, max_length=1000)
+    owners: list[dict] = Field(default_factory=list, max_length=1000)
+
+
+def _declarations_target(host: str, base_url: str) -> tuple[str, int]:
+    """(host, effective port) the saved declarations are keyed on, from base_url,
+    after checking the route host names the same host."""
+    from urllib.parse import urlsplit
+    from harness.protected_routes import _target_of
+    target = _target_of(base_url or "")
+    if target is None:
+        raise HTTPException(status_code=400, detail="base_url has no resolvable host and port")
+    route = urlsplit(host if "//" in host else f"//{host}").hostname or host.split(":", 1)[0]
+    if route.lower() != target[0]:
+        raise HTTPException(status_code=400,
+                            detail=f"route host {host!r} does not match base_url host {target[0]!r}")
+    return target
+
+
+def _validated_declarations(protected_paths: list, owners: list) -> None:
+    """422 unless every entry parses under the RV-S / RV-T grammars, so only route
+    patterns and identity labels are ever saved."""
+    from harness.protected_routes import parse_pattern
+    from harness.ownership_declarations import _entry
+    problems = []
+    for index, entry in enumerate(protected_paths):
+        try:
+            parse_pattern(entry)
+        except ValueError as exc:
+            problems.append(f"protected_paths[{index}]: {exc}")
+    for index, entry in enumerate(owners):
+        try:
+            _entry(entry)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            problems.append(f"owners[{index}]: {exc}")
+    if problems:
+        raise HTTPException(status_code=422, detail=problems[:20])
+
+
+@app.put("/engagement/{host}/declarations")
+async def engagement_declarations_save(host: str, req: DeclarationsRequest,
+                                       authorization: str | None = Header(default=None)):
+    """Explicitly save (replace) the operator's protected_paths and owners for one
+    target (I16). Saving applies them to nothing: an investigation uses them only
+    with use_saved_declarations. Empty lists for both clear the saved entry."""
+    _require_auth(authorization)
+    target = _declarations_target(host, req.base_url)
+    from harness.scope_lock import host_in_scope
+    allowed_hosts = {(h or "").lower() for h in (orchestrator.allowed_hosts or [])}
+    if not host_in_scope(req.base_url, allowed_hosts, active_mode=True):
+        raise HTTPException(status_code=403,
+                            detail=f"target {req.base_url!r} is not in pre-authorized scope")
+    _validated_declarations(req.protected_paths, req.owners)
+    await asyncio.to_thread(store.save_engagement_declarations, *target,
+                            protected_paths=req.protected_paths, owners=req.owners)
+    return {"host": target[0], "port": target[1], "saved": bool(req.protected_paths or req.owners),
+            "protected_paths": len(req.protected_paths), "owners": len(req.owners)}
+
+
+@app.get("/engagement/{host}/declarations")
+async def engagement_declarations_view(host: str, base_url: str = Query(max_length=2048),
+                                       authorization: str | None = Header(default=None)):
+    """The declarations saved for this target, or empty lists when none are."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    target = _declarations_target(host, base_url)
+    saved = await asyncio.to_thread(store.load_engagement_declarations, *target)
+    return {"host": target[0], "port": target[1], "saved": saved is not None,
+            "protected_paths": (saved or {}).get("protected_paths", []),
+            "owners": (saved or {}).get("owners", [])}
 
 
 @app.post("/engagement/{host}/investigate")
@@ -1599,6 +1679,26 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             status_code=403,
             detail=f"target {req.base_url!r} is not in pre-authorized scope "
                    f"(server.allowed_hosts); investigate cannot grant new scope")
+
+    # I16 persistence, opt-in only: resolve the saved declarations into the request
+    # before anything reads its lists (journal key, kwargs), so a run that opted in
+    # behaves exactly like one that sent the same lists itself.
+    declarations_source = None
+    if req.use_saved_declarations:
+        saved = await asyncio.to_thread(store.load_engagement_declarations,
+                                        *_declarations_target(host, req.base_url)) or {}
+        declarations_source = {}
+        update = {}
+        for _field in ("protected_paths", "owners"):
+            if getattr(req, _field):
+                declarations_source[_field] = "request"
+            elif saved.get(_field):
+                update[_field] = saved[_field]
+                declarations_source[_field] = "saved"
+            else:
+                declarations_source[_field] = "none"
+        if update:
+            req = req.model_copy(update=update)
 
     # P1-8 admission bound -- an ADDITIONAL gate that runs strictly AFTER
     # P1-7's route/base_url-consistency and pre-authorized-scope checks
@@ -1749,6 +1849,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                     **({'owners': req.owners} if req.owners else {}),
                     **({'coverage_checkpoint': coverage_checkpoint} if coverage_checkpoint is not None else {}))
             job["result"].setdefault("run_id", run_context.run_id)
+            if declarations_source is not None:
+                job["result"].setdefault("declarations_source", declarations_source)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
             job["result"].setdefault("request_count", run_context.budget.used)
             # Use the persisted, proof-resolved projection and this run only.
