@@ -27,13 +27,18 @@ interpretable denial (`_denial`): 401/403, a redirect to a login page, or a logi
 page. A 5xx, a transport failure or any other answer proves nothing about
 authorization (RV-D2 V1), and neither does an absent-id control that failed.
 
-This validator NEVER confirms (RV-D2 V2). One principal reading a protected
-object at another id cannot show the object belongs to someone else: alice may
-own orders 1 and 2. Its best result is an "inconclusive" candidate that names the
-missing evidence -- a second identity's session, so cross_identity can show the
-object's owner reads it and this principal should not, or a manual check. A
-capture with no credentials, a foreign object served to anyone, or a failed
-control is a weaker candidate.
+On its own this validator never confirms (RV-D2 V2). One principal reading a
+protected object at another id cannot show the object belongs to someone else:
+alice may own orders 1 and 2. Its best result is an "inconclusive" candidate that
+names the missing evidence -- a second identity's session, so cross_identity can
+show the object's owner reads it and this principal should not, or a manual check.
+A capture with no credentials, a foreign object served to anyone, or a failed
+control is a weaker candidate. The one exception is an ownership ledger that
+establishes the protected foreign object belongs to a DIFFERENT account: an
+operator declaration, or -- only when nothing is declared for it -- ownership the
+harness observed for its own test principals (self_ownership.py). The anonymous
+control still runs first, so an object also served without credentials is never
+confirmed whatever the ledger says.
 
 Off by default with the rest of the active validators (validators.active_enabled),
 scope-gated, GET-only.
@@ -183,9 +188,13 @@ class IdorReadValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 candidate_ids: list[str] | None = None):
+                 candidate_ids: list[str] | None = None, ownership=None, run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        # An optional principals.OwnershipLedger (declared + self-observed facts).
+        # None keeps the single-principal behaviour: never a confirmation.
+        self.ownership = ownership
+        self.run_context = run_context
         # Foreign object ids observed elsewhere in the run (e.g. usernames mined
         # from public content), tried in addition to numeric neighbours.
         self.candidate_ids = candidate_ids or []
@@ -212,6 +221,44 @@ class IdorReadValidator(Validator):
             if failures is not None:
                 failures.exception(SendFailures.label("GET", url), e)
             return None
+
+    async def _reader(self, exchange: HttpExchange):
+        """The principal whose credentials made the captured request: the run
+        session that owns them, else the capture's credential alias (provisional)."""
+        import asyncio
+        from harness import principals, store
+        from harness.run_context import current_run_context
+        ctx = self.run_context or current_run_context()
+        if ctx is not None:
+            ref, _ = ctx.sessions.bind_headers(exchange.request_headers or {})
+            session = ctx.sessions.get(ref)
+            if session is not None:
+                return session.principal or principals.Principal(
+                    id=session.principal_id, role=session.role or "user", provisional=True)
+        try:
+            pid = await asyncio.to_thread(store.captured_principal_id, exchange)
+        except Exception:
+            return None
+        return principals.Principal(id=pid, provisional=True)
+
+    async def _ownership_of(self, exchange: HttpExchange, url: str):
+        """(decision, source, provenance) for the captured principal reading `url`."""
+        from harness import principals
+        from harness.run_context import current_run_context
+        unknown = (principals.AuthzDecision.UNKNOWN, "none", "")
+        if self.ownership is None or not hasattr(self.ownership, "authorization_source"):
+            return unknown
+        reader = await self._reader(exchange)
+        if reader is None or reader.is_anonymous:
+            return unknown
+        ctx = self.run_context or current_run_context()
+        ref = principals.object_reference(url, run_id=getattr(ctx, "run_id", "") or "")
+        decision, source, provenance = self.ownership.authorization_source(reader, ref, "GET")
+        if decision == principals.AuthzDecision.UNAUTHORIZED and reader.provisional \
+                and source != "self_observed":
+            # A credential alias cannot be compared with a declared owner name.
+            return unknown
+        return decision, source, provenance
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
@@ -304,6 +351,28 @@ class IdorReadValidator(Validator):
                     f"the unauthenticated control read of the foreign object answered HTTP {s_a}, "
                     f"which is not an authorization denial (only 401/403, a redirect to a login "
                     f"page or a login page is), so the object was not shown to be protected")
+                continue
+            # The ledger may know whose object this is (declared first, then
+            # self-observed); only then can one principal's read be a crossing.
+            from harness.principals import AuthzDecision
+            decision, source, provenance = await self._ownership_of(exchange, foreign_url)
+            if decision == AuthzDecision.UNAUTHORIZED:
+                kind_label = "Self-observed" if source == "self_observed" else "Declared"
+                return ValidationResult(
+                    self.name, "confirmed", "idor", confidence=0.9, confirmed=True,
+                    summary=(f"IDOR confirmed: changing the {kind} id {key!r} returned another "
+                             f"account's protected object to this session"),
+                    evidence=(f"As the captured principal, {exchange.method} with the {kind} id "
+                              f"{key!r} set to a foreign value returned a substantive object "
+                              f"(HTTP {s_f}) that differs from this principal's own object and a "
+                              f"known-absent id (HTTP {s_miss}); the same read without credentials "
+                              f"was refused ({denied}). {kind_label} ownership places that object "
+                              f"with a different account than this principal's ({provenance}). The "
+                              f"other object's contents are redacted; the probe was read-only."))
+            if decision == AuthzDecision.AUTHORIZED:
+                candidate = candidate or (
+                    f"the foreign object belongs to this principal's own account by "
+                    f"{source.replace('_', '-')} ownership, so reading it is not a crossing")
                 continue
             # V2: the object is protected and this session reads it, but one
             # principal cannot show it belongs to someone else.

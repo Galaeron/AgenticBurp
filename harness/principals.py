@@ -220,8 +220,15 @@ class OwnershipLedger:
     def __init__(self) -> None:
         self._by_ref: dict[str, OwnershipFact] = {}
         self._patterns = []
+        # The run's self_ownership.SelfOwnership, or None: ownership the harness
+        # observed for its own principals, consulted only when nothing is declared.
+        self.self_observed = None
 
     def record(self, fact: OwnershipFact) -> OwnershipFact:
+        # Self-observed facts live only in SelfOwnership, which is fed by harness
+        # exchanges; one arriving here would outrank declarations, so refuse it.
+        if (fact.provenance or "").startswith("self_observed"):
+            raise ValueError("self_observed ownership is recorded from harness exchanges only")
         self._by_ref[fact.object_ref] = fact
         return fact
 
@@ -287,6 +294,24 @@ class OwnershipLedger:
 
     def owner_of(self, object_ref: str) -> OwnershipFact | None:
         return self.lookup(object_ref)
+
+    def authorization_source(self, principal: Principal, object_ref: str,
+                             method: str = "GET") -> tuple[AuthzDecision, str, str]:
+        """(decision, source, provenance). An operator declaration (or a recorded
+        experiment fact) for the object always decides -- source "declared". Only
+        when nothing is declared does self-observed ownership answer -- source
+        "self_observed"; otherwise "none"."""
+        if self.has_declaration(object_ref, method):
+            fact = self.lookup(object_ref, method)
+            return (self.authorization(principal, object_ref, method), "declared",
+                    fact.provenance if fact else "contradictory declarations")
+        if self.self_observed is not None:
+            match = re.search(r"\|resource:(.*)$", object_ref)
+            decision, provenance = self.self_observed.authorization(
+                principal, "http://self" + (match.group(1) if match else ""))
+            if provenance:
+                return decision, "self_observed", provenance
+        return AuthzDecision.UNKNOWN, "none", ""
 
     def authorization(self, principal: Principal, object_ref: str, method: str = "GET") -> AuthzDecision:
         fact = self.lookup(object_ref, method)
