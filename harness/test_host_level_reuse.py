@@ -512,7 +512,9 @@ class HostPolicyIssueTests(unittest.TestCase):
             self.assertEqual(canonicalize(spelling), "cors", spelling)
         self.assertEqual(canonicalize("csp"), "csp")                 # existing entries unchanged
         self.assertEqual(canonicalize("clickjacking"), "csp")
-        self.assertIsNone(canonicalize("missing security headers"))  # still ambiguous
+        # Finding dedup (2026-11-03): the generic wording is its own host-wide class,
+        # never folded into csp.
+        self.assertEqual(canonicalize("missing security headers"), "missing_headers")
 
     def test_thirty_findings_in_three_spellings_on_thirty_routes_are_one_issue(self):
         findings = [_csp_finding(i, _SPELLINGS[i % 3]) for i in range(30)]

@@ -40,6 +40,10 @@ CANONICAL_CATEGORIES: tuple[str, ...] = (
     "crypto", "csp", "header_injection", "api_security",
     "websocket", "race_condition", "deserialization",
     "session_fixation", "session_timeout", "reset_token", "dom_xss", "toctou",
+    # Finding dedup (juice-shop-8h, 2026-11-03): classes the model files often that had
+    # no canonical home, so every wording was its own class. No specialist agent or
+    # validator owns them yet; they exist for issue grouping and the coverage ledger.
+    "insecure_transport", "missing_headers", "bfla",
 )
 
 # Deliberately generous but not promiscuous: each entry is a phrase an
@@ -191,6 +195,33 @@ _SYNONYMS: dict[str, str] = {
     "behavioral anomaly": "anomaly", "suspicious behavior": "anomaly",
 }
 
+# Finding dedup (2026-11-03): phrases added after the stored finding fingerprint was
+# frozen. canonicalize() uses them; legacy_canonicalize() (store.finding_fingerprint)
+# does not, so suppressions/observations keyed on an existing fingerprint stay valid.
+# Never edit an entry of _SYNONYMS above to "fix" a mapping -- add the new reading here.
+_DEDUP_SYNONYMS: dict[str, str] = {
+    "insecure_transport": "insecure_transport", "insecure transport": "insecure_transport",
+    "insecure communication": "insecure_transport",
+    "insecure communications": "insecure_transport",
+    "cleartext transmission": "insecure_transport", "cleartext credentials": "insecure_transport",
+    "cleartext communication": "insecure_transport",
+    "plaintext transmission": "insecure_transport", "unencrypted communication": "insecure_transport",
+    "unencrypted transport": "insecure_transport", "man in the middle": "insecure_transport",
+    "mitm": "insecure_transport", "token transmission over http": "insecure_transport",
+    "token exposure over http": "insecure_transport",
+    "missing_headers": "missing_headers", "missing security headers": "missing_headers",
+    "missing security header": "missing_headers", "missing http security headers": "missing_headers",
+    "missing http security header": "missing_headers",
+    "security headers missing": "missing_headers", "missing_security_headers": "missing_headers",
+    "bfla": "bfla", "broken function level authorization": "bfla",
+    "broken function level authorisation": "bfla", "function level authorization": "bfla",
+    "broken function level access control": "bfla",
+    "missing function level access control": "bfla",
+    # Object-level only: bare "Broken Access Control" stays unmapped on purpose (it spans
+    # idor/auth/business_logic; test_categories and the generic-guess gate rely on it).
+    "broken object level access control": "idor",
+}
+
 
 def _normalize(text: str) -> str:
     """
@@ -210,6 +241,31 @@ def _normalize(text: str) -> str:
     return text.strip()
 
 
+# The canonical set before the finding-dedup classes were added (legacy fingerprint).
+_LEGACY_CATEGORIES = frozenset(CANONICAL_CATEGORIES) - {"insecure_transport", "missing_headers", "bfla"}
+
+
+def _lookup(key: str, categories, table: dict[str, str]) -> str | None:
+    if key in categories:
+        return key
+    if key in table:
+        return table[key]
+    normalized = _normalize(key)
+    if normalized in categories:
+        return normalized
+    return table.get(normalized)
+
+
+def _lookup_current(key: str) -> str | None:
+    return (_lookup(key, CANONICAL_CATEGORIES, _SYNONYMS)
+            or _lookup(key, CANONICAL_CATEGORIES, _DEDUP_SYNONYMS))
+
+
+# Umbrella terms left unmapped on purpose (see _DEDUP_SYNONYMS): as one part of a
+# compound label they make the whole label ambiguous, not a qualifier.
+_AMBIGUOUS_PARTS = frozenset({"broken access control"})
+
+
 def canonicalize(raw: str | None) -> str | None:
     """
     Map a free-text vulnerability_class to one of CANONICAL_CATEGORIES,
@@ -217,18 +273,34 @@ def canonicalize(raw: str | None) -> str | None:
     (rather than guessing) is deliberate: an unmapped category should
     surface as visibly uncategorized, not get silently absorbed into the
     nearest-sounding bucket.
+
+    A compound "A / B" label ("BOLA / IDOR", "Insecure Transport / Token
+    Exposure") maps when every part that maps at all names the SAME class;
+    unmapped parts are qualifiers. Parts naming two different classes
+    ("SQL Injection / XSS") return None, and so does a part
+    that is a deliberately unmapped umbrella term (_AMBIGUOUS_PARTS): it names
+    a class, just not one this taxonomy can pick.
     """
     if not raw:
         return None
     key = raw.strip().lower()
-    if key in CANONICAL_CATEGORIES:
-        return key
-    if key in _SYNONYMS:
-        return _SYNONYMS[key]
-    normalized = _normalize(key)
-    if normalized in CANONICAL_CATEGORIES:
-        return normalized
-    return _SYNONYMS.get(normalized)
+    whole = _lookup_current(key)
+    if whole or "/" not in key:
+        return whole
+    parts = [part.strip() for part in key.split("/") if part.strip()]
+    if any(_normalize(part) in _AMBIGUOUS_PARTS for part in parts):
+        return None
+    mapped = {c for c in (_lookup_current(part) for part in parts) if c}
+    return next(iter(mapped)) if len(mapped) == 1 else None
+
+
+def legacy_canonicalize(raw: str | None) -> str | None:
+    """canonicalize() as it was when store.finding_fingerprint was last re-keyed: the
+    original table only, no compound split. The stored fingerprint keys suppressions
+    and observations, so it must not move when the dedup reading improves."""
+    if not raw:
+        return None
+    return _lookup(raw.strip().lower(), _LEGACY_CATEGORIES, _SYNONYMS)
 
 
 # Distinctive, unambiguous class tokens an LLM commonly embeds in a specific
@@ -254,6 +326,7 @@ _DISTINCTIVE_TOKENS: dict[str, str] = {
     "rce": "command_injection",
     "cors": "cors",
     "clickjacking": "csp",
+    "bfla": "bfla",
 }
 
 _DISTINCTIVE_RE = re.compile(
@@ -290,4 +363,5 @@ def all_known_phrases() -> dict[str, str]:
     """
     table = {cat: cat for cat in CANONICAL_CATEGORIES}
     table.update(_SYNONYMS)
+    table.update(_DEDUP_SYNONYMS)
     return table
