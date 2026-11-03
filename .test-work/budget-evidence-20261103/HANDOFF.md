@@ -135,7 +135,12 @@ For the ffuf slice, run it with `GATE_SUMMARY=gates-ffuf.txt` and `GATE_TESTS` s
   - Pin it to a SecLists commit SHA, with a sha256 per file recorded beside `ffuf.Dockerfile`, checked by `harness.supply_chain`.
   - COPY it into the image as a second wordlist, so runs can pick it.
   - Nothing was downloaded or vendored here. Which lists, and what size cap?
-- **C. Image pinning.** The ffuf image is built locally, but its base images are still not digest-pinned (the P3-2 OWNER/LIVE note in `tools/ffuf.Dockerfile`). Pin them before enabling ffuf in runs, and re-run `python -m harness.supply_chain images --require-digest`.
+- **C. Image pinning.** ANSWERED (yes, unless the owner objects) and DONE:
+  - Both `FROM` lines in `tools/ffuf.Dockerfile` are pinned by digest: `golang:1.22-bookworm@sha256:3d699e4d…` and `debian:bookworm-slim@sha256:99c0b25c…`, resolved with `docker buildx imagetools inspect` on 2026-11-03. `python -m harness.supply_chain images --require-digest` lists both as pinned.
+  - Inside a run ffuf launches only by digest. `ffuf_runner.pin_image` pins a tag to its local image ID, or checks a configured `name@sha256` / `sha256:<id>` against the local image (it never pulls). The ToolBroker runs with `require_digest=True`.
+  - New key `engagement.discovery_ffuf_image`, default `""`, which means "the local `harness/ffuf:2.1.0`, pinned to its image ID at launch". A wrong or absent digest skips ffuf with a reason.
+  - Live check: the image was rebuilt as `sha256:fb05cf06…`; see `live-ffuf-pin.txt` and `live-ffuf-proxy-pinned.txt` (PASS, budget_used == probes_sent). The in-image SecLists hash equals the lock.
+  - Still unpinned: `tools/sqlmap.Dockerfile` (`python:3.12-slim`), which is outside this item's scope.
 - **D. Container to proxy reachability.** The proxy binds 127.0.0.1 on the host. The container reaches it as `host.docker.internal`, which works on Docker Desktop and is the same assumption sqlmap's proxied container run makes. VERIFIED after B: a real Docker 29.8.2 run of the rebuilt image, through the proxy, against the owned SPA fixture. Every request was charged (budget_used == probes_sent, target GETs <= budget) for both wordlists; see `live-ffuf-proxy.txt` and `live_ffuf_proxy_check.py`. At a 3000-probe budget, ffuf's ~1652-request share ends partway through either alphabetical list. The SecLists run therefore never reached the fixture's `/api/items`, which is the truncation trade-off. A target with real juice-shop budgets still needs the live run.
 - **E. A budget stop loses ffuf's partial hits.** When the run budget or a cancel stops ffuf mid-scan, its partial JSON is discarded as an error. The paths it sent are still marked covered. Should partial hits be salvaged?
 

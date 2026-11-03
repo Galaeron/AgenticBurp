@@ -925,14 +925,17 @@ class ChainMixin:
 
     def _discovery_ffuf_kw(self) -> dict:
         """engagement.discovery_ffuf (default off) and, when it is on, a non-default
-        engagement.discovery_ffuf_wordlist; passed on only when they differ."""
+        engagement.discovery_ffuf_wordlist / discovery_ffuf_image; passed on only
+        when they differ."""
         cfg = self.config if isinstance(self.config, dict) else {}
         eng = cfg.get("engagement") or {}
         if not eng.get("discovery_ffuf"):
             return {}
         wordlist = str(eng.get("discovery_ffuf_wordlist") or "harness")
+        image = str(eng.get("discovery_ffuf_image") or "")
         return {"discovery_ffuf": True,
-                **({"discovery_ffuf_wordlist": wordlist} if wordlist != "harness" else {})}
+                **({"discovery_ffuf_wordlist": wordlist} if wordlist != "harness" else {}),
+                **({"discovery_ffuf_image": image} if image else {})}
 
     # Roles registered as replay identities below are owned by this engagement
     # and released when it ends (never leak into a later engagement on the host).

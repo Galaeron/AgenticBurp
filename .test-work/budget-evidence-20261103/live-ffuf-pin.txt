@@ -1,0 +1,5 @@
+tag -> sha256:fb05cf0628fcb446625dc38137f3deeec7c0e20adff9a412f7017ef7446d376a (harness/ffuf:2.1.0 pinned to local image ID sha256:fb05cf0628fcb446625dc38137f3deeec7c0e20adff9a412f7017ef7446d376a)
+pinned ID verifies locally: True
+repo digest harness/ffuf@sha256:fb05cf0628fcb446625dc38137f3deeec7c0e20adff9a412f7017ef7446d376a -> PASS (harness/ffuf@sha256:fb05cf0628fcb446625dc38137f3deeec7c0e20adff9a412f7017ef7446d376a (digest matches))
+wrong digest -> PASS (refused) ('harness/ffuf@sha256:0000000000000000000000000000000000000000000000000000000000000000' is not present locally (no pull attempted))
+broker with unpinned tag -> PASS (refused)

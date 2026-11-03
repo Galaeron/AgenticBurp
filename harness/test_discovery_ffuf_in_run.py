@@ -32,6 +32,8 @@ from harness.run_context import RunContext
 from harness.test_discovery_spa_wildcards import _SpaCatchAll
 
 _REAL_POPEN = subprocess.Popen
+_IMAGE_ID = "sha256:" + "1f" * 32
+_REPO_DIGEST = "sha256:" + "ab" * 32
 
 _FAKE_FFUF = r'''
 import base64, json, os, sys, urllib.error, urllib.request
@@ -73,6 +75,8 @@ class FfufInRunTests(unittest.TestCase):
         Path(self.wordlist).write_text("\n".join(self.WORDS), encoding="utf-8")
         self.env = {"FAKE_FFUF_WORDLIST": self.wordlist}
         self.launched: list[list[str]] = []
+        # What `docker image inspect` reports for the local image: (ID, RepoDigests).
+        self.local_image = (_IMAGE_ID, [f"harness/ffuf@{_REPO_DIGEST}"])
         fixture = self
 
         class _SwapPopen(_REAL_POPEN):
@@ -87,6 +91,8 @@ class FfufInRunTests(unittest.TestCase):
         self._patches = [patch("subprocess.Popen", _SwapPopen),
                          patch.object(tool_runner, "available", return_value=(True, "")),
                          patch.object(tool_runner, "image_present", return_value=True),
+                         patch.object(tool_runner, "local_image_digests",
+                                      side_effect=lambda image, timeout=10.0: self.local_image),
                          patch.object(tool_runner, "_force_remove", return_value=True)]
         for p in self._patches:
             p.start()
@@ -205,6 +211,42 @@ class FfufInRunTests(unittest.TestCase):
                              ffuf_wordlist="/etc/passwd")
         self.assertEqual(self.launched, [])
 
+    def test_a_tag_runs_pinned_to_its_local_image_id(self):
+        result, _ = self._discover()
+        args = self.launched[0]
+        self.assertIn(_IMAGE_ID, args)
+        self.assertFalse(any(a.startswith("harness/ffuf") for a in args), args)
+        self.assertTrue(any(f"pinned to local image ID {_IMAGE_ID}" in e for e in result.errors),
+                        result.errors)
+
+    def test_a_configured_digest_that_matches_the_local_image_runs(self):
+        ref = f"harness/ffuf@{_REPO_DIGEST}"
+        result, run = self._discover(ffuf_image=ref)
+        self.assertIn(ref, self.launched[0])
+        self.assertChargedToTheRun(result, run)
+
+    def test_a_digest_the_local_image_does_not_carry_launches_nothing(self):
+        result, run = self._discover(ffuf_image="harness/ffuf@sha256:" + "cd" * 32)
+        self.assertEqual(self.launched, [])
+        self.assertTrue(any(e.startswith("ffuf skipped: image not pinned by digest")
+                            for e in result.errors), result.errors)
+        self.assertEqual(result.ffuf_requests, 0)
+        self.assertChargedToTheRun(result, run)
+
+    def test_an_image_absent_locally_launches_nothing(self):
+        self.local_image = None
+        result, _ = self._discover()
+        self.assertEqual(self.launched, [])
+        self.assertTrue(any("not present locally" in e for e in result.errors), result.errors)
+
+    def test_removing_the_pin_is_refused_by_the_broker(self):
+        """Fault injection: an unpinned tag reaching the launch is refused, not run."""
+        from harness import ffuf_runner
+        with patch.object(ffuf_runner, "pin_image", return_value=("harness/ffuf:2.1.0", "unpinned")):
+            result, _ = self._discover()
+        self.assertEqual(self.launched, [])
+        self.assertTrue(any("not pinned by digest" in e for e in result.errors), result.errors)
+
     def test_negative_control_ffuf_stays_off_in_runs_by_default(self):
         result, run = self._discover(ffuf_in_runs=False)
         self.assertEqual(self.launched, [])
@@ -233,11 +275,20 @@ class DiscoveryFfufConfigTests(unittest.TestCase):
         self.assertEqual(self._kw({"discovery_ffuf": True, "discovery_ffuf_wordlist": "seclists"}),
                          {"discovery_ffuf": True, "discovery_ffuf_wordlist": "seclists"})
 
+    def test_a_configured_image_is_passed_only_when_set(self):
+        self.assertEqual(self._kw({"discovery_ffuf": True, "discovery_ffuf_image": ""}),
+                         {"discovery_ffuf": True})
+        ref = "harness/ffuf@" + _REPO_DIGEST
+        self.assertEqual(self._kw({"discovery_ffuf": True, "discovery_ffuf_image": ref}),
+                         {"discovery_ffuf": True, "discovery_ffuf_image": ref})
+        self.assertEqual(self._kw({"discovery_ffuf": False, "discovery_ffuf_image": ref}), {})
+
     def test_committed_config_keeps_the_current_behaviour(self):
         import yaml
         cfg = yaml.safe_load((Path(__file__).resolve().parent / "config.yaml").read_text(encoding="utf-8"))
         self.assertIs(cfg["engagement"]["discovery_ffuf"], False)
         self.assertEqual(cfg["engagement"]["discovery_ffuf_wordlist"], "harness")
+        self.assertEqual(cfg["engagement"]["discovery_ffuf_image"], "")
 
 
 if __name__ == "__main__":

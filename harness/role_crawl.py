@@ -621,6 +621,7 @@ async def crawl_roles(
     seed_paths: list[str] | None = None,
     discovery_ffuf: bool = False,
     discovery_ffuf_wordlist: str = "harness",
+    discovery_ffuf_image: str = "harness/ffuf:2.1.0",
 ) -> RoleCrawlResult:
     """Crawl `base_url` once per role, union the surface, probe every endpoint
     with every role, and derive auth-bypass + IDOR candidates from the matrix.
@@ -738,6 +739,7 @@ async def crawl_roles(
                                             run_context=run_context,
                                             ffuf_in_runs=discovery_ffuf,
                                             ffuf_wordlist=discovery_ffuf_wordlist,
+                                            ffuf_image=discovery_ffuf_image,
                                             session_ref=(session_refs[roles.index(sr)]
                                                          if session_refs is not None else None))
                     sres = await disc.discover()

@@ -715,6 +715,13 @@ class SurfaceDiscovery:
             if share <= 0:
                 result.errors.append("ffuf skipped: no discovery budget left")
                 return 0
+            # Inside a run ffuf launches only by digest (owner decision, #28): a
+            # configured name@sha256 must match the local image, a tag is pinned to
+            # its local image ID; the broker refuses anything unpinned.
+            pinned, pin_reason = ffuf_runner.pin_image(self.ffuf_image)
+            if pinned is None:
+                result.errors.append(f"ffuf skipped: image not pinned by digest: {pin_reason}")
+                return 0
             from harness import tool_runner
             from harness.tool_proxy import ToolProxy
             run = self.run_context
@@ -722,7 +729,7 @@ class SurfaceDiscovery:
                                     max_forwarded=share).start()
             try:
                 ffuf_result = await ffuf_runner.ffuf_discover(
-                    proxy.url_for(self.base_url + "/"), image=self.ffuf_image,
+                    proxy.url_for(self.base_url + "/"), image=pinned, require_digest=True,
                     headers=self.headers or None, filter_size=self._soft404_bytes,
                     wordlist=self.ffuf_wordlist,
                     cancel=lambda: run.cancel.cancelled or proxy.stop_requested,
@@ -735,7 +742,7 @@ class SurfaceDiscovery:
             covered = {path[len(base_path):] for path in proxy.forwarded_paths
                        if path.startswith(base_path + "/")}
             capped = proxy.refused.get("tool_cap", 0)
-            note = f"ffuf sent {proxy.forwarded} request(s) through the run"
+            note = f"ffuf ({pin_reason}) sent {proxy.forwarded} request(s) through the run"
             if capped:
                 note += f"; {capped} wordlist request(s) past its share were not sent"
             if proxy.stop_reason:

@@ -74,6 +74,7 @@ async def build_engagement(
     driver_capture_config=None,
     discovery_ffuf: bool = False,
     discovery_ffuf_wordlist: str = "harness",
+    discovery_ffuf_image: str = "",
 ) -> tuple[engagement.EngagementState, role_crawl.RoleCrawlResult]:
     """Discover + build the access matrix + fuse into an EngagementState.
 
@@ -174,6 +175,7 @@ async def build_engagement(
         **({"discovery_ffuf": True} if discovery_ffuf else {}),
         **({"discovery_ffuf_wordlist": discovery_ffuf_wordlist}
            if discovery_ffuf_wordlist != "harness" else {}),
+        **({"discovery_ffuf_image": discovery_ffuf_image} if discovery_ffuf_image else {}),
     )
 
     state = engagement.EngagementState(host=host or _host_of(base_url))

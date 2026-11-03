@@ -328,6 +328,11 @@ engagement:
   # hash-pinned SecLists subset in tools/ffuf-seclists.lock.json, verified by
   # `python -m harness.supply_chain wordlists`). Only read when discovery_ffuf is on.
   discovery_ffuf_wordlist: harness
+  # The ffuf image runs inside a run only by digest. Empty (the default): the
+  # local harness/ffuf:2.1.0 is pinned to its image ID at launch. Or set an
+  # audited build, harness/ffuf@sha256:<digest> or sha256:<image id>; it must match
+  # the local image (never pulled) or ffuf is skipped. Only read with discovery_ffuf.
+  discovery_ffuf_image: ""
   coverage_leg_budget: 80
   # Case-granular driving (coverage_drive_cases) dispatches ssti, command injection
   # and sqlmap once per parameter; coverage_parameter_field_cap caps how many

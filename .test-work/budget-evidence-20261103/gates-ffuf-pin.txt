@@ -1,0 +1,7 @@
+py312 precondition exit=0 Ran 74 tests in 0.850s OK
+py312 touched exit=0 Ran 224 tests in 161.344s OK
+py312 smoke exit=0 Ran 149 tests in 95.600s OK
+py314 precondition exit=0 Ran 74 tests in 0.732s OK
+py314 touched exit=0 Ran 224 tests in 237.132s OK
+py314 smoke exit=0 Ran 149 tests in 97.980s OK
+diff-check exit=0
