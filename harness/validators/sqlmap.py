@@ -343,6 +343,41 @@ def _points_evidence(points: list[dict], tail: str, differential: str = "") -> s
     return "\n".join(lines) + f"\n{_TAIL_MARKER}\n" + tail
 
 
+# sqlmap's own conclusions: its warning/critical/error lines and any line about
+# injectability. The decision lines come LAST in its output, after an early
+# "heuristics detected ... WAF/IPS" line, so a head-truncated copy (the ledger keeps
+# 1000 characters) lost the verdict on every not-confirmed run of the 8h juice-shop run.
+_VERDICT_LINE = re.compile(r"\[(?:WARNING|CRITICAL|ERROR)\]|injectable|is vulnerable", re.I)
+_LOG_TIME = re.compile(r"^\s*\[\d{2}:\d{2}:\d{2}\]\s*")
+_VERDICT_MARKER = "sqlmap verdict:"
+_MAX_VERDICT_LINES = 6
+_VERDICT_LINE_CAP = 160
+
+
+def verdict_lines(output: str) -> list[str]:
+    """sqlmap's last few distinct verdict lines, oldest first, without timestamps."""
+    picked: list[str] = []
+    for line in reversed((output or "").splitlines()):
+        if not _VERDICT_LINE.search(line):
+            continue
+        text = _LOG_TIME.sub("", line).strip()[:_VERDICT_LINE_CAP]
+        if text and text not in picked:
+            picked.append(text)
+            if len(picked) == _MAX_VERDICT_LINES:
+                break
+    return picked[::-1]
+
+
+def _verdict_evidence(output: str) -> tuple[str, str]:
+    """(evidence, limitation) for a run sqlmap did not confirm: the parsed verdict
+    lines first, so any head-truncated copy keeps them, then the output tail."""
+    lines = verdict_lines(output)
+    if not lines:
+        return output, ""
+    return (f"{_VERDICT_MARKER}\n" + "\n".join(lines) + f"\n{_TAIL_MARKER}\n" + output,
+            "sqlmap: " + "; ".join(lines))
+
+
 class SqlmapValidator(Validator):
     """Optional active SQLi validator.
 
@@ -775,6 +810,7 @@ class SqlmapValidator(Validator):
             confirmed = proc.returncode == 0 and "is vulnerable" in lower
             if confirmed:
                 return await self._sqlmap_confirmation(finding, exchange, output, cmd)
+            verdict_evidence, verdict = _verdict_evidence(output)
             if proxy is not None and proxy.stop_reason:
                 # The run refused part of the scan: an incomplete scan is not a negative.
                 why = _PROXY_STOP_WHY.get(proxy.stop_reason, "the run was cancelled")
@@ -782,7 +818,7 @@ class SqlmapValidator(Validator):
                     self.name, "skipped", finding.vulnerability_class,
                     summary=f"sqlmap incomplete: {why} after {proxy.forwarded} request(s) "
                             "were sent through the run -- not a negative result",
-                    evidence=output, raw_output=output, command=cmd)
+                    evidence=verdict_evidence, raw_output=output, command=cmd, limitation=verdict)
             # Secondary confirmation for auth/login endpoints (HANDOVER_6 §3/§6.3):
             # sqlmap's own analysis is fragile on a valid-cred (2xx) login capture
             # even with --ignore-code, because it must infer the 2xx<->401 flip
@@ -805,14 +841,15 @@ class SqlmapValidator(Validator):
                     self.name, "inconclusive", finding.vulnerability_class,
                     summary=f"sqlmap did not find parameter {only[0][1]!r} to test "
                             "-- not a negative result",
-                    evidence=output, raw_output=output, command=cmd,
-                    control_outcome=NAMED_PARAMETER_UNTESTED)
+                    evidence=verdict_evidence, raw_output=output, command=cmd,
+                    control_outcome=NAMED_PARAMETER_UNTESTED, limitation=verdict)
             return ValidationResult(
                 self.name, "not_confirmed", finding.vulnerability_class,
                 confidence=0.2 if proc.returncode == 0 else 0.0,
                 confirmed=False,
-                summary="sqlmap did not establish SQL injection for the captured request",
-                evidence=output, raw_output=output, command=cmd,
+                summary="sqlmap did not establish SQL injection for the captured request"
+                        + (f" ({verdict_lines(output)[-1]})" if verdict else ""),
+                evidence=verdict_evidence, raw_output=output, command=cmd, limitation=verdict,
             )
 
     async def _sqlmap_confirmation(self, finding: Finding, exchange: HttpExchange,

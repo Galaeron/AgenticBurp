@@ -13,7 +13,8 @@ import functools
 
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 from harness.execution_registry import ExecutionRegistry
-from harness.validators.base import ValidationResult, observed_result_of, proof_artifact_kwargs
+from harness.validators.base import (ValidationResult, observed_result_of, proof_artifact_kwargs,
+                                     proof_limitation_of)
 
 
 def _fallback_result_binds(result, routed) -> bool:
@@ -308,6 +309,7 @@ class ConfirmMixin:
                 validator_version=getattr(result, "version", "") or "",
                 status=result.status, confirmed=result.confirmed,
                 observed_result=observed_result_of(result),
+                limitation=proof_limitation_of(result),
                 **proof_artifact_kwargs(result))
             ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
             if ok:
@@ -326,6 +328,7 @@ class ConfirmMixin:
         finding_ref: str, ledger_summary: str, ledger_data: dict,
         validator_version: str = "", observed_result: str = "",
         expected_invariant: str = "", proof_artifacts: dict | None = None,
+        limitation: str = "",
     ) -> tuple[bool, dict | None, str]:
         """RB-4/INV-2 shared proof+ledger persistence.
 
@@ -362,7 +365,8 @@ class ConfirmMixin:
         pr = evidence.ProofRecord.from_validation_result(
             case=case, validator=validator_name, validator_version=validator_version,
             status=status, confirmed=confirmed, observed_result=observed_result,
-            expected_invariant=expected_invariant, **(proof_artifacts or {}))
+            expected_invariant=expected_invariant, limitation=limitation,
+            **(proof_artifacts or {}))
         ok, reason = await asyncio.to_thread(store.persist_proof_record, pr)
         if ok:
             return True, pr.to_dict(), reason
@@ -603,7 +607,8 @@ class ConfirmMixin:
                         case=case,
                         validator=getattr(validator, "name", "validator"),
                         validator_version=getattr(validator, "version", ""),
-                        status="error", confirmed=False, observed_result=str(result)[:300])
+                        status="error", confirmed=False, observed_result=str(result)[:300],
+                        limitation=summary)
                     ok, reason = await asyncio.to_thread(store.persist_proof_record, ep)
                     if ok:
                         proofs.append(ep.to_dict())
@@ -711,6 +716,7 @@ class ConfirmMixin:
                     observed_result=observed_result_of(result),
                     expected_invariant=getattr(validator, "expected_invariant", ""),
                     proof_artifacts=proof_artifact_kwargs(result),
+                    limitation=proof_limitation_of(result),
                     finding_ref=finding.finding_id,
                     ledger_summary=(
                         f"{result.validator}: {result.status}"

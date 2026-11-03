@@ -46,6 +46,10 @@ class ValidationResult:
     # (header_fingerprint below), so findings of one host-wide policy group as one
     # issue. "" when the validator is not a header check or saw no response.
     header_fingerprint: str = ""
+    # Why this attempt did not reach a decision, in the validator's own words (e.g.
+    # sqlmap's verdict lines). Copied onto the ProofRecord's `limitation` by
+    # proof_limitation_of; "" lets the summary stand in.
+    limitation: str = ""
 
     def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
         """Name the sends behind this verdict; each is an ExecutionOutcome, a
@@ -107,6 +111,23 @@ def proof_artifact_kwargs(result) -> dict:
     if policy:
         kwargs["policy_fingerprint"] = policy
     return kwargs
+
+
+def proof_limitation_of(result, limit: int = 500) -> str:
+    """ProofRecord.limitation for a result that is not a confirmation: the
+    validator's own `limitation`, else its summary, else its evidence's first line,
+    with the status and any control outcome. Before this every inconclusive proof
+    of the 8h juice-shop run carried only the generic legacy note, and the real
+    reason was left in the VALIDATION_DECISION ledger."""
+    status = (getattr(result, "status", "") or "").lower()
+    if getattr(result, "confirmed", False) or status == "confirmed":
+        return ""
+    reason = (getattr(result, "limitation", "") or getattr(result, "summary", "") or
+              next(iter((getattr(result, "evidence", "") or "").strip().splitlines()), "") or
+              "the validator gave no reason")
+    control = getattr(result, "control_outcome", "") or ""
+    head = f"{status or 'unknown'}" + (f" [{control}]" if control else "")
+    return f"{head}: {' '.join(str(reason).split())}"[:limit]
 
 
 def header_fingerprint(*values: str | None) -> str:

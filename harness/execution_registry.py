@@ -43,6 +43,12 @@ SHAPE_KEYED = frozenset({
     "sqlmap", "command_injection", "ssti", "xxe", "nosql",
     "header_injection_validator", "verbose_error_validator",
 })
+# Tool scans that test EVERY parameter of the request whatever parameter the finding
+# named (sqlmap runs without -p unless parameter_only), so the named parameter is not
+# part of their key; identity (R03) and workflow state still are. The 8h juice-shop
+# run re-ran sqlmap on one request shape because findings named different parameters
+# (path id, query d, none) -- up to ~2.3k requests per rerun.
+TOOL_SCAN_KEYED = frozenset({"sqlmap"})
 # Validators whose verdict is a fact about a route's response headers (E2).
 HEADER_CHECKED = frozenset({"csp_validator", "cors_validator"})
 # Not shape-keyed although they test parameters: ssrf, open_redirect, path_traversal
@@ -139,13 +145,20 @@ class _Stored:
 
 
 def _conditions(validator, finding=None) -> dict:
+    if (getattr(validator, "name", "") in TOOL_SCAN_KEYED
+            and not getattr(finding, "parameter_only", False)):
+        # The scan tests every parameter, whichever one the finding named.
+        parameter = ("", "")
+    else:
+        parameter = (str(getattr(finding, "parameter_location", "") or "").strip().lower(),
+                     str(getattr(finding, "parameter_name", "") or "").strip())
+        # A parameter-only run tests nothing else, so it never
+        # stands in for a named-first run (or the reverse).
+        if getattr(finding, "parameter_only", False):
+            parameter += ("only",)
     return {"mechanism_version": str(getattr(validator, "mechanism_version", "1") or "1"),
             "state": str(getattr(finding, "workflow_state_id", "") or ""),
-            "parameter": (str(getattr(finding, "parameter_location", "") or "").strip().lower(),
-                          str(getattr(finding, "parameter_name", "") or "").strip())
-                         # A parameter-only run tests nothing else, so it never
-                         # stands in for a named-first run (or the reverse).
-                         + (("only",) if getattr(finding, "parameter_only", False) else ())}
+            "parameter": parameter}
 
 
 class ExecutionRegistry:

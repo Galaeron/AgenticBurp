@@ -708,3 +708,61 @@ class ContainerEgressRoutingTests(unittest.IsolatedAsyncioTestCase):
         mraw.assert_not_called()
         self.assertEqual(result.status, "confirmed")
         self.assertTrue(result.confirmed)
+
+
+class SqlmapVerdictEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    """The ledger keeps only evidence[:1000], and sqlmap's own verdict comes last in
+    a ~7k log (the 8h juice-shop run lost every one of them). The verdict lines now
+    lead the evidence and ride on the result as its limitation. Docker is mocked."""
+
+    _LOG = "\n".join(
+        ["[12:00:01] [INFO] testing connection to the target URL",
+         "[12:00:02] [WARNING] it appears that the target is protected by some kind of WAF/IPS"]
+        + [f"[12:00:{i % 60:02d}] [INFO] testing 'payload variant {i}'" for i in range(120)]
+        + ["[12:09:58] [WARNING] GET parameter 'id' does not seem to be injectable",
+           "[12:09:59] [CRITICAL] all tested parameters do not appear to be injectable. "
+           "Try to increase values for '--level'/'--risk' options"])
+
+    def test_verdict_lines_are_the_last_distinct_flagged_lines_without_timestamps(self):
+        from harness.validators.sqlmap import verdict_lines
+        lines = verdict_lines(self._LOG)
+        self.assertEqual(lines[-1][:60],
+                         "[CRITICAL] all tested parameters do not appear to be injecta")
+        self.assertIn("[WARNING] GET parameter 'id' does not seem to be injectable", lines)
+        self.assertFalse(any(line.startswith("[12:") for line in lines))
+        self.assertEqual(verdict_lines("[INFO] nothing to see\nplain line"), [])
+
+    async def test_not_confirmed_scan_keeps_its_final_verdict_in_the_first_1000_chars(self):
+        from harness import tool_runner
+        self.assertGreater(len(self._LOG), 4000)
+        self.assertNotIn("all tested parameters", self._LOG[:1000])
+        validator = SqlmapValidator(binary="sqlmap", container_image="sqlmap:test",
+                                    allowed_hosts=["127.0.0.1"])
+        exchange = HttpExchange(url="http://127.0.0.1:5000/item?id=1", method="GET",
+                                request_headers={}, response_status=200)
+        with patch.object(tool_runner, "available", return_value=(True, "27")), \
+                patch.object(tool_runner, "run", return_value=(0, self._LOG, "")):
+            result = await validator.validate(_finding(), exchange)
+        self.assertFalse(result.confirmed)
+        head = result.evidence[:1000]
+        self.assertIn("all tested parameters do not appear to be injectable", head)
+        self.assertIn("WAF/IPS", head)
+        self.assertIn("all tested parameters do not appear", result.limitation)
+        self.assertTrue(result.limitation.startswith("sqlmap: "), result.limitation)
+        # The full log is still there, after the verdict block.
+        self.assertIn("payload variant 119", result.evidence)
+        self.assertEqual(result.raw_output.strip(), self._LOG.strip())
+
+    async def test_negative_control_a_log_without_verdict_lines_is_left_as_is(self):
+        from harness import tool_runner
+        log = "\n".join(f"[12:00:{i:02d}] [INFO] testing 'variant {i}'" for i in range(40))
+        validator = SqlmapValidator(binary="sqlmap", container_image="sqlmap:test",
+                                    allowed_hosts=["127.0.0.1"])
+        exchange = HttpExchange(url="http://127.0.0.1:5000/item?id=1", method="GET",
+                                request_headers={}, response_status=200)
+        with patch.object(tool_runner, "available", return_value=(True, "27")), \
+                patch.object(tool_runner, "run", return_value=(0, log, "")):
+            result = await validator.validate(_finding(), exchange)
+        self.assertFalse(result.confirmed)
+        self.assertEqual(result.limitation, "")
+        self.assertNotIn("sqlmap verdict:", result.evidence)
