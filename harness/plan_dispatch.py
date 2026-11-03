@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import re
 
-from harness.categories import canonicalize
+from harness.categories import canonicalize, legacy_canonicalize
 from harness.models import AgentReport, Finding, HttpExchange, TestPlan
 
 log = logging.getLogger(__name__)
@@ -237,7 +237,10 @@ _FOLLOWUP_CONFIDENCE_CAP = 0.35
 def injection_classes(finding: Finding) -> list[str]:
     """Injection classes the model named for this finding that its own class
     does not already route to."""
-    own = canonicalize(finding.vulnerability_class or "")
+    # The strict single-class reading: a compound label such as
+    # "Authentication Bypass / SQL Injection" names no parameter, so it still gets
+    # per-parameter follow-ups even though the dedup reading files it under sqli.
+    own = legacy_canonicalize(finding.vulnerability_class or "")
     text = " ".join([finding.vulnerability_class or "", finding.summary or ""])
     found: list[str] = []
     for cls, rx in _INJECTION_TOKENS:

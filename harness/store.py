@@ -320,6 +320,20 @@ CREATE TABLE IF NOT EXISTS finding_inputs (
 );
 """
 
+# Plan dispatch (2026-11-03): why the harness bound, ran or could not run a
+# planner plan (plan_dispatch). Versioned additive side table keyed on
+# test_plans.plan_id plus the 'plan-dispatch-schema' marker; test_plans itself is
+# not altered. Rollback: DROP TABLE plan_dispatch_notes and delete the marker; the
+# previous build never reads either.
+_PLAN_DISPATCH_VERSION = 1
+_PLAN_DISPATCH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plan_dispatch_notes (
+    plan_id TEXT PRIMARY KEY,
+    note TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+"""
+
 # P0-1: the durable stream for harness.evidence_ledger.EvidenceLedger. Append-only
 # (event_id is the primary key and every write is INSERT OR IGNORE -- a caller
 # re-persisting the same event, e.g. after a retry, is a no-op, never an overwrite)
@@ -613,6 +627,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_PROOF_IDENTITY_SCHEMA)
     conn.executescript(_DECLARATIONS_SCHEMA)
     conn.executescript(_FINDING_INPUTS_SCHEMA)
+    conn.executescript(_PLAN_DISPATCH_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
@@ -630,6 +645,8 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
                  (str(_DECLARATIONS_VERSION),))
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('finding-inputs-schema', ?)",
                  (str(_FINDING_INPUTS_VERSION),))
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('plan-dispatch-schema', ?)",
+                 (str(_PLAN_DISPATCH_VERSION),))
     ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
@@ -654,7 +671,6 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
         ("severity", "ALTER TABLE test_plans ADD COLUMN severity TEXT NOT NULL DEFAULT ''"),
         ("confidence", "ALTER TABLE test_plans ADD COLUMN confidence REAL NOT NULL DEFAULT 0.0"),
         ("escalated", "ALTER TABLE test_plans ADD COLUMN escalated INTEGER NOT NULL DEFAULT 0"),
-        ("dispatch_note", "ALTER TABLE test_plans ADD COLUMN dispatch_note TEXT NOT NULL DEFAULT ''"),
     ]:
         if col not in plan_cols:
             conn.execute(ddl)
@@ -1758,8 +1774,9 @@ def record_plan_dispatch(plan_id: str, *, status: str, validator: str, summary: 
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (plan_id, out_status, confidence, int(bool(confirmed) and not observed),
              f"{note}: {summary}" if summary else note, evidence or "", time.time()))
-        conn.execute("UPDATE test_plans SET status = ?, dispatch_note = ? WHERE plan_id = ?",
-                     (out_status, note, plan_id))
+        conn.execute("UPDATE test_plans SET status = ? WHERE plan_id = ?", (out_status, plan_id))
+        conn.execute("INSERT OR REPLACE INTO plan_dispatch_notes VALUES (?, ?, ?)",
+                     (plan_id, note, time.time()))
         conn.commit()
         return True, "accepted"
     finally:
@@ -1773,8 +1790,11 @@ def mark_plan_not_dispatchable(plan_id: str, reason: str) -> bool:
     conn = _connect()
     try:
         cur = conn.execute(
-            "UPDATE test_plans SET status = 'not_dispatchable', dispatch_note = ? "
-            "WHERE plan_id = ? AND status = 'proposed'", (reason[:300], plan_id))
+            "UPDATE test_plans SET status = 'not_dispatchable' "
+            "WHERE plan_id = ? AND status = 'proposed'", (plan_id,))
+        if cur.rowcount > 0:
+            conn.execute("INSERT OR REPLACE INTO plan_dispatch_notes VALUES (?, ?, ?)",
+                         (plan_id, reason[:300], time.time()))
         conn.commit()
         return cur.rowcount > 0
     finally:
@@ -1786,8 +1806,9 @@ def plan_dispatch_notes(host: str) -> list[dict]:
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT plan_id, capability, finding_class, status, dispatch_note FROM test_plans "
-            "WHERE host = ? ORDER BY created_at", (host,)).fetchall()
+            "SELECT p.plan_id, p.capability, p.finding_class, p.status, COALESCE(n.note, '') "
+            "FROM test_plans p LEFT JOIN plan_dispatch_notes n ON n.plan_id = p.plan_id "
+            "WHERE p.host = ? ORDER BY p.created_at", (host,)).fetchall()
     finally:
         conn.close()
     return [{"plan_id": r[0], "capability": r[1], "finding_class": r[2], "status": r[3],
@@ -3466,6 +3487,8 @@ def wipe_engagement(host: str) -> dict:
         )
         counts["validation_runs"] = cur.rowcount
 
+        conn.execute("DELETE FROM plan_dispatch_notes WHERE plan_id IN "
+                     "(SELECT plan_id FROM test_plans WHERE host = ?)", (host,))
         cur = conn.execute("DELETE FROM test_plans WHERE host = ?", (host,))
         counts["test_plans"] = cur.rowcount
 

@@ -26,9 +26,11 @@ _LEGACY_SQL = Path(__file__).resolve().parent / "testing_fixtures" / "state_sche
 # test_i16_persist, test_finding_dedup).
 _NEW_OBJECTS = {"exchange_observations", "observation_attributions",
                 "idx_exchange_observations_scope", "idx_exchange_observations_endpoint",
-                "proof_identity", "engagement_declarations", "finding_inputs"}
+                "proof_identity", "engagement_declarations", "finding_inputs",
+                "plan_dispatch_notes"}
 _NEW_MARKERS = sorted([repr(("observation-schema", "1")), repr(("proof-identity-schema", "1")),
-                       repr(("engagement-declarations-schema", "1")), repr(("finding-inputs-schema", "1"))])
+                       repr(("engagement-declarations-schema", "1")), repr(("finding-inputs-schema", "1")),
+                       repr(("plan-dispatch-schema", "1"))])
 _LEGACY_URL = "https://legacy.example/api/orders/7"
 
 
@@ -150,8 +152,9 @@ class ObservationMigrationTests(unittest.TestCase):
             conn.execute("DROP TABLE proof_identity")
             conn.execute("DROP TABLE engagement_declarations")
             conn.execute("DROP TABLE finding_inputs")
+            conn.execute("DROP TABLE plan_dispatch_notes")
             conn.execute("DELETE FROM state_metadata WHERE name IN ('observation-schema', 'proof-identity-schema', "
-                         "'engagement-declarations-schema', 'finding-inputs-schema')")
+                         "'engagement-declarations-schema', 'finding-inputs-schema', 'plan-dispatch-schema')")
             conn.commit()
             after = _legacy_identity(conn)
         finally:
