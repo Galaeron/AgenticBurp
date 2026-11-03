@@ -417,14 +417,15 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             self._managed_ownership = True
         return ledger
 
-    async def _validate_findings(self, exchange, reports, *, run_context=None):
+    async def _validate_findings(self, exchange, reports, *, run_context=None, only_validators=None):
         from copy import copy
         authz = (getattr(self, "config", {}) or {}).get("authz", {}) or {}
         declared = isinstance(authz, dict) and "owners" in authz
         if not declared and not getattr(run_context, "_declared_ownership", None):
             # Keep the original registry protocol for callers without declarations,
             # including evidence-only registries that do not expose a validators map.
-            return await ConfirmMixin._validate_findings(self, exchange, reports, run_context=run_context)
+            return await ConfirmMixin._validate_findings(self, exchange, reports, run_context=run_context,
+                                                         only_validators=only_validators)
         # The shared orchestrator must not change another concurrent run's
         # cross-identity validator while that validator awaits a response.
         local = copy(self)
@@ -443,4 +444,5 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
                 run_context._ownership_registries = registries
         local.validator_registry = registry
         local._configure_ownership(exchange.url, run_context=run_context)
-        return await ConfirmMixin._validate_findings(local, exchange, reports, run_context=run_context)
+        return await ConfirmMixin._validate_findings(local, exchange, reports, run_context=run_context,
+                                                     only_validators=only_validators)

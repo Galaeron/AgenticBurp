@@ -627,6 +627,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
         ("severity", "ALTER TABLE test_plans ADD COLUMN severity TEXT NOT NULL DEFAULT ''"),
         ("confidence", "ALTER TABLE test_plans ADD COLUMN confidence REAL NOT NULL DEFAULT 0.0"),
         ("escalated", "ALTER TABLE test_plans ADD COLUMN escalated INTEGER NOT NULL DEFAULT 0"),
+        ("dispatch_note", "ALTER TABLE test_plans ADD COLUMN dispatch_note TEXT NOT NULL DEFAULT ''"),
     ]:
         if col not in plan_cols:
             conn.execute(ddl)
@@ -1690,6 +1691,72 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
     finally:
         conn.close()
 
+
+
+def record_plan_dispatch(plan_id: str, *, status: str, validator: str, summary: str = "",
+                         confidence: float = 0.0, confirmed: bool = False,
+                         evidence: str = "") -> tuple[bool, str]:
+    """Bind a harness-side validator run to a still-proposed plan (plan_dispatch).
+
+    A planner plan names a capability, not the validator that implements it, so
+    its id never matches the validator's own plan and its row stayed `proposed`
+    even when that validator ran on the same finding. The result is recorded
+    under the same confirmation policy as persist_validation_submission: a
+    capability that cannot confirm records `observed`. Only a `proposed` plan is
+    bound, so a Burp or earlier result is never overwritten."""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT capability, status FROM test_plans WHERE plan_id = ?",
+                           (plan_id,)).fetchone()
+        if not row:
+            return False, "unknown test plan"
+        if row[1] != "proposed":
+            return False, "plan already has a result"
+        observed = bool(confirmed) and not capability_can_confirm(row[0])
+        if confirmed and not observed and status != "confirmed":
+            return False, "confirmed result has invalid status"
+        out_status = "observed" if observed else status
+        note = f"dispatched by the harness via {validator}"
+        conn.execute(
+            """INSERT INTO validation_runs
+               (plan_id, status, confidence, confirmed, summary, evidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (plan_id, out_status, confidence, int(bool(confirmed) and not observed),
+             f"{note}: {summary}" if summary else note, evidence or "", time.time()))
+        conn.execute("UPDATE test_plans SET status = ?, dispatch_note = ? WHERE plan_id = ?",
+                     (out_status, note, plan_id))
+        conn.commit()
+        return True, "accepted"
+    finally:
+        conn.close()
+
+
+def mark_plan_not_dispatchable(plan_id: str, reason: str) -> bool:
+    """Record why the harness could not run a proposed plan itself (no local
+    validator, active mode off, validator declined). No validation_runs row is
+    written: nothing ran. The Burp plane may still execute the plan later."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE test_plans SET status = 'not_dispatchable', dispatch_note = ? "
+            "WHERE plan_id = ? AND status = 'proposed'", (reason[:300], plan_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def plan_dispatch_notes(host: str) -> list[dict]:
+    """Status and dispatch note per plan for a host, for reports and tests."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT plan_id, capability, finding_class, status, dispatch_note FROM test_plans "
+            "WHERE host = ? ORDER BY created_at", (host,)).fetchall()
+    finally:
+        conn.close()
+    return [{"plan_id": r[0], "capability": r[1], "finding_class": r[2], "status": r[3],
+             "dispatch_note": r[4]} for r in rows]
 
 _PROOF_COLUMNS = (
     "proof_id, run_id, case_id, principal_id, request_template_id, check_id, "

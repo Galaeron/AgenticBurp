@@ -1,0 +1,4 @@
+python 312
+unit (precondition, plan_dispatch, worklist x2, pivot_memory, planner, store): Ran 194 tests in 25.941s OK
+smoke: Ran 149 tests in 133.012s OK
+git diff --check: clean
