@@ -230,6 +230,26 @@ def _distinct_discovery_roles(roles: list, cap: int = 6) -> list:
     return out[:cap]
 
 
+def _principal_discovery_roles(roles: list, cap: int = 8) -> list:
+    """crawl_per_principal: one crawl per DISTINCT registered principal -- two
+    same-role users are two sweeps, because what each can reach (their own
+    basket, their own orders) differs even when their feature set does not.
+    Authenticated principals first (highest trust leading), then anonymous;
+    capped so the fan-out stays bounded."""
+    picked: dict[str, object] = {}
+    for r in roles:
+        picked.setdefault(r.principal_id(), r)
+    out = list(picked.values())
+    out.sort(key=lambda r: (not r.norm_headers(), -_trust(r.role)))
+    return out[:cap]
+
+
+def crawl_roles_for(roles: list, per_principal: bool = False) -> list:
+    """The roles a crawl or sweep runs as: one per distinct feature key (the
+    default, as before) or, with `per_principal`, one per registered principal."""
+    return _principal_discovery_roles(roles) if per_principal else _distinct_discovery_roles(roles)
+
+
 @dataclass
 class RoleSession:
     role: str                 # "anonymous" | "user" | "admin" | "service" | free label
@@ -240,6 +260,10 @@ class RoleSession:
     # expected_permissions are declared by the tester/fixture, never role rank.
     tenant: str | None = None
     expected_permissions: frozenset = frozenset()
+    # Operator-declared login request (session_freshness.login_refresher) used to
+    # re-establish this principal's session when it goes stale mid-run. Holds a
+    # credential, so it is kept out of repr and never journaled or reported.
+    login: dict | None = field(default=None, repr=False, compare=False)
 
     def norm_headers(self) -> dict:
         return dict(self.headers or {})
@@ -619,6 +643,7 @@ async def crawl_roles(
     session_refs: list[str | None] | None = None,
     owned_object_ids: dict | None = None,
     seed_paths: list[str] | None = None,
+    per_principal: bool = False,
 ) -> RoleCrawlResult:
     """Crawl `base_url` once per role, union the surface, probe every endpoint
     with every role, and derive auth-bypass + IDOR candidates from the matrix.
@@ -716,7 +741,7 @@ async def crawl_roles(
             # integrations/webhook endpoint is 404/403 for admin), so a one-identity
             # sweep structurally misses them. Union the routes; split the probe
             # budget across the sweeps so the total stays within discovery_max_probes.
-            sweep_roles = _distinct_discovery_roles(roles)
+            sweep_roles = crawl_roles_for(roles, per_principal)
             # Each sweep gets the FULL budget, not a split share: the wordlist needs
             # the whole budget to complete, and discovery probes are cheap HTTP GETs
             # (the iterative agent, not discovery, dominates wall time). Splitting it

@@ -43,7 +43,7 @@ from typing import Any
 
 from harness.browser_driver import CaptureObservation, default_driver, playwright_available
 
-__all__ = ["CaptureObservation", "capture_requests", "discover", "playwright_available"]
+__all__ = ["CaptureObservation", "capture_requests", "crawl_spa", "discover", "playwright_available"]
 
 
 async def capture_requests(url: str, *, wait_ms: int = 1500,
@@ -78,6 +78,22 @@ async def capture_requests(url: str, *, wait_ms: int = 1500,
     return await driver.capture_requests(
         url, wait_ms=wait_ms, headers=headers, scope=scope, cancel=cancel,
         gate=gate, budget=budget, max_captured=max_captured)
+
+
+async def crawl_spa(url: str, *, cdp_endpoint: str | None = None,
+                    launch_timeout_ms: int = 10000, **kwargs):
+    """`capture_requests` across the app's client-side views (spa_navigation):
+    a thin wrapper around `browser_driver.PlaywrightDriver.crawl_spa`. Returns a
+    `spa_navigation.SpaCrawlResult`; without a browser engine, one with an error
+    and no views."""
+    driver = default_driver(cdp_endpoint=cdp_endpoint)
+    if driver is None:
+        from harness.spa_navigation import SpaCrawlResult
+        result = SpaCrawlResult(start_url=url)
+        result.errors.append("no headless browser engine available (playwright not installed)")
+        return result
+    driver.launch_timeout_ms = launch_timeout_ms
+    return await driver.crawl_spa(url, **kwargs)
 
 
 def _dedup_key(exchange: dict) -> tuple:

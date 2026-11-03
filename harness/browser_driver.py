@@ -343,6 +343,59 @@ class CaptureObservation:
 _JS_ISSUED_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
 
 
+def _with_identity(exchange: dict, run_origin: str, headers: dict | None) -> dict:
+    """The identity router attaches the principal's credentials OUTSIDE the browser
+    (see _IdentityRouter._send), so the request the page reports carries none. A
+    same-origin capture is recorded with the credentials it was actually sent with,
+    so engagement_builder binds it to its principal instead of to anonymous."""
+    if not headers or ScopePolicy.origin_of(exchange.get("url") or "") != run_origin:
+        return exchange
+    names = {k.lower() for k in headers}
+    request_headers = {k: v for k, v in (exchange.get("request_headers") or {}).items()
+                       if k.lower() not in names}
+    request_headers.update(headers)
+    return {**exchange, "request_headers": request_headers}
+
+
+async def _js_issued_exchange(request, note: str) -> dict | None:
+    """One finished XHR/fetch request as an `HttpExchange.model_dump()` dict; None
+    for any other resource type (documents, scripts, images ...)."""
+    from harness.models import HttpExchange
+    if (request.resource_type or "").lower() not in _JS_ISSUED_RESOURCE_TYPES:
+        return None
+    try:
+        body = request.post_data or ""
+    except Exception:
+        body = ""
+    resp_status = None
+    resp_headers: dict = {}
+    resp_body = ""
+    try:
+        response = await request.response()
+    except Exception:
+        response = None
+    if response is not None:
+        try:
+            resp_status = response.status
+            resp_headers = dict(response.headers)
+        except Exception:
+            pass
+        try:
+            resp_body = await response.text()
+        except Exception:
+            resp_body = ""
+    try:
+        req_headers = dict(request.headers)
+    except Exception:
+        req_headers = {}
+    return HttpExchange(
+        url=request.url, method=request.method,
+        request_headers=req_headers, request_body=body,
+        response_status=resp_status, response_headers=resp_headers,
+        response_body=resp_body, analyst_note=note,
+    ).model_dump()
+
+
 @runtime_checkable
 class BrowserDriver(Protocol):
     async def visit(self, url: str, *, wait_ms: int = 1500,
@@ -585,6 +638,8 @@ class _IdentityRouter:
                     final = ""
                 if hop_set_cookies or final:
                     fulfilled["set-cookie"] = "\n".join(hop_set_cookies + ([final] if final else []))
+                if (resource_type or "").lower() in _JS_ISSUED_RESOURCE_TYPES:
+                    self._offer_route(url, method, body, response)
                 await route.fulfill(status=response.status_code, headers=fulfilled,
                                     body=response.content)
                 return
@@ -624,6 +679,26 @@ class _IdentityRouter:
                 headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
             url, method = next_url, next_method
         await route.abort()
+
+    def _offer_route(self, url: str, method: str, body, response) -> None:
+        """route_feed (engagement.recrawl): an XHR/fetch call a page fired is offered
+        back to the engagement, so a route a later browser visit reveals reaches
+        the worklist. No feed installed: nothing happens."""
+        from harness.run_context import current_run_context
+        rc = current_run_context()
+        feed = getattr(rc, "route_feed", None) if rc is not None else None
+        if feed is None:
+            return
+        try:
+            if isinstance(body, (bytes, bytearray)):
+                body = bytes(body).decode("utf-8", "replace")
+            feed.observe_response(
+                capability=f"browser:{self.label}", method=method, url=url,
+                status=response.status_code, request_headers={}, request_body=body,
+                response_headers=dict(response.headers),
+                response_body=lambda: response.text)
+        except Exception:   # feedback is additive; never break the page
+            pass
 
     async def _send(self, url: str, method: str, request_headers: dict, body, hop_cookies: dict):
         """One request the browser asked for, sent through the run's pinned
@@ -904,7 +979,6 @@ class PlaywrightDriver:
         allowed, only whether an already-allowed xhr/fetch request is
         recorded.
         """
-        from harness.models import HttpExchange
         obs = CaptureObservation(url=url)
         if is_cancelled(cancel):
             obs.load_error = "cancelled before navigation"
@@ -940,41 +1014,11 @@ class PlaywrightDriver:
                     async def _record(request) -> None:
                         if len(obs.exchanges) >= max_captured:
                             return
-                        if (request.resource_type or "").lower() not in _JS_ISSUED_RESOURCE_TYPES:
-                            return
-                        try:
-                            body = request.post_data or ""
-                        except Exception:
-                            body = ""
-                        resp_status = None
-                        resp_headers: dict = {}
-                        resp_body = ""
-                        try:
-                            response = await request.response()
-                        except Exception:
-                            response = None
-                        if response is not None:
-                            try:
-                                resp_status = response.status
-                                resp_headers = dict(response.headers)
-                            except Exception:
-                                pass
-                            try:
-                                resp_body = await response.text()
-                            except Exception:
-                                resp_body = ""
-                        try:
-                            req_headers = dict(request.headers)
-                        except Exception:
-                            req_headers = {}
-                        obs.exchanges.append(HttpExchange(
-                            url=request.url, method=request.method,
-                            request_headers=req_headers, request_body=body,
-                            response_status=resp_status, response_headers=resp_headers,
-                            response_body=resp_body,
-                            analyst_note="driver_capture: JS-issued request observed while "
-                                         f"loading {url}",
-                        ).model_dump())
+                        exchange = await _js_issued_exchange(
+                            request, "driver_capture: JS-issued request observed while "
+                                     f"loading {url}")
+                        if exchange is not None and len(obs.exchanges) < max_captured:
+                            obs.exchanges.append(exchange)
 
                     page.on("requestfinished",
                             lambda req: __import__("asyncio").create_task(_record(req)))
@@ -999,6 +1043,102 @@ class PlaywrightDriver:
         finally:
             await router.aclose()
         return obs
+
+    async def crawl_spa(self, url: str, *, wait_ms: int = 1500,
+                        headers: dict | None = None,
+                        scope: "ScopePolicy | None" = None,
+                        cancel: "asyncio.Event | Callable[[], bool] | None" = None,
+                        gate: "SafetyGate | None" = None,
+                        budget: "RequestBudget | None" = None,
+                        max_views: int = 30, max_depth: int = 4,
+                        max_captured: int = 200, extra_views=(),
+                        deadline: float | None = None):
+        """`capture_requests` across the app's client-side views: load `url`, then
+        follow the in-app links and router targets the rendered DOM exposes
+        (harness.spa_navigation.crawl_views decides which), recording the XHR/fetch
+        requests each view fires. One browser context and the SAME identity router
+        as `capture_requests`, so every request -- each view's navigation included
+        -- gets the identical scope/credential/gate/budget decision. A view that
+        differs from the current one only by its hash route is entered by setting
+        `location.hash` (the app stays loaded, as a click would leave it); any
+        other view is a routed main-frame navigation. Returns a
+        `spa_navigation.SpaCrawlResult`."""
+        from harness.spa_navigation import LINK_TARGETS_JS, SpaCrawlResult, crawl_views
+        effective_scope = scope if scope is not None else ScopePolicy(
+            allowed_hosts=frozenset({ScopePolicy.host_of(url)}))
+        if is_cancelled(cancel):
+            result = SpaCrawlResult(start_url=url)
+            result.stopped_by = "cancelled"
+            return result
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as e:  # pragma: no cover - guarded by available()
+            result = SpaCrawlResult(start_url=url)
+            result.errors.append(f"playwright import failed: {e}")
+            return result
+        router = _IdentityRouter(url=url, headers=headers, scope=effective_scope,
+                                 cancel=cancel, gate=gate, budget=budget,
+                                 timeout_s=self.launch_timeout_ms / 1000,
+                                 label="browser_driver.crawl_spa")
+        timeout_ms = self.launch_timeout_ms
+        try:
+            async with async_playwright() as p:
+                if self.cdp_endpoint:
+                    browser = await p.chromium.connect_over_cdp(
+                        self.cdp_endpoint, timeout=timeout_ms)
+                else:
+                    browser = await p.chromium.launch(headless=True,
+                                                      args=await router.launch_args())
+                context = None
+                try:
+                    context = await browser.new_context(service_workers="block")
+                    await router.install(context)
+                    page = await context.new_page()
+                    pending: list = []
+                    page.on("requestfinished", lambda req: pending.append(
+                        asyncio.ensure_future(_js_issued_exchange(req, ""))))
+
+                    class _Adapter:
+                        async def open(self, target: str) -> None:
+                            current = page.url or ""
+                            same_doc = (current.split("#", 1)[0] == target.split("#", 1)[0]
+                                        and "#" in target and current not in ("", "about:blank"))
+                            if same_doc:
+                                await page.evaluate("h => { location.hash = h; }",
+                                                    "#" + target.split("#", 1)[1])
+                            else:
+                                await router.goto(page, target, timeout_ms)
+                            await page.wait_for_timeout(wait_ms)
+
+                        async def links(self) -> list:
+                            found = await page.evaluate(LINK_TARGETS_JS)
+                            return [str(v) for v in found or [] if isinstance(v, str)]
+
+                        async def drain(self) -> list:
+                            done = list(pending)
+                            pending.clear()
+                            out = await asyncio.gather(*done, return_exceptions=True)
+                            return [_with_identity(e, router.run_origin, headers)
+                                    for e in out if isinstance(e, dict)]
+
+                        def current_url(self) -> str:
+                            return page.url or ""
+
+                    return await crawl_views(
+                        _Adapter(), url, in_scope=effective_scope.in_scope,
+                        max_views=max_views, max_depth=max_depth, max_captured=max_captured,
+                        extra_views=extra_views, cancel=cancel, budget=budget,
+                        deadline=deadline)
+                finally:
+                    if context is not None:
+                        await _quietly(context.close())
+                    await _quietly(browser.close())
+        except Exception as e:
+            result = SpaCrawlResult(start_url=url)
+            result.errors.append(f"{e.__class__.__name__}: {e}")
+            return result
+        finally:
+            await router.aclose()
 
     async def cross_site_submit(self, *, attacker_url: str, victim_url: str,
                                 readback_url: str, victim_method: str = "POST",
