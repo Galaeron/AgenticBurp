@@ -154,10 +154,12 @@ class DependencyBannerDedupTests(unittest.TestCase):
         # UNATTRIBUTED (no parameter_location/parameter_name) non-dependency
         # findings on the same host must still surface as two issues -- the
         # RB-3 exception must not weaken R04 for anything outside the
-        # dependency/banner class family.
+        # dependency/banner class family. Finding dedup (2026-11-03) narrowed R04
+        # to labels the taxonomy cannot read: an unattributed CANONICAL class on
+        # one endpoint is one issue (test_finding_dedup).
         fs = [
-            F("https://x/api/x", "information_disclosure", method="GET"),
-            F("https://x/api/x", "information_disclosure", method="GET"),
+            F("https://x/api/x", "weird vendor-specific quirk", method="GET"),
+            F("https://x/api/x", "weird vendor-specific quirk", method="GET"),
         ]
         fs[0]["finding_id"] = "A"
         fs[1]["finding_id"] = "B"
@@ -379,10 +381,20 @@ class ReviewRegressionTests(unittest.TestCase):
                             issues.issue_id_for(issues.issue_key(right)))
 
     def test_distinct_unknown_input_findings_do_not_collapse(self):  # R04
-        # two distinct unattributed findings (distinct finding_ids) must NOT merge
-        fa = F("https://a.invalid/items/1", "idor"); fa["finding_id"] = "A"
-        fb = F("https://a.invalid/items/1", "idor"); fb["finding_id"] = "B"
+        # Two distinct findings whose input is UNKNOWN (rows written before
+        # finding_inputs, input_recorded False) of an input-bearing class must NOT
+        # merge: they may name different parameters. Finding dedup (2026-11-03).
+        fa = F("https://a.invalid/items/1", "sqli"); fa["finding_id"] = "A"
+        fb = F("https://a.invalid/items/1", "sqli"); fb["finding_id"] = "B"
+        fa["fingerprint"], fb["fingerprint"] = "fpA", "fpB"
+        fa["input_recorded"] = fb["input_recorded"] = False
         self.assertEqual(len(issues.group_findings_into_issues([fa, fb])), 2)
+
+    def test_unattributed_canonical_findings_on_one_endpoint_merge(self):  # finding dedup
+        fa = F("https://a.invalid/items/1", "idor"); fa["finding_id"] = "A"
+        fb = F("https://a.invalid/items/1", "IDOR / BOLA"); fb["finding_id"] = "B"
+        (only,) = issues.group_findings_into_issues([fa, fb])
+        self.assertEqual(sorted(issues.export_issue(only)["member_ids"]), ["A", "B"])
 
     def test_export_redacts_url_query_secret(self):  # R03
         exp = issues.export_issue(issues.group_findings_into_issues([

@@ -92,6 +92,9 @@ _REMEDIATION_HINTS: dict[str, str] = {
     "dom_xss": "Never pass client-side sources (location.hash/.search, document.referrer, postMessage data) into a dangerous sink (innerHTML, document.write, eval, jQuery .html()); use textContent or a sanitizer (e.g. DOMPurify) and treat all URL/DOM input as untrusted in client JS.",
     "toctou": "Make the authorization check and the state change atomic: perform the privilege/ownership check inside the same transaction (or under a row/advisory lock) that commits the write, so two interleaved requests cannot both pass the check before either commits.",
     "graphql": "Disable introspection in production, and enforce field-level authorization independent of the overall query being otherwise valid.",
+    "insecure_transport": "Serve the application only over HTTPS: redirect plain HTTP, send Strict-Transport-Security, and never accept credentials or tokens over cleartext.",
+    "missing_headers": "Set the standard security response headers host-wide (Content-Security-Policy, X-Content-Type-Options, frame-ancestors/X-Frame-Options, Referrer-Policy, HSTS on HTTPS).",
+    "bfla": "Enforce function-level authorization server-side on every privileged route and method (deny by default, check the caller's role), independent of what the UI exposes.",
     "supply_chain": "Pin dependency versions, monitor for disclosed advisories against them, and remove exposed manifests/lockfiles from public access.",
 }
 
@@ -153,6 +156,12 @@ class ReportFinding:
     principal_id: str = ""
     workflow_state_id: str = ""
     locations: list[str] = field(default_factory=list)
+    # Finding dedup (2026-11-03): whether the store recorded this row's input, every
+    # collapsed member's id, and -- for an authorization class collapsed across
+    # principals -- each captured principal it was seen under.
+    input_recorded: bool = True
+    member_ids: list[str] = field(default_factory=list)
+    principals: list[str] = field(default_factory=list)
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
@@ -191,6 +200,7 @@ def _from_store_dict(d: dict) -> ReportFinding:
         policy_fingerprint=issues._policy_of(d),
         principal_id=d.get("principal_id", "") or "",
         workflow_state_id=d.get("workflow_state_id", "") or "",
+        input_recorded=d.get("input_recorded", True) is not False,
         **finding_triage(d),
     )
 
@@ -301,12 +311,23 @@ def _dedup_key(f: "ReportFinding") -> tuple:
         "url": f.url, "method": f.method, "vulnerability_class": f.vulnerability_class,
         "parameter_location": f.parameter_location, "parameter_name": f.parameter_name,
         "validator": f.validator, "policy_fingerprint": f.policy_fingerprint,
-        "principal_id": f.principal_id, "workflow_state_id": f.workflow_state_id})
+        "principal_id": f.principal_id, "workflow_state_id": f.workflow_state_id,
+        "fingerprint": f.fingerprint, "input_recorded": f.input_recorded})
+
+
+# Finding dedup (2026-11-03): an authorization flaw on one object route is one issue
+# whichever captured user saw it; the principals are listed as affected instances.
+_PRINCIPAL_INDEPENDENT_CLASSES = frozenset({"idor", "bfla"})
 
 
 def _rank_tuple(f: "ReportFinding") -> tuple:
-    # Higher is better: confirmed first, then more-severe, then higher confidence.
-    return (1 if f.confirmed else 0, -_SEVERITY_ORDER.get(f.severity, 99), f.confidence)
+    # Higher is better: confirmed first, then oracle-verified, then not a demoted LEAD
+    # (so a collapse never shows a weaker verdict than a member has), then more-severe,
+    # then higher confidence.
+    from harness.confirmation_gate import STATE_LEAD
+    return (1 if f.confirmed else 0, 1 if f.verification_state == "verified" else 0,
+            0 if f.lifecycle_state == STATE_LEAD else 1,
+            -_SEVERITY_ORDER.get(f.severity, 99), f.confidence)
 
 
 def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportFinding"], int]:
@@ -319,19 +340,29 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
     groups: dict[tuple[str, str], "ReportFinding"] = {}
     order: list[tuple[str, str]] = []
     for f in findings:
-        k = (_dedup_key(f), f.captured_principal_id)
+        key = _dedup_key(f)
+        k = (key, "" if key[3] in _PRINCIPAL_INDEPENDENT_CLASSES else f.captured_principal_id)
+        member_id = f.finding_id or f.fingerprint
         cur = groups.get(k)
         if cur is None:
             f.duplicate_count = 1
             f.locations = [f.url] if f.url else []
+            f.member_ids = [member_id] if member_id else []
+            f.principals = [f.captured_principal_id] if f.captured_principal_id else []
             groups[k] = f
             order.append(k)
         else:
             total = cur.duplicate_count + 1
             locations = cur.locations + ([f.url] if f.url and f.url not in cur.locations else [])
+            member_ids = cur.member_ids + ([member_id] if member_id else [])
+            principals = cur.principals + (
+                [f.captured_principal_id]
+                if f.captured_principal_id and f.captured_principal_id not in cur.principals else [])
             winner = f if _rank_tuple(f) > _rank_tuple(cur) else cur
             winner.duplicate_count = total
             winner.locations = locations
+            winner.member_ids = member_ids
+            winner.principals = principals
             groups[k] = winner
     survivors = [groups[k] for k in order]
     return survivors, len(findings) - len(survivors)
@@ -631,13 +662,23 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
         lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** under the same "
                      f"{f.validator} policy -- collapsed into this one finding. Locations: "
                      + ", ".join(f"`{issues.redact_url(u)}`" for u in f.locations))
+    elif f.duplicate_count > 1 and issues.issue_class(f.vulnerability_class) in issues._HOST_WIDE_CLASSES:
+        lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** on this host "
+                     f"(a host-wide class) -- collapsed into this one finding. Locations: "
+                     + ", ".join(f"`{issues.redact_url(u)}`" for u in f.locations))
     elif f.duplicate_count > 1:
         lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** of this endpoint "
                      f"family (same class, different object id) -- collapsed into this one finding.")
     if f.owasp_category:
         lines.append(f"**OWASP category:** {f.owasp_category}")
-    if f.captured_principal_id:
+    if len(f.principals) > 1:
+        lines.append("**Captured auth contexts:** "
+                     + ", ".join(f"`{p}`" for p in f.principals)
+                     + " (pseudonymous capture labels; not verified identity)")
+    elif f.captured_principal_id:
         lines.append(f"**Captured auth context:** `{f.captured_principal_id}` (pseudonymous capture label; not verified identity)")
+    if f.duplicate_count > 1 and f.member_ids:
+        lines.append("**Member findings:** " + ", ".join(f"`{m}`" for m in f.member_ids))
     basis_note = _basis_note(f.basis)
     if basis_note and f.basis != "derived":
         lines.append(f"> ⚠️ {basis_note}")
