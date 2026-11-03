@@ -105,6 +105,14 @@ mean/variance) with its own inline arithmetic now routes through
 3. **Slice 3 (`80b9050`)**: `testing/score.py` (OWASP-bucket scorer) scalar
    precision/recall/F1, behind a byte-identical golden test; `testing/nightly_precision.py`
    is covered transitively (delegates to `score.score`/`score.format_table`). DONE.
+4. **Slice 4 (`4db35bc`, 2026-11-02)**: `harness/eval_repeat.py` (W-23 repeated-eval
+   driver) `EvalReport._agg` -> `eval_metrics.summarize`, behind a byte-identical golden
+   test (`harness/test_eval_repeat_eval_metrics_reroute.py`). DONE. This driver was
+   missed by the slice-3 grep below.
+
+**Still unrouted (found 2026-11-02):** `testing/pool_strict_runs.py::_prf` and
+`testing/reconcile_benchmark.py` (`_recompute`, inline P/R, `pvariance`) still carry
+their own metric arithmetic; they are the next offline slices.
 
 **Verified NOT to contain duplicated metric arithmetic** (grep-confirmed; they answer
 different questions and are correctly left alone): `harness/eval_health.py` (stage

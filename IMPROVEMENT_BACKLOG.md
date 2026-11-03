@@ -366,6 +366,17 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked (s
   single-command scorecard that emits scorecard+provenance+health+coverage in one run —
   needs a live model run, OWNER/LIVE, out of offline loop scope. Map:
   [reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md](reviews/2026-09-26/P1-3_METRICS_CONSOLIDATION.md).
+- **Progress (2026-11-02, slice 4, VERIFIED offline):** `4db35bc` — the "consolidation
+  complete" grep above missed `harness/eval_repeat.py` (W-23 `run_repeated` driver), which
+  still hand-rolled `statistics.fmean/pstdev` in `EvalReport._agg`. Now routed through
+  `eval_metrics.summarize`, keeping its own 4dp rounding, min/max, empty-run convention and
+  rounded-stdev high-variance flag; `summary()`/`passes_floor()`/`compare()` byte-identical
+  (pre-reroute golden, sorted-key JSON, identical on 3.12 and 3.14). +5 tests in
+  `harness/test_eval_repeat_eval_metrics_reroute.py` (golden via `run_repeated`, spy on the
+  shared `summarize`, negative control: variance-as-stdev breaks the golden and silently
+  disables the high-variance gate). **Still-unrouted inline arithmetic (offline, next
+  slices):** `testing/pool_strict_runs.py::_prf` (P/R/F1, `on_zero=0.0`) and
+  `testing/reconcile_benchmark.py` (`_recompute` fmean/pstdev, inline P/R, `pvariance`).
 - **Domain:** Evaluation / Maintainability · **Effort:** M · **Depends on:** P0-3
 - **Evidence (VERIFIED):** overlapping layers — `testing/score.py`,
   `testing/nightly_precision.py`, standalone `evaluation_integrity/`, and
