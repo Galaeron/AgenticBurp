@@ -29,7 +29,7 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-from harness.categories import canonicalize
+from harness.categories import canonicalize, distinctive_token
 from harness.engagement import normalize_path
 from harness import security
 
@@ -82,7 +82,15 @@ def _is_dependency_class(vulnerability_class: str) -> bool:
 # route. These canonical classes group by host + class + the policy's fingerprint
 # (Finding.header_fingerprint), not by endpoint family, so 30 routes serving one
 # policy are one issue listing 30 routes; routes with different policies stay apart.
-_HEADER_POLICY_CLASSES = frozenset({"csp", "cors"})
+#
+# Finding dedup (juice-shop-8h, 2026-11-03): insecure transport and missing security
+# headers are host-wide facts the model files once per endpoint (28 transport rows over
+# 15 routes in one run). They join this set and, unlike csp/cors, group by host even
+# when no policy fingerprint is known: transport is decided by the scheme, which the
+# host key already carries, and a model finding never has a fingerprint. A known
+# fingerprint still splits different policies.
+_HOST_WIDE_CLASSES = frozenset({"insecure_transport", "missing_headers"})
+_HEADER_POLICY_CLASSES = frozenset({"csp", "cors"}) | _HOST_WIDE_CLASSES
 
 # Batch 08 / AR-08b: confirmation mechanisms whose proven flaw is a host trust policy,
 # not a route (a token verifier accepting forgeries). One policy fingerprint on several
@@ -245,13 +253,26 @@ class Issue:
 
     @property
     def best_member(self) -> dict:
-        """The strongest single observation (confirmed > severe > confident), used
-        for the export's headline evidence -- without discarding the others."""
-        def rank(m):
-            return (1 if m.get("confirmed") else 0,
-                    -_SEV_ORDER.get((m.get("severity") or "info").lower(), 99),
-                    float(m.get("confidence", 0.0) or 0.0))
-        return max(self.members, key=rank) if self.members else {}
+        """The strongest single observation (confirmed > oracle-verified > not a
+        demoted LEAD > severe > confident), used for the export's headline evidence
+        and triage -- without discarding the others. The verdict terms come before
+        severity so a merged issue never shows a weaker verdict than a member has."""
+        return max(self.members, key=verdict_rank) if self.members else {}
+
+    @property
+    def member_ids(self) -> list[str]:
+        """Every member's finding id (fingerprint when it has none), in member order."""
+        return [m.get("finding_id") or m.get("fingerprint") or "" for m in self.members]
+
+
+def verdict_rank(m: dict) -> tuple:
+    """Order observations strongest-verdict first, then severity, then confidence."""
+    from harness.confirmation_gate import STATE_LEAD, finding_lifecycle_state
+    return (1 if m.get("confirmed") else 0,
+            1 if m.get("oracle_verified") else 0,
+            0 if finding_lifecycle_state(m) == STATE_LEAD else 1,
+            -_SEV_ORDER.get((m.get("severity") or "info").lower(), 99),
+            float(m.get("confidence", 0.0) or 0.0))
 
 
 def _host_of(url: str) -> str:
@@ -274,7 +295,10 @@ def issue_key(finding: dict) -> tuple:
     input, and authorization boundary. When the affected input is UNKNOWN, a
     per-finding disambiguator (finding_id/fingerprint) is added so two distinct
     unattributed findings do NOT collapse into one issue (review R04); attributed
-    inputs and repeated object ids that share a known input still group.
+    inputs and repeated object ids that share a known input still group. Finding
+    dedup (2026-11-03): the disambiguator is dropped when the class is canonical
+    (`issue_class`), except for an input-bearing class on a row stored before its
+    input was recorded, which keeps its stored fingerprint.
 
     RB-3 (INV-4) exception: a dependency/banner-class finding (see
     `_is_dependency_class`) is a host-level advisory about running software,
@@ -297,7 +321,8 @@ def issue_key(finding: dict) -> tuple:
 
     E2 exception: a header-policy finding (csp, cors; see `_HEADER_POLICY_CLASSES`)
     groups by host + class + the policy fingerprint (`_policy_of`), with no endpoint
-    family or method.
+    family or method. insecure_transport and missing_headers do too, and also when
+    the policy is unknown (`_HOST_WIDE_CLASSES`).
 
     AR-08b exception: a finding confirmed by a route-independent mechanism (see
     `ROUTE_INDEPENDENT_MECHANISMS`) with a known policy groups by host + class +
@@ -308,22 +333,52 @@ def issue_key(finding: dict) -> tuple:
     host = _host_of(url)
     method = (finding.get("method") or "").upper()
     vc = finding.get("vulnerability_class", "") or ""
-    canon = canonicalize(vc) or vc.strip().lower()
     if _is_dependency_class(vc):
-        return (host, "", "", canon, "", "read", "")
+        return (host, "", "", canonicalize(vc) or vc.strip().lower(), "", "read", "")
+    canon = issue_class(vc)
     # Without a fingerprint (a model finding, or a proof stored before AR-08a) nothing
     # says the policy is the same, so it keeps the endpoint-family key below rather
-    # than matching every route.
-    if canon in _HEADER_POLICY_CLASSES and _policy_of(finding):
+    # than matching every route -- except for the host-wide classes (see above).
+    if canon in _HEADER_POLICY_CLASSES and (_policy_of(finding) or canon in _HOST_WIDE_CLASSES):
         return (host, "", "", canon, "", "read", _policy_of(finding))
     affected = _affected_input(finding)
     identity = _route_independent_identity(finding)
     if identity:
         return (host, "", "", canon, affected, _boundary_for(method), identity)
     family = normalize_path(url) if url else ""
-    # Unknown input is not a wildcard: keep distinct findings distinct.
-    disambiguator = "" if affected else (finding.get("finding_id") or finding.get("fingerprint") or "")
+    # Unknown input is not a wildcard: keep distinct findings distinct -- unless the
+    # class is canonical. Then (host, endpoint family, method, class, boundary) already
+    # names one issue, and the disambiguator only split every model finding (which never
+    # carries an input) into its own issue. A raw-label fallback still keeps it.
+    # A row stored before the findings table recorded its input (`input_recorded`
+    # False) may have named one: for an input-bearing class its stored fingerprint,
+    # which always hashed the input, keeps different inputs apart.
+    if affected:
+        disambiguator = ""
+    elif canon in _CANONICAL_SET:
+        disambiguator = (finding.get("fingerprint") or "") if (
+            canon in _INPUT_BEARING_CLASSES and finding.get("input_recorded") is False) else ""
+    else:
+        disambiguator = finding.get("finding_id") or finding.get("fingerprint") or ""
     return (host, family, method, canon, affected, _boundary_for(method), disambiguator)
+
+
+def issue_class(vulnerability_class: str) -> str:
+    """The class an issue groups on: the canonical class, else a distinctive class
+    token in the label ("Broken Access Control (BOLA) on Workflow Scope" -> idor), else
+    the raw lowercased label. Grouping only -- the stored finding fingerprint keeps
+    categories.legacy_canonicalize so suppressions stay valid."""
+    vc = vulnerability_class or ""
+    return canonicalize(vc) or distinctive_token(vc) or vc.strip().lower()
+
+
+from harness.categories import CANONICAL_CATEGORIES as _CANONICAL_CATEGORIES  # noqa: E402
+
+_CANONICAL_SET = frozenset(_CANONICAL_CATEGORIES)
+# Classes whose identity is the injected input, not the route or object.
+_INPUT_BEARING_CLASSES = frozenset({
+    "sqli", "nosql", "xss", "dom_xss", "command_injection", "ssti", "path_traversal",
+    "xxe", "header_injection", "open_redirect", "ssrf", "file_upload", "deserialization"})
 
 
 def issue_id_for(key: tuple) -> str:
@@ -579,6 +634,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "proof_references": proof_refs,
         "affected_instances": [redact_url(u) for u in issue.affected_instances],
         "instances_count": len(issue.members),
+        "member_ids": issue.member_ids,
         **({"affected_routes": sorted({normalize_path(u) for u in issue.affected_instances})}
            if issue.vulnerability_class in _HEADER_POLICY_CLASSES
            or any(_route_independent_identity(m) for m in issue.members) else {}),

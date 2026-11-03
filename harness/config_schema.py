@@ -345,6 +345,10 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     # ("just analyze captured traffic") forces both off.
     "engagement.experiments.enabled",
     "engagement.experiments.planner",
+    # Crawl loop: route feedback re-crawls new routes as every principal, and the
+    # per-principal crawl multiplies crawl traffic -- both active target traffic.
+    "engagement.recrawl.enabled",
+    "engagement.crawl_per_principal",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

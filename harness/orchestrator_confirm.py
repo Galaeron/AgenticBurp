@@ -200,7 +200,12 @@ class ConfirmMixin:
                 effort_budget=self.effort_budget,
                 on_step=_feed_step,
             )
-            outcome = await pivot_memory.integrate(result, exchange, model=chosen_model)
+            async def _review(findings, plans):
+                await self._review_iterative_findings(
+                    exchange, specialty, findings, plans, model=chosen_model,
+                    run_context=probe_ctx)
+            outcome = await pivot_memory.integrate(result, exchange, model=chosen_model,
+                                                   review=_review)
             return {"iterative_result": result.to_dict(), "integration": outcome.to_dict()}
         finally:
             # ARCH-1: close ONLY a context this call owns (the standalone probe).
@@ -208,6 +213,44 @@ class ConfirmMixin:
             # lifetime belongs to investigate_engagement.
             if owned_ctx is not None:
                 await owned_ctx.aclose()
+
+    async def _review_iterative_findings(self, exchange, specialty, findings, plans, *,
+                                         model="", run_context=None) -> dict:
+        """Review and plan an iterative agent's held findings before they persist.
+
+        The worklist path folded these findings into the graph as bare
+        `candidate` rows: no validator ran on them, no case, no review verdict
+        (the 8h Juice Shop run's login "Authentication Bypass / SQL Injection"
+        findings). Their plans are dispatched here in priority order within the
+        plan-dispatch cap; a finding with no plan gets the normal agent-routed
+        validation, as analyze() gives every finding. The confirmation gate then
+        sets each finding's review verdict from what actually ran. All sends go
+        through _validate_findings, so scope, safety gate and mutating ceilings
+        apply unchanged."""
+        from harness import confirmation_gate, plan_dispatch
+        report = AgentReport(agent=specialty, model=model or "iterative", findings=list(findings))
+        validation_reports: list = []
+        summary = await plan_dispatch.dispatch_plans(
+            self, exchange, plans, [report], validation_reports, run_context=run_context)
+        planned = {p.finding_class for p in plans}
+        unplanned = [f for f in findings if f.vulnerability_class not in planned]
+        cases = dict(summary.get("cases") or {})
+        if unplanned:
+            more, proofs = await self._validate_findings(
+                exchange, [AgentReport(agent=specialty, model=report.model, findings=unplanned)],
+                run_context=run_context)
+            validation_reports.extend(more)
+            for proof in proofs:
+                if proof.get("finding_ref") and proof.get("case_id"):
+                    cases.setdefault(proof["finding_ref"], proof["case_id"])
+        for f in findings:
+            if not f.case_id and f.finding_id in cases:
+                f.case_id = cases[f.finding_id]
+        confirmation_gate.apply_confirmation_suppression(
+            [report], validation_reports,
+            live_verified_markers=await self.get_run_derived_live_markers(),
+            config=getattr(self, "config", {}))
+        return summary
 
     async def run_retry_agents(
         self,
@@ -434,7 +477,8 @@ class ConfirmMixin:
         )
 
     async def _validate_findings(
-        self, exchange: HttpExchange, reports: list[AgentReport], *, run_context=None
+        self, exchange: HttpExchange, reports: list[AgentReport], *, run_context=None,
+        only_validators=None,
     ) -> tuple[list[ValidationReport], list[dict]]:
         """Run bounded, opt-in validators against model-generated hypotheses.
 
@@ -442,6 +486,9 @@ class ConfirmMixin:
         generated URL or shell command. This makes the LLM a planner and
         evidence extractor while deterministic/tool-backed validators are
         the confirmation layer.
+
+        `only_validators`, a set of Validator.name values, restricts dispatch to
+        those validators (plan_dispatch runs one plan's capability this way).
 
         Each validator's own .plan() is persisted and the result is
         recorded through the same persist_validation_submission gate the
@@ -524,10 +571,13 @@ class ConfirmMixin:
                 case = _case_for(finding, report, report_index, finding_index)
                 validators = self.validator_registry.for_finding(
                     finding, exchange, agent=report.agent)
+                if only_validators is not None:
+                    validators = [v for v in validators
+                                  if getattr(v, "name", "") in only_validators]
                 bind_context = getattr(self.validator_registry, "bind_run_context", None)
                 if bind_context is not None:
                     validators = bind_context(validators, run_context)
-                if not validators:
+                if not validators and only_validators is None:
                     # P0-1: an honest "never tested" record -- this finding's class
                     # has no applicable confirmation leg, so no VALIDATION_DECISION
                     # will ever be emitted for it below. Recorded as an OBSERVATION

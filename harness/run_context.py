@@ -789,8 +789,10 @@ class TargetTransport:
                 outcome="blocked", final_url=request.url,
                 error="session is not authorized for the requested destination",
                 artifact=self._artifact(request.url, "credential_destination_blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
-        if session and session.health == "expired":
+        if session and session.health in ("expired", "stale"):
             # E5a: the health probe rejected this identity's credentials; nothing is sent.
+            # A stale session (session_freshness) is refused the same way, so its
+            # denials are never read as the target's access control.
             return ExecutionOutcome(
                 outcome="session_expired", final_url=request.url,
                 error=_session_expired_message(session),
@@ -896,6 +898,19 @@ class TargetTransport:
                                       int(transport_cfg.get("route_5xx_threshold", 8)))
             if session and credential_destination and capability != _HEALTH_CAPABILITY:
                 await self._session_feedback(session, resp.status_code, url)
+                await self._freshness_feedback(session, method, url, resp.status_code)
+            if ctx.route_feed is not None:
+                # route_feed: a route this run first saw now, in any response, goes
+                # back to the engagement's worklist (engagement.recrawl; off by default).
+                try:
+                    ctx.route_feed.observe_response(
+                        capability=capability, method=method, url=url,
+                        status=resp.status_code, request_headers=send_headers,
+                        request_body=body, response_headers=dict(resp.headers),
+                        response_body=lambda: getattr(resp, "text", ""),
+                        session=session if session and credential_destination else None)
+                except Exception:   # feedback is additive; never fail the send
+                    pass
 
             if resp.status_code in _REDIRECT_CODES and resp.headers.get("location") and _hop < max_redirects:
                 nxt = urljoin(url, resp.headers["location"])
@@ -906,6 +921,11 @@ class TargetTransport:
                 headers = {}          # drop one-shot headers; creds re-decided by same-origin next hop
                 url = nxt
                 continue
+            if ctx.self_ownership is not None:
+                ctx.self_ownership.observe(
+                    source="transport", method=method, url=url, status=resp.status_code,
+                    principal_id=session.principal_id if session and credential_destination else "",
+                    response_body=resp.text)
             return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
                                     headers=dict(resp.headers), final_url=url,
                                     artifact=self._artifact(
@@ -931,6 +951,52 @@ class TargetTransport:
         if status == 401:
             session.auth_failures += 1
             await self._recheck_session(session, url)
+
+    async def _freshness_feedback(self, session: ManagedSession, method: str, url: str,
+                                  status: int) -> None:
+        """session_freshness: a sustained 401/403 rate on routes this session was
+        served before makes it stale -> refresh it, else stop using it."""
+        monitor = self.ctx.freshness()
+        if monitor is None or session.health in ("expired", "stale"):
+            return
+        if monitor.observe(session, method, url, status):
+            async with session.health_lock():
+                await self._session_stale(session, monitor)
+
+    async def _session_stale(self, session: ManagedSession, monitor) -> None:
+        if session.health in ("expired", "stale"):
+            return
+        evidence = monitor.evidence(session)
+        cfg = self.ctx.config.get("transport", {}) or {}
+        limit = int(cfg.get("max_session_refreshes", 2))
+        if session._refresh_fn is not None and session._refreshes < limit:
+            session._refreshes += 1
+            try:
+                fresh = await session._refresh_fn()
+            except Exception:
+                fresh = None
+            ok = isinstance(fresh, dict) and bool(fresh)
+            if ok:
+                self.ctx.sessions.replace_headers(session.session_id, fresh)
+            monitor.reset_window(session)
+            monitor.record("session_refresh", session, ok=ok, attempt=session._refreshes, **evidence)
+            self.ctx.health.record_event(
+                "session_refresh",
+                f"session {session.name} looked stale ({evidence['denials']} denials on "
+                f"{evidence['denied_routes']} route(s) it was served before); refresh "
+                + ("succeeded" if ok else "failed"),
+                session=session.name, session_id=session.session_id, ok=ok,
+                attempt=session._refreshes, **evidence)
+            if ok or session._refreshes < limit:
+                return
+        session.health = "stale"
+        monitor.record("session_stale", session, **evidence)
+        self.ctx.health.record_event(
+            "session_stale",
+            f"session {session.name} is stale: {evidence['denials']} denials on "
+            f"{evidence['denied_routes']} route(s) it was served before, and no refresh "
+            "restored it; its sends are refused so denials are not read as access control",
+            session=session.name, session_id=session.session_id, **evidence)
 
     def _probe_for(self, session: ManagedSession, url: str) -> "HealthProbe | None":
         """The session's registered probe, else the one `transport.session_probe.path`
@@ -1255,6 +1321,25 @@ class RunContext:
     # the code that creates the run (a benchmark runner, a test), never by a model
     # or from observed content.
     objective_task: object = field(default=None, repr=False, compare=False)
+    # session_freshness.SessionFreshness, built on first use when
+    # transport.session_freshness.enabled; None (and never built) when off.
+    # route_feed.RouteFeed, installed by an engagement with engagement.recrawl on;
+    # the transport offers it every route it first sees. None: nothing is offered.
+    route_feed: object = field(default=None, repr=False, compare=False)
+    _freshness: object = field(default=None, repr=False, compare=False)
+    _freshness_built: bool = field(default=False, repr=False, compare=False)
+
+    def freshness(self):
+        """The run's session-freshness tracker, or None when the feature is off."""
+        if not self._freshness_built:
+            from harness.session_freshness import FreshnessConfig, SessionFreshness
+            cfg = FreshnessConfig.from_config(self.config)
+            self._freshness = SessionFreshness(cfg) if cfg.enabled else None
+            self._freshness_built = True
+        return self._freshness
+    # The run's self_ownership.SelfOwnership (authz.self_observed_ownership), or
+    # None: ownership facts observed from this run's own exchanges, never a model's.
+    self_ownership: object = field(default=None, repr=False, compare=False)
 
     @classmethod
     def create(cls, *, run_id: str | None = None, allowed_hosts=None, gate_config: dict | None = None,
@@ -1280,6 +1365,7 @@ class RunContext:
         _gate_cfg = {**(gate_config or {}), "allowed_hosts": list(entries)}
         _gate_cfg['target_policy'] = target_policy
         resolved_gate = gate if gate is not None else SafetyGate(SafetyGateConfig.from_dict(_gate_cfg))
+        from harness import self_ownership
         return cls(
             run_id=resolved_run_id,
             scope=ScopePolicy(allowed_hosts=entries),
@@ -1291,7 +1377,9 @@ class RunContext:
             target_policy=target_policy,
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
                              if configured_namespace else resolved_run_id), timeout=timeout,
-            objective_task=objective_task)
+            objective_task=objective_task,
+            self_ownership=(self_ownership.SelfOwnership(run_id=resolved_run_id)
+                            if self_ownership.enabled(config_snapshot) else None))
 
     def default_client(self, *, destination: str | None = None) -> httpx.AsyncClient:
         profile = self.tls_policy.profile_for(destination)

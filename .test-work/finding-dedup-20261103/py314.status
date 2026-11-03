@@ -1,0 +1,9 @@
+label=py314 python=/c/Users/arthu/AppData/Local/Python/pythoncore-3.14-64/python.exe head=bae5321 started=2026-11-03T12:09:13+01:00
+Python 3.14.7
+precondition=0
+touched=1
+touched: Ran 852 tests in 395.861s
+touched: FAILED (failures=1)
+smoke=0
+diff_check=0
+finished=2026-11-03T12:18:06+01:00

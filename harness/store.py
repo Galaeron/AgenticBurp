@@ -90,8 +90,10 @@ def finding_fingerprint(host: str, method: str, url: str, vulnerability_class: s
     fingerprint, defeating suppression and duplicating findings. Two runs that
     word the same issue differently now hash identically.
     """
-    from harness.categories import canonicalize
-    check = canonicalize(vulnerability_class) or (vulnerability_class or "").lower()
+    # legacy_canonicalize, not canonicalize: suppressions and observations key on this
+    # hash, so the finding-dedup class readings (2026-11-03) live in issues.issue_key.
+    from harness.categories import legacy_canonicalize
+    check = legacy_canonicalize(vulnerability_class) or (vulnerability_class or "").lower()
     fingerprint = hashlib.sha256("\x1f".join([
         host or "",
         (method or "").upper(),
@@ -293,6 +295,42 @@ CREATE TABLE IF NOT EXISTS engagement_declarations (
     declarations_version INTEGER NOT NULL,
     updated_at REAL NOT NULL,
     PRIMARY KEY (host, port)
+);
+"""
+
+# Finding dedup (2026-11-03): the input a finding names (parameter_location/
+# parameter_name), so a finding with no proof record still reports it -- the
+# fingerprint always hashed it, but nothing read it back. Versioned additive
+# migration in AR-08a's pattern: a NEW side table keyed on the findings row's
+# unique key (fingerprint, case_id) plus the 'finding-inputs-schema' marker in
+# state_metadata; findings itself is not altered. Nothing is backfilled: a finding
+# with no row here and no proof record was written before this table and reads as
+# input_recorded=False ("unknown", never "no input"). '' in both columns is a
+# finding that named no input. Rollback: DROP TABLE finding_inputs and delete the
+# marker; the previous build never reads either.
+_FINDING_INPUTS_VERSION = 1
+_FINDING_INPUTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS finding_inputs (
+    fingerprint TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    parameter_location TEXT NOT NULL,
+    parameter_name TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (fingerprint, case_id)
+);
+"""
+
+# Plan dispatch (2026-11-03): why the harness bound, ran or could not run a
+# planner plan (plan_dispatch). Versioned additive side table keyed on
+# test_plans.plan_id plus the 'plan-dispatch-schema' marker; test_plans itself is
+# not altered. Rollback: DROP TABLE plan_dispatch_notes and delete the marker; the
+# previous build never reads either.
+_PLAN_DISPATCH_VERSION = 1
+_PLAN_DISPATCH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plan_dispatch_notes (
+    plan_id TEXT PRIMARY KEY,
+    note TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 """
 
@@ -588,6 +626,8 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_EVIDENCE_SCHEMA)
     conn.executescript(_PROOF_IDENTITY_SCHEMA)
     conn.executescript(_DECLARATIONS_SCHEMA)
+    conn.executescript(_FINDING_INPUTS_SCHEMA)
+    conn.executescript(_PLAN_DISPATCH_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
@@ -603,6 +643,10 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
                  (str(_PROOF_IDENTITY_VERSION),))
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('engagement-declarations-schema', ?)",
                  (str(_DECLARATIONS_VERSION),))
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('finding-inputs-schema', ?)",
+                 (str(_FINDING_INPUTS_VERSION),))
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('plan-dispatch-schema', ?)",
+                 (str(_PLAN_DISPATCH_VERSION),))
     ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
@@ -884,6 +928,14 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
                 finding_id, case_id, proof_id, oracle_verified, verification_state,
                 oracle_capsule_id, exchange_id, run_id, engagement_id, captured_principal_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+        # Finding dedup: the input each finding names, in its side table (see
+        # _FINDING_INPUTS_SCHEMA). Keyed like the findings row, so a deduped
+        # re-report is a no-op here too.
+        conn.executemany(
+            "INSERT OR IGNORE INTO finding_inputs (fingerprint, case_id, parameter_location, "
+            "parameter_name, created_at) VALUES (?, ?, ?, ?, ?)",
+            [(r[14], r[18] or "", getattr(f, "parameter_location", "") or "",
+              getattr(f, "parameter_name", "") or "", now) for r, f in zip(rows, findings)])
         # AR-3: one observation row per (finding, exchange), regardless of
         # whether the findings INSERT above was a fresh row or an IGNOREd
         # duplicate -- a deduped finding still records this exchange as a
@@ -1691,6 +1743,77 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
         conn.close()
 
 
+
+def record_plan_dispatch(plan_id: str, *, status: str, validator: str, summary: str = "",
+                         confidence: float = 0.0, confirmed: bool = False,
+                         evidence: str = "") -> tuple[bool, str]:
+    """Bind a harness-side validator run to a still-proposed plan (plan_dispatch).
+
+    A planner plan names a capability, not the validator that implements it, so
+    its id never matches the validator's own plan and its row stayed `proposed`
+    even when that validator ran on the same finding. The result is recorded
+    under the same confirmation policy as persist_validation_submission: a
+    capability that cannot confirm records `observed`. Only a `proposed` plan is
+    bound, so a Burp or earlier result is never overwritten."""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT capability, status FROM test_plans WHERE plan_id = ?",
+                           (plan_id,)).fetchone()
+        if not row:
+            return False, "unknown test plan"
+        if row[1] != "proposed":
+            return False, "plan already has a result"
+        observed = bool(confirmed) and not capability_can_confirm(row[0])
+        if confirmed and not observed and status != "confirmed":
+            return False, "confirmed result has invalid status"
+        out_status = "observed" if observed else status
+        note = f"dispatched by the harness via {validator}"
+        conn.execute(
+            """INSERT INTO validation_runs
+               (plan_id, status, confidence, confirmed, summary, evidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (plan_id, out_status, confidence, int(bool(confirmed) and not observed),
+             f"{note}: {summary}" if summary else note, evidence or "", time.time()))
+        conn.execute("UPDATE test_plans SET status = ? WHERE plan_id = ?", (out_status, plan_id))
+        conn.execute("INSERT OR REPLACE INTO plan_dispatch_notes VALUES (?, ?, ?)",
+                     (plan_id, note, time.time()))
+        conn.commit()
+        return True, "accepted"
+    finally:
+        conn.close()
+
+
+def mark_plan_not_dispatchable(plan_id: str, reason: str) -> bool:
+    """Record why the harness could not run a proposed plan itself (no local
+    validator, active mode off, validator declined). No validation_runs row is
+    written: nothing ran. The Burp plane may still execute the plan later."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE test_plans SET status = 'not_dispatchable' "
+            "WHERE plan_id = ? AND status = 'proposed'", (plan_id,))
+        if cur.rowcount > 0:
+            conn.execute("INSERT OR REPLACE INTO plan_dispatch_notes VALUES (?, ?, ?)",
+                         (plan_id, reason[:300], time.time()))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def plan_dispatch_notes(host: str) -> list[dict]:
+    """Status and dispatch note per plan for a host, for reports and tests."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT p.plan_id, p.capability, p.finding_class, p.status, COALESCE(n.note, '') "
+            "FROM test_plans p LEFT JOIN plan_dispatch_notes n ON n.plan_id = p.plan_id "
+            "WHERE p.host = ? ORDER BY p.created_at", (host,)).fetchall()
+    finally:
+        conn.close()
+    return [{"plan_id": r[0], "capability": r[1], "finding_class": r[2], "status": r[3],
+             "dispatch_note": r[4]} for r in rows]
+
 _PROOF_COLUMNS = (
     "proof_id, run_id, case_id, principal_id, request_template_id, check_id, "
     "parameter_location, parameter_name, workflow_state_id, finding_ref, validator, validator_version, "
@@ -1874,8 +1997,10 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                       f.evidence, f.suggested_test, f.owasp_category, f.basis, f.confirmed,
                       f.agent, f.fingerprint, f.finding_id, f.case_id, f.proof_id,
                       f.method, f.review_verdict,
-                      (SELECT parameter_location FROM proof_records WHERE case_id = f.case_id LIMIT 1),
-                      (SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1),
+                      COALESCE((SELECT parameter_location FROM proof_records WHERE case_id = f.case_id LIMIT 1),
+                               fi.parameter_location),
+                      COALESCE((SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1),
+                               fi.parameter_name),
                       (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       s.fingerprint IS NOT NULL AS suppressed,
                       f.oracle_verified, f.verification_state, f.oracle_capsule_id,
@@ -1885,6 +2010,7 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                LEFT JOIN proof_records p ON p.proof_id = f.proof_id AND f.proof_id != ''
                LEFT JOIN proof_identity i ON i.proof_id = p.proof_id AND i.identity_version = ?
+               LEFT JOIN finding_inputs fi ON fi.fingerprint = f.fingerprint AND fi.case_id = f.case_id
                WHERE f.host = ? AND f.engagement_id = ?
                  AND (? IS NULL OR f.captured_principal_id = ?)
                  AND (? IS NULL OR f.run_id = ?)
@@ -1909,6 +2035,10 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
          # confidence number.
          "lifecycle_state": confirmation_gate.lifecycle_state(bool(confirmed), rv),
          "parameter_location": ploc or "", "parameter_name": pname or "",
+         # Finding dedup: False only for a row written before finding_inputs existed
+         # (no side row, no proof record) -- issues.issue_key then keeps
+         # input-bearing classes apart rather than assume no input.
+         "input_recorded": ploc is not None or pname is not None,
          "principal_id": principal or "", "suppressed": bool(suppressed),
          "captured_principal_id": captured_principal_id or "",
          # P0.2-API: the oracle's verdict (item #1/#2) must be readable from the
@@ -2327,7 +2457,8 @@ def mark_chain_detected(url: str, signature: str, *, engagement_id: str = "") ->
 
 from harness.categories import CANONICAL_CATEGORIES  # noqa: E402  (kept near point of use)
 
-_NO_ACTIVE_VALIDATOR = {"misconfig", "ai_llm", "supply_chain"}
+_NO_ACTIVE_VALIDATOR = {"misconfig", "ai_llm", "supply_chain",
+                        "insecure_transport", "missing_headers", "bfla"}
 
 
 def set_coverage_override(host: str, category: str, reason: str) -> None:
@@ -3123,6 +3254,8 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #                                matching any of them belongs to one of the
 #                                target host's findings)
 #     proof_identity         -- proof_id no longer in proof_records (AR-08a)
+#     finding_inputs         -- fingerprint (finding dedup; same fingerprints
+#                                as finding_observations)
 #     engagement_declarations -- host, or host:port (I16 persistence)
 #     ledger_events          -- finding_ref (sizes case_ids UNION finding_ids
 #                                of the target host's findings -- see the
@@ -3332,6 +3465,14 @@ def wipe_engagement(host: str) -> dict:
             counts["finding_observations"] = cur.rowcount
         else:
             counts["finding_observations"] = 0
+        # Finding dedup: the inputs the target host's findings named.
+        if target_fingerprints:
+            placeholders = ",".join("?" for _ in target_fingerprints)
+            counts["finding_inputs"] = conn.execute(
+                f"DELETE FROM finding_inputs WHERE fingerprint IN ({placeholders})",
+                list(target_fingerprints)).rowcount
+        else:
+            counts["finding_inputs"] = 0
 
         # (g) every other confirmed host/fingerprint-scoped table.
         # validation_runs has no host column and no ON DELETE CASCADE (and
@@ -3346,6 +3487,8 @@ def wipe_engagement(host: str) -> dict:
         )
         counts["validation_runs"] = cur.rowcount
 
+        conn.execute("DELETE FROM plan_dispatch_notes WHERE plan_id IN "
+                     "(SELECT plan_id FROM test_plans WHERE host = ?)", (host,))
         cur = conn.execute("DELETE FROM test_plans WHERE host = ?", (host,))
         counts["test_plans"] = cur.rowcount
 

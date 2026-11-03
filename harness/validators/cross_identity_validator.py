@@ -366,14 +366,33 @@ class CrossIdentityValidator(Validator):
         import harness.principals as _pr
         if self.ownership is None:
             return _pr.AuthzDecision.UNKNOWN
-        decision = self.ownership.authorization(principal, self._object_ref(url), _ownership_method.get())
-        if decision == _pr.AuthzDecision.UNAUTHORIZED and getattr(principal, "provisional", False):
+        ref, method = self._object_ref(url), _ownership_method.get()
+        source = "declared"
+        if hasattr(self.ownership, "authorization_source"):
+            decision, source, _ = self.ownership.authorization_source(principal, ref, method)
+        else:
+            decision = self.ownership.authorization(principal, ref, method)
+        # A self-observed decision already required the owner and this principal to
+        # be shown to be different ACCOUNTS (self_ownership.py), so a credential
+        # alias does not make it unknown; against a declared owner it does.
+        if decision == _pr.AuthzDecision.UNAUTHORIZED and getattr(principal, "provisional", False) \
+                and source != "self_observed":
             return _pr.AuthzDecision.UNKNOWN
         return decision
 
     def _ownership_provenance(self, exchange):
         fact = self.ownership.lookup(self._object_ref(exchange.url), exchange.method) if self.ownership else None
+        if fact is None and getattr(self.ownership, "self_observed", None) is not None:
+            hit = self.ownership.self_observed.fact_for(exchange.url)
+            if hit is not None:
+                return hit[1]
         return fact.provenance if fact else "no ownership provenance"
+
+    def _ownership_kind(self, exchange) -> str:
+        if getattr(self.ownership, "self_observed", None) is not None \
+                and not self.ownership.has_declaration(self._object_ref(exchange.url), exchange.method):
+            return "Self-observed"
+        return "Declared"
 
     def _undeclared_lead(self, fc: str, exchange: HttpExchange, ident: dict, detail: str,
                          function_level: bool = False) -> ValidationResult:
@@ -710,7 +729,7 @@ class CrossIdentityValidator(Validator):
                         validator=self.name, status="confirmed", finding_class=fc,
                         confidence=ev.confidence, confirmed=True,
                         summary=f"Cross-identity ({ident['name']}): {ev.summary}",
-                        evidence=f"Declared ownership of {self._object_ref(exchange.url)!r} does not "
+                        evidence=f"{self._ownership_kind(exchange)} ownership of {self._object_ref(exchange.url)!r} does not "
                                  f"entitle {accessor.id!r} to it. {self._ownership_provenance(exchange)}. {ev.detail}"
                     ).with_artifacts(baseline=source_read, attack=attempt, controls=[anon])
                 if decision == _pr.AuthzDecision.AUTHORIZED:
@@ -728,7 +747,7 @@ class CrossIdentityValidator(Validator):
                             summary=f"Cross-identity ({source.id}): the captured read by "
                                     f"{source.id!r} returned the protected object that the entitled "
                                     f"principal {accessor.id!r} sees, while anonymous was denied.",
-                            evidence=f"Declared ownership of {self._object_ref(exchange.url)!r} does "
+                            evidence=f"{self._ownership_kind(exchange)} ownership of {self._object_ref(exchange.url)!r} does "
                                      f"not entitle the source principal {source.id!r}; the entitled "
                                      f"principal's replay matched its captured response. {self._ownership_provenance(exchange)}. {ev.detail}"
                         ).with_artifacts(baseline=attempt, attack=source_read, controls=[anon])

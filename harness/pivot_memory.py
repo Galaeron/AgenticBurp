@@ -96,6 +96,7 @@ async def integrate(
     *,
     persist: bool = True,
     model: str = "",
+    review=None,
 ) -> IntegrationOutcome:
     """Consume an iterative agent's result: hold its findings, build validation
     plans, remember them, then combine + pivot over the host's history.
@@ -104,6 +105,12 @@ async def integrate(
     plans, compute chains/pivots against whatever history already exists) -- a
     dry run for preview or testing. `model` labels the remembered findings'
     provenance.
+
+    `review`, an async `(findings, plans)` callable, runs after the plans are
+    persisted and before the findings are: the orchestrator dispatches the plans
+    to its validators and gates the results there, so a remembered finding
+    carries its review verdict, case and proof instead of staying a bare
+    candidate. A failing review never drops the findings.
     """
     outcome = IntegrationOutcome(
         agent=getattr(result, "agent", "iterative"),
@@ -126,15 +133,24 @@ async def integrate(
         return outcome
 
     # 2. VALIDATE -- declarative, safe verification plans for the execution plane.
+    # An injection class the model only named in prose ("Authentication Bypass /
+    # SQL Injection") gets per-parameter follow-ups, so it is planned too.
+    from harness import plan_dispatch
+    held.extend(plan_dispatch.injection_followups(held, exchange))
     outcome.validation_plans = planner.plans_for_findings(exchange, held)
 
     # 3. REMEMBER -- persist into the host's accumulated history.
     if persist:
+        if outcome.validation_plans:
+            await asyncio.to_thread(store.persist_test_plans, exchange, outcome.validation_plans)
+        if review is not None:
+            try:
+                await review(held, outcome.validation_plans)
+            except Exception as e:  # review is additive -- never lose the findings
+                log.warning("pivot_memory: review of %s failed: %s", outcome.agent, e)
         await asyncio.to_thread(
             store.persist_findings, exchange, outcome.agent, held, model, "",
         )
-        if outcome.validation_plans:
-            await asyncio.to_thread(store.persist_test_plans, exchange, outcome.validation_plans)
         outcome.remembered = True
 
     # 4. COMBINE + PIVOT over the host's (now-updated) full history.

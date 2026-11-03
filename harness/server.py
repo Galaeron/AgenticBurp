@@ -795,7 +795,8 @@ def _role_sessions(raw_roles) -> list:
                 role=str(r.get("role", "user")), headers=r.get("headers") or {},
                 name=(str(r["name"]) if r.get("name") else None),
                 tenant=(str(r["tenant"]) if r.get("tenant") else None),
-                expected_permissions=frozenset(r.get("expected_permissions") or []))
+                expected_permissions=frozenset(r.get("expected_permissions") or []),
+                login=(dict(r["login"]) if isinstance(r.get("login"), dict) else None))
             for r in (raw_roles or [])]
 
 

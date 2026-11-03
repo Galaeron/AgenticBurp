@@ -981,6 +981,13 @@ class ChainMixin:
         # drive), and bound the investigation stages by wall-clock time.
         _investigation_deadline = (time.monotonic() + self.investigation_seconds
                                    if self.investigation_seconds > 0 else None)
+        # Crawl loop (all off by default): per-principal crawls, route feedback with
+        # re-crawl rounds, and per-phase time-slices of the deadline above.
+        from harness.phase_schedule import PhaseSchedule
+        from harness.route_feed import RecrawlConfig, RouteFeed
+        _schedule = PhaseSchedule.from_config(self.config, _investigation_deadline)
+        _recrawl_cfg = RecrawlConfig.from_config(self.config)
+        _per_principal = bool((self.config.get("engagement") or {}).get("crawl_per_principal", False))
         _run_budget = getattr(run_context or _run_context_mod.current_run_context(), "budget", None)
         _coverage_hold = (_run_budget.hold(self.coverage_request_reserve)
                           if self.coverage_request_reserve > 0 and hasattr(_run_budget, "hold") else 0)
@@ -1035,6 +1042,7 @@ class ChainMixin:
                 active_discovery=active_discovery,
                 discovery_max_probes=discovery_max_probes, run_context=run_context,
                 **self._discovery_ffuf_kw(),
+                **({"per_principal": True} if _per_principal else {}),
                 **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
                 **({"driver_capture_config": self.config["driver_capture"]}
                    if (self.config.get("driver_capture") or {}).get("enabled") else {}))
@@ -1141,7 +1149,8 @@ class ChainMixin:
                 feature_caps = await engagement_builder.feature_crawl_captures(
                     base_url, roles, allowed_hosts=self.allowed_hosts,
                     submit_forms=_get_gate().config.allow_mutating_replay,
-                    seed_paths=discovered_paths, run_context=run_context, errors=_errors)
+                    seed_paths=discovered_paths, run_context=run_context, errors=_errors,
+                    **({"per_principal": True} if _per_principal else {}))
                 # Make workflow routes and their real request shapes visible to
                 # prioritisation. Content-level model review remains deferred.
                 for ex in feature_caps:
@@ -1256,10 +1265,10 @@ class ChainMixin:
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a
-        # username-keyed IDOR is reachable, not just numeric neighbours. It never
-        # confirms (RV-D2): one principal cannot show the object is unauthorised,
-        # so its best result is an inconclusive candidate; only cross_identity
-        # confirms IDOR.
+        # username-keyed IDOR is reachable, not just numeric neighbours. Alone it
+        # never confirms (RV-D2): one principal cannot show the object is
+        # unauthorised. It confirms only when the shared ownership ledger
+        # (declared, else self-observed) places the object with another account.
         _idor_cfg = (self.config.get("validators", {}) or {}).get("idor_read", {}) or {}
         _idor_read = IdorReadValidator(
             allowed_hosts=self.allowed_hosts,
@@ -1267,7 +1276,8 @@ class ChainMixin:
             # operator declared for this engagement (e.g. a known victim account,
             # like a tester who was told which record to reach).
             candidate_ids=(list(_idor_cfg.get("candidate_ids", []) or [])
-                           + _harvest_object_ids(_all_captured, {r.principal_id() for r in roles})))
+                           + _harvest_object_ids(_all_captured, {r.principal_id() for r in roles})),
+            ownership=ownership, run_context=run_context)
         _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts, run_context=run_context)
         _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts,
                                  run_context=run_context)
@@ -1746,6 +1756,12 @@ class ChainMixin:
                     confirmed.append(r)
             return confirmed
 
+        # Lets the worklist spend its precondition budget only on nodes that
+        # warrant a leg (pure: shape routing sends nothing).
+        _precondition.warranted = lambda node, exchange: any(
+            not objective_class or vclass == objective_class
+            for vclass, _ in shape_precondition_legs(node, exchange, roles, base_url))
+
         # P2-1: ONE business-context planning pass, BEFORE the worklist sweep, so
         # its business-impact re-ranking actually changes what the bounded node
         # budget investigates first (a checkout/payment/role endpoint ahead of a
@@ -1859,11 +1875,11 @@ class ChainMixin:
                 _objective_outcomes.append(_objective_outcome_entry)
                 break
 
-        async def _investigate(st, rs):
+        async def _investigate(st, rs, deadline=_investigation_deadline):
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
                 max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary,
-                stop_on_confirm=stop_on_confirm, deadline=_investigation_deadline,
+                stop_on_confirm=stop_on_confirm, deadline=deadline,
                 **_worklist_kwargs)
             timed_out = (worklist_summary.get("skipped_by_reason") or {}).get("time_budget", 0)
             if timed_out:
@@ -1872,12 +1888,58 @@ class ChainMixin:
                                          "worklist node(s) not investigated"})
             return outs, [f for o in outs for f in o.get("findings_detail", [])]
 
+        _route_feed = None
+        _recrawl_report: dict = {"enabled": _recrawl_cfg.enabled, "rounds": 0, "routes": 0}
+
+        async def _recrawl_rounds(feed):
+            """engagement.recrawl: while routes seen after discovery are pending, re-crawl
+            them as every principal and investigate them (bounded by max_rounds, the
+            per-run route budget, cancellation and the recrawl time-slice)."""
+            if feed is None:
+                return
+            _instr.phases.begin("recrawl")
+            deadline = _schedule.deadline_for("recrawl", _investigation_deadline)
+            while (_recrawl_report["rounds"] < _recrawl_cfg.max_rounds
+                   and feed.pending() >= _recrawl_cfg.min_new_routes):
+                if run_context.cancel.cancelled:
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    _errors.append({"phase": "recrawl",
+                                    "error": f"recrawl time budget reached: {feed.pending()} "
+                                             "new route(s) not re-crawled"})
+                    break
+                _recrawl_report["rounds"] += 1
+                fresh = feed.drain(_recrawl_cfg.max_routes_per_round)
+                _recrawl_report["routes"] += len(fresh)
+                st3, caps3 = await engagement_builder.recrawl_state(
+                    base_url, roles, fresh, run_context=run_context, host=state.host,
+                    deadline=deadline)
+                outs3, found3 = await _investigate(st3, roles, deadline=deadline)
+                outcomes.extend(outs3)
+                all_findings.extend(found3)
+                state.merge_from(st3)
+                _all_captured.extend(caps3)
+                log.info("investigate_engagement: recrawl round %d -- %d new route(s), %d node(s)",
+                         _recrawl_report["rounds"], len(fresh), len(outs3))
+            _recrawl_report["feed"] = feed.stats()
+
         if _objective_outcomes:
             outcomes = _objective_outcomes
             all_findings = [f for o in outcomes for f in o["findings_detail"]]
         else:
-            outcomes, all_findings = await _investigate(state, roles)
+            # route_feed: from here on, every route the run first sees (validator and
+            # model-directed probes, browser XHRs) is offered back for re-crawl.
+            if _recrawl_cfg.enabled and run_context is not None:
+                _route_feed = RouteFeed(
+                    origin=_run_context_mod.ScopePolicy.origin_of(base_url),
+                    in_scope=run_context.scope.in_scope,
+                    max_new_routes=_recrawl_cfg.max_new_routes,
+                    known={(ep.method, ep.path) for ep in state.endpoints.values()})
+                run_context.route_feed = _route_feed
+            outcomes, all_findings = await _investigate(
+                state, roles, deadline=_schedule.deadline_for("worklist", _investigation_deadline))
             _journal_phase("worklist")
+            await _recrawl_rounds(_route_feed)
 
         # Phase 0.1 now runs after deterministic confirmation. Broad engagements
         # retain the full content review. Objective runners may stop once a
@@ -1949,6 +2011,9 @@ class ChainMixin:
         if _investigation_deadline is not None:
             _review_deadline = min(_review_deadline or _investigation_deadline,
                                    _investigation_deadline)
+        # phase_slices: review gets its share of what is left, so the chain rounds
+        # after it are not starved; an explicit capture_review_seconds still binds.
+        _review_deadline = _schedule.deadline_for("capture_review", _review_deadline)
         if not (stop_on_confirm and _early_confirmed):
             await review_captured_exchanges(
                 self, state, _all_captured, run_context=run_context,
@@ -1984,8 +2049,9 @@ class ChainMixin:
         link = chain_linker.link_findings(state, all_findings, responses=_responses)
         chains = list(link["chain_findings"])
         creds, rounds, seen_ident = link["credential_caps"], 0, set()
+        _chain_deadline = _schedule.deadline_for("chain_rounds", _investigation_deadline)
         while creds and rounds < max_chain_rounds:
-            if _investigation_deadline is not None and time.monotonic() >= _investigation_deadline:
+            if _chain_deadline is not None and time.monotonic() >= _chain_deadline:
                 _errors.append({"phase": "chain_rounds",
                                 "error": f"investigation time budget reached: chain round "
                                          f"{rounds + 1} of up to {max_chain_rounds} not started"})
@@ -2008,7 +2074,7 @@ class ChainMixin:
                 active_discovery=active_discovery,
                 discovery_max_probes=discovery_max_probes, run_context=run_context,
                 **self._discovery_ffuf_kw())
-            outs2, new_findings = await _investigate(st2, derived)
+            outs2, new_findings = await _investigate(st2, derived, deadline=_chain_deadline)
             if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
                 await review_captured_exchanges(
                     self, st2, getattr(rc2, "captured", None), run_context=run_context,
@@ -2564,6 +2630,16 @@ class ChainMixin:
             "worklist_summary": worklist_summary,
             "chains": chains,
             "chain_rounds": rounds,
+            # Crawl loop: what re-crawl rounds took from the route feed, the time each
+            # sliced phase was granted, and the run's session refresh/stale events.
+            "crawl_loop": {
+                "per_principal": _per_principal,
+                "spa_views": getattr(rc, "spa_views", None) or [],
+                "recrawl": _recrawl_report,
+                "phase_schedule": _schedule.report() if _schedule.active else None,
+                "session_events": list(getattr(run_context.freshness(), "events", []) or [])
+                                  if run_context is not None and hasattr(run_context, "freshness") else [],
+            },
             # P2-1: the Application Semantic Model built this run (None when the
             # business-context pass is off), so the API/report can show the
             # inferred roles/objects/workflows/value-flows/sinks and the ranked
