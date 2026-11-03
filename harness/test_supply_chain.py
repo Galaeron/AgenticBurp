@@ -244,6 +244,92 @@ class ImagePinCliTests(_Tmp):
         self.assertFalse([r for r in rows if r["error"]])
 
 
+class PinnedWordlistTests(unittest.TestCase):
+    """The SecLists subset baked into the ffuf image: pinned by SHA + sha256,
+    checked offline by `supply_chain wordlists`."""
+
+    def _copy(self):
+        import shutil
+        tmp = Path(tempfile.mkdtemp(prefix="wordlists_", dir=ROOT / ".test-work"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        shutil.copy(ROOT / sc.DEFAULT_WORDLIST_LOCK, tmp / "ffuf-seclists.lock.json")
+        shutil.copytree(ROOT / "tools/seclists", tmp / "seclists")
+        shutil.copy(ROOT / "tools/ffuf-wordlist-seclists.txt", tmp / "ffuf-wordlist-seclists.txt")
+        return tmp
+
+    def _errors(self, lock):
+        return [r for r in sc.verify_wordlists(lock, root=lock.parent) if not r["ok"]]
+
+    def test_committed_wordlists_verify(self):
+        rows = sc.verify_wordlists(ROOT / sc.DEFAULT_WORDLIST_LOCK)
+        self.assertEqual(len(rows), 5)          # 4 sources + the merged list
+        self.assertEqual([r for r in rows if not r["ok"]], [])
+        with patch("builtins.print"):
+            self.assertEqual(sc.main(["wordlists"]), 0)
+
+    def test_lock_pins_a_full_commit_and_every_file(self):
+        lock = json.loads((ROOT / sc.DEFAULT_WORDLIST_LOCK).read_text(encoding="utf-8"))
+        self.assertEqual(lock["repo"], "danielmiessler/SecLists")
+        self.assertRegex(lock["commit"], r"^[0-9a-f]{40}$")
+        self.assertEqual({f["path"] for f in lock["files"]}, {
+            "Discovery/Web-Content/common.txt", "Discovery/Web-Content/api/api-endpoints.txt",
+            "Discovery/Web-Content/api/api-endpoints-res.txt", "Discovery/Web-Content/api/objects.txt"})
+        for f in lock["files"]:
+            self.assertRegex(f["sha256"], r"^[0-9a-f]{64}$")
+
+    def test_tampered_source_is_refused(self):
+        tmp = self._copy()
+        with open(tmp / "seclists/common.txt", "ab") as fh:
+            fh.write(b"evil-path\n")
+        errors = self._errors(tmp / "ffuf-seclists.lock.json")
+        self.assertEqual([(Path(e["file"]).name, e["error"]) for e in errors],
+                         [("common.txt", "sha256 mismatch"),
+                          ("ffuf-wordlist-seclists.txt", "not the merge of the locked sources")])
+        with patch("builtins.print"):
+            self.assertEqual(sc.main(["wordlists", "--lock", str(tmp / "ffuf-seclists.lock.json")]), 1)
+
+    def test_merged_list_must_be_the_merge_of_the_sources(self):
+        tmp = self._copy()
+        lock_path = tmp / "ffuf-seclists.lock.json"
+        merged = tmp / "ffuf-wordlist-seclists.txt"
+        merged.write_bytes(merged.read_bytes() + b"extra\n")
+        self.assertEqual([e["error"] for e in self._errors(lock_path)], ["sha256 mismatch"])
+        # Re-locking the edited merge does not help: it is re-derived from the sources.
+        import hashlib
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock["merged"]["sha256"] = hashlib.sha256(merged.read_bytes()).hexdigest()
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+        self.assertEqual([e["error"] for e in self._errors(lock_path)],
+                         ["not the merge of the locked sources"])
+
+    def test_branch_name_or_missing_file_is_refused(self):
+        tmp = self._copy()
+        lock_path = tmp / "ffuf-seclists.lock.json"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock["commit"] = "master"
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+        (tmp / "seclists/api__objects.txt").unlink()
+        errors = {e["error"] for e in self._errors(lock_path)}
+        self.assertIn("lock must pin danielmiessler/SecLists to a full commit SHA", errors)
+        self.assertIn("missing", errors)
+
+    def test_merge_rule(self):
+        out = sc.merge_wordlist_lines([b"# c\n/api/a\n\nb c\napi/a\n", b"x\r\n/x\n"])
+        self.assertEqual(out, b"api/a\nx\n")
+
+    def test_image_copies_the_verified_merged_list(self):
+        docker = (ROOT / "tools/ffuf.Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("COPY ffuf-wordlist-seclists.txt /wordlist-seclists.txt", docker)
+        self.assertEqual(ffuf_runner.WORDLISTS["seclists"], "/wordlist-seclists.txt")
+        self.assertEqual(ffuf_runner.WORDLISTS["harness"], ffuf_runner.DEFAULT_WORDLIST)
+
+    def test_wordlists_are_never_eol_converted(self):
+        out = subprocess.run(["git", "check-attr", "text", "tools/seclists/common.txt",
+                              "tools/ffuf-wordlist-seclists.txt"], cwd=ROOT,
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.count(": text: unset"), 2, out)
+
+
 class CiAuditJobTests(unittest.TestCase):
     def test_dependency_audit_job_audits_the_lock_and_emits_the_sbom(self):
         import yaml
@@ -253,6 +339,7 @@ class CiAuditJobTests(unittest.TestCase):
         self.assertIn("pip-audit -r harness/requirements.lock", scripts)
         self.assertIn("python -m harness.supply_chain sbom", scripts)
         self.assertIn("python -m harness.supply_chain images", scripts)
+        self.assertIn("python -m harness.supply_chain wordlists", scripts)
         self.assertRegex(scripts, r"pip-audit==\d+\.\d+\.\d+")
 
 

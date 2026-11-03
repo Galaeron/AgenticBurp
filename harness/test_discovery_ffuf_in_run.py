@@ -98,13 +98,13 @@ class FfufInRunTests(unittest.TestCase):
         self.target.close()
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def _discover(self, *, ffuf_in_runs=True, max_probes=400, max_requests=5000):
+    def _discover(self, *, ffuf_in_runs=True, max_probes=400, max_requests=5000, **kw):
         run = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=max_requests)
         disc = SurfaceDiscovery(self.target.base, allowed_hosts=["127.0.0.1"],
                                 nouns=["items", "nothing", "ghost"], prefixes=["/api/", "/v1/"],
                                 collections=[], actions=[], sensitive_files=[],
                                 max_probes=max_probes, run_context=run,
-                                ffuf_in_runs=ffuf_in_runs)
+                                ffuf_in_runs=ffuf_in_runs, **kw)
 
         async def go():
             try:
@@ -188,6 +188,23 @@ class FfufInRunTests(unittest.TestCase):
         self.assertGreater(len(self.target.requests), run.budget.used,
                            "bypassing the proxy is no longer visible -- the control is vacuous")
 
+    def test_wordlist_choice_reaches_ffuf(self):
+        self._discover()
+        args = self.launched[0]
+        self.assertEqual(args[args.index("-w") + 1], "/wordlist.txt")   # default: harness list
+        self.launched.clear()
+        self.target.requests.clear()
+        result, run = self._discover(ffuf_wordlist="seclists")
+        args = self.launched[0]
+        self.assertEqual(args[args.index("-w") + 1], "/wordlist-seclists.txt")
+        self.assertChargedToTheRun(result, run)
+
+    def test_unknown_wordlist_is_refused_before_anything_runs(self):
+        with self.assertRaises(ValueError):
+            SurfaceDiscovery(self.target.base, allowed_hosts=["127.0.0.1"],
+                             ffuf_wordlist="/etc/passwd")
+        self.assertEqual(self.launched, [])
+
     def test_negative_control_ffuf_stays_off_in_runs_by_default(self):
         result, run = self._discover(ffuf_in_runs=False)
         self.assertEqual(self.launched, [])
@@ -195,6 +212,32 @@ class FfufInRunTests(unittest.TestCase):
                       result.errors)
         self.assertEqual(result.ffuf_requests, 0)
         self.assertChargedToTheRun(result, run)
+
+
+class DiscoveryFfufConfigTests(unittest.TestCase):
+    """engagement.discovery_ffuf / discovery_ffuf_wordlist -> build_engagement kwargs."""
+
+    def _kw(self, engagement):
+        from types import SimpleNamespace
+        from harness.orchestrator_chain import ChainMixin
+        return ChainMixin._discovery_ffuf_kw(SimpleNamespace(config={"engagement": engagement}))
+
+    def test_off_passes_nothing_even_with_a_wordlist(self):
+        self.assertEqual(self._kw({}), {})
+        self.assertEqual(self._kw({"discovery_ffuf": False, "discovery_ffuf_wordlist": "seclists"}), {})
+
+    def test_on_with_default_and_seclists_wordlist(self):
+        self.assertEqual(self._kw({"discovery_ffuf": True}), {"discovery_ffuf": True})
+        self.assertEqual(self._kw({"discovery_ffuf": True, "discovery_ffuf_wordlist": "harness"}),
+                         {"discovery_ffuf": True})
+        self.assertEqual(self._kw({"discovery_ffuf": True, "discovery_ffuf_wordlist": "seclists"}),
+                         {"discovery_ffuf": True, "discovery_ffuf_wordlist": "seclists"})
+
+    def test_committed_config_keeps_the_current_behaviour(self):
+        import yaml
+        cfg = yaml.safe_load((Path(__file__).resolve().parent / "config.yaml").read_text(encoding="utf-8"))
+        self.assertIs(cfg["engagement"]["discovery_ffuf"], False)
+        self.assertEqual(cfg["engagement"]["discovery_ffuf_wordlist"], "harness")
 
 
 if __name__ == "__main__":

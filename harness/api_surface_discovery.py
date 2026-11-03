@@ -250,7 +250,8 @@ class SurfaceDiscovery:
                  actions=None, sensitive_files=None, timeout: float = 8.0, max_probes: int = 6000,
                  use_ffuf: bool = True, ffuf_image: str = "harness/ffuf:2.1.0",
                  run_context=None, session_ref: str | None = None,
-                 soft404_prune_after: int = 16, ffuf_in_runs: bool = False):
+                 soft404_prune_after: int = 16, ffuf_in_runs: bool = False,
+                 ffuf_wordlist: str = "harness"):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
         self.allowed_hosts = allowed_hosts or []
@@ -273,6 +274,9 @@ class SurfaceDiscovery:
         # (engagement.discovery_ffuf); its traffic then goes through a ToolProxy
         # that charges every request to the run's budget, scope and gate.
         self.ffuf_in_runs = ffuf_in_runs
+        # Named in-image wordlist (ffuf_runner.WORDLISTS); refused early if unknown.
+        from harness import ffuf_runner
+        self.ffuf_wordlist = ffuf_runner.wordlist_path(ffuf_wordlist)
         self.run_context = run_context
         self.session_ref = session_ref
         self._seen: dict[str, Route] = {}
@@ -703,7 +707,7 @@ class SurfaceDiscovery:
         if self.run_context is None:
             ffuf_result = await ffuf_runner.ffuf_discover(
                 self.base_url, image=self.ffuf_image, headers=self.headers or None,
-                filter_size=self._soft404_bytes)
+                filter_size=self._soft404_bytes, wordlist=self.ffuf_wordlist)
         else:
             remaining = min(self.max_probes, self._phase_limit) - self._probes
             # Leave a fifth for re-checking ffuf's hits and the sweep it cannot do.
@@ -720,6 +724,7 @@ class SurfaceDiscovery:
                 ffuf_result = await ffuf_runner.ffuf_discover(
                     proxy.url_for(self.base_url + "/"), image=self.ffuf_image,
                     headers=self.headers or None, filter_size=self._soft404_bytes,
+                    wordlist=self.ffuf_wordlist,
                     cancel=lambda: run.cancel.cancelled or proxy.stop_requested,
                     egress=tool_runner.EgressPolicy(allowed_hosts=(tool_runner._HOST_ALIAS,)))
             finally:

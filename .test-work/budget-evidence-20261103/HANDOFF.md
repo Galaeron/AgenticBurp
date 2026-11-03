@@ -115,13 +115,28 @@ For the ffuf slice, run it with `GATE_SUMMARY=gates-ffuf.txt` and `GATE_TESTS` s
 ### ffuf / wordlist (added scope)
 
 - **A. Turn on `engagement.discovery_ffuf` for local live runs?** It stays off in the committed config. With it on, each role sweep spends up to ~4/5 of its discovery phase budget on ffuf through the proxy. That is faster wall-clock, but not fewer requests: ffuf cannot prune soft-404 branches the way the Python sweep now does.
-- **B. Wordlist.** `tools/gen_ffuf_wordlist.py` bakes in 12,950 lines, all from the harness's own vocabulary: prefixes × nouns, `/1`, nested collections, actions and sensitive files, plus about 50 curated common-web paths. It is not small, but it is not a well-known list either.
+- **B. ANSWERED (yes) and done in the "second ffuf wordlist" commit.**
+  - **Pin.** The pin is SecLists commit `0c618cfc28d1e68811b95c61cc9ab05bc10b0a02` (2026-06-21, the last change to common.txt; all four lists are at their latest there). It covers:
+    - `Discovery/Web-Content/common.txt`
+    - `api/api-endpoints.txt`
+    - `api/api-endpoints-res.txt`
+    - `api/objects.txt`
+    - The case variants and vendor-specific api lists are left out.
+  - **Lock and files.** The sha256 and size of each file are in `tools/ffuf-seclists.lock.json`. The sources live in `tools/seclists/`. The merged, deduplicated list is `tools/ffuf-wordlist-seclists.txt`: 13,947 lines, with a leading `/` stripped, and it is a pure function of the sources.
+  - **Fetching.** `tools/fetch_seclists.py` fetches only `raw.githubusercontent.com/danielmiessler/SecLists/<sha>/...`. In non-`--pin` mode it refuses on any hash mismatch.
+  - **Hash check.** The first pin was checked independently: the git blob SHA of each local file equals the blob SHA GitHub's contents API reports at that commit.
+  - **Verification.** `python -m harness.supply_chain wordlists` verifies offline: the lock pins a full SHA, each source sha256 matches, and the merged list hash matches and equals the re-derived merge. CI now runs it in the dependency-audit job.
+  - **Line endings.** `.gitattributes` marks the files `-text`, so autocrlf cannot change the hashes.
+  - **Image.** It COPYs the merged list to `/wordlist-seclists.txt`.
+  - **Config.** `engagement.discovery_ffuf_wordlist: harness` is the default and maps to `/wordlist.txt`. `seclists` selects the second list. It is only read when `discovery_ffuf` is on, and unknown names are refused in the `SurfaceDiscovery` constructor.
+  - **Size and timeout.** About 14k lines is close to the harness list's 12,950. ffuf's per-run share cap and its 180 s container timeout still apply, so on a slow target a run may time out before the list ends. Watch this in the live run.
+- **B (original question). Wordlist.** `tools/gen_ffuf_wordlist.py` bakes in 12,950 lines, all from the harness's own vocabulary: prefixes × nouns, `/1`, nested collections, actions and sensitive files, plus about 50 curated common-web paths. It is not small, but it is not a well-known list either.
   - Proposal: add a pinned subset of SecLists, for example `Discovery/Web-Content/common.txt` plus `api/api-endpoints.txt` and `api/objects.txt`.
   - Pin it to a SecLists commit SHA, with a sha256 per file recorded beside `ffuf.Dockerfile`, checked by `harness.supply_chain`.
   - COPY it into the image as a second wordlist, so runs can pick it.
   - Nothing was downloaded or vendored here. Which lists, and what size cap?
 - **C. Image pinning.** The ffuf image is built locally, but its base images are still not digest-pinned (the P3-2 OWNER/LIVE note in `tools/ffuf.Dockerfile`). Pin them before enabling ffuf in runs, and re-run `python -m harness.supply_chain images --require-digest`.
-- **D. Container to proxy reachability.** The proxy binds 127.0.0.1 on the host. The container reaches it as `host.docker.internal`, which works on Docker Desktop and is the same assumption sqlmap's proxied container run makes. It has not been verified on a live Docker run in this session.
+- **D. Container to proxy reachability.** The proxy binds 127.0.0.1 on the host. The container reaches it as `host.docker.internal`, which works on Docker Desktop and is the same assumption sqlmap's proxied container run makes. VERIFIED after B: a real Docker 29.8.2 run of the rebuilt image, through the proxy, against the owned SPA fixture. Every request was charged (budget_used == probes_sent, target GETs <= budget) for both wordlists; see `live-ffuf-proxy.txt` and `live_ffuf_proxy_check.py`. At a 3000-probe budget, ffuf's ~1652-request share ends partway through either alphabetical list. The SecLists run therefore never reached the fixture's `/api/items`, which is the truncation trade-off. A target with real juice-shop budgets still needs the live run.
 - **E. A budget stop loses ffuf's partial hits.** When the run budget or a cancel stops ffuf mid-scan, its partial JSON is discarded as an error. The paths it sent are still marked covered. Should partial hits be salvaged?
 
 ### Earlier items
@@ -136,5 +151,5 @@ For the ffuf slice, run it with `GATE_SUMMARY=gates-ffuf.txt` and `GATE_TESTS` s
 ## Not done / not verified
 
 - No live run against juice-shop to measure the probe and request savings end to end. The numbers come from the fixture.
-- ffuf in runs was not exercised against real Docker or the real image. Its tests use a stand-in ffuf.
+- ffuf in runs: the unit tests use a stand-in ffuf. The real image and proxy path was checked once against the owned fixture (live-ffuf-proxy.txt), not against juice-shop.
 - Nothing pushed.

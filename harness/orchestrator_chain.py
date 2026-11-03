@@ -924,9 +924,15 @@ class ChainMixin:
         return result
 
     def _discovery_ffuf_kw(self) -> dict:
-        """engagement.discovery_ffuf, passed on only when enabled (default off)."""
+        """engagement.discovery_ffuf (default off) and, when it is on, a non-default
+        engagement.discovery_ffuf_wordlist; passed on only when they differ."""
         cfg = self.config if isinstance(self.config, dict) else {}
-        return {"discovery_ffuf": True} if (cfg.get("engagement") or {}).get("discovery_ffuf") else {}
+        eng = cfg.get("engagement") or {}
+        if not eng.get("discovery_ffuf"):
+            return {}
+        wordlist = str(eng.get("discovery_ffuf_wordlist") or "harness")
+        return {"discovery_ffuf": True,
+                **({"discovery_ffuf_wordlist": wordlist} if wordlist != "harness" else {})}
 
     # Roles registered as replay identities below are owned by this engagement
     # and released when it ends (never leak into a later engagement on the host).

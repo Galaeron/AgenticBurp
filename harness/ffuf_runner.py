@@ -27,6 +27,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IMAGE = "harness/ffuf:2.1.0"
 DEFAULT_WORDLIST = "/wordlist.txt"
+# Wordlists baked into the image, by config name (engagement.discovery_ffuf_wordlist).
+# "harness": the harness's own vocabulary (tools/gen_ffuf_wordlist.py), the default.
+# "seclists": the hash-pinned SecLists subset (tools/ffuf-seclists.lock.json).
+WORDLISTS = {"harness": DEFAULT_WORDLIST, "seclists": "/wordlist-seclists.txt"}
+
+
+def wordlist_path(name: str) -> str:
+    """The in-image path of a named wordlist; an unknown name is refused."""
+    try:
+        return WORDLISTS[name]
+    except KeyError:
+        raise ValueError(f"unknown ffuf wordlist {name!r} (expected one of {sorted(WORDLISTS)})") from None
 DEFAULT_THREADS = 40
 DEFAULT_TIMEOUT = 180.0
 
@@ -182,12 +194,15 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
 async def ffuf_discover(target_url: str, *, image: str = DEFAULT_IMAGE,
                         headers: dict[str, str] | None = None,
                         timeout: float = DEFAULT_TIMEOUT, cancel=None,
-                        filter_size: int | None = None, egress=None) -> FfufResult:
+                        filter_size: int | None = None, egress=None,
+                        wordlist: str = DEFAULT_WORDLIST) -> FfufResult:
     """Async wrapper: run ffuf in a thread so it doesn't block the event loop.
     I05-C: if the awaiting task is cancelled, the container is stopped and removed
     before the cancellation propagates."""
     extra = {} if filter_size is None and egress is None else {
         "filter_size": filter_size, "egress": egress}
+    if wordlist != DEFAULT_WORDLIST:
+        extra["wordlist"] = wordlist
     return await tool_runner.call_cancellable(
         run_sync, target_url, image=image, headers=headers, timeout=timeout,
         **({"cancel": cancel} if cancel is not None else {}), **extra)

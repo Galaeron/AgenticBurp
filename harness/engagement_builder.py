@@ -73,6 +73,7 @@ async def build_engagement(
     seed_exchanges=None,
     driver_capture_config=None,
     discovery_ffuf: bool = False,
+    discovery_ffuf_wordlist: str = "harness",
 ) -> tuple[engagement.EngagementState, role_crawl.RoleCrawlResult]:
     """Discover + build the access matrix + fuse into an EngagementState.
 
@@ -171,6 +172,8 @@ async def build_engagement(
         session_refs=session_refs,
         **({"seed_paths": [urlsplit(ex.url).path for ex, _ in seeds]} if seeds else {}),
         **({"discovery_ffuf": True} if discovery_ffuf else {}),
+        **({"discovery_ffuf_wordlist": discovery_ffuf_wordlist}
+           if discovery_ffuf_wordlist != "harness" else {}),
     )
 
     state = engagement.EngagementState(host=host or _host_of(base_url))

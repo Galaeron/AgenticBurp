@@ -323,6 +323,11 @@ engagement:
   # DEFAULT OFF: the current behaviour (ffuf skipped inside runs) is unchanged.
   # Needs Docker and the locally built image; without them the sweep is as before.
   discovery_ffuf: false
+  # Which wordlist baked into the ffuf image it runs: "harness" (the harness's own
+  # vocabulary, tools/ffuf-wordlist.txt; the default) or "seclists" (the
+  # hash-pinned SecLists subset in tools/ffuf-seclists.lock.json, verified by
+  # `python -m harness.supply_chain wordlists`). Only read when discovery_ffuf is on.
+  discovery_ffuf_wordlist: harness
   coverage_leg_budget: 80
   # Case-granular driving (coverage_drive_cases) dispatches ssti, command injection
   # and sqlmap once per parameter; coverage_parameter_field_cap caps how many

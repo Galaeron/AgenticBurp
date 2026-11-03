@@ -22,6 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /go/bin/ffuf /usr/local/bin/ffuf
 COPY ffuf-wordlist.txt /wordlist.txt
+# Second wordlist: the SecLists subset pinned by commit SHA + sha256 in
+# ffuf-seclists.lock.json (fetch_seclists.py; checked by
+# `python -m harness.supply_chain wordlists`). Selected by
+# engagement.discovery_ffuf_wordlist: seclists.
+COPY ffuf-wordlist-seclists.txt /wordlist-seclists.txt
 RUN useradd -m runner
 USER runner
 ENTRYPOINT ["ffuf"]
