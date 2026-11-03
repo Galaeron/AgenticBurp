@@ -1910,7 +1910,7 @@ class ChainMixin:
                 "review_stats": _review_stats,
                 "degraded": bool(_errors),
                 "stopped_on_confirmation": stopped,
-                "instrumentation": _instr.snapshot(),
+                **_instr.result_blocks(),  # instrumentation + top-level costs (AR-10 P3)
             }
 
         if stop_on_confirm and _early_confirmed:
@@ -2585,5 +2585,5 @@ class ChainMixin:
             "errors": _errors,
             "review_stats": _review_stats,
             "degraded": bool(_errors) or health["status"] == "incomplete",
-            "instrumentation": _instr.snapshot(),
+            **_instr.result_blocks(),  # instrumentation + top-level costs (AR-10 P3)
         }

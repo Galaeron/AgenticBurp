@@ -132,7 +132,7 @@ class IterativeRunDiagnosticsTests(_EngagementCallerBase, unittest.TestCase):
         self.assertEqual((block["probes"], block["probes_without_diagnostics"]), (0, 0))
         self.assertEqual(block["by_stop_reason"], {})
         self.assertEqual({k: v for k, v in block["totals"].items() if k != "evidence_attempt_ids"},
-                         {**{k: 0 for k in _COUNTS}, "evidence_attempts": 0})
+                         {**{k: 0 for k in _COUNTS}, "evidence_attempts": 0, "steps": 0})
         self.assertEqual(block["totals"]["evidence_attempt_ids"], [])
         self.assertFalse(any("diagnostics" in o for o in result["outcomes"]))
 
