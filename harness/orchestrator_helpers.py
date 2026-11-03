@@ -675,6 +675,40 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
     return out
 
 
+# Agent name for the deterministic reflected-parameter hypotheses. Unlike the
+# shape legs these are kept unconfirmed (capped by the confirmation gate): a
+# reflection is an observed fact, and it is what gets an XSS plan planned.
+_REFLECTION_AGENT = "reflection_detector"
+# Shorter values reflect by coincidence ("1", "en", "id").
+_REFLECTION_MIN_VALUE = 3
+
+
+def reflected_parameter_findings(exchange: HttpExchange) -> list[Finding]:
+    """One low-confidence XSS hypothesis per query parameter whose captured value
+    appears verbatim in the captured response body. Passive: it reads the one
+    exchange and sends nothing. The browser_xss validator (or the planner's
+    reflection_context_validation plan) is what tests it."""
+    from urllib.parse import parse_qsl, urlsplit as _split
+    body = exchange.response_body or ""
+    if not body:
+        return []
+    out: list[Finding] = []
+    seen: set[str] = set()
+    for name, value in parse_qsl(_split(exchange.url).query, keep_blank_values=False):
+        value = value.strip()
+        if name in seen or len(value) < _REFLECTION_MIN_VALUE or value not in body:
+            continue
+        seen.add(name)
+        out.append(Finding(
+            vulnerability_class="xss", confidence=0.3, severity="medium",
+            summary=(f"Reflected parameter: the value of query parameter {name!r} is "
+                     f"echoed in the response from {exchange.url.split('?', 1)[0]}"),
+            evidence=f"query parameter {name!r} value reflected in the response body",
+            suggested_test="Run a browser execution check on this parameter",
+            basis="derived", parameter_location="query", parameter_name=name))
+    return out
+
+
 async def review_captured_exchanges(orch, state, captured, *, max_reviews: int = 200,
                                     run_context=None, seen=None, errors=None,
                                     deadline: float | None = None, stats: dict | None = None,

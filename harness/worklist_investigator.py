@@ -159,7 +159,33 @@ def _derive_probe(node: dict) -> tuple[str, str] | None:
         return "auth", (
             f"{method} {path} is a privileged-looking endpoint reachable by a low-trust role "
             f"({', '.join(reach) or 'unknown'}). Probe for broken function-level authorization / auth bypass.")
+    template = node.get("template") or {}
+    if method.upper() in _WRITE_METHODS and (template.get("body") or "").strip():
+        return "injection", (
+            f"{method} {path} accepts a request body ({template.get('content_type') or 'unknown type'}). "
+            f"Test its body parameters one at a time for injection (SQL, NoSQL, command, "
+            f"template) and missing input validation, keeping the captured body's shape.")
     return None
+
+
+_WRITE_METHODS = ("POST", "PUT", "PATCH")
+
+
+def _with_probe_template(node: dict) -> dict:
+    """A write node with no captured template takes the request shape of its
+    own access-matrix probe (E5b): the body role_crawl already sent to it from
+    the SPA's call shape. Those probes are kept only as variants, so a write
+    endpoint that answered 4xx to the probe had no template, warranted no leg
+    and was skipped. Nothing new is sent here; replaying the body later still
+    goes through the safety gate's mutating ceilings."""
+    if node.get("template") or (node.get("method") or "GET").upper() not in _WRITE_METHODS:
+        return node
+    from harness.engagement import ACCESS_MATRIX_SOURCE
+    for variant in node.get("capture_variants") or []:
+        template = variant.get("template") or {}
+        if variant.get("source") == ACCESS_MATRIX_SOURCE and (template.get("body") or "").strip():
+            return dict(node, template=template, template_source=ACCESS_MATRIX_SOURCE)
+    return node
 
 
 # Keywords a derived specialty's confirmation would carry, so R21 can tell whether
@@ -170,6 +196,7 @@ _SPECIALTY_KEYWORDS = {
              "broken access", "access_control", "access control"),
     "auth": ("auth", "bfla", "function-level", "function level", "privilege",
              "missing authorization", "missing_authorization"),
+    "injection": ("injection", "sqli", "sql", "nosql", "command", "ssti", "template"),
 }
 
 
@@ -386,6 +413,19 @@ def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
     return "no_applicable_hypothesis"
 
 
+def _precondition_warranted(precondition_fn, node: dict, exchange) -> bool:
+    """Whether `precondition_fn` would run any leg on this node. A function
+    without a `warranted(node, exchange)` attribute is assumed to warrant one
+    (the earlier behaviour), and so is one whose check raises."""
+    check = getattr(precondition_fn, "warranted", None)
+    if check is None:
+        return True
+    try:
+        return bool(check(node, exchange))
+    except Exception:
+        return True
+
+
 async def investigate_worklist(
     probe_fn,
     state,
@@ -476,6 +516,7 @@ async def investigate_worklist(
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
                             "reason": problem, "next_action": "Supply an in-scope complete capture and its owning identity"})
             continue
+        node = _with_probe_template(node)
         derived = _derive_probe(node)
         # R21: completion belongs to an (endpoint, check) case, not the whole
         # endpoint -- a "validated" endpoint may still hold UNRELATED vulnerabilities.
@@ -497,9 +538,8 @@ async def investigate_worklist(
         # assignment leg attempted, and it is finite while decoys can be
         # numerous (the same route guessed under a dozen path prefixes).
         is_junk_node = bool(node.get("dead_endpoint")) or bool(node.get("malformed_or_encoded"))
-        do_precond = (precondition_fn is not None and precondition_run < max_precondition_legs
-                     and not is_junk_node)
-        if not do_agent and not do_precond:
+        precond_possible = precondition_fn is not None and not is_junk_node
+        if not do_agent and not precond_possible:
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
                             "reason": _skip_reason(node, eligible, investigated, max_nodes, False)})
             continue  # no agent hypothesis AND no shape-driven leg to run -- skip
@@ -518,6 +558,18 @@ async def investigate_worklist(
                    else role_headers.get(probe_role, {}))
         parent_id = _parent_template_object_id(state, node)
         exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
+        # 2026-11-03 yield analysis: only a node whose shape warrants a leg spends
+        # the precondition budget. Counting every node let the first 24 nodes --
+        # most warranting nothing -- exhaust it, so a later write endpoint with a
+        # real body was reported as missing_template/no_applicable_hypothesis.
+        warrants = precond_possible and _precondition_warranted(precondition_fn, node, exchange)
+        do_precond = warrants and precondition_run < max_precondition_legs
+        if not do_agent and not do_precond:
+            reason = (SKIP_BUDGET_EXHAUSTED if warrants
+                      else _skip_reason(node, eligible, investigated, max_nodes, False))
+            skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
+                            "reason": reason})
+            continue
 
         # E7: a node an earlier run finished needs no work, so the deadline does not apply.
         key = node_key(node) if (completed is not None or on_outcome is not None) else ""

@@ -1731,6 +1731,12 @@ class ChainMixin:
                     confirmed.append(r)
             return confirmed
 
+        # Lets the worklist spend its precondition budget only on nodes that
+        # warrant a leg (pure: shape routing sends nothing).
+        _precondition.warranted = lambda node, exchange: any(
+            not objective_class or vclass == objective_class
+            for vclass, _ in shape_precondition_legs(node, exchange, roles, base_url))
+
         # P2-1: ONE business-context planning pass, BEFORE the worklist sweep, so
         # its business-impact re-ranking actually changes what the bounded node
         # budget investigates first (a checkout/payment/role endpoint ahead of a

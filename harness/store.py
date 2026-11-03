@@ -320,6 +320,20 @@ CREATE TABLE IF NOT EXISTS finding_inputs (
 );
 """
 
+# Plan dispatch (2026-11-03): why the harness bound, ran or could not run a
+# planner plan (plan_dispatch). Versioned additive side table keyed on
+# test_plans.plan_id plus the 'plan-dispatch-schema' marker; test_plans itself is
+# not altered. Rollback: DROP TABLE plan_dispatch_notes and delete the marker; the
+# previous build never reads either.
+_PLAN_DISPATCH_VERSION = 1
+_PLAN_DISPATCH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plan_dispatch_notes (
+    plan_id TEXT PRIMARY KEY,
+    note TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+"""
+
 # P0-1: the durable stream for harness.evidence_ledger.EvidenceLedger. Append-only
 # (event_id is the primary key and every write is INSERT OR IGNORE -- a caller
 # re-persisting the same event, e.g. after a retry, is a no-op, never an overwrite)
@@ -613,6 +627,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_PROOF_IDENTITY_SCHEMA)
     conn.executescript(_DECLARATIONS_SCHEMA)
     conn.executescript(_FINDING_INPUTS_SCHEMA)
+    conn.executescript(_PLAN_DISPATCH_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
@@ -630,6 +645,8 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
                  (str(_DECLARATIONS_VERSION),))
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('finding-inputs-schema', ?)",
                  (str(_FINDING_INPUTS_VERSION),))
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('plan-dispatch-schema', ?)",
+                 (str(_PLAN_DISPATCH_VERSION),))
     ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
@@ -1725,6 +1742,77 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
     finally:
         conn.close()
 
+
+
+def record_plan_dispatch(plan_id: str, *, status: str, validator: str, summary: str = "",
+                         confidence: float = 0.0, confirmed: bool = False,
+                         evidence: str = "") -> tuple[bool, str]:
+    """Bind a harness-side validator run to a still-proposed plan (plan_dispatch).
+
+    A planner plan names a capability, not the validator that implements it, so
+    its id never matches the validator's own plan and its row stayed `proposed`
+    even when that validator ran on the same finding. The result is recorded
+    under the same confirmation policy as persist_validation_submission: a
+    capability that cannot confirm records `observed`. Only a `proposed` plan is
+    bound, so a Burp or earlier result is never overwritten."""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT capability, status FROM test_plans WHERE plan_id = ?",
+                           (plan_id,)).fetchone()
+        if not row:
+            return False, "unknown test plan"
+        if row[1] != "proposed":
+            return False, "plan already has a result"
+        observed = bool(confirmed) and not capability_can_confirm(row[0])
+        if confirmed and not observed and status != "confirmed":
+            return False, "confirmed result has invalid status"
+        out_status = "observed" if observed else status
+        note = f"dispatched by the harness via {validator}"
+        conn.execute(
+            """INSERT INTO validation_runs
+               (plan_id, status, confidence, confirmed, summary, evidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (plan_id, out_status, confidence, int(bool(confirmed) and not observed),
+             f"{note}: {summary}" if summary else note, evidence or "", time.time()))
+        conn.execute("UPDATE test_plans SET status = ? WHERE plan_id = ?", (out_status, plan_id))
+        conn.execute("INSERT OR REPLACE INTO plan_dispatch_notes VALUES (?, ?, ?)",
+                     (plan_id, note, time.time()))
+        conn.commit()
+        return True, "accepted"
+    finally:
+        conn.close()
+
+
+def mark_plan_not_dispatchable(plan_id: str, reason: str) -> bool:
+    """Record why the harness could not run a proposed plan itself (no local
+    validator, active mode off, validator declined). No validation_runs row is
+    written: nothing ran. The Burp plane may still execute the plan later."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE test_plans SET status = 'not_dispatchable' "
+            "WHERE plan_id = ? AND status = 'proposed'", (plan_id,))
+        if cur.rowcount > 0:
+            conn.execute("INSERT OR REPLACE INTO plan_dispatch_notes VALUES (?, ?, ?)",
+                         (plan_id, reason[:300], time.time()))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def plan_dispatch_notes(host: str) -> list[dict]:
+    """Status and dispatch note per plan for a host, for reports and tests."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT p.plan_id, p.capability, p.finding_class, p.status, COALESCE(n.note, '') "
+            "FROM test_plans p LEFT JOIN plan_dispatch_notes n ON n.plan_id = p.plan_id "
+            "WHERE p.host = ? ORDER BY p.created_at", (host,)).fetchall()
+    finally:
+        conn.close()
+    return [{"plan_id": r[0], "capability": r[1], "finding_class": r[2], "status": r[3],
+             "dispatch_note": r[4]} for r in rows]
 
 _PROOF_COLUMNS = (
     "proof_id, run_id, case_id, principal_id, request_template_id, check_id, "
@@ -3399,6 +3487,8 @@ def wipe_engagement(host: str) -> dict:
         )
         counts["validation_runs"] = cur.rowcount
 
+        conn.execute("DELETE FROM plan_dispatch_notes WHERE plan_id IN "
+                     "(SELECT plan_id FROM test_plans WHERE host = ?)", (host,))
         cur = conn.execute("DELETE FROM test_plans WHERE host = ?", (host,))
         counts["test_plans"] = cur.rowcount
 
