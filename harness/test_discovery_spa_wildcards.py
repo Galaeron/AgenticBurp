@@ -156,9 +156,103 @@ class WildcardDiscoveryCallerTests(unittest.IsolatedAsyncioTestCase):
             result = await disc.discover()
         self.assertTrue({"/api/users", "/api/orders"}.issubset(set(result.paths())))
 
+    async def test_soft404_needs_matching_content_type(self):
+        # Same status and body but a different content type is not the catch-all.
+        disc = SurfaceDiscovery("https://app.test", prefixes=[], nouns=[], collections=[],
+                                actions=[], sensitive_files=[], seed_paths=["/data/export"],
+                                use_ffuf=False, max_probes=20)
+        async def probe(method, path):
+            disc._content_types[path] = "text/csv" if path == "/data/export" else "text/html"
+            return 200, "same-body", ""
+        with patch.object(disc, "_probe", side_effect=probe):
+            result = await disc.discover()
+        self.assertIsNotNone(disc._soft404)
+        self.assertIn("/data/export", result.paths())
+
     async def test_calibration_obeys_zero_budget(self):
         disc = SurfaceDiscovery("https://app.test", max_probes=0, use_ffuf=False)
         with patch.object(disc, "_probe", AsyncMock()) as probe:
             result = await disc.discover()
         probe.assert_not_awaited()
         self.assertEqual(result.probes_sent, 0)
+
+
+class _SpaCatchAll:
+    """A real local single-page-app server: /api/items and /admin/real-panel are
+    the only routes; every other GET answers HTTP 200 with the index shell, which
+    carries a per-request nonce of fixed length (as a CSP nonce would)."""
+
+    def __init__(self):
+        import secrets as _secrets
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        fixture = self
+        self.requests: list[str] = []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                fixture.requests.append(self.path)
+                path = self.path.split("?", 1)[0]
+                if path in ("/api/config", "/api/items", "/admin/real-panel", "/v1/items"):
+                    body, ctype = b'{"items":[{"name":"widget"}]}', "application/json"
+                else:
+                    body = ('<!doctype html><html><head><script nonce="%s"></script></head>'
+                            '<body><app-root></app-root></body></html>' % _secrets.token_hex(8)).encode()
+                    ctype = "text/html; charset=UTF-8"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class SpaSoft404PruningTests(unittest.IsolatedAsyncioTestCase):
+    NOUNS = [f"noun{i}" for i in range(40)] + ["items"]
+
+    def _discovery(self, base, **kwargs):
+        return SurfaceDiscovery(base, allowed_hosts=["127.0.0.1"], nouns=self.NOUNS,
+                                prefixes=["/api/", "/admin/", "/v1/", "/"],
+                                collections=["users", "admin"], actions=[], sensitive_files=[],
+                                seed_paths=["/admin/real-panel", "/api/config"], use_ffuf=False,
+                                max_probes=3000, **kwargs)
+
+    async def test_spa_catchall_branches_are_pruned_and_real_routes_kept(self):
+        server = _SpaCatchAll()
+        try:
+            pruned = await self._discovery(server.base).discover()
+            pruned_requests = len(server.requests)
+            pruned_v1 = sum(p.startswith("/v1/") for p in server.requests)
+            server.requests.clear()
+            # Negative control: the same sweep without pruning.
+            unpruned = await self._discovery(server.base, soft404_prune_after=10**6).discover()
+            unpruned_requests = len(server.requests)
+        finally:
+            server.close()
+        # A namespace the app references stays live, so its late guesses still run.
+        self.assertEqual(pruned.paths(), ["/admin/real-panel", "/api/config", "/api/items"])
+        # Trade-off: an unreferenced namespace whose first guesses all hit the
+        # catch-all is dropped, so a real route late in its wordlist is missed.
+        self.assertEqual(unpruned.paths(), ["/admin/real-panel", "/api/config", "/api/items", "/v1/items"])
+        self.assertIn("/v1/", pruned.soft404_pruned_prefixes)
+        self.assertNotIn("/api/", pruned.soft404_pruned_prefixes)
+        self.assertNotIn("/admin/", pruned.soft404_pruned_prefixes)  # a live route sits there
+        self.assertGreater(pruned.soft404_candidates_pruned, 0)
+        self.assertEqual(unpruned.soft404_pruned_prefixes, [])
+        self.assertLessEqual(pruned_requests, pruned.probes_sent)  # GETs; OPTIONS not recorded
+        # The dead /v1/ branch stops at the prune threshold (16 guesses); the
+        # unpruned sweep spends ~250 requests there.
+        self.assertLessEqual(pruned_v1, 16)
+        self.assertGreater(sum(p.startswith("/v1/") for p in server.requests), 200)
+        self.assertLess(pruned_requests, unpruned_requests * 0.6)

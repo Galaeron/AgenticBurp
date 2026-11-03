@@ -183,6 +183,10 @@ class SurfaceResult:
     sensitive_file_hits: list[str] = field(default_factory=list)
     wildcard_prefixes: list[str] = field(default_factory=list)
     wildcard_candidates_suppressed: int = 0
+    # Namespaces whose guessed descendants kept matching the soft-404 signature
+    # with no live route under them; their remaining wordlist branch was dropped.
+    soft404_pruned_prefixes: list[str] = field(default_factory=list)
+    soft404_candidates_pruned: int = 0
     # WL-05: one record per sensitive_file_hits entry -- the real status, content
     # type, body length and fingerprint, and whether the body carries the
     # artifact's content signature (see sensitive_file_verdict). Never the body.
@@ -204,6 +208,8 @@ class SurfaceResult:
             "errors": self.errors,
             "wildcard_prefixes": self.wildcard_prefixes,
             "wildcard_candidates_suppressed": self.wildcard_candidates_suppressed,
+            "soft404_pruned_prefixes": self.soft404_pruned_prefixes,
+            "soft404_candidates_pruned": self.soft404_candidates_pruned,
         }
 
 
@@ -237,7 +243,8 @@ class SurfaceDiscovery:
                  nouns=None, collections=None, prefixes=None, seed_paths=None,
                  actions=None, sensitive_files=None, timeout: float = 8.0, max_probes: int = 6000,
                  use_ffuf: bool = True, ffuf_image: str = "harness/ffuf:2.1.0",
-                 run_context=None, session_ref: str | None = None):
+                 run_context=None, session_ref: str | None = None,
+                 soft404_prune_after: int = 16):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
         self.allowed_hosts = allowed_hosts or []
@@ -278,7 +285,19 @@ class SurfaceDiscovery:
         # everything (404->500, a 200 "not found" page, an SPA index) is
         # recognised as "not found" by SHAPE, not mistaken for a real route.
         # None until calibrated, or when the app returns honest 404s.
-        self._soft404: tuple[int, str] | None = None
+        # (status, content type, normalized-body hash, normalized length, hash
+        # stable?) -- see _calibrate_not_found and _soft404_match.
+        self._soft404: tuple[int, str, str, int, bool] | None = None
+        # Soft-404 branch pruning: once `soft404_prune_after` guessed paths under
+        # one namespace match the soft-404 signature and none of its paths is a
+        # live route, the rest of that wordlist branch is not sent. A juice-shop
+        # SPA run spent ~19k probes enumerating /admin/, /v1/, /internal/ ...
+        # descendants that all answered the index page.
+        self.soft404_prune_after = max(1, int(soft404_prune_after))
+        self._soft404_counts: dict[str, int] = {}
+        self._live_prefixes: set[str] = set()
+        self._soft404_dead: set[str] = set()
+        self._soft404_pruned = 0
         self._prefix_controls: dict[tuple[str, str], tuple[int, str] | None] = {}
         self._wildcard_prefixes: set[str] = set()
         self._wildcard_suppressed = 0
@@ -355,23 +374,64 @@ class SurfaceDiscovery:
                 control = await self._raw(method, bogus)
                 if control is None:
                     return True  # insufficient budget: candidate existence remains unproven
-                sigs.append((control[0], self._norm_body_hash(control[1], bogus)))
+                sigs.append((control[0], self._content_type(bogus),
+                             self._norm_body_hash(control[1], bogus)))
             self._prefix_controls[key] = sigs[0] if sigs[0] == sigs[1] else None
         signature = self._prefix_controls[key]
-        if signature is not None and (status, self._norm_body_hash(body, path)) == signature:
+        if signature is not None and (status, self._content_type(path),
+                                      self._norm_body_hash(body, path)) == signature:
             self._wildcard_prefixes.add(parent)
             self._wildcard_suppressed += 1
             return True
         return False
+
+    def _norm_body_len(self, body: str, path: str) -> int:
+        # Digits are kept: collapsing digit runs would make a random hex nonce's
+        # length vary with how its digits happen to cluster.
+        return len((body or "").replace(path, "PATH"))
+
+    def _content_type(self, path: str) -> str:
+        return (self._content_types.get(path) or "").split(";", 1)[0].strip().lower()
+
+    def _soft404_match(self, status: int, body: str, path: str) -> bool:
+        """True when a response has the calibrated catch-all's shape: same status
+        and content type, and the same normalized body -- or, when the two
+        calibration controls differed only in content (a per-request nonce in an
+        SPA shell), the same normalized length."""
+        if self._soft404 is None:
+            return False
+        sig_status, sig_ctype, sig_hash, sig_len, hash_stable = self._soft404
+        if status != sig_status or self._content_type(path) != sig_ctype:
+            return False
+        if self._norm_body_hash(body, path) == sig_hash:
+            return True
+        return not hash_stable and self._norm_body_len(body, path) == sig_len
 
     def _not_found(self, status: int, body: str, path: str) -> bool:
         """Existence oracle: a hard 404/framework marker, OR a match to the
         calibrated soft-404 signature (Phase 5 -- content/shape, not status)."""
         if _is_not_found(status, body):
             return True
-        if self._soft404 is not None and (status, self._norm_body_hash(body, path)) == self._soft404:
-            return True
-        return False
+        return self._soft404_match(status, body, path)
+
+    @staticmethod
+    def _ancestor_prefixes(path: str) -> list[str]:
+        """'/a/b/c' -> ['/a/', '/a/b/']; a root leaf ('/login') has none, so the
+        root namespace itself is never pruned."""
+        segs = [s for s in path.split("?", 1)[0].split("/") if s]
+        return ["/" + "/".join(segs[:i]) + "/" for i in range(1, len(segs))]
+
+    def _note_soft404(self, path: str) -> None:
+        for pre in self._ancestor_prefixes(path):
+            n = self._soft404_counts.get(pre, 0) + 1
+            self._soft404_counts[pre] = n
+            if n >= self.soft404_prune_after and pre not in self._live_prefixes:
+                self._soft404_dead.add(pre)
+
+    def _note_live(self, path: str) -> None:
+        for pre in self._ancestor_prefixes(path):
+            self._live_prefixes.add(pre)
+            self._soft404_dead.discard(pre)
 
     async def _calibrate_not_found(self) -> None:
         """Fingerprint the app's answer to KNOWN-BOGUS paths. A soft-404 signature
@@ -389,9 +449,15 @@ class SurfaceDiscovery:
             status, body, _allow = r
             if _is_not_found(status, body):
                 continue  # honest not-found already handled by the oracle
-            sigs.append((status, self._norm_body_hash(body, bogus)))
-        if len(sigs) == 2 and sigs[0] == sigs[1]:
-            self._soft404 = sigs[0]
+            sigs.append((status, self._content_type(bogus), self._norm_body_hash(body, bogus),
+                         self._norm_body_len(body, bogus)))
+        if len(sigs) != 2:
+            return
+        (s0, c0, h0, l0), (s1, c1, h1, l1) = sigs
+        # Same status, content type and length: the catch-all. A differing hash
+        # at the same length is a per-request nonce, so match on length there.
+        if s0 == s1 and c0 == c1 and l0 == l1:
+            self._soft404 = (s0, c0, h0, l0, h0 == h1)
 
     async def _check(self, path: str, source: str, method: str = "GET") -> Route | None:
         if path in self._seen:
@@ -405,18 +471,25 @@ class SurfaceDiscovery:
         if not referenced and any(path.startswith(p) for p in self._wildcard_prefixes):
             self._wildcard_suppressed += 1
             return None
+        if not referenced and any(p in self._soft404_dead for p in self._ancestor_prefixes(path)):
+            self._soft404_pruned += 1
+            return None
         self._attempted.add((method, path))
         r = await self._raw(method, path)
         if r is None:
             return None
         status, body, allow = r
-        if self._not_found(status, body, path):
+        if _is_not_found(status, body):
+            return None
+        if self._soft404_match(status, body, path):
+            self._note_soft404(path)
             return None
         if await self._prefix_wildcard(method, path, status, body):
             return None
         methods = tuple(m.strip().upper() for m in allow.split(",") if m.strip()) or (method,)
         route = Route(path=path, status=status, methods=methods, length=len(body), source=source)
         self._seen[path] = route
+        self._note_live(path)
         if 200 <= status < 300:
             self._bodies[path] = body
         return route
@@ -571,6 +644,11 @@ class SurfaceDiscovery:
         result.sensitive_file_evidence = [dict(r) for r in self._sensitive_evidence]
         result.wildcard_prefixes = sorted(self._wildcard_prefixes)
         result.wildcard_candidates_suppressed = self._wildcard_suppressed
+        result.soft404_pruned_prefixes = sorted(self._soft404_dead)
+        result.soft404_candidates_pruned = self._soft404_pruned
+        if self._soft404_dead:
+            result.errors.append(f"soft-404 branches pruned: {len(self._soft404_dead)} namespace(s), "
+                                 f"{self._soft404_pruned} guessed candidate(s) not sent")
         if self._wildcard_prefixes:
             result.errors.append("wildcard responses suppressed; guessed descendants were not expanded")
         return result
