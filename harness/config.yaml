@@ -35,6 +35,19 @@ transport:
   # max_session_refreshes times, if a refresh callback is registered, then expired.
   session_probe: null
   max_session_refreshes: 2
+  # Session freshness (harness/session_freshness.py). When on, a session is STALE once
+  # its last `window` sends to routes it was served before (2xx) hold at least
+  # `min_denials` 401/403s over at least `min_routes` such routes, at a rate of at
+  # least `denial_rate`. A stale session is refreshed through its role's declared
+  # `login` request (the same max_session_refreshes cap), else marked stale: its sends
+  # are then refused unsent, so later denials are not read as access control. Every
+  # refresh and stale verdict is logged as a health event. Off = nothing tracked.
+  session_freshness:
+    enabled: false
+    window: 20
+    min_denials: 6
+    min_routes: 2
+    denial_rate: 0.6
   route_5xx_threshold: 8
   route_circuit_cooldown_seconds: 300
 
@@ -248,6 +261,14 @@ driver_capture:
   enabled: false
   wait_ms: 1500        # settle time after load, for async JS-issued requests
   max_captured: 50      # cap on XHR/fetch exchanges captured per page visit
+  # SPA navigation (harness/spa_navigation.py): instead of loading only the start
+  # page, follow the in-app links and router targets the rendered DOM exposes
+  # (anchors, routerLink, hash routes), in scope and never destructive-looking,
+  # recording each view's XHR/fetch calls. Bounded by max_views and max_depth, and
+  # max_captured caps the exchanges across all views. Needs `enabled` above.
+  spa_navigation: false
+  max_views: 30
+  max_depth: 4
 
 # Cross-site browser PoC for CSRF confirmation -- LB-5 (harness/browser_driver.py
 # PlaywrightDriver.cross_site_submit + harness/validators/csrf_validator.py).
@@ -342,6 +363,30 @@ engagement:
   coverage_request_reserve: 0
   investigation_seconds: 0
   coverage_drive_seconds: 0
+  # Phase time-slices of investigation_seconds (harness/phase_schedule.py). A map of
+  # phase -> share for worklist, recrawl, capture_review and chain_rounds: each phase
+  # gets its share of the time LEFT when it begins (time a phase leaves unused rolls
+  # forward), so no phase holds the rest of the run. An explicit cap such as
+  # capture_review_seconds still applies. Empty, or investigation_seconds 0, keeps
+  # every phase's deadline as before. Example: {worklist: 4, recrawl: 1,
+  # capture_review: 2, chain_rounds: 2}.
+  phase_slices: {}
+  # Crawl once per registered principal (harness/role_crawl.crawl_roles_for) instead
+  # of once per distinct role feature: two same-role users get two discovery sweeps,
+  # two browser crawls and two feature crawls. DEFAULT OFF: it multiplies crawl traffic.
+  crawl_per_principal: false
+  # Route feedback and re-crawl (harness/route_feed.py). When on, a route the run first
+  # sees after discovery (a validator or model-directed probe's response that says the
+  # route exists, a browser XHR) is fed back: after the worklist pass, up to max_rounds
+  # rounds re-crawl the pending routes (one GET as every principal) and investigate
+  # them. At most max_new_routes routes per run, max_routes_per_round per round; a
+  # round starts only with min_new_routes pending. DEFAULT OFF: it sends active traffic.
+  recrawl:
+    enabled: false
+    max_rounds: 2
+    min_new_routes: 1
+    max_new_routes: 200
+    max_routes_per_round: 50
   # Graph -> experiment -> workflow -> proof cycle (experiment.py). When enabled, each
   # IDOR/BOLA business-context hypothesis is turned into a stateful cross-account
   # test (create a private object as one identity, read it as that identity and as

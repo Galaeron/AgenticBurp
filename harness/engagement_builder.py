@@ -54,6 +54,10 @@ def register_role_sessions(run_context, base_url: str, roles) -> list[str] | Non
             session_id, principal_id, dict(role.headers or {}),
             allowed_origins=[permitted_origin], role=role.role,
             name=role.name or principal_id, principal=role.to_principal())
+        if getattr(role, "login", None):
+            from harness.session_freshness import login_refresher
+            run_context.sessions.set_refresh(
+                session_id, login_refresher(run_context, role.login, base_url))
         session_refs.append(session_id)
     return session_refs
 
@@ -72,6 +76,8 @@ async def build_engagement(
     run_context=None,
     seed_exchanges=None,
     driver_capture_config=None,
+    per_principal: bool = False,
+    extra_views=(),
 ) -> tuple[engagement.EngagementState, role_crawl.RoleCrawlResult]:
     """Discover + build the access matrix + fuse into an EngagementState.
 
@@ -85,6 +91,7 @@ async def build_engagement(
     from harness.run_context import ScopePolicy
     seeds = []
     seed_errors = []
+    spa_views: list[dict] = []
     capture_config = driver_capture_config or {}
     supplied = list(seed_exchanges or [])[:200]
     if capture_config.get("enabled", False):
@@ -92,16 +99,35 @@ async def build_engagement(
             seed_errors.append("browser capture skipped: owning RunContext required")
         else:
             from harness import driver_capture
-            for role in role_crawl._distinct_discovery_roles(roles):
+            spa = bool(capture_config.get("spa_navigation", False))
+            for role in role_crawl.crawl_roles_for(roles, per_principal):
                 if run_context.cancel.cancelled or len(supplied) >= 200:
                     break
                 try:
+                    wait_ms = min(10000, max(0, int(capture_config.get("wait_ms", 1500))))
+                    room = min(200 - len(supplied),
+                               max(0, int(capture_config.get("max_captured", 50))))
+                    if spa:
+                        # Follow the app's client-side routes, recording each view's
+                        # XHR/fetch calls (spa_navigation; off by default).
+                        crawl = await driver_capture.crawl_spa(
+                            base_url, headers=role.norm_headers(), scope=run_context.scope,
+                            gate=run_context.gate, budget=run_context.budget,
+                            cancel=run_context.cancel, wait_ms=wait_ms, max_captured=room,
+                            max_views=max(1, int(capture_config.get("max_views", 30))),
+                            max_depth=max(0, int(capture_config.get("max_depth", 4))),
+                            extra_views=extra_views)
+                        supplied.extend(crawl.exchanges[:200 - len(supplied)])
+                        spa_views.append({"principal": role.principal_id(),
+                                          "views": len(crawl.views),
+                                          "exchanges": len(crawl.exchanges),
+                                          "stopped_by": crawl.stopped_by})
+                        seed_errors.extend("browser spa crawl: " + e for e in crawl.errors)
+                        continue
                     observation = await driver_capture.capture_requests(
                         base_url, headers=role.norm_headers(), scope=run_context.scope,
                         gate=run_context.gate, budget=run_context.budget,
-                        cancel=run_context.cancel,
-                        wait_ms=min(10000, max(0, int(capture_config.get("wait_ms", 1500)))),
-                        max_captured=min(200 - len(supplied), max(0, int(capture_config.get("max_captured", 50)))))
+                        cancel=run_context.cancel, wait_ms=wait_ms, max_captured=room)
                     supplied.extend(observation.exchanges[:200 - len(supplied)])
                     if observation.load_error:
                         seed_errors.append("browser capture incomplete: " + observation.load_error)
@@ -168,6 +194,7 @@ async def build_engagement(
         discovery_max_probes=discovery_max_probes,
         run_context=run_context,
         session_refs=session_refs,
+        **({"per_principal": True} if per_principal else {}),
         **({"seed_paths": [urlsplit(ex.url).path for ex, _ in seeds]} if seeds else {}),
     )
 
@@ -206,10 +233,66 @@ async def build_engagement(
         state.record_identity_probe(probe["url"], probe["method"], probe)
     for r in roles:
         state.ingest_identity(f"rolecrawl:{r.name or r.role}", r.role, source="seed")
+    if spa_views:
+        log.info("build_engagement: spa navigation %s", spa_views)
+        result.spa_views = spa_views
 
     log.info("build_engagement: %s -- %d endpoints, %d idor candidates, %d idor findings",
              base_url, len(result.endpoints), len(result.idor_candidates), len(result.idor_findings))
     return state, result
+
+
+async def recrawl_state(base_url: str, roles: list[RoleSession], observations, *,
+                        run_context=None, host: str | None = None,
+                        deadline: float | None = None) -> tuple:
+    """engagement.recrawl: turn routes seen after discovery (route_feed) into a
+    separate EngagementState to investigate and merge, like a chain round's.
+
+    Each route gets its observed request as its template and, when the request
+    carried a session, that principal's observation. A GET route is then re-crawled
+    once AS every registered principal (one GET each, through the run's transport,
+    so scope, gate, budget and cancellation apply) and each answer is recorded per
+    principal -- an authenticated-only route enters the worklist with the
+    principal(s) that reached it. Returns (state, captured exchange dicts)."""
+    import time
+    from harness.models import HttpExchange
+    from harness.run_context import TypedRequest
+    state = engagement.EngagementState(host=host or _host_of(base_url))
+    captured: list[dict] = []
+    principals = role_crawl.crawl_roles_for(roles, per_principal=True)
+    for obs in observations:
+        ep = state._ep(obs.method, obs.path)
+        try:
+            ex = HttpExchange(**obs.exchange)
+            state.record_template(ex.url, ex.method, ex)
+            captured.append(ex.model_dump())
+        except (TypeError, ValueError):
+            pass
+        if obs.principal_id and obs.status is not None:
+            ep.record_principal_observation(
+                obs.principal_id, role=obs.role or "user", status=obs.status,
+                reachable=200 <= obs.status < 300, session_ref=obs.session_ref,
+                observed_at=time.time(), source="route_feed")
+        if obs.method != "GET" or run_context is None:
+            continue
+        for role in principals:
+            if run_context.cancel.cancelled or (deadline is not None and time.monotonic() >= deadline):
+                break
+            session_ref, extra = run_context.sessions.bind_headers(role.norm_headers())
+            if role.norm_headers() and session_ref is None:
+                continue          # credentials with no registered session: never sent
+            out = await run_context.target_transport().execute(
+                TypedRequest("GET", obs.url, headers=extra), capability="recrawl",
+                session_ref=session_ref)
+            if out.status is None:
+                continue
+            ep.record_principal_observation(
+                role_crawl._matrix_principal_id(role), role=role.role, status=out.status,
+                reachable=200 <= out.status < 300, session_ref=session_ref,
+                observed_at=time.time(), source="recrawl")
+    log.info("recrawl_state: %s -- %d new route(s) re-crawled as %d principal(s)",
+             base_url, len(observations), len(principals))
+    return state, captured
 
 
 async def feature_crawl_captures(
@@ -225,6 +308,7 @@ async def feature_crawl_captures(
     seed_paths: list[str] | None = None,
     run_context=None,
     errors=None,
+    per_principal: bool = False,
 ) -> list:
     """Run the stateful feature-workflow crawl (feature_workflow.crawl_features) as
     each DISTINCT-feature role and union the captured exchanges.
@@ -252,7 +336,7 @@ async def feature_crawl_captures(
     def _h(*parts: str) -> str:
         return hashlib.sha1("\x00".join(parts).encode("utf-8", "ignore")).hexdigest()[:12]
 
-    sweep_roles = role_crawl._distinct_discovery_roles(roles) if roles else []
+    sweep_roles = role_crawl.crawl_roles_for(roles, per_principal) if roles else []
     seen: set[tuple] = set()
     out: list = []
     for r in sweep_roles:
