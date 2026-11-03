@@ -1241,10 +1241,10 @@ class ChainMixin:
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a
-        # username-keyed IDOR is reachable, not just numeric neighbours. It never
-        # confirms (RV-D2): one principal cannot show the object is unauthorised,
-        # so its best result is an inconclusive candidate; only cross_identity
-        # confirms IDOR.
+        # username-keyed IDOR is reachable, not just numeric neighbours. Alone it
+        # never confirms (RV-D2): one principal cannot show the object is
+        # unauthorised. It confirms only when the shared ownership ledger
+        # (declared, else self-observed) places the object with another account.
         _idor_cfg = (self.config.get("validators", {}) or {}).get("idor_read", {}) or {}
         _idor_read = IdorReadValidator(
             allowed_hosts=self.allowed_hosts,
@@ -1252,7 +1252,8 @@ class ChainMixin:
             # operator declared for this engagement (e.g. a known victim account,
             # like a tester who was told which record to reach).
             candidate_ids=(list(_idor_cfg.get("candidate_ids", []) or [])
-                           + _harvest_object_ids(_all_captured, {r.principal_id() for r in roles})))
+                           + _harvest_object_ids(_all_captured, {r.principal_id() for r in roles})),
+            ownership=ownership, run_context=run_context)
         _bxss = BrowserXssValidator(allowed_hosts=self.allowed_hosts, run_context=run_context)
         _jwt = JwtForgeValidator(allowed_hosts=self.allowed_hosts,
                                  run_context=run_context)

@@ -381,9 +381,10 @@ class ValidatorRegistry:
         registered and the auto-armed cross-identity validator alike; the cached
         auto-armed instance is rebuilt so a declaration made after arming counts."""
         self.ownership = ledger
-        xid = self.validators.get("cross_identity")
-        if xid is not None:
-            xid.ownership = ledger
+        for name in ("cross_identity", "idor_read"):
+            validator = self.validators.get(name)
+            if validator is not None:
+                validator.ownership = ledger
         self._auto_xid = None
 
     def set_active_enabled(self, enabled: bool) -> None:
