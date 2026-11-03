@@ -57,12 +57,16 @@ class ToolProxy:
     def __init__(self, run, target_url: str, *, capability: str,
                  bind_host: str = "127.0.0.1",
                  client_timeout: float | None = None,
-                 max_forwarded: int | None = None):
+                 max_forwarded: int | None = None, cap_stops: bool = False):
         self.run = run
         # A caller's own share of the run budget (discovery's probe budget for
         # ffuf): past it nothing more is sent, so a 13k-line wordlist cannot spend
         # more than the sweep it stands in for.
         self.max_forwarded = max_forwarded
+        # With cap_stops the cap also ends the scan (stop_reason "tool_cap"), for a
+        # tool whose every request may create state (sqlmap on a create endpoint);
+        # without it the tool is answered 404 and finishes its list (ffuf).
+        self.cap_stops = cap_stops
         self.forwarded_paths: set[str] = set()   # paths actually sent through the run
         self.target_origin = _origin(target_url)
         self.capability = capability
@@ -209,9 +213,13 @@ class ToolProxy:
             return 403, {}, b"harness tool proxy: redirect target is outside the tool's origin"
         url = self.target_origin + (p.path or "/") + (f"?{p.query}" if p.query else "")
         if self.max_forwarded is not None and self.forwarded >= self.max_forwarded:
-            # Answered as not-found and NOT sent: the tool finishes its list with the
-            # hits it has (it filters 404s) instead of being killed mid-scan.
+            # NOT sent. Answered as not-found, so the tool finishes its list with the
+            # hits it has (it filters 404s) instead of being killed mid-scan -- or,
+            # with cap_stops, the scan ends here.
             self._refuse("tool_cap")
+            if self.cap_stops:
+                self.stop_reason = self.stop_reason or "tool_cap"
+                return 503, {}, b"harness tool proxy: not sent, the tool's request cap is reached"
             return 404, {}, b"harness tool proxy: not sent, the tool's request share is spent"
         send_headers = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 

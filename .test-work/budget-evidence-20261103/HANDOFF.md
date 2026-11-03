@@ -144,7 +144,27 @@ For the ffuf slice, run it with `GATE_SUMMARY=gates-ffuf.txt` and `GATE_TESTS` s
 1. **Per-role discovery sweeps each get the full budget.** role_crawl runs one discovery per distinct role, which is about a 3× multiplier on 19,439 probes. Should later sweeps reuse the first sweep's dead-prefix and soft-404 state, or share one budget? This was not changed here.
 2. **Should sqlmap collapse across identities?** The R03 invariant keeps identity in the key, so the same request under alice and bob still runs twice. Some of the run's captcha re-runs came from different source captures, possibly different identities. Is SQLi identity-dependent enough to keep this?
 3. **Pruning threshold.** The value 16 is a kwarg, not config. Pruning can miss a real route late in the wordlist under an unreferenced namespace. Expose it in config.yaml (default unchanged), or keep it internal?
-4. **Account creation.** About 685 accounts were created by sqlmap fuzzing `POST /api/Users`. Should sqlmap skip registration and other create endpoints, or run them `parameter_only`?
+4. **Account creation. ANSWERED ("Light sqlmap, capped") and done in its own commit.**
+   - **What counts as a create** (`create_endpoint_reason` in `validators/sqlmap.py`):
+     - a POST/PUT whose base capture answered 201;
+     - a POST to a non-id path that answered with a new object id (top-level or `data.id`), excluding responses that carry a token, which are logins;
+     - a POST to a plural collection path such as `/api/Users` or `/api/BasketItems`.
+     - A registration counts even though its body has a password. The juice-shop `POST /api/Users` is auth-shaped, so an auth-shape exclusion would have missed it.
+   - **The light scan:**
+     - `--level 1 --risk 1 --technique BE`, whatever the configured level/risk;
+     - a hard cap of `validators.sqlmap.create_endpoint_max_requests` requests, default 200 in config.yaml;
+     - the cap is enforced by the run's ToolProxy through `max_forwarded` plus the new `cap_stops`. At the cap nothing more is sent, the proxy stop ends the container, and the verdict is "incomplete", never a negative.
+   - **Outside a run:** a create endpoint is not scanned at all. The result is skipped with that reason, because nothing could enforce the cap.
+   - **Proof reason:** the limitation and the evidence lead with `light sqlmap (create endpoint: <why>): level 1, risk 1, techniques BE, at most N requests; M request(s) sent[, cap reached]`.
+   - **Tests:** `test_sqlmap_create_endpoints.py` covers:
+     - detection, with negatives for GET, update, login and action endpoints;
+     - the cap bounding a 40-request stand-in tool at 5;
+     - level/risk/technique;
+     - the proof reason;
+     - an under-cap scan;
+     - no run means no scan;
+     - an update endpoint keeping the full scan;
+     - fault injection: a proxy without the cap lets all 20 requests through.
 5. **Other validators still lose their tails.** The ledger `[:1000]` head-cut remains for every validator except sqlmap's verdict block. Should we store a head and a tail, or a per-validator digest?
 6. **Confirm-path fallback.** The fallback `RunContext` has no execution registry, so the collapse does not apply there. Is that intended?
 

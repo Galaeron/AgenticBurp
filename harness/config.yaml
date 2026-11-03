@@ -668,6 +668,12 @@ validators:
     timeout_seconds: 90
     level: 1
     risk: 1
+    # Create endpoints (a POST/PUT that answered 201 or a new object id, or a POST
+    # to a plural collection path such as /api/Users) get a light scan: level 1,
+    # risk 1, boolean + error techniques only, and at most this many requests per
+    # scan, enforced by the run's tool proxy (outside a run they are not scanned).
+    # Every request may create an object; the reason and cap go in the proof.
+    create_endpoint_max_requests: 200
   # Cross-identity (Autorize-style) access-control validator. The single-exchange
   # idor/auth agents can only GUESS at broken access control; this replays the
   # request as ANOTHER identity (+ anonymous) and compares, the only way to tell

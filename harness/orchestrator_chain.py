@@ -1314,6 +1314,7 @@ class ChainMixin:
             timeout_seconds=int(_sql_cfg.get("timeout_seconds", 90)),
             level=int(_sql_cfg.get("level", 1)),
             risk=int(_sql_cfg.get("risk", 1)),
+            create_endpoint_max_requests=int(_sql_cfg.get("create_endpoint_max_requests", 200)),
             container_image=_sql_cfg.get("container_image"),
             run_context=run_context,
             allowed_hosts=self.allowed_hosts,
