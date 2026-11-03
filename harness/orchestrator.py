@@ -397,12 +397,14 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         from harness.protected_routes import _target_of
         origin = (urlsplit(url).scheme.lower(), _target_of(url))
         cached = getattr(run_context, "_declared_ownership", {}) if run_context else {}
+        self_observed = getattr(run_context, "self_ownership", None) if run_context else None
         if engagement_owners is None and origin in cached:
             ledger = cached[origin]
         else:
             authz = self.config.get("authz", {}) or {}
             configured = isinstance(authz, dict) and "owners" in authz
-            if not configured and not engagement_owners and not getattr(self, "_managed_ownership", False):
+            if not configured and not engagement_owners and self_observed is None \
+                    and not getattr(self, "_managed_ownership", False):
                 return self.validator_registry.ownership  # preserve explicitly injected ledgers
             identities = identity_headers.identities_for_host(urlsplit(url).hostname or "")
             if run_context is not None:
@@ -411,6 +413,9 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             if run_context is not None:
                 cached[origin] = ledger
                 run_context._declared_ownership = cached
+        if self_observed is not None and getattr(ledger, "self_observed", self_observed) is None:
+            # Below every declaration: consulted only for an object nothing declares.
+            ledger.self_observed = self_observed
         if install and self.validator_registry.ownership is not ledger:
             self.validator_registry.set_ownership(ledger)
         if install:
@@ -421,7 +426,8 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         from copy import copy
         authz = (getattr(self, "config", {}) or {}).get("authz", {}) or {}
         declared = isinstance(authz, dict) and "owners" in authz
-        if not declared and not getattr(run_context, "_declared_ownership", None):
+        if not declared and not getattr(run_context, "_declared_ownership", None) \
+                and getattr(run_context, "self_ownership", None) is None:
             # Keep the original registry protocol for callers without declarations,
             # including evidence-only registries that do not expose a validators map.
             return await ConfirmMixin._validate_findings(self, exchange, reports, run_context=run_context)
@@ -435,8 +441,9 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         if registry is None:
             registry = copy(self.validator_registry)
             registry.validators = dict(registry.validators)
-            if "cross_identity" in registry.validators:
-                registry.validators["cross_identity"] = copy(registry.validators["cross_identity"])
+            for name in ("cross_identity", "idor_read"):
+                if name in registry.validators:
+                    registry.validators[name] = copy(registry.validators[name])
             registry._auto_xid = None
             if run_context is not None:
                 registries[registry_key] = registry

@@ -340,7 +340,7 @@ _CLASS_TAGS: dict[str, set[str]] = {
     "open_redirect": {"open_redirect", "open-redirect", "open redirect"},
     "ssrf": {"ssrf", "server-side request forgery"},
     "admin_exposure": {"admin_exposure", "admin-exposure"},
-    "access_control": {"idor", "access_control", "access-control", "broken-access-control", "missing-authorization"},
+    "access_control": {"idor", "bfla", "access_control", "access-control", "broken-access-control", "missing-authorization"},
     "dependency_exposure": {"dependency_exposure", "dependency-exposure", "manifest-exposure"},
     "known_vuln": {"known-vulnerable-dependency"},
     "weak_auth": {"weak_auth", "weak-auth", "authentication-bypass", "session"},

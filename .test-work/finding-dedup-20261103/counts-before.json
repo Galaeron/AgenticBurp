@@ -1,0 +1,142 @@
+{
+  "code": "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\bm2-discriminator-afa402\\.test-work\\finding-dedup-20261103\\before-src",
+  "store_rows": 141,
+  "chain_rows": 0,
+  "report_collapse_survivors": 121,
+  "report_collapse_removed": 20,
+  "report_survivors_non_chain": 121,
+  "issue_export_count": 132,
+  "issue_groups": 132,
+  "issue_groups_by_class": {
+    "idor": 13,
+    "insecure communication": 10,
+    "xss": 8,
+    "misconfig": 7,
+    "sqli": 7,
+    "api_security": 7,
+    "insecure transport / token exposure over http": 6,
+    "missing security headers": 5,
+    "insecure transport": 5,
+    "broken object-level authorization (bola) / idor": 3,
+    "jwt": 3,
+    "csrf": 3,
+    "insecure transport / man-in-the-middle (mitm)": 3,
+    "insecure direct object reference / broken object-level access control": 3,
+    "broken function-level authorization (bfla)": 2,
+    "info_disclosure": 2,
+    "broken object level authorization (bola) / insecure direct object reference (idor)": 2,
+    "cors": 2,
+    "insecure transport / cleartext credentials": 2,
+    "missing security header": 2,
+    "broken access control": 2,
+    "broken function-level authorization (bfla) / injection": 1,
+    "command injection / rce": 1,
+    "authentication bypass": 1,
+    "authentication bypass / sql injection": 1,
+    "broken access control / information disclosure": 1,
+    "broken object-level authorization (bola) / insecure direct object reference (idor)": 1,
+    "idor/bola": 1,
+    "insecure transport / cleartext transmission": 1,
+    "insecure direct object reference / broken object-level authorization (idor/bola)": 1,
+    "insecure transport / token exposure": 1,
+    "lack of pagination / resource limiting": 1,
+    "token transmission over http": 1,
+    "cors misconfiguration / trust boundary bypass": 1,
+    "lack of resource/rate limiting at the api layer (unbounded list)": 1,
+    "cross-origin resource sharing (cors) misconfiguration": 1,
+    "broken access control (bola) on workflow scope": 1,
+    "state-changing request without csrf protection": 1,
+    "broken function level authorization (api context)": 1,
+    "information exposure / excessive data exposure": 1,
+    "lack of pagination/resource limiting on list endpoints": 1,
+    "nosql": 1,
+    "lack of resource / rate limiting at the api layer": 1,
+    "broken access control / information exposure": 1,
+    "overly permissive cors policy": 1,
+    "lack of resource scoping/filtering": 1,
+    "broken access control (resource scoping)": 1,
+    "cache key mismatch / missing vary header": 1,
+    "broken access control (information disclosure)": 1,
+    "token storage issues": 1,
+    "business logic flaw / broken access control": 1,
+    "lack of pagination / resource exhaustion via list endpoint": 1,
+    "suspicious_pattern": 1,
+    "insecure direct object reference (idor) / broken object-level access control": 1,
+    "mass assignment / excessive data binding": 1,
+    "misconfigured cors policy": 1
+  },
+  "largest_issue_groups": [
+    [
+      "jwt",
+      "",
+      "",
+      10
+    ],
+    [
+      "broken function-level authorization (bfla)",
+      "GET",
+      "/api/Users",
+      1
+    ],
+    [
+      "broken function-level authorization (bfla)",
+      "GET",
+      "/profile",
+      1
+    ],
+    [
+      "info_disclosure",
+      "GET",
+      "/rest/user/whoami",
+      1
+    ],
+    [
+      "xss",
+      "GET",
+      "/rest/user/whoami",
+      1
+    ],
+    [
+      "broken function-level authorization (bfla) / injection",
+      "GET",
+      "/rest/user/whoami",
+      1
+    ],
+    [
+      "command injection / rce",
+      "GET",
+      "/rest/user/whoami",
+      1
+    ],
+    [
+      "authentication bypass",
+      "POST",
+      "/rest/user/login",
+      1
+    ],
+    [
+      "authentication bypass / sql injection",
+      "POST",
+      "/rest/user/login",
+      1
+    ],
+    [
+      "broken access control / information disclosure",
+      "GET",
+      "/rest/admin/application-configuration",
+      1
+    ],
+    [
+      "broken object-level authorization (bola) / idor",
+      "PUT",
+      "/api/BasketItems/{id}",
+      1
+    ],
+    [
+      "broken object-level authorization (bola) / idor",
+      "GET",
+      "/api/BasketItems/{id}",
+      1
+    ]
+  ]
+}

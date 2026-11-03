@@ -198,6 +198,8 @@ class TestChainRuleCoverageIsDocumented(unittest.TestCase):
         "dom_xss",
         # toctou is a standalone atomicity finding; no dedicated chain rule yet.
         "toctou",
+        # Finding dedup (2026-11-03): host-wide hygiene classes, no chain rule.
+        "insecure_transport", "missing_headers",
     })
 
     def test_categories_with_no_chain_rule_are_the_known_documented_set(self):
