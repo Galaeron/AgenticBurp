@@ -56,8 +56,14 @@ class ToolProxy:
 
     def __init__(self, run, target_url: str, *, capability: str,
                  bind_host: str = "127.0.0.1",
-                 client_timeout: float | None = None):
+                 client_timeout: float | None = None,
+                 max_forwarded: int | None = None):
         self.run = run
+        # A caller's own share of the run budget (discovery's probe budget for
+        # ffuf): past it nothing more is sent, so a 13k-line wordlist cannot spend
+        # more than the sweep it stands in for.
+        self.max_forwarded = max_forwarded
+        self.forwarded_paths: set[str] = set()   # paths actually sent through the run
         self.target_origin = _origin(target_url)
         self.capability = capability
         self.bind_host = bind_host
@@ -202,6 +208,11 @@ class ToolProxy:
             self._refuse("off_origin_redirect")
             return 403, {}, b"harness tool proxy: redirect target is outside the tool's origin"
         url = self.target_origin + (p.path or "/") + (f"?{p.query}" if p.query else "")
+        if self.max_forwarded is not None and self.forwarded >= self.max_forwarded:
+            # Answered as not-found and NOT sent: the tool finishes its list with the
+            # hits it has (it filters 404s) instead of being killed mid-scan.
+            self._refuse("tool_cap")
+            return 404, {}, b"harness tool proxy: not sent, the tool's request share is spent"
         send_headers = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 
         out = await self.run.target_transport().send_creds(
@@ -209,6 +220,7 @@ class ToolProxy:
             body=body, max_redirects=0)
         if out.outcome in ("ok", "error"):
             self.forwarded += 1
+            self.forwarded_paths.add(p.path or "/")
         if out.outcome != "ok":
             self._refuse(out.outcome)
             # A run that stopped the tool's traffic (budget, cancel, an expired session,

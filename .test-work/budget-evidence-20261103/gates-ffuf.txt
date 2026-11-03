@@ -1,0 +1,8 @@
+py312 precondition exit=0 Ran 74 tests in 0.796s OK
+py312 touched exit=1 Ran 402 tests in 379.611s FAILED (failures=1, errors=1)
+py312 smoke exit=0 Ran 149 tests in 97.049s OK
+py314 precondition exit=0 Ran 74 tests in 1.300s OK
+py314 touched exit=1 Ran 402 tests in 426.024s FAILED (failures=1, errors=1)
+py314 smoke exit=0 Ran 149 tests in 99.102s OK
+diff-check exit=0
+rerun after fixture fix (test_sensitive_file_confirmation: shell length varies per response): py312 Ran 11 OK; py314 Ran 11 OK

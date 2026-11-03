@@ -923,6 +923,11 @@ class ChainMixin:
                     task.meta["final_pass"] = {"status": "deferred", "reason": result["stopped_by"]}
         return result
 
+    def _discovery_ffuf_kw(self) -> dict:
+        """engagement.discovery_ffuf, passed on only when enabled (default off)."""
+        cfg = self.config if isinstance(self.config, dict) else {}
+        return {"discovery_ffuf": True} if (cfg.get("engagement") or {}).get("discovery_ffuf") else {}
+
     # Roles registered as replay identities below are owned by this engagement
     # and released when it ends (never leak into a later engagement on the host).
     @identity_headers.leased
@@ -1020,6 +1025,7 @@ class ChainMixin:
                 max_endpoints=discovery_max_endpoints,
                 active_discovery=active_discovery,
                 discovery_max_probes=discovery_max_probes, run_context=run_context,
+                **self._discovery_ffuf_kw(),
                 **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
                 **({"driver_capture_config": self.config["driver_capture"]}
                    if (self.config.get("driver_capture") or {}).get("enabled") else {}))
@@ -1990,7 +1996,8 @@ class ChainMixin:
                 crawl_max_pages=discovery_max_pages,
                 max_endpoints=discovery_max_endpoints,
                 active_discovery=active_discovery,
-                discovery_max_probes=discovery_max_probes, run_context=run_context)
+                discovery_max_probes=discovery_max_probes, run_context=run_context,
+                **self._discovery_ffuf_kw())
             outs2, new_findings = await _investigate(st2, derived)
             if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
                 await review_captured_exchanges(

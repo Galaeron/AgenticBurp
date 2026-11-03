@@ -316,6 +316,13 @@ engagement:
   # extra leg traffic. Bounded by coverage_leg_budget. Legs stay gated by
   # validators.active_enabled + scope; mutating legs also by allow_mutating_replay.
   coverage_drive_legs: false
+  # Containerised ffuf content discovery inside pipeline runs. When on, the
+  # discovery sweep runs ffuf (harness/ffuf:2.1.0) through a loopback proxy that
+  # charges each of its requests to the run budget, scope and gate, capped at most
+  # of the sweep's own probe budget; the Python sweep then skips what ffuf sent.
+  # DEFAULT OFF: the current behaviour (ffuf skipped inside runs) is unchanged.
+  # Needs Docker and the locally built image; without them the sweep is as before.
+  discovery_ffuf: false
   coverage_leg_budget: 80
   # Case-granular driving (coverage_drive_cases) dispatches ssti, command injection
   # and sqlmap once per parameter; coverage_parameter_field_cap caps how many

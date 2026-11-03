@@ -187,6 +187,10 @@ class SurfaceResult:
     # with no live route under them; their remaining wordlist branch was dropped.
     soft404_pruned_prefixes: list[str] = field(default_factory=list)
     soft404_candidates_pruned: int = 0
+    # ffuf inside a run: requests it sent through the run (each one charged to the
+    # run budget), and its hits the harness's own soft-404 fingerprint rejected.
+    ffuf_requests: int = 0
+    ffuf_soft404_disagreements: int = 0
     # WL-05: one record per sensitive_file_hits entry -- the real status, content
     # type, body length and fingerprint, and whether the body carries the
     # artifact's content signature (see sensitive_file_verdict). Never the body.
@@ -210,6 +214,8 @@ class SurfaceResult:
             "wildcard_candidates_suppressed": self.wildcard_candidates_suppressed,
             "soft404_pruned_prefixes": self.soft404_pruned_prefixes,
             "soft404_candidates_pruned": self.soft404_candidates_pruned,
+            "ffuf_requests": self.ffuf_requests,
+            "ffuf_soft404_disagreements": self.ffuf_soft404_disagreements,
         }
 
 
@@ -244,7 +250,7 @@ class SurfaceDiscovery:
                  actions=None, sensitive_files=None, timeout: float = 8.0, max_probes: int = 6000,
                  use_ffuf: bool = True, ffuf_image: str = "harness/ffuf:2.1.0",
                  run_context=None, session_ref: str | None = None,
-                 soft404_prune_after: int = 16):
+                 soft404_prune_after: int = 16, ffuf_in_runs: bool = False):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
         self.allowed_hosts = allowed_hosts or []
@@ -263,6 +269,10 @@ class SurfaceDiscovery:
         self.max_probes = max_probes
         self.use_ffuf = use_ffuf
         self.ffuf_image = ffuf_image
+        # Inside a run ffuf is launched only when the operator enables it
+        # (engagement.discovery_ffuf); its traffic then goes through a ToolProxy
+        # that charges every request to the run's budget, scope and gate.
+        self.ffuf_in_runs = ffuf_in_runs
         self.run_context = run_context
         self.session_ref = session_ref
         self._seen: dict[str, Route] = {}
@@ -288,6 +298,14 @@ class SurfaceDiscovery:
         # (status, content type, normalized-body hash, normalized length, hash
         # stable?) -- see _calibrate_not_found and _soft404_match.
         self._soft404: tuple[int, str, str, int, bool] | None = None
+        # The soft-404 answer's raw byte length when both calibration controls had
+        # the same one: handed to ffuf as -fs so both filters drop one baseline.
+        self._soft404_bytes: int | None = None
+        self._soft404_matches = 0
+        # Paths a proxied ffuf run already sent through the run: the Python sweep
+        # does not guess them again.
+        self._ffuf_covered: set[str] = set()
+        self._ffuf_covered_skips = 0
         # Soft-404 branch pruning: once `soft404_prune_after` guessed paths under
         # one namespace match the soft-404 signature and none of its paths is a
         # live route, the rest of that wordlist branch is not sent. A juice-shop
@@ -450,14 +468,16 @@ class SurfaceDiscovery:
             if _is_not_found(status, body):
                 continue  # honest not-found already handled by the oracle
             sigs.append((status, self._content_type(bogus), self._norm_body_hash(body, bogus),
-                         self._norm_body_len(body, bogus)))
+                         self._norm_body_len(body, bogus), len(body.encode("utf-8"))))
         if len(sigs) != 2:
             return
-        (s0, c0, h0, l0), (s1, c1, h1, l1) = sigs
+        (s0, c0, h0, l0, b0), (s1, c1, h1, l1, b1) = sigs
         # Same status, content type and length: the catch-all. A differing hash
         # at the same length is a per-request nonce, so match on length there.
         if s0 == s1 and c0 == c1 and l0 == l1:
             self._soft404 = (s0, c0, h0, l0, h0 == h1)
+            if b0 == b1:
+                self._soft404_bytes = b0
 
     async def _check(self, path: str, source: str, method: str = "GET") -> Route | None:
         if path in self._seen:
@@ -474,6 +494,9 @@ class SurfaceDiscovery:
         if not referenced and any(p in self._soft404_dead for p in self._ancestor_prefixes(path)):
             self._soft404_pruned += 1
             return None
+        if not referenced and path in self._ffuf_covered:
+            self._ffuf_covered_skips += 1
+            return None
         self._attempted.add((method, path))
         r = await self._raw(method, path)
         if r is None:
@@ -482,6 +505,7 @@ class SurfaceDiscovery:
         if _is_not_found(status, body):
             return None
         if self._soft404_match(status, body, path):
+            self._soft404_matches += 1
             self._note_soft404(path)
             return None
         if await self._prefix_wildcard(method, path, status, body):
@@ -646,6 +670,9 @@ class SurfaceDiscovery:
         result.wildcard_candidates_suppressed = self._wildcard_suppressed
         result.soft404_pruned_prefixes = sorted(self._soft404_dead)
         result.soft404_candidates_pruned = self._soft404_pruned
+        if self._ffuf_covered_skips:
+            result.errors.append(f"ffuf covered {self._ffuf_covered_skips} wordlist candidate(s); "
+                                 "the Python sweep did not resend them")
         if self._soft404_dead:
             result.errors.append(f"soft-404 branches pruned: {len(self._soft404_dead)} namespace(s), "
                                  f"{self._soft404_pruned} guessed candidate(s) not sent")
@@ -656,26 +683,75 @@ class SurfaceDiscovery:
     async def _ffuf_fast_path(self, result: SurfaceResult) -> int:
         """Run ffuf in a container and seed its discovered routes into _seen.
         Returns the number of routes found. Fails silently (returns 0) when
-        Docker or the image is absent."""
+        Docker or the image is absent.
+
+        Inside a run (only with ffuf_in_runs) ffuf is pointed at a loopback
+        ToolProxy: every request it makes is replayed through the run, so it is
+        charged to the run budget and checked against scope and the gate, and the
+        container may reach nothing but that proxy. Its share is capped at most of
+        the sweep budget it stands in for; the requests it sent count as probes,
+        and the paths it sent are not guessed again by the Python sweep."""
         from harness import ffuf_runner
-        if self.run_context is not None:
+        if self.run_context is not None and not self.ffuf_in_runs:
             result.errors.append("ffuf skipped: external requests cannot spend the owning run budget")
             return 0
         ok, reason = ffuf_runner.ffuf_available(self.ffuf_image)
         if not ok:
             result.errors.append(f"ffuf skipped: {reason}")
             return 0
-        ffuf_result = await ffuf_runner.ffuf_discover(
-            self.base_url, image=self.ffuf_image, headers=self.headers or None)
+        covered: set[str] = set()
+        if self.run_context is None:
+            ffuf_result = await ffuf_runner.ffuf_discover(
+                self.base_url, image=self.ffuf_image, headers=self.headers or None,
+                filter_size=self._soft404_bytes)
+        else:
+            remaining = min(self.max_probes, self._phase_limit) - self._probes
+            # Leave a fifth for re-checking ffuf's hits and the sweep it cannot do.
+            share = remaining - remaining // 5
+            if share <= 0:
+                result.errors.append("ffuf skipped: no discovery budget left")
+                return 0
+            from harness import tool_runner
+            from harness.tool_proxy import ToolProxy
+            run = self.run_context
+            proxy = await ToolProxy(run, self.base_url, capability="surface_discovery_ffuf",
+                                    max_forwarded=share).start()
+            try:
+                ffuf_result = await ffuf_runner.ffuf_discover(
+                    proxy.url_for(self.base_url + "/"), image=self.ffuf_image,
+                    headers=self.headers or None, filter_size=self._soft404_bytes,
+                    cancel=lambda: run.cancel.cancelled or proxy.stop_requested,
+                    egress=tool_runner.EgressPolicy(allowed_hosts=(tool_runner._HOST_ALIAS,)))
+            finally:
+                await proxy.close()
+            self._probes += proxy.forwarded
+            result.ffuf_requests = proxy.forwarded
+            base_path = urlsplit(self.base_url).path.rstrip("/")
+            covered = {path[len(base_path):] for path in proxy.forwarded_paths
+                       if path.startswith(base_path + "/")}
+            capped = proxy.refused.get("tool_cap", 0)
+            note = f"ffuf sent {proxy.forwarded} request(s) through the run"
+            if capped:
+                note += f"; {capped} wordlist request(s) past its share were not sent"
+            if proxy.stop_reason:
+                note += f"; stopped: {proxy.stop_reason}"
+            result.errors.append(note)
         if ffuf_result.error:
             result.errors.append(f"ffuf error: {ffuf_result.error}")
+            self._ffuf_covered = covered
             return 0
         count = 0
+        matches_before = self._soft404_matches
         for route in ffuf_result.routes:
             if route.path not in self._seen:
                 # External tool hits are candidates, not proof of existence.
                 if await self._check(route.path, "ffuf") is not None:
                     count += 1
+        result.ffuf_soft404_disagreements = self._soft404_matches - matches_before
+        if result.ffuf_soft404_disagreements:
+            result.errors.append(f"ffuf: {result.ffuf_soft404_disagreements} hit(s) matched the "
+                                 "harness soft-404 fingerprint and were dropped")
+        self._ffuf_covered = covered
         if count:
             result.errors.append(f"ffuf seeded {count} routes")
         return count

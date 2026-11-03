@@ -327,6 +327,8 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     "engagement.driver_execute",
     "engagement.feature_crawl",
     "engagement.coverage_drive_legs",
+    # ffuf inside runs sends its own wordlist traffic to the target.
+    "engagement.discovery_ffuf",
     "coordinator.cloud_primary",
     "coordinator.cloud_reasoning",
     # P2-1: the business-context planning pass re-ranks the worklist and proposes

@@ -619,6 +619,7 @@ async def crawl_roles(
     session_refs: list[str | None] | None = None,
     owned_object_ids: dict | None = None,
     seed_paths: list[str] | None = None,
+    discovery_ffuf: bool = False,
 ) -> RoleCrawlResult:
     """Crawl `base_url` once per role, union the surface, probe every endpoint
     with every role, and derive auth-bypass + IDOR candidates from the matrix.
@@ -734,6 +735,7 @@ async def crawl_roles(
                                             allowed_hosts=allowed_hosts, max_probes=per_budget,
                                             seed_paths=sorted(discovered | set(seed_paths or [])),
                                             run_context=run_context,
+                                            ffuf_in_runs=discovery_ffuf,
                                             session_ref=(session_refs[roles.index(sr)]
                                                          if session_refs is not None else None))
                     sres = await disc.discover()

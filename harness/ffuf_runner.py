@@ -56,8 +56,12 @@ def ffuf_available(image: str = DEFAULT_IMAGE) -> tuple[bool, str]:
 def build_args(target_url: str, *, wordlist: str = DEFAULT_WORDLIST,
                threads: int = DEFAULT_THREADS, headers: dict[str, str] | None = None,
                match_codes: str = "all", filter_codes: str = "404",
-               auto_calibrate: bool = True) -> list[str]:
-    """Build the ffuf argument list.  Pure -- no side effects, testable."""
+               auto_calibrate: bool = True, filter_size: int | None = None) -> list[str]:
+    """Build the ffuf argument list.  Pure -- no side effects, testable.
+
+    `filter_size` is the byte length of the target's soft-404 answer as the
+    harness's own calibration measured it (SurfaceDiscovery): passed as -fs so
+    ffuf drops the same catch-all the Python fingerprint does, on top of -ac."""
     url = tool_runner.localhost_url(target_url.rstrip("/") + "/FUZZ")
     args = [
         "-u", url,
@@ -70,6 +74,8 @@ def build_args(target_url: str, *, wordlist: str = DEFAULT_WORDLIST,
     ]
     if auto_calibrate:
         args.append("-ac")
+    if filter_size is not None:
+        args.extend(["-fs", str(int(filter_size))])
     for name, value in (headers or {}).items():
         args.extend(["-H", f"{name}: {value}"])
     return args
@@ -141,15 +147,19 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
              wordlist: str = DEFAULT_WORDLIST, threads: int = DEFAULT_THREADS,
              headers: dict[str, str] | None = None, timeout: float = DEFAULT_TIMEOUT,
              match_codes: str = "all", filter_codes: str = "404",
-             auto_calibrate: bool = True, cancel=None) -> FfufResult:
+             auto_calibrate: bool = True, cancel=None, filter_size: int | None = None,
+             egress=None) -> FfufResult:
     """Run ffuf in a container and return parsed routes.  Synchronous (blocks).
     I05-C: `cancel` stops a running container (see tool_runner.run). SC-9: the run
-    goes through a ToolBroker, so an unboundable image/timeout launches nothing."""
+    goes through a ToolBroker, so an unboundable image/timeout launches nothing.
+    An `egress` policy is enforced (fail closed), as for the proxied sqlmap run."""
     args = build_args(target_url, wordlist=wordlist, threads=threads,
                       headers=headers, match_codes=match_codes,
-                      filter_codes=filter_codes, auto_calibrate=auto_calibrate)
+                      filter_codes=filter_codes, auto_calibrate=auto_calibrate,
+                      filter_size=filter_size)
     try:
-        broker = tool_runner.ToolBroker(image=image, timeout=timeout)
+        broker = tool_runner.ToolBroker(image=image, timeout=timeout, egress=egress,
+                                        enforce_egress=egress is not None)
         rc, stdout, stderr = broker.run(args, cancel=cancel)
     except tool_runner.ToolCleanupFailed:
         raise   # a container that may still run is not an ordinary ffuf error
@@ -171,9 +181,13 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
 
 async def ffuf_discover(target_url: str, *, image: str = DEFAULT_IMAGE,
                         headers: dict[str, str] | None = None,
-                        timeout: float = DEFAULT_TIMEOUT) -> FfufResult:
+                        timeout: float = DEFAULT_TIMEOUT, cancel=None,
+                        filter_size: int | None = None, egress=None) -> FfufResult:
     """Async wrapper: run ffuf in a thread so it doesn't block the event loop.
     I05-C: if the awaiting task is cancelled, the container is stopped and removed
     before the cancellation propagates."""
+    extra = {} if filter_size is None and egress is None else {
+        "filter_size": filter_size, "egress": egress}
     return await tool_runner.call_cancellable(
-        run_sync, target_url, image=image, headers=headers, timeout=timeout)
+        run_sync, target_url, image=image, headers=headers, timeout=timeout,
+        **({"cancel": cancel} if cancel is not None else {}), **extra)
