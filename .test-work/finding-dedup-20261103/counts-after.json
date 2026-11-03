@@ -1,0 +1,116 @@
+{
+  "code": "C:\\Users\\arthu\\Documents\\AgenticVibe\\.claude\\worktrees\\bm2-discriminator-afa402",
+  "store_rows": 141,
+  "chain_rows": 0,
+  "report_collapse_survivors": 81,
+  "report_collapse_removed": 60,
+  "report_survivors_non_chain": 81,
+  "issue_export_count": 78,
+  "issue_groups": 78,
+  "issue_groups_by_class": {
+    "idor": 9,
+    "xss": 8,
+    "sqli": 8,
+    "api_security": 8,
+    "misconfig": 7,
+    "cors": 5,
+    "bfla": 4,
+    "jwt": 3,
+    "csrf": 3,
+    "info_disclosure": 2,
+    "broken access control": 2,
+    "command_injection": 1,
+    "authentication bypass": 1,
+    "broken access control / information disclosure": 1,
+    "insecure_transport": 1,
+    "lack of pagination / resource limiting": 1,
+    "lack of resource/rate limiting at the api layer (unbounded list)": 1,
+    "missing_headers": 1,
+    "lack of pagination/resource limiting on list endpoints": 1,
+    "nosql": 1,
+    "lack of resource / rate limiting at the api layer": 1,
+    "broken access control / information exposure": 1,
+    "lack of resource scoping/filtering": 1,
+    "broken access control (resource scoping)": 1,
+    "cache key mismatch / missing vary header": 1,
+    "broken access control (information disclosure)": 1,
+    "token storage issues": 1,
+    "business logic flaw / broken access control": 1,
+    "lack of pagination / resource exhaustion via list endpoint": 1,
+    "suspicious_pattern": 1
+  },
+  "largest_issue_groups": [
+    [
+      "insecure_transport",
+      "",
+      "",
+      29
+    ],
+    [
+      "jwt",
+      "",
+      "",
+      10
+    ],
+    [
+      "idor",
+      "GET",
+      "/rest/basket/{id}",
+      9
+    ],
+    [
+      "missing_headers",
+      "",
+      "",
+      7
+    ],
+    [
+      "idor",
+      "GET",
+      "/api/BasketItems/{id}",
+      4
+    ],
+    [
+      "idor",
+      "GET",
+      "/api/Products/{id}",
+      4
+    ],
+    [
+      "idor",
+      "PUT",
+      "/api/BasketItems/{id}",
+      2
+    ],
+    [
+      "cors",
+      "GET",
+      "/api/BasketItems",
+      2
+    ],
+    [
+      "csrf",
+      "POST",
+      "/api/BasketItems",
+      2
+    ],
+    [
+      "idor",
+      "POST",
+      "/api/BasketItems",
+      2
+    ],
+    [
+      "idor",
+      "GET",
+      "/rest/products/search",
+      2
+    ],
+    [
+      "api_security",
+      "GET",
+      "/api/Users",
+      2
+    ]
+  ]
+}

@@ -906,6 +906,11 @@ class TargetTransport:
                 headers = {}          # drop one-shot headers; creds re-decided by same-origin next hop
                 url = nxt
                 continue
+            if ctx.self_ownership is not None:
+                ctx.self_ownership.observe(
+                    source="transport", method=method, url=url, status=resp.status_code,
+                    principal_id=session.principal_id if session and credential_destination else "",
+                    response_body=resp.text)
             return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
                                     headers=dict(resp.headers), final_url=url,
                                     artifact=self._artifact(
@@ -1255,6 +1260,9 @@ class RunContext:
     # the code that creates the run (a benchmark runner, a test), never by a model
     # or from observed content.
     objective_task: object = field(default=None, repr=False, compare=False)
+    # The run's self_ownership.SelfOwnership (authz.self_observed_ownership), or
+    # None: ownership facts observed from this run's own exchanges, never a model's.
+    self_ownership: object = field(default=None, repr=False, compare=False)
 
     @classmethod
     def create(cls, *, run_id: str | None = None, allowed_hosts=None, gate_config: dict | None = None,
@@ -1280,6 +1288,7 @@ class RunContext:
         _gate_cfg = {**(gate_config or {}), "allowed_hosts": list(entries)}
         _gate_cfg['target_policy'] = target_policy
         resolved_gate = gate if gate is not None else SafetyGate(SafetyGateConfig.from_dict(_gate_cfg))
+        from harness import self_ownership
         return cls(
             run_id=resolved_run_id,
             scope=ScopePolicy(allowed_hosts=entries),
@@ -1291,7 +1300,9 @@ class RunContext:
             target_policy=target_policy,
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
                              if configured_namespace else resolved_run_id), timeout=timeout,
-            objective_task=objective_task)
+            objective_task=objective_task,
+            self_ownership=(self_ownership.SelfOwnership(run_id=resolved_run_id)
+                            if self_ownership.enabled(config_snapshot) else None))
 
     def default_client(self, *, destination: str | None = None) -> httpx.AsyncClient:
         profile = self.tls_policy.profile_for(destination)

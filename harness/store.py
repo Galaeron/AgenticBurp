@@ -90,8 +90,10 @@ def finding_fingerprint(host: str, method: str, url: str, vulnerability_class: s
     fingerprint, defeating suppression and duplicating findings. Two runs that
     word the same issue differently now hash identically.
     """
-    from harness.categories import canonicalize
-    check = canonicalize(vulnerability_class) or (vulnerability_class or "").lower()
+    # legacy_canonicalize, not canonicalize: suppressions and observations key on this
+    # hash, so the finding-dedup class readings (2026-11-03) live in issues.issue_key.
+    from harness.categories import legacy_canonicalize
+    check = legacy_canonicalize(vulnerability_class) or (vulnerability_class or "").lower()
     fingerprint = hashlib.sha256("\x1f".join([
         host or "",
         (method or "").upper(),
@@ -293,6 +295,28 @@ CREATE TABLE IF NOT EXISTS engagement_declarations (
     declarations_version INTEGER NOT NULL,
     updated_at REAL NOT NULL,
     PRIMARY KEY (host, port)
+);
+"""
+
+# Finding dedup (2026-11-03): the input a finding names (parameter_location/
+# parameter_name), so a finding with no proof record still reports it -- the
+# fingerprint always hashed it, but nothing read it back. Versioned additive
+# migration in AR-08a's pattern: a NEW side table keyed on the findings row's
+# unique key (fingerprint, case_id) plus the 'finding-inputs-schema' marker in
+# state_metadata; findings itself is not altered. Nothing is backfilled: a finding
+# with no row here and no proof record was written before this table and reads as
+# input_recorded=False ("unknown", never "no input"). '' in both columns is a
+# finding that named no input. Rollback: DROP TABLE finding_inputs and delete the
+# marker; the previous build never reads either.
+_FINDING_INPUTS_VERSION = 1
+_FINDING_INPUTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS finding_inputs (
+    fingerprint TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    parameter_location TEXT NOT NULL,
+    parameter_name TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (fingerprint, case_id)
 );
 """
 
@@ -588,6 +612,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_EVIDENCE_SCHEMA)
     conn.executescript(_PROOF_IDENTITY_SCHEMA)
     conn.executescript(_DECLARATIONS_SCHEMA)
+    conn.executescript(_FINDING_INPUTS_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
@@ -603,6 +628,8 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
                  (str(_PROOF_IDENTITY_VERSION),))
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('engagement-declarations-schema', ?)",
                  (str(_DECLARATIONS_VERSION),))
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('finding-inputs-schema', ?)",
+                 (str(_FINDING_INPUTS_VERSION),))
     ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
@@ -885,6 +912,14 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
                 finding_id, case_id, proof_id, oracle_verified, verification_state,
                 oracle_capsule_id, exchange_id, run_id, engagement_id, captured_principal_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+        # Finding dedup: the input each finding names, in its side table (see
+        # _FINDING_INPUTS_SCHEMA). Keyed like the findings row, so a deduped
+        # re-report is a no-op here too.
+        conn.executemany(
+            "INSERT OR IGNORE INTO finding_inputs (fingerprint, case_id, parameter_location, "
+            "parameter_name, created_at) VALUES (?, ?, ?, ?, ?)",
+            [(r[14], r[18] or "", getattr(f, "parameter_location", "") or "",
+              getattr(f, "parameter_name", "") or "", now) for r, f in zip(rows, findings)])
         # AR-3: one observation row per (finding, exchange), regardless of
         # whether the findings INSERT above was a fresh row or an IGNOREd
         # duplicate -- a deduped finding still records this exchange as a
@@ -1941,8 +1976,10 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                       f.evidence, f.suggested_test, f.owasp_category, f.basis, f.confirmed,
                       f.agent, f.fingerprint, f.finding_id, f.case_id, f.proof_id,
                       f.method, f.review_verdict,
-                      (SELECT parameter_location FROM proof_records WHERE case_id = f.case_id LIMIT 1),
-                      (SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1),
+                      COALESCE((SELECT parameter_location FROM proof_records WHERE case_id = f.case_id LIMIT 1),
+                               fi.parameter_location),
+                      COALESCE((SELECT parameter_name FROM proof_records WHERE case_id = f.case_id LIMIT 1),
+                               fi.parameter_name),
                       (SELECT principal_id FROM proof_records WHERE case_id = f.case_id LIMIT 1),
                       s.fingerprint IS NOT NULL AS suppressed,
                       f.oracle_verified, f.verification_state, f.oracle_capsule_id,
@@ -1952,6 +1989,7 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                LEFT JOIN proof_records p ON p.proof_id = f.proof_id AND f.proof_id != ''
                LEFT JOIN proof_identity i ON i.proof_id = p.proof_id AND i.identity_version = ?
+               LEFT JOIN finding_inputs fi ON fi.fingerprint = f.fingerprint AND fi.case_id = f.case_id
                WHERE f.host = ? AND f.engagement_id = ?
                  AND (? IS NULL OR f.captured_principal_id = ?)
                  AND (? IS NULL OR f.run_id = ?)
@@ -1976,6 +2014,10 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
          # confidence number.
          "lifecycle_state": confirmation_gate.lifecycle_state(bool(confirmed), rv),
          "parameter_location": ploc or "", "parameter_name": pname or "",
+         # Finding dedup: False only for a row written before finding_inputs existed
+         # (no side row, no proof record) -- issues.issue_key then keeps
+         # input-bearing classes apart rather than assume no input.
+         "input_recorded": ploc is not None or pname is not None,
          "principal_id": principal or "", "suppressed": bool(suppressed),
          "captured_principal_id": captured_principal_id or "",
          # P0.2-API: the oracle's verdict (item #1/#2) must be readable from the
@@ -2394,7 +2436,8 @@ def mark_chain_detected(url: str, signature: str, *, engagement_id: str = "") ->
 
 from harness.categories import CANONICAL_CATEGORIES  # noqa: E402  (kept near point of use)
 
-_NO_ACTIVE_VALIDATOR = {"misconfig", "ai_llm", "supply_chain"}
+_NO_ACTIVE_VALIDATOR = {"misconfig", "ai_llm", "supply_chain",
+                        "insecure_transport", "missing_headers", "bfla"}
 
 
 def set_coverage_override(host: str, category: str, reason: str) -> None:
@@ -3190,6 +3233,8 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #                                matching any of them belongs to one of the
 #                                target host's findings)
 #     proof_identity         -- proof_id no longer in proof_records (AR-08a)
+#     finding_inputs         -- fingerprint (finding dedup; same fingerprints
+#                                as finding_observations)
 #     engagement_declarations -- host, or host:port (I16 persistence)
 #     ledger_events          -- finding_ref (sizes case_ids UNION finding_ids
 #                                of the target host's findings -- see the
@@ -3399,6 +3444,14 @@ def wipe_engagement(host: str) -> dict:
             counts["finding_observations"] = cur.rowcount
         else:
             counts["finding_observations"] = 0
+        # Finding dedup: the inputs the target host's findings named.
+        if target_fingerprints:
+            placeholders = ",".join("?" for _ in target_fingerprints)
+            counts["finding_inputs"] = conn.execute(
+                f"DELETE FROM finding_inputs WHERE fingerprint IN ({placeholders})",
+                list(target_fingerprints)).rowcount
+        else:
+            counts["finding_inputs"] = 0
 
         # (g) every other confirmed host/fingerprint-scoped table.
         # validation_runs has no host column and no ON DELETE CASCADE (and
