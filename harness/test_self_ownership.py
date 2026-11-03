@@ -106,6 +106,112 @@ class SelfOwnershipStoreTests(unittest.TestCase):
         self.assertTrue(enabled({"authz": {"self_observed_ownership": True}}))
 
 
+class AgentRouteClassificationTests(unittest.TestCase):
+    """GET /api/cards/mine is unknown to the deterministic rules. The agent may say
+    which pointer names the caller's own object; the harness checks it against what
+    alice and bob were actually served."""
+
+    def _store(self, *, anon=False, bob_card=102, single=False):
+        so = _observed()
+        cards = [(ALICE, 101)] + ([] if single else [(BOB, bob_card)])
+        if anon:
+            cards.append(("anonymous", 103))
+        for pid, card in cards:
+            so.observe(source="transport", principal_id=pid, method="GET", url=f"{APP}/api/cards/mine",
+                       status=200, response_body=json.dumps(
+                           {"card": {"ref": card, "currency": "EUR", "holder": f"{pid[:12]}"}}))
+        return so
+
+    def _classify(self, so, proposal):
+        seen = []
+
+        async def classify(payload):
+            seen.append(payload)
+            if isinstance(proposal, Exception):
+                raise proposal
+            return proposal
+        recorded = asyncio.run(so.classify_pending(classify))
+        return recorded, seen
+
+    GOOD = {"self_scoped": True, "kind": "own_object", "id_pointer": "/card/ref", "collection": "cards"}
+
+    def test_verified_agent_route_yields_self_observed_facts(self):
+        so = self._store()
+        recorded, seen = self._classify(so, self.GOOD)
+        self.assertEqual(len(recorded), 2)
+        self.assertIn("agent-classified route", so.fact_for(APP + "/api/cards/101")[1])
+        self.assertEqual(so.authorization(_alias(BOB), APP + "/api/cards/101")[0], AuthzDecision.UNAUTHORIZED)
+        self.assertEqual(so.authorization(_alias(ALICE), APP + "/api/cards/101")[0], AuthzDecision.AUTHORIZED)
+        # The agent saw the route and the key skeleton only, never a value.
+        self.assertEqual(seen[0]["route"], "/api/cards/mine")
+        self.assertNotIn("101", json.dumps(seen[0]))
+        # Later exchanges on the verified route apply the rule directly.
+        so.observe(source="transport", principal_id=ALICE, method="GET", url=f"{APP}/api/cards/mine",
+                   status=200, response_body=json.dumps({"card": {"ref": 104}}))
+        self.assertIsNotNone(so.fact_for(APP + "/api/cards/104"))
+
+    def test_pointer_to_a_value_both_principals_share_is_refused(self):
+        # A wrong model claim: "currency" is the same for everyone, not per principal.
+        so = self._store()
+        recorded, _ = self._classify(so, dict(self.GOOD, id_pointer="/card/currency"))
+        self.assertEqual(recorded, [])
+        self.assertIsNone(so.fact_for(APP + "/api/cards/EUR"))
+
+    def test_route_served_to_anonymous_is_refused(self):
+        so = self._store(anon=True)
+        recorded, _ = self._classify(so, self.GOOD)
+        self.assertEqual(recorded, [])
+
+    def test_unresolvable_pointer_and_model_failure_record_nothing(self):
+        for proposal in (dict(self.GOOD, id_pointer="/card/owner"), RuntimeError("model down"),
+                         dict(self.GOOD, collection="../users"), {"self_scoped": False}):
+            with self.subTest(proposal=repr(proposal)[:40]):
+                recorded, _ = self._classify(self._store(), proposal)
+                self.assertEqual(recorded, [])
+
+    def test_one_principal_is_not_enough_to_ask(self):
+        recorded, seen = self._classify(self._store(single=True), self.GOOD)
+        self.assertEqual((recorded, seen), ([], []))
+
+
+class AnalyzeHookTests(unittest.TestCase):
+    """The analyse path records captures and asks the local agent model, through the
+    run's Ollama client, once two principals were served an unknown route."""
+
+    def _run(self, config):
+        from types import SimpleNamespace
+        from harness.orchestrator_detect import DetectMixin
+        from harness.run_context import RunContext
+        calls = []
+
+        class Ollama:
+            async def chat_json(self, model, system, user, temperature=0.0):
+                calls.append((model, json.loads(user)))
+                return AgentRouteClassificationTests.GOOD
+        ctx = RunContext.create(allowed_hosts=["t.test"],
+                                config={"authz": {"self_observed_ownership": True}})
+        ctx.self_ownership.persist = False
+        ctx.sessions.register("a", ALICE, {"Authorization": "Bearer a"}, allowed_origins=[APP])
+        ctx.sessions.register("b", BOB, {"Authorization": "Bearer b"}, allowed_origins=[APP])
+        me = SimpleNamespace(config=config, ollama=Ollama())
+        for token, card in (("a", 101), ("b", 102)):
+            ex = HttpExchange(url=f"{APP}/api/cards/mine", method="GET",
+                              request_headers={"Authorization": f"Bearer {token}"}, response_status=200,
+                              response_body=json.dumps({"card": {"ref": card}}))
+            asyncio.run(DetectMixin._observe_self_ownership(me, ctx, ex))
+        return ctx.self_ownership, calls
+
+    def test_agent_classifies_and_harness_records(self):
+        so, calls = self._run({"agent_defaults": {"model": "local-model"}})
+        self.assertEqual([c[0] for c in calls], ["local-model"])
+        self.assertIsNotNone(so.fact_for(APP + "/api/cards/101"))
+
+    def test_no_local_model_means_no_agent_call(self):
+        so, calls = self._run({})
+        self.assertEqual(calls, [])
+        self.assertIsNone(so.fact_for(APP + "/api/cards/101"))
+
+
 class LedgerPriorityTests(unittest.TestCase):
     def test_self_observed_answers_only_when_nothing_is_declared(self):
         led = _ledger(_observed())

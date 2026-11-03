@@ -20,6 +20,11 @@ What counts as an observation (an exchange the harness itself sent or captured -
   - an authenticated POST answered 2xx with a JSON `id`: the creating principal
     owns `<collection>/{id}`.
 
+On top of those rules, an agent (the local model) may classify an unknown route
+as self-scoped, naming only a kind and a JSON pointer; the harness uses it only
+after its own exchanges corroborate it (see `classify_pending`). The model never
+names an owner or an id, so no fact comes from its claim.
+
 A decision needs more than a differing credential: two credentials can be two
 sessions of ONE account. UNAUTHORIZED therefore needs the owner and the reader to
 be shown to be DIFFERENT accounts -- both bound to an account of the same kind
@@ -52,7 +57,23 @@ HARNESS_SOURCES = frozenset({"transport", "capture"})
 _WHOAMI = re.compile(r"^(whoami|me|current[-_]?user|userinfo|self)$", re.IGNORECASE)
 _LOGIN = re.compile(r"(log[-_]?in|sign[-_]?in|authenticate|oauth2?/token|sessions?)$", re.IGNORECASE)
 _ID_SEGMENT = re.compile(r"^(\d+|[0-9a-fA-F]{8,}|[0-9a-fA-F]{8}-[0-9a-fA-F-]{4,})$")
+_COLLECTION = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,40}$")
 _BASKET_KEYS = ("bid", "basketid", "basket_id")
+MAX_CANDIDATE_ROUTES = 50
+MAX_SAMPLES = 4
+MAX_AGENT_CALLS = 20
+
+ROUTE_CLASSIFIER_PROMPT = """You classify one HTTP route of a web application under test.
+You see the method, the route template ({id} marks an id segment) and the SHAPE of a JSON
+response (keys and value types, no values). Decide whether the route returns, to whoever
+calls it, an identifier of the CALLER'S OWN account or of an object the caller owns
+(e.g. "my profile", "my cart", "the order I just created").
+Answer JSON only:
+{"self_scoped": true|false, "kind": "account"|"own_object",
+ "id_pointer": "<JSON pointer to that identifier, e.g. /data/id>",
+ "collection": "<the path segment under which that object is addressed, e.g. users, baskets>"}
+Say self_scoped=false when unsure. Your answer is a hypothesis: the harness verifies it
+against the responses it observed before using it."""
 _EMAIL_KEYS = ("email", "umail", "mail")
 
 
@@ -99,6 +120,39 @@ def _find(doc, keys) -> str:
     return ""
 
 
+def _at(doc, pointer) -> str | None:
+    """The non-empty scalar at a JSON pointer, else None."""
+    if not isinstance(pointer, str) or not pointer.startswith("/"):
+        return None
+    cur = doc
+    try:
+        for token in pointer[1:].split("/"):
+            token = token.replace("~1", "/").replace("~0", "~")
+            cur = cur[int(token)] if isinstance(cur, list) else cur[token]
+    except (ValueError, TypeError, KeyError, IndexError):
+        return None
+    return _scalar(cur) or None
+
+
+def _skeleton(doc, depth: int = 4):
+    """Keys and value types of a JSON document, no values (what the agent may see)."""
+    if isinstance(doc, dict) and depth > 0:
+        return {str(k)[:60]: _skeleton(v, depth - 1) for k, v in list(doc.items())[:40]}
+    if isinstance(doc, list) and depth > 0:
+        return [_skeleton(doc[0], depth - 1)] if doc else []
+    return type(doc).__name__
+
+
+def ollama_route_classifier(ollama, model: str):
+    """The production classifier: the run's local agent model asked for JSON."""
+    async def classify(payload: dict) -> dict:
+        from harness.ollama_client import model_stage
+        with model_stage("self_ownership"):
+            return await ollama.chat_json(model, ROUTE_CLASSIFIER_PROMPT,
+                                          json.dumps(payload)[:6000], temperature=0.0)
+    return classify
+
+
 @dataclass(frozen=True)
 class _Owner:
     principal: str = ""             # a run principal id, or "" for an account-owned object
@@ -119,6 +173,11 @@ class SelfOwnership:
         self._accounts: dict[str, set] = {}
         self._objects: dict[tuple, tuple] = {}   # (stem, id) -> (_Owner | None, provenance)
         self.rejected = 0
+        # Agent-classified routes: (origin, method, template) -> verified rule, or
+        # None once refused; samples wait in memory only (never logged or persisted).
+        self._routes: dict[tuple, dict | None] = {}
+        self._samples: dict[tuple, list] = {}
+        self._agent_calls = 0
 
     # -- recording ---------------------------------------------------------------
 
@@ -167,7 +226,112 @@ class SelfOwnership:
                 recorded += self._own(origin, last, oid, _Owner(principal=principal),
                                       f"id returned by POST {parts.path} as {principal}",
                                       route=f"{parts.path.rstrip('/')}/{{id}}")
+        if not recorded and method in ("GET", "POST"):
+            recorded = self._agent_route(origin, method, segments, principal, doc)
         return recorded
+
+    # -- agent-classified routes ---------------------------------------------------
+    #
+    # On top of the deterministic rules above, an agent may classify a route the
+    # rules do not know as self-scoped. It names only a KIND and a JSON POINTER for
+    # a route template; it never names an owner or an id. The harness accepts the
+    # classification only when its own exchanges corroborate it: the pointer
+    # resolves to a scalar in every sample, at least two distinct authenticated
+    # principals were served the route with DIFFERENT values there (the route
+    # answers per principal), and no anonymous request was served the route. Facts
+    # then come from the observed bodies, as with the deterministic rules.
+
+    def _agent_route(self, origin: str, method: str, segments: list, principal: str, doc) -> list[str]:
+        key = (origin, method, "/" + "/".join("{id}" if _ID_SEGMENT.match(s) else s for s in segments))
+        rule = self._routes.get(key)
+        if rule is not None:
+            return self._apply_rule(key, rule, principal, doc) if rule and principal else []
+        samples = self._samples.get(key)
+        if samples is None:
+            if len(self._samples) >= MAX_CANDIDATE_ROUTES:
+                return []
+            samples = self._samples[key] = []
+        if not principal:
+            samples.append(("", doc))      # an anonymous answer is kept only to refuse the route
+        elif len(samples) < MAX_SAMPLES and not any(p == principal for p, _ in samples):
+            samples.append((principal, doc))
+        return []
+
+    def pending_routes(self) -> list:
+        """Route keys the agent has not classified yet and the harness could verify:
+        at least two distinct authenticated principals were served them."""
+        return [k for k, s in self._samples.items()
+                if k not in self._routes and len({p for p, _ in s if p}) >= 2]
+
+    async def classify_pending(self, classify_fn, *, limit: int = 3) -> list[str]:
+        """Ask `classify_fn` (async, payload -> dict) about up to `limit` pending
+        routes; verify and apply what it proposes. The payload carries the route
+        template and the JSON key skeleton only -- never a value from a body."""
+        recorded = []
+        for key in self.pending_routes()[:limit]:
+            if self._agent_calls >= MAX_AGENT_CALLS:
+                break
+            self._agent_calls += 1
+            origin, method, template = key
+            payload = {"method": method, "route": template,
+                       "response_shape": _skeleton(self._samples[key][0][1])}
+            try:
+                proposal = await classify_fn(payload)
+            except Exception as exc:   # a model failure classifies nothing
+                log.info("self_ownership: route classifier failed for %s %s: %s", method, template,
+                         type(exc).__name__)
+                self._routes[key] = None
+                continue
+            rule, why = self._verify(key, proposal)
+            self._routes[key] = rule
+            if rule is None:
+                log.info("self_ownership: agent route proposal for %s %s refused: %s", method, template, why)
+                continue
+            for principal, doc in self._samples.pop(key, []):
+                if principal:
+                    recorded += self._apply_rule(key, rule, principal, doc)
+        return recorded
+
+    def _verify(self, key, proposal) -> tuple[dict | None, str]:
+        if not isinstance(proposal, dict) or proposal.get("self_scoped") is not True:
+            return None, "not proposed as self-scoped"
+        kind, pointer = proposal.get("kind"), proposal.get("id_pointer")
+        collection = proposal.get("collection")
+        if kind not in ("account", "own_object"):
+            return None, "unknown kind"
+        if not isinstance(collection, str) or not _COLLECTION.match(collection):
+            return None, "collection is not a plain path segment"
+        samples = self._samples.get(key, [])
+        if any(not p for p, _ in samples):
+            return None, "an anonymous request was served this route"
+        values = {}
+        for principal, doc in samples:
+            value = _at(doc, pointer)
+            if value is None:
+                return None, "the pointer does not resolve to a scalar in every observed response"
+            values.setdefault(principal, set()).add(value)
+        if len(values) < 2:
+            return None, "fewer than two principals observed"
+        seen = [v for vals in values.values() for v in vals]
+        if len(seen) != len(set(seen)):
+            return None, "two principals were served the same value (not per-principal)"
+        return {"kind": kind, "pointer": pointer, "collection": collection,
+                "corroboration": f"{len(values)} principals, distinct values"}, ""
+
+    def _apply_rule(self, key, rule: dict, principal: str, doc) -> list[str]:
+        origin, method, template = key
+        value = _at(doc, rule["pointer"])
+        if value is None:
+            return []
+        how = (f"agent-classified route {method} {template} (pointer {rule['pointer']}; harness-verified: "
+               f"{rule['corroboration']})")
+        if rule["kind"] == "account":
+            # An account id is an account key only within its route's collection.
+            account = f"id@{_stem(rule['collection'])}:{value}"
+            self._accounts.setdefault(principal, set()).add(account)
+            return self._own(origin, rule["collection"], value,
+                             _Owner(account=frozenset({account})), how)
+        return self._own(origin, rule["collection"], value, _Owner(principal=principal), how)
 
     def _own(self, origin: str, collection: str, oid: str, owner: _Owner, how: str,
              *, route: str = "") -> list[str]:
@@ -219,10 +383,10 @@ class SelfOwnership:
         b = set(other.account) | (self._accounts.get(other.principal, set()) if other.principal else set())
         if a & b:
             return True
-        for kind in ("id:", "email:"):
-            ka, kb = {k for k in a if k.startswith(kind)}, {k for k in b if k.startswith(kind)}
-            if ka and kb:
-                return False
+        # Keys of one kind ("id", "email", or an agent route's "id@<collection>")
+        # on both sides and none shared: different accounts.
+        if {k.split(":", 1)[0] for k in a} & {k.split(":", 1)[0] for k in b}:
+            return False
         return None
 
     def authorization(self, principal, url: str) -> tuple[AuthzDecision, str]:

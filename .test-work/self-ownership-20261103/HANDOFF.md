@@ -1,7 +1,7 @@
 # Self-observed ownership — handoff (2026-11-03)
 
 Branch `claude/sleepy-wu-832279` (worktree `identity-store-leak-3b4646`), base main `bae5321`.
-Not pushed.
+Pushed as PR #26 (commit 1 `3e8fc45`, commit 2 on top; no force-push).
 
 ## Problem (from `.test-work/juice-shop-8h-20261103/YIELD_ANALYSIS.md`, i16-persist worktree)
 116 idor_read and 20 cross_identity proofs ended inconclusive/supported on "no ownership or
@@ -51,20 +51,27 @@ even though the harness had logged in two fresh accounts itself and read their o
 untouched. With it absent every path behaves exactly as before (ledger None → no change).
 To try it: `authz: {self_observed_ownership: true}` in the ignored `harness/config.local.yaml`.
 
-## Owner questions
-1. Should `authz.self_observed_ownership` default ON? It sends no traffic itself (passive);
-   the risk is false confirmations, bounded by the different-account rule. If yes, add it to
-   `config.yaml` and the safe-default guard tests.
-2. idor_read was "never confirms" (RV-D2 V2). It now confirms when the ledger places the object
-   with another account (declared or self-observed). Acceptable, or cap it at `supported`?
-3. Are the self-scoped route heuristics acceptable (whoami/me/userinfo; login `bid`; POST `id`),
-   or should they be operator-listable patterns (e.g. `authz.self_scoped_routes`)?
-4. Should JWT-forged sessions be excluded as observers? A forged token's whoami binds that
-   session to the victim account — correct as a fact, but it makes later reads by that session
-   "same account" (AUTHORIZED), i.e. it can only suppress, never add, a confirmation.
-5. Standalone `/analyze` creates a fresh run per exchange, so a store there sees one exchange;
-   cross-exchange self-observation only works within an engagement run. Persist account bindings
-   per host (new table) to cover standalone? (Not done: store.py is under the dedup session.)
+## Owner decisions (2026-11-03)
+1. Default stays passive: `authz.self_observed_ownership` off unless set. Done.
+2. idor_read confirming when the ledger places the object with another account: accepted.
+3. An agent call on top of the deterministic route rules: done (commit 2, below).
+4. Forged-JWT sessions stay observers (exhaustive): already the case; no exclusion added.
+5. Standalone `/analyze` limitation accepted.
+
+## Agent route classification (commit 2)
+- When the deterministic rules record nothing for an authenticated/anonymous 2xx JSON exchange,
+  the store keeps up to 4 samples (in memory only) per (origin, method, route template).
+- Once two distinct authenticated principals were served a route, `analyze()` asks the LOCAL
+  agent model (`agent_defaults.model`, via the run's Ollama client, stage `self_ownership`) for
+  `{self_scoped, kind: account|own_object, id_pointer, collection}`. The prompt holds the route
+  template and a key/type skeleton only, never a value. No local model configured: no call.
+- The harness accepts it only if: the pointer resolves to a scalar in every sample; at least two
+  principals got DIFFERENT values there; no anonymous request was served the route; collection is
+  a plain segment. Facts then come from the observed bodies (provenance names the agent route and
+  the corroboration). The model never names an owner or an id. Agent-bound account ids are
+  namespaced `id@<collection>:` so they never compare against whoami `id:` keys.
+- Caps: 50 candidate routes, 20 agent calls per run, 3 per analysed exchange; a failed or refused
+  proposal marks the route classified (not retried).
 
 ## Not done / not verified
 - No live Juice Shop re-run; the 8h numbers are unchanged until one runs with the key on.
