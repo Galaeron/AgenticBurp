@@ -1068,6 +1068,21 @@ class ChainMixin:
                             if _resuming else None),
                 "on_review": lambda key, payload: _journal_put(f"review:{key}", payload),
                 "summary_out": _review_summary}
+        # engagement.retry_rounds (off by default): record what every sweep and review
+        # settles, so the time left after the coverage drive goes to the work they left.
+        from harness import retry_rounds
+        _retry_cfg = retry_rounds.RetryRoundsConfig.from_config(self.config)
+        _retry_ledger = None
+        _retry_report: dict = {"enabled": False}
+        if _retry_cfg.enabled and _investigation_deadline is None:
+            _retry_report = {"enabled": True, "rounds": [], "stopped_by": "no_deadline"}
+        elif _retry_cfg.enabled:
+            _retry_ledger = retry_rounds.RetryLedger()
+            _worklist_kwargs = _retry_ledger.wire(_worklist_kwargs)
+            _review_kwargs["model_failed"] = _retry_ledger.review_failed
+        # The shape-driven legs one sweep may attempt (investigate_worklist's default).
+        _max_precondition_legs = max(0, int((self.config.get("engagement") or {}).get(
+            "max_precondition_legs", 24)))
 
         # Operator/capture supplied shapes (for example the runner's successful
         # login setup exchange) are first-class evidence. They do not trigger new
@@ -1863,6 +1878,7 @@ class ChainMixin:
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
                 max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary,
+                max_precondition_legs=_max_precondition_legs,
                 stop_on_confirm=stop_on_confirm, deadline=deadline,
                 **_worklist_kwargs)
             timed_out = (worklist_summary.get("skipped_by_reason") or {}).get("time_budget", 0)
@@ -2526,6 +2542,50 @@ class ChainMixin:
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
 
+        # engagement.retry_rounds: until reserve_seconds before the deadline, sweep the
+        # worklist and review captures again with growing budgets, for the nodes and
+        # captures earlier passes left (harness/retry_rounds.py). Off by default.
+        if _retry_ledger is not None:
+            _instr.phases.begin("retry_rounds")
+
+            async def _retry_sweep(budgets, deadline):
+                summary: dict = {}
+                outs = await worklist_investigator.investigate_worklist(
+                    _probe, state, base_url, roles, confirm_fn=_confirm,
+                    precondition_fn=_precondition, max_nodes=budgets["max_nodes"],
+                    step_budget=budgets["step_budget"],
+                    max_precondition_legs=budgets["max_precondition_legs"],
+                    summary_out=summary, stop_on_confirm=stop_on_confirm, deadline=deadline,
+                    **_retry_ledger.sweep_kwargs())
+                fresh = [o for o in outs if not o.get("resumed")]
+                outcomes.extend(fresh)
+                all_findings.extend(f for o in fresh for f in o.get("findings_detail", []))
+                return fresh, summary
+
+            async def _retry_review(budgets, deadline):
+                stats = new_review_stats()
+                produced = await review_captured_exchanges(
+                    self, state, _all_captured, run_context=run_context,
+                    seen=_reviewed_captures, errors=_retry_report.setdefault("errors", []),
+                    stats=stats, max_reviews=budgets["max_reviews"], deadline=deadline,
+                    **_review_kwargs)
+                return stats["reviewed"], produced
+
+            try:
+                _retry_report.update(await retry_rounds.run_retry_rounds(
+                    _retry_cfg, _retry_ledger, deadline=_investigation_deadline,
+                    base_budgets={"max_nodes": max_nodes, "step_budget": step_budget,
+                                  "max_precondition_legs": _max_precondition_legs,
+                                  "max_reviews": self.capture_review_limit},
+                    sweep=_retry_sweep, review=_retry_review, reviewed=_reviewed_captures,
+                    cancelled=lambda: bool(run_context is not None
+                                           and run_context.cancel.cancelled)))
+            except Exception as e:  # extra rounds are a bonus -- never sink the run
+                log.warning("investigate_engagement: retry rounds failed: %s", e)
+                _errors.append({"phase": "retry_rounds", "error": f"{type(e).__name__}: {e}"})
+            log.info("investigate_engagement: retry rounds -- %d round(s), stopped by %s",
+                     len(_retry_report.get("rounds") or []), _retry_report.get("stopped_by"))
+
         # AR-FP: the bounded final re-evaluation of experiment tasks over the values
         # and sessions every later phase left, before proofs are projected and the
         # dispositions taken. Inside the coverage stage's deadline; best-effort like
@@ -2620,6 +2680,7 @@ class ChainMixin:
                 "spa_views": getattr(rc, "spa_views", None) or [],
                 "recrawl": _recrawl_report,
                 "phase_schedule": _schedule.report() if _schedule.active else None,
+                "retry_rounds": _retry_report,
                 "session_events": list(getattr(run_context.freshness(), "events", []) or [])
                                   if run_context is not None and hasattr(run_context, "freshness") else [],
             },
