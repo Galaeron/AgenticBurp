@@ -39,6 +39,7 @@ from .dom_xss_validator import DomXssValidator
 from .toctou_validator import ToctouValidator
 from .verbose_error_validator import VerboseErrorValidator
 from .security_headers_validator import SecurityHeadersValidator
+from .error_handling_validator import ErrorHandlingValidator
 from harness.safety_gate import get_default_gate, reset_default_gate
 
 log = logging.getLogger(__name__)
@@ -338,6 +339,10 @@ class ValidatorRegistry:
         if cfg.get("security_headers", {}).get("enabled", True):
             self.validators["security_headers"] = SecurityHeadersValidator()
 
+        # WSTG-ERRH-01 coverage adapter (passive -- judges captured error responses).
+        if cfg.get("error_handling", {}).get("enabled", True):
+            self.validators["error_handling"] = ErrorHandlingValidator()
+
         # Browser-driven XSS validator (A2) -- active: loads candidate URLs in a
         # real headless browser and confirms only on observed script execution.
         # Enabled here just registers it; it still only RUNS when
@@ -464,7 +469,6 @@ class ValidatorRegistry:
         unavailable = {
             "WSTG-CONF-06": "method enumeration is not a security verdict",
             "WSTG-CONF-07": "HTTP absence does not prove HTTPS HSTS policy",
-            "WSTG-ERRH-01": "no check-specific error oracle is bound",
             "WSTG-INFO-02": "fingerprinting is reconnaissance, without this check adapter",
             "WSTG-INFO-05": "comments alone do not establish sensitive disclosure",
             "WSTG-ATHN-01": "generic authentication bypass has no exact bound procedure",

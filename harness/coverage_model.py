@@ -614,8 +614,9 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "Test for directory traversal in file-serving endpoints",
           "Path traversal"),
     Check("WSTG-ERRH-01", "Error handling / stack traces", Phase.ENDPOINT,
-          "info_disclosure", _always_applicable, "recon",
-          "Trigger errors and check for verbose stack traces / debug info"),
+          "info_disclosure", _always_applicable, "error_handling",
+          "Check captured error responses for stack traces and framework error pages "
+          "(passive: errors are not provoked)"),
     # Mass assignment is an API-layer scenario with NO dedicated WSTG v4.2 test
     # (WSTG-CONF-09 is "Test File Permission" -- a different thing), so it carries an
     # internal id and its real sources live in external_refs. See coverage_manifest.

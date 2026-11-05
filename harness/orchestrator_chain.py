@@ -2284,9 +2284,10 @@ class ChainMixin:
                 # These registered validators have check-specific oracles. Do not
                 # wire generic recon/crypto here: their aggregate verdict cannot
                 # establish each individual header, metadata, method or TLS check.
-                # security_headers is passive: it judges the captured response.
-                for name in ("csp", "cors", "header_injection",
-                             "http_request_smuggling", "race_condition", "security_headers"):
+                # security_headers and error_handling are passive: they judge the
+                # captured response.
+                for name in ("csp", "cors", "header_injection", "http_request_smuggling",
+                             "race_condition", "security_headers", "error_handling"):
                     registered = self.validator_registry.validators.get(name)
                     if registered is not None:
                         _val_by_conf[name] = self.validator_registry.bind_run_context(

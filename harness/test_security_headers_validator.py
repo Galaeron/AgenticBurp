@@ -134,7 +134,10 @@ def _header_state(base, roles, **kwargs):
     return state, RoleCrawlResult(base_url=base)
 
 
-class EngagementCallerTests(unittest.TestCase):
+class PassiveLegCallerTest(unittest.TestCase):
+    """Drives one passive coverage family through Orchestrator.investigate_engagement
+    over a canned state, with every other leg family disabled and sends recorded."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -147,7 +150,7 @@ class EngagementCallerTests(unittest.TestCase):
     def restore(old):
         store._DB_PATH, cache._cache = old
 
-    def run_caller(self, enabled, case_drive):
+    def drive(self, family, check_id, validator_name, state_fn, enabled, case_drive):
         from harness import test_smoke_investigate as smoke
         from harness.coverage_tracker import _LEG_CONFIRMATIONS
         from harness.orchestrator import Orchestrator
@@ -155,14 +158,14 @@ class EngagementCallerTests(unittest.TestCase):
         cfg = smoke._test_config()
         for name in _LEG_CONFIRMATIONS:
             cfg["validators"].setdefault(name, {})["enabled"] = False
-        cfg["validators"]["security_headers"]["enabled"] = enabled
+        cfg["validators"][family]["enabled"] = enabled
         orch = Orchestrator(cfg)
         _controlled_model(orch)
         orch.engagement_coverage_drive = True
         orch.engagement_coverage_case_drive = case_drive
         orch.run_active_probe = AsyncMock(return_value={
             "iterative_result": {"stop_reason": "gave_up", "findings": []}, "integration": {}})
-        validator = orch.validator_registry.validators.get("security_headers")
+        validator = orch.validator_registry.validators.get(family)
         calls = AsyncMock(wraps=validator.validate) if validator else AsyncMock()
         if validator:
             validator.validate = calls
@@ -172,25 +175,31 @@ class EngagementCallerTests(unittest.TestCase):
             sent.append(str(request.url))
             raise httpx.ConnectError("offline fixture", request=request)
 
-        with patch("harness.engagement_builder.build_engagement", side_effect=_header_state), \
+        with patch("harness.engagement_builder.build_engagement", side_effect=state_fn), \
                 patch("httpx.AsyncClient.send", new=_send), \
                 patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=smoke._responder(False)):
             result = asyncio.run(orch.investigate_engagement(
                 smoke.BASE_URL, smoke.ROLES, max_nodes=0, step_budget=1, max_chain_rounds=0))
-        rows = [r for r in result["coverage"]["phase_ledger"]["cells"] if r["check"] == "WSTG-CONF-02"]
-        found = [f for f in result["findings"] if f.get("confirmed_by_leg") == SecurityHeadersValidator.name]
+        rows = [r for r in result["coverage"]["phase_ledger"]["cells"] if r["check"] == check_id]
+        found = [f for f in result["findings"] if f.get("confirmed_by_leg") == validator_name]
         return calls, rows, found, sent
 
     @staticmethod
-    def by_path(rows):
-        return {path: [r for r in rows if r["endpoint"].endswith(" " + path)] for path in _PATHS}
+    def by_path(rows, paths):
+        return {path: [r for r in rows if r["endpoint"].endswith(" " + path)] for path in paths}
+
+
+class EngagementCallerTests(PassiveLegCallerTest):
+    def run_caller(self, enabled, case_drive):
+        return self.drive("security_headers", "WSTG-CONF-02", SecurityHeadersValidator.name,
+                          _header_state, enabled, case_drive)
 
     def test_drive_confirms_controls_and_skips_without_sending(self):
         for case_drive in (False, True):
             with self.subTest(case_drive=case_drive):
                 calls, rows, found, sent = self.run_caller(True, case_drive)
                 self.assertGreater(calls.await_count, 0)
-                rows = self.by_path(rows)
+                rows = self.by_path(rows, _PATHS)
                 for path in _PATHS:
                     self.assertTrue(rows[path], path)
                 self.assertTrue(all(r["observation_status"] == CellStatus.CONFIRMED.value and r["conclusive"]

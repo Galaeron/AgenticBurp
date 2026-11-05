@@ -384,11 +384,12 @@ class ReadinessInputTests(unittest.TestCase):
         self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login')['status'],'ready')
 
     def test_unavailable_adapter_protocol_and_disable_dispositions(self):
-        for check in ('WSTG-CONF-06','WSTG-CONF-07','WSTG-ERRH-01','WSTG-INFO-02','WSTG-INFO-05'):
+        for check in ('WSTG-CONF-06','WSTG-CONF-07','WSTG-INFO-02','WSTG-INFO-05'):
             result=self.decide(check)
             self.assertEqual(result['reason_code'],'check_adapter_missing');self.assertIsNone(result['finding_class'])
-        # CONF-02 is bound to the passive header adapter: unavailable until it is registered.
-        self.assertEqual(self.decide('WSTG-CONF-02')['reason_code'],'validator_unavailable')
+        # CONF-02 and ERRH-01 are bound to passive adapters: unavailable until registered.
+        for check in ('WSTG-CONF-02','WSTG-ERRH-01'):
+            self.assertEqual(self.decide(check)['reason_code'],'validator_unavailable')
         registry=self.registry();registry.validators['security_headers']=SimpleNamespace(active=False)
         registry.active_enabled=False
         from harness.models import HttpExchange
