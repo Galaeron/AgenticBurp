@@ -226,6 +226,14 @@ models:
 iterative_agent:
   enabled: false
   max_steps: 250
+  # In-step retries of a transient model failure (timeout, connection error,
+  # HTTP 5xx, HTTP 429) before the probe stops with "error", after a 2 s backoff
+  # or the 429's Retry-After; a Retry-After over 30 s is a quota and stops the
+  # probe. An empty reply is not retried. An open Ollama breaker is waited out
+  # instead, one step per wait, never past the run's deadline. Counted in the
+  # probe's diagnostics as model_error_retries and breaker_waits. 0 turns the
+  # in-step retry off; capped at 3.
+  model_error_retries: 1
 
 # Browser-driven XSS validation -- A2 (validators/browser_xss_validator.py).
 # Loads candidate URLs in a real headless browser and confirms XSS only on

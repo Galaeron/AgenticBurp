@@ -34,15 +34,16 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx  # noqa: F401 -- HTTP transport site; sends now go via run_context.TargetTransport
 
-from harness import global_throttle
+from harness import circuit_breaker, global_throttle
 from harness.models import Finding, HttpExchange, sanitize_agent_finding
-from harness.ollama_client import OllamaInvalidJSONError
+from harness.ollama_client import OllamaInvalidJSONError, OllamaTransientError
 from harness.safety_gate import get_default_gate
 from harness.security import SECRET_HEADER_NAMES  # the one classifier behind redact_headers
 from harness.run_context import transport_for  # W-16: the single TargetTransport
@@ -85,6 +86,40 @@ _PRIOR_ATTEMPTS_WINDOW = 25     # attempt lines carried in each prompt
 _VALUE_EXCERPT_CHARS = 60       # payload value shown per attempt line
 _TARGET_RENDER_CHARS = 160      # normalized target shown per attempt line
 _OUTCOME_RENDER_CHARS = 100     # outcome (status+length, or block reason) per line
+
+# Model-failure retry. Job 0574e29a0799 (r3): 28 of 44 probes ended on ONE model
+# error, losing every step taken. Most were the shared Ollama breaker fast-failing
+# the call (2,130 of 3,097 calls never reached the model; it re-opened 61 times).
+# A transient failure is now retried in the same step this many times
+# (iterative_agent.model_error_retries). OllamaClient has already spent its own
+# transport retries (ollama.transient_retries) on a 5xx or timeout by then.
+DEFAULT_MODEL_ERROR_RETRIES = 1
+# Hard ceiling, like ollama.transient_retries: a typo cannot stall one step for minutes.
+_MAX_MODEL_ERROR_RETRIES = 3
+_MODEL_ERROR_BACKOFF_SECONDS = 2.0
+# Timeouts, connection errors, HTTP 5xx and HTTP 429 (OllamaTransientError and its
+# subclasses, or a bare builtin timeout/connection error). Everything else is
+# permanent for the step: a missing model, another 4xx, a prompt the validator
+# refused, and an empty reply body -- the same prompt at the same context window
+# comes back empty again. An open breaker is waited out instead (_breaker_wait).
+_TRANSIENT_MODEL_ERRORS = (OllamaTransientError, TimeoutError, ConnectionError)
+# A Retry-After longer than this is a quota or exhausted credits, not a burst: the
+# probe stops rather than wait. The same line OllamaClient draws for its own retries.
+_MAX_RETRY_AFTER_SECONDS = 30.0
+
+
+async def _backoff_sleep(seconds: float, cancel=None) -> None:
+    """The wait before a model retry, cut short when the run is cancelled; patched
+    out by tests."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0 and not (cancel is not None and cancel.cancelled):
+        await asyncio.sleep(min(left, 1.0))
+
+
+def _is_quota(exc: Exception) -> bool:
+    """A rate limit (OllamaClient's 429) whose Retry-After is longer than a burst."""
+    retry_after = getattr(exc, "retry_after", None)
+    return isinstance(retry_after, (int, float)) and retry_after > _MAX_RETRY_AFTER_SECONDS
 
 
 def _attempt_id(key: str) -> str:
@@ -330,10 +365,13 @@ class IterativeResult:
     # AR-09: progress accounting, counts and IDs only (never prompt or payload
     # text). A refusal is only the model's explicit `verdict: "refused"`; an
     # empty object is a parse error and a failed send is a blocked attempt.
+    # model_error_retries counts in-step retries of a transient model failure;
+    # breaker_waits counts steps spent waiting out an open Ollama breaker.
     diagnostics: dict = field(default_factory=lambda: {
         "parse_errors": 0, "refusals": 0, "rejected_proposals": 0,
         "unavailable_selections": 0, "duplicate_proposals": 0, "blocked_attempts": 0,
-        "useful_unique_actions": 0, "evidence_attempt_ids": []})
+        "useful_unique_actions": 0, "model_error_retries": 0, "breaker_waits": 0,
+        "evidence_attempt_ids": []})
 
     def to_dict(self) -> dict:
         return {
@@ -383,12 +421,21 @@ Rules:
 class IterativeAgent:
     def __init__(self, ollama, model: str, allowed_hosts: list[str], *, temperature: float = 0.2,
                  max_steps: int = 250, run_context=None, experiment_handoff=None,
-                 experiment_catalog=None):
+                 experiment_catalog=None,
+                 model_error_retries: int | None = DEFAULT_MODEL_ERROR_RETRIES,
+                 deadline: float | None = None):
         self.ollama = ollama
         self.model = model
         self.allowed_hosts = allowed_hosts or []
         self.temperature = temperature
         self.max_steps = max_steps
+        # Clamped to [0, _MAX_MODEL_ERROR_RETRIES]; unset (None) => the default.
+        self.model_error_retries = max(0, min(
+            int(DEFAULT_MODEL_ERROR_RETRIES if model_error_retries is None else model_error_retries),
+            _MAX_MODEL_ERROR_RETRIES))
+        # The owning run's deadline (a time.monotonic() value), when it has one: no
+        # model-retry wait runs past it.
+        self.deadline = deadline
         # ARCH-1: the OWNING run's context when this probe runs inside an
         # engagement (threaded engagement -> run_active_probe -> here), else a
         # single standalone context the caller built for the whole probe. When
@@ -568,6 +615,78 @@ class IterativeAgent:
                      specialty, result.steps_used, result.distinct_requests,
                      result.duplicate_proposals, result.stop_reason)
 
+    async def _next_action(self, system: str, user: str,
+                           effort_budget: "EffortBudget | None", diag: dict):
+        """One model call for the step's action. A transient failure is retried
+        in place (see _retry_wait), each retry counted in
+        diag["model_error_retries"]; any other failure, or the last one, is
+        raised to the loop unchanged."""
+        from harness.ollama_client import model_stage
+        retries = 0
+        while True:
+            try:
+                if effort_budget is not None:
+                    with model_stage("iterative"):
+                        r = await self.ollama.chat_json_metered(
+                            model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
+                    from harness.effort import CallKind
+                    effort_budget.record(CallKind.ESCALATION, self.model, r.prompt_tokens, r.completion_tokens)
+                    return r.data
+                with model_stage("iterative"):
+                    return await self.ollama.chat_json(
+                        model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
+            except Exception as exc:
+                wait = self._retry_wait(exc, retries, effort_budget)
+                if wait is None:
+                    raise
+                retries += 1
+                diag["model_error_retries"] += 1
+                log.warning("iterative: transient model failure (%s); retry %d/%d in %.1fs",
+                            type(exc).__name__, retries, self.model_error_retries, wait)
+            await _backoff_sleep(wait, self._cancel_token())
+
+    def _retry_wait(self, exc: Exception, retries_done: int,
+                    effort_budget: "EffortBudget | None") -> float | None:
+        """Seconds to wait before retrying `exc` in the same step (the backoff, or
+        a 429's Retry-After when longer), or None to raise it: not transient, out
+        of retries, a quota, the breaker now open (the loop waits that out, see
+        _breaker_wait), or the wait not allowed (_may_wait)."""
+        if (retries_done >= self.model_error_retries or not isinstance(exc, _TRANSIENT_MODEL_ERRORS)
+                or _is_quota(exc) or circuit_breaker.current_ollama_breaker("ollama").is_open):
+            return None
+        wait = max(_MODEL_ERROR_BACKOFF_SECONDS, getattr(exc, "retry_after", None) or 0.0)
+        return wait if self._may_wait(wait, effort_budget) else None
+
+    def _breaker_wait(self, exc: Exception, effort_budget: "EffortBudget | None") -> float | None:
+        """Seconds to wait out the open Ollama breaker before the next step, or None
+        to stop the probe. `exc` is the breaker's refusal (CircuitOpenError) or a
+        transient failure that left it open. The wait takes the place of a step,
+        so the probe's step budget bounds how many it makes; _may_wait keeps each
+        inside the run's deadline. The time left is CircuitBreaker.seconds_until_retry
+        (PR #29); a breaker without it fails fast, as before."""
+        breaker = circuit_breaker.current_ollama_breaker("ollama")
+        if not (isinstance(exc, circuit_breaker.CircuitOpenError)
+                or (isinstance(exc, _TRANSIENT_MODEL_ERRORS) and not _is_quota(exc) and breaker.is_open)):
+            return None
+        seconds_until_retry = getattr(breaker, "seconds_until_retry", None)
+        if seconds_until_retry is None:
+            return None
+        # A HALF_OPEN breaker refuses calls past its trial slot with 0 s left: back off anyway.
+        wait = max(_MODEL_ERROR_BACKOFF_SECONDS, seconds_until_retry())
+        return wait if self._may_wait(wait, effort_budget) else None
+
+    def _may_wait(self, seconds: float, effort_budget: "EffortBudget | None") -> bool:
+        """A model-retry wait runs only while the run is not cancelled, ends before
+        the run's deadline, and the effort budget still allows spend."""
+        if self._run_context is not None and self._run_context.cancel.cancelled:
+            return False
+        if self.deadline is not None and time.monotonic() + seconds >= self.deadline:
+            return False
+        return effort_budget is None or effort_budget.allow()[0]
+
+    def _cancel_token(self):
+        return self._run_context.cancel if self._run_context is not None else None
+
     async def _run_loop(self, result: IterativeResult, exchange: HttpExchange,
                         hypothesis: str, specialty: str, step_budget: int,
                         effort_budget: "EffortBudget | None", on_step) -> IterativeResult:
@@ -627,25 +746,25 @@ class IterativeAgent:
                     "\n\n" + _prior_attempts_block(attempts, result.duplicate_proposals) +
                     "\n\nChoose your next action as a single JSON object.")
             try:
-                from harness.ollama_client import model_stage
-                if effort_budget is not None:
-                    with model_stage("iterative"):
-                        r = await self.ollama.chat_json_metered(
-                            model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
-                    from harness.effort import CallKind
-                    effort_budget.record(CallKind.ESCALATION, self.model, r.prompt_tokens, r.completion_tokens)
-                    action = r.data
-                else:
-                    with model_stage("iterative"):
-                        action = await self.ollama.chat_json(
-                            model=self.model, system_prompt=system, user_prompt=user, temperature=self.temperature)
+                action = await self._next_action(system, user, effort_budget, diag)
             except OllamaInvalidJSONError:
                 # AR-09: unparseable model output is a counted, bounded step, not
                 # a run-ending error. Its text is never echoed (it may carry secrets).
                 action = None
             except Exception as e:
+                wait = self._breaker_wait(e, effort_budget) if step < budget else None
+                if wait is not None:
+                    diag["breaker_waits"] += 1
+                    log.warning("iterative:%s step %d: Ollama breaker open; waiting %.1fs for step %d",
+                                specialty, step, wait, step + 1)
+                    await _backoff_sleep(wait, self._cancel_token())
+                    continue
                 result.stop_reason = "error"
                 result.handoff_note = f"LLM call failed at step {step}: {e}"
+                if _is_quota(e):
+                    result.handoff_note += (
+                        f" -- a Retry-After over {_MAX_RETRY_AFTER_SECONDS:.0f}s is a quota or "
+                        "exhausted credits, so it was not waited out")
                 break
 
             if not isinstance(action, dict) or "action" not in action:

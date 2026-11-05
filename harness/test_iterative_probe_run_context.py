@@ -123,11 +123,14 @@ class _RecordingAgent:
     """Captures the run_context run_active_probe hands the agent; no real work."""
     last_run_context = "unset"
     last_experiment_handoff = "unset"
+    last_model_error_retries = "unset"
 
     def __init__(self, ollama, model, allowed_hosts, *, max_steps=250, run_context=None,
-                 experiment_handoff=None, experiment_catalog=None):
+                 experiment_handoff=None, experiment_catalog=None, model_error_retries=1,
+                 deadline=None):
         type(self).last_run_context = run_context
         type(self).last_experiment_handoff = experiment_handoff
+        type(self).last_model_error_retries = model_error_retries
 
     async def run(self, *a, **k):
         return SimpleNamespace(to_dict=lambda: {"stop_reason": "gave_up", "findings": []})
