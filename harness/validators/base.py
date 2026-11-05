@@ -46,6 +46,10 @@ class ValidationResult:
     # (header_fingerprint below), so findings of one host-wide policy group as one
     # issue. "" when the validator is not a header check or saw no response.
     header_fingerprint: str = ""
+    # The severity a coverage-driven confirmation is ingested at, for a validator
+    # whose verdict is a hardening fact (a missing header, a disclosed stack
+    # trace). "" keeps the coverage path's default.
+    severity: str = ""
 
     def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
         """Name the sends behind this verdict; each is an ExecutionOutcome, a

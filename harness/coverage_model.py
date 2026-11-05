@@ -555,8 +555,9 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "misconfig", _always_applicable, "recon",
           "Test which HTTP methods are enabled"),
     Check("WSTG-CONF-02", "Security headers", Phase.DOMAIN,
-          "misconfig", _always_applicable, "recon",
-          "Check X-Frame-Options, X-Content-Type-Options, etc."),
+          "misconfig", _always_applicable, "security_headers",
+          "Check the captured response's X-Content-Type-Options and Referrer-Policy "
+          "(CSP/framing: WSTG-CONF-05; HSTS: WSTG-CONF-07)"),
     # The genuine WSTG-CONF-09. It is a host/deployment file-permission review, not
     # something a black-box HTTP client can confirm -- so it is a MANUAL check.
     Check("WSTG-CONF-09", "Test File Permission", Phase.DOMAIN,

@@ -200,7 +200,20 @@ _LEG_CONFIRMATIONS = {
     "deserialization_oob", "auth_sequence", "stored_xss", "verb_tamper", "csrf",
     "file_upload", "rate_limit", "reset_token", "dom_xss", "toctou", "race_condition",
     "csp", "cors", "nosql", "header_injection", "http_request_smuggling",
+    "security_headers",
 }
+# Legs that judge the captured response and send nothing. They run first and spend
+# no dispatch budget, so they never crowd out a leg that sends.
+_PASSIVE_LEG_CONFIRMATIONS = frozenset({"security_headers"})
+
+
+def _passive_first(cells):
+    """`cells` ((identity, endpoint, check id or Check), ...) with the passive legs
+    first; each group keeps its order."""
+    def confirmation(cell):
+        check = cell[2] if isinstance(cell[2], Check) else CHECKS_BY_ID.get(cell[2])
+        return getattr(check, "confirmation", "")
+    return sorted(cells, key=lambda cell: confirmation(cell) not in _PASSIVE_LEG_CONFIRMATIONS)
 
 # E7: a drive hands its checkpoint to `on_checkpoint` after every this many completed
 # legs, so a run that dies inside a long drive resumes from the last of them.
@@ -508,22 +521,25 @@ class CoverageTracker:
         what turns the matrix from an after-the-fact record into I1's work-program:
         every applicable deterministic check is attempted deterministically,
         independent of whether the LLM labelled it. Returns cells driven. Bounded
-        by `budget` so a large surface can't fan out unboundedly, and by
+        by `budget` (a passive leg spends none) so a large surface can't fan out unboundedly, and by
         `deadline` (a `time.monotonic()` value) so it ends in time."""
         self.evaluate_readiness(readiness)
         n = 0
         self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
         pending = self.pending_leg_cells(driveable)
         self.queued.update((ident, ep_key, check.id) for ident, ep_key, check in pending)
-        for (ident, ep_key, check) in _fair_cells(pending, self._unauthenticated()):
-            if n >= budget:
+        spent = 0
+        for (ident, ep_key, check) in _passive_first(_fair_cells(pending, self._unauthenticated())):
+            passive = check.confirmation in _PASSIVE_LEG_CONFIRMATIONS
+            if not passive and spent >= budget:
                 self.stopped_by = "leg budget"
                 break
             if deadline is not None and time.monotonic() >= deadline:
                 self.stopped_by = "time budget"
                 break
             self._checkpoint_after(n)
-            n += 1  # Bound attempts, including failed or declined dispatches.
+            n += 1
+            spent += not passive  # Bound attempts, including failed or declined dispatches.
             self.attempted.add((ident, ep_key, check.id))
             method, _, path = ep_key.partition(" ")
             try:
@@ -603,7 +619,8 @@ class CoverageTracker:
         `field_cap` inputs per cell (`_drive_parameter_cases`).
 
         `budget` bounds DISPATCH ATTEMPTS -- one per `run_case` call, so a cell driven
-        per parameter spends one unit per input it dispatches (R05). A callback
+        per parameter spends one unit per input it dispatches (R05). A passive leg
+        (`_PASSIVE_LEG_CONFIRMATIONS`) runs first and spends none. A callback
         that RAISES records the representative ERROR (visible, never swallowed); one
         that returns None records INCONCLUSIVE (dispatched, no usable send). An
         unknown status fails conservatively to INCONCLUSIVE, not an optimistic
@@ -622,12 +639,13 @@ class CoverageTracker:
                 continue
             cells.setdefault((ident, ep_key, check_id), []).append(ck)
 
-        attempts = 0
+        attempts = passive_attempts = 0
         self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
         self.queued.update(cells)
-        for (ident, ep_key, check_id) in _fair_cells(list(cells), self._unauthenticated()):
+        for (ident, ep_key, check_id) in _passive_first(_fair_cells(list(cells), self._unauthenticated())):
             cks = cells[(ident, ep_key, check_id)]
-            if attempts >= budget:
+            passive = CHECKS_BY_ID[check_id].confirmation in _PASSIVE_LEG_CONFIRMATIONS
+            if not passive and attempts - passive_attempts >= budget:
                 self.stopped_by = "leg budget"
                 break
             if deadline is not None and time.monotonic() >= deadline:
@@ -643,9 +661,10 @@ class CoverageTracker:
             if targets:
                 attempts += await self._drive_parameter_cases(
                     run_case, ident, ep_key, check, cks, rep, targets, deadline,
-                    budget - attempts, field_cap)
+                    budget - (attempts - passive_attempts), field_cap)
             else:
                 attempts += 1
+                passive_attempts += passive
                 await self._drive_request_level(run_case, ident, ep_key, check, cks, rep)
         return attempts
 

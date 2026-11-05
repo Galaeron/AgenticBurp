@@ -38,6 +38,7 @@ from .reset_token_validator import ResetTokenValidator
 from .dom_xss_validator import DomXssValidator
 from .toctou_validator import ToctouValidator
 from .verbose_error_validator import VerboseErrorValidator
+from .security_headers_validator import SecurityHeadersValidator
 from harness.safety_gate import get_default_gate, reset_default_gate
 
 log = logging.getLogger(__name__)
@@ -333,6 +334,10 @@ class ValidatorRegistry:
         if verbose_cfg.get("enabled", True):
             self.validators["verbose_error"] = VerboseErrorValidator()
 
+        # WSTG-CONF-02 coverage adapter (passive -- judges captured response headers).
+        if cfg.get("security_headers", {}).get("enabled", True):
+            self.validators["security_headers"] = SecurityHeadersValidator()
+
         # Browser-driven XSS validator (A2) -- active: loads candidate URLs in a
         # real headless browser and confirms only on observed script execution.
         # Enabled here just registers it; it still only RUNS when
@@ -457,7 +462,6 @@ class ValidatorRegistry:
                     "mechanism_id": mechanism if status != "unsupported" else None,
                     "mechanism_version": 1, "finding_class": finding_class if status == "ready" else None}
         unavailable = {
-            "WSTG-CONF-02": "individual security-header oracle is not bound",
             "WSTG-CONF-06": "method enumeration is not a security verdict",
             "WSTG-CONF-07": "HTTP absence does not prove HTTPS HSTS policy",
             "WSTG-ERRH-01": "no check-specific error oracle is bound",

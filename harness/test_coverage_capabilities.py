@@ -55,7 +55,9 @@ class CoverageCapabilityTests(unittest.IsolatedAsyncioTestCase):
             return next(r for r in rows if r['check'] == check and r['identity'] == 'anonymous')
         self.assertEqual(row('WSTG-CONF-05')['terminal_reason'], 'validator_unavailable')
         self.assertEqual(row('WSTG-CONF-09')['terminal_reason'], 'manual_required')
-        self.assertEqual(row('WSTG-CONF-02')['terminal_reason'], 'check_adapter_missing')
+        self.assertEqual(row('WSTG-INFO-02')['terminal_reason'], 'check_adapter_missing')
+        # CONF-02 has an adapter now; an empty driver leaves it unavailable, not missing.
+        self.assertEqual(row('WSTG-CONF-02')['terminal_reason'], 'validator_unavailable')
         self.assertFalse(row('WSTG-CONF-05')['eligible'])
         self.assertTrue(any(r['terminal_reason'] == 'unreachable_identity' for r in rows))
 
@@ -382,9 +384,16 @@ class ReadinessInputTests(unittest.TestCase):
         self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login')['status'],'ready')
 
     def test_unavailable_adapter_protocol_and_disable_dispositions(self):
-        for check in ('WSTG-CONF-02','WSTG-CONF-06','WSTG-CONF-07','WSTG-ERRH-01','WSTG-INFO-02','WSTG-INFO-05'):
+        for check in ('WSTG-CONF-06','WSTG-CONF-07','WSTG-ERRH-01','WSTG-INFO-02','WSTG-INFO-05'):
             result=self.decide(check)
             self.assertEqual(result['reason_code'],'check_adapter_missing');self.assertIsNone(result['finding_class'])
+        # CONF-02 is bound to the passive header adapter: unavailable until it is registered.
+        self.assertEqual(self.decide('WSTG-CONF-02')['reason_code'],'validator_unavailable')
+        registry=self.registry();registry.validators['security_headers']=SimpleNamespace(active=False)
+        registry.active_enabled=False
+        from harness.models import HttpExchange
+        result=registry.capability_for_check(CHECKS_BY_ID['WSTG-CONF-02'],HttpExchange(url='http://fixture.invalid',method='GET'))
+        self.assertEqual(result['status'],'ready');self.assertIsNotNone(result['finding_class'])
         self.assertEqual(self.decide('WSTG-CRYP-01')['reason_code'],'protocol_inapplicable')
         registry=self.registry();registry.active_enabled=False
         from harness.models import HttpExchange

@@ -400,7 +400,7 @@ def coverage_confirmation_finding(res, check, url: str, identity: str) -> dict |
         "vulnerability_class": getattr(res, "finding_class", None) or check.vulnerability_class,
         "confirmed": True,
         "confidence": getattr(res, "confidence", None) or 0.9,
-        "severity": "high",
+        "severity": getattr(res, "severity", "") or "high",
         "summary": (getattr(res, "summary", "") or
                     f"Coverage-driven {check.confirmation} leg confirmed on {url}"),
         "evidence": getattr(res, "evidence", "") or "",
