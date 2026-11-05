@@ -645,6 +645,19 @@ class PathTraversalUnsentTests(_RvpBase):
         reports = self._run(_files([]), max_requests=5)
         self._assert_not_negative(reports, "inconclusive")
 
+    def test_post_leg_cut_by_the_mutating_ceiling_is_not_a_negative(self):
+        # The safe default allows one mutating send per finding (R16): the first
+        # POST probe answers and the gate refuses the rest. Each refusal used to
+        # be filed as one unsendable payload, so the leg ended not_confirmed.
+        # The GET leg above (no mutating accounting) is the control.
+        sent = []
+        ex = self._ex().model_copy(update={"method": "POST"})
+        reports = self._run_in("path_traversal", PathTraversalValidator(allowed_hosts=_HOSTS, timeout=1.0),
+                               _finding("path_traversal"), ex, _files(sent))
+        self._assert_not_negative(reports, "inconclusive")
+        self.assertEqual(len(sent), 1, "the leg kept sending after the ceiling refused it")
+        self.assertIn("mutating-request ceiling", _text(reports))
+
     # -- controls
     def test_file_read_still_confirms(self):
         self._assert_confirmed(self._run(_files([], reads=True)))

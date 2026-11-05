@@ -156,6 +156,25 @@ class PathTraversalValidator(Validator):
             return (_mutate_last_segment(exchange.url, value) or exchange.url), (exchange.request_body or "")
         return mutate(exchange, loc, param, value)
 
+    def _ceiling_spent(self, finding: Finding, method: str) -> bool:
+        """Whether the run gate's per-finding mutating ceiling (R16) has no send
+        left for this leg's finding. Once it is spent, every remaining mutating
+        payload is refused too, so the refusal ends the leg rather than marking one
+        payload unsendable. Read from the gate's own accounting, never from the
+        refusal's wording. Only a mutating send keyed on a finding is counted; an
+        accounting the gate cannot answer counts as spent (fail closed: the leg
+        stops incomplete instead of reading the refusals as a negative)."""
+        finding_id = getattr(finding, "finding_id", "") or ""
+        if not finding_id:
+            return False
+        try:
+            gate = self.run_context.gate
+            if gate.classify(method) != ActionRiskTier.MUTATING:
+                return False
+            return gate.mutating_headroom(finding_id, self.name)[0] == 0
+        except Exception:
+            return True
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
@@ -173,8 +192,10 @@ class PathTraversalValidator(Validator):
         # Probes that got no response (RV-P P7). A payload the scope lock or the
         # session's origin check cannot send (e.g. a backslash path segment) is
         # refused on its own and the rest still run; a refusal that ends the
-        # run (budget, cancellation, mutating replay) stops the leg. A probe
-        # that never answered is not part of a negative.
+        # run (budget, cancellation, mutating replay) stops the leg, and so does
+        # the per-finding mutating ceiling (R16) once it is spent: the gate would
+        # refuse every remaining payload alike. A probe that never answered is
+        # not part of a negative.
         planned = len(targets) * len(_PREFIXES) * len(_TARGETS)
         answered = 0
         unsendable: list[str] = []
@@ -204,10 +225,14 @@ class PathTraversalValidator(Validator):
                                 capability=self.name, session_ref=session_ref,
                                 case_ref=finding.finding_id or "", max_redirects=0)
                             if not outcome.executed:
-                                if outcome.outcome in ("out_of_scope", "blocked"):
+                                ceiling_cut = (outcome.outcome == "blocked"
+                                               and self._ceiling_spent(finding, method))
+                                if outcome.outcome in ("out_of_scope", "blocked") and not ceiling_cut:
                                     unsendable.append(f"{label}: {outcome.outcome}")
                                     continue
-                                refused = f"path-traversal replay declined: {outcome.outcome}"
+                                why = getattr(outcome, "error", "") or ""
+                                refused = (f"path-traversal replay declined: {outcome.outcome}"
+                                           + (f" ({why})" if why else ""))
                                 break
                             if not outcome.ok:
                                 art = getattr(outcome, "artifact", None)

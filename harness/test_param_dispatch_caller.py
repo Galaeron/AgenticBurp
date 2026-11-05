@@ -9,7 +9,10 @@ an input the leg cannot target alone (a repeated name) stays inconclusive, and a
 leg that does not report its input leaves every parameter case inconclusive.
 The per-finding mutating ceiling counts per parameter case: a parameter the
 ceiling cuts off stays open, and one ceiling shared by every parameter (the
-defect control) would cut the later one.
+defect control) would cut the later one. Request-level legs (path traversal,
+and the request-level attempt of SSTI and command injection) count the ceiling
+on their own case too: a leg the ceiling cuts off is never a clean negative, and
+one under it still concludes.
 
 Only discovery is canned (one endpoint with a captured form template), the agent
 probe is stubbed, and the worklist's shape-driven legs are switched off (they
@@ -39,7 +42,7 @@ from harness.role_crawl import RoleSession
 
 _HARNESS = Path(__file__).resolve().parent
 _JINJA_MUL = re.compile(r"\{\{(\d+)\*(\d+)\}\}")
-SSTI, REDIRECT = "WSTG-INPV-18", "WSTG-INPV-17"
+SSTI, REDIRECT, CMDI, TRAVERSAL = "WSTG-INPV-18", "WSTG-INPV-17", "WSTG-INPV-12", "WSTG-ATHZ-01"
 ROLES = [RoleSession("anonymous", {})]
 # Every coverage leg but the two this file is about stays off, so the loopback
 # server only sees SSTI and open-redirect traffic.
@@ -104,7 +107,10 @@ def _config() -> dict:
     return cfg
 
 
-class PerParameterDispatchCallerTest(unittest.TestCase):
+class _LoopbackDrive(unittest.TestCase):
+    """The loopback target and one investigate_engagement run over a canned
+    endpoint (no tests of its own)."""
+
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.mkdtemp(prefix="param_dispatch_")
@@ -177,6 +183,8 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
         self.coverage = coverage
         return matrix, key, cases
 
+
+class PerParameterDispatchCallerTest(_LoopbackDrive):
     def test_vulnerable_parameter_confirmed_beside_clean_one(self):
         matrix, key, cases = self._run("/render", "tpl=hello&name=bob")
         ssti = cases(SSTI)
@@ -355,6 +363,115 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
         self.assertIn("mutating-request ceiling", ssti["b"].reason)
         self.assertFalse(ssti["b"].executed)
         self.assertNotEqual(matrix.get(*key(SSTI)).status, CellStatus.NOT_DETECTED)
+
+
+_NEGATIVES = (CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE)
+
+
+class RequestLevelCeilingCallerTest(_LoopbackDrive):
+    """The per-finding mutating ceiling (R16) on request-level coverage legs, each
+    keyed on its own case. Lowered per check in the test's own config only."""
+
+    @staticmethod
+    def _answered(leg) -> int:
+        """Answered sends the case's attempts recorded (a cut-off inconclusive leg
+        is not `executed`, but its answered probes are on its attempt)."""
+        return sum(a.get("sent", 0) for a in leg.attempts if isinstance(a, dict))
+
+    # -- path traversal: a clean POST file route, injected in its path segment
+    #    only (no form parameter): 16 POSTs, one per encoding and system file.
+    def _traversal_run(self, ceiling):
+        return self._run("/files/view", "{}", disable=("ssti", "open_redirect"), live_context=True,
+                         validators_cfg={"path_traversal": {"enabled": True},
+                                         "mutating_ceiling_by_check": {"path_traversal": ceiling}})
+
+    def test_traversal_cut_off_by_the_ceiling_is_never_a_clean_negative(self):
+        matrix, key, cases = self._traversal_run(4)
+        leg = cases(TRAVERSAL)[""]
+        self.assertEqual(leg.status, CellStatus.INCONCLUSIVE, leg.reason)
+        self.assertIn("mutating-request ceiling", leg.reason)
+        self.assertEqual(self._answered(leg), 4)           # the case's own account
+        self.assertNotIn(matrix.get(*key(TRAVERSAL)).status, _NEGATIVES)
+
+    def test_traversal_under_the_ceiling_concludes(self):
+        # Negative control: the hard cap (20) covers every probe, so the clean
+        # route concludes on its own account.
+        matrix, key, cases = self._traversal_run(20)
+        leg = cases(TRAVERSAL)[""]
+        self.assertEqual(leg.status, CellStatus.NOT_DETECTED, leg.reason)
+        self.assertTrue(leg.executed)
+        self.assertEqual(matrix.get(*key(TRAVERSAL)).status, CellStatus.NOT_DETECTED)
+
+    def test_control_a_ceiling_refusal_read_as_one_unsendable_payload_reads_clean(self):
+        """Defect injection: the leg files each ceiling refusal as one unsendable
+        payload (the former behaviour), so the cut leg ends not_confirmed and the
+        cell reads clean. The cut-off test above sees it."""
+        from harness.validators.path_traversal_validator import PathTraversalValidator
+        with patch.object(PathTraversalValidator, "_ceiling_spent", return_value=False):
+            matrix, key, cases = self._traversal_run(4)
+        self.assertEqual(cases(TRAVERSAL)[""].status, CellStatus.NOT_DETECTED)
+        self.assertEqual(matrix.get(*key(TRAVERSAL)).status, CellStatus.NOT_DETECTED)
+
+    def test_control_an_unkeyed_request_level_leg_escapes_the_ceiling(self):
+        """Defect injection: the request-level leg carries no ceiling key (the
+        former drive), so the ceiling never counts it and every probe is sent.
+        The cut-off test above sees it."""
+        from harness.validators.path_traversal_validator import PathTraversalValidator
+        original = PathTraversalValidator.validate
+
+        async def unkeyed(self, finding, exchange):
+            return await original(self, finding.model_copy(update={"finding_id": ""}), exchange)
+
+        with patch.object(PathTraversalValidator, "validate", unkeyed):
+            _matrix, _key, cases = self._traversal_run(4)
+        leg = cases(TRAVERSAL)[""]
+        self.assertEqual(leg.status, CellStatus.NOT_DETECTED, leg.reason)
+        self.assertGreater(self._answered(leg), 4)
+
+    # -- the request-level attempt of SSTI and command injection: a field cap of
+    #    0 keeps the cell request-level, so one leg tests both inputs.
+    def _request_level_run(self, check, ceiling, **validators_cfg):
+        disable = tuple(n for n in ("ssti", "open_redirect", "command_injection") if n != check)
+        return self._run("/echo", "a=1&b=2", engagement_cfg={"coverage_parameter_field_cap": 0},
+                         disable=disable, live_context=True,
+                         validators_cfg={**validators_cfg, check: {"enabled": True},
+                                         "mutating_ceiling_by_check": {check: ceiling}})
+
+    def test_ssti_request_level_cut_off_is_never_a_clean_negative(self):
+        # Six POSTs per clean input: the twelve this leg needs are cut at six.
+        matrix, key, cases = self._request_level_run("ssti", 6)
+        leg = cases(SSTI)[""]
+        self.assertEqual(leg.status, CellStatus.INCONCLUSIVE, leg.reason)
+        self.assertIn("mutating-request ceiling", leg.reason)
+        self.assertEqual(self._answered(leg), 6)
+        self.assertNotIn(matrix.get(*key(SSTI)).status, _NEGATIVES)
+
+    def test_ssti_request_level_under_the_ceiling_concludes(self):
+        matrix, key, cases = self._request_level_run("ssti", 12)
+        leg = cases(SSTI)[""]
+        self.assertEqual(leg.status, CellStatus.NOT_DETECTED, leg.reason)
+        self.assertTrue(leg.executed)
+
+    def test_command_injection_request_level_cut_off_is_never_a_clean_negative(self):
+        # Three in-band POSTs per input (callbacks off): the third is refused.
+        matrix, key, cases = self._request_level_run(
+            "command_injection", 2, oob_callbacks_enabled=False)
+        leg = cases(CMDI)[""]
+        self.assertIn(leg.status, (CellStatus.INCONCLUSIVE, CellStatus.BLOCKED), leg.reason)
+        self.assertIn("mutating-request ceiling", leg.reason)
+        self.assertEqual(self._answered(leg), 2)
+        self.assertNotIn(matrix.get(*key(CMDI)).status, _NEGATIVES)
+
+    def test_command_injection_request_level_under_the_ceiling_runs_every_probe(self):
+        # Control: under the ceiling every in-band probe of both inputs is
+        # answered; with callbacks off the leg ends on its own reason, not on
+        # the ceiling (it never concludes in-band alone).
+        matrix, key, cases = self._request_level_run(
+            "command_injection", 6, oob_callbacks_enabled=False)
+        leg = cases(CMDI)[""]
+        self.assertEqual(self._answered(leg), 6)
+        self.assertNotIn("ceiling", leg.reason)
+        self.assertIn("callback probes disabled", leg.reason)
 
 
 class SqlmapParameterOnlyTest(unittest.TestCase):
