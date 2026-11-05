@@ -470,6 +470,11 @@ class ValidatorRegistry:
             if exchange is not None and urlsplit(exchange.url).scheme == "http":
                 return decision("unsupported", "protocol_inapplicable", "no TLS surface on this HTTP target")
             return decision("unsupported", "check_adapter_missing", "no TLS configuration adapter is bound")
+        if (check.id == "WSTG-CONF-07" and exchange is not None
+                and urlsplit(exchange.url).scheme == "http"):
+            # RFC 6797 8.1: a browser ignores Strict-Transport-Security over plain HTTP.
+            return decision("unsupported", "protocol_inapplicable",
+                            "HSTS applies to HTTPS responses; this target is plain HTTP")
         if check.id in unavailable:
             return decision("unsupported", "check_adapter_missing", unavailable[check.id])
         if family == "manual":

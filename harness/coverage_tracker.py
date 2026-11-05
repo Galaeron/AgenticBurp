@@ -150,7 +150,10 @@ _LEG_STATUS = {
 }
 _LEG_STATUS_UNKNOWN = CellStatus.INCONCLUSIVE
 # The case driver's mapping: it keeps a validator's controlled_negative distinct.
+# A validator's "safe" is its executed negative here too, as in _LEG_STATUS (r3:
+# 208 CORS cases that sent their probes and passed stayed inconclusive without it).
 _CASE_STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.NOT_DETECTED,
+                "safe": CellStatus.NOT_DETECTED,
                 "controlled_negative": CellStatus.CONTROLLED_NEGATIVE,
                 "blocked": CellStatus.BLOCKED, "inconclusive": CellStatus.INCONCLUSIVE,
                 "skipped": CellStatus.SKIPPED, "error": CellStatus.ERROR}
