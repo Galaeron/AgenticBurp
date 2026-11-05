@@ -99,10 +99,16 @@ def is_settled(outcome: dict) -> bool:
 
 def round_budgets(base: dict, cfg: RetryRoundsConfig, round_no: int) -> dict:
     """`base` budgets scaled for `round_no` (1 = the first retry round). A budget of 0
-    (that stage turned off) stays 0."""
+    (that stage turned off) stays 0, and None (no bound) stays None."""
     factor = min(cfg.growth ** round_no, _MAX_FACTOR)
-    out = {name: int(math.ceil(int(value) * factor)) if int(value) > 0 else 0
-           for name, value in base.items()}
+
+    def scale(value):
+        if value is None:
+            return None
+        value = int(value)
+        return int(math.ceil(value * factor)) if value > 0 else 0
+
+    out = {name: scale(value) for name, value in base.items()}
     if "step_budget" in out:
         out["step_budget"] = min(out["step_budget"], max(cfg.max_step_budget, int(base["step_budget"])))
     return out

@@ -396,6 +396,19 @@ SKIP_POLICY_BLOCKED = "policy_blocked"
 SKIP_TIME_BUDGET = "time_budget"
 
 
+def resolve_precondition_legs(value, *, time_boxed: bool) -> int | None:
+    """`engagement.max_precondition_legs` as investigate_worklist takes it. `auto`
+    (or unset) is no count bound for a time-boxed run, whose deadline bounds the
+    legs, and 24 otherwise; `unlimited` is no bound; a number is that bound (0: no
+    legs)."""
+    word = str(value).strip().lower() if value is not None else "auto"
+    if word == "auto":
+        return None if time_boxed else 24
+    if word == "unlimited":
+        return None
+    return max(0, int(value))
+
+
 def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
                  policy_blocked_leg: bool) -> str:
     """Why a node that reached the end of one sweep iteration with no agent
@@ -436,7 +449,7 @@ async def investigate_worklist(
     precondition_fn=None,
     stop_on_confirm: bool = False,
     max_nodes: int = 8,
-    max_precondition_legs: int = 24,
+    max_precondition_legs: int | None = 24,
     step_budget: int = 16,
     id_fill: str = "1",
     worklist_limit: int = 200,
@@ -485,6 +498,10 @@ async def investigate_worklist(
     budget with eligible work still on the table. It also gets
     `iterative_diagnostics` (AR-10 P1): the agent probes' AR-09 counts summed per
     run and per stop reason; see `iterative_diagnostics()`.
+
+    `max_precondition_legs` bounds the nodes whose shape-driven legs one sweep
+    attempts; past it a warranted node is skipped as budget_exhausted. None means
+    no count bound (a time-boxed engagement bounds them by `deadline`).
 
     `deadline`, a `time.monotonic()` value, stops the sweep starting work on a
     node once passed; every later node that had work due is skipped as
@@ -575,7 +592,8 @@ async def investigate_worklist(
         legs_ran_before = warrants and legs_done is not None and key in legs_done
         if legs_ran_before:
             warrants = False
-        do_precond = warrants and precondition_run < max_precondition_legs
+        do_precond = warrants and (max_precondition_legs is None
+                                   or precondition_run < max_precondition_legs)
         if not do_agent and not do_precond:
             if legs_ran_before and not eligible:
                 continue  # an earlier sweep of this run attempted its legs; nothing new

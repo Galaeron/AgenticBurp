@@ -928,7 +928,7 @@ class ChainMixin:
     @identity_headers.leased
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
-                                     discovery_max_endpoints: int = 150,
+                                     discovery_max_endpoints: int | None = None,
                                      discovery_max_pages: int = 40,
                                      active_discovery: bool = True,
                                      max_chain_rounds: int = 1, run_context=None,
@@ -949,6 +949,9 @@ class ChainMixin:
         `roles` is a list of role_crawl.RoleSession. Requires iterative_agent
         enabled (run_active_probe enforces it). `max_chain_rounds` bounds the
         Milestone-C closed loop (re-test AS a credential learned from a finding).
+        `discovery_max_endpoints` caps the method+path operations discovery probes
+        with every role; None takes `engagement.discovery_max_endpoints` (default 0:
+        every discovered operation, so the worklist sees the whole surface).
         `protected_paths` and `owners` are the operator's engagement declarations
         (I16): merged into the state after discovery, where the missing-auth (RV-S)
         and ownership (RV-T) confirmations read them. None or empty changes nothing."""
@@ -967,6 +970,10 @@ class ChainMixin:
         # drive), and bound the investigation stages by wall-clock time.
         _investigation_deadline = (time.monotonic() + self.investigation_seconds
                                    if self.investigation_seconds > 0 else None)
+        if discovery_max_endpoints is None:
+            discovery_max_endpoints = (self.config.get("engagement") or {}).get(
+                "discovery_max_endpoints", 0)
+        discovery_max_endpoints = max(0, int(discovery_max_endpoints or 0))
         # Crawl loop (all off by default): per-principal crawls, route feedback with
         # re-crawl rounds, and per-phase time-slices of the deadline above.
         from harness.phase_schedule import PhaseSchedule
@@ -1080,9 +1087,11 @@ class ChainMixin:
             _retry_ledger = retry_rounds.RetryLedger()
             _worklist_kwargs = _retry_ledger.wire(_worklist_kwargs)
             _review_kwargs["model_failed"] = _retry_ledger.review_failed
-        # The shape-driven legs one sweep may attempt (investigate_worklist's default).
-        _max_precondition_legs = max(0, int((self.config.get("engagement") or {}).get(
-            "max_precondition_legs", 24)))
+        # The shape-driven legs one sweep may attempt: by default no count bound when
+        # the run is time-boxed (its deadline bounds them), else 24.
+        _max_precondition_legs = worklist_investigator.resolve_precondition_legs(
+            (self.config.get("engagement") or {}).get("max_precondition_legs"),
+            time_boxed=_investigation_deadline is not None)
 
         # Operator/capture supplied shapes (for example the runner's successful
         # login setup exchange) are first-class evidence. They do not trigger new

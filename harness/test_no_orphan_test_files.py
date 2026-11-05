@@ -17,6 +17,8 @@ CASE_BASE_MODULES = frozenset({
     'harness.coverage_evidence_case',
     'harness.test_pairing_contract',
     'harness.test_experiment_cycle',
+    'harness.test_retry_rounds',
+    'harness.test_role_crawl',
 })
 
 

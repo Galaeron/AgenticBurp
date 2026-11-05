@@ -387,9 +387,17 @@ engagement:
     min_new_routes: 1
     max_new_routes: 200
     max_routes_per_round: 50
-  # Shape-driven confirmation legs one worklist sweep may attempt (the worklist
-  # investigator's default). Nodes past it are reported as budget_exhausted.
-  max_precondition_legs: 24
+  # Shape-driven confirmation legs one worklist sweep may attempt; nodes past it
+  # are reported as budget_exhausted. `auto`: no count bound when the run is
+  # time-boxed (investigation_seconds; the deadline bounds the legs), else 24.
+  # `unlimited`, or a number (0 turns the legs off). r3 skipped 262 warranted
+  # nodes at the old fixed 24.
+  max_precondition_legs: auto
+  # Method+path operations engagement discovery probes with every role. 0 (the
+  # default) probes every discovered operation; a cap cuts the sorted list, so it
+  # drops routes by name, not by value (r3 lost 64 of 214 operations at 150).
+  # A request's discovery_max_endpoints overrides it.
+  discovery_max_endpoints: 0
   # Retry rounds (harness/retry_rounds.py). When on, with investigation_seconds set,
   # the time left after the coverage drive is not given back: until reserve_seconds
   # before the deadline, rounds sweep the worklist and review captures again, round r

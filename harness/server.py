@@ -1543,6 +1543,9 @@ class InvestigateRequest(_BaseModel):
     # the analysis request's field above (max(1, min(v, 20000))). The default
     # equals investigate_engagement's own default, so omitting it changes nothing.
     discovery_max_probes: int = 6000
+    # Cap on the method+path operations discovery probes with every role. None
+    # takes engagement.discovery_max_endpoints (default 0: no cap, the whole surface).
+    discovery_max_endpoints: int | None = None
     resume_job_id: str | None = None
     # I16: the operator's engagement declarations for this run (saved lists apply
     # only through use_saved_declarations below).
@@ -1850,6 +1853,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                     seed_exchanges=req.seed_exchanges,
                     active_discovery=req.active_discovery,
                     discovery_max_probes=max(1, min(req.discovery_max_probes, 20000)),
+                    **({'discovery_max_endpoints': max(0, min(req.discovery_max_endpoints, 100000))}
+                       if req.discovery_max_endpoints is not None else {}),
                     **({'protected_paths': req.protected_paths} if req.protected_paths else {}),
                     **({'owners': req.owners} if req.owners else {}),
                     **({'coverage_checkpoint': coverage_checkpoint} if coverage_checkpoint is not None else {}))

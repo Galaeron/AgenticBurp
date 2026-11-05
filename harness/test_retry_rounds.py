@@ -374,7 +374,7 @@ class RetryRoundsCallerTests(unittest.TestCase):
         store._DB_PATH, cache._cache = self._orig
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def _investigate(self, engagement=None):
+    def _investigate(self, engagement=None, **investigate):
         cfg = _config()
         cfg["engagement"].update(engagement or {})
         orch = Orchestrator(cfg)
@@ -427,7 +427,8 @@ class RetryRoundsCallerTests(unittest.TestCase):
                 async with rc:
                     return await orch.investigate_engagement(
                         BASE, [RoleSession("anonymous", {})], max_nodes=1, step_budget=16,
-                        max_chain_rounds=0, discovery_max_probes=1, run_context=rc)
+                        max_chain_rounds=0, discovery_max_probes=1, run_context=rc,
+                        **investigate)
             finally:
                 await rc.aclose()
 
@@ -443,7 +444,7 @@ class RetryRoundsCallerTests(unittest.TestCase):
     def test_time_left_goes_to_escalated_rounds_over_the_work_left(self):
         result, sweeps, reviews = self._investigate({
             "investigation_seconds": 900, "capture_review_limit": 5,
-            "retry_rounds": {"enabled": True}})
+            "max_precondition_legs": 24, "retry_rounds": {"enabled": True}})
         self.assertEqual(len(sweeps), 3)
         first, retry, last = sweeps
         self.assertEqual((first["max_nodes"], first["step_budget"],
