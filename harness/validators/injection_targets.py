@@ -83,6 +83,16 @@ def select_targets(finding, candidates: list[tuple[str, str]], limit: int,
     return list(candidates[:limit]), ("" if len(candidates) <= limit else PARTIAL_COVERAGE)
 
 
+def tested_inputs(finding, targets) -> tuple[tuple[str, str], ...]:
+    """What a leg reports in ValidationResult.tested_parameters: under a
+    per-parameter dispatch, the one input it was bound to once that input is its
+    only target; otherwise nothing, so the case driver keeps the R01 rule."""
+    if getattr(finding, "parameter_only", False) and len(targets) == 1:
+        return (((finding.parameter_location or "").strip().lower(),
+                 (finding.parameter_name or "").strip()),)
+    return ()
+
+
 # Coverage case driving: legs that can test ONE input per dispatch, by the case
 # locations each can address on its own. sqlmap's `-p` naming of JSON body keys
 # is unverified, so its JSON keys stay request-level.

@@ -35,7 +35,8 @@ from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult, artifact_id_of
-from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
+from .injection_targets import (param_targets, mutate, replay_headers, select_targets,
+                                coverage_note, tested_inputs)
 
 # Two 2-digit primes -> a distinctive 4-digit product unlikely to appear by
 # chance, and one no reasonable page computes for an unrelated reason.
@@ -205,6 +206,8 @@ class SstiValidator(Validator):
             return ok, detail
 
         def _finish(result: ValidationResult) -> ValidationResult:
+            # Every send from here on targets `targets` only.
+            result.tested_parameters = tested_inputs(finding, targets)
             if not residual:
                 return result
             note = (f"RESIDUAL STATE: the original captured request was NOT restored "

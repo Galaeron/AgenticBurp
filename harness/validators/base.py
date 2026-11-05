@@ -46,6 +46,11 @@ class ValidationResult:
     # (header_fingerprint below), so findings of one host-wide policy group as one
     # issue. "" when the validator is not a header check or saw no response.
     header_fingerprint: str = ""
+    # Per-parameter dispatch: the (parameter_location, parameter_name) inputs this
+    # leg restricted its sends to, in the coverage case vocabulary (query,
+    # body_form, body_json). The case driver binds a verdict to a parameter case
+    # only when this names exactly that input; empty means the leg did not say.
+    tested_parameters: tuple[tuple[str, str], ...] = ()
 
     def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
         """Name the sends behind this verdict; each is an ExecutionOutcome, a

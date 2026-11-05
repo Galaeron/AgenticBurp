@@ -445,7 +445,15 @@ class SqlmapValidator(Validator):
                             "parameter of the replayed request, so it was not tested",
                     control_outcome=NAMED_PARAMETER_UNTESTED)
             only = [(loc, name)]
+        result = await self._validate_request(finding, exchange, only)
+        if only and result is not None:
+            # Every send below targets `only` (-p and the probes' only_params).
+            from .injection_targets import tested_inputs
+            result.tested_parameters = tested_inputs(finding, only)
+        return result
 
+    async def _validate_request(self, finding: Finding, exchange: HttpExchange,
+                                only: list[tuple[str, str]] | None) -> ValidationResult:
         if exchange.method.upper() != "GET":
             # sqlmap fuzzes a parameter by sending many requests with
             # different payloads to the SAME endpoint via the SAME
@@ -801,6 +809,7 @@ class SqlmapValidator(Validator):
                     return secondary
             if only and "not present within" in lower:
                 # A `-p` sqlmap could not find tested nothing: never a negative.
+                from .injection_targets import NAMED_PARAMETER_UNTESTED
                 return ValidationResult(
                     self.name, "inconclusive", finding.vulnerability_class,
                     summary=f"sqlmap did not find parameter {only[0][1]!r} to test "

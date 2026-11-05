@@ -565,10 +565,11 @@ class CoverageTracker:
             ep = endpoints.get(ep_key) or {}
             # Always register the request-level (no-parameter) case FIRST: it is the
             # representative the leg's whole-request result binds to. A PARAMETER
-            # check additionally enumerates the endpoint's concrete inputs -- for
-            # VISIBILITY, not per-parameter attribution (R01): these deterministic
-            # legs test the whole request, so a sibling input is left inconclusive
-            # rather than credited with the request-level verdict.
+            # check additionally enumerates the endpoint's concrete inputs: a leg
+            # that can test one input alone (`case_target`) is driven on each, and
+            # for any other leg they are VISIBILITY, not per-parameter attribution
+            # (R01): a sibling input is left inconclusive rather than credited
+            # with the request-level verdict.
             # The request-level representative is ALWAYS registered (it is the case
             # the leg is actually driven on) -- it is never starved by the budget.
             rep_res = self.matrix.expand_cases(ident, ep_key, check.id, [NO_PARAMETER_CASE])
@@ -600,7 +601,8 @@ class CoverageTracker:
         "no per-parameter attribution" reason -- visible, but never credited with the
         request-level verdict, proof, or a separate execution. A leg that can (see
         `case_target`) is driven once per parameter case instead, at most
-        `field_cap` inputs per cell (`_drive_parameter_cases`).
+        `field_cap` inputs per cell (`_drive_parameter_cases`), and its verdict
+        binds to that case only when the leg reports testing exactly that input.
 
         `budget` bounds DISPATCH ATTEMPTS -- one per `run_case` call, so a cell driven
         per parameter spends one unit per input it dispatches (R05). A callback
@@ -706,6 +708,32 @@ class CoverageTracker:
             evidence=(getattr(res, "evidence", "") or "")[:200], executed=executed,
             attempts=fresh, referenced_attempts=referenced)
 
+    def _record_parameter_result(self, ident, ep_key, check, case, rep, res) -> None:
+        """Bind one per-parameter dispatch's result to `case`. A verdict binds only
+        when the leg reports it tested exactly that input
+        (ValidationResult.tested_parameters); a leg that does not say keeps the
+        R01 rule: the case stays INCONCLUSIVE, never tested, and a confirmation
+        it cannot place marks the request-level case instead. A result with no
+        verdict (skipped, blocked, error, inconclusive) is recorded as it is."""
+        status = _CASE_STATUS.get(getattr(res, "status", ""), CellStatus.INCONCLUSIVE)
+        tested = tuple(tuple(t) for t in (getattr(res, "tested_parameters", ()) or ()))
+        if (status not in (CellStatus.CONFIRMED, CellStatus.NOT_DETECTED,
+                           CellStatus.CONTROLLED_NEGATIVE)
+                or tested == (case_target(check.confirmation, case),)):
+            self._record_case_result(ident, ep_key, check, case, res,
+                                     f"{check.confirmation} driven on {case.label()}")
+            return
+        if status == CellStatus.CONFIRMED:
+            self._record_case_result(ident, ep_key, check, rep, res,
+                                     f"{check.confirmation} confirmed on the request")
+        _, fresh, referenced = _attempt_facts(res, CellStatus.INCONCLUSIVE)
+        self.matrix.record_case(
+            ident, ep_key, check.id, case, status=CellStatus.INCONCLUSIVE,
+            reason=f"{check.confirmation} did not report testing {case.label()} on its own, "
+                   f"so its {getattr(res, 'status', '')} result is not attributed to this input",
+            validator=check.confirmation, executed=False,
+            attempts=fresh, referenced_attempts=referenced)
+
     async def _drive_parameter_cases(self, run_case, ident, ep_key, check, cks, rep,
                                      targets, deadline, remaining, field_cap) -> int:
         """Per-parameter dispatch (owner option b): drive the leg once per input it
@@ -760,8 +788,7 @@ class CoverageTracker:
                     reason=f"{check.confirmation} produced no send for {case.label()}",
                     validator=check.confirmation, executed=False)
                 continue
-            self._record_case_result(ident, ep_key, check, case, res,
-                                     f"{check.confirmation} driven on {case.label()}")
+            self._record_parameter_result(ident, ep_key, check, case, rep, res)
         others = [(c, r) for c, r in self.matrix.cases_for_cell(ident, ep_key, check_id)
                   if c.coord_id() != rep.coord_id()]
         if (not timed_out and not out_of_budget
