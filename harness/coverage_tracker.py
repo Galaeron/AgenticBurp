@@ -271,6 +271,8 @@ class CoverageTracker:
         self.on_checkpoint = None
         # Why a drive stopped with queued cells left: "leg budget" or "time budget".
         self.stopped_by = None
+        # Passive legs judged (no send, no budget); the drivers return only budgeted dispatches.
+        self.passive_judged = 0
         # canonical vulnerability_class -> [check_id]; plus the raw class token so
         # a check class canonicalize() returns None for (e.g. "misconfig") still maps.
         self._class_to_checks: dict[str, list[str]] = {}
@@ -520,7 +522,8 @@ class CoverageTracker:
         .status / .summary, or None to skip), recording the REAL outcome. This is
         what turns the matrix from an after-the-fact record into I1's work-program:
         every applicable deterministic check is attempted deterministically,
-        independent of whether the LLM labelled it. Returns cells driven. Bounded
+        independent of whether the LLM labelled it. Returns the budgeted (sending)
+        cells driven; passive judgements are counted in `passive_judged`. Bounded
         by `budget` (a passive leg spends none) so a large surface can't fan out unboundedly, and by
         `deadline` (a `time.monotonic()` value) so it ends in time."""
         self.evaluate_readiness(readiness)
@@ -540,6 +543,7 @@ class CoverageTracker:
             self._checkpoint_after(n)
             n += 1
             spent += not passive  # Bound attempts, including failed or declined dispatches.
+            self.passive_judged += passive
             self.attempted.add((ident, ep_key, check.id))
             method, _, path = ep_key.partition(" ")
             try:
@@ -563,7 +567,7 @@ class CoverageTracker:
                 validator=getattr(res, "validator", None) or check.confirmation,
                 evidence=(getattr(res, "evidence", "") or "")[:200],
                 executed=executed, attempts=fresh, referenced_attempts=referenced)
-        return n
+        return spent
 
     def expand_parameter_cases(self, endpoints: dict[str, dict], *,
                                driveable: set[str] | None = None,
@@ -625,7 +629,8 @@ class CoverageTracker:
         that returns None records INCONCLUSIVE (dispatched, no usable send). An
         unknown status fails conservatively to INCONCLUSIVE, not an optimistic
         NOT_DETECTED (R06). `deadline`, a `time.monotonic()` value, stops new
-        dispatches once passed. Returns the number of dispatch attempts made."""
+        dispatches once passed. Returns the number of budgeted dispatch attempts
+        made; passive judgements are counted in `passive_judged`."""
         # group pending cases by cell so each leg is driven once, at request level
         self.evaluate_readiness(readiness)
         cells: dict[tuple[str, str, str], list] = {}
@@ -666,7 +671,8 @@ class CoverageTracker:
                 attempts += 1
                 passive_attempts += passive
                 await self._drive_request_level(run_case, ident, ep_key, check, cks, rep)
-        return attempts
+        self.passive_judged += passive_attempts
+        return attempts - passive_attempts
 
     async def _drive_request_level(self, run_case, ident, ep_key, check, cks, rep) -> None:
         """Drive the leg once on the request-level representative; its verdict
@@ -1093,6 +1099,7 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["legs_driven"] = driven
+    report["passive_legs_judged"] = tracker.passive_judged
     report["drive_stopped_by"] = tracker.stopped_by
     report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
     return report
@@ -1130,6 +1137,7 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     report = tracker.report()
     report["cases_enumerated"] = enumerated
     report["cases_driven"] = driven
+    report["passive_legs_judged"] = tracker.passive_judged
     report["drive_stopped_by"] = tracker.stopped_by
     report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
     return report

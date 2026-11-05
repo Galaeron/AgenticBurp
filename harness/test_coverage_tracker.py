@@ -250,11 +250,13 @@ class DriveLegsTests(unittest.TestCase):
             calls["order"].append(passive)
             return _Res()
 
-        asyncio.run(t.drive_coverage_legs(run_leg, budget=2))
+        driven = asyncio.run(t.drive_coverage_legs(run_leg, budget=2))
         # The budget caps the legs that send; a passive leg (judges the captured
         # response) runs first and spends none.
         self.assertEqual(calls["n"], 2)
+        self.assertEqual(driven, 2)                           # legs_driven counts budgeted legs only
         self.assertGreater(calls["passive"], 0)
+        self.assertEqual(t.passive_judged, calls["passive"])
         self.assertEqual(calls["order"], sorted(calls["order"], reverse=True))
 
     def test_build_coverage_driven_reports_legs_driven(self):
@@ -480,7 +482,8 @@ class CasesDrivenTests(unittest.TestCase):
 
         attempts = asyncio.run(t.drive_coverage_cases(failing, budget=1))
         self.assertEqual(calls["n"], 1)                       # budget bounded the calls that send
-        self.assertEqual(attempts, 1 + calls["passive"])      # a passive leg spends none
+        self.assertEqual(attempts, 1)                         # a passive leg spends none
+        self.assertEqual(t.passive_judged, calls["passive"])
         self.assertEqual(t.matrix.case_summary()["error"], 1 + calls["passive"])  # every failure is visible
 
     def test_none_result_is_inconclusive_not_silent(self):

@@ -496,6 +496,10 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             # guard; its live sends go through the gate-routed RunContext transport
             # (transport.send) with the form's own/ hardcoded method, never exchange.method.
             "nosql_validator.py",
+            # Passive coverage legs: the method appears only in a HEAD skip guard and in
+            # summary text. Neither validator holds a client or sends anything.
+            "security_headers_validator.py",
+            "error_handling_validator.py",
         }
 
         violations = []

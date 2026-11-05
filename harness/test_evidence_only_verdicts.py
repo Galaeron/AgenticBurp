@@ -290,7 +290,9 @@ class ObservedPersistenceTests(_Caller):
         registry = orch.validator_registry
         covered = {}
         for key, validator in list(registry.validators.items()):
-            finding = Finding(vulnerability_class=sorted(validator.finding_classes)[0],
+            # A coverage-only validator routes no agent finding (empty finding_classes);
+            # it is still asked to plan, under a generic class.
+            finding = Finding(vulnerability_class=min(validator.finding_classes, default="misconfig"),
                               confidence=0.5, summary="candidate", evidence="fixture",
                               suggested_test="verify", basis="derived")
             exchange = _page(f"/items?id=1&via={key}")

@@ -159,11 +159,14 @@ class AssessmentEvidence(unittest.TestCase):
         self.assertTrue(tracker.matrix.get("user", "POST /api/search", "WSTG-INPV-05").executed)
 
     def test_failed_coverage_dispatch_is_visible_and_spends_attempt_budget(self):
-        from harness.coverage_tracker import CoverageTracker
+        from harness.coverage_tracker import (CoverageTracker, _LEG_CONFIRMATIONS,
+                                              _PASSIVE_LEG_CONFIRMATIONS)
         tracker = CoverageTracker()
         tracker.build({"POST /api/search": {"path": "/api/search", "methods": ("POST",)}}, ["user"])
         run = AsyncMock(side_effect=RuntimeError("fixture failure"))
-        self.assertEqual(asyncio.run(tracker.drive_coverage_legs(run, budget=1)), 1)
+        # Sending legs only: a passive leg spends no attempt budget.
+        sending = set(_LEG_CONFIRMATIONS) - _PASSIVE_LEG_CONFIRMATIONS
+        self.assertEqual(asyncio.run(tracker.drive_coverage_legs(run, driveable=sending, budget=1)), 1)
         self.assertEqual(run.await_count, 1)
         self.assertEqual(tracker.report()['audited']['not_a_clean_negative']['error'], 1)
         self.assertEqual(tracker.report()['audited']['executed']['numerator'], 0)
