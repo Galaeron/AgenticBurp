@@ -35,10 +35,12 @@ def model_stage(label: str):
         _MODEL_STAGE.reset(token)
 
 
-# Per-stage counters; the ms fields are floats, the rest ints.
+# Per-stage counters; the ms fields are floats, the rest ints. The max field is a
+# high-water mark (the largest prompt the stage sent), not a counter.
 _STAGE_COUNT_FIELDS = ("calls", "completed", "failed", "cancelled", "retried",
-                       "prompt_tokens", "completion_tokens")
+                       "prompt_tokens", "completion_tokens", "context_truncated")
 _STAGE_MS_FIELDS = ("prompt_eval_ms", "eval_ms", "load_ms", "wall_ms")
+_STAGE_MAX_FIELDS = ("max_prompt_tokens",)
 
 
 class OllamaError(RuntimeError):
@@ -84,6 +86,165 @@ class OllamaTransientError(OllamaError):
         self.timeout = timeout
 
 
+class OllamaRateLimitedError(OllamaTransientError):
+    """HTTP 429: the service is up and asked us to slow down (Ollama cloud's free
+    tier does). Retried like any transient fault, after the server's Retry-After
+    when it sends one; a Retry-After over _MAX_RETRY_AFTER_SECONDS is a quota, not
+    a burst, so it is not waited out. Excluded from the circuit breaker: a rate
+    limit is not an outage, and opening the breaker would fast-fail every model's
+    calls, local ones included."""
+
+    def __init__(self, message: str = "", *, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class OllamaEmptyResponseError(OllamaError):
+    """HTTP 200 with an empty message body: a model-output fault, not an outage,
+    so excluded from the circuit breaker. On job 0574e29a0799, 151 of these (after
+    7-15k-character prompts, so most likely replies that ran out of window) were
+    counted as outages: the shared breaker re-opened 61 times and 2,130 of 3,097
+    prompts were fast-failed unsent. When the context guard can tell the window
+    filled, the call raises OllamaContextTruncatedError instead."""
+
+
+class OllamaContextTruncatedError(OllamaError):
+    """The call did not fit the model's context window, so its reply is not an
+    answer to the prompt that was sent. `kind` is "prompt" (Ollama cut the prompt
+    before evaluating it) or "reply" (prompt plus reply filled the window, so the
+    reply was stopped or generated after Ollama shifted the prompt out).
+
+    Measured on job 0574e29a0799 (Ollama 0.40.13, 4096-token window): Ollama cut
+    88 prompts of 4,098-8,118 tokens down to 2,051 and answered them; 86 of those
+    answers were used as if the whole prompt had been read. Deterministic for a
+    given prompt and window, so it is never retried, and excluded from the
+    circuit breaker: one oversized prompt must not fast-fail every other call."""
+
+    def __init__(self, message: str = "", *, kind: str, window: int | None,
+                 window_source: str | None):
+        super().__init__(message)
+        self.kind = kind
+        self.window = window
+        self.window_source = window_source
+
+
+# Exceptions that do not count as circuit-breaker failures: a config-level,
+# per-prompt or rate-limit fault, not a service outage. What still counts: a
+# transport failure, a timeout, a 5xx. Shared with RunContext's per-run breaker.
+BREAKER_EXCLUDED_ERRORS = (OllamaModelNotFoundError, OllamaInvalidJSONError,
+                           OllamaContextTruncatedError, OllamaEmptyResponseError,
+                           OllamaRateLimitedError)
+
+
+# Context-window guard. Ollama does not say when it cuts a prompt: the reply
+# carries prompt_eval_count, the tokens it actually evaluated (cached ones
+# included, verified on 0.40.13). Measured on job 0574e29a0799 and live on
+# 0.40.13: a prompt longer than the window is cut to about HALF the window
+# (4096 -> 2051, 512 -> 258), so the count alone never reaches the window. What
+# gives it away is the prompt's length: harness prompts run 2.46-4.11 characters
+# per evaluated token on gemma4 (713 calls), cut ones 6.51-9.80 (86 calls).
+_WINDOW_SLACK_TOKENS = 16
+_MAX_CHARS_PER_TOKEN = 5.0
+# No window is probed for a call too small to fill one this size (Ollama's
+# smallest default context), so small calls never cost a lookup.
+_MIN_PLAUSIBLE_WINDOW = 2048
+# A failed or inconclusive /api/ps lookup is not repeated for this model sooner.
+_CONTEXT_PROBE_RETRY_SECONDS = 10.0
+_CONTEXT_PROBE_TIMEOUT = httpx.Timeout(2.0, connect=1.0)
+# The engagement preflight's prompt size when this client has measured none
+# larger: the largest prompt of job 0574e29a0799 (Ollama's own log, gemma4).
+ESTIMATED_LARGEST_PROMPT_TOKENS = 8118
+
+
+def is_cloud_model(model: str) -> bool:
+    """True for an Ollama cloud model (`gemma4:31b-cloud`, `glm-4.6:cloud`). Those
+    run off-host, ignore options.num_ctx and are not in /api/ps, so the context
+    guard and the preflight leave them alone."""
+    name = str(model or "").strip().lower()
+    return name.endswith("-cloud") or name.endswith(":cloud")
+
+
+def _model_key(model: str) -> str:
+    """The name /api/ps lists a model under: an untagged name means `:latest`."""
+    name = str(model or "").strip().lower()
+    return name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
+
+
+def context_overflow(prompt_tokens, completion_tokens, prompt_chars, window) -> str | None:
+    """"prompt" when Ollama cut the prompt to fit `window`, "reply" when prompt plus
+    reply filled it, else None. None too when the window or the prompt count is
+    unknown: no verdict without both.
+
+    A prompt is cut when its evaluated count reaches the window (runners that cut
+    to the full window), or when the count sits at half the window or more while
+    the prompt we sent has far more characters than that many tokens can hold
+    (Ollama 0.40, which cuts to about half; see the constants above)."""
+    if not window or not isinstance(prompt_tokens, int):
+        return None
+    full = window - _WINDOW_SLACK_TOKENS
+    if prompt_tokens >= full:
+        return "prompt"
+    if (prompt_tokens >= window // 2 - _WINDOW_SLACK_TOKENS
+            and prompt_chars > _MAX_CHARS_PER_TOKEN * prompt_tokens):
+        return "prompt"
+    if isinstance(completion_tokens, int) and prompt_tokens + completion_tokens >= full:
+        return "reply"
+    return None
+
+
+def recommended_num_ctx(prompt_tokens: int) -> int:
+    """A window that holds `prompt_tokens` and as much again for the reply (and a
+    reasoning trace), rounded up to a power of two: 8118 -> 16384."""
+    return 1 << max(2 * int(prompt_tokens) - 1, 1).bit_length()
+
+
+def _announce_warning(message: str, **detail) -> None:
+    """Show a context-window warning on the activity feed, where the operator
+    watches the run. Observability only: a feed failure never fails the call."""
+    try:
+        from harness import activity_feed
+        activity_feed.publish("note", message, level="warn", **detail)
+    except Exception:
+        log.debug("context window announcement failed", exc_info=True)
+
+
+async def run_context_preflight(client, models, *, timeout: float = 5.0) -> dict | None:
+    """`client.context_preflight(models)`, best-effort: a client without one, a slow
+    Ollama or any failure returns None and the run goes on. investigate_engagement
+    calls this whether or not run instrumentation is on, so both runs send the
+    same requests (it asks Ollama's /api/ps, never the target)."""
+    preflight = getattr(client, "context_preflight", None)
+    if not callable(preflight):
+        return None
+    try:
+        report = await asyncio.wait_for(preflight(models), timeout)
+    except Exception as e:
+        log.debug("context preflight failed: %s", e)
+        return None
+    return report if isinstance(report, dict) else None
+
+
+def context_truncated_count(client) -> int:
+    """The client's running count of calls that did not fit the context window
+    (0 for a client that does not keep one)."""
+    count = getattr(client, "model_context_truncated_count", 0)
+    return count if type(count) is int else 0
+
+
+def context_window_error(client, truncated_before: int) -> dict | None:
+    """The run's `errors` entry when calls made since `truncated_before` (an earlier
+    context_truncated_count) did not fit the context window: their replies were
+    discarded, so the run is degraded."""
+    count = context_truncated_count(client) - truncated_before
+    if count <= 0:
+        return None
+    return {"phase": "model_context",
+            "error": (f"{count} model call(s) did not fit the model's context window; their "
+                      f"replies were discarded. Set ollama.num_ctx ("
+                      f"{recommended_num_ctx(ESTIMATED_LARGEST_PROMPT_TOKENS)} holds the largest "
+                      "prompt measured) in harness/config.local.yaml, or use a cloud model")}
+
+
 # Bounded transient retry (E6). Measured on job 383f0ebff8e8: 24 of 126
 # critique calls got an Ollama HTTP 500 (3.2 s median time-to-fail) and none was
 # ever retried, so each shipped its findings unreviewed.
@@ -98,6 +259,25 @@ MAX_TIMEOUT_RETRIES = 1
 _MAX_TRANSIENT_RETRIES = 5
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_CAP_SECONDS = 8.0
+# Longest 429 Retry-After that is waited out before a retry; a longer one fails
+# the call now rather than stalling it.
+_MAX_RETRY_AFTER_SECONDS = 30.0
+
+
+def _retry_after_seconds(value) -> float | None:
+    """A Retry-After header (delta-seconds or an HTTP-date) as seconds from now,
+    or None when absent or unreadable."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
 
 
 def _is_transient_status(status_code: int) -> bool:
@@ -289,16 +469,16 @@ class OllamaClient:
         self.seed = int(seed) if seed is not None else None
         # Optional per-request Ollama context window (options.num_ctx). Default
         # None => the key is NOT sent, so Ollama keeps its own server/model
-        # default and every existing call site is byte-for-byte unchanged. A
-        # caller (e.g. a local/eval overlay via config.local.yaml's
-        # `ollama.num_ctx`) can pin a smaller window when the harness's prompts
-        # are far below the model's default context: on a VRAM-limited box, a
-        # model loaded at a huge default context (e.g. qwen3:8b at 32768 = 10GB)
-        # spills onto CPU and each call runs several times slower, whereas the
-        # same model pinned to a context that actually covers the prompt
-        # (measured p99 < 4k tokens here) stays fully GPU-resident. Never sent
-        # unless set, so this cannot change behavior for a caller that leaves it
-        # unset.
+        # default and every existing call site is byte-for-byte unchanged. Set
+        # it (config.local.yaml's `ollama.num_ctx`) when that default is too
+        # small for the harness's prompts: on job 0574e29a0799 Ollama's 4096
+        # default cut every prompt over 4,096 tokens (the largest was 8,118),
+        # so 16384 is the value to pin for a local model. Too large has a cost
+        # too: on a VRAM-limited box a model loaded at 32768 (qwen3:8b, ~10 GB)
+        # spills onto CPU and each call runs several times slower. Cloud models
+        # ignore it. Never sent unless set, so this cannot change behavior for a
+        # caller that leaves it unset; the context guard (context_overflow)
+        # reports a call that did not fit either way.
         self.num_ctx = int(num_ctx) if num_ctx else None
 
         # Pure instrumentation (added for the P2-2 ablation cost axis): count
@@ -335,6 +515,17 @@ class OllamaClient:
         # bookkeeping read off values this client already has -- it adds no
         # request and changes no result.
         self.stage_metrics: dict[str, dict] = {}
+        # Context-window guard (see context_overflow). Calls whose reply was
+        # discarded because the call did not fit the window, by kind; the window
+        # each local model is loaded with, from GET /api/ps (0 = Ollama does not
+        # report one, so it is never asked again); when each model's window was
+        # last looked up; the largest prompt each model was sent.
+        self.model_context_truncated_count = 0
+        self.model_context_truncated_by_kind = {"prompt": 0, "reply": 0}
+        self._context_windows: dict[str, int] = {}
+        self._context_probed_at: dict[str, float] = {}
+        self._max_prompt_tokens: dict[str, int] = {}
+        self._context_warned: set[tuple[str, str]] = set()
 
         # Initialize circuit breaker. Uses the shared-registry accessor
         # (not `OllamaCircuitBreaker(...)` directly) so that every
@@ -352,13 +543,13 @@ class OllamaClient:
             # own generic defaults (5/3/30.0/1) would silently override the
             # Ollama-specific ones (3/2/60.0/1) for THOSE fields too, not just
             # excluded_exceptions. Only real change here: exclude
-            # OllamaModelNotFoundError, see its own docstring for why.
+            # BREAKER_EXCLUDED_ERRORS, see each class's docstring for why.
             circuit_breaker.CircuitBreakerConfig(
                 failure_threshold=3,
                 success_threshold=2,
                 timeout_seconds=60.0,
                 half_open_max_requests=1,
-                excluded_exceptions=(OllamaModelNotFoundError, OllamaInvalidJSONError),
+                excluded_exceptions=BREAKER_EXCLUDED_ERRORS,
                 enabled=True,
                 # E6 failure-rate rule: also open when >= half of the last 20
                 # calls failed, even if never 3 in a row.
@@ -382,7 +573,8 @@ class OllamaClient:
         row = self.stage_metrics.get(label)
         if row is None:
             row = self.stage_metrics[label] = {
-                **dict.fromkeys(_STAGE_COUNT_FIELDS, 0), **dict.fromkeys(_STAGE_MS_FIELDS, 0.0)}
+                **dict.fromkeys(_STAGE_COUNT_FIELDS, 0), **dict.fromkeys(_STAGE_MS_FIELDS, 0.0),
+                **dict.fromkeys(_STAGE_MAX_FIELDS, 0)}
         return row
 
     def metrics_snapshot(self) -> dict:
@@ -393,6 +585,8 @@ class OllamaClient:
         totals = {k: sum(row[k] for row in stages.values())
                   for k in (*_STAGE_COUNT_FIELDS, *_STAGE_MS_FIELDS)}
         totals.update({k: round(totals[k], 1) for k in _STAGE_MS_FIELDS})
+        totals.update({k: max((row[k] for row in stages.values()), default=0)
+                       for k in _STAGE_MAX_FIELDS})
         return {"stages": stages, "totals": totals,
                 "client": {"attempted": self.model_attempted_count,
                            "completed": self.model_completed_count,
@@ -401,13 +595,178 @@ class OllamaClient:
                            "cancelled": self.model_cancelled_count,
                            "retries": self.model_retry_count,
                            "retry_recovered": self.model_retry_recovered_count,
-                           "unknown_usage": self.model_unknown_usage_count},
+                           "unknown_usage": self.model_unknown_usage_count,
+                           "context_truncated": self.model_context_truncated_count},
                 # Whether this run measured reasoning mode: the configured
                 # setting plus the calls that actually sent think on.
                 "think": {**think_setting(self.think),
                           "think_calls": self.model_think_call_count,
                           "traces": self.model_thinking_trace_count,
-                          "trace_chars": self.model_thinking_trace_chars}}
+                          "trace_chars": self.model_thinking_trace_chars},
+                # Calls that did not fit the context window, and the windows the
+                # guard checked them against (a list, so it is not delta'd).
+                "context": {"truncated": dict(self.model_context_truncated_by_kind),
+                            "windows": self._context_window_rows()}}
+
+    def _context_window_rows(self) -> list[dict]:
+        if self.num_ctx:
+            return [{"model": "*", "context_length": self.num_ctx, "source": "num_ctx"}]
+        return [{"model": key, "context_length": length, "source": "api_ps"}
+                for key, length in sorted(self._context_windows.items()) if length]
+
+    async def _probe_context_windows(self) -> None:
+        """One GET /api/ps: cache the context window of every model it lists.
+        Best-effort and short-timeout; a failed lookup leaves the cache as it was
+        and never fails the model call that asked for it."""
+        try:
+            async with httpx.AsyncClient(timeout=_CONTEXT_PROBE_TIMEOUT) as client:
+                resp = await client.get(f"{self.base_url}/api/ps")
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            log.debug("context window lookup (GET /api/ps) failed: %s", e)
+            return
+        rows = data.get("models") if isinstance(data, dict) else None
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            length = row.get("context_length")
+            length = length if type(length) is int and length > 0 else 0
+            for name in {row.get("name"), row.get("model")}:
+                if isinstance(name, str) and name:
+                    self._context_windows[_model_key(name)] = length
+
+    async def _context_window(self, model: str, prompt_tokens=None) -> tuple[int | None, str | None]:
+        """(window, source) a call to `model` runs in: the configured num_ctx, else
+        the window /api/ps reports the model loaded with ("api_ps"). (None, None)
+        for a cloud model and when the window is not known. A cached window is
+        looked up again when a prompt larger than it came back (the model was
+        reloaded), at most once per _CONTEXT_PROBE_RETRY_SECONDS."""
+        if is_cloud_model(model):
+            return None, None
+        if self.num_ctx:
+            return self.num_ctx, "num_ctx"
+        key = _model_key(model)
+        cached = self._context_windows.get(key)
+        if cached == 0:
+            return None, None
+        if cached and not (isinstance(prompt_tokens, int) and prompt_tokens > cached):
+            return cached, "api_ps"
+        probed_at = self._context_probed_at.get(key)
+        if probed_at is None or time.monotonic() - probed_at >= _CONTEXT_PROBE_RETRY_SECONDS:
+            self._context_probed_at[key] = time.monotonic()
+            await self._probe_context_windows()
+            cached = self._context_windows.get(key)
+        return (cached, "api_ps") if cached else (None, None)
+
+    async def _check_context(self, model, payload, prompt_tokens, completion_tokens,
+                             done_reason, measurement) -> None:
+        """Raise OllamaContextTruncatedError when this call did not fit the model's
+        context window (see context_overflow), or a local model's reply stopped
+        for length (the harness never sets num_predict, so only the window can
+        stop it); count and report it first. A call too small to fill any
+        plausible window, and any cloud-model call, costs no lookup."""
+        if is_cloud_model(model):
+            return
+        window = source = kind = None
+        prompt_chars = sum(len(m.get("content") or "") for m in payload.get("messages") or []
+                           if isinstance(m, dict))
+        if isinstance(prompt_tokens, int) and (
+                self.num_ctx or prompt_tokens + (completion_tokens or 0)
+                >= _MIN_PLAUSIBLE_WINDOW // 2 - _WINDOW_SLACK_TOKENS):
+            window, source = await self._context_window(model, prompt_tokens)
+            kind = context_overflow(prompt_tokens, completion_tokens, prompt_chars, window)
+        stopped_for_length = kind is None and done_reason == "length"
+        if stopped_for_length:
+            kind = "reply"
+        if kind is None:
+            return
+        self.model_context_truncated_count += 1
+        self.model_context_truncated_by_kind[kind] += 1
+        self._stage_row()["context_truncated"] += 1
+        measurement["outcome"] = "context_truncated"
+        measurement["context_truncated"] = kind
+        advice = (f"set ollama.num_ctx: {recommended_num_ctx(max(window or 0, ESTIMATED_LARGEST_PROMPT_TOKENS))} "
+                  "in harness/config.local.yaml or use a cloud model")
+        if kind == "prompt":
+            what = (f"Ollama cut the {prompt_chars}-character prompt to {prompt_tokens} tokens "
+                    f"to fit the {window}-token context window ({source})")
+        elif not stopped_for_length:
+            what = (f"prompt and reply filled the {window}-token context window ({source}): "
+                    f"{prompt_tokens}+{completion_tokens} tokens")
+        else:
+            # Ollama reported the stop, but the counts do not show a full window
+            # (unknown window, or one reported larger than the server used).
+            what = (f"the reply stopped at the context limit (done_reason length, "
+                    f"{prompt_tokens}+{completion_tokens} tokens"
+                    + (f", {window}-token window per {source})" if window else ")"))
+        err = OllamaContextTruncatedError(
+            f"Model '{model}': {what}; reply discarded. {advice}",
+            kind=kind, window=window, window_source=source)
+        self.audit_logger.log_llm_error(model=model, error=err)
+        first = (model, kind) not in self._context_warned
+        self._context_warned.add((model, kind))
+        log.log(logging.WARNING if first else logging.INFO, "%s", err)
+        if first:
+            _announce_warning(str(err), model=model, context_truncated=kind, window=window)
+        raise err
+
+    async def context_preflight(self, models) -> dict:
+        """Engagement-start check that each local model's context window holds the
+        harness's largest prompt: the largest this client has measured, or the
+        r3 estimate when it has measured none larger. Logs a WARNING per model
+        whose window is smaller. Reads only GET /api/ps; never loads a model or
+        changes num_ctx. A model that is not loaded yet is "unknown": the
+        per-call guard still checks every call it makes.
+
+        Returns {num_ctx, largest_prompt: {tokens, source}, models: [{model,
+        status (ok | too_small | unknown | cloud), context_length, source}],
+        warnings: [str]}."""
+        measured = max(self._max_prompt_tokens.values(), default=0)
+        largest = max(measured, ESTIMATED_LARGEST_PROMPT_TOKENS)
+        largest_source = "measured" if measured >= ESTIMATED_LARGEST_PROMPT_TOKENS else "estimated"
+        names = sorted({str(m).strip() for m in models or () if m and str(m).strip()})
+        if not self.num_ctx and any(not is_cloud_model(m) for m in names):
+            await self._probe_context_windows()
+        rows, warnings = [], []
+        for name in names:
+            if is_cloud_model(name):
+                rows.append({"model": name, "status": "cloud", "context_length": None, "source": None})
+                continue
+            if self.num_ctx:
+                window, source = self.num_ctx, "num_ctx"
+            else:
+                window = self._context_windows.get(_model_key(name)) or None
+                source = "api_ps" if window else None
+            status = "unknown" if window is None else ("too_small" if window < largest else "ok")
+            rows.append({"model": name, "status": status, "context_length": window, "source": source})
+            if status == "unknown":
+                rows[-1]["note"] = ("not loaded at run start and ollama.num_ctx is unset: it loads "
+                                    "at the Ollama server's default context (4096 on 0.40.13 unless "
+                                    f"OLLAMA_CONTEXT_LENGTH is set), smaller than the {largest}-token "
+                                    "prompts this harness sends")
+            if status != "too_small":
+                continue
+            basis = ("measured on this server" if largest_source == "measured"
+                     else "estimated: the largest prompt of job 0574e29a0799")
+            where = (f"ollama.num_ctx is {window}" if source == "num_ctx" else
+                     f"model {name} is loaded with a {window}-token context window and "
+                     "ollama.num_ctx is unset")
+            warnings.append(
+                f"Context window too small: {where}, but harness prompts reach {largest} tokens "
+                f"({basis}). Ollama cuts a longer prompt to about half the window and still "
+                "answers it; on job 0574e29a0799 that cut 88 prompts. The guard now discards "
+                "those replies, so the calls fail instead. Set ollama.num_ctx: "
+                f"{recommended_num_ctx(largest)} in harness/config.local.yaml, or use a cloud model.")
+        for warning in warnings:
+            log.warning("%s", warning)
+            _announce_warning(warning)
+        if not warnings and any(r["status"] == "unknown" for r in rows):
+            log.info("context preflight: %s not loaded yet; each call is checked as it returns",
+                     ", ".join(r["model"] for r in rows if r["status"] == "unknown"))
+        return {"num_ctx": self.num_ctx,
+                "largest_prompt": {"tokens": largest, "source": largest_source},
+                "models": rows, "warnings": warnings}
 
     def _think_for_call(self) -> bool:
         """The `think` value for a call made now: on for every call, or only
@@ -558,9 +917,11 @@ class OllamaClient:
                             else measurement["queue_ms"] + waited_ms)
                         parsed, data = await self._send_once(url, payload, model, measurement)
                 except OllamaTransientError as exc:
+                    retry_after = getattr(exc, "retry_after", None)
                     if not self._may_retry(retries_done) or (
                             getattr(exc, "timeout", False)
-                            and timeout_retries_done >= MAX_TIMEOUT_RETRIES):
+                            and timeout_retries_done >= MAX_TIMEOUT_RETRIES) or (
+                            retry_after is not None and retry_after > _MAX_RETRY_AFTER_SECONDS):
                         if retries_done:
                             log.warning(
                                 "Ollama call for model %s failed after %d transient retr%s (%s); giving up",
@@ -568,7 +929,8 @@ class OllamaClient:
                         raise
                     retries_done += 1
                     timeout_retries_done += bool(getattr(exc, "timeout", False))
-                    delay = _backoff_delay(retries_done)
+                    # A 429's Retry-After is the server's own floor on the wait.
+                    delay = max(_backoff_delay(retries_done), retry_after or 0.0)
                     log.warning(
                         "Ollama transient failure for model %s (%s); retry %d/%d in %.1fs",
                         model, exc, retries_done, self.transient_retries, delay)
@@ -628,6 +990,14 @@ class OllamaClient:
             raise OllamaTransientError("Ollama closed the connection unexpectedly") from e
 
         if resp.status_code != 200:
+            if resp.status_code == 429:
+                retry_after = _retry_after_seconds(resp.headers.get("retry-after"))
+                err = OllamaRateLimitedError(
+                    "Ollama returned HTTP 429 (rate limited"
+                    + (f", Retry-After {retry_after:.0f}s)" if retry_after is not None else ")"),
+                    retry_after=retry_after)
+                self.audit_logger.log_llm_error(model=model, error=err)
+                raise err
             if _is_transient_status(resp.status_code):
                 self.audit_logger.log_llm_error(
                     model=model,
@@ -672,6 +1042,11 @@ class OllamaClient:
         stage["completed"] += 1
         stage["prompt_tokens"] += prompt_tokens or 0
         stage["completion_tokens"] += completion_tokens or 0
+        if prompt_tokens is not None:
+            stage["max_prompt_tokens"] = max(stage["max_prompt_tokens"], prompt_tokens)
+            model_key = _model_key(model)
+            self._max_prompt_tokens[model_key] = max(self._max_prompt_tokens.get(model_key, 0),
+                                                     prompt_tokens)
         for field, key in (("prompt_eval_ms", "prompt_eval_duration"), ("eval_ms", "eval_duration"),
                            ("load_ms", "load_duration")):
             nanos = data.get(key)
@@ -697,13 +1072,15 @@ class OllamaClient:
             measurement["thinking_chars"] = trace_chars
             self.model_thinking_trace_count += 1
             self.model_thinking_trace_chars += trace_chars
+        # Before the empty-body check: a reply that ran out of window often comes
+        # back empty, and that is a context fault, not an Ollama one.
+        await self._check_context(model, payload, prompt_tokens, completion_tokens,
+                                  data.get("done_reason"), measurement)
         content = data.get("message", {}).get("content", "")
         if not content:
-            self.audit_logger.log_llm_error(
-                model=model,
-                error=OllamaError("Ollama returned an empty message body"),
-            )
-            raise OllamaError("Ollama returned an empty message body")
+            err = OllamaEmptyResponseError("Ollama returned an empty message body")
+            self.audit_logger.log_llm_error(model=model, error=err)
+            raise err
 
         try:
             parsed = _loads_lenient(_strip_json_fence(content))

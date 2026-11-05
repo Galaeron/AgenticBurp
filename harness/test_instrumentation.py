@@ -137,7 +137,8 @@ class ModelStageTests(_ModelBase):
     async def test_control_without_stage_bookkeeping_the_sums_fail(self):
         # Patch the new accounting out: every call lands in a throwaway row.
         with patch.object(OllamaClient, "_stage_row", lambda self: {
-                **dict.fromkeys(oc._STAGE_COUNT_FIELDS, 0), **dict.fromkeys(oc._STAGE_MS_FIELDS, 0.0)}):
+                **dict.fromkeys(oc._STAGE_COUNT_FIELDS, 0), **dict.fromkeys(oc._STAGE_MS_FIELDS, 0.0),
+                **dict.fromkeys(oc._STAGE_MAX_FIELDS, 0)}):
             with self.assertRaises(AssertionError):
                 await self._check_stage_sums()
 

@@ -205,9 +205,10 @@ class NumCtxOptInTests(unittest.IsolatedAsyncioTestCase):
     num_ctx, omitted (byte-for-byte the prior payload) otherwise. Motivated by
     a VRAM finding on this hardware -- qwen3:8b at its 32768 default context
     loads at 10GB and spills 41% onto CPU (~19s/call), while the same model
-    pinned to a context that still covers the harness's <4k-token prompts stays
-    fully GPU-resident (6.2GB, 100% GPU, ~3s/call). The pin must never change
-    behavior for a caller that leaves it unset."""
+    pinned to a smaller context stays fully GPU-resident (6.2GB, 100% GPU,
+    ~3s/call). The pin must still hold the harness's prompts: they reached 8,118
+    tokens on job 0574e29a0799 (see test_ollama_context_window). The pin must
+    never change behavior for a caller that leaves it unset."""
 
     def _capture_client(self, num_ctx):
         captured = {}

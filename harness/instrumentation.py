@@ -130,6 +130,24 @@ def run_costs(instrumentation: dict | None, wall_seconds) -> dict:
             "retries": counter("retries"), "wall_seconds": wall_seconds}
 
 
+def ollama_models(orchestrator) -> list[str]:
+    """The models an engagement sends to Ollama: the coordinator, reasoning and
+    critique models (a role a config moves to another provider is left out) and
+    every agent's model."""
+    config = getattr(orchestrator, "config", None) or {}
+    coord = config.get("coordinator") or {}
+    critique = config.get("critique") or {}
+    models = set()
+    if coord.get("provider", "ollama") == "ollama":
+        models.add(getattr(orchestrator, "coordinator_model", None) or coord.get("model"))
+    if critique.get("provider", "ollama") == "ollama":
+        from harness.coordinator import reasoning_model
+        models.update((reasoning_model(config), critique.get("model")))
+    agents = getattr(getattr(orchestrator, "agent_manager", None), "agents", None) or {}
+    models.update(getattr(agent, "model", None) for agent in agents.values())
+    return sorted(m for m in models if isinstance(m, str) and m.strip())
+
+
 class RunInstrumentation:
     """The instrumentation of ONE `investigate_engagement` call.
 
@@ -148,6 +166,9 @@ class RunInstrumentation:
         self._started_monotonic = time.monotonic()
         self._model_baseline = self._model_snapshot()
         self._store_baseline = self._store_snapshot()
+        # The context-window preflight report for this run, set by
+        # investigate_engagement (ollama_client.run_context_preflight); reported only.
+        self.context_preflight: dict | None = None
         self.phases = PhaseRecorder(
             requests=(lambda: budget.used) if budget is not None else None,
             model_calls=(lambda: self._client.model_completed_count) if self._client is not None else None)
@@ -189,6 +210,8 @@ class RunInstrumentation:
                 out["health"] = health()
             except Exception:
                 log.debug("health_report failed", exc_info=True)
+        if self.context_preflight is not None:
+            out["context_preflight"] = self.context_preflight
         return out
 
     def result_blocks(self) -> dict:
