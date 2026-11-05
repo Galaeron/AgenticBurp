@@ -131,12 +131,15 @@ class AgentManager:
     
     def _create_agent(self, agent_class, agent_config):
         """One configuration contract for initial, dynamic and recreated agents."""
+        from harness import prompt_budget
         defaults = self.config.get("agent_defaults", {})
-        return agent_class(
+        agent = agent_class(
             ollama=self.ollama,
             model=agent_config.get("model", defaults.get("model", "qwen3:8b")),
             temperature=agent_config.get("temperature", defaults.get("temperature", 0.1)),
         )
+        agent.prompt_budget = prompt_budget.from_config(self.config)
+        return agent
     
     def get_agent(self, name: str) -> BaseAgent | None:
         """

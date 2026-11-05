@@ -216,6 +216,12 @@ class AgentReport(BaseModel):
     # agent such as cors/csp). None means the agent saw the normal budget, so
     # a reviewer can tell a shortened body from a full one.
     input_body_chars: Optional[int] = None
+    # Context-window fit (harness/prompt_budget.py): None when the prompt was sent
+    # as built (no budget configured, or it fitted). Otherwise the budget, the
+    # estimated tokens before/after, `fits`, and `elided`: each part left out or
+    # shortened (methodology notes, shared rules, specialty sections or text,
+    # prior findings, request/response body with original and kept characters).
+    prompt_fit: Optional[dict] = None
 
 
 class ObservationAttribution(BaseModel):
@@ -378,6 +384,8 @@ class StageOutcome(BaseModel):
     failed: int = 0
     reason: Optional[str] = None
     affected_finding_ids: list[str] = Field(default_factory=list)
+    # Context-window fit of this stage's prompt, as AgentReport.prompt_fit.
+    prompt_fit: Optional[dict] = None
 
 
 class AnalysisResponse(BaseModel):

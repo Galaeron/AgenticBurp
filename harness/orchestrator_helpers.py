@@ -709,6 +709,24 @@ def reflected_parameter_findings(exchange: HttpExchange) -> list[Finding]:
     return out
 
 
+def _prompt_fits(resp) -> list[dict]:
+    """What was cut from the model prompts of one capture's analysis to fit the
+    context window (harness/prompt_budget.py): one {agent or stage, fits, elided}
+    per prompt that was fitted; [] when every prompt was sent whole."""
+    fitted = []
+    for report in getattr(resp, "agent_reports", None) or []:
+        fit = getattr(report, "prompt_fit", None)
+        if fit:
+            fitted.append({"agent": getattr(report, "agent", "?"), "fits": fit.get("fits"),
+                           "elided": list(fit.get("elided") or [])})
+    for outcome in getattr(resp, "stage_outcomes", None) or []:
+        fit = getattr(outcome, "prompt_fit", None)
+        if fit:
+            fitted.append({"stage": getattr(outcome, "name", "?"), "fits": fit.get("fits"),
+                           "elided": list(fit.get("elided") or [])})
+    return fitted
+
+
 async def review_captured_exchanges(orch, state, captured, *, max_reviews: int = 200,
                                     run_context=None, seen=None, errors=None,
                                     deadline: float | None = None, stats: dict | None = None,
@@ -746,8 +764,10 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     identity, covered_by, reason}; it is never reported as reviewed or as a finding.
 
     `stats`, when given, is added to (so one dict can span several calls):
-    reviewed, grouped (the entries above), unreviewed (left by a bound) and
-    by_tier (reviewed per tier name).
+    reviewed, grouped (the entries above), unreviewed (left by a bound),
+    by_tier (reviewed per tier name) and elided: one {capture, method, prompts}
+    per capture whose model prompts were cut to fit the context window
+    (`ollama.num_ctx`), each prompt as {agent or stage, fits, elided parts}.
 
     E7 resume: `resumed` maps a capture's observation key (review_frontier's) to the
     findings an earlier, interrupted run got from it; such a capture skips
@@ -765,6 +785,7 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     grouped: list[dict] = []
     grouped_keys: list[str] = []   # observation_key of each grouped entry, in order
     tier_counts = dict.fromkeys(assessment_health.TIER_NAMES, 0)
+    elided: list[dict] = []        # captures whose prompts were cut to fit the context
 
     def _grouped(member, representative):
         grouped_keys.append(assessment_health.observation_key(member))
@@ -820,6 +841,9 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
                           getattr(ex, "url", "?"), e)
                 continue
             findings = [f.model_dump() for r in resp.agent_reports for f in r.findings]
+            fitted = _prompt_fits(resp)
+            if fitted:
+                elided.append({"capture": ex.url, "method": ex.method, "prompts": fitted})
             if on_review is not None:
                 on_review(key, {"findings": findings})
         if findings:
@@ -828,6 +852,9 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     if reviewed:
         log.info("review_captured_exchanges: reviewed %d captured 2xx exchanges, "
                  "%d produced findings", reviewed, produced)
+    if elided:
+        log.info("review_captured_exchanges: %d capture(s) had model prompts cut to fit "
+                 "the context window (review_stats.elided)", len(elided))
     remaining = 0
     if stopped_by:
         remaining = sum(1 for _ in review_frontier(captured, seen=set(seen)))
@@ -844,6 +871,7 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             stats.setdefault(name, empty)
         stats["reviewed"] += reviewed
         stats["grouped"].extend(grouped)
+        stats["elided"].extend(elided)
         stats["unreviewed"] += remaining
         for name, count in tier_counts.items():
             stats["by_tier"][name] = stats["by_tier"].get(name, 0) + count

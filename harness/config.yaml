@@ -78,6 +78,19 @@ ollama:
   # manifest records the setting under model_versions.think; the reasoning
   # trace is never parsed or stored, only its length.
 
+# Context-window budget for agent and critique prompts (harness/prompt_budget.py).
+# The context is `ollama.num_ctx` when set, else `model_context_tokens` below;
+# with neither (the default, and right for cloud models) prompts go out
+# unchanged. With a context, an oversized prompt is fitted to it minus
+# `answer_tokens`: methodology notes, inapplicable shared rules, specialty
+# sections the exchange does not match, prior findings, then body text and
+# specialty text are cut in that order, each cut marked in the prompt and listed
+# per capture in the job result's review_stats.elided. Raise `answer_tokens`
+# when thinking mode is on, as the trace shares the window.
+prompt_budget:
+  model_context_tokens: null
+  answer_tokens: 1024
+
 # How many specialist agents are allowed to run concurrently against
 # Ollama through one AgentManager. The application orchestrator shares that
 # manager across overlapping exchanges/jobs, so the limit applies across those
