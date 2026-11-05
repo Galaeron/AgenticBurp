@@ -25,6 +25,8 @@ from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import SentAnswer, Validator, ValidationResult, artifact_id_of
+from .injection_targets import (param_targets, select_targets, coverage_note, tested_inputs,
+                                NAMED_PARAMETER_UNTESTED)
 from harness.validators.sqlmap import (_mutate_query_param, _mutate_json_param, _mutate_form_param,
                                _looks_like_json, _content_type_of)
 
@@ -209,9 +211,21 @@ class SsrfValidator(Validator):
         from harness.scope_lock import host_in_scope
         if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
             return self._skip("target origin is out of scope")
-        cands = _candidate_params(exchange)
+        shaped = _candidate_params(exchange)
+        # Every URL-shaped parameter is tried (no cap), plus the one the finding
+        # names when it is not URL-shaped; a per-parameter dispatch tries only it.
+        cands, coverage = select_targets(finding, shaped, len(shaped) + 1,
+                                         available=param_targets(exchange))
         if not cands:
+            if getattr(finding, "parameter_only", False):
+                return ValidationResult(
+                    self.name, "skipped", "ssrf",
+                    summary=f"the {finding.parameter_location or 'unnamed'} parameter "
+                            f"{finding.parameter_name!r} is not a parameter of the replayed "
+                            "request, so it was not tested",
+                    control_outcome=NAMED_PARAMETER_UNTESTED)
             return self._skip("no URL-shaped parameter to redirect to a collaborator")
+        tested = tested_inputs(finding, cands)
         if not self.oob_callbacks_enabled:
             # The in-band differential uses alternate loopback ports as fetch
             # controls. Those are separate services outside an exact target
@@ -268,7 +282,7 @@ class SsrfValidator(Validator):
                             f"the {loc} parameter {param!r}.",
                     evidence=f"Set {loc} param {param!r} to a unique collaborator URL; the target called "
                              f"back to it out-of-band, proving server-side request forgery (blind-safe)."
-                             + lost).with_artifacts(baseline=baseline, attack=reply, controls=[control])
+                             + lost, tested_parameters=tested).with_artifacts(baseline=baseline, attack=reply, controls=[control])
             if reply is None:
                 kind, why = unsent[-1]
                 unsent[-1] = (kind, f"{why} after the request was sent; no callback within "
@@ -300,8 +314,11 @@ class SsrfValidator(Validator):
         return ValidationResult(
             self.name, "not_confirmed", "ssrf", confidence=0.0, confirmed=False,
             summary="No out-of-band callback and no in-band fetch differential observed",
-            evidence=f"Tried {len(cands)} URL-shaped parameter(s); no collaborator hit and the "
-                     f"response did not depend on internal-target reachability.")
+            evidence=f"Tried {len(cands)} parameter(s) "
+                     f"({', '.join(repr(p) for _l, p in cands)}); no collaborator hit and the "
+                     f"response did not depend on internal-target reachability."
+                     + coverage_note(coverage, finding),
+            control_outcome=coverage, tested_parameters=tested)
 
     # A served vs a closed loopback port on the same host: identical URL strings
     # (so echo cancels), differing only in whether a server-side fetch succeeds.

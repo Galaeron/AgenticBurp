@@ -95,11 +95,15 @@ def tested_inputs(finding, targets) -> tuple[tuple[str, str], ...]:
 
 # Coverage case driving: legs that can test ONE input per dispatch, by the case
 # locations each can address on its own. sqlmap's `-p` naming of JSON body keys
-# is unverified, so its JSON keys stay request-level.
+# is unverified, so its JSON keys stay request-level; browser_xss injects only
+# into the query string.
 PER_PARAMETER_LOCATIONS = {
     "ssti": frozenset({"query", "body_form", "body_json"}),
     "command_injection": frozenset({"query", "body_form", "body_json"}),
     "sqlmap": frozenset({"query", "body_form"}),
+    "open_redirect": frozenset({"query", "body_form", "body_json"}),
+    "ssrf": frozenset({"query", "body_form", "body_json"}),
+    "browser_xss": frozenset({"query"}),
 }
 # At most this many parameter cases of one cell are dispatched one by one (the
 # legs' own six-parameter cap); the rest stay inconclusive.

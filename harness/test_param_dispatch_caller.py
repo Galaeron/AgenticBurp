@@ -1,10 +1,12 @@
 """Per-parameter dispatch, through investigate_engagement's real coverage case drive.
 
-A leg that can test one input (SSTI here) is driven once per parameter case, so
-each parameter gets its own verdict: the evaluating parameter is confirmed and
-the literal one beside it concludes clean. Controls: a case-budget-truncated
-parameter stays open (never a clean negative), and a request-level-only leg
-(open redirect) is still driven once with its parameter cases left inconclusive.
+A leg that can test one input (SSTI and open redirect here) is driven once per
+parameter case, so each parameter gets its own verdict: the evaluating (or
+redirecting) parameter is confirmed and the literal one beside it concludes
+clean. The verdict binds only because the leg reports the input it tested.
+Controls: a case-budget-truncated parameter stays open (never a clean negative),
+an input the leg cannot target alone (a repeated name) stays inconclusive, and a
+leg that does not report its input leaves every parameter case inconclusive.
 
 Only discovery is canned (one endpoint with a captured form template), the agent
 probe is stubbed, and the worklist's shape-driven legs are switched off (they
@@ -46,13 +48,20 @@ _OTHER_LEGS = ("sqlmap", "browser_xss", "stored_xss", "dom_xss", "command_inject
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """POST /render evaluates `{{a*b}}` in `tpl` only; every other value (and every
-    value on /echo) is reflected literally."""
+    """POST /render evaluates `{{a*b}}` in `tpl` only; POST /goto redirects to its
+    `next` value; every other value (and every value on /echo) is reflected
+    literally."""
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         params = parse_qsl(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
         path = urlsplit(self.path).path
+        if path == "/goto":
+            self.send_response(302)
+            self.send_header("Location", dict(params).get("next", "/"))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         out = []
         for name, value in params:
             if path == "/render" and name == "tpl":
@@ -176,18 +185,47 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
         self.assertNotIn(matrix.get(*key(SSTI)).status,
                          (CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE))
 
-    def test_request_level_leg_is_unchanged(self):
-        # Open redirect is not dispatched per parameter: one request-level attempt,
-        # and both inputs stay inconclusive, exactly as before.
-        _matrix, _key, cases = self._run("/redirect", "a=1&b=2")
+    def test_open_redirect_concludes_each_parameter(self):
+        # Open redirect is dispatched per parameter too: each clean input is
+        # concluded on its own send, so the cell concludes clean.
+        matrix, key, cases = self._run("/redirect", "a=1&b=2")
         redirect = cases(REDIRECT)
         self.assertEqual(set(redirect), {"", "a", "b"})
         for name in ("a", "b"):
-            self.assertEqual(redirect[name].status, CellStatus.INCONCLUSIVE)
-            self.assertIn("request level", redirect[name].reason)
-            self.assertFalse(redirect[name].executed)
-        # SSTI on the same endpoint is per parameter.
-        self.assertEqual(cases(SSTI)["a"].status, CellStatus.NOT_DETECTED)
+            self.assertEqual(redirect[name].status, CellStatus.NOT_DETECTED, redirect[name].reason)
+            self.assertTrue(redirect[name].executed)
+        self.assertEqual(matrix.get(*key(REDIRECT)).status, CellStatus.NOT_DETECTED)
+
+    def _redirect_cases(self):
+        matrix, key, _cases = self._run("/goto", "next=/home&a=1&a=2")
+        cases = {(ck.parameter_name, ck.occurrence): r
+                 for ck, r in matrix.cases_for_cell(*key(REDIRECT))}
+        return matrix.get(*key(REDIRECT)), cases
+
+    def test_redirecting_parameter_confirmed_untargetable_sibling_stays_open(self):
+        cell, cases = self._redirect_cases()
+        self.assertEqual(cases[("next", 0)].status, CellStatus.CONFIRMED, cases[("next", 0)].reason)
+        self.assertTrue(cases[("next", 0)].executed)
+        self.assertEqual(cases[("a", 0)].status, CellStatus.NOT_DETECTED, cases[("a", 0)].reason)
+        self.assertTrue(cases[("a", 0)].executed)
+        # Control: the second `a` cannot be targeted alone, so the leg never
+        # tested it; it stays inconclusive behind the request-level attempt.
+        self.assertEqual(cases[("a", 1)].status, CellStatus.INCONCLUSIVE)
+        self.assertFalse(cases[("a", 1)].executed)
+        self.assertTrue(cases[("", 0)].executed)
+        self.assertEqual(cell.status, CellStatus.CONFIRMED)
+
+    def test_control_a_leg_that_does_not_report_its_input_attributes_nothing(self):
+        """Defect injection: the same sends, but the leg reports no tested input,
+        so no parameter case is concluded; the confirmation stays on the request."""
+        from harness.validators import open_redirect_validator
+        with patch.object(open_redirect_validator, "tested_inputs", return_value=()):
+            cell, cases = self._redirect_cases()
+        for case in (("next", 0), ("a", 0), ("a", 1)):
+            self.assertEqual(cases[case].status, CellStatus.INCONCLUSIVE, case)
+            self.assertFalse(cases[case].executed, case)
+        self.assertEqual(cases[("", 0)].status, CellStatus.CONFIRMED)
+        self.assertEqual(cell.status, CellStatus.CONFIRMED)
 
     # -- engagement.coverage_parameter_field_cap, read from the config
     def _field_cap_run(self):

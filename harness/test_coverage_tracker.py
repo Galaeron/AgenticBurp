@@ -520,8 +520,9 @@ class CasesDrivenTests(unittest.TestCase):
 
 class PerParameterDispatchTests(unittest.TestCase):
     """Owner option (b): a leg that can test one input (sqlmap -p, SSTI, command
-    injection) is driven once per parameter case, and each verdict binds to that
-    parameter only when the leg reports testing exactly it."""
+    injection, open redirect, SSRF, reflected XSS) is driven once per parameter
+    case, and each verdict binds to that parameter only when the leg reports
+    testing exactly it."""
 
     KEY = ("user", "POST /api/x", "WSTG-INPV-05")   # sqlmap
 
@@ -636,6 +637,17 @@ class PerParameterDispatchTests(unittest.TestCase):
         self.assertEqual(calls, [""])
         self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
         self.assertEqual(cases["sort"].status, CellStatus.INCONCLUSIVE)
+
+    def test_reported_input_concludes_each_newly_per_parameter_leg(self):
+        # Open redirect, SSRF and reflected XSS now dispatch per query input.
+        for check_id in ("WSTG-INPV-17", "WSTG-INPV-19", "WSTG-INPV-01"):
+            self.KEY = ("user", "POST /api/redirect", check_id)   # a URL-shaped path
+            with self.subTest(check_id):
+                t, cases, calls = self._drive("next=x&sort=y", lambda ck: self._Res("not_confirmed"))
+                self.assertEqual(calls, ["next", "sort"])
+                self.assertEqual(cases["next"].status, CellStatus.NOT_DETECTED)
+                self.assertEqual(cases["sort"].status, CellStatus.NOT_DETECTED)
+                self.assertEqual(t.matrix.get(*self.KEY).status, CellStatus.NOT_DETECTED)
 
     def test_control_leg_that_does_not_report_its_input_keeps_r01(self):
         # Defect injection: the same clean results, but the leg names no input,
