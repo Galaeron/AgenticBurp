@@ -2365,9 +2365,16 @@ class ChainMixin:
                     # to a leg that can test that input alone; bind the leg to it.
                     target = case_target(check.confirmation, case_key) if case_key is not None else None
                     if target is not None:
+                        # The per-finding mutating ceiling (R16) counts per
+                        # parameter case: each dispatch is its own account, keyed
+                        # on its case, so one input's leg may spend the per-check
+                        # ceiling and never starves a later input. A leg the
+                        # ceiling cuts off reports itself incomplete, not clean.
+                        ceiling_key = (leg_case.case_id if leg_case is not None else
+                                       "|".join((identity, method, path, check.id, *target)))
                         leg_finding = leg_finding.model_copy(update={
                             "parameter_location": target[0], "parameter_name": target[1],
-                            "parameter_only": True})
+                            "parameter_only": True, "finding_id": ceiling_key})
                     res = await _cached_validate(
                         validator, leg_finding, ex,
                         case_ref=leg_case.case_id if leg_case is not None else "")

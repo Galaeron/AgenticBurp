@@ -7,6 +7,9 @@ clean. The verdict binds only because the leg reports the input it tested.
 Controls: a case-budget-truncated parameter stays open (never a clean negative),
 an input the leg cannot target alone (a repeated name) stays inconclusive, and a
 leg that does not report its input leaves every parameter case inconclusive.
+The per-finding mutating ceiling counts per parameter case: a parameter the
+ceiling cuts off stays open, and one ceiling shared by every parameter (the
+defect control) would cut the later one.
 
 Only discovery is canned (one endpoint with a captured form template), the agent
 probe is stubbed, and the worklist's shape-driven legs are switched off (they
@@ -119,7 +122,8 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
         store._DB_PATH, cache._cache = cls._orig_store_db, cls._orig_cache
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
-    def _run(self, path, body, case_budget=8, engagement_cfg=None, disable=()):
+    def _run(self, path, body, case_budget=8, engagement_cfg=None, disable=(), validators_cfg=None,
+             live_context=False):
         base = self.base
 
         def canned(base_url, roles, **kw):
@@ -139,6 +143,7 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
 
         cfg = _config()
         cfg["engagement"].update(engagement_cfg or {})
+        cfg["validators"].update(validators_cfg or {})
         for name in disable:
             cfg["validators"].setdefault(name, {})["enabled"] = False
         orch = Orchestrator(cfg)
@@ -147,9 +152,22 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
         orch.coverage_case_budget = case_budget
         orch.run_active_probe = AsyncMock(return_value={
             "iterative_result": {"stop_reason": "gave_up", "findings": []}, "integration": {}})
+        async def investigate():
+            if not live_context:
+                return await orch.investigate_engagement(
+                    base, ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0)
+            # As the server's engagement job: the run's own context and gate, so the
+            # legs send through the run executor and its per-finding ceiling.
+            from harness.orchestrator_helpers import per_run_gate_config
+            from harness.run_context import RunContext
+            async with RunContext.create(
+                    allowed_hosts=["127.0.0.1"], config=cfg,
+                    gate_config=per_run_gate_config(cfg, orch.validator_registry)) as ctx:
+                return await orch.investigate_engagement(
+                    base, ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0, run_context=ctx)
+
         with patch("harness.engagement_builder.build_engagement", side_effect=canned),                 patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]):
-            result = asyncio.run(orch.investigate_engagement(
-                base, ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0))
+            result = asyncio.run(investigate())
         coverage = result.get("coverage") or {}
         self.assertIn("cases_driven", coverage, "the case-driven coverage path did not run")
         matrix = CoverageMatrix.from_dict(coverage["checkpoint"]["matrix"])
@@ -291,6 +309,52 @@ class PerParameterDispatchCallerTest(unittest.TestCase):
             _matrix, _key, cases = self._leg_budget_run()
         self.assertEqual(cases(SSTI)["b"].status, CellStatus.NOT_DETECTED)
         self.assertEqual(self.coverage["cases_driven"], 1)
+
+    # -- the per-finding mutating ceiling (R16) counts per parameter case
+    def _ceiling_run(self, path, body, ceiling):
+        return self._run(path, body, disable=("open_redirect",), live_context=True,
+                         validators_cfg={"mutating_ceiling_by_check": {"ssti": ceiling}})
+
+    def test_parameter_cut_off_by_the_mutating_ceiling_is_never_a_clean_negative(self):
+        # A ceiling of 3: `tpl` confirms in 3 POSTs (probe, control, baseline);
+        # the clean `name` needs one per syntax, so its fourth is refused.
+        matrix, key, cases = self._ceiling_run("/render", "tpl=hello&name=bob", 3)
+        ssti = cases(SSTI)
+        self.assertEqual(ssti["tpl"].status, CellStatus.CONFIRMED, ssti["tpl"].reason)
+        self.assertTrue(ssti["tpl"].executed)
+        self.assertEqual(ssti["name"].status, CellStatus.INCONCLUSIVE, ssti["name"].reason)
+        self.assertIn("mutating-request ceiling", ssti["name"].reason)
+        self.assertFalse(ssti["name"].executed)
+        self.assertEqual(matrix.get(*key(SSTI)).status, CellStatus.CONFIRMED)
+
+    def test_mutating_ceiling_counts_per_parameter_case(self):
+        # A ceiling of 6 is exactly one clean input's sends: under it, each
+        # parameter concludes on its own account.
+        matrix, key, cases = self._ceiling_run("/echo", "a=1&b=2", 6)
+        ssti = cases(SSTI)
+        for name in ("a", "b"):
+            self.assertEqual(ssti[name].status, CellStatus.NOT_DETECTED, ssti[name].reason)
+            self.assertTrue(ssti[name].executed)
+        self.assertEqual(matrix.get(*key(SSTI)).status, CellStatus.NOT_DETECTED)
+
+    def test_control_a_ceiling_shared_by_the_parameters_cuts_the_later_one(self):
+        """Defect injection: one account for every parameter (per finding, not per
+        case). `a` spends the ceiling, so `b` is refused before its first send and
+        stays open, never a clean negative."""
+        from harness.safety_gate import SafetyGate
+        original = SafetyGate._reserve_mutating
+
+        def shared(self, finding_id, n, validator_name=None):
+            return original(self, "shared" if finding_id else finding_id, n, validator_name)
+
+        with patch.object(SafetyGate, "_reserve_mutating", shared):
+            matrix, key, cases = self._ceiling_run("/echo", "a=1&b=2", 6)
+        ssti = cases(SSTI)
+        self.assertEqual(ssti["a"].status, CellStatus.NOT_DETECTED, ssti["a"].reason)
+        self.assertNotIn(ssti["b"].status, (CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE))
+        self.assertIn("mutating-request ceiling", ssti["b"].reason)
+        self.assertFalse(ssti["b"].executed)
+        self.assertNotEqual(matrix.get(*key(SSTI)).status, CellStatus.NOT_DETECTED)
 
 
 class SqlmapParameterOnlyTest(unittest.TestCase):
