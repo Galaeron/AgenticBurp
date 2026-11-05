@@ -18,6 +18,7 @@
 | Historical positioning | [COMPETITIVE_LANDSCAPE.md](../COMPETITIVE_LANDSCAPE.md) |
 | Accept the merged architecture repair; specify the live run and the model A/B (AR-10) | [AR10_INTEGRATED_ACCEPTANCE_SPEC.md](AR10_INTEGRATED_ACCEPTANCE_SPEC.md) |
 | Retained observations (supplied captures with or without findings) | [OBSERVATION_MEMORY.md](OBSERVATION_MEMORY.md) |
+| Why a coverage check has (or lacks) a deterministic adapter (`check_adapter_missing`) | [COVERAGE_ADAPTERS.md](COVERAGE_ADAPTERS.md) |
 
 Historical measurements, plans and reviews describe their named revisions, not
 current capability. Code is authoritative for routing/configuration; executed
