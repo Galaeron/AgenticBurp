@@ -19,6 +19,7 @@ from harness.models import Finding, HttpExchange
 from harness.validators.browser_xss_validator import BrowserXssValidator
 from harness.validators.injection_targets import NAMED_PARAMETER_UNTESTED, tested_inputs
 from harness.validators.open_redirect_validator import OpenRedirectValidator
+from harness.validators.path_traversal_validator import PathTraversalValidator
 from harness.validators.ssrf_validator import SsrfValidator
 
 
@@ -161,6 +162,67 @@ class OpenRedirectParameterOnlyTests(unittest.TestCase):
         self.assertEqual(res.status, "skipped")
         self.assertEqual(res.control_outcome, NAMED_PARAMETER_UNTESTED)
         self.assertEqual(res.tested_parameters, ())
+
+
+class PathTraversalParameterOnlyTests(unittest.TestCase):
+    """One injection point per dispatch: a bound parameter whatever its shape,
+    or (on the path location) the last path segment alone."""
+    URL = "http://t.test/files/view?file=report.pdf&lang=en"
+
+    def setUp(self):
+        global_throttle.configure(0)
+        safety_gate.reset_default_gate()
+        safety_gate.get_default_gate({"active_enabled": True, "allowed_hosts": ["t.test"]})
+        self.addCleanup(safety_gate.reset_default_gate)
+
+    def _validate(self, finding):
+        sent = []
+
+        async def record(client, method, url, **kw):
+            parts = urlsplit(str(url))
+            sent.append((parts.path, dict(parse_qsl(parts.query))))
+
+            class _R:
+                status_code = 404
+                text = "not found"
+                headers = {}
+            return _R()
+
+        ex = HttpExchange(url=self.URL, method="GET", request_headers={}, request_body="",
+                          response_status=200, response_body="ok")
+        with patch("httpx.AsyncClient.request", record):
+            return asyncio.run(PathTraversalValidator(allowed_hosts=["t.test"]).validate(finding, ex)), sent
+
+    def test_bound_parameter_is_the_only_point_probed(self):
+        # `lang` is not file-shaped: a bound dispatch tests it all the same.
+        res, sent = self._validate(_finding("path_traversal", "lang", "query", only=True))
+        self.assertEqual(res.status, "not_confirmed", res.summary)
+        self.assertEqual(res.tested_parameters, (("query", "lang"),))
+        self.assertEqual(len(sent), 16)
+        self.assertTrue(all(path == "/files/view" and q["file"] == "report.pdf" for path, q in sent))
+
+    def test_bound_path_location_probes_the_path_segment_only(self):
+        res, sent = self._validate(_finding("path_traversal", "", "path", only=True))
+        self.assertEqual(res.status, "not_confirmed", res.summary)
+        self.assertEqual(res.tested_parameters, (("path", ""),))
+        self.assertIn("the path segment", res.evidence)
+        self.assertTrue(sent)
+        self.assertTrue(all(path != "/files/view" and q == {"file": "report.pdf", "lang": "en"}
+                            for path, q in sent))
+
+    def test_control_unbound_run_probes_parameter_and_path_and_reports_nothing(self):
+        res, sent = self._validate(_finding("path_traversal"))
+        self.assertEqual(res.status, "not_confirmed", res.summary)
+        self.assertEqual(res.tested_parameters, ())
+        self.assertTrue(any(q.get("file") != "report.pdf" for _p, q in sent))
+        self.assertTrue(any(path != "/files/view" for path, _q in sent))
+
+    def test_control_bound_input_the_request_lacks_is_untested(self):
+        res, sent = self._validate(_finding("path_traversal", "zzz", "query", only=True))
+        self.assertEqual(res.status, "skipped")
+        self.assertEqual(res.control_outcome, NAMED_PARAMETER_UNTESTED)
+        self.assertEqual(res.tested_parameters, ())
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

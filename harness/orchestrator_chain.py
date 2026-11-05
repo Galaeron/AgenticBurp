@@ -24,7 +24,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 # standalone one when it is None".
 from harness.run_context import transport_for, ExecutionOutcome, case_scope, count_sends
 from harness.execution_registry import ExecutionRegistry
-from harness.validators.injection_targets import case_target
+from harness.validators.injection_targets import REQUEST_LEVEL_INPUTS, case_target
 from harness import run_journal
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
 # same shadowing reason as above (several methods below have a `run_context` parameter).
@@ -2336,7 +2336,8 @@ class ChainMixin:
                     return worklist_investigator._seed_exchange(
                         base_url, node, _role_headers.get(identity, {}), ""), None
 
-                async def _run_captured_leg(identity, method, path, check, case_key=None, node=None):
+                async def _run_captured_leg(identity, method, path, check, case_key=None, node=None,
+                                            remainder_only=False):
                     validator = _val_by_conf.get(check.confirmation)
                     if validator is None:
                         return None  # e.g. sqlmap/race_condition -- not driven here
@@ -2376,6 +2377,12 @@ class ChainMixin:
                         leg_finding = leg_finding.model_copy(update={
                             "parameter_location": target[0], "parameter_name": target[1],
                             "parameter_only": True})
+                    elif remainder_only and check.confirmation in REQUEST_LEVEL_INPUTS:
+                        # Every parameter case was tested alone: the request-level
+                        # attempt tests only the input no parameter case names.
+                        leg_finding = leg_finding.model_copy(update={
+                            "parameter_location": REQUEST_LEVEL_INPUTS[check.confirmation],
+                            "parameter_name": "", "parameter_only": True})
                     res = await _cached_validate(
                         validator, leg_finding, ex,
                         case_ref=leg_case.case_id if leg_case is not None else "")
@@ -2454,11 +2461,13 @@ class ChainMixin:
                         decisions.append(decision)
                     return decisions[0] if decisions else preliminary
 
-                async def _run_leg_core(identity, method, path, check, case_key=None):
+                async def _run_leg_core(identity, method, path, check, case_key=None, *,
+                                        remainder_only=False):
                     ep_key = f"{method} {path}"
                     ep = state.endpoints.get(ep_key)
                     if ep is None or not ep.capture_variants:
-                        return await _run_captured_leg(identity, method, path, check, case_key)
+                        return await _run_captured_leg(identity, method, path, check, case_key,
+                                                       remainder_only=remainder_only)
                     variants = _replayable.get((ep_key, identity))
                     if variants is None:
                         variants = replayable_variants(
@@ -2488,7 +2497,8 @@ class ChainMixin:
                             outcomes.append(_VR(check.confirmation, "inconclusive", check.vulnerability_class,
                                                 summary=problem + ": supply a complete authorized capture"))
                         else:
-                            outcomes.append(await _run_captured_leg(identity, method, path, check, case_key, node))
+                            outcomes.append(await _run_captured_leg(identity, method, path, check, case_key,
+                                                                    node, remainder_only=remainder_only))
                     # Every proof instance was recorded above. A positive instance
                     # does not turn another unanswered variant into a clean cell.
                     incomplete = [r for r in outcomes if r is None or r.status not in

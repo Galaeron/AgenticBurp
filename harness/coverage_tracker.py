@@ -126,7 +126,8 @@ def resume_context_key(config):
     return hashlib.sha256((source['sha256'] + config_fingerprint(config)).encode()).hexdigest()
 
 from harness.categories import canonicalize
-from harness.validators.injection_targets import PER_PARAMETER_FIELD_CAP, case_target
+from harness.validators.injection_targets import (PER_PARAMETER_FIELD_CAP, PER_PARAMETER_LOCATIONS,
+                                                  REQUEST_LEVEL_INPUTS, case_target)
 from harness.coverage_model import (
     ATTEMPT_SCHEMA_VERSION, CHECK_CATALOG, CHECKS_BY_ID, Check, CellStatus, CellResult, CoverageMatrix,
 )
@@ -576,12 +577,22 @@ class CoverageTracker:
             total += rep_res["added"]
             # The concrete parameter inputs are enumerated for visibility, bounded by
             # the per-cell budget; over-budget inputs stay visible (SKIPPED).
+            params = []
             if check.phase == Phase.PARAMETER:
                 params = derive_input_cases_from_template(ep.get("template"))
-                if params:
-                    p_res = self.matrix.expand_cases(ident, ep_key, check.id, params,
-                                                     budget_remaining=per_cell_budget)
-                    total += p_res["added"] + p_res["budget_skipped"]
+            elif check.confirmation in PER_PARAMETER_LOCATIONS:
+                # An endpoint check whose leg can test one parameter alone (path
+                # traversal) fans out over the inputs at the locations that leg
+                # injects into; what only its request-level attempt reaches (see
+                # REQUEST_LEVEL_INPUTS: the path) stays on the representative. An
+                # empty body's root container ("/") names no input.
+                locations = PER_PARAMETER_LOCATIONS.get(check.confirmation, ())
+                params = [c for c in derive_input_cases_from_template(ep.get("template"))
+                          if c.parameter_location in locations and c.parameter_name != "/"]
+            if params:
+                p_res = self.matrix.expand_cases(ident, ep_key, check.id, params,
+                                                 budget_remaining=per_cell_budget)
+                total += p_res["added"] + p_res["budget_skipped"]
         return total
 
     async def drive_coverage_cases(self, run_case, *, driveable: set[str] | None = None,
@@ -651,10 +662,13 @@ class CoverageTracker:
                 await self._drive_request_level(run_case, ident, ep_key, check, cks, rep)
         return attempts
 
-    async def _drive_request_level(self, run_case, ident, ep_key, check, cks, rep) -> None:
+    async def _drive_request_level(self, run_case, ident, ep_key, check, cks, rep, *,
+                                   remainder_only: bool = False) -> None:
         """Drive the leg once on the request-level representative; its verdict
         binds to that case only, and every other case in `cks` is recorded
-        INCONCLUSIVE (R01: no per-parameter attribution)."""
+        INCONCLUSIVE (R01: no per-parameter attribution). `remainder_only` (a leg
+        in REQUEST_LEVEL_INPUTS, every parameter case already tested alone) asks
+        the leg to test only the input no parameter case names."""
         check_id = check.id
         method, _, path = ep_key.partition(" ")
         no_attr_reason = (f"{check.confirmation} ran at request level; this leg does not "
@@ -667,7 +681,8 @@ class CoverageTracker:
                                             status=CellStatus.INCONCLUSIVE, reason=reason)
 
         try:
-            res = await run_case(ident, method, path, check, rep)
+            res = await (run_case(ident, method, path, check, rep, remainder_only=True)
+                         if remainder_only else run_case(ident, method, path, check, rep))
         except Exception as e:  # a leg blowing up is recorded, never swallowed
             log.debug("drive_coverage_cases: %s on %s failed: %s", check.confirmation, ep_key, e)
             # An attempt was actually dispatched (run_case was invoked and
@@ -689,7 +704,9 @@ class CoverageTracker:
             _mark_siblings_inconclusive(no_attr_reason)
             return
         self._record_case_result(ident, ep_key, check, rep, res,
-                                 f"{check.confirmation} driven at request level")
+                                 f"{check.confirmation} driven at request level"
+                                 + (f" on the {REQUEST_LEVEL_INPUTS.get(check.confirmation)} only"
+                                    if remainder_only else ""))
         _mark_siblings_inconclusive(no_attr_reason)
 
     def _record_case_result(self, ident, ep_key, check, case, res, default_reason) -> None:
@@ -742,8 +759,10 @@ class CoverageTracker:
         the cap, the case budget, the leg budget (`remaining` dispatches) or the
         deadline stay inconclusive. When any input was not tested on its own, the
         request-level representative is ALSO driven as before (detection
-        unchanged, one more dispatch), bound to itself only. Returns the number of
-        dispatches made."""
+        unchanged, one more dispatch), bound to itself only. A leg in
+        REQUEST_LEVEL_INPUTS drives it even when every input was tested alone,
+        bound to the input no parameter case names (`remainder_only`). Returns the
+        number of dispatches made."""
         check_id = check.id
         method, _, path = ep_key.partition(" ")
         tested: set[str] = set()
@@ -791,15 +810,21 @@ class CoverageTracker:
             self._record_parameter_result(ident, ep_key, check, case, rep, res)
         others = [(c, r) for c, r in self.matrix.cases_for_cell(ident, ep_key, check_id)
                   if c.coord_id() != rep.coord_id()]
-        if (not timed_out and not out_of_budget
-                and any(c.coord_id() not in tested for c, _r in others)):
+        untested = any(c.coord_id() not in tested for c, _r in others)
+        # A leg whose request-level attempt also reaches an input no parameter
+        # case names (path traversal's path segment) runs it even when every
+        # parameter was tested alone, on that input only: skipping it would leave
+        # the input untested under a clean cell.
+        remainder_only = not untested and check.confirmation in REQUEST_LEVEL_INPUTS
+        if not timed_out and not out_of_budget and (untested or remainder_only):
             # Some input was not tested alone (a location this leg cannot target,
             # the field cap, the case budget): keep today's request-level attempt
             # while the leg budget allows one more dispatch. Inputs tested alone
             # keep their own verdicts.
             if used < remaining:
                 rest = [c for c in cks if c.coord_id() not in tested]
-                await self._drive_request_level(run_case, ident, ep_key, check, rest, rep)
+                await self._drive_request_level(run_case, ident, ep_key, check, rest, rep,
+                                                remainder_only=remainder_only)
                 return used + 1
             out_of_budget = True
             self.stopped_by = "leg budget"

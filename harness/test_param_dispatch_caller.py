@@ -12,7 +12,11 @@ ceiling cuts off stays open, and one ceiling shared by every parameter (the
 defect control) would cut the later one. Request-level legs (path traversal,
 and the request-level attempt of SSTI and command injection) count the ceiling
 on their own case too: a leg the ceiling cuts off is never a clean negative, and
-one under it still concludes.
+one under it still concludes. Path traversal is dispatched per injection point:
+each form parameter alone, then the path segment alone, each on its own account,
+so a POST file route with a parameter concludes at the hard cap; a point the
+ceiling cuts stays open, and the path segment is still probed (a traversal there
+confirms) once every parameter was tested alone.
 
 Only discovery is canned (one endpoint with a captured form template), the agent
 probe is stubbed, and the worklist's shape-driven legs are switched off (they
@@ -21,6 +25,7 @@ real requests to a loopback server.
 """
 import asyncio
 import os
+import posixpath
 import re
 import shutil
 import tempfile
@@ -30,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 import yaml
 
@@ -55,13 +60,18 @@ _OTHER_LEGS = ("sqlmap", "browser_xss", "stored_xss", "dom_xss", "command_inject
 
 class _Handler(BaseHTTPRequestHandler):
     """POST /render evaluates `{{a*b}}` in `tpl` only; POST /goto redirects to its
-    `next` value; every other value (and every value on /echo) is reflected
-    literally."""
+    `next` value; POST /downloads/<name> serves <name> from /srv/files, so a
+    traversal in that path segment reads /etc/passwd; every other value (and
+    every value on /echo) is reflected literally."""
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         params = parse_qsl(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
         path = urlsplit(self.path).path
+        if (path.startswith("/downloads/")
+                and posixpath.normpath("/srv/files/" + unquote(path[len("/downloads/"):])) == "/etc/passwd"):
+            self._reply(b"root:x:0:0:root:/root:/bin/bash")
+            return
         if path == "/goto":
             self.send_response(302)
             self.send_header("Location", dict(params).get("next", "/"))
@@ -472,6 +482,72 @@ class RequestLevelCeilingCallerTest(_LoopbackDrive):
         self.assertEqual(self._answered(leg), 6)
         self.assertNotIn("ceiling", leg.reason)
         self.assertIn("callback probes disabled", leg.reason)
+
+
+class PathTraversalPerPointCallerTest(_LoopbackDrive):
+    """Path traversal per injection point on a POST file route with a form
+    parameter: 16 probes per point, 32 in all, more than the hard cap (20). Each
+    parameter is dispatched alone, then the request-level attempt probes the path
+    segment alone, each point on its own R16 account. Lowered per check in the
+    test's own config only."""
+
+    _answered = staticmethod(RequestLevelCeilingCallerTest._answered)
+
+    def _point_run(self, path, ceiling):
+        return self._run(path, "file=report.pdf", disable=("ssti", "open_redirect"), live_context=True,
+                         validators_cfg={"path_traversal": {"enabled": True},
+                                         "mutating_ceiling_by_check": {"path_traversal": ceiling}})
+
+    def test_post_file_route_concludes_at_the_hard_cap(self):
+        matrix, key, cases = self._point_run("/files/view", 20)
+        traversal = cases(TRAVERSAL)
+        self.assertEqual(set(traversal), {"", "file"})
+        for name in ("file", ""):            # the parameter, then the path segment
+            self.assertEqual(traversal[name].status, CellStatus.NOT_DETECTED, traversal[name].reason)
+            self.assertTrue(traversal[name].executed)
+        # Every probe of the parameter answered on its own account (8 encodings x
+        # 2 files); the path segment answered on another (its two backslash
+        # payloads cannot be sent).
+        self.assertEqual(self._answered(traversal["file"]), 16)
+        self.assertEqual(self._answered(traversal[""]), 14)
+        self.assertEqual(matrix.get(*key(TRAVERSAL)).status, CellStatus.NOT_DETECTED)
+
+    def test_point_cut_off_by_the_ceiling_stays_open(self):
+        matrix, key, cases = self._point_run("/files/view", 8)
+        traversal = cases(TRAVERSAL)
+        for name in ("file", ""):
+            self.assertEqual(traversal[name].status, CellStatus.INCONCLUSIVE, traversal[name].reason)
+            self.assertIn("mutating-request ceiling", traversal[name].reason)
+            self.assertEqual(self._answered(traversal[name]), 8)   # each point's own account
+        self.assertNotIn(matrix.get(*key(TRAVERSAL)).status, _NEGATIVES)
+
+    def test_traversal_in_the_path_segment_confirms_beside_a_clean_parameter(self):
+        matrix, key, cases = self._point_run("/downloads/view", 20)
+        traversal = cases(TRAVERSAL)
+        self.assertEqual(traversal["file"].status, CellStatus.NOT_DETECTED, traversal["file"].reason)
+        self.assertEqual(traversal[""].status, CellStatus.CONFIRMED, traversal[""].reason)
+        self.assertEqual(matrix.get(*key(TRAVERSAL)).status, CellStatus.CONFIRMED)
+
+    def test_control_a_request_level_attempt_on_every_point_never_concludes(self):
+        """Defect injection: the request-level attempt is not bound to the path
+        segment, so it probes the parameter again with it: 32 probes on one
+        account, cut at the hard cap. The concluding test above sees it."""
+        with patch("harness.orchestrator_chain.REQUEST_LEVEL_INPUTS", {}):
+            matrix, key, cases = self._point_run("/files/view", 20)
+        rep = cases(TRAVERSAL)[""]
+        self.assertEqual(rep.status, CellStatus.INCONCLUSIVE, rep.reason)
+        self.assertIn("mutating-request ceiling", rep.reason)
+        self.assertEqual(self._answered(rep), 20)
+        self.assertNotIn(matrix.get(*key(TRAVERSAL)).status, _NEGATIVES)
+
+    def test_control_skipping_the_path_segment_reads_a_vulnerable_route_clean(self):
+        """Defect injection: no request-level attempt once every parameter was
+        tested alone, so the path segment is never probed and the route reads
+        NOT_DETECTED. The path-segment test above sees it."""
+        with patch("harness.coverage_tracker.REQUEST_LEVEL_INPUTS", {}):
+            matrix, key, cases = self._point_run("/downloads/view", 20)
+        self.assertEqual(cases(TRAVERSAL)[""].status, CellStatus.NOT_DETECTED)
+        self.assertEqual(matrix.get(*key(TRAVERSAL)).status, CellStatus.NOT_DETECTED)
 
 
 class SqlmapParameterOnlyTest(unittest.TestCase):

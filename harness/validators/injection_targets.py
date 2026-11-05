@@ -104,7 +104,15 @@ PER_PARAMETER_LOCATIONS = {
     "open_redirect": frozenset({"query", "body_form", "body_json"}),
     "ssrf": frozenset({"query", "body_form", "body_json"}),
     "browser_xss": frozenset({"query"}),
+    "path_traversal": frozenset({"query", "body_form", "body_json"}),
 }
+# Legs whose request-level attempt also tests an input that no parameter case
+# names, by the case location that input has: path traversal injects into the
+# request's last path segment. Such a leg's endpoint check fans out over the
+# parameter inputs it can test alone; once each was tested alone, its
+# request-level attempt still runs, bound to that location only, so it never
+# repeats the parameters' probes (and each input keeps its own R16 account).
+REQUEST_LEVEL_INPUTS = {"path_traversal": "path"}
 # At most this many parameter cases of one cell are dispatched one by one (the
 # legs' own six-parameter cap); the rest stay inconclusive.
 PER_PARAMETER_FIELD_CAP = 6
