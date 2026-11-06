@@ -50,6 +50,10 @@
   30 s, else fails fast. Other 4xx still count. Tests: harness/test_ollama_context_window.py.
 
 ## Verification
+- `integrate/r5-fixes-2026-11-06` (r5-gap fixes: proof binding, leg routing, coverage),
+  2026-11-06, Windows, system Python 3.14: full on `bbed9bd0` harness 5659 OK, native 38,
+  integrity 59; evaluation failed 2 stale cross-user dry-run expectations (writes no
+  longer arm cross_identity), fixed in `3b63e8b5`, evaluation 451 / 17 skips. Java not rerun.
 - `integrate/main-2026-11-06` `768939b6`, 2026-11-06, Windows, system Python 3.14: full
   exit 0 (harness 5614, native 38, evaluation 451 / 17 skips, integrity 59). The first
   full run failed (22 failures, 47 errors): a semantic merge conflict left sqlmap's
@@ -81,6 +85,18 @@
   /metrics, JSONP whoami, /redirect reached but unchecked; ~28k requests on
   /.well-known/csaf/*; 5xx unexamined (fixed above). Evidence (no token or *-private
   files): `AgenticVibe-archive/live-runs-2026-11-05/`.
+- r6 (job a674352e19b6, `3b63e8b5` = r5-gap fixes, r5's config plus server-error lead
+  dispatch 50): cancelled at the soft deadline in the confirmation phase, so the coverage
+  drive, server-error pass and end-of-job accounting never ran (result rebuilt offline,
+  no coverage funnel). 160,000 requests, 2,188 model calls; 21 proof-bound cases, 6 groups,
+  same 3 flaws. Fixes seen working: login SQLi proof bound and CONFIRMED; no proven
+  finding downgraded; `/rest/products/search` SQLi confirmed (candidate); cross_identity
+  sends 28,984 -> 11,649, idor_read 1,889 -> 388, 47 `no_applicable_leg`; csaf requests
+  31,764 -> 3,048; AV-EXPOSURE-01 confirmed /metrics, /ftp, /ftp/quarantine, JSONP whoami
+  (25 legacy proofs, no artifact ids); CONF-02 42 and ERRH-01 12 confirmations; writes
+  sent. New cost: sqlmap ran full scans on ~10 write endpoints (2-3k requests each;
+  sqlmap_tool 49,847 -> 68,079) and still 6.9k on /socket.io/; 19:02Z-21:41Z was sends only.
+  Evidence: `AgenticVibe-archive/live-runs-2026-11-06/`.
 
 ## Live acceptance v8 (2026-10-28, live-v8-gemma4-full/RUN_STATUS.md)
 - Owned `av-eval-js-daybreak-20261021` on 127.0.0.1:3002 only (port 3000 is unrelated).
@@ -93,8 +109,9 @@
   alg:none). Replay audit: 0 false positives. No SQLi confirmed (v7 confirmed login SQLi).
 
 ## Open work (priority order)
-1. Fix the r5 gaps (routing, binding, coverage; Live runs above), then a new live run to
-   check them and everything that landed 2026-11-06.
+1. r6 follow-ups: reserve time for the coverage drive and end-of-job accounting (r6 was
+   cut in confirmation); bound sqlmap on write endpoints and skip /socket.io/; give
+   passive-leg proofs their exchange artifact ids. Then rerun.
 2. Proof/issue dedup (owner, 2026-10-28): one vulnerability, one proof, keyed on host,
    mechanism, principal and check family; other routes become affected locations.
 3. Coverage drive throughput: 110 of 1380 queued sent, 1270 incomplete attempts (v8).
