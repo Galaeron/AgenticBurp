@@ -55,7 +55,8 @@ TOOL_SCAN_KEYED = frozenset({"sqlmap"})
 # Validators whose verdict is a fact about a route's response headers (E2).
 HEADER_CHECKED = frozenset({"csp_validator", "cors_validator"})
 # Passive validators whose verdict is a fact about the one captured response.
-RESPONSE_JUDGED = frozenset({"security_headers_validator", "error_handling_validator"})
+RESPONSE_JUDGED = frozenset({"security_headers_validator", "error_handling_validator",
+                             "content_exposure_validator"})
 # Not shape-keyed although they test parameters: ssrf, open_redirect, path_traversal
 # and deserialization_oob pick WHICH parameter to attack by its value (URL-, path- or
 # blob-shaped), so two requests with the same names can need different checks.

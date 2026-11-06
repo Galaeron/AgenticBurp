@@ -617,6 +617,23 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "info_disclosure", _always_applicable, "error_handling",
           "Check captured error responses for stack traces and framework error pages "
           "(passive: errors are not provoked)"),
+    # r5: /ftp, /metrics and whoami?callback= only met recon (WSTG-INFO-05), which is
+    # not a verdict. No single WSTG v4.2 test owns these, so the id is internal.
+    Check("AV-EXPOSURE-01", "Directory index, metrics or JSONP exposure", Phase.ENDPOINT,
+          "info_disclosure", _always_applicable, "content_exposure",
+          "Check captured 2xx responses for a directory index, a Prometheus metrics "
+          "exposition or a JSONP callback wrapper (passive: nothing is sent)",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-CONF-04",
+                          "https://owasp.org/www-project-web-security-testing-guide/v42/"
+                          "4-Web_Application_Security_Testing/"
+                          "02-Configuration_and_Deployment_Management_Testing/"
+                          "04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information",
+                          "Review Old Backup and Unreferenced Files for Sensitive Information",
+                          version="4.2"),
+              ExternalRef("CWE", "CWE-548", "https://cwe.mitre.org/data/definitions/548.html",
+                          "Exposure of Information Through Directory Listing"),
+          )),
     # Mass assignment is an API-layer scenario with NO dedicated WSTG v4.2 test
     # (WSTG-CONF-09 is "Test File Permission" -- a different thing), so it carries an
     # internal id and its real sources live in external_refs. See coverage_manifest.

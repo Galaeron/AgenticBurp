@@ -42,6 +42,19 @@ class CrawlerTests(unittest.TestCase):
         self.assertIn("/api/users/{id}", r.endpoints)
         self.assertIn("/api/tickets", r.from_request_calls)
 
+    def test_r5_js_query_literals_reach_the_surface_with_their_parameter(self):
+        # r5: "./redirect?to=" never reached the open-redirect leg because the
+        # literal's query (the only input) was dropped before the matrix.
+        pages = {
+            "http://t.test/": '<html><script src="/main.js"></script></html>',
+            "http://t.test/main.js": ('a="./redirect?to=https://x.example/";'
+                                      'b="/rest/user/reset-password?token=1"'),
+        }
+        r = self._crawl(pages)
+        self.assertIn("/redirect?to=/", r.endpoints)
+        # Negative control: the destructive guard still keeps a reset route out.
+        self.assertFalse([e for e in r.endpoints if "reset-password?" in e], r.endpoints)
+
     def test_scope_gating_blocks_offsite_base(self):
         r = asyncio.run(crawler.crawl("http://evil.test/", allowed_hosts=["t.test"]))
         self.assertTrue(any("out of scope" in e for e in r.errors))

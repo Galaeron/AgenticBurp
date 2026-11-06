@@ -285,6 +285,10 @@ _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
                  note="PASSIVE WSTG-ERRH-01 coverage leg: a stack trace or framework error page in "
                       "a captured error response. Sends nothing; no Java case. Distinct from "
                       "'info_disclosure' (Python 'verbose_error', agent-finding leads)."),
+    _python_only("content_exposure", "content_exposure",
+                 note="PASSIVE AV-EXPOSURE-01 coverage leg: a directory index, Prometheus "
+                      "exposition or JSONP callback wrapper in a captured 2xx. Sends nothing; "
+                      "no Java case."),
 )
 
 CAPABILITY_MATRIX: dict[str, CapabilityOwnership] = {

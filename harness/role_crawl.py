@@ -162,6 +162,38 @@ def _synthesize_query(path: str) -> str:
     return ""
 
 
+def mutating_policy_reason(run_context=None) -> str:
+    """Why this run's gate refuses every write, or "" when writes are allowed."""
+    gate = getattr(run_context, "gate", None)
+    if gate is None:
+        from harness.safety_gate import get_default_gate
+        gate = get_default_gate()
+    cfg = getattr(gate, "config", None)
+    if not getattr(cfg, "active_enabled", False):
+        return "active_testing_disabled"
+    if not getattr(cfg, "allow_mutating_replay", False):
+        return "mutating_replay_disabled"
+    return ""
+
+
+def _suppressed_as_withheld(suppressed) -> list[dict]:
+    """The destructive/session-setup guard's suppressions as withheld operations.
+    An entry is "METHOD /path" (an operation) or a bare path/URL (a link, form or
+    JS reference dropped before any method was known: method "*")."""
+    out = []
+    for entry in sorted(suppressed or ()):
+        method, _, rest = str(entry).partition(" ")
+        if rest and method.isupper():
+            path = rest
+        else:
+            method, path = "*", str(entry)
+        path = urlsplit(path).path or path
+        reason = ("destructive_path_guard" if crawler._DESTRUCTIVE_NAVIGATION.search(path)
+                  or method == "*" else "session_setup_guard")
+        out.append({"method": method, "path": path, "reason": reason})
+    return out
+
+
 def _resolve_probe_methods(methods: set[str] | None) -> tuple[str, ...]:
     """Pick bounded operations to exercise for one discovered path.
     `methods` are the REAL accepted verbs from discovery (an Allow header),
@@ -566,6 +598,12 @@ class RoleCrawlResult:
     # such actions) that were deliberately NOT probed, so a run can show it never
     # attempted a state-destroying request. Mirrors CrawlResult.suppressed_navigation.
     suppressed_navigation: set = field(default_factory=set)
+    # r5: every write operation the surface named but this run did not send, with
+    # why (withheld_operation_reasons), so a policy choice is visible in the run
+    # result and coverage report instead of a silent omission.
+    withheld_operations: list = field(default_factory=list)
+    # Discovery expansion caps that applied (reported, never silent).
+    discovery_bounds: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     # P1.3: per-(owner,requester) results of the ACTIVE cross-role object probe
     # (probe_cross_role_matrix) -- dicts from CrossRoleOutcome.to_dict(). Leaked
@@ -586,6 +624,8 @@ class RoleCrawlResult:
             "idor_findings": self.idor_findings,
             "captured": self.captured,
             "suppressed_navigation": sorted(self.suppressed_navigation),
+            "withheld_operations": list(self.withheld_operations),
+            "discovery_bounds": list(self.discovery_bounds),
             "errors": self.errors,
             "cross_role_outcomes": self.cross_role_outcomes,
         }
@@ -781,6 +821,10 @@ async def crawl_roles(
                     result.sensitive_file_evidence.extend(sres.sensitive_file_evidence)
                     if sres.spec_found:
                         result.errors.append(f"[discovery] used spec {sres.spec_found}")
+                    # Expansion bounds are reported with the run, never silent.
+                    result.discovery_bounds.extend(
+                        e for e in sres.errors
+                        if e.startswith("backup suffixes") and e not in result.discovery_bounds)
                 except Exception as e:
                     result.errors.append(f"[discovery] sweep as {sr.role!r} failed: {e.__class__.__name__}")
             log.info("role_crawl: active discovery swept %d role(s) -> %d routes (%d probes), "
@@ -793,6 +837,7 @@ async def crawl_roles(
     # ...), even if active discovery surfaced it. Detection reaches the vulnerable
     # surface via safe reads; it never needs to execute the destructive action.
     _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+    write_policy = mutating_policy_reason(run_context)
     operations = []
     for path in sorted(discovered):
         for method in _resolve_probe_methods(path_methods.get(path)):
@@ -802,7 +847,12 @@ async def crawl_roles(
             if method.upper() in _MUTATING and _SESSION_SETUP_PATH.search(path):
                 result.suppressed_navigation.add(f"{method} {path}")
                 continue
+            if method.upper() in _MUTATING and write_policy:
+                # The gate refuses it; say so rather than leave a silent gap.
+                result.withheld_operations.append(
+                    {"method": method.upper(), "path": path, "reason": write_policy})
             operations.append((path, method))
+    result.withheld_operations.extend(_suppressed_as_withheld(result.suppressed_navigation))
     if max_endpoints > 0 and len(operations) > max_endpoints:
         result.errors.append(f"surface truncated to {max_endpoints} of {len(operations)} "
                              "endpoint operations for probing")

@@ -91,5 +91,42 @@ class CallShapeTests(unittest.TestCase):
         self.assertEqual(extract_call_shapes(""), [])
 
 
+# A compiled Angular service, the shape Juice Shop's bundle ships (r5).
+_HOST_VAR_BUNDLE = (
+    'class A{constructor(){this.hostServer=X.hostServer,this.host=this.hostServer+"/api/Feedbacks"}'
+    'save(e){return this.http.post(this.host+"/",e)}}'
+    'class B{constructor(){this.hostServer=X.hostServer,this.host=this.hostServer+"/rest/products"}'
+    'get(e){return this.http.get(this.host+"/"+e+"/reviews")}'
+    'create(e,t){return this.http.put(`${this.host}/${e}/reviews`,t)}}'
+    'class C{changePassword(e){return this.http.get(this.hostServer+'
+    '"/rest/user/change-password?current="+e.current+"&new="+e.new)}}'
+    'a=["href","./redirect?to=https://github.com/juice-shop/juice-shop"];')
+
+
+class HostVariableCallTests(unittest.TestCase):
+    """r5: writes made through a host variable were never queued, and a literal
+    with a concatenated query was never requested at all."""
+
+    def test_r5_write_methods_recovered_through_host_variable(self):
+        shapes = {(s.method, s.path) for s in extract_call_shapes(_HOST_VAR_BUNDLE)}
+        self.assertIn(("POST", "/api/Feedbacks"), shapes)
+        self.assertIn(("PUT", "/rest/products/{id}/reviews"), shapes)
+        self.assertIn(("GET", "/rest/products/{id}/reviews"), shapes)
+        self.assertIn(("GET", "/rest/user/change-password"), shapes)
+
+    def test_r5_query_bearing_literals_keep_path_and_input_shape(self):
+        r = extract_endpoints(_HOST_VAR_BUNDLE, "https://app.test/main.js")
+        self.assertIn("/rest/user/change-password", r.same_origin_paths)
+        self.assertIn("/rest/user/change-password?current=1", r.paths_with_query)
+        # An absolute destination is never replayed: it becomes same-origin "/".
+        self.assertIn("/redirect?to=/", r.paths_with_query)
+
+    def test_negative_control_unrelated_get_calls_are_not_routes(self):
+        js = ('m=new Map();m.get(k);this.cache.get(this.key);'
+              'this.title="/not-a-host";this.http.post(this.other,e)')
+        self.assertEqual(extract_call_shapes(js), [])
+        self.assertEqual(extract_endpoints("x='/a?<b>'", "https://app.test/").paths_with_query, set())
+
+
 if __name__ == "__main__":
     unittest.main()

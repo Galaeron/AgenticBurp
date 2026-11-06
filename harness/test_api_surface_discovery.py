@@ -392,6 +392,69 @@ class SensitiveFileTests(unittest.TestCase):
         self.assertIn("/app.js", res.paths())
         self.assertIn("/app.js.old", res.paths())
 
+    def _tracking(self, known, default=(500, _NF, ""), **kw):
+        sent = []
+
+        def r(method, path):
+            sent.append(path)
+            if path in known:
+                return known[path]
+            if path.split("?", 1)[0] in known and "?" in path:
+                return known[path.split("?", 1)[0]]   # query ignored, like a static file
+            return default
+        kw.setdefault("prefixes", ["/"])
+        kw.setdefault("collections", [])
+        kw.setdefault("nouns", [])
+        kw.setdefault("actions", [])
+        kw.setdefault("sensitive_files", [])
+        return _FakeDiscovery(r, **kw), sent
+
+    def test_r5_backup_suffix_never_lands_on_a_query_or_stacks(self):
+        # r5: a static JSON file seeded with a query (and with the variants an
+        # earlier sweep "found") got suffixes appended to the query value,
+        # stacking one level per sweep: ?id=1.bak.old.swp.
+        meta = "/.well-known/csaf/provider-metadata.json"
+        known = {meta: (200, '{"canonical_url": "x"}', "")}
+        seeds = [meta + "?id=1", meta + "?id=1.bak", meta + ".bak"]
+        disc, sent = self._tracking(known, seed_paths=seeds)
+        _run(disc)
+        self.assertFalse([p for p in sent if "?id=1." in p and p not in seeds], sent)
+        self.assertNotIn(meta + ".bak.bak", sent)
+        self.assertNotIn(meta + ".bak.old", sent)
+
+    def test_r5_suffix_that_mirrors_the_base_stops_expanding_it(self):
+        # A server that ignores the suffix serves the original file: that is not
+        # a backup, and its other suffixes would mirror it too.
+        body = '{"same": "file"}'
+        known = {"/docs/data.json": (200, body, ""), "/docs/data.json.bak": (200, body, "")}
+        disc, sent = self._tracking(known, seed_paths=["/docs/data.json"])
+        res = _run(disc)
+        self.assertNotIn("/docs/data.json.bak", res.paths())
+        self.assertEqual([p for p in sent if p.startswith("/docs/data.json") and p != "/docs/data.json"
+                          and "?" not in p],
+                         ["/docs/data.json.bak"])
+        self.assertEqual(res.backup_variants_mirrored, 1)
+        self.assertTrue(any("original body" in e for e in res.errors), res.errors)
+
+    def test_r5_backup_bases_capped_per_directory_and_reported(self):
+        files = [f"/static/f{i:02d}.json" for i in range(11)]
+        known = {f: (200, f"distinct {f}", "") for f in files}
+        disc, sent = self._tracking(known, seed_paths=files)
+        res = _run(disc)
+        expanded = {p[:-4] for p in sent if p.endswith(".bak") and p.startswith("/static/")}
+        self.assertEqual(len(expanded), 8)
+        self.assertEqual(res.backup_capped_prefixes, {"/static/": 3})
+        self.assertTrue(any("capped at 8" in e for e in res.errors), res.errors)
+
+    def test_r5_negative_control_distinct_backup_still_found(self):
+        known = {"/docs/data.json": (200, '{"v": 2}', ""),
+                 "/docs/data.json.bak": (200, '{"v": 1, "secret": true}', "")}
+        disc, _sent = self._tracking(known, seed_paths=["/docs/data.json"])
+        res = _run(disc)
+        self.assertIn("/docs/data.json.bak", res.paths())
+        self.assertEqual(res.backup_variants_mirrored, 0)
+        self.assertEqual(res.backup_capped_prefixes, {})
+
     def test_absent_sensitive_files_not_reported(self):
         # Negative control: everything 404s -> nothing invented.
         disc = _FakeDiscovery(self._responder({}),
@@ -399,6 +462,17 @@ class SensitiveFileTests(unittest.TestCase):
                               actions=[], sensitive_files=[".env", ".git/config"])
         res = _run(disc)
         self.assertEqual(res.paths(), [])
+
+
+class DirectoryListingSignatureTests(unittest.TestCase):
+    def test_r5_express_serve_index_is_a_listing(self):
+        from harness.api_surface_discovery import _sig_directory_listing
+        self.assertTrue(_sig_directory_listing("<html><head><title>listing directory /ftp</title>"))
+        self.assertTrue(_sig_directory_listing("<title>Index of /backup</title>"))
+
+    def test_negative_control_prose_is_not_a_listing(self):
+        from harness.api_surface_discovery import _sig_directory_listing
+        self.assertIsNone(_sig_directory_listing("<title>Shop</title><p>listing directory / files</p>"))
 
 
 class BodyPathMiningTests(unittest.TestCase):

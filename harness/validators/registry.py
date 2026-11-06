@@ -40,6 +40,7 @@ from .toctou_validator import ToctouValidator
 from .verbose_error_validator import VerboseErrorValidator
 from .security_headers_validator import SecurityHeadersValidator
 from .error_handling_validator import ErrorHandlingValidator
+from .content_exposure_validator import ContentExposureValidator
 from harness.safety_gate import get_default_gate, reset_default_gate
 
 log = logging.getLogger(__name__)
@@ -343,6 +344,10 @@ class ValidatorRegistry:
         # WSTG-ERRH-01 coverage adapter (passive -- judges captured error responses).
         if cfg.get("error_handling", {}).get("enabled", True):
             self.validators["error_handling"] = ErrorHandlingValidator()
+
+        # AV-EXPOSURE-01 coverage adapter (passive -- judges captured 2xx bodies).
+        if cfg.get("content_exposure", {}).get("enabled", True):
+            self.validators["content_exposure"] = ContentExposureValidator()
 
         # Browser-driven XSS validator (A2) -- active: loads candidate URLs in a
         # real headless browser and confirms only on observed script execution.

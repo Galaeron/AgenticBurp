@@ -670,5 +670,51 @@ class ActiveDiscoveryMethodPropagationTests(unittest.TestCase):
             fixture.close()
 
 
+class WithheldOperationTests(unittest.TestCase):
+    """r5: a write the surface names but the run does not send is listed with why."""
+
+    def _crawl(self, gate_config):
+        from harness.crawler import CrawlResult
+        from harness.js_endpoint_extractor import CallShape
+        cr = CrawlResult(base_url="http://shop.test/")
+        cr.call_shapes.append(CallShape("POST", "/api/Feedbacks"))
+        cr.call_shapes.append(CallShape("GET", "/api/Feedbacks"))
+        cr.suppressed_navigation.add("/rest/user/reset-password")
+        role = RoleSession("user", {"Cookie": "s=1"})
+
+        async def fake_crawl(base_url, **kwargs):
+            return cr
+
+        async def fake_probe(*args, **kwargs):
+            return 200, "[]", {"content-type": "application/json"}
+
+        async def scenario():
+            ctx = RunContext.create(allowed_hosts=["shop.test"], max_requests=10,
+                                    gate_config=gate_config)
+            ctx.sessions.register("user", "user", role.norm_headers(),
+                                  allowed_origins=[ScopePolicy.origin_of("http://shop.test/")])
+            try:
+                with patch("harness.crawler.crawl", fake_crawl), \
+                     patch("harness.role_crawl._probe", fake_probe):
+                    return await role_crawl.crawl_roles(
+                        "http://shop.test/", [role], allowed_hosts=["shop.test"],
+                        run_context=ctx, session_refs=["user"])
+            finally:
+                await ctx.aclose()
+        return asyncio.run(scenario())
+
+    def test_r5_writes_listed_with_policy_reason_when_mutation_is_off(self):
+        result = self._crawl({"active_enabled": True, "allow_mutating_replay": False})
+        withheld = {(w["method"], w["path"], w["reason"]) for w in result.withheld_operations}
+        self.assertIn(("POST", "/api/Feedbacks", "mutating_replay_disabled"), withheld)
+        self.assertIn(("*", "/rest/user/reset-password", "destructive_path_guard"), withheld)
+        self.assertEqual(result.to_dict()["withheld_operations"], result.withheld_operations)
+
+    def test_negative_control_allowed_writes_are_not_listed(self):
+        result = self._crawl({"active_enabled": True, "allow_mutating_replay": True})
+        self.assertFalse([w for w in result.withheld_operations if w["path"] == "/api/Feedbacks"],
+                         result.withheld_operations)
+
+
 if __name__ == "__main__":
     unittest.main()
