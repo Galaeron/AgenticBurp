@@ -563,7 +563,7 @@ class SqlmapValidator(Validator):
                             "parameter of the replayed request, so it was not tested",
                     control_outcome=NAMED_PARAMETER_UNTESTED)
             only = [(loc, name)]
-        result = await self._validate_request(finding, exchange, only)
+        result = await self._validate_request(finding, exchange, only, light)
         if only and result is not None:
             # Every send below targets `only` (-p and the probes' only_params).
             from .injection_targets import tested_inputs
@@ -571,7 +571,8 @@ class SqlmapValidator(Validator):
         return result
 
     async def _validate_request(self, finding: Finding, exchange: HttpExchange,
-                                only: list[tuple[str, str]] | None) -> ValidationResult:
+                                only: list[tuple[str, str]] | None,
+                                light: dict) -> ValidationResult:
         if exchange.method.upper() != "GET":
             # sqlmap fuzzes a parameter by sending many requests with
             # different payloads to the SAME endpoint via the SAME
