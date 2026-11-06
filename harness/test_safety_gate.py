@@ -500,6 +500,7 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             # summary text. Neither validator holds a client or sends anything.
             "security_headers_validator.py",
             "error_handling_validator.py",
+            "content_exposure_validator.py",
         }
 
         violations = []

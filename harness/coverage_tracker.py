@@ -204,11 +204,11 @@ _LEG_CONFIRMATIONS = {
     "deserialization_oob", "auth_sequence", "stored_xss", "verb_tamper", "csrf",
     "file_upload", "rate_limit", "reset_token", "dom_xss", "toctou", "race_condition",
     "csp", "cors", "nosql", "header_injection", "http_request_smuggling",
-    "security_headers", "error_handling",
+    "security_headers", "error_handling", "content_exposure",
 }
 # Legs that judge the captured response and send nothing. They run first and spend
 # no dispatch budget, so they never crowd out a leg that sends.
-_PASSIVE_LEG_CONFIRMATIONS = frozenset({"security_headers", "error_handling"})
+_PASSIVE_LEG_CONFIRMATIONS = frozenset({"security_headers", "error_handling", "content_exposure"})
 
 
 def _passive_first(cells):

@@ -1489,7 +1489,9 @@ def _sig_log_file(body):
 
 
 def _sig_directory_listing(body):
-    if re.search(r"<title>\s*(?:Index of /|Directory listing for /)", body[:4000], re.I):
+    # "listing directory /" is Express serve-index's title (r5: /ftp).
+    if re.search(r"<title>\s*(?:Index of /|Directory listing for /|listing directory /)",
+                 body[:4000], re.I):
         return "a web-server directory index"
     return None
 

@@ -464,6 +464,17 @@ class SensitiveFileTests(unittest.TestCase):
         self.assertEqual(res.paths(), [])
 
 
+class DirectoryListingSignatureTests(unittest.TestCase):
+    def test_r5_express_serve_index_is_a_listing(self):
+        from harness.api_surface_discovery import _sig_directory_listing
+        self.assertTrue(_sig_directory_listing("<html><head><title>listing directory /ftp</title>"))
+        self.assertTrue(_sig_directory_listing("<title>Index of /backup</title>"))
+
+    def test_negative_control_prose_is_not_a_listing(self):
+        from harness.api_surface_discovery import _sig_directory_listing
+        self.assertIsNone(_sig_directory_listing("<title>Shop</title><p>listing directory / files</p>"))
+
+
 class BodyPathMiningTests(unittest.TestCase):
     """Phase 0.2(d): mine response BODIES (not just JS assets) for path-like
     strings and same-host URLs, fed back as candidate routes."""
