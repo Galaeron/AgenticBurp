@@ -653,7 +653,8 @@ async def crawl_roles(
 
     `roles` is a list of RoleSession; include an anonymous role (empty headers)
     to detect auth bypass. Probing is bounded by `max_endpoints` method+path
-    operations so a large surface cannot fan out without limit.
+    operations so a large surface cannot fan out without limit; 0 probes every
+    discovered operation (the engagement default).
 
     `active_discovery` augments the JS-mined surface with black-box API discovery
     (api_surface_discovery) -- essential on a headless API where the JS crawler
@@ -802,7 +803,7 @@ async def crawl_roles(
                 result.suppressed_navigation.add(f"{method} {path}")
                 continue
             operations.append((path, method))
-    if len(operations) > max_endpoints:
+    if max_endpoints > 0 and len(operations) > max_endpoints:
         result.errors.append(f"surface truncated to {max_endpoints} of {len(operations)} "
                              "endpoint operations for probing")
 
@@ -811,7 +812,7 @@ async def crawl_roles(
     # records status, role, session ref and observation time; by_role /
     # reachable_roles / fingerprints are the role view derived from the cells.
     captured_keys: set[tuple] = set()   # (method, path, body-fp) -> dedup captures
-    for path, probe_method in operations[:max_endpoints]:
+    for path, probe_method in (operations[:max_endpoints] if max_endpoints > 0 else operations):
         # Use the endpoint's REAL accepted method (from discovery's Allow-header
         # introspection) rather than always GET -- a POST/PUT-only endpoint
         # probed with GET returns a uniform wrong-method error to every role

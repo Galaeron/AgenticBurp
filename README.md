@@ -58,6 +58,18 @@ This is the core path. When the Burp extension sends an HTTP exchange to `POST /
 17. **Auto-escalation** -- if engagement policy allows, escalates to deeper investigation.
 18. **Persist + respond** -- findings stored in SQLite (`store.py`), response returned.
 
+### The engagement investigation (`orchestrator_chain.py: investigate_engagement()`)
+
+`POST /engagement/{host}/investigate` runs a whole-application investigation as a background job, with the supplied identities (roles). In outline:
+
+1. **Build the engagement** -- crawl as every role, discover and probe operations, and build the endpoint graph and its worklist (`engagement_builder.py`).
+2. **Header audit** -- run the CORS, CSP and verbose-error validators over every captured exchange.
+3. **Worklist sweep** -- the iterative agent investigates the highest-ranked nodes. Each node whose shape warrants it also gets a deterministic confirmation leg, chosen by class: cross-identity replay for access control, sqlmap for SQL injection, the nosql validator for NoSQL injection, a headless browser for XSS, and so on. A NoSQL finding goes to the nosql leg, never to sqlmap.
+4. **Capture review** -- the model reviews the captured exchanges. Then chain rounds link findings and re-test with any leaked credential.
+5. **Coverage matrix** -- one row per endpoint and check (`coverage_tracker.py`). Optional legs fill in the cells nothing tested (`engagement.coverage_drive_legs`).
+6. **Server-error follow-up** (`server_errors.py`, `engagement.server_errors`) -- the transport records the 5xx answers to the run's own requests. It scans the first bodies on each route; it keeps only parameter names, never values. A stack trace or debug page becomes a confirmed `verbose_error_disclosure`. A database error answering suspect input becomes an `sql_injection` / `nosql_injection` lead, bound to the parameter when exactly one parameter carried suspect input. `max_lead_confirmations` leads go to that class's leg, using the route's captured template. The default is 0, because dispatching sends active traffic (`passive-only` forces it to 0). The result's `server_errors` key lists every route that answered 5xx and what each lead became.
+7. **Retry rounds** (`retry_rounds.py`, `engagement.retry_rounds`, off by default) -- when the run is time-boxed (`investigation_seconds`), the time left is spent instead of given back. Until `reserve_seconds` before the deadline, rounds re-sweep the nodes an earlier budget skipped, the probes that ended on a model error or ran out of steps, and the captures whose review failed (including a failed critique, whose findings would otherwise ship unreviewed). Each round grows the budgets. Afterwards the server-error pass runs again, and the coverage matrix is refreshed with what the rounds found. A late unconfirmed detection never overturns a leg's verdict; a late confirmation does outrank a leg's negative.
+
 ### Evidence ledger
 
 Every step emits events to an append-only ledger (`evidence_ledger.py`). Events carry a `Provenance` envelope (code version, config fingerprint, model tag). The ledger is wired into agents (HYPOTHESIS events), validators (EXECUTION events), the confirmation gate (FINDING_REVISION events), and the orchestrator (RUN_SUMMARY). Persisted to SQLite and exposed via `GET /findings/{finding_ref}/evidence`.

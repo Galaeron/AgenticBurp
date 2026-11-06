@@ -396,6 +396,19 @@ SKIP_POLICY_BLOCKED = "policy_blocked"
 SKIP_TIME_BUDGET = "time_budget"
 
 
+def resolve_precondition_legs(value, *, time_boxed: bool) -> int | None:
+    """`engagement.max_precondition_legs` as investigate_worklist takes it. `auto`
+    (or unset) is no count bound for a time-boxed run, whose deadline bounds the
+    legs, and 24 otherwise; `unlimited` is no bound; a number is that bound (0: no
+    legs)."""
+    word = str(value).strip().lower() if value is not None else "auto"
+    if word == "auto":
+        return None if time_boxed else 24
+    if word == "unlimited":
+        return None
+    return max(0, int(value))
+
+
 def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
                  policy_blocked_leg: bool) -> str:
     """Why a node that reached the end of one sweep iteration with no agent
@@ -436,7 +449,7 @@ async def investigate_worklist(
     precondition_fn=None,
     stop_on_confirm: bool = False,
     max_nodes: int = 8,
-    max_precondition_legs: int = 24,
+    max_precondition_legs: int | None = 24,
     step_budget: int = 16,
     id_fill: str = "1",
     worklist_limit: int = 200,
@@ -444,6 +457,7 @@ async def investigate_worklist(
     deadline: float | None = None,
     completed: dict[str, dict] | None = None,
     on_outcome=None,
+    legs_done: set[str] | None = None,
 ) -> list[dict]:
     """Drive `probe_fn` over the top `max_nodes` actionable worklist nodes.
 
@@ -485,6 +499,10 @@ async def investigate_worklist(
     `iterative_diagnostics` (AR-10 P1): the agent probes' AR-09 counts summed per
     run and per stop reason; see `iterative_diagnostics()`.
 
+    `max_precondition_legs` bounds the nodes whose shape-driven legs one sweep
+    attempts; past it a warranted node is skipped as budget_exhausted. None means
+    no count bound (a time-boxed engagement bounds them by `deadline`).
+
     `deadline`, a `time.monotonic()` value, stops the sweep starting work on a
     node once passed; every later node that had work due is skipped as
     `time_budget`, and one with nothing to run keeps its own reason.
@@ -495,6 +513,12 @@ async def investigate_worklist(
     outcome marked `resumed`, without calling probe_fn, confirm_fn or precondition_fn.
     `on_outcome(node_key, outcome)` is called as each node's outcome finishes (an
     errored probe is not reported, so it runs again on resume).
+
+    `legs_done` (retry rounds) holds the node_key of every node whose shape-driven
+    legs an earlier sweep of this run already attempted. They are deterministic, so
+    they are not sent again: such a node spends no precondition budget, and one with
+    no agent work left is passed over without a skip entry. Each node whose legs run
+    here is added (not one whose leg raised, so that leg is tried again).
 
     Returns a per-node outcome list; findings are folded back into `state`."""
     from harness.coverage_tracker import _principal_of
@@ -558,13 +582,21 @@ async def investigate_worklist(
                    else role_headers.get(probe_role, {}))
         parent_id = _parent_template_object_id(state, node)
         exchange = _seed_exchange(base_url, node, headers, parent_id or id_fill)
+        key = (node_key(node) if (completed is not None or on_outcome is not None
+                                  or legs_done is not None) else "")
         # 2026-11-03 yield analysis: only a node whose shape warrants a leg spends
         # the precondition budget. Counting every node let the first 24 nodes --
         # most warranting nothing -- exhaust it, so a later write endpoint with a
         # real body was reported as missing_template/no_applicable_hypothesis.
         warrants = precond_possible and _precondition_warranted(precondition_fn, node, exchange)
-        do_precond = warrants and precondition_run < max_precondition_legs
+        legs_ran_before = warrants and legs_done is not None and key in legs_done
+        if legs_ran_before:
+            warrants = False
+        do_precond = warrants and (max_precondition_legs is None
+                                   or precondition_run < max_precondition_legs)
         if not do_agent and not do_precond:
+            if legs_ran_before and not eligible:
+                continue  # an earlier sweep of this run attempted its legs; nothing new
             reason = (SKIP_BUDGET_EXHAUSTED if warrants
                       else _skip_reason(node, eligible, investigated, max_nodes, False))
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
@@ -572,7 +604,6 @@ async def investigate_worklist(
             continue
 
         # E7: a node an earlier run finished needs no work, so the deadline does not apply.
-        key = node_key(node) if (completed is not None or on_outcome is not None) else ""
         if completed is not None and key in completed:
             stored = completed[key]
             if do_precond:
@@ -605,6 +636,7 @@ async def investigate_worklist(
             # confirmed -- otherwise max_precondition_legs was a confirmation ceiling
             # that never bit on the far-more-common no-finding path.
             precondition_run += 1
+            leg_raised = False
             try:
                 precond_findings = await precondition_fn(node, exchange) or []
             except SafetyGateBlocked:
@@ -617,6 +649,9 @@ async def investigate_worklist(
                 log.debug("precondition_fn failed on %s %s: %s",
                           node.get("method"), node.get("path"), e)
                 precond_findings = []
+                leg_raised = True
+            if legs_done is not None and not leg_raised:
+                legs_done.add(key)
             if precond_findings:
                 for f in precond_findings:
                     f.setdefault("url", exchange.url)

@@ -145,7 +145,15 @@ class CircuitBreaker:
     def is_half_open(self) -> bool:
         """Check if circuit is half-open (testing recovery)."""
         return self._state == CircuitState.HALF_OPEN
-    
+
+    def seconds_until_retry(self) -> float:
+        """Seconds until a call is let through again: 0 unless OPEN with its timeout
+        still running. The state itself only changes on the next call, so `is_open`
+        stays true after the timeout has passed."""
+        if self._state != CircuitState.OPEN or not self.config.enabled or self._last_state_change is None:
+            return 0.0
+        return max(0.0, self.config.timeout_seconds - (time.time() - self._last_state_change))
+
     def _should_trip(self) -> bool:
         """Check if the circuit should trip (open)."""
         return (self._consecutive_failures >= self.config.failure_threshold and 

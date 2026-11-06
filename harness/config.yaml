@@ -404,6 +404,45 @@ engagement:
     min_new_routes: 1
     max_new_routes: 200
     max_routes_per_round: 50
+  # Shape-driven confirmation legs one worklist sweep may attempt; nodes past it
+  # are reported as budget_exhausted. `auto`: no count bound when the run is
+  # time-boxed (investigation_seconds; the deadline bounds the legs), else 24.
+  # `unlimited`, or a number (0 turns the legs off). r3 skipped 262 warranted
+  # nodes at the old fixed 24.
+  max_precondition_legs: auto
+  # Method+path operations engagement discovery probes with every role. 0 (the
+  # default) probes every discovered operation; a cap cuts the sorted list, so it
+  # drops routes by name, not by value (r3 lost 64 of 214 operations at 150).
+  # A request's discovery_max_endpoints overrides it.
+  discovery_max_endpoints: 0
+  # Retry rounds (harness/retry_rounds.py). When on, with investigation_seconds set,
+  # the time left after the coverage drive is not given back: until reserve_seconds
+  # before the deadline, rounds sweep the worklist and review captures again, round r
+  # with max_nodes, step_budget (capped at max_step_budget), max_precondition_legs
+  # and capture_review_limit multiplied by growth^r. A round probes the nodes an
+  # earlier budget skipped, the probes that ended on a model error or out of steps,
+  # and the captures whose model review failed; settled work and deterministic legs
+  # are not repeated. It waits up to breaker_wait_seconds for an open Ollama circuit
+  # breaker, and stops early after max_rounds (0: none) or max_idle_rounds rounds in
+  # a row with nothing settled or found (0: never). DEFAULT OFF: it sends active traffic.
+  retry_rounds:
+    enabled: false
+    growth: 2
+    max_rounds: 0
+    reserve_seconds: 300
+    max_step_budget: 1024
+    breaker_wait_seconds: 120
+    max_idle_rounds: 3
+  # Server errors the run's own sends drew (harness/server_errors.py). The transport
+  # scans the first bodies of each route's 5xx answers (passive: nothing is sent, only
+  # parameter names are kept). A stack trace becomes a confirmed verbose_error_disclosure;
+  # a database error becomes an sql_injection / nosql_injection lead, reported under
+  # `server_errors` in the investigate result. Up to max_lead_confirmations leads go to
+  # the sqlmap / nosql leg with the route's captured template. DEFAULT 0: dispatch
+  # sends active traffic, so the leads stay leads unless it is raised.
+  server_errors:
+    enabled: true
+    max_lead_confirmations: 0
   # Graph -> experiment -> workflow -> proof cycle (experiment.py). When enabled, each
   # IDOR/BOLA business-context hypothesis is turned into a stateful cross-account
   # test (create a private object as one identity, read it as that identity and as

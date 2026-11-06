@@ -382,10 +382,14 @@ class ReadinessInputTests(unittest.TestCase):
         self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login')['status'],'ready')
 
     def test_unavailable_adapter_protocol_and_disable_dispositions(self):
-        for check in ('WSTG-CONF-02','WSTG-CONF-06','WSTG-CONF-07','WSTG-ERRH-01','WSTG-INFO-02','WSTG-INFO-05'):
+        for check in ('WSTG-CONF-02','WSTG-CONF-06','WSTG-ERRH-01','WSTG-INFO-02','WSTG-INFO-05'):
             result=self.decide(check)
             self.assertEqual(result['reason_code'],'check_adapter_missing');self.assertIsNone(result['finding_class'])
         self.assertEqual(self.decide('WSTG-CRYP-01')['reason_code'],'protocol_inapplicable')
+        # HSTS is ignored over plain HTTP (RFC 6797 8.1); over HTTPS its adapter is missing.
+        self.assertEqual(self.decide('WSTG-CONF-07')['reason_code'],'protocol_inapplicable')
+        self.assertEqual(self.decide('WSTG-CONF-07',url='https://fixture.invalid/register')['reason_code'],
+                         'check_adapter_missing')
         registry=self.registry();registry.active_enabled=False
         from harness.models import HttpExchange
         result=registry.capability_for_check(CHECKS_BY_ID['WSTG-CONF-05'],HttpExchange(url='http://fixture.invalid',method='GET'))

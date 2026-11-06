@@ -159,6 +159,13 @@ class SafeDefaultGuardTests(unittest.TestCase):
          lambda cfg: cfg.get("engagement", {}).get("experiments", {}).get("enabled", False) is False),
         ("engagement.experiments.planner",
          lambda cfg: cfg.get("engagement", {}).get("experiments", {}).get("planner", False) is False),
+        # Retry rounds sweep the worklist again until the deadline.
+        ("engagement.retry_rounds.enabled",
+         lambda cfg: cfg.get("engagement", {}).get("retry_rounds", {}).get("enabled", False) is False),
+        # Server-error leads dispatched to sqlmap / the nosql leg.
+        ("engagement.server_errors.max_lead_confirmations",
+         lambda cfg: not cfg.get("engagement", {}).get("server_errors", {}).get(
+             "max_lead_confirmations", 0)),
     ]
 
     def test_passive_privacy_guard(self):
@@ -204,6 +211,8 @@ class SafeDefaultGuardTests(unittest.TestCase):
         "cross_site_poc.enabled": True,
         "engagement.experiments.enabled": True,
         "engagement.experiments.planner": True,
+        "engagement.retry_rounds.enabled": True,
+        "engagement.server_errors.max_lead_confirmations": 2,
     }
 
     @staticmethod

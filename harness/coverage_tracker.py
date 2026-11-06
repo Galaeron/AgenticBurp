@@ -150,7 +150,10 @@ _LEG_STATUS = {
 }
 _LEG_STATUS_UNKNOWN = CellStatus.INCONCLUSIVE
 # The case driver's mapping: it keeps a validator's controlled_negative distinct.
+# A validator's "safe" is its executed negative here too, as in _LEG_STATUS (r3:
+# 208 CORS cases that sent their probes and passed stayed inconclusive without it).
 _CASE_STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.NOT_DETECTED,
+                "safe": CellStatus.NOT_DETECTED,
                 "controlled_negative": CellStatus.CONTROLLED_NEGATIVE,
                 "blocked": CellStatus.BLOCKED, "inconclusive": CellStatus.INCONCLUSIVE,
                 "skipped": CellStatus.SKIPPED, "error": CellStatus.ERROR}
@@ -355,9 +358,18 @@ class CoverageTracker:
                 else (identities[0] if identities else "anonymous"))
 
     def record_findings_from_state(self, endpoints: dict[str, dict], identities: list[str],
-                                   identity_roles: dict[str, str] | None = None) -> int:
+                                   identity_roles: dict[str, str] | None = None, *,
+                                   late: bool = False) -> int:
         """Record CONFIRMED/DETECTED cells from the findings attached to each
-        endpoint, attributed to the endpoint's probe identity. Returns cells set."""
+        endpoint, attributed to the endpoint's probe identity. Returns cells set.
+
+        `late` records findings produced after the matrix was driven (retry rounds)
+        into the cells it already has, and counts only the cells it changes: a
+        confirmed finding is recorded anywhere (a confirmation outranks a driven
+        negative, and `record` never overwrites a confirmed cell); a detected one
+        only fills a cell no leg executed, so a driven verdict is never overturned
+        by an agent label. A cell the matrix does not have is left out: a late
+        finding does not grow the denominator after the drive."""
         n = 0
         for ep_key, ep in endpoints.items():
             findings = ep.get("findings") or []
@@ -369,6 +381,11 @@ class CoverageTracker:
                 confirmed = bool(f.get("confirmed"))
                 status = CellStatus.CONFIRMED if confirmed else CellStatus.DETECTED
                 for check_id in self.checks_for_class(vc):
+                    if late:
+                        cell = self.matrix.get(ident, ep_key, check_id)
+                        if (cell is None or cell.status in (status, CellStatus.CONFIRMED)
+                                or (not confirmed and cell.executed)):
+                            continue
                     self.matrix.record(
                         ident, ep_key, check_id, status=status,
                         reason=f"{'confirmed' if confirmed else 'detected'} {vc}",
@@ -1053,7 +1070,8 @@ def build_coverage(state, roles, investigated_keys: set[str] | None = None,
 async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | None = None,
                                 budget: int = 80, investigated_keys: set[str] | None = None,
                                 checkpoint=None, context_key="",
-                                deadline: float | None = None, on_checkpoint=None, readiness=None) -> dict:
+                                deadline: float | None = None, on_checkpoint=None, readiness=None,
+                                tracker_out: list | None = None) -> dict:
     """Like build_coverage, but ACTIVELY DRIVES the deterministic legs (I1): after
     recording the findings the run already produced, it fires every applicable
     leg-backed cell via `run_leg` (regardless of any agent label) and records the
@@ -1076,6 +1094,8 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     report["legs_driven"] = driven
     report["drive_stopped_by"] = tracker.stopped_by
     report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
+    if tracker_out is not None:
+        tracker_out.append(tracker)
     return report
 
 
@@ -1084,7 +1104,8 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
                                       parameter_field_cap: int = PER_PARAMETER_FIELD_CAP,
                                       investigated_keys: set[str] | None = None,
                                       checkpoint=None, context_key="",
-                                      deadline: float | None = None, on_checkpoint=None, readiness=None) -> dict:
+                                      deadline: float | None = None, on_checkpoint=None, readiness=None,
+                                      tracker_out: list | None = None) -> dict:
     """Case-granular coverage driving (T05/R26): enumerate each applicable leg
     cell's concrete input cases from the endpoint template, then fire a leg PER
     CASE via `run_case(identity, method, path, check, case_key)` and record the
@@ -1113,4 +1134,28 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     report["cases_driven"] = driven
     report["drive_stopped_by"] = tracker.stopped_by
     report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
+    if tracker_out is not None:
+        tracker_out.append(tracker)
+    return report
+
+
+def refresh_after_retry_rounds(tracker, previous: dict, state, roles,
+                               investigated_keys: set[str] | None = None) -> dict:
+    """Re-issue a driven coverage report once retry rounds have run.
+
+    The matrix is built and driven before the retry rounds, so findings those rounds
+    produce would otherwise be missing from it. This records them into the same
+    tracker (`record_findings_from_state(late=True)`: no driven verdict overturned,
+    no new cells) and returns a fresh report that keeps the drive's statistics from
+    `previous`. Returns `previous` unchanged when the rounds changed no cell."""
+    endpoints = endpoint_view(state)
+    identities, identity_roles = _identities_of(roles)
+    changed = tracker.record_findings_from_state(endpoints, identities, identity_roles, late=True)
+    if not changed:
+        return previous
+    tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
+    report = tracker.report()
+    for key, value in previous.items():
+        report.setdefault(key, value)
+    report["refreshed_after_retry_rounds"] = changed
     return report

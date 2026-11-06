@@ -942,7 +942,7 @@ class ChainMixin:
     @identity_headers.leased
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
-                                     discovery_max_endpoints: int = 150,
+                                     discovery_max_endpoints: int | None = None,
                                      discovery_max_pages: int = 40,
                                      active_discovery: bool = True,
                                      max_chain_rounds: int = 1, run_context=None,
@@ -963,6 +963,9 @@ class ChainMixin:
         `roles` is a list of role_crawl.RoleSession. Requires iterative_agent
         enabled (run_active_probe enforces it). `max_chain_rounds` bounds the
         Milestone-C closed loop (re-test AS a credential learned from a finding).
+        `discovery_max_endpoints` caps the method+path operations discovery probes
+        with every role; None takes `engagement.discovery_max_endpoints` (default 0:
+        every discovered operation, so the worklist sees the whole surface).
         `protected_paths` and `owners` are the operator's engagement declarations
         (I16): merged into the state after discovery, where the missing-auth (RV-S)
         and ownership (RV-T) confirmations read them. None or empty changes nothing."""
@@ -981,6 +984,10 @@ class ChainMixin:
         # drive), and bound the investigation stages by wall-clock time.
         _investigation_deadline = (time.monotonic() + self.investigation_seconds
                                    if self.investigation_seconds > 0 else None)
+        if discovery_max_endpoints is None:
+            discovery_max_endpoints = (self.config.get("engagement") or {}).get(
+                "discovery_max_endpoints", 0)
+        discovery_max_endpoints = max(0, int(discovery_max_endpoints or 0))
         # Crawl loop (all off by default): per-principal crawls, route feedback with
         # re-crawl rounds, and per-phase time-slices of the deadline above.
         from harness.phase_schedule import PhaseSchedule
@@ -1083,6 +1090,23 @@ class ChainMixin:
                             if _resuming else None),
                 "on_review": lambda key, payload: _journal_put(f"review:{key}", payload),
                 "summary_out": _review_summary}
+        # engagement.retry_rounds (off by default): record what every sweep and review
+        # settles, so the time left after the coverage drive goes to the work they left.
+        from harness import retry_rounds
+        _retry_cfg = retry_rounds.RetryRoundsConfig.from_config(self.config)
+        _retry_ledger = None
+        _retry_report: dict = {"enabled": False}
+        if _retry_cfg.enabled and _investigation_deadline is None:
+            _retry_report = {"enabled": True, "rounds": [], "stopped_by": "no_deadline"}
+        elif _retry_cfg.enabled:
+            _retry_ledger = retry_rounds.RetryLedger()
+            _worklist_kwargs = _retry_ledger.wire(_worklist_kwargs)
+            _review_kwargs["model_failed"] = _retry_ledger.review_failed
+        # The shape-driven legs one sweep may attempt: by default no count bound when
+        # the run is time-boxed (its deadline bounds them), else 24.
+        _max_precondition_legs = worklist_investigator.resolve_precondition_legs(
+            (self.config.get("engagement") or {}).get("max_precondition_legs"),
+            time_boxed=_investigation_deadline is not None)
 
         # Operator/capture supplied shapes (for example the runner's successful
         # login setup exchange) are first-class evidence. They do not trigger new
@@ -1621,7 +1645,9 @@ class ChainMixin:
                 except Exception:
                     return
             elif ("sqli" in low or "sql injection" in low
-                  or "sql_injection" in low):
+                  or "sql_injection" in low) and "nosql" not in low:
+                # ("nosql injection" contains "sql injection": a NoSQL finding is the
+                # nosql leg's, below, never sqlmap's.)
                 try:
                     await _apply(
                         finding,
@@ -1879,6 +1905,7 @@ class ChainMixin:
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
                 max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary,
+                max_precondition_legs=_max_precondition_legs,
                 stop_on_confirm=stop_on_confirm, deadline=deadline,
                 **_worklist_kwargs)
             timed_out = (worklist_summary.get("skipped_by_reason") or {}).get("time_budget", 0)
@@ -2258,14 +2285,17 @@ class ChainMixin:
         _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds
                               if self.coverage_drive_seconds > 0 else None)
         coverage: dict = {}
+        # The driven tracker, kept so retry rounds' findings can be recorded into it
+        # (coverage_tracker.refresh_after_retry_rounds).
+        _coverage_trackers: list = []
         _prerequisite_blocks: dict = {}   # (endpoint, identity) -> grouped entry (E5b)
         try:
             from harness import coverage_tracker
             # E7: a caller's checkpoint wins; otherwise the journal's, when an earlier attempt
             # got far enough to write one. It is handed back every N legs of the drive.
-            _coverage_kwargs: dict = {}
+            _coverage_kwargs: dict = {"tracker_out": _coverage_trackers}
             if _journal is not None:
-                _coverage_kwargs = {"on_checkpoint": lambda cp: _journal_put("coverage:checkpoint", cp)}
+                _coverage_kwargs["on_checkpoint"] = lambda cp: _journal_put("coverage:checkpoint", cp)
                 _stored_checkpoint = (_journal_read(lambda: _journal.get("coverage:checkpoint"), None)
                                       if _resuming and coverage_checkpoint is None else None)
                 if _stored_checkpoint is not None:
@@ -2543,6 +2573,152 @@ class ChainMixin:
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
 
+        # engagement.server_errors (harness/server_errors.py): the 5xx answers this run's
+        # own sends drew. A stack trace is a confirmed disclosure; a database error is an
+        # injection lead, and up to max_lead_confirmations leads go to the leg for their
+        # class with the route's captured template. Runs here and again after the retry
+        # rounds, for the errors their sends drew.
+        _se_cfg = ((self.config.get("engagement") or {}).get("server_errors") or {})
+        _server_error_report: dict = {"enabled": bool(_se_cfg.get("enabled", True)),
+                                      "findings": 0, "leads": 0, "leads_dispatched": 0,
+                                      "leads_confirmed": 0, "leads_not_dispatched": {}}
+        _server_error_done: dict = {}   # finding key -> confirmed, as ingested
+
+        def _server_error_exchange(method, url, lead):
+            """The route's captured template as its lowest-trust reaching identity. A
+            query parameter the lead names but the template lacks gets a neutral value."""
+            from urllib.parse import parse_qsl, urlencode, urlsplit
+            from harness.engagement import normalize_path
+            ep = state.endpoints.get(f"{method.upper()} {normalize_path(url)}")
+            if ep is None:
+                return None
+            node = ep.to_dict()
+            reach = node.get("reachable_roles") or []
+            role = min(reach, key=worklist_investigator._trust) if reach else None
+            ident = next((r for r in roles if r.role == role), None)
+            ex = worklist_investigator._seed_exchange(
+                base_url, node, dict(getattr(ident, "headers", None) or {}), "1")
+            name = lead.get("parameter_name")
+            if lead.get("parameter_location") == "query" and name and name not in {
+                    k for k, _ in parse_qsl(urlsplit(ex.url).query, keep_blank_values=True)}:
+                ex.url += ("&" if "?" in ex.url else "?") + urlencode({name: "1"})
+            return ex
+
+        async def _server_error_pass() -> int:
+            ledger = getattr(run_context, "server_errors", None) if run_context is not None else None
+            if ledger is None or not _server_error_report["enabled"]:
+                return 0
+            max_leads = int(_se_cfg.get("max_lead_confirmations", 0) or 0)
+            skipped = _server_error_report["leads_not_dispatched"]
+            changed = 0
+            for f in ledger.findings():
+                method = f.pop("method", "GET")
+                key = f"{method} {f['url']} {f['vulnerability_class']}"
+                if key in _server_error_done:
+                    continue
+                if not f.get("confirmed"):
+                    _server_error_report["leads"] += 1
+                    reason = ("max_lead_confirmations"
+                              if _server_error_report["leads_dispatched"] >= max_leads
+                              else "cancelled" if (run_context is not None
+                                                   and run_context.cancel.cancelled)
+                              else "deadline" if (_investigation_deadline is not None
+                                                  and time.monotonic() >= _investigation_deadline)
+                              else "")
+                    exchange = None if reason else _server_error_exchange(method, f["url"], f)
+                    if exchange is None:
+                        reason = reason or "no_endpoint"
+                        skipped[reason] = skipped.get(reason, 0) + 1
+                    else:
+                        _server_error_report["leads_dispatched"] += 1
+                        try:
+                            await _confirm(f, exchange)
+                        except Exception as e:  # a lead stays a lead
+                            log.debug("server-error lead on %s: %s", f["url"], e)
+                        _server_error_report["leads_confirmed"] += int(bool(f.get("confirmed")))
+                _server_error_report["findings"] += 1
+                _server_error_done[key] = bool(f.get("confirmed"))
+                state.ingest_findings(f["url"], method, [f])
+                all_findings.append(dict(f, method=method))
+                changed += 1
+            return changed
+
+        _server_error_changed = 0
+        try:
+            _server_error_changed += await _server_error_pass()
+        except Exception as e:  # a report layer plus bounded legs -- never sink the run
+            log.warning("investigate_engagement: server-error follow-up failed: %s", e)
+            _errors.append({"phase": "server_errors", "error": f"{type(e).__name__}: {e}"})
+
+        # engagement.retry_rounds: until reserve_seconds before the deadline, sweep the
+        # worklist and review captures again with growing budgets, for the nodes and
+        # captures earlier passes left (harness/retry_rounds.py). Off by default.
+        if _retry_ledger is not None:
+            _instr.phases.begin("retry_rounds")
+
+            async def _retry_sweep(budgets, deadline):
+                summary: dict = {}
+                outs = await worklist_investigator.investigate_worklist(
+                    _probe, state, base_url, roles, confirm_fn=_confirm,
+                    precondition_fn=_precondition, max_nodes=budgets["max_nodes"],
+                    step_budget=budgets["step_budget"],
+                    max_precondition_legs=budgets["max_precondition_legs"],
+                    summary_out=summary, stop_on_confirm=stop_on_confirm, deadline=deadline,
+                    **_retry_ledger.sweep_kwargs())
+                fresh = [o for o in outs if not o.get("resumed")]
+                outcomes.extend(fresh)
+                all_findings.extend(f for o in fresh for f in o.get("findings_detail", []))
+                return fresh, summary
+
+            async def _retry_review(budgets, deadline):
+                stats = new_review_stats()
+                produced = await review_captured_exchanges(
+                    self, state, _all_captured, run_context=run_context,
+                    seen=_reviewed_captures, errors=_retry_report.setdefault("errors", []),
+                    stats=stats, max_reviews=budgets["max_reviews"], deadline=deadline,
+                    **_review_kwargs)
+                return stats["reviewed"], produced
+
+            try:
+                _retry_report.update(await retry_rounds.run_retry_rounds(
+                    _retry_cfg, _retry_ledger, deadline=_investigation_deadline,
+                    base_budgets={"max_nodes": max_nodes, "step_budget": step_budget,
+                                  "max_precondition_legs": _max_precondition_legs,
+                                  "max_reviews": self.capture_review_limit},
+                    sweep=_retry_sweep, review=_retry_review, reviewed=_reviewed_captures,
+                    cancelled=lambda: bool(run_context is not None
+                                           and run_context.cancel.cancelled)))
+            except Exception as e:  # extra rounds are a bonus -- never sink the run
+                log.warning("investigate_engagement: retry rounds failed: %s", e)
+                _errors.append({"phase": "retry_rounds", "error": f"{type(e).__name__}: {e}"})
+            log.info("investigate_engagement: retry rounds -- %d round(s), stopped by %s",
+                     len(_retry_report.get("rounds") or []), _retry_report.get("stopped_by"))
+
+        if _retry_ledger is not None and _retry_report.get("rounds"):
+            try:   # the server errors the rounds' own sends drew
+                _server_error_changed += await _server_error_pass()
+            except Exception as e:
+                log.warning("investigate_engagement: server-error follow-up failed: %s", e)
+                _errors.append({"phase": "server_errors", "error": f"{type(e).__name__}: {e}"})
+        if run_context is not None and _server_error_report["enabled"]:
+            _server_error_report["ledger"] = run_context.server_errors.report()
+        # The matrix was built before the rounds and the server-error follow-up: record
+        # what they found into it.
+        if coverage and (_server_error_changed or (_retry_ledger is not None
+                                                   and _retry_report.get("rounds"))):
+            try:
+                if _coverage_trackers:
+                    coverage = coverage_tracker.refresh_after_retry_rounds(
+                        _coverage_trackers[-1], coverage, state, roles,
+                        investigated_keys=investigated_keys)
+                elif not coverage.get("legs_driven"):   # the passive matrix: rebuild it
+                    coverage = coverage_tracker.build_coverage(
+                        state, roles, investigated_keys=investigated_keys)
+            except Exception as e:  # coverage is a report layer -- never sink the run
+                log.warning("investigate_engagement: coverage refresh failed: %s", e)
+                _errors.append({"phase": "coverage_refresh",
+                                "error": f"{type(e).__name__}: {e}"})
+
         # AR-FP: the bounded final re-evaluation of experiment tasks over the values
         # and sessions every later phase left, before proofs are projected and the
         # dispositions taken. Inside the coverage stage's deadline; best-effort like
@@ -2637,6 +2813,7 @@ class ChainMixin:
                 "spa_views": getattr(rc, "spa_views", None) or [],
                 "recrawl": _recrawl_report,
                 "phase_schedule": _schedule.report() if _schedule.active else None,
+                "retry_rounds": _retry_report,
                 "session_events": list(getattr(run_context.freshness(), "events", []) or [])
                                   if run_context is not None and hasattr(run_context, "freshness") else [],
             },
@@ -2644,6 +2821,9 @@ class ChainMixin:
             # business-context pass is off), so the API/report can show the
             # inferred roles/objects/workflows/value-flows/sinks and the ranked
             # chaining hypotheses that drove the re-ranking.
+            # engagement.server_errors: the 5xx answers this run's own sends drew, and
+            # the disclosures and injection leads followed up from them.
+            "server_errors": _server_error_report,
             "application_semantic_model": _asm.to_dict() if _asm else None,
             "experiments": _experiments,
             "experiment_preflight": _experiment_dispositions,

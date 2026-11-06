@@ -67,6 +67,21 @@ deserialization validator proves RCE by making the target call back to a
 local collaborator — treat that as a different class of test that your rules
 of engagement may require explicit sign-off for.
 
+For a time-boxed engagement investigation (`investigation_seconds`), two further
+opt-ins spend the run's time on follow-ups. Both send active traffic:
+
+```yaml
+engagement:
+  retry_rounds:
+    enabled: true               # re-sweep skipped nodes / failed reviews until the deadline
+  server_errors:
+    max_lead_confirmations: 5   # send database-error leads from the run's own 5xx to sqlmap / the nosql leg
+```
+
+The server-error ledger itself is passive and on by default. The result's
+`server_errors` key lists every route that answered 5xx, even when no lead is
+sent. `passive-only` forces both opt-ins off.
+
 **Set a request rate limit** for any real engagement (the default is unlimited):
 
 ```yaml
