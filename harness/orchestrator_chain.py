@@ -1225,7 +1225,8 @@ class ChainMixin:
             # ARCH-1: forward THIS engagement's run_context so the iterative
             # probe's sends spend the run's budget/transport, not a throwaway one.
             return await self.run_active_probe(exchange, hypothesis, specialty,
-                                               step_budget=sb, run_context=run_context)
+                                               step_budget=sb, run_context=run_context,
+                                               deadline=_investigation_deadline)
 
         # Cross-identity confirmation for the investigation path: register the
         # roles as replay identities and confirm access-control findings the

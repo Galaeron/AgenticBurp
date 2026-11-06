@@ -125,6 +125,7 @@ class ConfirmMixin:
         step_budget: int | None = None,
         on_step=None,
         run_context=None,
+        deadline: float | None = None,
     ) -> dict:
         """Drive the iterative agent (F4) against one captured exchange, then
         integrate its result through F2 (pivot_memory): hold the findings as
@@ -135,7 +136,8 @@ class ConfirmMixin:
         Off unless iterative_agent.enabled is set in config -- this is a
         fundamentally more active mode than the passive pipeline. Mutating steps
         remain gated by the safety gate on top of that flag. Scope is enforced
-        against allowed_hosts inside the agent."""
+        against allowed_hosts inside the agent. `deadline` (a time.monotonic()
+        value) is the owning run's: the agent's model-retry waits stop short of it."""
         if not self.iterative_agent_enabled:
             raise RuntimeError(
                 "iterative agent is disabled (set iterative_agent.enabled in config.yaml)")
@@ -162,8 +164,8 @@ class ConfirmMixin:
         # config iterative_agent.max_requests.
         owned_ctx = None
         probe_ctx = run_context
+        _ia_cfg = (self.config or {}).get("iterative_agent", {}) or {}
         if probe_ctx is None:
-            _ia_cfg = (self.config or {}).get("iterative_agent", {}) or {}
             _cfg_max = _ia_cfg.get("max_requests")
             ceiling = effective_budget * 2 + 10 if _cfg_max is None else _cfg_max
             if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
@@ -178,6 +180,7 @@ class ConfirmMixin:
             max_steps=self.iterative_agent_max_steps, run_context=probe_ctx,
             experiment_handoff=experiment_handoff,
             experiment_catalog=lambda: self._experiment_catalog(probe_ctx),
+            model_error_retries=_ia_cfg.get("model_error_retries"), deadline=deadline,
         )
 
         # Publish each step to the live feed (V1), and still call any caller-
