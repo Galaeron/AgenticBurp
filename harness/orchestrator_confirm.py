@@ -595,7 +595,8 @@ class ConfirmMixin:
                             f"no confirmation validator available for class "
                             f"{finding.vulnerability_class!r}",
                             data={"not_tested": f"no validator applies to "
-                                                 f"vulnerability_class={finding.vulnerability_class!r}"},
+                                                 f"vulnerability_class={finding.vulnerability_class!r}",
+                                  "reason_code": "no_applicable_leg"},
                             provenance=evidence_ledger.Provenance.capture(
                                 config=getattr(self, "config", {})),
                             case_ref=case.case_id)

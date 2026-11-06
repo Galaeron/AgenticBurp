@@ -202,6 +202,13 @@ class IdorReadValidator(Validator):
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if (exchange.method or "GET").upper() != "GET":
             return False
+        # An object-access claim only: a GET that merely carries an id is not an
+        # IDOR hypothesis, so an XSS/SQLi/JWT finding there is never sent here (r5:
+        # every class on /rest/basket/<id> was routed to this leg).
+        from harness import access_control_gate
+        if not (super().applies(finding, exchange)
+                or access_control_gate._is_access_control_class(finding.vulnerability_class)):
+            return False
         return _locate_id(exchange) is not None
 
     def _skip(self, why: str) -> ValidationResult:

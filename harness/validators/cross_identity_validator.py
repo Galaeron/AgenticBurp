@@ -283,7 +283,19 @@ class CrossIdentityValidator(Validator):
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         # Reuse the access-control gate's markers so the two never drift.
-        return access_control_gate._is_access_control_class(finding.vulnerability_class)
+        if not access_control_gate._is_access_control_class(finding.vulnerability_class):
+            return False
+        return self.shape_applies(exchange)
+
+    @staticmethod
+    def shape_applies(exchange: HttpExchange) -> bool:
+        """The request shapes this leg can test: a GET (it replays reads only) that
+        names an object to swap or reaches an admin-namespaced function. Any other
+        shape (a login POST, a collection read like /rest/memories/) is never sent
+        here, so the leg's own "skipped" is not recorded as having tested it (r5)."""
+        if (exchange.method or "GET").upper() != "GET":
+            return False
+        return has_object_identifier(exchange.url) or is_admin_namespaced(exchange.url)
 
     async def _probe(self, url: str, headers: dict,
                      session_ref: str | None = None) -> identity_compare.Probe:
