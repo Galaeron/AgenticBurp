@@ -2778,6 +2778,9 @@ class ChainMixin:
             _errors.append({"phase":"experiment_projection", "error":type(exc).__name__})
             _experiment_projection = {"cases":[{"status":"unresolved", "reason":"experiment projection unavailable"}], "findings":[]}
         coverage["experiment_cases"] = _experiment_projection["cases"]
+        # r5: write operations the surface named but the run never sent, with why
+        # (gate policy or path guard), so they are listed rather than omitted.
+        coverage["withheld_operations"] = list(getattr(rc, "withheld_operations", None) or [])
         from harness.experiment import task_dispositions
         _experiment_dispositions = task_dispositions(state, run_context,
             enabled=bool(self._experiments_config().get('enabled', False)),
@@ -2875,6 +2878,8 @@ class ChainMixin:
             # running again, and the requests that saved (by validator).
             "execution_registry": _exec_registry.stats(),
             "coverage": coverage,
+            "withheld_operations": coverage.get("withheld_operations", []),
+            "discovery_bounds": list(getattr(rc, "discovery_bounds", None) or []),
             # E5b: each (endpoint, identity) the coverage drive could not replay
             # because no request was observed as that identity, once, with the
             # number of checks it blocked and what to supply.

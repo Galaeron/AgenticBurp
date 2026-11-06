@@ -206,6 +206,11 @@ async def crawl(
                 else:
                     safe_paths.add(found_path)
             result.endpoints |= safe_paths
+            # A query-bearing literal or link keeps its parameter names, so the role
+            # crawl records the input shape (/redirect?to=, ...?current=) with the path.
+            result.endpoints |= {
+                p for p in found.paths_with_query
+                if not _DESTRUCTIVE_NAVIGATION.search(urlsplit(p).path or "/")}
             result.external_urls |= found.external_urls
             result.from_request_calls |= {
                 p for p in found.from_request_calls

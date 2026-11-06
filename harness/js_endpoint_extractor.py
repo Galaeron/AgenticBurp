@@ -28,6 +28,11 @@ _PATH = r"/[A-Za-z0-9_\-./~%${}:]+"
 # more char, and rejects `//` (protocol-relative handled separately) and bare
 # `/`.
 _QUOTED_PATH = re.compile(r"""['"`](/(?!/)[A-Za-z0-9_\-./~%${}:]*[A-Za-z0-9_\-}%])['"`]""")
+# r5: a literal the bundle concatenates a query onto ("/rest/user/change-password?
+# current=" + ...) ends in "?name=", so _QUOTED_PATH's closing quote never matched
+# and the route was never requested. The query is kept as an input shape.
+_QUOTED_QUERY_PATH = re.compile(
+    r"""['"`](\.?/(?!/)[A-Za-z0-9_\-./~%:]*[A-Za-z0-9_\-])\?([A-Za-z0-9_\-.~%=&:/+]*)['"`]""")
 
 # Slash-less API literals a bundle joins onto a host variable itself
 # (`this.host + "api/Users"`, `"rest/products/search"`): the leading slash is
@@ -133,12 +138,110 @@ def extract_call_shapes(body: str) -> list[CallShape]:
                 path, method = m.group(1), m.group(2)
             if _looks_like_endpoint(path):
                 shapes.add(CallShape(method=method.upper(), path=_normalize(path)))
+    for method, path in _host_variable_calls(body):
+        norm = _normalize(path)
+        if _looks_like_endpoint(norm):
+            shapes.add(CallShape(method=method.upper(), path=norm))
     return sorted(shapes, key=lambda s: (s.path, s.method))
+
+
+def _query_shape(query: str) -> str:
+    """The parameter names of a literal query, each with a placeholder value. An
+    absolute URL value (a redirect link's destination) becomes same-origin "/", so
+    replaying the shape never points the target at another host."""
+    pairs = []
+    for part in (query or "").split("&"):
+        name, _, value = part.partition("=")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\-.]{0,40}", name or ""):
+            continue
+        if re.match(r"(?i)[a-z][a-z0-9+.-]*:|//", value):
+            value = "/"
+        elif not value or not re.fullmatch(r"[A-Za-z0-9_\-.~]{1,64}", value):
+            value = "1"
+        pairs.append(f"{name}={value}")
+    return "&".join(pairs)
+
+
+# r5: Angular/compiled services call through a host variable, never a literal:
+#   this.host=this.hostServer+"/api/Feedbacks"; ... this.http.post(this.host+"/",e)
+#   this.http.put(this.host+"/"+e+"/reviews",t) / .get(`${this.host}/${e}/reviews`)
+# so _VERB_CALL never saw the method and every write on such a route stayed a GET.
+_HOST_ASSIGN = re.compile(
+    r"""(?:\bthis\.|\b)([A-Za-z_$][\w$]*)\s*=\s*(?:[A-Za-z_$][\w$.]*\s*\+\s*)?"""
+    r"""['"`](/(?!/)[A-Za-z0-9_\-./~%:]*[A-Za-z0-9_\-])['"`]""")
+_PIECE = r"""(?:['"`][^'"`\n]{0,120}['"`]|[A-Za-z_$][\w$.]*)"""
+_VAR_CALL = re.compile(
+    r"""\.(get|post|put|patch|delete)\s*\(\s*(?:this\.)?([A-Za-z_$][\w$]*)"""
+    r"""((?:\s*\+\s*""" + _PIECE + r""")*)\s*[,)]""")
+_TEMPLATE_CALL = re.compile(
+    r"""\.(get|post|put|patch|delete)\s*\(\s*`\$\{(?:this\.)?([A-Za-z_$][\w$]*)\}([^`]{0,160})`""")
+_HOSTISH = re.compile(r"(?i)host|url|base|api|endpoint|server|root|prefix")
+
+
+def _host_bases(body: str) -> list[tuple[int, str, str]]:
+    """(position, variable, path) for each `var = [host +] "/path"` assignment."""
+    out = []
+    for m in _HOST_ASSIGN.finditer(body):
+        name, path = m.group(1), m.group(2)
+        if "+" in m.group(0) or _HOSTISH.search(name):
+            out.append((m.start(), name, path))
+    return out
+
+
+def _base_for(bases, name: str, pos: int) -> str | None:
+    """The nearest assignment of `name` before `pos` (a compiled class assigns its
+    host field in the constructor, ahead of the methods that use it)."""
+    found = None
+    for at, var, path in bases:
+        if at >= pos:
+            break
+        if var == name:
+            found = path
+    return found
+
+
+def _joined(base: str, pieces: list[str]) -> str | None:
+    out = base
+    for piece in pieces:
+        if piece[:1] in "'\"`":
+            text = piece[1:-1]
+            if not re.fullmatch(r"[A-Za-z0-9_\-./~%:?=&{}]*", text):
+                return None
+            out += text
+        else:
+            out += "{id}"
+    return out
+
+
+def _host_variable_calls(body: str) -> list[tuple[str, str]]:
+    """(METHOD, path) for calls made through a host variable."""
+    bases = _host_bases(body)
+    calls = []
+    for m in _VAR_CALL.finditer(body):
+        pieces = re.findall(_PIECE, m.group(3) or "")
+        base = _base_for(bases, m.group(2), m.start())
+        if base is None:
+            # An origin-only host (this.hostServer = environment.hostServer) still
+            # names the route when the first concatenated piece is a "/path" literal.
+            if not pieces or not re.match(r"""['"`]/(?!/)""", pieces[0]):
+                continue
+            base = ""
+        path = _joined(base, pieces)
+        if path:
+            calls.append((m.group(1), path))
+    for m in _TEMPLATE_CALL.finditer(body):
+        base = _base_for(bases, m.group(2), m.start())
+        rest = re.sub(r"\$\{[^}]*\}", "{id}", m.group(3))
+        if base is not None and re.fullmatch(r"[A-Za-z0-9_\-./~%:?=&{}]*", rest):
+            calls.append((m.group(1), base + rest))
+    return calls
 
 
 @dataclass
 class ExtractedEndpoints:
     same_origin_paths: set[str] = field(default_factory=set)   # normalized paths on the target
+    # "path?name=value" input shapes named by query-bearing literals and links.
+    paths_with_query: set[str] = field(default_factory=set)
     external_urls: set[str] = field(default_factory=set)       # absolute URLs to other hosts
     from_request_calls: set[str] = field(default_factory=set)  # subset seen in fetch/axios/xhr
 
@@ -147,6 +250,7 @@ class ExtractedEndpoints:
             "same_origin_paths": sorted(self.same_origin_paths),
             "external_urls": sorted(self.external_urls),
             "from_request_calls": sorted(self.from_request_calls),
+            "paths_with_query": sorted(self.paths_with_query),
         }
 
 
@@ -177,6 +281,16 @@ def extract_endpoints(body: str, base_url: str = "") -> ExtractedEndpoints:
         p = m.group(1)
         if _looks_like_endpoint(p):
             out.same_origin_paths.add(_normalize(p))
+
+    # 2a. query-bearing literals ("/x?name=" + v, "./redirect?to=https://...").
+    for m in _QUOTED_QUERY_PATH.finditer(body):
+        p = m.group(1).lstrip(".")
+        if _looks_like_endpoint(p):
+            norm = _normalize(p)
+            out.same_origin_paths.add(norm)
+            shape = _query_shape(m.group(2))
+            if shape:
+                out.paths_with_query.add(f"{norm}?{shape}")
 
     # 2b. slash-less api/... and rest/... literals.
     for m in _RELATIVE_API_PATH.finditer(body):

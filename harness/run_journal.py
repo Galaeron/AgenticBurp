@@ -204,6 +204,8 @@ def discovery_payload(state, rc, roles) -> dict:
             "auth_bypass_candidates": list(getattr(rc, "auth_bypass_candidates", None) or []),
             "idor_candidates": list(getattr(rc, "idor_candidates", None) or []),
             "idor_findings": list(getattr(rc, "idor_findings", None) or []),
+            "withheld_operations": list(getattr(rc, "withheld_operations", None) or []),
+            "discovery_bounds": list(getattr(rc, "discovery_bounds", None) or []),
         },
     }
 
@@ -222,6 +224,8 @@ def restore_discovery(payload: dict, roles):
         auth_bypass_candidates=list(stored.get("auth_bypass_candidates") or []),
         idor_candidates=list(stored.get("idor_candidates") or []),
         idor_findings=list(stored.get("idor_findings") or []),
+        withheld_operations=list(stored.get("withheld_operations") or []),
+        discovery_bounds=list(stored.get("discovery_bounds") or []),
         identity_probes=[])
     return EngagementState.from_dict(payload["state"]), rc
 
