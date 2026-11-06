@@ -77,6 +77,34 @@ class _StoreCase(unittest.TestCase):
         return orch
 
 
+class OwnClassBindingTests(_StoreCase):
+    """Defect 1 (+ defect 2 at the confirmation site), through _validate_findings."""
+
+    def test_idor_proof_confirms_only_the_access_control_finding(self):
+        from harness.validators.idor_read_validator import IdorReadValidator
+        orch = self._orch({"idor_read": IdorReadValidator(allowed_hosts=["shop.invalid"])})
+        xss = _finding("Cross-Site Scripting (XSS)", verdict="downgraded")
+        headers = _finding("Missing Security Headers")
+        transport = _finding("Insecure Transmission")
+        idor = _finding("Insecure Direct Object Reference (IDOR)", verdict="downgraded")
+        reports = [AgentReport(agent="xss", model="m", findings=[xss]),
+                   AgentReport(agent="misconfig", model="m", findings=[headers]),
+                   AgentReport(agent="auth", model="m", findings=[transport]),
+                   AgentReport(agent="idor", model="m", findings=[idor])]
+        with patch.object(IdorReadValidator, "validate", new=_confirmed("idor_read", "idor")):
+            asyncio.run(orch._validate_findings(
+                _get("http://shop.invalid/rest/basket/7", {"Cookie": "s=alice"}), reports))
+        self.assertTrue(idor.confirmed)
+        self.assertTrue(idor.proof_id)
+        for other in (xss, headers, transport):
+            self.assertFalse(other.confirmed, other.vulnerability_class)
+            self.assertFalse(other.proof_id, other.vulnerability_class)
+        # Defect 2: the proven finding is no longer left "downgraded" by the
+        # pre-validation critique; the unproven one keeps its demotion.
+        self.assertEqual(idor.review_verdict, "validator-confirmed")
+        self.assertEqual(xss.review_verdict, "downgraded")
+
+
 class CritiqueAnnotatesProvenTests(unittest.IsolatedAsyncioTestCase):
     """Defect 2 at the critique stage: annotate a proven finding, never demote it."""
 

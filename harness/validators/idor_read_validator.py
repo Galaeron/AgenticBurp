@@ -51,7 +51,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import httpx
 
-from harness import global_throttle
+from harness import access_control_gate, global_throttle
 from harness.missing_auth_probe import _AUTH_HEADERS
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
@@ -200,6 +200,12 @@ class IdorReadValidator(Validator):
         self.candidate_ids = candidate_ids or []
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
+        # The finding must claim an access-control mechanism (the same markers
+        # cross_identity uses): an id in the URL alone made this leg apply to
+        # every finding on the route, so its read differential "confirmed" XSS,
+        # header and transport findings on /rest/basket/<id> (r5).
+        if not access_control_gate._is_access_control_class(finding.vulnerability_class):
+            return False
         if (exchange.method or "GET").upper() != "GET":
             return False
         return _locate_id(exchange) is not None
