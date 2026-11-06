@@ -27,7 +27,8 @@ from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import SentAnswer, Validator, ValidationResult, artifact_id_of
-from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
+from .injection_targets import (param_targets, mutate, replay_headers, select_targets,
+                                coverage_note, tested_inputs)
 
 # Shell metacharacters that break out of the surrounding command, tried in order.
 # `{u}` is the collaborator URL. Covers POSIX (`;`, `|`, `$()`, backticks,
@@ -218,7 +219,8 @@ class CommandInjectionValidator(Validator):
                                 "executed a shell command.",
                         evidence=f"Injected `{tmpl.format(a='<nonce-a>', b='<nonce-b>')}` "
                                  f"into {param!r}; "
-                                 "the response contained the unique command-output marker."
+                                 "the response contained the unique command-output marker.",
+                        tested_parameters=tested_inputs(finding, targets),
                     ).with_artifacts(**proof)
 
         # A loopback collaborator cannot be reached by a remote target. Avoid
@@ -280,7 +282,8 @@ class CommandInjectionValidator(Validator):
                 summary=f"OS command injection confirmed: a shell payload placed in the {loc} "
                         f"parameter {param!r} executed on the server.",
                 evidence=f"Injected a metacharacter-prefixed fetch (`{tmpl.format(u='<collaborator>')}`) "
-                         f"into {param!r}; the target ran it and called back out-of-band (blind-safe)."
+                         f"into {param!r}; the target ran it and called back out-of-band (blind-safe).",
+                tested_parameters=tested_inputs(finding, targets),
             ).with_artifacts(**proof)
         if unsent:
             return incomplete()
@@ -293,4 +296,4 @@ class CommandInjectionValidator(Validator):
             evidence=f"Tried {len(targets)} parameter(s) x {len(_TEMPLATES)} shell payloads; "
                      f"no collaborator hit within the window. Waited once for {len(probes)} "
                      f"callback(s) (timeout {self.timeout:g} s)." + coverage_note(coverage, finding),
-            control_outcome=coverage)
+            control_outcome=coverage, tested_parameters=tested_inputs(finding, targets))

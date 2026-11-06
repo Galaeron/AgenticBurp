@@ -5,6 +5,7 @@ import unittest
 from harness import engagement
 from harness.coverage_tracker import CoverageTracker, build_coverage, endpoint_view
 from harness.coverage_model import CellStatus
+from harness.validators.injection_targets import case_target
 
 
 class ClassMappingTests(unittest.TestCase):
@@ -361,14 +362,15 @@ class CasesDrivenTests(unittest.TestCase):
         t.expand_parameter_cases(eps, per_cell_budget=8)
 
         class _Res:
-            def __init__(self, s): self.status = s; self.summary = "x"; self.confidence = 0.9; self.evidence = "e"; self.validator = "v"
+            def __init__(self, s, tested): self.status = s; self.summary = "x"; self.confidence = 0.9; self.evidence = "e"; self.validator = "v"; self.tested_parameters = tested
 
         dispatched = []
 
         async def run_case(identity, method, path, check, case_key):
             if check.id == "WSTG-INPV-05" and path == "/api/search":
                 dispatched.append(case_key.parameter_name)
-                return _Res("confirmed" if case_key.parameter_name == "search" else "not_confirmed")
+                return _Res("confirmed" if case_key.parameter_name == "search" else "not_confirmed",
+                            ((case_key.parameter_location, case_key.parameter_name),))
             return None
 
         asyncio.run(t.drive_coverage_cases(run_case, budget=100))
@@ -385,7 +387,7 @@ class CasesDrivenTests(unittest.TestCase):
         self.assertNotIn(("WSTG-INPV-05", "sort"), nt)
 
     def test_control_request_level_confirm_does_not_credit_parameter_siblings(self):
-        """Control (R01): a leg that cannot test one input (reflected XSS) is still
+        """Control (R01): a leg that cannot test one input (NoSQL injection) is still
         driven once on the request-level case; its confirm marks the cell as RISK
         but the parameter inputs stay inconclusive (untested), as before."""
         import asyncio
@@ -399,20 +401,20 @@ class CasesDrivenTests(unittest.TestCase):
             def __init__(self, s): self.status = s; self.summary = "x"; self.confidence = 0.9; self.evidence = "e"; self.validator = "v"
 
         async def run_case(identity, method, path, check, case_key):
-            # a request-level confirm on the reflected-XSS cell (the driver only
-            # calls the no-parameter representative); no per-parameter attribution
-            if check.id == "WSTG-INPV-01":
+            # a request-level confirm on the NoSQL cell (the driver only calls
+            # the no-parameter representative); no per-parameter attribution
+            if check.id == "WSTG-INPV-06":
                 self.assertTrue(case_key.is_no_parameter)   # driven at request level
                 return _Res("confirmed")
             return None
 
         asyncio.run(t.drive_coverage_cases(run_case, budget=100))
         # the cell shows endpoint RISK ...
-        self.assertEqual(t.matrix.get("user", "POST /api/search", "WSTG-INPV-01").status,
+        self.assertEqual(t.matrix.get("user", "POST /api/search", "WSTG-INPV-06").status,
                          CellStatus.CONFIRMED)
         # ... but neither parameter input is confirmed; both stay inconclusive (untested)
         cases = {ck.parameter_name: r for ck, r in
-                 t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-01")}
+                 t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-06")}
         self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
         self.assertEqual(cases["sort"].status, CellStatus.INCONCLUSIVE)
         nt_params = {c["parameter_name"] for c in t.matrix.cases_not_tested()}
@@ -427,13 +429,17 @@ class CasesDrivenTests(unittest.TestCase):
         class _Res:
             status = "not_confirmed"; summary = ""; confidence = None; evidence = ""; validator = "v"
 
+            def __init__(self, tested): self.tested_parameters = tested
+
         dispatched = []
 
         async def run_case(identity, method, path, check, case_key):
-            # a not_confirmed result on one cell only
+            # a not_confirmed result on one cell only, reporting the input it
+            # was bound to (none at request level)
             if check.id == check_id and path == "/api/search":
                 dispatched.append(case_key.parameter_name)
-                return _Res()
+                target = case_target(check.confirmation, case_key)
+                return _Res((target,) if target else ())
             return None
 
         report = asyncio.run(build_coverage_cases_driven(
@@ -455,14 +461,14 @@ class CasesDrivenTests(unittest.TestCase):
         self.assertNotIn(("POST /api/search", "WSTG-INPV-05", "sort"), nt)
 
     def test_control_build_coverage_cases_driven_reports_request_level_pending_honestly(self):
-        """Control: the reflected-XSS leg runs at REQUEST LEVEL (not_confirmed), so the
+        """Control: the NoSQL leg runs at REQUEST LEVEL (not_confirmed), so the
         concrete inputs 'search'/'sort' are NOT individually attributed and stay in
         the honest not-tested list; the request-level result is not itself a gap."""
-        report, dispatched, nt = self._cases_driven_report("WSTG-INPV-01")
+        report, dispatched, nt = self._cases_driven_report("WSTG-INPV-06")
         self.assertEqual(dispatched, [""])
         self.assertGreaterEqual(report["cases_driven"], 1)
-        self.assertIn(("POST /api/search", "WSTG-INPV-01", "search"), nt)
-        self.assertIn(("POST /api/search", "WSTG-INPV-01", "sort"), nt)
+        self.assertIn(("POST /api/search", "WSTG-INPV-06", "search"), nt)
+        self.assertIn(("POST /api/search", "WSTG-INPV-06", "sort"), nt)
 
     def test_failing_callback_is_recorded_as_error_and_consumes_budget(self):
         # R05: a raising callback must be recorded ERROR (visible) and the budget must
@@ -525,22 +531,27 @@ class CasesDrivenTests(unittest.TestCase):
 
 class PerParameterDispatchTests(unittest.TestCase):
     """Owner option (b): a leg that can test one input (sqlmap -p, SSTI, command
-    injection) is driven once per parameter case, and each verdict binds to that
-    parameter only."""
+    injection, open redirect, SSRF, reflected XSS) is driven once per parameter
+    case, and each verdict binds to that parameter only when the leg reports
+    testing exactly it."""
 
     KEY = ("user", "POST /api/x", "WSTG-INPV-05")   # sqlmap
 
     class _Res:
-        def __init__(self, status, control_outcome=""):
+        # tested=None: report the input the dispatch bound the leg to, as the
+        # production legs do; a tuple overrides it (a leg that does not say).
+        def __init__(self, status, control_outcome="", tested=None):
             self.status, self.control_outcome = status, control_outcome
             self.summary, self.confidence, self.evidence, self.validator = "s", None, "", "sqlmap"
             self.sent_count = 2
+            self.tested_parameters = tested
 
     def _drive(self, query, outcome, per_cell_budget=8, budget=100, **drive_kwargs):
         import asyncio
-        st = _state_with([("POST", "/api/x", {"reachable_roles": ["user"]})])
-        st.endpoints["POST /api/x"].template = {
-            "method": "POST", "query": query, "body": "", "content_type": "", "object_id": None}
+        method, _, path = self.KEY[1].partition(" ")
+        st = _state_with([(method, path, {"reachable_roles": ["user"]})])
+        st.endpoints[self.KEY[1]].template = {
+            "method": method, "query": query, "body": "", "content_type": "", "object_id": None}
         t = CoverageTracker()
         eps = endpoint_view(st)
         t.build(eps, ["user"])
@@ -551,7 +562,11 @@ class PerParameterDispatchTests(unittest.TestCase):
             if check.id != self.KEY[2]:
                 return None
             calls.append(case_key.parameter_name)
-            return outcome(case_key)
+            res = outcome(case_key)
+            if res is not None and res.tested_parameters is None:
+                target = case_target(check.confirmation, case_key)
+                res.tested_parameters = (target,) if target else ()
+            return res
 
         self.attempts = asyncio.run(t.drive_coverage_cases(run_case, budget=budget, **drive_kwargs))
         cases = {ck.parameter_name: r for ck, r in t.matrix.cases_for_cell(*self.KEY)}
@@ -626,13 +641,57 @@ class PerParameterDispatchTests(unittest.TestCase):
         self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
 
     def test_request_level_leg_is_unchanged(self):
-        # Reflected XSS (browser_xss) cannot target one input: still one dispatch
-        # on the request-level case, siblings inconclusive.
-        self.KEY = ("user", "POST /api/x", "WSTG-INPV-01")
+        # NoSQL injection (nosql) cannot target one input: still one dispatch on
+        # the request-level case, siblings inconclusive.
+        self.KEY = ("user", "POST /api/x", "WSTG-INPV-06")
         t, cases, calls = self._drive("search=x&sort=y", lambda ck: self._Res("not_confirmed"))
         self.assertEqual(calls, [""])
         self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
         self.assertEqual(cases["sort"].status, CellStatus.INCONCLUSIVE)
+
+    def test_reported_input_concludes_each_newly_per_parameter_leg(self):
+        # Open redirect, SSRF and reflected XSS now dispatch per query input.
+        for check_id in ("WSTG-INPV-17", "WSTG-INPV-19", "WSTG-INPV-01"):
+            self.KEY = ("user", "POST /api/redirect", check_id)   # a URL-shaped path
+            with self.subTest(check_id):
+                t, cases, calls = self._drive("next=x&sort=y", lambda ck: self._Res("not_confirmed"))
+                self.assertEqual(calls, ["next", "sort"])
+                self.assertEqual(cases["next"].status, CellStatus.NOT_DETECTED)
+                self.assertEqual(cases["sort"].status, CellStatus.NOT_DETECTED)
+                self.assertEqual(t.matrix.get(*self.KEY).status, CellStatus.NOT_DETECTED)
+
+    def test_control_leg_that_does_not_report_its_input_keeps_r01(self):
+        # Defect injection: the same clean results, but the leg names no input,
+        # so no parameter case is concluded and the cell stays open.
+        t, cases, calls = self._drive("search=x&sort=y",
+                                      lambda ck: self._Res("not_confirmed", tested=()))
+        self.assertEqual(calls, ["search", "sort"])
+        for name in ("search", "sort"):
+            self.assertEqual(cases[name].status, CellStatus.INCONCLUSIVE, name)
+            self.assertFalse(cases[name].executed, name)
+            self.assertIn("did not report testing", cases[name].reason)
+        self.assertNotEqual(t.matrix.get(*self.KEY).status, CellStatus.NOT_DETECTED)
+        nt = {c["parameter_name"] for c in t.matrix.cases_not_tested()}
+        self.assertTrue({"search", "sort"} <= nt)
+
+    def test_control_misnamed_input_is_not_attributed(self):
+        # A leg reporting a sibling's name for this dispatch binds nothing.
+        t, cases, _ = self._drive("search=x&sort=y", lambda ck: self._Res(
+            "not_confirmed", tested=(("query", "sort"),)))
+        self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
+        self.assertEqual(cases["sort"].status, CellStatus.NOT_DETECTED)
+        self.assertNotEqual(t.matrix.get(*self.KEY).status, CellStatus.NOT_DETECTED)
+
+    def test_control_unattributed_confirm_marks_the_request_only(self):
+        # A confirmation the leg cannot place keeps the endpoint risk on the
+        # request-level case; the dispatched input is not credited with it.
+        t, cases, _ = self._drive("search=x&sort=y", lambda ck: self._Res(
+            "confirmed" if ck.parameter_name == "search" else "not_confirmed",
+            tested=() if ck.parameter_name == "search" else None))
+        self.assertEqual(cases[""].status, CellStatus.CONFIRMED)
+        self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
+        self.assertEqual(cases["sort"].status, CellStatus.NOT_DETECTED)
+        self.assertEqual(t.matrix.get(*self.KEY).status, CellStatus.CONFIRMED)
 
 
 class RefreshAfterRetryRoundsTests(unittest.TestCase):

@@ -83,14 +83,36 @@ def select_targets(finding, candidates: list[tuple[str, str]], limit: int,
     return list(candidates[:limit]), ("" if len(candidates) <= limit else PARTIAL_COVERAGE)
 
 
+def tested_inputs(finding, targets) -> tuple[tuple[str, str], ...]:
+    """What a leg reports in ValidationResult.tested_parameters: under a
+    per-parameter dispatch, the one input it was bound to once that input is its
+    only target; otherwise nothing, so the case driver keeps the R01 rule."""
+    if getattr(finding, "parameter_only", False) and len(targets) == 1:
+        return (((finding.parameter_location or "").strip().lower(),
+                 (finding.parameter_name or "").strip()),)
+    return ()
+
+
 # Coverage case driving: legs that can test ONE input per dispatch, by the case
 # locations each can address on its own. sqlmap's `-p` naming of JSON body keys
-# is unverified, so its JSON keys stay request-level.
+# is unverified, so its JSON keys stay request-level; browser_xss injects only
+# into the query string.
 PER_PARAMETER_LOCATIONS = {
     "ssti": frozenset({"query", "body_form", "body_json"}),
     "command_injection": frozenset({"query", "body_form", "body_json"}),
     "sqlmap": frozenset({"query", "body_form"}),
+    "open_redirect": frozenset({"query", "body_form", "body_json"}),
+    "ssrf": frozenset({"query", "body_form", "body_json"}),
+    "browser_xss": frozenset({"query"}),
+    "path_traversal": frozenset({"query", "body_form", "body_json"}),
 }
+# Legs whose request-level attempt also tests an input that no parameter case
+# names, by the case location that input has: path traversal injects into the
+# request's last path segment. Such a leg's endpoint check fans out over the
+# parameter inputs it can test alone; once each was tested alone, its
+# request-level attempt still runs, bound to that location only, so it never
+# repeats the parameters' probes (and each input keeps its own R16 account).
+REQUEST_LEVEL_INPUTS = {"path_traversal": "path"}
 # At most this many parameter cases of one cell are dispatched one by one (the
 # legs' own six-parameter cap); the rest stay inconclusive.
 PER_PARAMETER_FIELD_CAP = 6

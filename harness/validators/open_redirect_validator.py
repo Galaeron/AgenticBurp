@@ -26,7 +26,8 @@ from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
-from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
+from .injection_targets import (param_targets, mutate, replay_headers, select_targets,
+                                coverage_note, tested_inputs, NAMED_PARAMETER_UNTESTED)
 
 _REDIRECT_PARAM_NAMES = {"url", "redirect", "redirect_uri", "redirect_url", "redirecturl",
                          "next", "return", "returnurl", "return_url", "returnto", "return_to",
@@ -130,7 +131,15 @@ class OpenRedirectValidator(Validator):
         targets, coverage = select_targets(finding, shaped, len(shaped) + 1,
                                            available=param_targets(exchange))
         if not targets:
+            if getattr(finding, "parameter_only", False):
+                return ValidationResult(
+                    self.name, "skipped", "open_redirect",
+                    summary=f"the {finding.parameter_location or 'unnamed'} parameter "
+                            f"{finding.parameter_name!r} is not a parameter of the replayed "
+                            "request, so it was not tested",
+                    control_outcome=NAMED_PARAMETER_UNTESTED)
             return self._skip("no redirect-shaped parameter to point off-origin")
+        tested = tested_inputs(finding, targets)
         method = (exchange.method or "GET").upper()
         headers = replay_headers(exchange)
         candidate = ""  # sentinel reached Location, but no off-origin redirect
@@ -182,7 +191,8 @@ class OpenRedirectValidator(Validator):
                                 f"Location the server redirects to.",
                         evidence=f"Set {param!r} to `{payload}`; the server responded with HTTP "
                                  f"{resp.status_code}, a redirect to the off-origin sentinel host "
-                                 f"{_SENTINEL_HOST!r} (Location: {location})."
+                                 f"{_SENTINEL_HOST!r} (Location: {location}).",
+                        tested_parameters=tested,
                     ).with_artifacts(baseline=baseline, attack=resp, controls=[control])
                 if not candidate and _SENTINEL_HOST in location.lower():
                     why = ("it stays on the target's own origin" if is_redirect
@@ -211,6 +221,7 @@ class OpenRedirectValidator(Validator):
         return ValidationResult(
             self.name, "not_confirmed", "open_redirect", confidence=0.0, confirmed=False,
             summary="No off-origin redirect observed -- the redirect target is not attacker-controlled",
-            evidence=f"Tried {len(targets)} redirect-shaped parameter(s); no Location pointed at the sentinel host."
+            evidence=f"Tried {len(targets)} parameter(s) "
+                     f"({', '.join(repr(p) for _l, p in targets)}); no Location pointed at the sentinel host."
                      + coverage_note(coverage, finding),
-            control_outcome=coverage)
+            control_outcome=coverage, tested_parameters=tested)

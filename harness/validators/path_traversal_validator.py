@@ -34,7 +34,8 @@ from harness.categories import canonicalize
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked, ActionRiskTier
 from .base import Validator, ValidationResult
-from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
+from .injection_targets import (param_targets, mutate, replay_headers, select_targets, coverage_note,
+                                tested_inputs, NAMED_PARAMETER_UNTESTED)
 
 _FILE_PARAM_NAMES = {"file", "filename", "path", "filepath", "page", "template", "doc",
                      "document", "download", "load", "read", "include", "view", "img",
@@ -142,7 +143,16 @@ class PathTraversalValidator(Validator):
     def _targets(self, exchange: HttpExchange, finding: Finding) -> tuple[list[tuple[str, str]], str]:
         params = param_targets(exchange)
         has_segment = _last_segment_index(exchange.url) is not None
-        if has_segment and (finding.parameter_location or "").strip().lower() == "path":
+        located_on_path = (finding.parameter_location or "").strip().lower() == "path"
+        if getattr(finding, "parameter_only", False):
+            # Per-parameter dispatch (coverage case drive): exactly one injection
+            # point, whatever its shape. On the path location it is the last path
+            # segment: the request-level attempt after each parameter was tested
+            # on its own. An input the request lacks is not tested at all.
+            if located_on_path:
+                return ([(_PATHSEG, "")], "") if has_segment else ([], NAMED_PARAMETER_UNTESTED)
+            return select_targets(finding, params, _MAX_PARAMS, available=params)
+        if has_segment and located_on_path:
             # The path segment is always tried, so a path-located finding is covered.
             finding = finding.model_copy(update={"parameter_name": ""})
         targets, coverage = select_targets(
@@ -156,11 +166,35 @@ class PathTraversalValidator(Validator):
             return (_mutate_last_segment(exchange.url, value) or exchange.url), (exchange.request_body or "")
         return mutate(exchange, loc, param, value)
 
+    def _ceiling_spent(self, finding: Finding, method: str) -> bool:
+        """Whether the run gate's per-finding mutating ceiling (R16) has no send
+        left for this leg's finding. Once it is spent, every remaining mutating
+        payload is refused too, so the refusal ends the leg rather than marking one
+        payload unsendable. Read from the gate's own accounting, never from the
+        refusal's wording. Only a mutating send keyed on a finding is counted; an
+        accounting the gate cannot answer counts as spent (fail closed: the leg
+        stops incomplete instead of reading the refusals as a negative)."""
+        finding_id = getattr(finding, "finding_id", "") or ""
+        if not finding_id:
+            return False
+        try:
+            gate = self.run_context.gate
+            if gate.classify(method) != ActionRiskTier.MUTATING:
+                return False
+            return gate.mutating_headroom(finding_id, self.name)[0] == 0
+        except Exception:
+            return True
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         targets, coverage = self._targets(exchange, finding)
+        if not targets and coverage == NAMED_PARAMETER_UNTESTED:
+            skipped = self._skip(f"the input this dispatch is bound to ({finding.parameter_location}:"
+                                 f"{finding.parameter_name}) is not in the request; untested")
+            skipped.control_outcome = coverage
+            return skipped
         if not targets:
             return self._skip("no file/path-shaped parameter or path segment to inject a traversal into")
         method = (exchange.method or "GET").upper()
@@ -173,9 +207,15 @@ class PathTraversalValidator(Validator):
         # Probes that got no response (RV-P P7). A payload the scope lock or the
         # session's origin check cannot send (e.g. a backslash path segment) is
         # refused on its own and the rest still run; a refusal that ends the
-        # run (budget, cancellation, mutating replay) stops the leg. A probe
-        # that never answered is not part of a negative.
+        # run (budget, cancellation, mutating replay) stops the leg, and so does
+        # the per-finding mutating ceiling (R16) once it is spent: the gate would
+        # refuse every remaining payload alike. A probe that never answered is
+        # not part of a negative.
         planned = len(targets) * len(_PREFIXES) * len(_TARGETS)
+        # Under a per-parameter dispatch, the one input this leg was bound to.
+        tested = tested_inputs(finding, targets)
+        points = ", ".join("the path segment" if loc == _PATHSEG else f"{loc} parameter {param!r}"
+                           for loc, param in targets)
         answered = 0
         unsendable: list[str] = []
         errors: list[str] = []
@@ -204,10 +244,14 @@ class PathTraversalValidator(Validator):
                                 capability=self.name, session_ref=session_ref,
                                 case_ref=finding.finding_id or "", max_redirects=0)
                             if not outcome.executed:
-                                if outcome.outcome in ("out_of_scope", "blocked"):
+                                ceiling_cut = (outcome.outcome == "blocked"
+                                               and self._ceiling_spent(finding, method))
+                                if outcome.outcome in ("out_of_scope", "blocked") and not ceiling_cut:
                                     unsendable.append(f"{label}: {outcome.outcome}")
                                     continue
-                                refused = f"path-traversal replay declined: {outcome.outcome}"
+                                why = getattr(outcome, "error", "") or ""
+                                refused = (f"path-traversal replay declined: {outcome.outcome}"
+                                           + (f" ({why})" if why else ""))
                                 break
                             if not outcome.ok:
                                 art = getattr(outcome, "artifact", None)
@@ -252,7 +296,8 @@ class PathTraversalValidator(Validator):
                             summary=f"Path traversal confirmed: the {where} read an arbitrary file "
                                     f"outside the intended directory.",
                             evidence=f"Injected `{prefix + target}` into the {where}; the response contained "
-                                     f"the canonical contents of {target} (matched /{marker.pattern}/).")
+                                     f"the canonical contents of {target} (matched /{marker.pattern}/).",
+                            tested_parameters=tested)
         if not answered and not errors:
             # Nothing reached the target: a declined leg, as before.
             return self._skip(refused or f"path-traversal replay declined: every payload was "
@@ -265,7 +310,7 @@ class PathTraversalValidator(Validator):
                 summary=f"Path-traversal check incomplete: {unanswered} of {planned} probe(s) got no "
                         f"response ({why}); not a negative result",
                 evidence=f"{answered} answered probe(s) returned no system-file contents, but a "
-                         f"probe that never answered cannot show them.")
+                         f"probe that never answered cannot show them.", tested_parameters=tested)
         skipped = (f" {len(unsendable)} payload(s) could not be sent at all (e.g. {unsendable[0]})."
                    if unsendable else "")
         if baseline_echoes:
@@ -274,6 +319,7 @@ class PathTraversalValidator(Validator):
         return ValidationResult(
             self.name, "not_confirmed", "path_traversal", confidence=0.0, confirmed=False,
             summary="No system-file contents returned -- traversal appears blocked or not a file read",
-            evidence=f"Tried {len(targets)} injection point(s) across {len(_PREFIXES)} traversal encodings; "
-                     f"neither /etc/passwd nor win.ini contents appeared.{skipped}" + coverage_note(coverage, finding),
-            control_outcome=coverage)
+            evidence=f"Tried {len(targets)} injection point(s) ({points}) across {len(_PREFIXES)} traversal "
+                     f"encodings; neither /etc/passwd nor win.ini contents appeared.{skipped}"
+                     + coverage_note(coverage, finding),
+            control_outcome=coverage, tested_parameters=tested)

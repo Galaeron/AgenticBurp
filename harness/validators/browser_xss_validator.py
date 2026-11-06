@@ -33,6 +33,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from .base import Validator, ValidationResult
+from .injection_targets import NAMED_PARAMETER_UNTESTED, tested_inputs
 
 log = logging.getLogger("harness.browser_xss_validator")
 
@@ -123,17 +124,24 @@ class BrowserXssValidator(Validator):
         host = (urlsplit(url).hostname or "").lower()
         return scope_lock.host_in_scope(url, self.allowed_hosts)
 
-    def _candidate_urls(self, exchange: HttpExchange, a: int, b: int) -> list[str]:
+    def _candidate_urls(self, exchange: HttpExchange, a: int, b: int,
+                        only: str | None = None) -> list[str]:
         """One URL per (query param, payload): the captured URL with a single
         parameter's value replaced by an execution payload. Bounded by
         max_visits. When the URL has no query params, the payloads are tried as
         a single synthetic `q` parameter so a bare reflected endpoint is still
-        probed."""
+        probed. `only` (a per-parameter dispatch) mutates that parameter alone."""
         parts = urlsplit(exchange.url)
         params = parse_qsl(parts.query, keep_blank_values=True)
         payloads = _payloads(a, b)
         urls: list[str] = []
-        if not params:
+        if only is not None:
+            i = next(n for n, (k, _v) in enumerate(params) if k == only)
+            for pl in payloads:
+                mutated = list(params)
+                mutated[i] = (only, pl)
+                urls.append(urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(mutated), "")))
+        elif not params:
             for pl in payloads:
                 q = urlencode([("q", pl)])
                 urls.append(urlunsplit((parts.scheme, parts.netloc, parts.path, q, "")))
@@ -164,8 +172,22 @@ class BrowserXssValidator(Validator):
             return ValidationResult(validator=self.name, status="skipped", finding_class="xss",
                                     summary="target out of scope", evidence=urlsplit(exchange.url).hostname or "")
 
+        only = None
+        if getattr(finding, "parameter_only", False):
+            # Per-parameter dispatch: test the named query parameter alone, so the
+            # verdict is bound to it; any other input is not tested at all.
+            only = (finding.parameter_name or "").strip()
+            present = [k for k, _v in parse_qsl(urlsplit(exchange.url).query, keep_blank_values=True)]
+            if (finding.parameter_location or "").strip().lower() != "query" or only not in present:
+                return ValidationResult(
+                    validator=self.name, status="skipped", finding_class="xss",
+                    summary=f"the {finding.parameter_location or 'unnamed'} parameter {only!r} is "
+                            "not a query parameter of the replayed URL, so it was not tested",
+                    control_outcome=NAMED_PARAMETER_UNTESTED)
+        tested = tested_inputs(finding, [only] if only is not None else [])
+
         a, b, expected = _challenge()
-        urls = self._candidate_urls(exchange, a, b)
+        urls = self._candidate_urls(exchange, a, b, only)
         errors: list[str] = []
         signal: tuple[str, str, str] | None = None  # (url, note, detail) of the first candidate
         # R7: forwarded only when a RunContext is actually bound -- omitted
@@ -201,7 +223,7 @@ class BrowserXssValidator(Validator):
                     evidence=(f"Injected payload executed: the browser console logged {expected}, "
                               f"the product of {a}*{b}, which the payload computes but does not "
                               f"contain, when loading {url[:300]}"),
-                    raw_output=obs.all_text()[:800])
+                    raw_output=obs.all_text()[:800], tested_parameters=tested)
             if expected in _dialog_messages(obs):
                 return ValidationResult(
                     validator=self.name, status="confirmed", finding_class="xss",
@@ -212,7 +234,7 @@ class BrowserXssValidator(Validator):
                               f"product of {a}*{b}, which the payload computes but does not "
                               f"contain, when loading {url[:300]}. Execution was shown by the "
                               f"dialog only, not by the console."),
-                    raw_output=obs.all_text()[:800])
+                    raw_output=obs.all_text()[:800], tested_parameters=tested)
             note, detail = _unmatched_signal(obs)
             if note and signal is None:
                 signal = (url, note, detail)
@@ -235,4 +257,4 @@ class BrowserXssValidator(Validator):
             evidence=(f"Tried {len(urls)} candidate URL(s); neither the console nor a dialog showed "
                       f"the computed product {expected}."
                       + (f" Errors: {'; '.join(errors[:3])}" if errors else "")),
-            raw_output="")
+            raw_output="", tested_parameters=tested if status == "not_confirmed" else ())

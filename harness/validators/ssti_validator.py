@@ -35,7 +35,8 @@ from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult, artifact_id_of
-from .injection_targets import param_targets, mutate, replay_headers, select_targets, coverage_note
+from .injection_targets import (param_targets, mutate, replay_headers, select_targets,
+                                coverage_note, tested_inputs)
 
 # Two 2-digit primes -> a distinctive 4-digit product unlikely to appear by
 # chance, and one no reasonable page computes for an unrelated reason.
@@ -205,6 +206,8 @@ class SstiValidator(Validator):
             return ok, detail
 
         def _finish(result: ValidationResult) -> ValidationResult:
+            # Every send from here on targets `targets` only.
+            result.tested_parameters = tested_inputs(finding, targets)
             if not residual:
                 return result
             note = (f"RESIDUAL STATE: the original captured request was NOT restored "
@@ -249,7 +252,17 @@ class SstiValidator(Validator):
                     outcome = await _send(method, url, send_body=body or None,
                                           send_headers=request_headers, redirects=2)
                     if not outcome.executed:
-                        return _finish(self._skip(f"SSTI replay declined: {outcome.outcome}"))
+                        declined = f"SSTI replay declined: {outcome.outcome}" + (
+                            f" ({outcome.error})" if getattr(outcome, "error", "") else "")
+                        if not answered:
+                            return _finish(self._skip(declined))
+                        # Refused after answered sends (e.g. the mutating ceiling):
+                        # the payloads not yet sent are untested, so no negative.
+                        return _finish(ValidationResult(
+                            self.name, "inconclusive", "ssti", confidence=0.0, confirmed=False,
+                            summary=f"SSTI check incomplete: {declined}; not a negative result",
+                            evidence=f"{answered} answered send(s) showed no evaluated product "
+                                     f"before the rest were refused."))
                     if not outcome.ok:
                         error = getattr(outcome, "error", "") or ""
                         failed.append(f"{loc} {param!r}: {outcome.outcome}"

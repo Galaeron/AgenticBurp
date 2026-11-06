@@ -24,7 +24,7 @@ from harness.orchestrator_chain import _ConfirmationCache
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext, TypedRequest
 from harness.validators.base import ValidationResult
-from harness.validators.injection_targets import case_target
+from harness.validators.injection_targets import case_target, tested_inputs
 
 ROLES = [RoleSession("anonymous", {})]
 CHECK = "WSTG-INPV-05"          # SQL injection, a parameter (case-driven) check
@@ -69,8 +69,12 @@ class _OneSend:
     async def validate(self, finding, exchange):
         outcome = await self.run_context.executor().execute(
             TypedRequest("GET", exchange.url), capability="sqlmap")
+        # Like a production leg, it reports the one input a per-parameter
+        # dispatch bound it to (nothing at request level).
         return ValidationResult(self.name, self.status if outcome.ok else "inconclusive",
-                                finding.vulnerability_class, summary="fixture leg")
+                                finding.vulnerability_class, summary="fixture leg",
+                                tested_parameters=tested_inputs(
+                                    finding, [(finding.parameter_location, finding.parameter_name)]))
 
 
 def _state(base, *paths):
