@@ -145,6 +145,13 @@ _COMMON_BACKUP_BASES = (
     "index.php config.php database.php wp-config.php settings.php config.js app.js "
     ".env web.config config.json"
 ).split()
+# Discovered file-like routes per directory that get backup variants. The cap is
+# reported in SurfaceResult.backup_capped_prefixes, never applied silently.
+_BACKUP_BASES_PER_DIR = 8
+
+
+def _has_backup_suffix(segment: str) -> bool:
+    return any(segment.endswith(suffix) for suffix in _BACKUP_SUFFIXES)
 
 
 def _first_segment_prefix(path: str) -> str:
@@ -195,6 +202,11 @@ class SurfaceResult:
     # type, body length and fingerprint, and whether the body carries the
     # artifact's content signature (see sensitive_file_verdict). Never the body.
     sensitive_file_evidence: list[dict] = field(default_factory=list)
+    # Backup-suffix bounds: variants that mirrored their base file (dropped, and
+    # the base's remaining suffixes not sent), and directories whose discovered
+    # file-like routes exceeded _BACKUP_BASES_PER_DIR -> bases left unexpanded.
+    backup_variants_mirrored: int = 0
+    backup_capped_prefixes: dict[str, int] = field(default_factory=dict)
 
     def paths(self) -> list[str]:
         return sorted({r.path for r in self.routes})
@@ -216,6 +228,8 @@ class SurfaceResult:
             "soft404_candidates_pruned": self.soft404_candidates_pruned,
             "ffuf_requests": self.ffuf_requests,
             "ffuf_soft404_disagreements": self.ffuf_soft404_disagreements,
+            "backup_variants_mirrored": self.backup_variants_mirrored,
+            "backup_capped_prefixes": dict(self.backup_capped_prefixes),
         }
 
 
@@ -323,6 +337,8 @@ class SurfaceDiscovery:
         self._prefix_controls: dict[tuple[str, str], tuple[int, str] | None] = {}
         self._wildcard_prefixes: set[str] = set()
         self._wildcard_suppressed = 0
+        self._backup_mirrored = 0
+        self._backup_capped: dict[str, int] = {}
 
     async def _probe(self, method: str, path: str):
         """One live request. A method seam so tests inject a canned responder and
@@ -682,6 +698,15 @@ class SurfaceDiscovery:
                                  f"{self._soft404_pruned} guessed candidate(s) not sent")
         if self._wildcard_prefixes:
             result.errors.append("wildcard responses suppressed; guessed descendants were not expanded")
+        result.backup_variants_mirrored = self._backup_mirrored
+        result.backup_capped_prefixes = dict(self._backup_capped)
+        if self._backup_mirrored:
+            result.errors.append(f"backup suffixes: {self._backup_mirrored} file(s) served their original "
+                                 "body for a suffixed name; their remaining suffixes were not sent")
+        if self._backup_capped:
+            result.errors.append(
+                f"backup suffixes capped at {_BACKUP_BASES_PER_DIR} discovered file(s) per directory: "
+                + ", ".join(f"{d} ({n} not expanded)" for d, n in sorted(self._backup_capped.items())))
         return result
 
     async def _ffuf_fast_path(self, result: SurfaceResult) -> int:
@@ -822,18 +847,53 @@ class SurfaceDiscovery:
                     self._sensitive_hits.append(path)
                     self._sensitive_evidence.append(self._sensitive_record(path, route))
 
-            file_like = set(_COMMON_BACKUP_BASES)
+            # r5: a backup suffix belongs on the FILE, never on its query string
+            # (`provider-metadata.json?id=1` -> `...?id=1.bak` is the same file),
+            # and a name that already carries one is not a new base. Without both
+            # rules each role sweep re-seeded the previous sweep's variants and
+            # stacked one more suffix (`?id=1.bak.old.swp`): ~28k requests to one
+            # static JSON file in the Juice Shop r5 run.
+            discovered_bases: dict[str, list[str]] = {}
             for p in list(self._seen):
-                seg = p.rsplit("/", 1)[-1]
-                if "." in seg and not seg.startswith("."):   # looks like <name>.<ext>
-                    file_like.add(p.lstrip("/"))
+                path_only = p.split("?", 1)[0]
+                seg = path_only.rsplit("/", 1)[-1]
+                if ("." in seg and not seg.startswith(".")       # looks like <name>.<ext>
+                        and not _has_backup_suffix(seg)):
+                    parent = path_only.rsplit("/", 1)[0] + "/"
+                    bases = discovered_bases.setdefault(parent, [])
+                    if path_only.lstrip("/") not in bases:
+                        bases.append(path_only.lstrip("/"))
+            file_like = set(_COMMON_BACKUP_BASES)
+            for parent, bases in discovered_bases.items():
+                bases.sort()
+                kept = bases[:_BACKUP_BASES_PER_DIR]
+                file_like.update(kept)
+                if len(bases) > len(kept):
+                    self._backup_capped[parent] = len(bases) - len(kept)
             for base in sorted(file_like):
+                base_path = "/" + base.lstrip("/")
                 for suf in _BACKUP_SUFFIXES:
                     if not self._budget_left():
                         return
-                    await self._check("/" + base.lstrip("/") + suf, "sensitive_file")
+                    candidate = base_path + suf
+                    route = await self._check(candidate, "sensitive_file")
+                    if route is not None and self._mirrors(candidate, base_path):
+                        # The server ignored the suffix and served the original:
+                        # not a backup file, and its siblings will mirror it too.
+                        self._seen.pop(candidate, None)
+                        self._bodies.pop(candidate, None)
+                        self._backup_mirrored += 1
+                        break
         finally:
             self._follow_redirects = True
+
+    def _mirrors(self, candidate: str, base_path: str) -> bool:
+        """True when `candidate` answered with exactly its base file's body."""
+        base_body = self._bodies.get(base_path)
+        body = self._bodies.get(candidate)
+        if base_body is None or body is None:
+            return False
+        return self._norm_body_hash(body, candidate) == self._norm_body_hash(base_body, base_path)
 
     def _sensitive_record(self, path: str, route: Route) -> dict:
         """The evidence record for one sensitive-file hit: the real status, content
