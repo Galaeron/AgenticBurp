@@ -113,8 +113,16 @@ BUILDERS: dict = {
     "dom_xss": _benign_literal,
 }
 
+# Legs that emit CONFIRMED only after a paired negative control EXECUTED in the
+# same probe and held: jwt_forge confirms a forged/invalid-signature token only
+# where a garbage-signature token (or the tokenless request) was answered with a
+# denial. A benign-variant builder would duplicate that control, so N-of-N
+# reproduction of the controlled verdict is the oracle bar (r5: every proven
+# alg:none finding stayed a candidate for want of a builder).
+IN_PROBE_CONTROLLED: frozenset = frozenset({"jwt_forge"})
+
 # Legs whose confirmation is a self-contained proof (unique OOB token callback):
 # reproduced N-of-N is sufficient for VERIFIED, no benign-variant control needed.
 SELF_CONTROLLING: frozenset = frozenset({
     "ssrf", "xxe", "command_injection", "deserialization_oob",
-})
+}) | IN_PROBE_CONTROLLED

@@ -207,5 +207,37 @@ class StoredProofBindingTests(_StoreCase):
         self.assertFalse(any(r["confirmed"] for r in self._rows().values()))
 
 
+class VerificationStateTests(_StoreCase):
+    """Defect 4: the oracle stamps a reproduced, in-probe-controlled jwt proof verified."""
+
+    _ORACLE = {"enabled": True, "n_required": 2, "safe_passive_default": True}
+
+    def test_reproduced_jwt_forge_confirmation_is_verified(self):
+        from harness.validators.jwt_forge_validator import JwtForgeValidator
+        orch = self._orch({"jwt_forge": JwtForgeValidator(allowed_hosts=["shop.invalid"])},
+                          oracle=self._ORACLE)
+        jwt = _finding("jwt")
+        with patch.object(JwtForgeValidator, "validate", new=_confirmed("jwt_forge", "jwt")):
+            asyncio.run(orch._validate_findings(
+                _get("http://shop.invalid/api/BasketItems/1", {"Authorization": f"Bearer {_JWT}"}),
+                [AgentReport(agent="jwt", model="m", findings=[jwt])]))
+        self.assertTrue(jwt.confirmed)
+        self.assertTrue(jwt.oracle_verified, jwt.oracle_reason)
+        self.assertEqual(jwt.verification_state, "verified")
+
+    def test_leg_without_any_negative_control_stays_candidate(self):
+        from harness.validators.idor_read_validator import IdorReadValidator
+        orch = self._orch({"idor_read": IdorReadValidator(allowed_hosts=["shop.invalid"])},
+                          oracle=self._ORACLE)
+        idor = _finding("idor")
+        with patch.object(IdorReadValidator, "validate", new=_confirmed("idor_read", "idor")):
+            asyncio.run(orch._validate_findings(
+                _get("http://shop.invalid/rest/basket/7", {"Cookie": "s=alice"}),
+                [AgentReport(agent="idor", model="m", findings=[idor])]))
+        self.assertTrue(idor.confirmed)
+        self.assertFalse(idor.oracle_verified)
+        self.assertEqual(idor.verification_state, "candidate")
+
+
 if __name__ == "__main__":
     unittest.main()
