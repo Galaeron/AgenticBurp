@@ -1002,6 +1002,15 @@ class ChainMixin:
         # phase and opens the next; nothing is reordered or skipped by it.
         _instr = RunInstrumentation(self, run_context or _run_context_mod.current_run_context(),
                                     _run_budget)
+        # Warn before the run when a local model's context window cannot hold the
+        # harness's largest prompt (job 0574e29a0799: Ollama cut 88 prompts). Not
+        # instrumentation: it runs either way and asks Ollama, never the target.
+        # The report rides in the instrumentation block.
+        from harness.instrumentation import ollama_models
+        from harness.ollama_client import (context_truncated_count, context_window_error,
+                                           run_context_preflight)
+        _truncated_before = context_truncated_count(self.ollama)
+        _instr.context_preflight = await run_context_preflight(self.ollama, ollama_models(self))
         _instr.phases.begin("discovery")
 
         # E7: with a journal on the run, each finished unit is written as it completes, and
@@ -1988,6 +1997,9 @@ class ChainMixin:
 
         def _objective_result(stopped: bool) -> dict:
             from harness.experiment import task_dispositions
+            _context_error = context_window_error(self.ollama, _truncated_before)
+            if _context_error:
+                _errors.append(_context_error)
             return {
                 "experiment_preflight": task_dispositions(state,run_context,
                     enabled=bool(self._experiments_config().get('enabled',False)),
@@ -2782,6 +2794,11 @@ class ChainMixin:
                                           "may have short-circuited during this engagement"})
         except Exception as e:
             log.debug("investigate_engagement: circuit breaker check failed: %s", e)
+        # Model calls that did not fit the context window had their replies
+        # discarded: the same errors -> degraded contract.
+        _context_error = context_window_error(self.ollama, _truncated_before)
+        if _context_error:
+            _errors.append(_context_error)
 
         from harness.assessment_health import assessment_health
         try:

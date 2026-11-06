@@ -101,6 +101,17 @@ class JobStatusStore:
                        if key in result and isinstance(result[key], (int, bool, str))}
             if isinstance(result.get('findings'), list):
                 summary['findings'] = len(result['findings'])
+            instrumentation = result.get('instrumentation')
+            instrumentation = instrumentation if isinstance(instrumentation, dict) else {}
+            # Model calls whose reply was discarded because the call did not fit
+            # the model's context window (OllamaContextTruncatedError).
+            client = (instrumentation.get('model_metrics') or {}).get('client')
+            if isinstance(client, dict) and type(client.get('context_truncated')) is int:
+                summary['context_truncated'] = client['context_truncated']
+            # Run-start warnings that a local model's window cannot hold the prompts.
+            preflight = instrumentation.get('context_preflight')
+            if isinstance(preflight, dict) and isinstance(preflight.get('warnings'), list):
+                summary['context_window_warnings'] = len(preflight['warnings'])
             data.update(result_ref=f"/engagement/{quote(job['host'], safe='')}/investigate/{quote(job['job_id'], safe='')}/result",
                         result_size_bytes=len(content), result_sha256=digest,
                         result_summary=summary, result_available=True, delivery_error=job.get('delivery_error'))

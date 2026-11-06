@@ -155,7 +155,10 @@ class RunManifest:
                           # E9: per-stage model usage and phase walls, read from the
                           # run's own instrumentation block (None when it has none).
                           "model_metrics": _counters(instrumentation.get("model_metrics")),
-                          "phase_timings": _counters(instrumentation.get("phase_timings"))})
+                          "phase_timings": _counters(instrumentation.get("phase_timings")),
+                          # Whether each local model's context window held the
+                          # largest prompt at run start (OllamaClient.context_preflight).
+                          "context_preflight": _counters(instrumentation.get("context_preflight"))})
         self._persist(append_ledger=True)
 
     def _persist(self, *, append_ledger: bool) -> None:

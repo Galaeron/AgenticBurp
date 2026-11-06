@@ -1498,13 +1498,10 @@ class RunContext:
             push_ollama_breaker,
         )
         if self._ollama_breaker is None:
-            # Same config OllamaClient.__init__ uses (ollama_client.py:130-137),
-            # so a per-run breaker trips/heals identically to the shared
-            # singleton, including which exceptions don't count as failures.
-            from harness.ollama_client import (
-                OllamaInvalidJSONError,
-                OllamaModelNotFoundError,
-            )
+            # Same config OllamaClient.__init__ uses, so a per-run breaker
+            # trips/heals identically to the shared singleton, including which
+            # exceptions don't count as failures.
+            from harness.ollama_client import BREAKER_EXCLUDED_ERRORS
             self._ollama_breaker = OllamaCircuitBreaker(
                 "ollama",
                 CircuitBreakerConfig(
@@ -1512,7 +1509,7 @@ class RunContext:
                     success_threshold=2,
                     timeout_seconds=60.0,
                     half_open_max_requests=1,
-                    excluded_exceptions=(OllamaModelNotFoundError, OllamaInvalidJSONError),
+                    excluded_exceptions=BREAKER_EXCLUDED_ERRORS,
                     enabled=True,
                 ),
             )
