@@ -757,8 +757,9 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     gets the count of captures taken from `resumed` under "resumed".
 
     `model_failed`, when given a set, gets the observation key of each capture whose
-    analysis raised or had an agent report a `raw_error` (a model call that failed or
-    was cut short by the circuit breaker). The capture stays in `seen`; a retry round
+    analysis raised, had an agent report a `raw_error` (a model call that failed or
+    was cut short by the circuit breaker), or had a stage fail (a failed critique
+    ships its findings unreviewed). The capture stays in `seen`; a retry round
     discards it from there to review it again.
 
     Returns the count of captured exchanges that yielded >=1 finding."""
@@ -827,8 +828,12 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
                 log.debug("review_captured_exchanges: analyze failed on %s: %s",
                           getattr(ex, "url", "?"), e)
                 continue
-            if model_failed is not None and any(getattr(r, "raw_error", None)
-                                                for r in resp.agent_reports):
+            # A failed stage (today: the critique, which then ships its findings
+            # unreviewed) is a failed model call too, so a retry round reviews it again.
+            if model_failed is not None and (
+                    any(getattr(r, "raw_error", None) for r in resp.agent_reports)
+                    or any(getattr(o, "status", None) == "failed"
+                           for o in getattr(resp, "stage_outcomes", None) or ())):
                 model_failed.add(key)
             findings = [f.model_dump() for r in resp.agent_reports for f in r.findings]
             if on_review is not None:

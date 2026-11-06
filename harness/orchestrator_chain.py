@@ -2266,14 +2266,17 @@ class ChainMixin:
         _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds
                               if self.coverage_drive_seconds > 0 else None)
         coverage: dict = {}
+        # The driven tracker, kept so retry rounds' findings can be recorded into it
+        # (coverage_tracker.refresh_after_retry_rounds).
+        _coverage_trackers: list = []
         _prerequisite_blocks: dict = {}   # (endpoint, identity) -> grouped entry (E5b)
         try:
             from harness import coverage_tracker
             # E7: a caller's checkpoint wins; otherwise the journal's, when an earlier attempt
             # got far enough to write one. It is handed back every N legs of the drive.
-            _coverage_kwargs: dict = {}
+            _coverage_kwargs: dict = {"tracker_out": _coverage_trackers}
             if _journal is not None:
-                _coverage_kwargs = {"on_checkpoint": lambda cp: _journal_put("coverage:checkpoint", cp)}
+                _coverage_kwargs["on_checkpoint"] = lambda cp: _journal_put("coverage:checkpoint", cp)
                 _stored_checkpoint = (_journal_read(lambda: _journal.get("coverage:checkpoint"), None)
                                       if _resuming and coverage_checkpoint is None else None)
                 if _stored_checkpoint is not None:
@@ -2594,6 +2597,18 @@ class ChainMixin:
                 _errors.append({"phase": "retry_rounds", "error": f"{type(e).__name__}: {e}"})
             log.info("investigate_engagement: retry rounds -- %d round(s), stopped by %s",
                      len(_retry_report.get("rounds") or []), _retry_report.get("stopped_by"))
+
+        # The matrix was driven before the retry rounds: record what they found into it.
+        if coverage and _coverage_trackers and _retry_ledger is not None \
+                and _retry_report.get("rounds"):
+            try:
+                coverage = coverage_tracker.refresh_after_retry_rounds(
+                    _coverage_trackers[-1], coverage, state, roles,
+                    investigated_keys=investigated_keys)
+            except Exception as e:  # coverage is a report layer -- never sink the run
+                log.warning("investigate_engagement: coverage refresh failed: %s", e)
+                _errors.append({"phase": "coverage_refresh",
+                                "error": f"{type(e).__name__}: {e}"})
 
         # AR-FP: the bounded final re-evaluation of experiment tasks over the values
         # and sessions every later phase left, before proofs are projected and the

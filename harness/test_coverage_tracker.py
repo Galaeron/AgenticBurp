@@ -624,5 +624,71 @@ class PerParameterDispatchTests(unittest.TestCase):
         self.assertEqual(cases["sort"].status, CellStatus.INCONCLUSIVE)
 
 
+class RefreshAfterRetryRoundsTests(unittest.TestCase):
+    """The matrix is driven before the retry rounds; refresh_after_retry_rounds records
+    what the rounds found into it without overturning a driven verdict."""
+    EP, CHECK = "GET /api/tickets/{id}", "WSTG-ATHZ-04"
+
+    def _driven(self):
+        from harness.coverage_tracker import refresh_after_retry_rounds
+        st = _state_with([("GET", "/api/tickets/{id}", {"reachable_roles": ["anonymous"]})])
+        t = CoverageTracker()
+        eps = endpoint_view(st)
+        t.build(eps, ["anonymous"])
+        t.record_findings_from_state(eps, ["anonymous"])
+        return st, t, refresh_after_retry_rounds
+
+    def _late(self, st, confirmed):
+        f = {"vulnerability_class": "idor", "confirmed": confirmed,
+             "severity": "high", "confidence": 0.9}
+        if confirmed:
+            f["confirmed_by_leg"] = "cross_identity"   # add_finding drops a leg-less confirmation
+        st._ep("GET", "/api/tickets/{id}").add_finding(f)
+
+    def _ran(self, t):
+        # Every check an idor finding maps to (BOLA and BFLA) had its leg run.
+        for check in t.checks_for_class("idor"):
+            t.matrix.record("anonymous", self.EP, check, status=CellStatus.NOT_DETECTED,
+                            reason="leg ran", executed=True)
+
+    def test_a_late_detection_fills_a_cell_no_leg_executed(self):
+        st, t, refresh = self._driven()
+        t.finalize_pending_reasons()
+        self.assertEqual(t.matrix.get("anonymous", self.EP, self.CHECK).status, CellStatus.SKIPPED)
+        self._late(st, confirmed=False)
+        report = refresh(t, {"legs_driven": 3}, st, [])
+        self.assertEqual(t.matrix.get("anonymous", self.EP, self.CHECK).status, CellStatus.DETECTED)
+        self.assertEqual(report["refreshed_after_retry_rounds"],
+                         len(t.checks_for_class("idor")))   # one cell per check the class maps to
+        self.assertEqual(report["legs_driven"], 3)   # the drive's statistics are kept
+
+    def test_control_a_late_detection_never_overturns_a_driven_verdict(self):
+        st, t, refresh = self._driven()
+        self._ran(t)
+        previous = {"legs_driven": 1}
+        self._late(st, confirmed=False)
+        self.assertIs(refresh(t, previous, st, []), previous)
+        self.assertEqual(t.matrix.get("anonymous", self.EP, self.CHECK).status,
+                         CellStatus.NOT_DETECTED)
+
+    def test_a_late_confirmation_outranks_a_driven_negative(self):
+        st, t, refresh = self._driven()
+        self._ran(t)
+        self._late(st, confirmed=True)
+        report = refresh(t, {}, st, [])
+        self.assertEqual(t.matrix.get("anonymous", self.EP, self.CHECK).status, CellStatus.CONFIRMED)
+        self.assertEqual(report["refreshed_after_retry_rounds"], len(t.checks_for_class("idor")))
+
+    def test_control_a_late_finding_on_an_unknown_endpoint_adds_no_cell(self):
+        st, t, refresh = self._driven()
+        before = len(t.matrix.cells())
+        st._ep("GET", "/api/new/{id}").add_finding(
+            {"vulnerability_class": "idor", "confirmed": True, "severity": "high",
+             "confirmed_by_leg": "cross_identity"})
+        previous = {}
+        self.assertIs(refresh(t, previous, st, []), previous)
+        self.assertEqual(len(t.matrix.cells()), before)
+
+
 if __name__ == "__main__":
     unittest.main()

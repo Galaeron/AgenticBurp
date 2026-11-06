@@ -348,6 +348,17 @@ class ReviewModelFailedTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(failed), 1)
             self.assertEqual(failed, seen)   # still seen until a retry round reopens it
 
+    async def test_a_failed_critique_stage_marks_the_capture(self):
+        from harness.models import StageOutcome
+        for status, expected in (("failed", 1), ("completed", 0)):
+            orch = SimpleNamespace(analyze=AsyncMock(return_value=SimpleNamespace(
+                agent_reports=[AgentReport(agent="a", model="m", findings=[])],
+                stage_outcomes=[StageOutcome(name="critique", status=status)])))
+            failed = set()
+            await review_captured_exchanges(orch, SimpleNamespace(record_template=lambda *a: None),
+                                            self._captured(), seen=set(), model_failed=failed)
+            self.assertEqual(len(failed), expected, status)
+
     async def test_control_a_clean_review_marks_nothing(self):
         orch, state = self._orch([AgentReport(agent="a", model="m", findings=[])])
         failed = set()
