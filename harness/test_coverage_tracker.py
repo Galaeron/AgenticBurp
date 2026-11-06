@@ -237,18 +237,27 @@ class DriveLegsTests(unittest.TestCase):
         self.assertEqual(sqli_cell.status, CellStatus.NOT_DETECTED)
 
     def test_driver_respects_budget(self):
+        from harness.coverage_tracker import _PASSIVE_LEG_CONFIRMATIONS
         t, asyncio = self._tracker()
-        calls = {"n": 0}
+        calls = {"n": 0, "passive": 0, "order": []}
 
         class _Res:
             status = "not_confirmed"; summary = ""; confidence = None; evidence = ""; validator = "v"
 
         async def run_leg(identity, method, path, check):
-            calls["n"] += 1
+            passive = check.confirmation in _PASSIVE_LEG_CONFIRMATIONS
+            calls["passive" if passive else "n"] += 1
+            calls["order"].append(passive)
             return _Res()
 
-        asyncio.run(t.drive_coverage_legs(run_leg, budget=2))
+        driven = asyncio.run(t.drive_coverage_legs(run_leg, budget=2))
+        # The budget caps the legs that send; a passive leg (judges the captured
+        # response) runs first and spends none.
         self.assertEqual(calls["n"], 2)
+        self.assertEqual(driven, 2)                           # legs_driven counts budgeted legs only
+        self.assertGreater(calls["passive"], 0)
+        self.assertEqual(t.passive_judged, calls["passive"])
+        self.assertEqual(calls["order"], sorted(calls["order"], reverse=True))
 
     def test_build_coverage_driven_reports_legs_driven(self):
         import asyncio
@@ -464,16 +473,18 @@ class CasesDrivenTests(unittest.TestCase):
         eps = endpoint_view(st)
         t.build(eps, ["user"])
         t.expand_parameter_cases(eps, per_cell_budget=8)
-        calls = {"n": 0}
+        from harness.coverage_tracker import _PASSIVE_LEG_CONFIRMATIONS
+        calls = {"n": 0, "passive": 0}
 
         async def failing(identity, method, path, check, case_key):
-            calls["n"] += 1
+            calls["passive" if check.confirmation in _PASSIVE_LEG_CONFIRMATIONS else "n"] += 1
             raise RuntimeError("synthetic operational failure")
 
         attempts = asyncio.run(t.drive_coverage_cases(failing, budget=1))
-        self.assertEqual(attempts, 1)
-        self.assertEqual(calls["n"], 1)                       # budget bounded the calls
-        self.assertEqual(t.matrix.case_summary()["error"], 1)  # the failure is visible
+        self.assertEqual(calls["n"], 1)                       # budget bounded the calls that send
+        self.assertEqual(attempts, 1)                         # a passive leg spends none
+        self.assertEqual(t.passive_judged, calls["passive"])
+        self.assertEqual(t.matrix.case_summary()["error"], 1 + calls["passive"])  # every failure is visible
 
     def test_none_result_is_inconclusive_not_silent(self):
         # R05: a callback that returns None is recorded INCONCLUSIVE (dispatched, no

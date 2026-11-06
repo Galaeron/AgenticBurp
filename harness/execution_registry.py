@@ -17,6 +17,9 @@ A key is a statement about what the leg tests, never about who asked:
   template and the identity, so their key is (validator, method, host, route template,
   identity) with no parameters or body: the universal header audit and the model-review
   path answer the same question once.
+- RESPONSE_JUDGED legs send nothing and judge the captured response they are handed,
+  so the response is part of the case: two captures of one request that drew
+  different responses are two cases.
 
 Batch 04: reuse is conditional and evidence-linked. Every key also carries the
 mechanism (validator) version and the finding's relevant workflow state, so a new
@@ -51,6 +54,8 @@ SHAPE_KEYED = frozenset({
 TOOL_SCAN_KEYED = frozenset({"sqlmap"})
 # Validators whose verdict is a fact about a route's response headers (E2).
 HEADER_CHECKED = frozenset({"csp_validator", "cors_validator"})
+# Passive validators whose verdict is a fact about the one captured response.
+RESPONSE_JUDGED = frozenset({"security_headers_validator", "error_handling_validator"})
 # Not shape-keyed although they test parameters: ssrf, open_redirect, path_traversal
 # and deserialization_oob pick WHICH parameter to attack by its value (URL-, path- or
 # blob-shaped), so two requests with the same names can need different checks.
@@ -120,6 +125,12 @@ def _base_key(validator_name: str, exchange, finding_class: str | None) -> tuple
         return (validator_name, (exchange.method or "GET").upper(),
                 urlsplit(exchange.url or "").netloc.lower(), normalize_path(exchange.url or ""),
                 identity, _header_claim(validator_name, finding_class))
+    if validator_name in RESPONSE_JUDGED:
+        response = json.dumps([exchange.response_status, sorted(
+            (str(k).lower(), str(v)) for k, v in (exchange.response_headers or {}).items()),
+            exchange.response_body or ""], default=str)
+        return confirmation_cache_key(validator_name, exchange, finding_class) + (
+            identity, hashlib.sha256(response.encode("utf-8", errors="replace")).hexdigest())
     if validator_name not in SHAPE_KEYED:
         return confirmation_cache_key(validator_name, exchange, finding_class) + (identity,)
     parts = urlsplit(exchange.url or "")

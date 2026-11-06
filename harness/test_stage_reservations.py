@@ -203,8 +203,14 @@ class CoverageDeadlineTests(unittest.TestCase):
         self.assertEqual(report["queued_not_attempted"], len(unbounded) - 1)
 
     def test_leg_budget_stop_is_named_apart_from_time(self):
+        from harness.coverage_model import CHECKS_BY_ID
         sent, report = self._legs(None, budget=1)
-        self.assertEqual(len(sent), 1)
+        # Passive legs judge the capture and spend no budget; one sending leg runs.
+        sending = [s for s in sent if CHECKS_BY_ID[s[3]].confirmation
+                   not in coverage_tracker._PASSIVE_LEG_CONFIRMATIONS]
+        self.assertEqual(len(sending), 1)
+        self.assertEqual(report["legs_driven"], 1)
+        self.assertEqual(report["passive_legs_judged"], len(sent) - 1)
         self.assertEqual(report["drive_stopped_by"], "leg budget")
 
     def test_case_drive_honours_the_deadline_between_parameter_dispatches(self):
@@ -248,7 +254,8 @@ class CoverageDeadlineTests(unittest.TestCase):
         state.endpoints["POST /api/search"].template = None
         sent, report = self._cases(130.0, clock=_Clock(), advance=45.0, state=state)
         self.assertEqual(len(sent), 1)
-        self.assertEqual(report["cases_driven"], 1)
+        # The one cell reached may be a passive leg (they run first, spend no budget).
+        self.assertEqual(report["cases_driven"] + report["passive_legs_judged"], 1)
         self.assertEqual(report["drive_stopped_by"], "time budget")
         self.assertEqual(report["queued_not_attempted"], len(unbounded) - 1)
 

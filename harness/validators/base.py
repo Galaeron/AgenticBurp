@@ -50,6 +50,10 @@ class ValidationResult:
     # sqlmap's verdict lines). Copied onto the ProofRecord's `limitation` by
     # proof_limitation_of; "" lets the summary stand in.
     limitation: str = ""
+    # The severity a coverage-driven confirmation is ingested at, for a validator
+    # whose verdict is a hardening fact (a missing header, a disclosed stack
+    # trace). "" keeps the coverage path's default.
+    severity: str = ""
 
     def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
         """Name the sends behind this verdict; each is an ExecutionOutcome, a

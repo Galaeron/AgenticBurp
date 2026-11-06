@@ -278,6 +278,13 @@ _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
                  note="One of AuthSequenceValidator's three dispatched classes; no Java case."),
     _python_only("username_enumeration", "auth_sequence",
                  note="One of AuthSequenceValidator's three dispatched classes; no Java case."),
+    _python_only("security_headers", "security_headers",
+                 note="PASSIVE WSTG-CONF-02 coverage leg: nosniff / Referrer-Policy on a captured "
+                      "2xx. Judges the captured response and sends nothing; no Java case."),
+    _python_only("error_disclosure", "error_handling",
+                 note="PASSIVE WSTG-ERRH-01 coverage leg: a stack trace or framework error page in "
+                      "a captured error response. Sends nothing; no Java case. Distinct from "
+                      "'info_disclosure' (Python 'verbose_error', agent-finding leads)."),
 )
 
 CAPABILITY_MATRIX: dict[str, CapabilityOwnership] = {

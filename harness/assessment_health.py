@@ -337,7 +337,8 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         finding = referenced.get(proof_id)
         validator = proof.get('validator', '')
         cls = ((finding or {}).get('vulnerability_class') or case.get('check_id') or validator).lower()
-        claimed = ('hardening' if validator in ('csp_validator', 'crypto_validator', 'verbose_error_validator')
+        claimed = ('hardening' if validator in ('csp_validator', 'crypto_validator', 'verbose_error_validator',
+                                                'security_headers_validator', 'error_handling_validator')
                    else 'reconnaissance' if validator == 'recon_validator' else 'vulnerability')
         refs = [proof.get('baseline_artifact_id'), proof.get('attack_artifact_id'),
                 *(proof.get('control_artifact_ids') or [])]

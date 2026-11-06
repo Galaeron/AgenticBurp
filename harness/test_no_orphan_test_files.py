@@ -19,6 +19,7 @@ CASE_BASE_MODULES = frozenset({
     'harness.test_experiment_cycle',
     'harness.test_retry_rounds',
     'harness.test_role_crawl',
+    'harness.test_security_headers_validator',
 })
 
 
