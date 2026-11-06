@@ -50,8 +50,11 @@
   30 s, else fails fast. Other 4xx still count. Tests: harness/test_ollama_context_window.py.
 
 ## Verification
-- `integrate/main-2026-11-06`, 2026-11-06, Windows, system Python 3.14: see NOTES.md of
-  the run-until-deadline session for the gate record of this merge.
+- `integrate/main-2026-11-06` `768939b6`, 2026-11-06, Windows, system Python 3.14: full
+  exit 0 (harness 5614, native 38, evaluation 451 / 17 skips, integrity 59). The first
+  full run failed (22 failures, 47 errors): a semantic merge conflict left sqlmap's
+  `_validate_request` without PR #28's `light` record (NameError), fixed in `1f32f775`.
+  Smoke and per-module tests had passed. Java not rerun.
 - `claude/run-until-deadline` `bfea370d`, 2026-11-06, Windows, system Python 3.14: smoke
   exit 0 (149); full exit 0 (harness 5434, native 38, evaluation 451 / 17 skips,
   integrity 59). Java not rerun.
