@@ -1415,6 +1415,43 @@ class ChainMixin:
                 run_id=_rb4_run_id, request_template_id=template_id,
                 check_id=check_id, principal_id=_rb4_principal_for(exchange))
 
+        def _proven_parameter(finding, res) -> tuple[str, str]:
+            """(location, name) of the input the leg proved: the finding's own
+            parameter, else the one the leg reports (tested_parameters for a
+            per-parameter leg, sqlmap's single injection point), else ("", "")."""
+            name = str(finding.get("parameter_name") or "")
+            if name:
+                return str(finding.get("parameter_location") or ""), name
+            tested = tuple(getattr(res, "tested_parameters", ()) or ())
+            if len(tested) == 1:
+                return str(tested[0][0] or ""), str(tested[0][1] or "")
+            points = {(p.get("place", ""), p.get("parameter", ""))
+                      for p in (getattr(res, "injection_points", ()) or ())
+                      if isinstance(p, dict) and p.get("parameter")}
+            if len(points) == 1:
+                return next(iter(points))
+            return "", ""
+
+        async def _bind_stored(finding, res, validator_name, exchange):
+            try:
+                location, name = _proven_parameter(finding, res)
+                proven = Finding(
+                    vulnerability_class=finding.get("vulnerability_class") or validator_name,
+                    confidence=float(finding.get("confidence", 0.9) or 0.9),
+                    severity=finding.get("severity") or "high",
+                    summary=finding.get("summary") or f"{validator_name} confirmed on {exchange.url}",
+                    evidence=finding.get("evidence") or "",
+                    suggested_test=finding.get("suggested_test") or "", basis="derived",
+                    review_verdict="validator-confirmed", confirmed=True,
+                    proof_id=finding["proof_id"], case_id=finding["case_id"],
+                    confirmed_by_leg=validator_name,
+                    parameter_location=location, parameter_name=name)
+                await asyncio.to_thread(store.bind_confirmation_proof, exchange, proven,
+                                        validator_name)
+            except Exception as e:  # bookkeeping never sinks the graph loop
+                log.debug("r5: binding %s proof to stored findings failed on %s: %s",
+                          validator_name, exchange.url, e)
+
         async def _apply(finding, res, leg, floor, exchange):
             # I04: an unconfirmed check that leaves a human-verifiable candidate
             # puts its copy-ready steps in the finding's next step.
@@ -1467,6 +1504,10 @@ class ChainMixin:
                     if ok:
                         finding["proof_id"] = proof_dict["proof_id"]
                         finding["case_id"] = case.case_id
+                        # r5: bind the proof to the stored finding of its own
+                        # class (and proven parameter) on this route, so the
+                        # findings table carries the confirmation too.
+                        await _bind_stored(finding, res, validator_name, exchange)
                         # The shape-driven legs' own probes (e.g.
                         # CrossIdentityValidator) don't thread case_ref through the
                         # shared TargetTransport, so a real reconstruct_persisted()

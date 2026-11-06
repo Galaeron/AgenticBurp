@@ -952,6 +952,67 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
         conn.close()
 
 
+def bind_confirmation_proof(exchange: HttpExchange, finding: Finding, agent_name: str, *,
+                            engagement_id: str = "") -> int:
+    """Bind a persisted confirmation proof to the stored finding(s) it proves.
+
+    The engagement graph loop confirms dict findings in engagement state; the
+    findings table (findings API, report) never heard of those proofs (r5:
+    sqlmap proved SQLi on POST /rest/user/login, the stored login rows stayed
+    unconfirmed). This marks confirmed only the UNCONFIRMED rows on the same
+    host, method and url whose class is the proof's own class (the fingerprint's
+    canonical reading) and whose recorded parameter is the proven one, or is
+    unnamed. A row of any other class or another parameter is never touched.
+    When no row matches and none is already confirmed, the proven finding is
+    persisted as its own row. `finding` must carry proof_id and case_id; a
+    finding without them binds nothing. Returns the number of rows bound/added."""
+    if not (finding.confirmed and finding.proof_id and finding.case_id):
+        return 0
+    from harness.categories import legacy_canonicalize
+
+    def _check(cls: str) -> str:
+        return legacy_canonicalize(cls) or (cls or "").lower()
+
+    check = _check(finding.vulnerability_class)
+    param = finding.parameter_name or ""
+    host = host_of(exchange.url)
+    engagement_id = _engagement_partition(engagement_id)
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT f.id, f.vulnerability_class, f.confirmed,
+                      COALESCE(fi.parameter_name, ''), f.fingerprint FROM findings f
+               LEFT JOIN finding_inputs fi ON fi.fingerprint = f.fingerprint
+                                          AND fi.case_id = f.case_id
+               WHERE f.host = ? AND f.method = ? AND f.url = ?
+                 AND f.engagement_id IN (?, '')""",
+            (host, (exchange.method or "").upper(), exchange.url, engagement_id)).fetchall()
+        same = [r for r in rows if _check(r[1]) == check and r[3] in (param, "")]
+        bind = sorted({r[0] for r in same if not r[2]})
+        if bind:
+            marks = ",".join("?" for _ in bind)
+            conn.execute(
+                f"""UPDATE findings SET confirmed = 1, proof_id = ?, case_id = ?,
+                        review_verdict = 'validator-confirmed',
+                        confidence = MAX(confidence, ?)
+                    WHERE id IN ({marks}) AND confirmed = 0""",
+                (finding.proof_id, finding.case_id, float(finding.confidence or 0.0), *bind))
+            # The row's recorded input is keyed by its case; re-key it to the proof's.
+            conn.executemany(
+                "INSERT OR IGNORE INTO finding_inputs (fingerprint, case_id, parameter_location, "
+                "parameter_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                sorted({(r[4], finding.case_id, finding.parameter_location or "", param, time.time())
+                        for r in same if r[0] in bind}))
+            conn.commit()
+            return len(bind)
+        if any(r[2] for r in same):
+            return 0
+    finally:
+        conn.close()
+    persist_findings(exchange, agent_name, [finding], engagement_id=engagement_id)
+    return 1
+
+
 def finding_observations(fingerprints: list[str] | None = None) -> dict[str, list[str]]:
     """fingerprint -> the list of exchange_ids that produced it (AR-3 LOOP
     half), read from the finding_observations link table -- NOT from

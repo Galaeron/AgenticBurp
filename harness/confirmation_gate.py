@@ -301,6 +301,23 @@ _LEAD_VERDICTS = frozenset({
 })
 
 
+def is_demoting_verdict(review_verdict: str | None) -> bool:
+    """True for a review verdict that demotes a finding (a LEAD verdict)."""
+    return (review_verdict or "").lower() in _LEAD_VERDICTS
+
+
+def carries_deterministic_proof(finding) -> bool:
+    """True when a finding is confirmed AND names the leg/proof behind it
+    (proof_id, confirmed_by_leg or confirmation_method). Model review may
+    annotate such a finding but never demote it."""
+    get = finding.get if isinstance(finding, dict) else (
+        lambda key, default=None: getattr(finding, key, default))
+    if not get("confirmed", False):
+        return False
+    return bool(get("proof_id", "") or get("confirmed_by_leg", "")
+                or get("confirmation_method", ""))
+
+
 def lifecycle_state(confirmed: bool, review_verdict: str | None = "") -> str:
     """Map (confirmed, review_verdict) to a CONFIRMED / SUSPECTED / LEAD state.
 

@@ -399,6 +399,25 @@ class RealPipelineGateTest(unittest.TestCase):
             self.assertTrue(recon["why_concluded"], f"why_concluded (VALIDATION_DECISION) must be recorded: {recon}")
 
 
+    def test_engagement_confirmation_reaches_the_findings_table(self):
+        """r5: an engagement-path (PASS2 `_apply`) confirmation must reach the
+        findings table the findings API and report read, bound to its own proof,
+        not live only in engagement state. Negative control: the patched fixture
+        stores no confirmed row for the object route."""
+        def _stored_confirmed():
+            return [r for r in store.all_host_findings(fx.base)
+                    if r["confirmed"] and "/api/notes/" in (r.get("url") or "")]
+        with _PipelineRun("vulnerable").run_live() as (result, fx):
+            proven = _confirmed_idor(result)
+            self.assertTrue(proven, "precondition: no confirmed engagement-path IDOR")
+            rows = _stored_confirmed()
+            self.assertTrue(rows, "the engagement-path confirmation never reached the findings table")
+            self.assertTrue(all(r["proof_id"] for r in rows), rows)
+            self.assertIn(proven[0]["proof_id"], {r["proof_id"] for r in rows})
+        with _PipelineRun("patched").run_live() as (result, fx):
+            self.assertEqual(_stored_confirmed(), [])
+
+
 class RealPipelineGateDefectInjectionTest(unittest.TestCase):
     """The gate is only worth having if it FAILS when the pipeline breaks. Each test
     reintroduces a known defect and asserts the positive gate's checks now go red.
