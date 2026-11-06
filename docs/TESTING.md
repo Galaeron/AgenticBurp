@@ -55,6 +55,8 @@ and a clean lockfile installation still need their own verification.
 | Does a leg distinguish vulnerable and secure behavior? | `test_leg_live_verification`, class-specific validator tests | Owned loopback fixture; optional browser/tool dependencies |
 | Are weak verdicts prevented from overconfirming? | `test_oracle_retirements`, `test_confirmation_gate`, `test_oracle_framework` | Unit/fixture evidence; inspect caller integration separately |
 | Does state survive persistence/export? | `test_verification_state_consistency`, `test_issues`, `test_serialization_roundtrip` | Python round trips do not prove Java display or every export path |
+| Are the run's own 5xx answers followed up? | `test_server_errors` | Loopback search route; sqlmap / nosql legs stubbed; also covers the NoSQL-to-nosql-leg routing |
+| Do retry rounds spend a time-boxed run's budget? | `test_retry_rounds`, `RefreshAfterRetryRoundsTests` in `test_coverage_tracker` | Stubbed worklist and review; no live model |
 | Are tests silently uncollected? | `test_no_orphan_test_files`, `test_async_test_hygiene` | Static guards plus CI wiring; runtime collection remains authoritative |
 
 The `test_score_provenance`, `test_evidence_audit`, `test_coverage_summary`, and
