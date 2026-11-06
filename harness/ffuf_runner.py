@@ -27,6 +27,43 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IMAGE = "harness/ffuf:2.1.0"
 DEFAULT_WORDLIST = "/wordlist.txt"
+# Wordlists baked into the image, by config name (engagement.discovery_ffuf_wordlist).
+# "harness": the harness's own vocabulary (tools/gen_ffuf_wordlist.py), the default.
+# "seclists": the hash-pinned SecLists subset (tools/ffuf-seclists.lock.json).
+WORDLISTS = {"harness": DEFAULT_WORDLIST, "seclists": "/wordlist-seclists.txt"}
+
+
+def wordlist_path(name: str) -> str:
+    """The in-image path of a named wordlist; an unknown name is refused."""
+    try:
+        return WORDLISTS[name]
+    except KeyError:
+        raise ValueError(f"unknown ffuf wordlist {name!r} (expected one of {sorted(WORDLISTS)})") from None
+
+
+def pin_image(image: str = DEFAULT_IMAGE) -> tuple[str | None, str]:
+    """(digest-pinned reference, reason) to run `image` with inside a run, or
+    (None, why not). A name@sha256:<digest> or sha256:<image id> reference must
+    match the local image (never pulled); a tag is pinned to the local image ID it
+    names now, so the whole run uses one exact build even if the tag is rebuilt."""
+    try:
+        parsed = tool_runner.parse_image_ref(image)
+    except tool_runner.ImageReferenceError as exc:
+        return None, str(exc)
+    if parsed.pinned:
+        ok, reason = tool_runner.verify_pinned_digest(image)
+        return (image, f"{image} ({reason})") if ok else (None, reason)
+    found = tool_runner.local_image_digests(image)
+    if found is None:
+        return None, f"{image!r} is not present locally (no pull attempted)"
+    image_id = found[0]
+    try:
+        tool_runner.validate_image_ref(image_id, require_digest=True)
+    except tool_runner.ImageReferenceError:
+        return None, f"{image!r} has no usable local image ID"
+    return image_id, f"{image} pinned to local image ID {image_id}"
+
+
 DEFAULT_THREADS = 40
 DEFAULT_TIMEOUT = 180.0
 
@@ -56,8 +93,12 @@ def ffuf_available(image: str = DEFAULT_IMAGE) -> tuple[bool, str]:
 def build_args(target_url: str, *, wordlist: str = DEFAULT_WORDLIST,
                threads: int = DEFAULT_THREADS, headers: dict[str, str] | None = None,
                match_codes: str = "all", filter_codes: str = "404",
-               auto_calibrate: bool = True) -> list[str]:
-    """Build the ffuf argument list.  Pure -- no side effects, testable."""
+               auto_calibrate: bool = True, filter_size: int | None = None) -> list[str]:
+    """Build the ffuf argument list.  Pure -- no side effects, testable.
+
+    `filter_size` is the byte length of the target's soft-404 answer as the
+    harness's own calibration measured it (SurfaceDiscovery): passed as -fs so
+    ffuf drops the same catch-all the Python fingerprint does, on top of -ac."""
     url = tool_runner.localhost_url(target_url.rstrip("/") + "/FUZZ")
     args = [
         "-u", url,
@@ -70,6 +111,8 @@ def build_args(target_url: str, *, wordlist: str = DEFAULT_WORDLIST,
     ]
     if auto_calibrate:
         args.append("-ac")
+    if filter_size is not None:
+        args.extend(["-fs", str(int(filter_size))])
     for name, value in (headers or {}).items():
         args.extend(["-H", f"{name}: {value}"])
     return args
@@ -141,15 +184,21 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
              wordlist: str = DEFAULT_WORDLIST, threads: int = DEFAULT_THREADS,
              headers: dict[str, str] | None = None, timeout: float = DEFAULT_TIMEOUT,
              match_codes: str = "all", filter_codes: str = "404",
-             auto_calibrate: bool = True, cancel=None) -> FfufResult:
+             auto_calibrate: bool = True, cancel=None, filter_size: int | None = None,
+             egress=None, require_digest: bool = False) -> FfufResult:
     """Run ffuf in a container and return parsed routes.  Synchronous (blocks).
     I05-C: `cancel` stops a running container (see tool_runner.run). SC-9: the run
-    goes through a ToolBroker, so an unboundable image/timeout launches nothing."""
+    goes through a ToolBroker, so an unboundable image/timeout launches nothing.
+    An `egress` policy is enforced (fail closed), as for the proxied sqlmap run.
+    With `require_digest` an image not pinned by digest launches nothing."""
     args = build_args(target_url, wordlist=wordlist, threads=threads,
                       headers=headers, match_codes=match_codes,
-                      filter_codes=filter_codes, auto_calibrate=auto_calibrate)
+                      filter_codes=filter_codes, auto_calibrate=auto_calibrate,
+                      filter_size=filter_size)
     try:
-        broker = tool_runner.ToolBroker(image=image, timeout=timeout)
+        broker = tool_runner.ToolBroker(image=image, timeout=timeout, egress=egress,
+                                        enforce_egress=egress is not None,
+                                        require_digest=require_digest)
         rc, stdout, stderr = broker.run(args, cancel=cancel)
     except tool_runner.ToolCleanupFailed:
         raise   # a container that may still run is not an ordinary ffuf error
@@ -171,9 +220,19 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
 
 async def ffuf_discover(target_url: str, *, image: str = DEFAULT_IMAGE,
                         headers: dict[str, str] | None = None,
-                        timeout: float = DEFAULT_TIMEOUT) -> FfufResult:
+                        timeout: float = DEFAULT_TIMEOUT, cancel=None,
+                        filter_size: int | None = None, egress=None,
+                        wordlist: str = DEFAULT_WORDLIST,
+                        require_digest: bool = False) -> FfufResult:
     """Async wrapper: run ffuf in a thread so it doesn't block the event loop.
     I05-C: if the awaiting task is cancelled, the container is stopped and removed
     before the cancellation propagates."""
+    extra = {} if filter_size is None and egress is None else {
+        "filter_size": filter_size, "egress": egress}
+    if wordlist != DEFAULT_WORDLIST:
+        extra["wordlist"] = wordlist
+    if require_digest:
+        extra["require_digest"] = True
     return await tool_runner.call_cancellable(
-        run_sync, target_url, image=image, headers=headers, timeout=timeout)
+        run_sync, target_url, image=image, headers=headers, timeout=timeout,
+        **({"cancel": cancel} if cancel is not None else {}), **extra)

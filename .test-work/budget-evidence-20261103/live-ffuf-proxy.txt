@@ -1,0 +1,4 @@
+Live check, real Docker 29.8.2 + rebuilt harness/ffuf:2.1.0 (ffuf 2.1.0-dev), owned SPA catch-all fixture on 127.0.0.1, max_probes=3000:
+wordlist=harness  ffuf_requests=1652 probes_sent=2212 budget_used=2212 target_gets=2211 routes=1  PASS (11304 past share not sent)
+wordlist=seclists ffuf_requests=1652 probes_sent=2151 budget_used=2151 target_gets=2151 routes=0  PASS (12223 past share not sent)
+In-image: /wordlist.txt 12950 lines; /wordlist-seclists.txt 13947 lines, sha256 ec064dd3...eb7f == lock.

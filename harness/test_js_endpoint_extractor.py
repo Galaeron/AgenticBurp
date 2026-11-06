@@ -53,6 +53,20 @@ class JsEndpointExtractorTests(unittest.TestCase):
         r = extract_endpoints(js, "https://app.test/x.js")
         self.assertEqual({p for p in r.same_origin_paths if p.startswith("/user")}, {"/user/{id}"})
 
+    def test_slash_less_api_and_rest_literals_are_same_origin_routes(self):
+        # A bundle joining its own host variable: this.host + "api/Users".
+        js = ('this.host=this.hostServer+"api/Quantitys";'
+              "get(e){return this.http.get(this.hostServer+'rest/products/search?q='+e)}"
+              '`rest/basket/${id}/checkout`')
+        r = extract_endpoints(js, "https://app.test/main.js")
+        self.assertTrue({"/api/Quantitys", "/rest/basket/{id}/checkout"} <= r.same_origin_paths,
+                        r.same_origin_paths)
+
+    def test_negative_control_other_slash_less_strings_are_not_routes(self):
+        r = extract_endpoints('x="assets/i18n/en.json"; y="apiKey/value"; z="text/html"',
+                              "https://app.test/main.js")
+        self.assertEqual(r.same_origin_paths, set())
+
 
 class CallShapeTests(unittest.TestCase):
     def test_verb_calls_capture_method(self):

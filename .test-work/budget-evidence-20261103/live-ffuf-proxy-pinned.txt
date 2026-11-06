@@ -1,0 +1,5 @@
+wordlist=harness ffuf_requests=1652 probes_sent=2212 budget_used=2212 target_gets=2211 routes=1 disagreements=0
+note: ffuf (harness/ffuf:2.1.0 pinned to local image ID sha256:fb05cf0628fcb446625dc38137f3deeec7c0e20adff9a412f7017ef7446d376a) sent 1652 request(s) through the run; 11222 wordlist request(s) past its shar
+note: ffuf seeded 1 routes
+note: ffuf covered 61 wordlist candidate(s); the Python sweep did not resend them
+PASS

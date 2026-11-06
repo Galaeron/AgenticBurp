@@ -1,0 +1,3 @@
+# Hash-pinned wordlists (tools/ffuf-seclists.lock.json): byte-exact, never EOL-converted.
+tools/seclists/** -text
+tools/ffuf-wordlist-seclists.txt -text

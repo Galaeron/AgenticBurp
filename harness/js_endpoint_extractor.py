@@ -29,6 +29,12 @@ _PATH = r"/[A-Za-z0-9_\-./~%${}:]+"
 # `/`.
 _QUOTED_PATH = re.compile(r"""['"`](/(?!/)[A-Za-z0-9_\-./~%${}:]*[A-Za-z0-9_\-}%])['"`]""")
 
+# Slash-less API literals a bundle joins onto a host variable itself
+# (`this.host + "api/Users"`, `"rest/products/search"`): the leading slash is
+# missing, so _QUOTED_PATH skips them, yet they name same-origin routes.
+_RELATIVE_API_PATH = re.compile(
+    r"""['"`]((?:api|rest)/[A-Za-z0-9_\-./~%${}:]*[A-Za-z0-9_\-}%])['"`]""")
+
 # Absolute URLs anywhere in the body.
 _ABS_URL = re.compile(r"""['"`]?(https?://[A-Za-z0-9._\-]+(?::\d+)?(/[^'"`\s<>()]*)?)""")
 
@@ -169,6 +175,12 @@ def extract_endpoints(body: str, base_url: str = "") -> ExtractedEndpoints:
     # 2. every quoted path-shaped literal.
     for m in _QUOTED_PATH.finditer(body):
         p = m.group(1)
+        if _looks_like_endpoint(p):
+            out.same_origin_paths.add(_normalize(p))
+
+    # 2b. slash-less api/... and rest/... literals.
+    for m in _RELATIVE_API_PATH.finditer(body):
+        p = "/" + m.group(1)
         if _looks_like_endpoint(p):
             out.same_origin_paths.add(_normalize(p))
 

@@ -32,7 +32,77 @@ from harness.safety_gate import get_default_gate
 # Why the run stopped the tool's proxied traffic (ToolProxy.stop_reason), for summaries.
 _PROXY_STOP_WHY = {"budget_exhausted": "the run's request budget ran out",
                    "session_expired": "the identity's session expired during the scan",
-                   "route_unavailable": "the route answered 5xx to every request and was paused"}
+                   "route_unavailable": "the route answered 5xx to every request and was paused",
+                   "tool_cap": "the create-endpoint request cap was reached"}
+
+# Create endpoints get a light sqlmap (owner decision, #28): every request sqlmap
+# sends to one may create an object (the 8h juice-shop run: one sqlmap scan sent
+# 4,765 requests to POST /api/Users and 685 of them created accounts). Level 1,
+# risk 1, boolean + error based only (no stacked, time or union queries), and a
+# hard per-endpoint request cap enforced by the run's tool proxy.
+LIGHT_TECHNIQUES = "BE"
+DEFAULT_CREATE_ENDPOINT_MAX_REQUESTS = 200
+_ID_KEYS = ("id", "_id", "uuid", "guid")
+_ID_SEGMENT = re.compile(
+    r"^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{24})$", re.I)
+_COLLECTION_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z_-]*[a-z]s$")
+
+
+def _has_new_object_id(body: str) -> bool:
+    try:
+        doc = _json.loads(body or "")
+    except ValueError:
+        return False
+    for obj in (doc, doc.get("data") if isinstance(doc, dict) else None):
+        if isinstance(obj, dict) and any(obj.get(k) not in (None, "") for k in _ID_KEYS):
+            return True
+    return False
+
+
+def create_endpoint_reason(exchange: HttpExchange) -> str:
+    """Why this captured request looks like it creates an object, or "".
+
+    A POST/PUT whose base capture answered 201, or a POST to a collection path
+    (no id as its last segment) that answered with a new object id or whose last
+    segment is a plural collection name (/api/Users, /api/BasketItems). A
+    registration is a create even though its body carries a password; a login
+    (no 201, not a collection path, answering a session token) is not."""
+    method = exchange.method.upper()
+    if method not in ("POST", "PUT"):
+        return ""
+    path = urlsplit(exchange.url).path
+    if exchange.response_status == 201:
+        return f"{method} {path} answered 201 Created in the base capture"
+    last = path.rstrip("/").rsplit("/", 1)[-1]
+    if method != "POST" or not last or _ID_SEGMENT.match(last):
+        return ""
+    # A login that answers with the user object and a session token is not a create.
+    if ((exchange.response_status or 0) // 100 == 2
+            and "token" not in (exchange.response_body or "").lower()
+            and _has_new_object_id(exchange.response_body)):
+        return f"POST {path} answered with a new object id in the base capture"
+    if _COLLECTION_SEGMENT.match(last):
+        return f"POST {path} targets a collection"
+    return ""
+
+
+def _light_note(reason: str, cap: int, proxy) -> str:
+    sent = (f"; {proxy.forwarded} request(s) sent"
+            + (", cap reached" if proxy.stop_reason == "tool_cap" else "")) if proxy is not None else ""
+    return (f"light sqlmap (create endpoint: {reason}): level 1, risk 1, "
+            f"techniques {LIGHT_TECHNIQUES}, at most {cap} requests{sent}")
+
+
+def _with_light_note(result: ValidationResult, note: str) -> ValidationResult:
+    """The light-coverage note leads the limitation (the proof reason) and the
+    evidence, so the report says why coverage was light."""
+    result.limitation = (note + ("; " + result.limitation if result.limitation else ""))[:1000]
+    if result.confirmed:
+        # sqlmap's injection points keep leading a confirmed result's evidence.
+        result.evidence = (result.evidence + "\n" if result.evidence else "") + note
+    else:
+        result.evidence = note + ("\n" + result.evidence if result.evidence else "")
+    return result
 
 
 def _looks_like_json(body: str, content_type: str) -> bool:
@@ -343,6 +413,41 @@ def _points_evidence(points: list[dict], tail: str, differential: str = "") -> s
     return "\n".join(lines) + f"\n{_TAIL_MARKER}\n" + tail
 
 
+# sqlmap's own conclusions: its warning/critical/error lines and any line about
+# injectability. The decision lines come LAST in its output, after an early
+# "heuristics detected ... WAF/IPS" line, so a head-truncated copy (the ledger keeps
+# 1000 characters) lost the verdict on every not-confirmed run of the 8h juice-shop run.
+_VERDICT_LINE = re.compile(r"\[(?:WARNING|CRITICAL|ERROR)\]|injectable|is vulnerable", re.I)
+_LOG_TIME = re.compile(r"^\s*\[\d{2}:\d{2}:\d{2}\]\s*")
+_VERDICT_MARKER = "sqlmap verdict:"
+_MAX_VERDICT_LINES = 6
+_VERDICT_LINE_CAP = 160
+
+
+def verdict_lines(output: str) -> list[str]:
+    """sqlmap's last few distinct verdict lines, oldest first, without timestamps."""
+    picked: list[str] = []
+    for line in reversed((output or "").splitlines()):
+        if not _VERDICT_LINE.search(line):
+            continue
+        text = _LOG_TIME.sub("", line).strip()[:_VERDICT_LINE_CAP]
+        if text and text not in picked:
+            picked.append(text)
+            if len(picked) == _MAX_VERDICT_LINES:
+                break
+    return picked[::-1]
+
+
+def _verdict_evidence(output: str) -> tuple[str, str]:
+    """(evidence, limitation) for a run sqlmap did not confirm: the parsed verdict
+    lines first, so any head-truncated copy keeps them, then the output tail."""
+    lines = verdict_lines(output)
+    if not lines:
+        return output, ""
+    return (f"{_VERDICT_MARKER}\n" + "\n".join(lines) + f"\n{_TAIL_MARKER}\n" + output,
+            "sqlmap: " + "; ".join(lines))
+
+
 class SqlmapValidator(Validator):
     """Optional active SQLi validator.
 
@@ -358,7 +463,8 @@ class SqlmapValidator(Validator):
     def __init__(self, binary: str = "sqlmap", timeout_seconds: int = 90,
                  level: int = 1, risk: int = 1, container_image: str | None = None,
                  run_context=None, allowed_hosts: list[str] | None = None,
-                 quick_only: bool = False):
+                 quick_only: bool = False,
+                 create_endpoint_max_requests: int = DEFAULT_CREATE_ENDPOINT_MAX_REQUESTS):
         self.binary = binary
         self.timeout_seconds = timeout_seconds
         self.level = max(1, min(level, 2))
@@ -377,6 +483,8 @@ class SqlmapValidator(Validator):
         self.container_image = container_image
         self.run_context = run_context
         self.quick_only = bool(quick_only)
+        # Hard cap on the requests one light (create-endpoint) sqlmap scan may send.
+        self.create_endpoint_max_requests = max(1, int(create_endpoint_max_requests))
 
     @staticmethod
     def _raw_request(exchange: HttpExchange) -> str:
@@ -414,6 +522,16 @@ class SqlmapValidator(Validator):
         )
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
+        light: dict = {}
+        result = await self._validate(finding, exchange, light)
+        if light.get("launched"):
+            # Every verdict of a light scan says so, and why (create endpoint, cap).
+            return _with_light_note(result, _light_note(light["reason"], light["cap"],
+                                                        light.get("proxy")))
+        return result
+
+    async def _validate(self, finding: Finding, exchange: HttpExchange,
+                        light: dict) -> ValidationResult:
         if not self.applies(finding, exchange):
             return ValidationResult(self.name, "skipped", finding.vulnerability_class,
                                     summary="validator does not apply")
@@ -506,6 +624,18 @@ class SqlmapValidator(Validator):
             return ValidationResult(self.name, "skipped", finding.vulnerability_class,
                                     summary=f"sqlmap not launched: {refusal}")
         _cancel = run.cancel if run is not None else None
+        create_reason = create_endpoint_reason(exchange)
+        cap = self.create_endpoint_max_requests
+        if create_reason and run is None:
+            # The cap is enforced by the run's tool proxy; without a run nothing
+            # would bound how many objects the scan creates.
+            note = _light_note(create_reason, cap, None)
+            return ValidationResult(
+                self.name, "skipped", finding.vulnerability_class,
+                summary=f"sqlmap not launched: {note} needs a run to enforce the cap",
+                limitation=f"skipped: {note}; not launched without a run to enforce the cap")
+        if create_reason:
+            light.update(reason=create_reason, cap=cap)
 
         with tempfile.TemporaryDirectory(prefix="harness-sqlmap-") as td:
             # Keep the raw request text around as an audit artifact (it's
@@ -528,9 +658,12 @@ class SqlmapValidator(Validator):
             request_file.write_text(self._raw_request(exchange), encoding="utf-8")
 
             cmd = [self.binary, "-u", exchange.url, "--batch",
-                   "--level", str(self.level), "--risk", str(self.risk),
+                   "--level", "1" if create_reason else str(self.level),
+                   "--risk", "1" if create_reason else str(self.risk),
                    "--threads", "1", "--timeout", "10", "--retries", "1",
                    "--flush-session", "--disable-coloring"]
+            if create_reason:
+                cmd += ["--technique", LIGHT_TECHNIQUES]
             if only:
                 cmd += ["-p", only[0][1]]
             # Deliberately no --smart: verified directly against a live
@@ -645,7 +778,10 @@ class SqlmapValidator(Validator):
             launch_cmd = cmd
             if run is not None:
                 from harness.tool_proxy import ToolProxy
-                proxy = await ToolProxy(run, exchange.url, capability="sqlmap_tool").start()
+                proxy = await ToolProxy(run, exchange.url, capability="sqlmap_tool",
+                                        **({"max_forwarded": cap, "cap_stops": True}
+                                           if create_reason else {})).start()
+                light["proxy"] = proxy
                 launch_cmd = list(cmd)
                 launch_cmd[launch_cmd.index("-u") + 1] = proxy.url_for(exchange.url)
                 _cancel = lambda: run.cancel.cancelled or proxy.stop_requested  # noqa: E731
@@ -675,6 +811,7 @@ class SqlmapValidator(Validator):
                     run_cmd = tool_runner.docker_cmd(
                         self.container_image, _container_args, egress=_egress_policy)
 
+            light["launched"] = bool(create_reason)
             try:
                 if _use_container:
                     from harness import tool_runner
@@ -775,6 +912,7 @@ class SqlmapValidator(Validator):
             confirmed = proc.returncode == 0 and "is vulnerable" in lower
             if confirmed:
                 return await self._sqlmap_confirmation(finding, exchange, output, cmd)
+            verdict_evidence, verdict = _verdict_evidence(output)
             if proxy is not None and proxy.stop_reason:
                 # The run refused part of the scan: an incomplete scan is not a negative.
                 why = _PROXY_STOP_WHY.get(proxy.stop_reason, "the run was cancelled")
@@ -782,7 +920,7 @@ class SqlmapValidator(Validator):
                     self.name, "skipped", finding.vulnerability_class,
                     summary=f"sqlmap incomplete: {why} after {proxy.forwarded} request(s) "
                             "were sent through the run -- not a negative result",
-                    evidence=output, raw_output=output, command=cmd)
+                    evidence=verdict_evidence, raw_output=output, command=cmd, limitation=verdict)
             # Secondary confirmation for auth/login endpoints (HANDOVER_6 §3/§6.3):
             # sqlmap's own analysis is fragile on a valid-cred (2xx) login capture
             # even with --ignore-code, because it must infer the 2xx<->401 flip
@@ -805,14 +943,15 @@ class SqlmapValidator(Validator):
                     self.name, "inconclusive", finding.vulnerability_class,
                     summary=f"sqlmap did not find parameter {only[0][1]!r} to test "
                             "-- not a negative result",
-                    evidence=output, raw_output=output, command=cmd,
-                    control_outcome=NAMED_PARAMETER_UNTESTED)
+                    evidence=verdict_evidence, raw_output=output, command=cmd,
+                    control_outcome=NAMED_PARAMETER_UNTESTED, limitation=verdict)
             return ValidationResult(
                 self.name, "not_confirmed", finding.vulnerability_class,
                 confidence=0.2 if proc.returncode == 0 else 0.0,
                 confirmed=False,
-                summary="sqlmap did not establish SQL injection for the captured request",
-                evidence=output, raw_output=output, command=cmd,
+                summary="sqlmap did not establish SQL injection for the captured request"
+                        + (f" ({verdict_lines(output)[-1]})" if verdict else ""),
+                evidence=verdict_evidence, raw_output=output, command=cmd, limitation=verdict,
             )
 
     async def _sqlmap_confirmation(self, finding: Finding, exchange: HttpExchange,

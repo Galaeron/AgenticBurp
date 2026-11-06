@@ -923,6 +923,20 @@ class ChainMixin:
                     task.meta["final_pass"] = {"status": "deferred", "reason": result["stopped_by"]}
         return result
 
+    def _discovery_ffuf_kw(self) -> dict:
+        """engagement.discovery_ffuf (default off) and, when it is on, a non-default
+        engagement.discovery_ffuf_wordlist / discovery_ffuf_image; passed on only
+        when they differ."""
+        cfg = self.config if isinstance(self.config, dict) else {}
+        eng = cfg.get("engagement") or {}
+        if not eng.get("discovery_ffuf"):
+            return {}
+        wordlist = str(eng.get("discovery_ffuf_wordlist") or "harness")
+        image = str(eng.get("discovery_ffuf_image") or "")
+        return {"discovery_ffuf": True,
+                **({"discovery_ffuf_wordlist": wordlist} if wordlist != "harness" else {}),
+                **({"discovery_ffuf_image": image} if image else {})}
+
     # Roles registered as replay identities below are owned by this engagement
     # and released when it ends (never leak into a later engagement on the host).
     @identity_headers.leased
@@ -1027,6 +1041,7 @@ class ChainMixin:
                 max_endpoints=discovery_max_endpoints,
                 active_discovery=active_discovery,
                 discovery_max_probes=discovery_max_probes, run_context=run_context,
+                **self._discovery_ffuf_kw(),
                 **({"per_principal": True} if _per_principal else {}),
                 **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
                 **({"driver_capture_config": self.config["driver_capture"]}
@@ -1312,6 +1327,7 @@ class ChainMixin:
             timeout_seconds=int(_sql_cfg.get("timeout_seconds", 90)),
             level=int(_sql_cfg.get("level", 1)),
             risk=int(_sql_cfg.get("risk", 1)),
+            create_endpoint_max_requests=int(_sql_cfg.get("create_endpoint_max_requests", 200)),
             container_image=_sql_cfg.get("container_image"),
             run_context=run_context,
             allowed_hosts=self.allowed_hosts,
@@ -2056,7 +2072,8 @@ class ChainMixin:
                 crawl_max_pages=discovery_max_pages,
                 max_endpoints=discovery_max_endpoints,
                 active_discovery=active_discovery,
-                discovery_max_probes=discovery_max_probes, run_context=run_context)
+                discovery_max_probes=discovery_max_probes, run_context=run_context,
+                **self._discovery_ffuf_kw())
             outs2, new_findings = await _investigate(st2, derived, deadline=_chain_deadline)
             if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
                 await review_captured_exchanges(

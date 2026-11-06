@@ -276,6 +276,67 @@ class ExecutionRegistryTests(unittest.TestCase):
         self.assertEqual(len(validator.calls), len(cases), validator.calls)
         self.assertEqual(registry.stats()["hits"], 0)
 
+    def _run_named(self, registry, validator, exchange, case_ref, location, name, *,
+                   only=False, cls="sqli"):
+        finding = _finding_of(cls)
+        finding.parameter_location, finding.parameter_name = location, name
+        finding.parameter_only = only
+        return registry.run(validator, finding, exchange, case_ref=case_ref,
+                            call=lambda: validator.validate(finding, exchange))
+
+    def test_sqlmap_findings_naming_different_parameters_run_once(self):
+        # The 8h juice-shop run: one request shape, findings naming path id,
+        # query d, and nothing -- sqlmap (no -p) tests them all every time.
+        registry, validator = ExecutionRegistry(), _Counting()
+        named = [("path", "id"), ("query", "d"), ("", "")]
+
+        async def go():
+            return [await self._run_named(registry, validator,
+                                          _ex("http://127.0.0.1/rest/track/1?d=x", headers=_ALICE),
+                                          f"case-{index}", location, name)
+                    for index, (location, name) in enumerate(named)]
+        results = asyncio.run(go())
+        self.assertEqual(len(validator.calls), 1, validator.calls)
+        self.assertTrue(all(r.summary.startswith("covered by case-0 ") for r in results[1:]),
+                        [r.summary for r in results])
+
+    def test_sqlmap_still_reruns_for_another_identity_whatever_parameter_is_named(self):
+        registry, validator = ExecutionRegistry(), _Counting()
+
+        async def go():
+            await self._run_named(registry, validator,
+                                  _ex("http://127.0.0.1/rest/track/1?d=x", headers=_ALICE),
+                                  "case-a", "query", "d")
+            await self._run_named(registry, validator,
+                                  _ex("http://127.0.0.1/rest/track/1?d=x", headers=_BOB),
+                                  "case-b", "path", "id")
+        asyncio.run(go())
+        self.assertEqual(len(validator.calls), 2)
+
+    def test_parameter_only_sqlmap_runs_keep_the_parameter_in_the_key(self):
+        # With parameter_only sqlmap passes -p, so each named parameter is its own scan,
+        # and a -p scan never stands in for the full one.
+        registry, validator = ExecutionRegistry(), _Counting()
+        exchange = _ex("http://127.0.0.1/rest/track/1?d=x", headers=_ALICE)
+
+        async def go():
+            await self._run_named(registry, validator, exchange, "case-a", "query", "d", only=True)
+            await self._run_named(registry, validator, exchange, "case-b", "path", "id", only=True)
+            await self._run_named(registry, validator, exchange, "case-c", "query", "d")
+            await self._run_named(registry, validator, exchange, "case-d", "query", "d", only=True)
+        asyncio.run(go())
+        self.assertEqual(len(validator.calls), 3, validator.calls)
+
+    def test_negative_control_other_shape_keyed_validators_still_split_on_the_parameter(self):
+        registry, validator = ExecutionRegistry(), _Counting("ssti")
+        exchange = _ex("http://127.0.0.1/rest/track/1?d=x", headers=_ALICE)
+
+        async def go():
+            await self._run_named(registry, validator, exchange, "case-a", "query", "d")
+            await self._run_named(registry, validator, exchange, "case-b", "path", "id")
+        asyncio.run(go())
+        self.assertEqual(len(validator.calls), 2)
+
     def test_an_object_check_on_another_object_id_still_runs(self):
         registry, validator = ExecutionRegistry(), _Counting("cross_identity")
 

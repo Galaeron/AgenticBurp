@@ -222,9 +222,10 @@ class StoreTests(unittest.TestCase):
 
 class _FakeValidator:
     """Minimal validator: returns a fixed ValidationResult (or raises)."""
-    def __init__(self, name, status, confirmed, raise_exc=False):
+    def __init__(self, name, status, confirmed, raise_exc=False, summary="s", limitation=""):
         self.name = name
         self._status, self._confirmed, self._raise = status, confirmed, raise_exc
+        self._summary, self._limitation = summary, limitation
 
     def plan(self, finding, exchange):
         return None  # no test-plan -> skip the validation_runs submission path
@@ -236,7 +237,8 @@ class _FakeValidator:
         return ValidationResult(validator=self.name, status=self._status,
                                 finding_class=finding.vulnerability_class,
                                 confidence=0.9 if self._confirmed else 0.2,
-                                confirmed=self._confirmed, summary="s", evidence="e")
+                                confirmed=self._confirmed, summary=self._summary,
+                                evidence="e", limitation=self._limitation)
 
 
 class _FakeRegistry:
@@ -321,6 +323,32 @@ class ValidateFindingsWiringTests(unittest.TestCase):
         self.assertEqual(proofs[0]["verdict"], "inconclusive")
         self.assertTrue(proofs[0]["legacy"])
         self.assertIn("legacy/unstructured", proofs[0]["limitation"])
+
+    def test_not_confirmed_proof_keeps_the_validators_own_reason(self):
+        # The 8h juice-shop run: every unconfirmed proof row said only "legacy/
+        # unstructured result: no resolvable exchange artifacts were captured".
+        reason = "sqlmap: [CRITICAL] all tested parameters do not appear to be injectable"
+        reg = _FakeRegistry({"sqli": _FakeValidator("sqlmap", "not_confirmed", False,
+                                                    summary="no injection", limitation=reason)})
+        _, proofs = self._run(self._reports("sqli"), self._exchange(), reg)
+        limitation = proofs[0]["limitation"]
+        self.assertIn("not_confirmed", limitation)
+        self.assertIn(reason, limitation)
+        self.assertIn("legacy/unstructured", limitation)
+        stored = store.best_proof_for_case(proofs[0]["case"]["case_id"])
+        self.assertIn(reason, stored["limitation"])
+
+    def test_without_a_limitation_the_summary_is_the_reason(self):
+        reg = _FakeRegistry({"sqli": _FakeValidator("sqlmap", "skipped", False,
+                                                    summary="proxy stopped before the scan")})
+        _, proofs = self._run(self._reports("sqli"), self._exchange(), reg)
+        self.assertIn("skipped: proxy stopped before the scan", proofs[0]["limitation"])
+
+    def test_negative_control_a_confirmed_proof_gets_no_limitation_text(self):
+        from harness.validators.base import ValidationResult, proof_limitation_of
+        self.assertEqual(proof_limitation_of(ValidationResult(
+            "sqlmap", "confirmed", "sqli", confirmed=True, summary="injectable",
+            limitation="ignored")), "")
 
     def test_retired_observation_is_not_a_secure_boundary(self):
         reg = _FakeRegistry({"csrf": _FakeValidator("csrf", "not_confirmed", False)})

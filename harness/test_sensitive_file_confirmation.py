@@ -26,6 +26,7 @@ placeholder content, no model or recall claim.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import os
 import secrets
@@ -58,10 +59,16 @@ _DOTENV = ("# synthetic fixture file -- placeholder values only\n"
 _LOGIN = "<!doctype html><html><head><title>Sign in</title></head><body><form>login</form></body></html>"
 
 
+_SHELL_SEQ = itertools.count()
+
+
 def _shell() -> str:
-    # A per-response nonce made of letters: _norm_body_hash only folds digits, so
-    # two bogus paths never share a signature and calibration records nothing.
-    nonce = secrets.token_hex(8).translate(str.maketrans("0123456789", "ghijklmnop"))
+    # A per-response nonce made of letters whose length also grows per response:
+    # _norm_body_hash only folds digits, and the soft-404 length fallback needs two
+    # equal lengths, so two bogus paths never share a signature and calibration
+    # records nothing.
+    nonce = (secrets.token_hex(8) + "a" * next(_SHELL_SEQ)).translate(
+        str.maketrans("0123456789", "ghijklmnop"))
     return (f'<!doctype html><html><head><meta name="csp-nonce" content="{nonce}">'
             '<title>App</title></head><body><div id="root"></div></body></html>')
 

@@ -76,6 +76,9 @@ async def build_engagement(
     run_context=None,
     seed_exchanges=None,
     driver_capture_config=None,
+    discovery_ffuf: bool = False,
+    discovery_ffuf_wordlist: str = "harness",
+    discovery_ffuf_image: str = "",
     per_principal: bool = False,
     extra_views=(),
 ) -> tuple[engagement.EngagementState, role_crawl.RoleCrawlResult]:
@@ -196,6 +199,10 @@ async def build_engagement(
         session_refs=session_refs,
         **({"per_principal": True} if per_principal else {}),
         **({"seed_paths": [urlsplit(ex.url).path for ex, _ in seeds]} if seeds else {}),
+        **({"discovery_ffuf": True} if discovery_ffuf else {}),
+        **({"discovery_ffuf_wordlist": discovery_ffuf_wordlist}
+           if discovery_ffuf_wordlist != "harness" else {}),
+        **({"discovery_ffuf_image": discovery_ffuf_image} if discovery_ffuf_image else {}),
     )
 
     state = engagement.EngagementState(host=host or _host_of(base_url))

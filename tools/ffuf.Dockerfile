@@ -10,18 +10,26 @@
 # the harness's own vocabulary), so the fuzz candidate set is versioned + auditable
 # with the image. Scope (target URL) and identity headers are passed by the harness
 # at run time, never baked in.
-# P3-2 OWNER/LIVE: base images are NOT digest-pinned yet (no digest was invented or
-# pulled offline). On a docker host, resolve each tag and pin it in place, e.g.
-#   docker buildx imagetools inspect golang:1.22-bookworm   ->   FROM golang:1.22-bookworm@sha256:<digest>
-# then confirm `python -m harness.supply_chain images --require-digest` exits 0.
-FROM golang:1.22-bookworm AS build
+# P3-2: base images are pinned by digest (resolved 2026-11-03 with
+#   docker buildx imagetools inspect <tag>
+# ; the tag is kept for readability, docker uses the digest). To move a base,
+# resolve the new digest the same way and confirm
+# `python -m harness.supply_chain images --require-digest` exits 0. Inside a run
+# the built image itself launches only by digest (ffuf_runner.pin_image;
+# engagement.discovery_ffuf_image).
+FROM golang:1.22-bookworm@sha256:3d699e4d15d0f8f13c9195c0632a16702b8cbdece2955af1c23b37ae5d55a253 AS build
 RUN go install github.com/ffuf/ffuf/v2@v2.1.0
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /go/bin/ffuf /usr/local/bin/ffuf
 COPY ffuf-wordlist.txt /wordlist.txt
+# Second wordlist: the SecLists subset pinned by commit SHA + sha256 in
+# ffuf-seclists.lock.json (fetch_seclists.py; checked by
+# `python -m harness.supply_chain wordlists`). Selected by
+# engagement.discovery_ffuf_wordlist: seclists.
+COPY ffuf-wordlist-seclists.txt /wordlist-seclists.txt
 RUN useradd -m runner
 USER runner
 ENTRYPOINT ["ffuf"]

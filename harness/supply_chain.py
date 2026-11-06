@@ -10,6 +10,12 @@ commit produce byte-identical SBOMs.
 
     python -m harness.supply_chain sbom [--out sbom.cdx.json]
     python -m harness.supply_chain images [--require-digest]
+    python -m harness.supply_chain wordlists
+
+`wordlists` checks the pinned SecLists subset baked into the ffuf image: every
+file named in tools/ffuf-seclists.lock.json is present with its locked sha256,
+the lock names a full commit SHA, and the merged wordlist is exactly the merge
+of those files (re-derived here, offline).
 
 Vulnerability lookup is NOT done here (it needs the network); CI runs pip-audit
 against harness/requirements.lock for that.
@@ -32,6 +38,9 @@ from harness.tool_runner import ImageReferenceError, parse_image_ref
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REQUIREMENTS = ("harness/requirements.lock", "harness/requirements-proxy.txt")
 DEFAULT_DOCKERFILES = ("tools/sqlmap.Dockerfile", "tools/ffuf.Dockerfile")
+DEFAULT_WORDLIST_LOCK = "tools/ffuf-seclists.lock.json"
+_SHA1_HEX = re.compile(r"[0-9a-f]{40}")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 SPEC_VERSION = "1.5"
 
 _REQ_RE = re.compile(
@@ -187,6 +196,73 @@ def _timestamp(explicit: str | None) -> str | None:
     return None
 
 
+def merge_wordlist_lines(blobs: list[bytes]) -> bytes:
+    """The merged ffuf wordlist: lines of every source in lock order, comments,
+    blanks and whitespace-bearing lines dropped, a leading slash stripped (ffuf
+    runs `-u <base>/FUZZ`), first occurrence kept."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for blob in blobs:
+        for raw in blob.decode("utf-8", errors="replace").splitlines():
+            line = raw.strip().lstrip("/")
+            if not line or line.startswith("#") or any(c.isspace() for c in line):
+                continue
+            if line not in seen:
+                seen.add(line)
+                out.append(line)
+    return ("\n".join(out) + "\n").encode("utf-8")
+
+
+def wordlist_source_name(path: str) -> str:
+    """Discovery/Web-Content/api/objects.txt -> api__objects.txt (flat, no clashes)."""
+    return path.removeprefix("Discovery/Web-Content/").replace("/", "__")
+
+
+def verify_wordlists(lock_path: Path, *, root: Path = ROOT) -> list[dict]:
+    """One row per locked file plus the merged list: {file, ok, error}."""
+    tools = lock_path.parent
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [{"file": _rel(lock_path, root), "ok": False, "error": f"unreadable lock: {exc}"}]
+    rows: list[dict] = []
+    if lock.get("repo") != "danielmiessler/SecLists" or not _SHA1_HEX.fullmatch(str(lock.get("commit", ""))):
+        rows.append({"file": _rel(lock_path, root), "ok": False,
+                     "error": "lock must pin danielmiessler/SecLists to a full commit SHA"})
+    blobs: list[bytes] = []
+    for entry in lock.get("files") or []:
+        path = tools / "seclists" / wordlist_source_name(str(entry.get("path", "")))
+        want = str(entry.get("sha256", ""))
+        try:
+            data = path.read_bytes()
+        except OSError:
+            rows.append({"file": _rel(path, root), "ok": False, "error": "missing"})
+            continue
+        blobs.append(data)
+        if not _SHA256_HEX.fullmatch(want):
+            error = "no sha256 in the lock"
+        elif hashlib.sha256(data).hexdigest() != want:
+            error = "sha256 mismatch"
+        else:
+            error = ""
+        rows.append({"file": _rel(path, root), "ok": not error, "error": error})
+    merged = lock.get("merged") or {}
+    mpath = tools / str(merged.get("file", "ffuf-wordlist-seclists.txt"))
+    try:
+        data = mpath.read_bytes()
+    except OSError:
+        rows.append({"file": _rel(mpath, root), "ok": False, "error": "missing"})
+        return rows
+    if hashlib.sha256(data).hexdigest() != merged.get("sha256"):
+        error = "sha256 mismatch"
+    elif len(blobs) != len(lock.get("files") or []) or data != merge_wordlist_lines(blobs):
+        error = "not the merge of the locked sources"
+    else:
+        error = ""
+    rows.append({"file": _rel(mpath, root), "ok": not error, "error": error})
+    return rows
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m harness.supply_chain")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -199,7 +275,15 @@ def main(argv: list[str] | None = None) -> int:
     images.add_argument("--dockerfiles", nargs="*", default=list(DEFAULT_DOCKERFILES))
     images.add_argument("--require-digest", action="store_true",
                         help="exit 1 when any base image is not pinned by digest")
+    lists = sub.add_parser("wordlists", help="verify the pinned SecLists subset for the ffuf image")
+    lists.add_argument("--lock", default=DEFAULT_WORDLIST_LOCK)
     args = parser.parse_args(argv)
+
+    if args.command == "wordlists":
+        rows = verify_wordlists(ROOT / args.lock)
+        for row in rows:
+            print(f"{'ok' if row['ok'] else 'ERROR':8} {row['file']}" + (f" ({row['error']})" if row["error"] else ""))
+        return 0 if rows and all(r["ok"] for r in rows) else 1
 
     if args.command == "sbom":
         doc = build_sbom([ROOT / p for p in args.requirements],

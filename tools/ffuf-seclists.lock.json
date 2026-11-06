@@ -1,0 +1,31 @@
+{
+  "repo": "danielmiessler/SecLists",
+  "commit": "0c618cfc28d1e68811b95c61cc9ab05bc10b0a02",
+  "files": [
+    {
+      "path": "Discovery/Web-Content/common.txt",
+      "sha256": "47fb86ca6fb3f97e5491161581900d6d99851fb16764eacddf16aa85617c956a",
+      "bytes": 38536
+    },
+    {
+      "path": "Discovery/Web-Content/api/api-endpoints.txt",
+      "sha256": "7860e451bec345a022018a4f76c820d2e7e130df480e31b80dc35dda06762a46",
+      "bytes": 4523
+    },
+    {
+      "path": "Discovery/Web-Content/api/api-endpoints-res.txt",
+      "sha256": "2b4e9afb0212260e64eae30fb0a7160e229c071f1bb5702676dcc6527e05b725",
+      "bytes": 181328
+    },
+    {
+      "path": "Discovery/Web-Content/api/objects.txt",
+      "sha256": "fa11d0d745e278754d2af09f928ee4e45f29d5934c576c92fde4866917393308",
+      "bytes": 20893
+    }
+  ],
+  "merged": {
+    "file": "ffuf-wordlist-seclists.txt",
+    "sha256": "ec064dd3e3f398c61a3cb9568d095cdd4a2671f2b4bdbad33aa5ffe0cdefeb7f",
+    "lines": 13947
+  }
+}

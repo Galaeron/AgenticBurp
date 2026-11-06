@@ -98,6 +98,10 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m harness.supply_chain images
+      - name: Verify the pinned ffuf wordlists (SecLists subset, sha256)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m harness.supply_chain wordlists
       - name: Install pip-audit
         run: python -m pip install pip-audit==2.9.0
       - name: Audit the lock for known vulnerabilities (advisory)
