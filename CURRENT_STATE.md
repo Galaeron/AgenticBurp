@@ -67,11 +67,17 @@
 ## Live runs 2026-11-05/06 (Juice Shop, 10 h, gemma4:latest, num_ctx 16384)
 - r4 (job 2e904173dac3): target lost at T+88 min (Docker Desktop died with a tool shell).
 - r5 (job ec2d4f39326d, local merge `72b4c1d1` = PR #28 + #29 + `ef513daf` + `29930dbd`):
-  205 candidates and 4 proven at T+7.5 h (jwt alg:none, basket IDOR, login-email boolean
-  SQLi, missing CSP). Gaps found: confident findings routed to validators that cannot test
-  them; the sqlmap login proof not bound to its finding and review downgrading proven
-  jwt/idor findings; writes never sent; /ftp, /metrics, JSONP whoami, /redirect reached
-  but unchecked; ~28k requests on /.well-known/csaf/*; 5xx unexamined (fixed above).
+  `done` on its own after 9.5 h, 160,937 requests, 2,226 model calls. 249 raw findings,
+  89 proof-bound cases in 13 vulnerability groups, which are 3 flaws (jwt alg:none, basket /
+  BasketItems IDOR, login-email boolean SQLi), plus missing CSP (hardening). Coverage:
+  4,934 applicable, 635 executed, 573 conclusive; `check_adapter_missing` 2,797,
+  `leg_precondition_unmet` 713; time budget left 101 worklist nodes and 365 captures
+  unreached (r3: 250 executed, 262 budget-exhausted). Gaps found: confident findings
+  routed to validators that cannot test them; the sqlmap login proof not bound to its
+  finding and review downgrading proven jwt/idor findings; writes never sent; /ftp,
+  /metrics, JSONP whoami, /redirect reached but unchecked; ~28k requests on
+  /.well-known/csaf/*; 5xx unexamined (fixed above). Evidence (no token or *-private
+  files): `AgenticVibe-archive/live-runs-2026-11-05/`.
 
 ## Live acceptance v8 (2026-10-28, live-v8-gemma4-full/RUN_STATUS.md)
 - Owned `av-eval-js-daybreak-20261021` on 127.0.0.1:3002 only (port 3000 is unrelated).
