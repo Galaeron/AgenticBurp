@@ -200,18 +200,12 @@ class IdorReadValidator(Validator):
         self.candidate_ids = candidate_ids or []
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
-        # The finding must claim an access-control mechanism (the same markers
-        # cross_identity uses): an id in the URL alone made this leg apply to
-        # every finding on the route, so its read differential "confirmed" XSS,
-        # header and transport findings on /rest/basket/<id> (r5).
-        if not access_control_gate._is_access_control_class(finding.vulnerability_class):
-            return False
         if (exchange.method or "GET").upper() != "GET":
             return False
-        # An object-access claim only: a GET that merely carries an id is not an
-        # IDOR hypothesis, so an XSS/SQLi/JWT finding there is never sent here (r5:
-        # every class on /rest/basket/<id> was routed to this leg).
-        from harness import access_control_gate
+        # An object-access claim only (this leg's own classes, or the access-control
+        # markers cross_identity uses): an id in the URL alone made this leg apply to
+        # every finding on the route, so its read differential "confirmed" XSS,
+        # header and transport findings on /rest/basket/<id> (r5).
         if not (super().applies(finding, exchange)
                 or access_control_gate._is_access_control_class(finding.vulnerability_class)):
             return False
