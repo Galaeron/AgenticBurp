@@ -64,6 +64,12 @@ def _armed_registry():
 class DryRunCrossUserDispatchTest(unittest.TestCase):
     def setUp(self):
         self.exchanges = _load_exchanges()
+        # The leg replays reads only: validate() skips a POST/PUT ("GET-only"), so
+        # since r5 applies() does not admit one either (a dispatch that can only
+        # skip was recorded as having tested the shape). The corpus's 9 GETs are
+        # what arms it; its 5 writes must not.
+        self.reads = [e for e in self.exchanges if e["method"].upper() == "GET"]
+        self.writes = [e for e in self.exchanges if e["method"].upper() != "GET"]
         self.hosts = {urlsplit(e["url"]).hostname for e in self.exchanges}
         for h in self.hosts:
             identity_headers.clear(h)
@@ -92,12 +98,15 @@ class DryRunCrossUserDispatchTest(unittest.TestCase):
                 names = [v.name for v in reg.for_finding(_finding(), _exchange(rec))]
                 if "cross_identity" in names:
                     dispatched += 1
+                elif rec["method"].upper() == "GET":
+                    self.fail(f"object-scoped read did not arm cross_identity: {rec['url']}")
         self.assertGreaterEqual(
             dispatched, 1,
             "the cross-user validator was never dispatched on the object-scoped crAPI "
             "corpus despite two registered identities -- the Phase 1.4 gate is not met")
-        # Dispatch is class-gated, so every object-scoped access-control finding arms it.
-        self.assertEqual(dispatched, len(self.exchanges))
+        # Every object-scoped access-control read arms it; no write does.
+        self.assertEqual((len(self.reads), len(self.writes)), (9, 5), "corpus methods changed")
+        self.assertEqual(dispatched, len(self.reads))
 
     def test_without_identities_it_does_not_dispatch_and_warns(self):
         # Negative control: identities are the thing that enables the check. With
@@ -147,14 +156,15 @@ class DryRunCrossUserDispatchTest(unittest.TestCase):
                     for rec in self.exchanges:
                         report = AgentReport(agent="idor", model="synthetic", findings=[_finding()])
                         validations, _ = await caller._validate_findings(_exchange(rec), [report], run_context=context)
+                        armed = registered and active and scoped and rec["method"].upper() == "GET"
                         self.assertEqual([v.status for v in validations],
-                                         ["not_confirmed"] if registered and active and scoped else [])
+                                         ["not_confirmed"] if armed else [], rec["method"] + " " + rec["url"])
                 return observed.await_count
             finally:
                 await context.aclose()
 
         for registered, active, scoped, expected in (
-                (True, True, True, 14), (False, True, True, 0),
+                (True, True, True, len(self.reads)), (False, True, True, 0),
                 (True, False, True, 0), (True, True, False, 0)):
             with self.subTest(registered=registered, active=active, scoped=scoped):
                 self.assertEqual(asyncio.run(exercise(registered, active, scoped)), expected)
