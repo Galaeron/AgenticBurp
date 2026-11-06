@@ -135,5 +135,77 @@ class CritiqueAnnotatesProvenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unproven.confidence, 0.2)
 
 
+class StoredProofBindingTests(_StoreCase):
+    """Defect 3: store.bind_confirmation_proof, the graph loop's binding seam."""
+
+    _URL = "http://shop.invalid/rest/user/login"
+
+    def _post(self) -> HttpExchange:
+        return HttpExchange(url=self._URL, method="POST",
+                            request_headers={"Content-Type": "application/json"},
+                            request_body='{"email": "a", "password": "b"}', response_status=401)
+
+    def _rows(self):
+        return {(r["vulnerability_class"], r["parameter_name"]): r
+                for r in store.all_host_findings(self._URL)}
+
+    def _seed(self):
+        ex = self._post()
+        store.persist_findings(ex, "iterative:auth", [
+            _finding("Broken Authentication", confidence=1.0),
+            _finding("sqli", confidence=0.35, parameter_location="body", parameter_name="email"),
+            _finding("sqli", confidence=0.35, parameter_location="body", parameter_name="password")])
+        return ex
+
+    def _proof(self, **kw) -> Finding:
+        # A real persisted sqlmap proof: the read side counts a confirmation only
+        # while its exact proof record is on file.
+        from harness.evidence import ProofRecord, TestCaseRef
+        case = TestCaseRef.make(run_id="r5", request_template_id="login", check_id="sqli",
+                                parameter_location="body", parameter_name="email")
+        pr = ProofRecord.from_validation_result(case=case, validator="sqlmap",
+                                                status="confirmed", confirmed=True)
+        ok, reason = store.persist_proof_record(pr)
+        self.assertTrue(ok, reason)
+        base = dict(confirmed=True, proof_id=pr.proof_id, case_id=case.case_id,
+                    confirmed_by_leg="sqlmap", verdict="validator-confirmed")
+        base.update(kw)
+        self.proof_id = pr.proof_id
+        return _finding("sqli", confidence=0.95, **base)
+
+    def test_proof_binds_its_class_and_parameter_only(self):
+        ex = self._seed()
+        n = store.bind_confirmation_proof(
+            ex, self._proof(parameter_location="body", parameter_name="email"), "sqlmap")
+        self.assertEqual(n, 1)
+        rows = self._rows()
+        email = rows[("sqli", "email")]
+        self.assertTrue(email["confirmed"])
+        self.assertEqual(email["proof_id"], self.proof_id)
+        self.assertEqual(email["review_verdict"], "validator-confirmed")
+        # Negative controls: another parameter, another class stay unconfirmed.
+        self.assertFalse(rows[("sqli", "password")]["confirmed"])
+        self.assertFalse(rows[("Broken Authentication", "")]["confirmed"])
+        self.assertEqual(len(rows), 3, "no extra row when a matching finding exists")
+
+    def test_unmatched_proof_creates_its_own_sqli_finding(self):
+        ex = self._post()
+        store.persist_findings(ex, "iterative:auth", [_finding("Broken Authentication")])
+        store.bind_confirmation_proof(
+            ex, self._proof(parameter_location="body", parameter_name="email"), "sqlmap")
+        rows = self._rows()
+        self.assertFalse(rows[("Broken Authentication", "")]["confirmed"],
+                         "a different-class finding must never be relabelled or confirmed")
+        created = rows[("sqli", "email")]
+        self.assertTrue(created["confirmed"])
+        self.assertEqual(created["proof_id"], self.proof_id)
+
+    def test_finding_without_a_proof_binds_nothing(self):
+        ex = self._seed()
+        self.assertEqual(store.bind_confirmation_proof(
+            ex, self._proof(proof_id="", parameter_name="email"), "sqlmap"), 0)
+        self.assertFalse(any(r["confirmed"] for r in self._rows().values()))
+
+
 if __name__ == "__main__":
     unittest.main()
