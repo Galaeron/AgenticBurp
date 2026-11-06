@@ -26,7 +26,8 @@ _COOKIE_SPLIT = re.compile(r"\n|,\s*(?=[^=;,\s]+=)")
 
 def new_review_stats() -> dict:
     """The empty `review_stats` block the capture review fills in."""
-    return {"reviewed": 0, "grouped": [], "unreviewed": 0, "by_tier": dict.fromkeys(TIER_NAMES, 0)}
+    return {"reviewed": 0, "grouped": [], "unreviewed": 0, "by_tier": dict.fromkeys(TIER_NAMES, 0),
+            "elided": []}
 
 
 def _lower(headers) -> dict:

@@ -115,10 +115,14 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   shared breaker opens for 60 s before a half-open retry, so a model you just
   restarted still fails until the window elapses. `/health` now lets you confirm
   recovery; tuning the window is a follow-up.
-- **[open/verify] `num_ctx` is not set.** A worst-case prompt may exceed the
-  model's default context window, and Ollama truncates from the start (where the
-  agent's instructions are) with no error. Verify your Ollama default and set
-  `num_ctx` if needed. Not yet confirmed as a live failure.
+- **[mitigated] Prompts larger than a small `num_ctx`.** Ollama truncates an
+  oversized prompt from the start (where the agent's instructions are) with no
+  error; r3 (gemma4 at `num_ctx` 4096) logged 88 truncations. When `num_ctx` (or
+  `prompt_budget.model_context_tokens`) is set, agent and critique prompts are
+  now fitted to it, every cut marked and listed in `review_stats.elided`. Token
+  counts are estimated, not measured; the context of an unset `num_ctx` is not
+  auto-detected; families routing (`coordinator.routing_mode: families`) is not
+  fitted.
 - **[open] Bodies sent to the model unredacted; cloud egress needs a policy.**
   Only auth headers are masked. `cloud_reasoning` sends real content off-host.
   See USER_MANUAL §5. Redaction before cloud is not implemented.
