@@ -113,6 +113,23 @@ class VerboseErrorValidator(Validator):
 
     async def validate(self, finding: "Finding", exchange: "HttpExchange") -> ValidationResult:
         matches = scan_exchange(exchange)
+        if not matches and not claims_verbose_error(finding):
+            # A broad "Information Disclosure" claim (r5: /api/SecurityQuestions/
+            # serving data) is about WHAT the response exposes, which a stack-trace
+            # detector cannot judge. Finding no trace is no applicable leg, not a
+            # controlled negative (not_confirmed would refute the claim).
+            return ValidationResult(
+                validator=self.get_name(),
+                status="skipped",
+                finding_class=finding.vulnerability_class,
+                confidence=0.0,
+                confirmed=False,
+                summary=("no_applicable_leg: the verbose-error detector tests stack traces "
+                         "and debug output only; this disclosure claim is about the data "
+                         "the response serves and was not tested"),
+                evidence="",
+                raw_output="",
+            )
         if not matches:
             return ValidationResult(
                 validator=self.get_name(),
@@ -143,6 +160,16 @@ class VerboseErrorValidator(Validator):
             evidence=" | ".join(evidence_parts),
             raw_output="\n".join(evidence_parts),
         )
+
+
+_ERROR_CLAIM = re.compile(r"\b(?:verbose|error|stack|trace|debug|exception|crash)", re.I)
+
+
+def claims_verbose_error(finding: "Finding") -> bool:
+    """Whether the finding's own claim is the one this detector tests: a verbose
+    error, stack trace or debug output (in its class or summary)."""
+    return bool(_ERROR_CLAIM.search(" ".join(
+        [finding.vulnerability_class or "", getattr(finding, "summary", "") or ""])))
 
 
 def scan_exchange(exchange: "HttpExchange") -> list[tuple[str, str, str]]:

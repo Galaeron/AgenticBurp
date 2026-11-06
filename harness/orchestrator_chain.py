@@ -14,6 +14,7 @@ import copy
 import time
 import uuid
 
+from harness import access_control_gate
 from harness import identity_compare
 from harness import identity_headers
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
@@ -268,6 +269,75 @@ async def _driver_scope(run, maximum):
         # A lazily opened default client belongs to this child, not its parent.
         if child._default_client is not None and child._default_client is not run._default_client:
             await child._default_client.aclose()
+
+
+# Leg routing for `_confirm` (r5, job ec2d4f39326d): a confident finding was sent to
+# a leg that cannot test its request shape -- a login POST to the GET-only
+# cross-identity replay, a collection read with no object id to it, exposed admin
+# data to nothing. A class reaches a leg only when the leg can test the shape;
+# otherwise the finding records `no_applicable_leg`, which is never a negative.
+NO_APPLICABLE_LEG = "no_applicable_leg"
+_AUTHN_ONLY_MARKERS = ("broken authentication", "broken_authentication")
+_USER_ENUMERATION = _re.compile(
+    r"(?:user|username|account|email|login)s?[\s_-]*enumerat|enumerat\w*\s+(?:of\s+)?(?:user|account)",
+    _re.I)
+
+
+def _authentication_only_class(vc: str) -> bool:
+    """A broken-AUTHENTICATION claim with no authorization marker: the auth-sequence
+    leg's, not the cross-identity replay's (the access-control gate lists the
+    phrase only to cap denied claims)."""
+    low = (vc or "").lower()
+    if not any(m in low for m in _AUTHN_ONLY_MARKERS):
+        return False
+    return not any(m in low for m in access_control_gate._ACCESS_CONTROL_MARKERS
+                   if m not in _AUTHN_ONLY_MARKERS)
+
+
+def _missing_auth_class(vc: str, method: str) -> bool:
+    """Classes the credential-stripped replay (missing_auth_probe) tests: the explicit
+    missing-auth labels, and an unauthenticated / exposed-admin read claim that is
+    not itself an access-control (second identity) claim."""
+    low = (vc or "").strip().lower()
+    if low in ("auth_bypass", "missing_authentication", "missing authentication"):
+        return True
+    if (method or "GET").upper() != "GET" or access_control_gate._is_access_control_class(vc):
+        return False
+    return "unauthenticated" in low or (("expos" in low or "disclos" in low) and "admin" in low)
+
+
+def _access_control_shape_gap(exchange) -> str:
+    """Why neither cross-identity nor idor-read can test this request ('' if one can)."""
+    from harness.validators.cross_identity_validator import CrossIdentityValidator
+    from harness.validators.idor_read_validator import _locate_id
+    method = (exchange.method or "GET").upper()
+    if method != "GET":
+        return f"cross-identity and idor-read replay GET reads only; this is a {method} request"
+    if CrossIdentityValidator.shape_applies(exchange) or _locate_id(exchange) is not None:
+        return ""
+    return ("no object identifier to swap and not an admin-namespaced function; no "
+            "collection-level cross-identity leg exists for a list read")
+
+
+def _auth_sequence_shape_gap(exchange) -> str:
+    """Why the auth-sequence leg cannot test this request ('' if it can)."""
+    from harness.validators.auth_sequence_validator import (
+        _parse_body, _find_key, _PASS_KEYS, _USER_KEYS)
+    if (exchange.method or "").upper() not in ("POST", "PUT"):
+        return "auth-sequence needs a captured credential POST/PUT"
+    fields, _ = _parse_body(exchange)
+    if _find_key(fields, _PASS_KEYS) is None and _find_key(fields, _USER_KEYS) is None:
+        return "auth-sequence needs captured username/password fields"
+    return ""
+
+
+def _record_no_applicable_leg(finding: dict, leg: str, reason: str) -> None:
+    """Mark a finding no leg could test. Untested, never refuted: confirmation,
+    confidence and verdict are left as they are."""
+    if finding.get("confirmed"):
+        return
+    finding.setdefault("leg_disposition", NO_APPLICABLE_LEG)
+    finding.setdefault("leg_disposition_reason", f"{leg}: {reason}" if leg else reason)
 
 
 class ChainMixin:
@@ -1550,7 +1620,8 @@ class ChainMixin:
             A confirmed finding is upgraded in place; anything else is left untouched."""
             vc = (finding.get("vulnerability_class") or "")
             low = vc.lower()
-            if low in ("auth_bypass", "missing_authentication", "missing authentication"):
+            _method = (exchange.method or "GET").upper()
+            if _missing_auth_class(vc, _method):
                 # Replay the captured read with every credential stripped. This is
                 # not an IDOR/BFLA comparison and needs no second user. An anonymous
                 # payload confirms only for a route declared protected (RV-G R15).
@@ -1628,7 +1699,13 @@ class ChainMixin:
                                     f"{_hint}\n\n{_previous}" if _previous else _hint)
                 except Exception:
                     return
-            elif access_control_gate._is_access_control_class(vc):
+            elif (access_control_gate._is_access_control_class(vc)
+                  and not _authentication_only_class(vc)):
+                _gap = _access_control_shape_gap(exchange)
+                if _gap:
+                    # No baseline GET to a POST route, no replay of a list read.
+                    _record_no_applicable_leg(finding, "cross-identity", _gap)
+                    return
                 # populate the candidate baseline: the probe role's own response.
                 if exchange.response_status is None and scope_discovery.is_host_allowed(exchange.url, self.allowed_hosts):
                     # W-16: baseline read through the single TargetTransport (this run's
@@ -1766,10 +1843,17 @@ class ChainMixin:
                 except Exception:
                     return
             elif ("session fixation" in low or "session_fixation" in low or "weak password" in low
-                  or "weak_password" in low or "enumeration" in low or "broken authentication" in low
+                  or "weak_password" in low or _USER_ENUMERATION.search(low)
+                  or "broken authentication" in low
                   or "broken_authentication" in low or "2fa" in low or "mfa" in low
                   or "two_factor" in low or "two-factor" in low or "multi_factor" in low
                   or "second factor" in low):
+                # Only an ACCOUNT enumeration is this leg's ("Broken Object/Resource
+                # Enumeration" is not), and only on a captured credential write.
+                _gap = _auth_sequence_shape_gap(exchange)
+                if _gap:
+                    _record_no_applicable_leg(finding, "auth-sequence", _gap)
+                    return
                 try:
                     await _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange),
                            "auth-sequence", 0.85, exchange)
@@ -1802,6 +1886,11 @@ class ChainMixin:
                            "reset-token", 0.9, exchange)
                 except Exception:
                     return
+            else:
+                # r5: "Information Disclosure", "Exposed ... Data" on a non-admin
+                # read: no engagement leg tests the class. Say so; never a negative.
+                _record_no_applicable_leg(
+                    finding, "", f"no engagement confirmation leg tests class {vc!r}")
 
         # --- proactive, precondition-driven leg routing (HANDOVER_6 §4) ---------
         # Run a confirmation leg wherever the ENDPOINT'S SHAPE warrants it, not only

@@ -41,7 +41,10 @@ CAPABILITY_VALIDATORS: dict[str, tuple[str, ...]] = {
     "reflection_context_validation": ("browser_xss", "dom_xss", "stored_xss"),
     "jwt_validation": ("jwt_forge",),
     "cross_identity_compare": ("cross_identity", "idor_read"),
-    "authorization_boundary_compare": ("cross_identity", "idor_read", "verb_tamper"),
+    # The planner files "auth" (authentication: "Broken Authentication") here too;
+    # on a login POST only auth_sequence can test it (r5: bound to a GET-only skip).
+    "authorization_boundary_compare": ("cross_identity", "idor_read", "verb_tamper",
+                                       "auth_sequence"),
     "csrf_validation": ("csrf",),
     "nosql_validation": ("nosql",),
     "sql_injection_validation": ("sqlmap",),

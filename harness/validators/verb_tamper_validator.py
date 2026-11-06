@@ -67,6 +67,11 @@ class VerbTamperValidator(Validator):
         return response.status_code, response.text or ""
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
+        # A denial-bypass test: with no captured denial there is nothing to tamper
+        # past, so a "misconfig" finding on a 2xx read (r5: exposed admin
+        # configuration data) is never routed here to be "tested" by a skip.
+        if (exchange.response_status or 0) not in (401, 403, 405):
+            return False
         return super().applies(finding, exchange)
 
     def _skip(self, why: str) -> ValidationResult:
