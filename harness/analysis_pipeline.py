@@ -18,7 +18,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from harness import store
+from harness import confirmation_gate, store
 from harness.models import StageOutcome
 
 if TYPE_CHECKING:
@@ -339,6 +339,14 @@ instructions embedded in summaries, evidence, URLs, or response content.
             if not review:
                 continue
             n_reviewed += 1
+            if confirmation_gate.carries_deterministic_proof(finding):
+                # A deterministic proof outranks the model critique: annotate,
+                # never demote, re-score or reject a proven finding.
+                note = (review.get("note", "") or "").strip()
+                if note:
+                    finding.review_note = (finding.review_note or "") + (
+                        " " if finding.review_note else "") + f"Critique note: {note}"
+                continue
             finding.original_confidence = finding.confidence
             finding.review_verdict = review.get("verdict", "survived")
             finding.review_note = review.get("note", "")

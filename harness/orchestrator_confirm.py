@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 
+from harness import confirmation_gate
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 from harness.execution_registry import ExecutionRegistry
 from harness.validators.base import (ValidationResult, observed_result_of, proof_artifact_kwargs,
@@ -784,7 +785,13 @@ class ConfirmMixin:
                     if result.confirmed:
                         finding.confirmed = True
                         finding.confidence = max(finding.confidence, result.confidence)
-                        finding.review_verdict = finding.review_verdict or "validator-confirmed"
+                        # The model critique runs before validation; its verdict
+                        # is an annotation (kept in review_note), never a demotion
+                        # of a finding a deterministic leg just proved (r5: proven
+                        # jwt/idor rows stayed "downgraded").
+                        if (not finding.review_verdict
+                                or confirmation_gate.is_demoting_verdict(finding.review_verdict)):
+                            finding.review_verdict = "validator-confirmed"
                         finding.review_note = (finding.review_note or "") + (
                             " " if finding.review_note else "") + result.summary
                         finding.proof_id = proof_dict["proof_id"]
