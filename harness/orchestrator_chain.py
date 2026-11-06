@@ -1629,7 +1629,9 @@ class ChainMixin:
                 except Exception:
                     return
             elif ("sqli" in low or "sql injection" in low
-                  or "sql_injection" in low):
+                  or "sql_injection" in low) and "nosql" not in low:
+                # ("nosql injection" contains "sql injection": a NoSQL finding is the
+                # nosql leg's, below, never sqlmap's.)
                 try:
                     await _apply(
                         finding,
@@ -2554,6 +2556,83 @@ class ChainMixin:
             log.warning("investigate_engagement: coverage build failed: %s", e)
             _errors.append({"phase": "coverage_build", "error": f"{type(e).__name__}: {e}"})
 
+        # engagement.server_errors (harness/server_errors.py): the 5xx answers this run's
+        # own sends drew. A stack trace is a confirmed disclosure; a database error is an
+        # injection lead, and up to max_lead_confirmations leads go to the leg for their
+        # class with the route's captured template. Runs here and again after the retry
+        # rounds, for the errors their sends drew.
+        _se_cfg = ((self.config.get("engagement") or {}).get("server_errors") or {})
+        _server_error_report: dict = {"enabled": bool(_se_cfg.get("enabled", True)),
+                                      "findings": 0, "leads": 0, "leads_dispatched": 0,
+                                      "leads_confirmed": 0, "leads_not_dispatched": {}}
+        _server_error_done: dict = {}   # finding key -> confirmed, as ingested
+
+        def _server_error_exchange(method, url, lead):
+            """The route's captured template as its lowest-trust reaching identity. A
+            query parameter the lead names but the template lacks gets a neutral value."""
+            from urllib.parse import parse_qsl, urlencode, urlsplit
+            from harness.engagement import normalize_path
+            ep = state.endpoints.get(f"{method.upper()} {normalize_path(url)}")
+            if ep is None:
+                return None
+            node = ep.to_dict()
+            reach = node.get("reachable_roles") or []
+            role = min(reach, key=worklist_investigator._trust) if reach else None
+            ident = next((r for r in roles if r.role == role), None)
+            ex = worklist_investigator._seed_exchange(
+                base_url, node, dict(getattr(ident, "headers", None) or {}), "1")
+            name = lead.get("parameter_name")
+            if lead.get("parameter_location") == "query" and name and name not in {
+                    k for k, _ in parse_qsl(urlsplit(ex.url).query, keep_blank_values=True)}:
+                ex.url += ("&" if "?" in ex.url else "?") + urlencode({name: "1"})
+            return ex
+
+        async def _server_error_pass() -> int:
+            ledger = getattr(run_context, "server_errors", None) if run_context is not None else None
+            if ledger is None or not _server_error_report["enabled"]:
+                return 0
+            max_leads = int(_se_cfg.get("max_lead_confirmations", 0) or 0)
+            skipped = _server_error_report["leads_not_dispatched"]
+            changed = 0
+            for f in ledger.findings():
+                method = f.pop("method", "GET")
+                key = f"{method} {f['url']} {f['vulnerability_class']}"
+                if key in _server_error_done:
+                    continue
+                if not f.get("confirmed"):
+                    _server_error_report["leads"] += 1
+                    reason = ("max_lead_confirmations"
+                              if _server_error_report["leads_dispatched"] >= max_leads
+                              else "cancelled" if (run_context is not None
+                                                   and run_context.cancel.cancelled)
+                              else "deadline" if (_investigation_deadline is not None
+                                                  and time.monotonic() >= _investigation_deadline)
+                              else "")
+                    exchange = None if reason else _server_error_exchange(method, f["url"], f)
+                    if exchange is None:
+                        reason = reason or "no_endpoint"
+                        skipped[reason] = skipped.get(reason, 0) + 1
+                    else:
+                        _server_error_report["leads_dispatched"] += 1
+                        try:
+                            await _confirm(f, exchange)
+                        except Exception as e:  # a lead stays a lead
+                            log.debug("server-error lead on %s: %s", f["url"], e)
+                        _server_error_report["leads_confirmed"] += int(bool(f.get("confirmed")))
+                _server_error_report["findings"] += 1
+                _server_error_done[key] = bool(f.get("confirmed"))
+                state.ingest_findings(f["url"], method, [f])
+                all_findings.append(dict(f, method=method))
+                changed += 1
+            return changed
+
+        _server_error_changed = 0
+        try:
+            _server_error_changed += await _server_error_pass()
+        except Exception as e:  # a report layer plus bounded legs -- never sink the run
+            log.warning("investigate_engagement: server-error follow-up failed: %s", e)
+            _errors.append({"phase": "server_errors", "error": f"{type(e).__name__}: {e}"})
+
         # engagement.retry_rounds: until reserve_seconds before the deadline, sweep the
         # worklist and review captures again with growing budgets, for the nodes and
         # captures earlier passes left (harness/retry_rounds.py). Off by default.
@@ -2598,13 +2677,26 @@ class ChainMixin:
             log.info("investigate_engagement: retry rounds -- %d round(s), stopped by %s",
                      len(_retry_report.get("rounds") or []), _retry_report.get("stopped_by"))
 
-        # The matrix was driven before the retry rounds: record what they found into it.
-        if coverage and _coverage_trackers and _retry_ledger is not None \
-                and _retry_report.get("rounds"):
+        if _retry_ledger is not None and _retry_report.get("rounds"):
+            try:   # the server errors the rounds' own sends drew
+                _server_error_changed += await _server_error_pass()
+            except Exception as e:
+                log.warning("investigate_engagement: server-error follow-up failed: %s", e)
+                _errors.append({"phase": "server_errors", "error": f"{type(e).__name__}: {e}"})
+        if run_context is not None and _server_error_report["enabled"]:
+            _server_error_report["ledger"] = run_context.server_errors.report()
+        # The matrix was built before the rounds and the server-error follow-up: record
+        # what they found into it.
+        if coverage and (_server_error_changed or (_retry_ledger is not None
+                                                   and _retry_report.get("rounds"))):
             try:
-                coverage = coverage_tracker.refresh_after_retry_rounds(
-                    _coverage_trackers[-1], coverage, state, roles,
-                    investigated_keys=investigated_keys)
+                if _coverage_trackers:
+                    coverage = coverage_tracker.refresh_after_retry_rounds(
+                        _coverage_trackers[-1], coverage, state, roles,
+                        investigated_keys=investigated_keys)
+                elif not coverage.get("legs_driven"):   # the passive matrix: rebuild it
+                    coverage = coverage_tracker.build_coverage(
+                        state, roles, investigated_keys=investigated_keys)
             except Exception as e:  # coverage is a report layer -- never sink the run
                 log.warning("investigate_engagement: coverage refresh failed: %s", e)
                 _errors.append({"phase": "coverage_refresh",
@@ -2712,6 +2804,9 @@ class ChainMixin:
             # business-context pass is off), so the API/report can show the
             # inferred roles/objects/workflows/value-flows/sinks and the ranked
             # chaining hypotheses that drove the re-ranking.
+            # engagement.server_errors: the 5xx answers this run's own sends drew, and
+            # the disclosures and injection leads followed up from them.
+            "server_errors": _server_error_report,
             "application_semantic_model": _asm.to_dict() if _asm else None,
             "experiments": _experiments,
             "experiment_preflight": _experiment_dispositions,

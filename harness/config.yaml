@@ -416,6 +416,16 @@ engagement:
     max_step_budget: 1024
     breaker_wait_seconds: 120
     max_idle_rounds: 3
+  # Server errors the run's own sends drew (harness/server_errors.py). The transport
+  # scans the first bodies of each route's 5xx answers (passive: nothing is sent, only
+  # parameter names are kept). A stack trace becomes a confirmed verbose_error_disclosure;
+  # a database error becomes an sql_injection / nosql_injection lead, reported under
+  # `server_errors` in the investigate result. Up to max_lead_confirmations leads go to
+  # the sqlmap / nosql leg with the route's captured template. DEFAULT 0: dispatch
+  # sends active traffic, so the leads stay leads unless it is raised.
+  server_errors:
+    enabled: true
+    max_lead_confirmations: 0
   # Graph -> experiment -> workflow -> proof cycle (experiment.py). When enabled, each
   # IDOR/BOLA business-context hypothesis is turned into a stateful cross-account
   # test (create a private object as one identity, read it as that identity and as

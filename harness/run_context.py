@@ -50,6 +50,7 @@ import httpx
 
 from harness import evidence
 from harness import scope_lock
+from harness.server_errors import ServerErrorLedger
 from harness.safety_gate import SafetyGate, SafetyGateConfig
 from harness.security import is_credential_header, is_identity_credential_header
 from harness.tls_policy import TLSPolicy
@@ -896,6 +897,13 @@ class TargetTransport:
                 counter[0] += 1
             ctx.health.route_observed(route_key, resp.status_code,
                                       int(transport_cfg.get("route_5xx_threshold", 8)))
+            if capability != _HEALTH_CAPABILITY and ctx.server_errors is not None:
+                # Passive: a 5xx body is scanned for the follow-up; never raises.
+                ctx.server_errors.observe(
+                    method=method, url=url, status=resp.status_code, capability=capability,
+                    body_fn=lambda: getattr(resp, "text", ""), request_body=body,
+                    content_type=next((v for k, v in send_headers.items()
+                                       if (k or "").lower() == "content-type"), ""))
             if session and credential_destination and capability != _HEALTH_CAPABILITY:
                 await self._session_feedback(session, resp.status_code, url)
                 await self._freshness_feedback(session, method, url, resp.status_code)
@@ -1285,6 +1293,9 @@ class RunContext:
     target_policy: TargetRequestPolicy = field(default_factory=TargetRequestPolicy, repr=False)
     # E5a: the run's route circuits and one-time health events (see health_report).
     health: TransportHealth = field(default_factory=TransportHealth, repr=False)
+    # The server errors this run's own sends drew, scanned for the follow-up
+    # (harness.server_errors; investigate_engagement turns it into findings/leads).
+    server_errors: ServerErrorLedger = field(default_factory=ServerErrorLedger, repr=False)
     # What safety_gate.push_gate returned when this run installed its gate as
     # ambient -- the gate (or None) that was ambient before it, to restore on
     # aclose(). Not a contextvars.Token: see push_gate's docstring for why.
