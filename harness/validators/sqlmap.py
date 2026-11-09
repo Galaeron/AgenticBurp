@@ -33,7 +33,7 @@ from harness.safety_gate import get_default_gate
 _PROXY_STOP_WHY = {"budget_exhausted": "the run's request budget ran out",
                    "session_expired": "the identity's session expired during the scan",
                    "route_unavailable": "the route answered 5xx to every request and was paused",
-                   "tool_cap": "the create-endpoint request cap was reached"}
+                   "tool_cap": "the per-scan request cap was reached"}
 
 # Create endpoints get a light sqlmap (owner decision, #28): every request sqlmap
 # sends to one may create an object (the 8h juice-shop run: one sqlmap scan sent
@@ -42,6 +42,11 @@ _PROXY_STOP_WHY = {"budget_exhausted": "the run's request budget ran out",
 # hard per-endpoint request cap enforced by the run's tool proxy.
 LIGHT_TECHNIQUES = "BE"
 DEFAULT_CREATE_ENDPOINT_MAX_REQUESTS = 200
+# PUT/PATCH/DELETE get the same light scan with a much tighter cap (r6: a full
+# scan spent 2-3k requests on each of ~10 write endpoints). Every request may
+# change or delete state, so the harness also never replays one to reproduce a hit.
+WRITE_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
+WRITE_ENDPOINT_MAX_REQUESTS = 20
 _ID_KEYS = ("id", "_id", "uuid", "guid")
 _ID_SEGMENT = re.compile(
     r"^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{24})$", re.I)
@@ -89,8 +94,31 @@ def create_endpoint_reason(exchange: HttpExchange) -> str:
 def _light_note(reason: str, cap: int, proxy) -> str:
     sent = (f"; {proxy.forwarded} request(s) sent"
             + (", cap reached" if proxy.stop_reason == "tool_cap" else "")) if proxy is not None else ""
-    return (f"light sqlmap (create endpoint: {reason}): level 1, risk 1, "
+    return (f"light sqlmap ({reason}): level 1, risk 1, "
             f"techniques {LIGHT_TECHNIQUES}, at most {cap} requests{sent}")
+
+
+# sqlmap's own "could not reach the target" verdicts. Only [CRITICAL] lines (and the
+# OS's "network is unreachable") count: a single "[WARNING] connection timed out ...
+# sqlmap is going to retry" during an otherwise answered scan is not a failure.
+_CONNECTION_FAILURE_RE = re.compile(
+    r"network is unreachable|\[CRITICAL\][^\n]*(?:unable to connect|connection refused|"
+    r"connection reset|connection timed out|can't establish|cannot connect|"
+    r"failed to establish a new connection|host .* does not exist|name or service not known)",
+    re.I)
+
+
+def _connection_failure(output: str, proxy) -> str:
+    """Why sqlmap never got an answer from the target, or "". Either sqlmap said so,
+    or inside a run every request it sent through the tool proxy failed at the
+    transport (the proxy answers those 502, which sqlmap reads as a page, not as a
+    connection failure)."""
+    found = _CONNECTION_FAILURE_RE.search(output or "")
+    if found:
+        return found.group(0).replace("[CRITICAL]", "").strip()[:160]
+    if proxy is not None and proxy.forwarded and proxy.refused.get("error", 0) >= proxy.forwarded:
+        return f"all {proxy.forwarded} request(s) sqlmap sent failed at the transport"
+    return ""
 
 
 def _with_light_note(result: ValidationResult, note: str) -> ValidationResult:
@@ -635,8 +663,14 @@ class SqlmapValidator(Validator):
             return ValidationResult(self.name, "skipped", finding.vulnerability_class,
                                     summary=f"sqlmap not launched: {refusal}")
         _cancel = run.cancel if run is not None else None
-        create_reason = create_endpoint_reason(exchange)
-        cap = self.create_endpoint_max_requests
+        write_endpoint = exchange.method.upper() in WRITE_METHODS
+        if write_endpoint:
+            create_reason = f"write endpoint: {exchange.method.upper()} {urlsplit(exchange.url).path}"
+            cap = min(self.create_endpoint_max_requests, WRITE_ENDPOINT_MAX_REQUESTS)
+        else:
+            create = create_endpoint_reason(exchange)
+            create_reason = f"create endpoint: {create}" if create else ""
+            cap = self.create_endpoint_max_requests
         if create_reason and run is None:
             # The cap is enforced by the run's tool proxy; without a run nothing
             # would bound how many objects the scan creates.
@@ -932,6 +966,14 @@ class SqlmapValidator(Validator):
                     summary=f"sqlmap incomplete: {why} after {proxy.forwarded} request(s) "
                             "were sent through the run -- not a negative result",
                     evidence=verdict_evidence, raw_output=output, command=cmd, limitation=verdict)
+            unreachable = _connection_failure(output, proxy)
+            if unreachable:
+                # sqlmap never got an answer to test: "we don't know", not a negative.
+                return ValidationResult(
+                    self.name, "error", finding.vulnerability_class,
+                    summary=f"sqlmap could not reach the target ({unreachable}) -- not a negative result",
+                    evidence=verdict_evidence, raw_output=output, command=cmd,
+                    limitation=f"transport failure: {unreachable}; not a negative result")
             # Secondary confirmation for auth/login endpoints (HANDOVER_6 §3/§6.3):
             # sqlmap's own analysis is fragile on a valid-cred (2xx) login capture
             # even with --ignore-code, because it must infer the 2xx<->401 flip
@@ -941,7 +983,7 @@ class SqlmapValidator(Validator):
             # Bounded to auth-shaped requests so a normal not_confirmed doesn't pay
             # for extra probes. The mutating method (if any) was already authorised
             # by the safety gate above before sqlmap ran.
-            if _looks_like_auth_request(exchange):
+            if not write_endpoint and _looks_like_auth_request(exchange):
                 secondary = await self._boolean_probe_fallback(finding, exchange, only_params=only)
                 if secondary is not None and secondary.confirmed:
                     secondary.summary = ("sqlmap did not confirm, but a boolean-differential probe did "
