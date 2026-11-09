@@ -35,6 +35,7 @@ from harness.engagement import EngagementState
 from harness.orchestrator import Orchestrator
 from harness.phase_schedule import PhaseSchedule
 from harness.role_crawl import RoleSession
+from harness import route_feed
 from harness.route_feed import RecrawlConfig, RouteFeed
 from harness.run_context import RunContext, ScopePolicy, TypedRequest
 from harness.session_freshness import FreshnessConfig, SessionFreshness, login_refresher
@@ -386,6 +387,65 @@ class RouteFeedTests(unittest.TestCase):
         self.assertNotIn("Set-Cookie", ex["response_headers"])
 
 
+class RouteFeedInputNameTests(unittest.TestCase):
+    """r5: a known (method, path) refused every new input on it. Novelty is keyed on
+    method + path + the sorted input NAMES; values never count."""
+
+    def _check_new_input_on_a_known_route_is_accepted(self):
+        feed = _feed()
+        self.assertTrue(_offer(feed, "/api/known?q=apple"))           # new input q
+        self.assertFalse(_offer(feed, "/api/known?q=pear"))           # same names: duplicate
+        self.assertTrue(_offer(feed, "/api/known?sort=asc&q=x"))      # another new input
+        self.assertFalse(_offer(feed, "/api/known"))                  # the known bare route
+        self.assertEqual(feed.refused, {"duplicate": 1, "known": 1})
+        drained = feed.drain()
+        self.assertEqual([o.inputs for o in drained], [("q",), ("q", "sort")])
+        self.assertFalse(_offer(feed, "/api/known?q=other", principal="u9"))   # now known
+        self.assertEqual(feed.refused["known"], 2)
+
+    def test_new_input_on_a_known_route_is_accepted_and_values_do_not_count(self):
+        self._check_new_input_on_a_known_route_is_accepted()
+
+    def test_control_route_only_key_refuses_the_new_input(self):
+        with patch.object(route_feed, "input_names", lambda url, body=None: ()):
+            with self.assertRaises(AssertionError):
+                self._check_new_input_on_a_known_route_is_accepted()
+
+    def test_body_field_names_count_and_their_values_do_not(self):
+        feed = _feed(known={("POST", "/api/orders", ("item",))})
+        def post(body):
+            return feed.offer_exchange({"method": "POST", "url": "http://shop.test/api/orders",
+                                        "request_body": body, "response_status": 201},
+                                       source="test")
+        self.assertFalse(post('{"item": 1}'))                         # known names
+        self.assertTrue(post('{"item": 2, "coupon": "X"}'))           # new field
+        self.assertFalse(post('{"coupon": "Y", "item": 3}'))          # same names, other values
+        self.assertTrue(post("item=1&note=hi"))                       # form names: item, note
+        self.assertEqual(route_feed.input_names("http://h/p?b=1&a=2&a=3", '{"z": {"y": 1}}'),
+                         ("a", "b", "z"))                              # top-level only
+
+    def test_transport_response_with_a_new_query_name_is_queued(self):
+        feed = _feed()
+        def see(url):
+            return feed.observe_response(capability="probe", method="GET", url=url, status=200,
+                                         request_headers={}, request_body=None,
+                                         response_headers={"Content-Type": "application/json"},
+                                         response_body="{}")
+        self.assertFalse(see("http://shop.test/api/known"))
+        self.assertTrue(see("http://shop.test/api/known?page=2"))
+        self.assertFalse(see("http://shop.test/api/known?page=3"))
+        self.assertEqual([o.url for o in feed.drain()], ["http://shop.test/api/known?page=2"])
+
+    def test_engagement_endpoint_keys_cover_its_captured_inputs(self):
+        st = EngagementState(host="shop.test")
+        st.record_template("http://shop.test/api/search?q=1", "GET",
+                           {"url": "http://shop.test/api/search?q=1", "method": "GET",
+                            "request_headers": {}, "request_body": "", "response_status": 200,
+                            "response_headers": {}, "response_body": "[]"})
+        keys = route_feed.endpoint_route_keys(st.endpoints["GET /api/search"])
+        self.assertEqual(keys, {("GET", "/api/search", ()), ("GET", "/api/search", ("q",))})
+
+
 class TransportRouteFeedTests(unittest.TestCase):
     """The transport offers every response of the run to an installed feed."""
 
@@ -632,7 +692,7 @@ class CrawlLoopCallerTests(unittest.TestCase):
         store._DB_PATH, cache._cache = self._orig
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def _investigate(self, engagement=None, offer_route=True):
+    def _investigate(self, engagement=None, offer_route=True, offers=None):
         cfg = _config()
         cfg["engagement"].update(engagement or {})
         orch = Orchestrator(cfg)
@@ -644,8 +704,9 @@ class CrawlLoopCallerTests(unittest.TestCase):
             seen["worklist"].append((sorted(st.endpoints), kwargs.get("deadline")))
             if offer_route and rc.route_feed is not None and len(seen["worklist"]) == 1:
                 # A validator probe meets a route the discovery never saw.
-                rc.route_feed.offer_exchange({"method": "GET", "url": f"{BASE}api/late/1",
-                                              "response_status": 200}, source="test")
+                for url in offers or [f"{BASE}api/late/1"]:
+                    rc.route_feed.offer_exchange({"method": "GET", "url": url,
+                                                  "response_status": 200}, source="test")
             return []
 
         async def recrawl_state(base_url, roles, observations, **kw):
@@ -695,6 +756,23 @@ class CrawlLoopCallerTests(unittest.TestCase):
         self.assertEqual(seen["worklist"][1][0], ["GET /api/late/{id}"])
         loop = result["crawl_loop"]["recrawl"]
         self.assertEqual((loop["rounds"], loop["routes"]), (1, 1))
+
+    def test_a_new_query_input_on_a_discovered_route_is_recrawled(self):
+        # The discovered GET /filter was captured as filter?q=1: a later q=7 is the
+        # same route and inputs (refused as known), filter?q=1&sort=x is new.
+        result, seen = self._investigate({"recrawl": {"enabled": True}},
+                                         offers=[f"{BASE}filter?q=7", f"{BASE}filter?q=1&sort=x"])
+        self.assertEqual(seen["recrawled"], [["/filter"]])
+        feed = result["crawl_loop"]["recrawl"]["feed"]
+        self.assertEqual((feed["accepted"], feed["refused"]), (1, {"known": 1}))
+
+    def test_control_route_only_key_drops_the_new_query_input(self):
+        # The r5 behaviour: keyed on (method, path) alone, the new input is refused.
+        with patch.object(route_feed, "input_names", lambda url, body=None: ()):
+            result, seen = self._investigate({"recrawl": {"enabled": True}},
+                                             offers=[f"{BASE}filter?q=1&sort=x"])
+        self.assertEqual(seen["recrawled"], [])
+        self.assertEqual(result["crawl_loop"]["recrawl"]["feed"]["refused"], {"known": 1})
 
     def test_control_recrawl_off_installs_no_feed_and_runs_one_worklist(self):
         result, seen = self._investigate()

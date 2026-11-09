@@ -1061,7 +1061,7 @@ class ChainMixin:
         # Crawl loop (all off by default): per-principal crawls, route feedback with
         # re-crawl rounds, and per-phase time-slices of the deadline above.
         from harness.phase_schedule import PhaseSchedule
-        from harness.route_feed import RecrawlConfig, RouteFeed
+        from harness.route_feed import RecrawlConfig, RouteFeed, endpoint_route_keys
         _schedule = PhaseSchedule.from_config(self.config, _investigation_deadline)
         _recrawl_cfg = RecrawlConfig.from_config(self.config)
         _per_principal = bool((self.config.get("engagement") or {}).get("crawl_per_principal", False))
@@ -2101,7 +2101,8 @@ class ChainMixin:
                     origin=_run_context_mod.ScopePolicy.origin_of(base_url),
                     in_scope=run_context.scope.in_scope,
                     max_new_routes=_recrawl_cfg.max_new_routes,
-                    known={(ep.method, ep.path) for ep in state.endpoints.values()})
+                    known={key for ep in state.endpoints.values()
+                           for key in endpoint_route_keys(ep)})
                 run_context.route_feed = _route_feed
             outcomes, all_findings = await _investigate(
                 state, roles, deadline=_schedule.deadline_for("worklist", _investigation_deadline))
