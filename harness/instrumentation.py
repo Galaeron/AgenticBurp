@@ -46,7 +46,11 @@ class PhaseRecorder:
     unavailable. Each finished phase is announced on the activity feed
     ("phase X finished in Ns")."""
 
-    def __init__(self, *, requests=None, model_calls=None, announce=True, clock=time.monotonic):
+    def __init__(self, *, requests=None, model_calls=None, announce=True, clock=time.monotonic,
+                 on_event=None):
+        # HU-5: on_event(event, name) with event "begin", "end" or "abort" (the
+        # phase was left by an exception, e.g. a cancellation). Observation only.
+        self._on_event = on_event
         self._requests = requests
         self._model_calls = model_calls
         self._announce = announce
@@ -61,9 +65,15 @@ class PhaseRecorder:
         entry = next(self._entries)
         started = self._clock()
         requests_before, calls_before = _count(self._requests), _count(self._model_calls)
+        self._notify("begin", name)
+        aborted = False
         try:
             yield
+        except BaseException:
+            aborted = True
+            raise
         finally:
+            self._notify("abort" if aborted else "end", name)
             elapsed = max(0.0, self._clock() - started)
             self._records.append((entry, {
                 "phase": name,
@@ -79,6 +89,14 @@ class PhaseRecorder:
                                           phase=name, elapsed_s=round(elapsed, 3))
                 except Exception:   # the feed is observability; it never sinks the run
                     log.debug("phase announcement failed", exc_info=True)
+
+    def _notify(self, event: str, name: str) -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event, name)
+        except Exception:   # bookkeeping never sinks the run
+            log.debug("phase event hook failed", exc_info=True)
 
     def begin(self, name: str) -> None:
         """End the open phase (if any) and start `name`."""
@@ -171,7 +189,15 @@ class RunInstrumentation:
         self.context_preflight: dict | None = None
         self.phases = PhaseRecorder(
             requests=(lambda: budget.used) if budget is not None else None,
-            model_calls=(lambda: self._client.model_completed_count) if self._client is not None else None)
+            model_calls=(lambda: self._client.model_completed_count) if self._client is not None else None,
+            on_event=self._phase_event)
+
+    def _phase_event(self, event: str, name: str) -> None:
+        """HU-5: forward a phase boundary to the run's handoff, when it has one."""
+        from harness import run_handoff
+        handoff = run_handoff.for_run(self._run_context)
+        if handoff is not None:
+            handoff.phase_event(event, name)
 
     def _model_snapshot(self) -> dict | None:
         snapshot = getattr(self._client, "metrics_snapshot", None)
