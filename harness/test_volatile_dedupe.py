@@ -140,6 +140,46 @@ class PlanDedupeTests(_TempDb):
         self.assertEqual(pa.source_exchange_hash, planner.exchange_fingerprint(a))
 
 
+class _IterResult:
+    """Duck-typed iterative_agent.IterativeResult."""
+    def __init__(self, findings):
+        self.agent, self.findings, self.handoff_note, self.stop_reason = (
+            "iterative:sqli", findings, "", "found")
+
+
+class IterativeReviewBindingTests(_TempDb):
+    """Caller level (review): pivot_memory.integrate hands its review -- which
+    dispatches plans and binds their results -- only the plans whose stored row is
+    this capture's, like analyze's dispatch does."""
+
+    def _integrate(self, url):
+        import asyncio
+        from harness import pivot_memory
+        reviewed = []
+
+        async def review(findings, plans):
+            reviewed.append([p.source_exchange_hash for p in plans])
+
+        exchange = _exchange(url)
+        asyncio.run(pivot_memory.integrate(_IterResult([_finding("sqli")]), exchange,
+                                           persist=True, review=review))
+        return planner.exchange_fingerprint(exchange), reviewed[0]
+
+    def test_second_capture_does_not_dispatch_the_first_captures_plans(self):
+        first_hash, first = self._integrate(f"{BASE}?q=apple&t=Nq3xYz8")
+        self.assertTrue(first)
+        self.assertEqual(set(first), {first_hash})
+        _, second = self._integrate(f"{BASE}?q=apple&t=Pk7aBc2")
+        self.assertEqual(second, [], "a foreign capture's plan rows must not be dispatched")
+
+    def test_a_different_request_is_still_reviewed(self):
+        """Negative control: a different object is its own capture and plans."""
+        self._integrate(f"{BASE}?q=apple")
+        other_hash, other = self._integrate(f"{BASE}?q=banana")
+        self.assertTrue(other)
+        self.assertEqual(set(other), {other_hash})
+
+
 class ValidatorPlanIdTests(unittest.TestCase):
     def setUp(self):
         self.registry = ValidatorRegistry({"validators": {"active_enabled": True}})

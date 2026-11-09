@@ -201,11 +201,16 @@ async def integrate(
 
     # 3. REMEMBER -- persist into the host's accumulated history.
     if persist:
-        if outcome.validation_plans:
-            await asyncio.to_thread(store.persist_test_plans, exchange, outcome.validation_plans)
+        # Only the plans whose stored row is THIS capture's are reviewed: a plan id
+        # another capture of the request (differing only in a cache-buster
+        # parameter) already stored is that capture's row, and dispatching it here
+        # would bind this capture's results to it (store.persist_test_plans).
+        own_plans = (await asyncio.to_thread(store.persist_test_plans, exchange,
+                                             outcome.validation_plans)
+                     if outcome.validation_plans else [])
         if review is not None:
             try:
-                await review(held, outcome.validation_plans)
+                await review(held, own_plans)
             except Exception as e:  # review is additive -- never lose the findings
                 log.warning("pivot_memory: review of %s failed: %s", outcome.agent, e)
         # A held finding the review left unbound, on an issue this run already
