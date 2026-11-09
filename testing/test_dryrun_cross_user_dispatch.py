@@ -53,23 +53,30 @@ def _exchange(rec) -> HttpExchange:
                         request_headers={}, request_body="")
 
 
-def _armed_registry():
+def _armed_registry(writes=True):
     # active + mutating replay on, so set_active_enabled raises no replay warning.
     reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": False,
-                                            "allow_mutating_replay": True}})
+                                            "allow_mutating_replay": writes}})
     reg.set_active_enabled(True)
     return reg
+
+
+# B1-T2: with mutating replay on, an object WRITE (PUT/PATCH; DELETE only with a
+# declared recreation contract) arms the write-authorization leg too. A POST is
+# never armed: it creates rather than modifies a named object.
+_WRITE_LEG = {"GET", "PUT", "PATCH"}
 
 
 class DryRunCrossUserDispatchTest(unittest.TestCase):
     def setUp(self):
         self.exchanges = _load_exchanges()
-        # The leg replays reads only: validate() skips a POST/PUT ("GET-only"), so
-        # since r5 applies() does not admit one either (a dispatch that can only
-        # skip was recorded as having tested the shape). The corpus's 9 GETs are
-        # what arms it; its 5 writes must not.
+        # Since r5 applies() admits only shapes the leg can test (a dispatch that
+        # can only skip was recorded as having tested the shape). The corpus's 9
+        # GETs arm it; of its 5 writes, the 2 object PUTs arm the B1-T2 write leg
+        # when mutating replay is on, and the 3 POSTs never do.
         self.reads = [e for e in self.exchanges if e["method"].upper() == "GET"]
         self.writes = [e for e in self.exchanges if e["method"].upper() != "GET"]
+        self.object_writes = [e for e in self.writes if e["method"].upper() in _WRITE_LEG]
         self.hosts = {urlsplit(e["url"]).hostname for e in self.exchanges}
         for h in self.hosts:
             identity_headers.clear(h)
@@ -98,15 +105,28 @@ class DryRunCrossUserDispatchTest(unittest.TestCase):
                 names = [v.name for v in reg.for_finding(_finding(), _exchange(rec))]
                 if "cross_identity" in names:
                     dispatched += 1
-                elif rec["method"].upper() == "GET":
-                    self.fail(f"object-scoped read did not arm cross_identity: {rec['url']}")
+                elif rec["method"].upper() in _WRITE_LEG:
+                    self.fail(f"object-scoped {rec['method']} did not arm cross_identity: {rec['url']}")
+                else:
+                    self.assertEqual(rec["method"].upper(), "POST")
         self.assertGreaterEqual(
             dispatched, 1,
             "the cross-user validator was never dispatched on the object-scoped crAPI "
             "corpus despite two registered identities -- the Phase 1.4 gate is not met")
-        # Every object-scoped access-control read arms it; no write does.
-        self.assertEqual((len(self.reads), len(self.writes)), (9, 5), "corpus methods changed")
-        self.assertEqual(dispatched, len(self.reads))
+        # Every object-scoped read and object PUT arms it; no POST does.
+        self.assertEqual((len(self.reads), len(self.writes), len(self.object_writes)), (9, 5, 2),
+                         "corpus methods changed")
+        self.assertEqual(dispatched, len(self.reads) + len(self.object_writes))
+
+    def test_writes_never_arm_with_mutating_replay_off(self):
+        # Negative control for B1-T2: with the write gate off, reads stay the
+        # only shape that arms cross_identity (GET-only, as before).
+        self._register_two()
+        reg = _armed_registry(writes=False)
+        for rec in self.exchanges:
+            names = [v.name for v in reg.for_finding(_finding(), _exchange(rec))]
+            self.assertEqual("cross_identity" in names, rec["method"].upper() == "GET",
+                             rec["method"] + " " + rec["url"])
 
     def test_without_identities_it_does_not_dispatch_and_warns(self):
         # Negative control: identities are the thing that enables the check. With
@@ -156,7 +176,8 @@ class DryRunCrossUserDispatchTest(unittest.TestCase):
                     for rec in self.exchanges:
                         report = AgentReport(agent="idor", model="synthetic", findings=[_finding()])
                         validations, _ = await caller._validate_findings(_exchange(rec), [report], run_context=context)
-                        armed = registered and active and scoped and rec["method"].upper() == "GET"
+                        armed = (registered and active and scoped
+                                 and rec["method"].upper() in _WRITE_LEG)
                         self.assertEqual([v.status for v in validations],
                                          ["not_confirmed"] if armed else [], rec["method"] + " " + rec["url"])
                 return observed.await_count
@@ -164,7 +185,7 @@ class DryRunCrossUserDispatchTest(unittest.TestCase):
                 await context.aclose()
 
         for registered, active, scoped, expected in (
-                (True, True, True, len(self.reads)), (False, True, True, 0),
+                (True, True, True, len(self.reads) + len(self.object_writes)), (False, True, True, 0),
                 (True, False, True, 0), (True, True, False, 0)):
             with self.subTest(registered=registered, active=active, scoped=scoped):
                 self.assertEqual(asyncio.run(exercise(registered, active, scoped)), expected)

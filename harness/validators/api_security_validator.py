@@ -1,7 +1,7 @@
 """
 API Security Validator
 
-Active validator covering two of the API-security agent's checks that
+Active validator covering three of the API-security agent's checks that
 lend themselves to a concrete probe from a single captured exchange:
 
 1. Mass assignment -- resend a JSON body with an extra unexpected
@@ -23,16 +23,24 @@ A probe that was refused or got no response is neither a pass nor a
 failure: the result says the check is incomplete (blocked when every probe
 was refused), never that the endpoint is safe.
 
-Excessive data exposure and API-versioning/inventory issues stay
-agent-only (LLM judgment on what fields "should" be exposed, or on
-whether an endpoint "looks" internal, isn't something a validator can
-mechanically confirm) -- this validator says so explicitly for those
-finding types rather than silently no-op'ing.
+3. Excessive data exposure -- replay the captured GET as its own principal.
+   Confirmed only when the answer holds an unmasked field from a fixed
+   credential-secret allowlist (password or hash, TOTP/2FA secret, API key or
+   token, session token, card PAN) on an object owned by an identified
+   account: another account's object, or the caller's own object for a secret
+   about the caller (password hash, TOTP secret). Owners come from the run's
+   registered sessions and observed account identifiers, never from a merely
+   different id. A second read as the caller must show the same value and an
+   anonymous read is the control.
+
+API-versioning/inventory issues stay agent-only (whether an endpoint "looks"
+deprecated or internal is judgment), and this validator says so explicitly.
 """
 
 from __future__ import annotations
 import json as jsonlib
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin, urlparse, parse_qs, urlunparse
@@ -56,6 +64,103 @@ _HUGE_LIMIT = 999999
 # Keys under which an answer may declare the page size it applied.
 _CAP_KEYS = {"limit", "max_limit", "maxlimit", "page_size", "pagesize", "per_page", "perpage",
              "max_page_size", "maxpagesize", "cap", "max"}
+
+# Sensitive-field exposure: exact normalized keys (lowercase, non-alphanumerics
+# dropped), never substring matches, so a label such as "Password" in an i18n
+# table or "passwordHint" is not a secret field.
+_SECRET_FIELDS = frozenset({
+    "password", "passwordhash", "passwd", "totpsecret", "twofactorsecret",
+    "2fasecret", "mfasecret", "otpsecret", "apikey", "apitoken", "accesstoken",
+    "refreshtoken", "sessiontoken", "sessionid", "authtoken", "token",
+    "cardpan", "cardnumber", "pan",
+})
+# Secrets that are a finding even on the caller's own object: no client needs to
+# read back its own password (hash) or second-factor seed. A caller's own token
+# or card number is ordinary account data and is not.
+_SELF_SECRETS = frozenset({"password", "passwordhash", "passwd", "totpsecret",
+                           "twofactorsecret", "2fasecret", "mfasecret", "otpsecret"})
+# Object keys whose scalar value names the account an object belongs to. An
+# object's own primary "id" is deliberately absent: a card or order id that
+# happens to equal another account's id names nobody. An account document is
+# still attributed, by its identifying fields (email, username) -- the only
+# shape in which its "id" would mean the account, and those fields name the
+# account by themselves.
+_OWNER_KEYS = frozenset({"userid", "owner", "ownerid", "accountid", "email",
+                         "principalid", "username"})
+# Fixed placeholder values that never carry a secret.
+_PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined", "redacted", "masked",
+                           "hidden", "password", "passwordhash", "secret", "token",
+                           "changeme", "placeholder", "n/a", "na", "[redacted]",
+                           "<redacted>", "[filtered]", "filtered", "removed", "empty"})
+_MASK_RE = re.compile(r"[*\u2022\u25cf]|[xX]{4,}|^(.)\1+$")
+_MIN_SECRET_LEN = 4
+_MAX_WALK_DEPTH = 12
+_MAX_LIST_ITEMS = 1000
+
+
+def _field_key(key) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
+def _secret_value(value) -> bool:
+    """True for a value that can carry a secret: a non-empty scalar that is not
+    a fixed placeholder, not masked, and not prose (a label has whitespace)."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return False
+    text = str(value).strip()
+    return (len(text) >= _MIN_SECRET_LEN and text.lower() not in _PLACEHOLDERS
+            and not _MASK_RE.search(text) and not re.search(r"\s", text))
+
+
+def _owner_keys(value) -> set:
+    from harness.self_ownership import _email_key
+    text = str(value).strip()
+    return {text, "id:" + text} | ({_email_key(value)} - {""})
+
+
+def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
+    """(field path, owner, object path, value digest) for each unmasked secret
+    field on an object owned by exactly one identified account in `accounts`,
+    that is either another account's or a _SELF_SECRETS field of the caller's.
+    Only a 2xx JSON answer is read."""
+    import hashlib
+    if not 200 <= (outcome.status or 0) < 300:
+        return []
+    try:
+        doc = jsonlib.loads(outcome.body or "")
+    except ValueError:
+        return []
+    hits: list[tuple] = []
+
+    def walk(value, path, owner, object_path, depth):
+        if depth > _MAX_WALK_DEPTH:
+            return
+        if isinstance(value, list):
+            for i, item in enumerate(value[:_MAX_LIST_ITEMS]):
+                # A list member is its own object: it never inherits its wrapper's owner.
+                walk(item, f"{path}[{i}]", "", "", depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        ids = [v for k, v in value.items() if _field_key(k) in _OWNER_KEYS
+               and isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip()]
+        if ids:
+            keys = set().union(*(_owner_keys(v) for v in ids))
+            owners = {pid for pid, account in accounts.items() if keys & account}
+            # Ambiguous or unknown owner: this object and its children name nobody.
+            owner = next(iter(owners)) if len(owners) == 1 else ""
+            object_path = path
+        for key, item in value.items():
+            field = _field_key(key)
+            if (owner and field in _SECRET_FIELDS and _secret_value(item)
+                    and (owner != caller_id or field in _SELF_SECRETS)):
+                digest = hashlib.sha256(str(item).encode()).hexdigest()[:16]
+                hits.append((f"{path}.{key}", owner, object_path, digest))
+            if isinstance(item, (dict, list)):
+                walk(item, f"{path}.{key}", owner, object_path, depth + 1)
+
+    walk(doc, "$", "", "", 0)
+    return hits
 
 
 @dataclass
@@ -157,6 +262,7 @@ class ApiSecurityValidator(Validator):
     active = True
 
     def __init__(self, timeout: float = 10.0, max_redirects: int = 0):
+        self.run_context = None
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.user_agent = (
@@ -201,15 +307,17 @@ class ApiSecurityValidator(Validator):
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> Any:
         tests: list[ApiSecurityTestResult] = []
-        fc = finding.vulnerability_class.lower()
+        fc = finding.vulnerability_class.lower().replace("_", " ")
 
-        if "excessive data exposure" in fc or "versioning" in fc or "inventory" in fc:
+        if "excessive data exposure" in fc:
+            return await self._probe_exposure(finding, exchange)
+
+        if "versioning" in fc or "inventory" in fc:
             return ValidationResult(
                 validator=self.get_name(), status="skipped",
                 finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
-                summary="This finding type requires judgment about which fields SHOULD be exposed "
-                        "or whether an endpoint looks deprecated/internal -- not mechanically "
-                        "confirmable by resending a request. Needs manual review.",
+                summary="Whether an endpoint looks deprecated or internal is judgment -- not "
+                        "mechanically confirmable by resending a request. Needs manual review.",
                 evidence="", raw_output="[]",
             )
 
@@ -282,6 +390,102 @@ class ApiSecurityValidator(Validator):
                 finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
                 summary=f"API security validation failed: {e}", evidence="", raw_output=str(e),
             )
+
+    async def _probe_exposure(self, finding, exchange):
+        """Sensitive-field exposure: replay the captured GET as its own principal and
+        confirm only an unmasked credential secret (_SECRET_FIELDS) on an object of
+        an identified account -- another account's object, or the caller's own
+        object for a secret about the caller itself (_SELF_SECRETS). Two replays as
+        the caller (baseline, attack) must show the same value, so a per-response
+        nonce is never a stored secret; an anonymous replay is the control."""
+        from harness.run_context import TypedRequest, current_run_context
+        from harness.security import is_identity_credential_header
+        from .cross_identity_validator import (CrossIdentityValidator, _auth_signature,
+                                                _principal_for, _source_identity)
+
+        def result(status, summary, evidence="", limitation=""):
+            return ValidationResult(self.get_name(), status, finding.vulnerability_class,
+                                    confirmed=status == "confirmed",
+                                    confidence=0.9 if status == "confirmed" else 0.0,
+                                    summary=summary, evidence=evidence, limitation=limitation)
+
+        if (exchange.method or "GET").upper() != "GET":
+            return result("skipped", "Sensitive-field exposure is checked on a captured GET only")
+        run = self.run_context or current_run_context()
+        if run is None:
+            return result("skipped", "Sensitive-field exposure needs a run with registered sessions")
+        cross = CrossIdentityValidator(run_context=run)
+        identities = cross._run_identities(urlparse(exchange.url).hostname or "")
+        source = _source_identity(identities, _auth_signature(exchange.request_headers))
+        if source is None:
+            return result("skipped", "The captured GET's principal is not a registered session")
+        caller = _principal_for(source)
+        if caller.provisional or caller.is_anonymous:
+            return result("skipped", "An identified account is required for exposure proof")
+
+        headers = {k: v for k, v in (exchange.request_headers or {}).items()
+                   if k.lower() not in {"host", "content-length"}}
+        anon_headers = {k: v for k, v in headers.items() if not is_identity_credential_header(k)}
+
+        async def send(as_caller: bool):
+            return await run.executor().execute(
+                TypedRequest("GET", exchange.url, headers=headers if as_caller else anon_headers),
+                capability=self.get_name(),
+                session_ref=source.get("session_ref") if as_caller else cross._anonymous_session_ref())
+
+        def unsent(out, role):
+            status = "error" if out.outcome == "error" else "blocked"
+            why = out.error or out.outcome
+            return result(status, f"Exposure {role} replay was not answered ({why}); the check is "
+                                  "incomplete, not a pass", limitation=why)
+
+        baseline = await send(True)
+        if not baseline.ok:
+            return unsent(baseline, "baseline")
+        accounts = self._exposure_accounts(identities, run, _principal_for)
+        hits = _exposure_hits(baseline, accounts, caller.id)
+        if not hits:
+            return result("not_confirmed", "No unmasked credential secret on an object of an "
+                                           "identified account").with_artifacts(baseline=baseline)
+        attack = await send(True)
+        if not attack.ok:
+            return unsent(attack, "repeat")
+        repeat = {h[:2]: h for h in _exposure_hits(attack, accounts, caller.id)}
+        stable = [h for h in hits if repeat.get(h[:2]) == h]
+        if not stable:
+            return result("not_confirmed", "The credential-like value changed between two reads "
+                                           "as the same principal (a per-response value, not a "
+                                           "stored secret)").with_artifacts(baseline=baseline, attack=attack)
+        control = await send(False)
+        if not control.ok:
+            return unsent(control, "anonymous control")
+        anon_leaks = {h[:2] for h in _exposure_hits(control, accounts, caller.id)}
+        evidence = " | ".join(
+            f"field={path}; object={obj}; owner={owner}; reader={caller.id}; "
+            f"{'own credential secret' if owner == caller.id else 'another account'}; "
+            f"anonymous read {'also shows it' if (path, owner) in anon_leaks else 'does not'}; "
+            f"value=[withheld]"
+            for path, owner, obj, _digest in stable)
+        return result("confirmed", f"Credential-secret exposure confirmed: GET {exchange.url} as "
+                                   f"{caller.id} returns {len(stable)} unmasked credential field(s)",
+                      evidence).with_artifacts(baseline=baseline, attack=attack, controls=[control])
+
+    @staticmethod
+    def _exposure_accounts(identities, run, principal_for) -> dict:
+        """principal id -> the account keys that name it: its own id plus the
+        account identifiers this run observed it holding (self_ownership). A
+        differing id alone never names an owner."""
+        accounts = {}
+        ownership = getattr(run, "self_ownership", None)
+        for ident in identities:
+            principal = principal_for(ident)
+            if principal.provisional or principal.is_anonymous:
+                continue
+            keys = {str(principal.id)}
+            if ownership is not None:
+                keys.update(ownership._account(principal))
+            accounts[principal.id] = keys
+        return accounts
 
     async def _probe_mass_assignment(self, exchange: HttpExchange) -> ApiSecurityTestResult | None:
         try:

@@ -114,12 +114,14 @@ class LightCappedSqlmapTests(_AccountingFixture, unittest.TestCase):
 
     def test_negative_control_other_endpoints_keep_the_full_scan(self):
         self.env["I05D_REQUESTS"] = "12"
-        exchange = HttpExchange(url=f"{self.target.base}/api/Users/7", method="PUT",
+        # A POST that creates nothing (no 201, no new id, not a collection path).
+        # PUT/PATCH/DELETE are write endpoints with their own cap (test_b1_sqlmap_repro).
+        exchange = HttpExchange(url=f"{self.target.base}/api/lookup", method="POST",
                                 request_headers={"Content-Type": "application/json"},
                                 request_body='{"email":"a@b.c"}', response_status=200,
-                                response_body='{"id": 7}')
+                                response_body='{"found": false}')
         result, run = self._run_create(cap=5, exchange=exchange, level=2, risk=2)
-        self.assertEqual(len(self._tool_requests()), 12, "an update endpoint was capped")
+        self.assertEqual(len(self._tool_requests()), 12, "a non-create POST was capped")
         args = self.launched[0]
         self.assertEqual(args[args.index("--level") + 1], "2")
         self.assertNotIn("--technique", args)

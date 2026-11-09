@@ -381,6 +381,9 @@ class ValidatorRegistry:
         # config-file edit -- in-memory only, gone on restart, matching how the
         # identities it needs are supplied (identity_headers.py).
         self._xid_cfg = cfg.get("cross_identity", {})
+        # B1-T2: a captured write arms cross_identity only with mutating replay on.
+        from harness.config_schema import parse_validators_flags
+        self._allow_mutating_replay = parse_validators_flags(cfg)["allow_mutating_replay"]
         self._allowed_hosts = config.get("server", {}).get("allowed_hosts", [])
         # WL-04 / owner decision D1: the ownership source every cross-identity
         # validator this registry builds consults before confirming (a
@@ -398,6 +401,8 @@ class ValidatorRegistry:
             timeout=float(self._xid_cfg.get("timeout", 10.0)),
             max_identities=int(self._xid_cfg.get("max_identities", 3)),
             ownership=self.ownership,
+            delete_restore_method=str(self._xid_cfg.get("delete_restore_method", "")),
+            allow_writes=getattr(self, "_allow_mutating_replay", False),
         )
 
     def set_ownership(self, ledger) -> None:
@@ -560,8 +565,13 @@ class ValidatorRegistry:
                 s.principal_id == "anonymous" and s.health != "expired"
                 for s in run_context.sessions.all()):
             return decision("needs_prerequisite", "missing_anonymous_control", "an explicit anonymous control session is required")
-        if family == "cross_identity" and method != "GET":
-            return decision("unsupported", "unsupported_method", "cross-identity replay is GET-only")
+        if family == "cross_identity" and method not in {"GET", "PUT", "PATCH", "DELETE"}:
+            return decision("unsupported", "unsupported_method", "cross-identity supports GET and reversible object writes")
+        if family == "cross_identity" and method in {"PUT", "PATCH", "DELETE"}:
+            if run_context is None or not run_context.gate.config.allow_mutating_replay:
+                return decision("policy_denied", "mutating_policy_denied", "write authorization requires explicit mutating replay permission")
+            if method == "DELETE" and str(self._xid_cfg.get("delete_restore_method", "")).upper() != "PUT":
+                return decision("needs_prerequisite", "missing_restore_contract", "DELETE requires an explicit PUT recreation contract")
         if check.id == "WSTG-ATHZ-04":
             from .idor_read_validator import _locate_id
             if not _locate_id(exchange):
