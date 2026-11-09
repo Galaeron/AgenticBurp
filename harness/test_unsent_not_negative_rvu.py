@@ -326,11 +326,19 @@ class RaceBurstUnsentTests(_RvuBase):
         self._assert_not_negative(reports, "blocked")
 
     # -- controls
-    def test_clean_successes_still_confirm(self):
-        self._assert_confirmed(self._run(_coupon([], unlimited=True)))
+    # Repeated clean successes are a lead, not proof: with no state read-back
+    # of the redemption count the burst cannot show a one-time limit was
+    # exceeded, so it stays not_confirmed and names the gap.
+    def _assert_lead(self, reports):
+        self._assert_negative(reports)
+        self.assertTrue(all("no state read-back" in r.summary and r.manual_verification
+                            for r in reports), _verdicts(reports))
 
-    def test_clean_successes_despite_failed_sends_still_confirm(self):
-        self._assert_confirmed(self._run(_coupon([], unlimited=True, fail=lambda i: i > 3)))
+    def test_clean_successes_are_a_lead_not_a_confirmation(self):
+        self._assert_lead(self._run(_coupon([], unlimited=True)))
+
+    def test_clean_successes_despite_failed_sends_are_a_lead(self):
+        self._assert_lead(self._run(_coupon([], unlimited=True, fail=lambda i: i > 3)))
 
     def test_answered_rejections_stay_negative(self):
         self._assert_negative(self._run(_coupon([])))

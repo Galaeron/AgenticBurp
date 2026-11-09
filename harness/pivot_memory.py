@@ -62,6 +62,9 @@ class IntegrationOutcome:
     pivot_hints: list[dict] = field(default_factory=list)           # forward chain-completion directions
     grounding: str = ""                                             # handoff note + methodology grounding
     remembered: bool = False
+    # Held findings bound to an already proven issue (see attach_to_proven_issues):
+    # {"finding_id", "attached_to", "proof_id", "case_id"} each.
+    attached: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -73,7 +76,67 @@ class IntegrationOutcome:
             "pivot_hints": self.pivot_hints,
             "grounding": self.grounding,
             "remembered": self.remembered,
+            "attached": self.attached,
         }
+
+
+def attach_to_proven_issues(held: list[Finding], exchange: HttpExchange, rows: list[dict],
+                            *, run_id: str = "") -> list[dict]:
+    """Bind each held finding that has no proof of its own to the already proven
+    finding of the SAME issue (issues.issue_key: host, endpoint family, method,
+    class, affected input, boundary), instead of leaving it an unbound duplicate
+    beside the confirmed issue (r5: the iterative agent's login SQLi finding).
+
+    A finding that names no input attaches only when the route holds exactly one
+    proven issue of its class -- never a choice among several (an unknown input is
+    not a wildcard, R04). The proven row must be confirmed, carry a resolved proof
+    of this run (`run_id`, when known), and not be tool-reported. The binding is
+    the harness's own proof, never the model's claim: the finding takes that row's
+    proof/case pointers, input coordinates and class label, so the store records it
+    as a sighting of that issue. A finding with no match, or with its own proof,
+    is left exactly as it is. Mutates `held`; returns one record per binding."""
+    from harness import issues
+    from harness.evidence import is_tool_reported
+    proven = [r for r in rows
+              if r.get("confirmed") and r.get("proof_id") and r.get("case_id")
+              and r.get("proof_status", "resolved") == "resolved" and not is_tool_reported(r)
+              and not (r.get("vulnerability_class") or "").startswith("potential-attack-chain:")
+              and (not run_id or not r.get("run_id") or r.get("run_id") == run_id)]
+
+    def _route(d: dict) -> tuple:
+        return (issues._host_of(d.get("url") or ""), issues.normalize_path(d.get("url") or ""),
+                (d.get("method") or "").upper(), issues.issue_class(d.get("vulnerability_class") or ""))
+
+    bound: list[dict] = []
+    for f in held:
+        if f.confirmed or f.proof_id or f.case_id:
+            continue
+        d = dict(f.model_dump(), url=exchange.url, method=(exchange.method or "").upper())
+        key = issues.issue_key(d)
+        # The proof must be of THIS route: a host-wide or dependency class drops the
+        # route from issue_key, and a header missing on one route is not proven on
+        # another by that route's proof.
+        on_route = [r for r in proven if _route(r) == _route(d)]
+        same = [r for r in on_route if issues.issue_key(r) == key]
+        if not same and not issues._affected_input(d):
+            if len({issues.issue_key(r) for r in on_route}) == 1:
+                same = on_route
+        if not same:
+            continue
+        e = same[0]
+        f.parameter_location = f.parameter_location or e.get("parameter_location") or ""
+        f.parameter_name = f.parameter_name or e.get("parameter_name") or ""
+        f.vulnerability_class = e.get("vulnerability_class") or f.vulnerability_class
+        f.proof_id, f.case_id = e["proof_id"], e["case_id"]
+        f.confirmed = True
+        f.confirmed_by_leg = e.get("validator") or f.confirmed_by_leg
+        f.review_verdict = "validator-confirmed"
+        target = e.get("finding_id") or e.get("fingerprint") or ""
+        f.review_note = ((f.review_note + " ") if f.review_note else "") + (
+            f"Attached to the proven issue of finding {target} (proof {e['proof_id']}).")
+        bound.append({"finding_id": f.finding_id, "attached_to": target,
+                      "proof_id": e["proof_id"], "case_id": e["case_id"]})
+    return bound
 
 
 def _grounding(result: "IterativeResult", exchange: HttpExchange) -> str:
@@ -141,13 +204,27 @@ async def integrate(
 
     # 3. REMEMBER -- persist into the host's accumulated history.
     if persist:
-        if outcome.validation_plans:
-            await asyncio.to_thread(store.persist_test_plans, exchange, outcome.validation_plans)
+        # Only the plans whose stored row is THIS capture's are reviewed: a plan id
+        # another capture of the request (differing only in a cache-buster
+        # parameter) already stored is that capture's row, and dispatching it here
+        # would bind this capture's results to it (store.persist_test_plans).
+        own_plans = (await asyncio.to_thread(store.persist_test_plans, exchange,
+                                             outcome.validation_plans)
+                     if outcome.validation_plans else [])
         if review is not None:
             try:
-                await review(held, outcome.validation_plans)
+                await review(held, own_plans)
             except Exception as e:  # review is additive -- never lose the findings
                 log.warning("pivot_memory: review of %s failed: %s", outcome.agent, e)
+        # A held finding the review left unbound, on an issue this run already
+        # proved, joins that issue rather than standing beside it as a duplicate.
+        try:
+            from harness import telemetry
+            rows = await asyncio.to_thread(store.all_host_findings, exchange.url)
+            outcome.attached = attach_to_proven_issues(
+                held, exchange, rows, run_id=telemetry.current_run_id() or "")
+        except Exception as e:  # binding is additive -- never lose the findings
+            log.warning("pivot_memory: attaching %s to proven issues failed: %s", outcome.agent, e)
         await asyncio.to_thread(
             store.persist_findings, exchange, outcome.agent, held, model, "",
         )

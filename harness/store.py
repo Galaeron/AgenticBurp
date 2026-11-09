@@ -273,6 +273,20 @@ CREATE TABLE IF NOT EXISTS proof_identity (
 );
 """
 
+# ProofRecord.evidence_source ("tool_reported": an external tool's detection the
+# harness did not reproduce), so a stored proof is accounted like the in-run one.
+# Additive side table keyed on proof_id, in proof_identity's pattern: proof_records
+# is not altered, nothing is backfilled, and a proof without a row reads as "" (the
+# validator's own exchanges). Rollback: DROP TABLE proof_evidence_source; the
+# previous build never reads it.
+_PROOF_EVIDENCE_SOURCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS proof_evidence_source (
+    proof_id TEXT PRIMARY KEY,
+    evidence_source TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+"""
+
 # I16 persistence: the operator's per-target declarations (protected_paths and
 # authz.owners-shaped entries), saved only by an explicit save and read only when a
 # request opts in (server: PUT /engagement/{host}/declarations, investigate's
@@ -625,6 +639,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_IDENTITY_SCHEMA)
     conn.executescript(_EVIDENCE_SCHEMA)
     conn.executescript(_PROOF_IDENTITY_SCHEMA)
+    conn.executescript(_PROOF_EVIDENCE_SOURCE_SCHEMA)
     conn.executescript(_DECLARATIONS_SCHEMA)
     conn.executescript(_FINDING_INPUTS_SCHEMA)
     conn.executescript(_PLAN_DISPATCH_SCHEMA)
@@ -1621,9 +1636,14 @@ def get_observation(observation_id: str, *, engagement_id: str = "") -> dict | N
         conn.close()
 
 
-def _persist_test_plans_for(host: str, url: str, plans: list[TestPlan]) -> None:
+def _persist_test_plans_for(host: str, url: str, plans: list[TestPlan]) -> list[TestPlan]:
+    """Insert each plan unless its id is already stored, and return the plans whose
+    stored row is bound to THEIR capture (source_exchange_hash). A plan id ignores
+    cache-buster parameters (planner.plan_key_fingerprint), so a second capture of
+    one request maps onto the first capture's row; it is not returned, and callers
+    must not submit or dispatch it as if the row were its own."""
     if not plans:
-        return
+        return []
     conn = _connect()
     try:
         conn.executemany(
@@ -1639,12 +1659,18 @@ def _persist_test_plans_for(host: str, url: str, plans: list[TestPlan]) -> None:
               int(p.escalated), time.time()) for p in plans],
         )
         conn.commit()
+        ids = sorted({p.id for p in plans})
+        stored = dict(conn.execute(
+            f"SELECT plan_id, source_exchange_hash FROM test_plans "
+            f"WHERE plan_id IN ({','.join('?' * len(ids))})", ids).fetchall())
+        return [p for p in plans if stored.get(p.id) == p.source_exchange_hash]
     finally:
         conn.close()
 
 
-def persist_test_plans(exchange: HttpExchange, plans: list[TestPlan]) -> None:
-    _persist_test_plans_for(host_of(exchange.url), exchange.url, plans)
+def persist_test_plans(exchange: HttpExchange, plans: list[TestPlan]) -> list[TestPlan]:
+    """See _persist_test_plans_for: returns the plans bound to this capture."""
+    return _persist_test_plans_for(host_of(exchange.url), exchange.url, plans)
 
 
 def persist_retry_plan(plan: TestPlan) -> None:
@@ -1884,8 +1910,10 @@ _PROOF_COLUMNS = (
 # AR-08a: every proof read joins its persisted policy fingerprint ("" when absent).
 _PROOF_SELECT = (
     ", ".join(f"p.{col.strip()}" for col in _PROOF_COLUMNS.split(","))
-    + ", COALESCE(i.policy_fingerprint, '') FROM proof_records p LEFT JOIN proof_identity i"
+    + ", COALESCE(i.policy_fingerprint, ''), COALESCE(es.evidence_source, '')"
+    " FROM proof_records p LEFT JOIN proof_identity i"
     f" ON i.proof_id = p.proof_id AND i.identity_version = {_PROOF_IDENTITY_VERSION}"
+    " LEFT JOIN proof_evidence_source es ON es.proof_id = p.proof_id"
 )
 
 
@@ -1921,6 +1949,10 @@ def persist_proof_record(proof) -> tuple[bool, str]:
                 "INSERT OR IGNORE INTO proof_identity (proof_id, policy_fingerprint, identity_version, "
                 "created_at) VALUES (?,?,?,?)",
                 (proof.proof_id, proof.policy_fingerprint, _PROOF_IDENTITY_VERSION, proof.created_at))
+        if getattr(proof, "evidence_source", ""):
+            conn.execute(
+                "INSERT OR IGNORE INTO proof_evidence_source (proof_id, evidence_source, created_at) "
+                "VALUES (?,?,?)", (proof.proof_id, proof.evidence_source, proof.created_at))
         conn.commit()
         return True, "accepted"
     finally:
@@ -1933,7 +1965,7 @@ def _proof_row_to_dict(row) -> dict:
      parameter_location, parameter_name, workflow_state_id, finding_ref, validator, validator_version,
      verdict, executed, legacy, baseline_artifact_id, attack_artifact_id,
      control_artifact_ids_json, expected_invariant, observed_result, limitation, created_at,
-     policy_fingerprint) = row
+     policy_fingerprint, evidence_source) = row
     return {
         "proof_id": proof_id,
         "case": {"run_id": run_id, "case_id": case_id, "principal_id": principal_id,
@@ -1947,6 +1979,7 @@ def _proof_row_to_dict(row) -> dict:
         "expected_invariant": expected_invariant, "observed_result": observed_result,
         "limitation": limitation, "created_at": created_at,
         "policy_fingerprint": policy_fingerprint or "",
+        **({"evidence_source": evidence_source} if evidence_source else {}),
     }
 
 
@@ -2066,11 +2099,12 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                       s.fingerprint IS NOT NULL AS suppressed,
                       f.oracle_verified, f.verification_state, f.oracle_capsule_id,
                       f.exchange_id, f.run_id, f.captured_principal_id,
-                      p.validator, p.workflow_state_id, i.policy_fingerprint
+                      p.validator, p.workflow_state_id, i.policy_fingerprint, es.evidence_source
                FROM findings f
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                LEFT JOIN proof_records p ON p.proof_id = f.proof_id AND f.proof_id != ''
                LEFT JOIN proof_identity i ON i.proof_id = p.proof_id AND i.identity_version = ?
+               LEFT JOIN proof_evidence_source es ON es.proof_id = p.proof_id
                LEFT JOIN finding_inputs fi ON fi.fingerprint = f.fingerprint AND fi.case_id = f.case_id
                WHERE f.host = ? AND f.engagement_id = ?
                  AND (? IS NULL OR f.captured_principal_id = ?)
@@ -2116,11 +2150,13 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
          # fingerprint (AR-08a), so issues.issue_key can group a route-independent
          # mechanism from the store alone. '' when unlinked or never fingerprinted.
          "validator": validator or "", "workflow_state_id": workflow_state_id or "",
-         "policy_fingerprint": policy_fingerprint or ""}
+         "policy_fingerprint": policy_fingerprint or "",
+         # The linked proof's evidence source ("tool_reported"), only when it has one.
+         **({"evidence_source": evidence_source} if evidence_source else {})}
         for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
              finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed,
              oracle_verified, vstate, capsule_id, exchange_id, run_id, captured_principal_id,
-             validator, workflow_state_id, policy_fingerprint) in rows
+             validator, workflow_state_id, policy_fingerprint, evidence_source) in rows
     ]
     _resolve_confirmation_proofs(results)
     if not include_suppressed:
@@ -3515,6 +3551,8 @@ def wipe_engagement(host: str) -> dict:
         counts["proof_identity"] = conn.execute(
             "DELETE FROM proof_identity WHERE proof_id NOT IN (SELECT proof_id FROM proof_records)"
         ).rowcount
+        conn.execute("DELETE FROM proof_evidence_source "
+                     "WHERE proof_id NOT IN (SELECT proof_id FROM proof_records)")
 
         # (f) finding_observations -- fingerprint IN fingerprints.
         if target_fingerprints:

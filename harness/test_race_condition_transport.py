@@ -41,13 +41,63 @@ class RaceTransportTests(unittest.TestCase):
 
         try:
             result = asyncio.run(scenario())
-            self.assertEqual(result.status, "confirmed")
+            # Repeated 200s are a lead, not proof: no state read-back exists.
+            self.assertEqual(result.status, "not_confirmed")
+            self.assertFalse(result.confirmed)
+            self.assertIn("read-back", result.limitation)
             self.assertEqual(ctx.budget.used, 3)
             self.assertEqual(len(fixture.httpd.received), 3)
             self.assertTrue(all(r["authorization"] == "Bearer racer"
                                 for r in fixture.httpd.received))
         finally:
             fixture.close()
+
+    def _burst(self, path, body='{"claim":true}'):
+        fixture = _Fixture()
+        ctx = RunContext.create(
+            allowed_hosts=["127.0.0.1"], max_requests=12,
+            gate_config={"active_enabled": True, "allow_mutating_replay": True,
+                         "max_burst_size": 12})
+        registry = ValidatorRegistry({"validators": {"active_enabled": True}})
+        exchange = HttpExchange(url=fixture.base + path, method="POST", request_headers={},
+                                request_body=body, response_status=200,
+                                response_body="posted")
+        validator = next(v for v in registry.bind_run_context(
+            registry.for_finding(_finding(), exchange), ctx)
+            if v.name == "race_condition_validator")
+        validator.burst_size = 12
+
+        async def scenario():
+            result = await validator.validate(_finding(), exchange)
+            await ctx.aclose()
+            return result
+
+        try:
+            return asyncio.run(scenario()), len(fixture.httpd.received)
+        finally:
+            fixture.close()
+
+    def test_login_burst_is_not_applicable_and_sends_nothing(self):
+        result, sent = self._burst("/rest/user/login",
+                                   '{"email":"a@b.test","password":"pw"}')
+        self.assertEqual(result.status, "skipped")
+        self.assertFalse(result.confirmed)
+        self.assertEqual(sent, 0)
+
+    def test_token_grant_burst_is_not_applicable(self):
+        result, sent = self._burst("/connect", "grant_type=password&username=a&password=b")
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(sent, 0)
+
+    def test_twelve_successes_without_readback_is_a_lead_not_confirmed(self):
+        result, sent = self._burst("/api/coupons/redeem")
+        self.assertEqual(sent, 12)
+        self.assertEqual(result.status, "not_confirmed")
+        self.assertFalse(result.confirmed)
+        self.assertLess(result.confidence, 0.5)
+        self.assertIn("12 of 12 concurrent requests", result.summary)  # lead evidence kept
+        self.assertIn("read-back", result.limitation)
+        self.assertTrue(result.manual_verification)
 
     def test_denied_burst_sends_nothing_and_uses_no_budget(self):
         fixture = _Fixture()

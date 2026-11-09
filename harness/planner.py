@@ -47,9 +47,30 @@ def exchange_fingerprint(exchange: HttpExchange) -> str:
     ]).encode()
     return hashlib.sha256(material).hexdigest()
 
+def plan_key_fingerprint(exchange: HttpExchange) -> str:
+    """exchange_fingerprint with cache-buster query parameters dropped
+    (volatile_params.stable_url): the key a plan id is built from, so two captures
+    of one request that differ only in a timestamp or random token are one plan.
+    exchange_fingerprint itself stays exact -- it is the plan's binding to the
+    capture (source_exchange_hash), which the Burp side recomputes."""
+    from harness.volatile_params import stable_url
+    return exchange_fingerprint(exchange.model_copy(update={"url": stable_url(exchange.url)}))
+
+
 def _plan_id(capability: str, finding: Finding, exchange: HttpExchange) -> str:
-    material = f"{capability}|{finding.vulnerability_class}|{exchange_fingerprint(exchange)}".encode()
+    material = f"{capability}|{finding.vulnerability_class}|{plan_key_fingerprint(exchange)}".encode()
     return f"{capability}:{hashlib.sha256(material).hexdigest()[:20]}"
+
+
+# Capabilities that mutate an HTTP parameter or body (injection) or replay a
+# state-changing form (CSRF). Not planned for an Engine.IO long-polling request,
+# whose query and body are transport framing (volatile_params.is_polling_transport);
+# websocket and passive capabilities still are.
+POLLING_EXCLUDED_CAPABILITIES = frozenset({
+    "sql_injection_validation", "nosql_validation", "command_injection_validation",
+    "ssti_validation", "xxe_validation", "header_injection_validation",
+    "reflection_context_validation", "open_redirect_validation", "csrf_validation",
+})
 
 
 def plans_for_findings(exchange: HttpExchange, findings: list[Finding]) -> list[TestPlan]:
@@ -65,6 +86,8 @@ def plans_for_findings(exchange: HttpExchange, findings: list[Finding]) -> list[
     the literal string "idor" would silently produce zero test plans,
     with no error and no visible sign that a plan should have existed.
     """
+    from harness.volatile_params import is_polling_transport
+    polling = is_polling_transport(exchange.url)
     plans: list[TestPlan] = []
     seen: set[tuple[str, str]] = set()
     for finding in findings:
@@ -141,6 +164,8 @@ def plans_for_findings(exchange: HttpExchange, findings: list[Finding]) -> list[
                 # producing "Plan is not assigned to Burp." on click.
                 cap, requires, plane = hint, True, "burp"
             else:
+                continue
+            if polling and cap in POLLING_EXCLUDED_CAPABILITIES:
                 continue
             key = (finding.vulnerability_class, cap)
             if key in seen:

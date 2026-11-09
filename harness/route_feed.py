@@ -12,7 +12,10 @@ installs it. Two sources offer to it:
     kept only when it says the route exists -- 2xx with a non-HTML body (a single-
     page app answers unknown paths with its HTML shell), or 401/403;
   - captured exchanges (`offer_exchange`): the XHR/fetch calls a browser view fired.
-A route already in the engagement, or already offered for the same principal, is a
+A route is keyed on its method, path template and the sorted NAMES of its inputs
+(query parameter names and top-level body field names; values never count), so a new
+input on a known route is new while a repeat with other values is not. A route key
+already in the engagement, or already offered for the same principal, is a
 duplicate; one out of scope or off the engagement origin is refused; and at most
 `max_new_routes` are ever accepted per run (the budget guard). The engagement drains
 the feed between phases and investigates what is new (orchestrator_chain recrawl).
@@ -22,16 +25,68 @@ transport offers nothing and the worklist is built once, as before.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
-__all__ = ["RecrawlConfig", "RouteFeed", "RouteObservation"]
+__all__ = ["RecrawlConfig", "RouteFeed", "RouteObservation", "input_names", "route_key",
+           "endpoint_route_keys"]
 
 _CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization",
                                  "x-api-key", "x-auth-token"})
 # Capabilities whose traffic is the run looking after itself, not the app's surface.
 _IGNORED_CAPABILITIES = frozenset({"session_health", "session_refresh"})
 _MAX_BODY = 4000
+
+
+def input_names(url: str, body=None) -> tuple:
+    """The sorted, distinct names of a request's inputs: its query parameter names
+    and its body's top-level field names (a JSON object's keys, or form-encoded
+    names). Values are never part of it; a body that is neither gives no names.
+    A cache-buster query parameter (volatile_params.stable_url: `_=<epoch>`, a
+    random `t=`) is not an input, so a repeat that adds one is not a new route."""
+    from harness.volatile_params import stable_url
+    names = {k for k, _ in parse_qsl(urlsplit(stable_url(url or "")).query,
+                                     keep_blank_values=True) if k}
+    text = body.strip() if isinstance(body, str) else ""
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            names.update(str(k) for k in parsed)
+    elif text and "=" in text and not text.startswith(("<", "[")):
+        names.update(k for k, _ in parse_qsl(text, keep_blank_values=True) if k)
+    return tuple(sorted(names))
+
+
+def route_key(method: str, path: str, inputs=()) -> tuple:
+    """(METHOD, path template, sorted input names): what makes a route new."""
+    return (str(method or "GET").upper(), path, tuple(sorted(set(inputs or ()))))
+
+
+def _as_key(entry) -> tuple:
+    """A `known` entry as a route key; a legacy (METHOD, path) pair means the route
+    with no inputs."""
+    entry = tuple(entry)
+    return entry if len(entry) == 3 else route_key(entry[0], entry[1])
+
+
+def endpoint_route_keys(ep) -> set:
+    """The route keys an engagement endpoint already covers: its captured template
+    and every capture variant's request, plus the bare route."""
+    method, path = str(getattr(ep, "method", "GET")).upper(), getattr(ep, "path", "/")
+    keys = {route_key(method, path)}
+    templates = [getattr(ep, "template", None)] + [
+        (v or {}).get("template") for v in (getattr(ep, "capture_variants", None) or [])
+        if isinstance(v, dict)]
+    for tmpl in templates:
+        if isinstance(tmpl, dict):
+            query = tmpl.get("query") or ""
+            keys.add(route_key(method, path, input_names(f"/?{query}" if query else "/",
+                                                         tmpl.get("body"))))
+    return keys
 
 
 @dataclass(frozen=True)
@@ -65,6 +120,7 @@ class RouteObservation:
     role: str | None = None
     session_ref: str | None = None
     status: int | None = None
+    inputs: tuple = ()            # sorted input names (see input_names)
 
 
 @dataclass
@@ -72,11 +128,16 @@ class RouteFeed:
     origin: str
     in_scope: object                       # callable(url) -> bool
     max_new_routes: int = 200
-    known: set = field(default_factory=set)        # {(METHOD, path)} already in the engagement
+    # Route keys already in the engagement: {(METHOD, path, sorted input names)}; a
+    # (METHOD, path) pair stands for the route with no inputs.
+    known: set = field(default_factory=set)
     accepted: int = 0
     refused: dict = field(default_factory=dict)    # reason -> count
-    _offered: set = field(default_factory=set)     # {(METHOD, path, principal)}
+    _offered: set = field(default_factory=set)     # {(route key, principal)}
     _pending: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.known = {_as_key(k) for k in self.known}
 
     def _refuse(self, reason: str) -> bool:
         self.refused[reason] = self.refused.get(reason, 0) + 1
@@ -96,9 +157,11 @@ class RouteFeed:
         except Exception:
             return self._refuse("out_of_scope")
         path = normalize_path(url)
-        if (method, path) in self.known:
+        inputs = input_names(url, exchange.get("request_body"))
+        route = route_key(method, path, inputs)
+        if route in self.known:
             return self._refuse("known")
-        key = (method, path, principal_id)
+        key = (route, principal_id)
         if key in self._offered:
             return self._refuse("duplicate")
         if self.accepted >= self.max_new_routes:
@@ -108,7 +171,7 @@ class RouteFeed:
         self._pending.append(RouteObservation(
             method=method, path=path, url=url, source=source, exchange=dict(exchange),
             principal_id=principal_id, role=role, session_ref=session_ref,
-            status=exchange.get("response_status")))
+            status=exchange.get("response_status"), inputs=inputs))
         return True
 
     def observe_response(self, *, capability: str, method: str, url: str, status: int | None,
@@ -126,7 +189,7 @@ class RouteFeed:
         if not exists:
             return False
         from harness.engagement import normalize_path
-        if (method.upper(), normalize_path(url)) in self.known:
+        if route_key(method, normalize_path(url), input_names(url, request_body)) in self.known:
             return False          # the common case: skip building an exchange
         exchange = {
             "url": url, "method": method.upper(),
@@ -152,11 +215,11 @@ class RouteFeed:
 
     def drain(self, limit: int | None = None) -> list[RouteObservation]:
         """Take up to `limit` pending observations (oldest first) and mark their
-        routes known, so a route is investigated in one round only."""
+        route keys known, so a route is investigated in one round only."""
         take = self._pending[:limit] if limit is not None else list(self._pending)
         self._pending = self._pending[len(take):]
         for obs in take:
-            self.known.add((obs.method, obs.path))
+            self.known.add(route_key(obs.method, obs.path, obs.inputs))
         return take
 
     def stats(self) -> dict:

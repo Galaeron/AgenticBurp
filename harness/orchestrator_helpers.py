@@ -347,8 +347,11 @@ def confirmation_cache_key(validator_name: str, exchange: HttpExchange,
     valid request. The named (location, parameter) is part of the case too: a leg
     tests a named parameter first, so one parameter's result is not another's."""
     import hashlib
+    from harness.volatile_params import stable_url
     method = (exchange.method or "GET").upper()
-    url = exchange.url or ""
+    # Cache-buster query parameters (an epoch, a random token, a date-time) are
+    # not part of the case: two captures differing only there are one check.
+    url = stable_url(exchange.url or "")
     body = exchange.request_body or ""
     body_hash = hashlib.md5(body.encode("utf-8", errors="replace")).hexdigest()
     identity_sig = _identity_signature(exchange.request_headers)
