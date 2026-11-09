@@ -344,7 +344,7 @@ class WriteEndpointTemplateTests(unittest.TestCase):
         node = wi._with_probe_template(node)
         self.assertEqual(node["template"]["body"], '{"email":"probe@example.test"}')
         self.assertEqual(node["template_source"], engagement.ACCESS_MATRIX_SOURCE)
-        specialty, hypothesis = wi._derive_probe(node)
+        [(specialty, hypothesis)] = wi._derive_probe(node)
         self.assertEqual(specialty, "injection")
         self.assertIn("body parameters", hypothesis)
 
@@ -353,7 +353,7 @@ class WriteEndpointTemplateTests(unittest.TestCase):
         self.assertNotIn("template", wi._with_probe_template(get))
         empty = {"method": "POST", "path": "/api/x", "capture_variants": [self._probe_variant("")]}
         self.assertNotIn("template", wi._with_probe_template(empty))
-        self.assertIsNone(wi._derive_probe({"method": "POST", "path": "/api/x"}))
+        self.assertEqual(wi._derive_probe({"method": "POST", "path": "/api/x"}), [])
 
     def test_captured_template_wins(self):
         node = {"method": "POST", "path": "/api/x", "template": {"body": "a=1"},
