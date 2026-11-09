@@ -27,18 +27,31 @@ logic (authorization_boundary_compare):
   - not_confirmed (deterministic REJECT) -> every other identity AND anon were
                  denied: the control held. The orchestrator downgrades the
                  single-exchange hypothesis (mirroring access_control_gate).
-  - skipped    -> no identities configured, out of scope, or non-GET (safe by
-                 default; mutating replay is intentionally not attempted here).
+  - skipped    -> no identities configured, out of scope, or a write while
+                 mutating replay is off.
+
+Write leg (B1-T2, PUT/PATCH/DELETE): only with validators.allow_mutating_replay
+and the run's safety gate. Owner baseline read, one write as a non-privileged
+other principal changing one field to a unique marker, owner read-back, then a
+MANDATORY restore (in `finally`) verified by a second owner read. A failed restore
+is a logged `error`. Confirmed only when the marker persisted on an object
+declared to another principal; an undeclared/shared object is a `supported` lead.
 
 Off by default: gated by validators.cross_identity.enabled AND
 validators.active_enabled (it sends live requests), and scoped to
-server.allowed_hosts. GET-only.
+server.allowed_hosts. Reads are GET-only; writes need the mutating gate.
 """
 from __future__ import annotations
 from harness import scope_lock
 import re
+import asyncio
+import json
+import logging
+import secrets
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
+
+log = logging.getLogger(__name__)
 
 import httpx
 
@@ -252,6 +265,7 @@ def _source_identity(idents: list, source_sig: tuple) -> dict | None:
 
 from contextvars import ContextVar
 _ownership_method = ContextVar("ownership_method", default="GET")
+_WRITE_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 
 
 class CrossIdentityValidator(Validator):
@@ -260,7 +274,8 @@ class CrossIdentityValidator(Validator):
 
     def __init__(self, allowed_hosts: list[str] | None = None,
                  timeout: float = 10.0, max_identities: int = 3, ownership=None,
-                 run_context=None):
+                 run_context=None, delete_restore_method: str = "",
+                 allow_writes: bool = False):
         self.allowed_hosts = set(allowed_hosts or [])
         self.timeout = timeout
         self.max_identities = max_identities
@@ -275,6 +290,14 @@ class CrossIdentityValidator(Validator):
         # the legacy direct path, so registry construction is unchanged until a run
         # supplies a context.
         self.run_context = run_context
+        # DELETE cannot be reversed generically. An operator must explicitly
+        # declare that PUT recreates the exact resource before this leg deletes it.
+        self.delete_restore_method = (delete_restore_method or "").upper()
+        # B1-T2: whether this registry's config permits mutating replay
+        # (validators.allow_mutating_replay). Off, a captured write never arms the
+        # leg -- reads stay GET-only. On, the run's own safety gate still decides
+        # every send (validate re-checks it before writing anything).
+        self.allow_writes = bool(allow_writes)
 
     def _object_ref(self, url: str) -> str:
         from harness import principals
@@ -285,15 +308,28 @@ class CrossIdentityValidator(Validator):
         # Reuse the access-control gate's markers so the two never drift.
         if not access_control_gate._is_access_control_class(finding.vulnerability_class):
             return False
-        return self.shape_applies(exchange)
+        return self.shape_applies(exchange) and self.write_admitted(exchange.method)
+
+    def write_admitted(self, method: str | None) -> bool:
+        """Whether this leg may be armed for `method`: GET always; PUT/PATCH only
+        with mutating replay permitted; DELETE additionally needs the operator's
+        delete_restore_method=PUT recreation contract."""
+        method = (method or "GET").upper()
+        if method == "GET":
+            return True
+        if method not in _WRITE_METHODS or not self.allow_writes:
+            return False
+        return method != "DELETE" or self.delete_restore_method == "PUT"
 
     @staticmethod
     def shape_applies(exchange: HttpExchange) -> bool:
-        """The request shapes this leg can test: a GET (it replays reads only) that
-        names an object to swap or reaches an admin-namespaced function. Any other
-        shape (a login POST, a collection read like /rest/memories/) is never sent
-        here, so the leg's own "skipped" is not recorded as having tested it (r5)."""
-        if (exchange.method or "GET").upper() != "GET":
+        """The request shapes this leg can test: a GET, or an object write (PUT/
+        PATCH/DELETE, B1-T2), that names an object to swap or reaches an
+        admin-namespaced function. Any other shape (a login POST, a collection read
+        like /rest/memories/) is never sent here, so the leg's own "skipped" is not
+        recorded as having tested it (r5). Whether a write may arm the leg is a
+        policy question answered by write_admitted, not by shape."""
+        if (exchange.method or "GET").upper() not in {"GET", *_WRITE_METHODS}:
             return False
         return has_object_identifier(exchange.url) or is_admin_namespaced(exchange.url)
 
@@ -623,6 +659,189 @@ class CrossIdentityValidator(Validator):
                 control_outcome="control_held")
         return self._skip(fc, "function-level comparison inconclusive")
 
+    async def _validate_write(self, finding, exchange):
+        from harness.principals import AuthzDecision
+        from harness.run_context import TypedRequest
+        from harness.security import is_identity_credential_header
+
+        fc, method, run = finding.vulnerability_class, exchange.method.upper(), self.run_context
+        if run is None:
+            return self._skip(fc, "Write authorization requires a run transport and registered sessions")
+        if not run.gate.config.active_enabled or not run.gate.config.allow_mutating_replay:
+            return self._skip(fc, "Write authorization skipped: mutating replay permission is off")
+        if not run.scope.in_scope(exchange.url) or not self.shape_applies(exchange):
+            return self._skip(fc, "Write authorization requires an in-scope object reference")
+        if method == "DELETE" and self.delete_restore_method != "PUT":
+            return self._skip(fc, "DELETE requires an explicit delete_restore_method=PUT contract "
+                                   "that recreates the original resource")
+        # Refuse before changing anything when known ceilings cannot pay for undo.
+        case_ref = finding.finding_id or finding.case_id or "write-authz-" + secrets.token_hex(8)
+        headroom, _, _ = run.gate.mutating_headroom(case_ref, self.name)
+        if headroom < 2 or (run.budget.remaining is not None and run.budget.remaining < 5):
+            return self._skip(fc, "Write and verified restore need two mutating sends for this case "
+                                  "(validators.mutating_ceiling_by_check.cross_identity >= 2) and "
+                                  "five request slots; nothing was written")
+        idents = self._run_identities(urlparse(exchange.url).hostname or "")
+        source = _source_identity(idents, _auth_signature(exchange.request_headers))
+        fact = self.ownership.lookup(self._object_ref(exchange.url), method) if self.ownership else None
+        owner_id = fact.owner_principal_id if fact else ""
+        owner = next((i for i in idents if _principal_for(i).id == owner_id), None) if owner_id else source
+        if owner is None or not owner.get("session_ref"):
+            return self._skip(fc, "No registered owner/baseline session is available for restoration")
+        others = _distinct_other_principals(idents, _auth_signature(owner["headers"]))
+        others = [i for i in others if not _PRIVILEGED_ROLE.search(i.get("role", ""))
+                  and not _principal_for(i).provisional
+                  and self._ownership_decision(_principal_for(i), exchange.url) != AuthzDecision.AUTHORIZED]
+        if not others:
+            return self._skip(fc, "No distinct non-privileged principal available to test the write")
+        # One controlled attempt per dispatch; no repeated mutation of the object.
+        other = others[0]
+        headers = {k: v for k, v in exchange.request_headers.items()
+                   if not is_identity_credential_header(k) and k.lower() not in
+                   {"host", "content-length", "if-match", "if-none-match"}}
+        headers["Content-Type"] = "application/json"
+
+        async def send(verb, ident, body=None, cleanup=False):
+            return await run.executor().execute(
+                TypedRequest(verb, exchange.url, headers=headers,
+                             body=json.dumps(body) if body is not None else None),
+                capability=self.name, session_ref=ident["session_ref"],
+                case_ref=case_ref, allow_cancelled_cleanup=cleanup)
+
+        def object_body(answer):
+            if not answer.ok or not 200 <= (answer.status or 0) < 300:
+                return None
+            try:
+                obj = json.loads(answer.body)
+            except (ValueError, TypeError):
+                return None
+            for _ in range(3):
+                if isinstance(obj, dict) and len(obj) == 1 and isinstance(
+                        next(iter(obj.values())), dict):
+                    obj = next(iter(obj.values()))
+                else:
+                    break
+            return obj if isinstance(obj, dict) and obj else None
+
+        baseline = await send("GET", owner)
+        original = object_body(baseline)
+        if original is None:
+            return self._skip(fc, "Owner baseline did not return a restorable JSON object")
+        try:
+            captured = json.loads(exchange.request_body or "{}")
+        except ValueError:
+            captured = {}
+        forbidden = {"id", "owner", "ownerid", "userid", "role", "password", "token",
+                     "email", "username", "apikey", "sessiontoken", "totpsecret"}
+        field = next((k for k in captured if isinstance(original.get(k), str)
+                      and re.sub(r"[^a-z0-9]", "", k.lower()) not in forbidden), None)
+        if method != "DELETE" and field is None:
+            return self._skip(fc, "No existing non-credential string field in the captured write to restore")
+        marker = "harness_authz_" + secrets.token_hex(12)
+        attack_body = ({**original, field: marker} if method == "PUT" else {field: marker})
+        restore_body = original if method in {"PUT", "DELETE"} else {field: original[field]}
+        # DELETE is undone by the operator-declared recreation verb (only PUT is admitted).
+        restore_method = self.delete_restore_method if method == "DELETE" else method
+        # Preflight both payloads through the same gate before attempting a write.
+        for verb, body in ((method, None if method == "DELETE" else attack_body),
+                           (restore_method, restore_body)):
+            decision = run.gate.authorize(validator_name=self.name, method=verb,
+                                          url=exchange.url, body=json.dumps(body))
+            if not decision.allowed:
+                return self._skip(fc, "Write/restore preflight refused: " + decision.reason)
+        def restored_matches(check) -> bool:
+            # Verify what this leg changed, not volatile fields (timestamps) the
+            # server rewrites on every save: the written field for PUT/PATCH, the
+            # recreated object's original values for DELETE.
+            obj = object_body(check) if check is not None else None
+            if obj is None:
+                return False
+            if method == "DELETE":
+                return all(obj.get(k) == v for k, v in original.items())
+            return obj.get(field) == original[field] and marker not in json.dumps(obj)
+
+        async def restore():
+            undo = await send(restore_method, owner, restore_body, cleanup=True)
+            check = await send("GET", owner, cleanup=True)
+            return undo, check
+
+        attack = after = undo = restored = None
+        failure, cancelled = "", False
+        try:
+            attack = await send(method, other, None if method == "DELETE" else attack_body)
+            after = await send("GET", owner)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as exc:  # a timeout can follow a committed write
+            failure = f"probe raised {type(exc).__name__}: {exc}"
+        finally:
+            # MANDATORY undo, as the owner, even after a denial, an exception or
+            # run cancellation (cleanup sends bypass the cancel token). Shielded so
+            # a second cancellation cannot abandon a half-done restore.
+            task = asyncio.ensure_future(restore())
+            try:
+                try:
+                    undo, restored = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    undo, restored = await task
+            except Exception as exc:
+                failure += f"; restore raised {type(exc).__name__}: {exc}"
+        restore_ok = (undo is not None and undo.ok and 200 <= (undo.status or 0) < 300
+                      and restored_matches(restored))
+        evidence = (f"object={exchange.url}; owner/baseline={_principal_for(owner).id}; "
+                    f"writer={_principal_for(other).id}; method={method}; "
+                    f"field={field or '[deleted object]'}; marker={marker}; "
+                    f"attack_status={getattr(attack, 'status', None)}; "
+                    f"restore_status={getattr(undo, 'status', None)}; "
+                    f"restore_succeeded={str(restore_ok).lower()}")
+        if not restore_ok:
+            # Loud: the target may still hold the marker (or lack the object).
+            message = ("RESTORE FAILED: the original state of " + exchange.url + " could not be "
+                       "restored and verified; the target may still hold " + marker
+                       + " -- restore it manually. " + evidence + (" " + failure if failure else ""))
+            log.error(message)
+            if cancelled:
+                raise asyncio.CancelledError(message)
+            return ValidationResult(self.name, "error", fc, summary=message, evidence=evidence)
+        if cancelled:
+            raise asyncio.CancelledError
+        if failure or attack is None or after is None or not attack.ok or not after.ok:
+            return ValidationResult(self.name, "error", fc,
+                                    summary="Write probe incomplete; original restored. " + failure,
+                                    evidence=evidence)
+        if attack.status in {401, 403}:
+            return ValidationResult(self.name, "not_confirmed", fc,
+                                    summary=f"Other principal's {method} was denied "
+                                            f"(HTTP {attack.status}); original restored",
+                                    evidence=evidence, control_outcome="control_held"
+                                    ).with_artifacts(baseline=baseline, attack=attack,
+                                                     controls=[after, restored])
+        persisted = ((after.status in {404, 410}) if method == "DELETE" else
+                     (object_body(after) or {}).get(field) == marker)
+        if not 200 <= (attack.status or 0) < 300 or not persisted:
+            return ValidationResult(self.name, "not_confirmed", fc,
+                                    summary=f"{method} as another principal returned HTTP "
+                                            f"{attack.status} but the owner read-back did not show "
+                                            f"the change; original restored",
+                                    evidence=evidence).with_artifacts(
+                                        baseline=baseline, attack=attack, controls=[after, restored])
+        # Confirmed only against a DECLARED boundary: a known owner who is not the
+        # writer, or an object declared to a privileged principal (admin-only).
+        # Undeclared/shared (catalogue) objects stay a lead.
+        denied = self._ownership_decision(_principal_for(other), exchange.url) == AuthzDecision.UNAUTHORIZED
+        return ValidationResult(
+            self.name, "confirmed" if denied else "supported", fc,
+            confirmed=denied, confidence=0.9 if denied else 0.4,
+            summary=(f"Broken object-level write authorization: {_principal_for(other).id!r} "
+                     f"{method} persisted on an object declared to another principal; original restored"
+                     if denied else
+                     f"LEAD: a low-privilege {method} persisted on an object with no declared "
+                     f"owner or access expectation; original restored. Verify whether this "
+                     f"principal may modify it."),
+            evidence=evidence + "; " + self._ownership_provenance(exchange),
+        ).with_artifacts(baseline=baseline, attack=attack, controls=[after, restored])
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         token = _ownership_method.set(exchange.method)
         try:
@@ -632,6 +851,8 @@ class CrossIdentityValidator(Validator):
 
     async def _validate_with_ownership_method(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         fc = finding.vulnerability_class
+        if (exchange.method or "GET").upper() in _WRITE_METHODS:
+            return await self._validate_write(finding, exchange)
         if (exchange.method or "GET").upper() != "GET":
             return self._skip(fc, "cross-identity replay is GET-only (safe); a mutating request is not replayed here")
         host = urlparse(exchange.url).hostname or ""
