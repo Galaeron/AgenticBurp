@@ -25,7 +25,7 @@ import hashlib
 import logging
 import re
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from harness.models import HttpExchange
 from harness.safety_gate import SafetyGateBlocked
@@ -135,12 +135,27 @@ def _trust(role: str) -> int:
     return _TRUST.get((role or "").lower(), 1)
 
 
-def _derive_probe(node: dict) -> tuple[str, str] | None:
-    """Map a worklist node to (specialty, hypothesis), or None to skip a node
-    with no actionable signal. The signal is what the access matrix already
-    established -- object-scoping, an unconfirmed IDOR candidate, or a low-trust
-    role reaching a privileged-looking path -- so the hypothesis is grounded, not
-    a blind guess."""
+def _query_names(template: dict) -> list[str]:
+    """The distinct query parameter names of a captured template, in order."""
+    names: list[str] = []
+    for name, _ in parse_qsl(str(template.get("query") or ""), keep_blank_values=True):
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _derive_probe(node: dict) -> list[tuple[str, str]]:
+    """Map a worklist node to its (specialty, hypothesis) probes, most important
+    first; empty to skip a node with no actionable signal. The signal is what the
+    access matrix already established -- object-scoping, an unconfirmed IDOR
+    candidate, or a low-trust role reaching a privileged-looking path -- or the
+    captured request's own inputs (a write body, query parameters), so the
+    hypothesis is grounded, not a blind guess.
+
+    The first probe is the one earlier versions returned alone. A node whose
+    captured request carries query parameters (a GET included) also gets an
+    injection probe on them -- r5's GET-query nodes got none -- merged into the
+    body-injection probe when that is the first one already."""
     method, path = node.get("method", "GET"), node.get("path", "/")
     reach = node.get("reachable_roles", []) or []
     reasons = node.get("reasons", []) or []
@@ -149,23 +164,33 @@ def _derive_probe(node: dict) -> tuple[str, str] | None:
                    or "object" in (f.get("vulnerability_class") or "").lower() for f in findings)
     low_trust_priv = any("privileged-looking" in r and "reach" in r for r in reasons) or \
         any("authz gap" in r.lower() for r in reasons)
+    template = node.get("template") or {}
+    query_names = _query_names(template)
+    query_text = (f"Test its query parameters ({', '.join(query_names)}) one at a time for "
+                  f"injection (SQL, NoSQL, command, template) and missing input validation, "
+                  f"keeping the other captured values.")
 
+    probes: list[tuple[str, str]] = []
     if node.get("object_scoped") or has_idor:
-        return "idor", (
+        probes.append(("idor", (
             f"Object-scoped endpoint {method} {path} is reachable by {', '.join(reach) or 'unknown roles'}. "
             f"Enumerate the object id to reach another identity's object and confirm broken "
-            f"object-level authorization (IDOR/BOLA).")
-    if low_trust_priv:
-        return "auth", (
+            f"object-level authorization (IDOR/BOLA).")))
+    elif low_trust_priv:
+        probes.append(("auth", (
             f"{method} {path} is a privileged-looking endpoint reachable by a low-trust role "
-            f"({', '.join(reach) or 'unknown'}). Probe for broken function-level authorization / auth bypass.")
-    template = node.get("template") or {}
-    if method.upper() in _WRITE_METHODS and (template.get("body") or "").strip():
-        return "injection", (
+            f"({', '.join(reach) or 'unknown'}). Probe for broken function-level authorization / auth bypass.")))
+    elif method.upper() in _WRITE_METHODS and (template.get("body") or "").strip():
+        hypothesis = (
             f"{method} {path} accepts a request body ({template.get('content_type') or 'unknown type'}). "
             f"Test its body parameters one at a time for injection (SQL, NoSQL, command, "
             f"template) and missing input validation, keeping the captured body's shape.")
-    return None
+        if query_names:
+            hypothesis += " " + query_text
+        return [("injection", hypothesis)]
+    if query_names:
+        probes.append(("injection", f"{method} {path} takes query parameters. " + query_text))
+    return probes
 
 
 _WRITE_METHODS = ("POST", "PUT", "PATCH")
@@ -530,6 +555,27 @@ async def investigate_worklist(
     eligible_count = 0
     skipped: list[dict] = []
     duplicates: list[dict] = []
+    # (node, exchange, probe_role, probe_session, node_key, probe): further probes
+    # of nodes whose first probe ran, for the second pass.
+    later: list[tuple] = []
+    extra_probes_run = 0
+    stopped = False
+
+    async def _agent_probe(exchange, hypothesis, specialty):
+        """One iterative agent probe: its findings (url-stamped and passed through
+        confirm_fn), stop reason and diagnostics. probe_fn's exception propagates."""
+        outcome = await probe_fn(exchange, hypothesis, specialty, step_budget)
+        agent_findings = _findings_from_outcome(outcome)
+        for f in agent_findings:
+            f.setdefault("url", exchange.url)  # stamp the concrete url for chain/capability linking
+        if confirm_fn is not None:
+            for f in agent_findings:
+                try:
+                    await confirm_fn(f, exchange)  # deterministic confirmation, mutates f in place
+                except Exception as e:  # confirmation is a bonus -- never sink the finding
+                    log.debug("confirm_fn failed on %s: %s", exchange.url, e)
+        return (agent_findings, (outcome or {}).get("iterative_result", {}).get("stop_reason"),
+                _probe_diagnostics(outcome))
 
     nodes = _without_duplicate_captures(
         (variant for node in state.worklist(worklist_limit)
@@ -541,16 +587,18 @@ async def investigate_worklist(
                             "reason": problem, "next_action": "Supply an in-scope complete capture and its owning identity"})
             continue
         node = _with_probe_template(node)
-        derived = _derive_probe(node)
         # R21: completion belongs to an (endpoint, check) case, not the whole
         # endpoint -- a "validated" endpoint may still hold UNRELATED vulnerabilities.
         # So we no longer skip a validated endpoint wholesale; we skip only the
-        # redundant AGENT re-probe when THIS node's derived class is already confirmed
-        # here. Shape-driven precondition legs (other classes) still run, and because
+        # redundant AGENT re-probe of a derived class already confirmed here.
+        # Shape-driven precondition legs (other classes) still run, and because
         # validated endpoints sink in the fused-score ordering they only draw leftover
-        # budget.
-        derived_confirmed = derived is not None and _derived_class_confirmed(node, derived[0])
-        eligible = derived is not None and not derived_confirmed
+        # budget. The node's first open probe runs in this pass; any further ones
+        # wait for the second pass below, so no node's second probe runs before
+        # every node had its first.
+        open_probes = [p for p in _derive_probe(node) if not _derived_class_confirmed(node, p[0])]
+        derived = open_probes[0] if open_probes else None
+        eligible = derived is not None
         if eligible:
             eligible_count += 1
         do_agent = eligible and investigated < max_nodes
@@ -610,11 +658,14 @@ async def investigate_worklist(
                 precondition_run += 1
             if do_agent and not (stop_on_confirm and stored.get("confirmed")):
                 investigated += 1
+                later.extend((node, exchange, probe_role, probe_session, key, extra)
+                             for extra in open_probes[1:])
             node_findings = [dict(f) for f in stored.get("findings_detail") or []]
             if node_findings:
                 state.ingest_findings(exchange.url, exchange.method, node_findings)
             outcomes.append(dict(stored, findings_detail=node_findings, resumed=True))
             if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
+                stopped = True
                 break
             continue
 
@@ -667,8 +718,11 @@ async def investigate_worklist(
         if do_agent and not (stop_on_confirm and precondition_confirmed):
             specialty, hypothesis = derived
             investigated += 1
+            later.extend((node, exchange, probe_role, probe_session, key, extra)
+                         for extra in open_probes[1:])
             try:
-                outcome = await probe_fn(exchange, hypothesis, specialty, step_budget)
+                agent_findings, agent_stop, agent_diag = await _agent_probe(
+                    exchange, hypothesis, specialty)
             except Exception as e:  # one node's failure must not sink the sweep
                 log.warning("investigate_worklist: node %s %s failed: %s",
                             node.get("method"), node.get("path"), e)
@@ -678,18 +732,7 @@ async def investigate_worklist(
                                  "error": repr(e), "precondition_findings": len(precond_findings),
                                  "findings_detail": list(node_findings)})
                 continue
-            agent_findings = _findings_from_outcome(outcome)
-            for f in agent_findings:
-                f.setdefault("url", exchange.url)  # stamp the concrete url for chain/capability linking
-            if confirm_fn is not None:
-                for f in agent_findings:
-                    try:
-                        await confirm_fn(f, exchange)  # deterministic confirmation, mutates f in place
-                    except Exception as e:  # confirmation is a bonus -- never sink the finding
-                        log.debug("confirm_fn failed on %s: %s", exchange.url, e)
             node_findings.extend(agent_findings)
-            agent_stop = (outcome or {}).get("iterative_result", {}).get("stop_reason")
-            agent_diag = _probe_diagnostics(outcome)
 
         if not do_agent and not precond_findings:
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
@@ -718,6 +761,67 @@ async def investigate_worklist(
             except Exception as e:  # recording a unit never sinks the sweep
                 log.warning("investigate_worklist: on_outcome failed: %s", e)
         if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
+            stopped = True
+            break
+
+    # Second pass: each node's further probes (e.g. injection on the query of an
+    # object-scoped node), in worklist order, from what is left of the same
+    # max_nodes agent budget. A probe the budget or the deadline cannot cover is
+    # reported as skipped with its specialty.
+    for node, exchange, probe_role, probe_session, key, (specialty, hypothesis) in later:
+        if stopped:
+            break
+        entry = {"path": node.get("path"), "method": node.get("method", "GET"),
+                 "specialty": specialty}
+        if investigated >= max_nodes:
+            skipped.append(dict(entry, reason=SKIP_BUDGET_EXHAUSTED))
+            continue
+        probe_key = f"{key}#{specialty}" if key else ""
+        if completed is not None and probe_key in completed:
+            stored = completed[probe_key]
+            if not (stop_on_confirm and stored.get("confirmed")):
+                investigated += 1
+            node_findings = [dict(f) for f in stored.get("findings_detail") or []]
+            if node_findings:
+                state.ingest_findings(exchange.url, exchange.method, node_findings)
+            outcomes.append(dict(stored, findings_detail=node_findings, resumed=True))
+            if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
+                break
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            skipped.append(dict(entry, reason=SKIP_TIME_BUDGET))
+            continue
+        investigated += 1
+        extra_probes_run += 1
+        try:
+            node_findings, agent_stop, agent_diag = await _agent_probe(exchange, hypothesis, specialty)
+        except Exception as e:  # one probe's failure must not sink the sweep
+            log.warning("investigate_worklist: %s probe of %s %s failed: %s", specialty,
+                        node.get("method"), node.get("path"), e)
+            outcomes.append({"path": node.get("path"), "specialty": specialty,
+                             "error": repr(e), "precondition_findings": 0, "findings_detail": []})
+            continue
+        if node_findings:
+            state.ingest_findings(exchange.url, exchange.method, node_findings)
+        outcomes.append({
+            "path": node.get("path"),
+            "specialty": specialty,
+            "probe_role": probe_role,
+            "probe_principal": _principal_of(probe_session) if probe_session is not None else None,
+            "findings": len(node_findings),
+            "findings_detail": node_findings,
+            "precondition_findings": 0,
+            "confirmed": any(f.get("confirmed") for f in node_findings),
+            "stop_reason": agent_stop,
+        })
+        if agent_diag is not None:
+            outcomes[-1]["diagnostics"] = agent_diag
+        if on_outcome is not None:
+            try:
+                on_outcome(probe_key, outcomes[-1])
+            except Exception as e:  # recording a unit never sinks the sweep
+                log.warning("investigate_worklist: on_outcome failed: %s", e)
+        if stop_on_confirm and any(f.get("confirmed") for f in node_findings):
             break
 
     log.info("investigate_worklist: %s -- investigated %d nodes, %d proactive legs attempted, "
@@ -738,6 +842,8 @@ async def investigate_worklist(
         summary_out.update({
             "eligible": eligible_count,
             "investigated": investigated,
+            # Of `investigated`, the probes beyond a node's first (second pass).
+            "extra_probes": extra_probes_run,
             "skipped": skipped,
             "skipped_by_reason": by_reason,
             # E4: captures identical to an earlier one (same route, identity,

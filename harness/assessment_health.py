@@ -11,6 +11,9 @@ from harness.models import HttpExchange
 
 # E1 review tiers, highest priority first. `review_stats.by_tier` uses these names.
 TIER_NAMES = ("authenticated_api", "anonymous_api", "other_non_html", "html")
+# review_frontier: of every TIER_SHARE_PERIOD picks, the last goes to a lower tier
+# (in turn) and the rest to the highest non-empty tier. See review_frontier.
+TIER_SHARE_PERIOD = 4
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # Response headers that carry the security posture (E1). Access-Control-Allow-* is
 # matched by prefix and Set-Cookie is reduced to its cookie names (values are
@@ -137,8 +140,15 @@ def observation_key(ex) -> str:
 def review_frontier(captured, *, seen=None, group_identical: bool = False, on_grouped=None):
     """Deduplicate exact observations, then order what is left for review.
 
-    Order (E1): tier first -- authenticated JSON/API or write, anonymous JSON/API
-    or write, other non-HTML, HTML (see capture_tier) -- and inside a tier the
+    Order (E1): by tier -- authenticated JSON/API or write, anonymous JSON/API
+    or write, other non-HTML, HTML (see capture_tier) -- interleaved so that no
+    tier starves (r5: all 71 reviews went to tier 0 and 365 captures were never
+    reached). The highest non-empty tier (tier 0 while it lasts) takes the first
+    TIER_SHARE_PERIOD - 1 picks of every TIER_SHARE_PERIOD; the remaining pick goes
+    to the lower non-empty tiers in turn. With TIER_SHARE_PERIOD = 4 and all four
+    tiers non-empty, tier 0 gets 3 of every 4 reviews and each lower tier at least
+    one in every window of N = 4 * 3 = 12 consecutive picks (fewer non-empty lower
+    tiers make the window shorter). The order is deterministic. Inside a tier the
     identity + first-path-segment families take turns, and inside a family the
     individual routes do, so polling on one route or one route family cannot
     consume the review budget before another gets its first review. Nothing is
@@ -180,29 +190,42 @@ def review_frontier(captured, *, seen=None, group_identical: bool = False, on_gr
         group = (ex.method, parts.netloc, parts.path, _identity(ex))
         tiers.setdefault(capture_tier(ex), {}).setdefault(_route_family(ex), {}) \
             .setdefault(group, deque()).append((key, ex))
-    for tier in sorted(tiers):
+    picks = 0
+    last_lower = -1
+    while tiers:
+        live = sorted(tiers)
+        primary, lower = live[0], live[1:]
+        if lower and picks % TIER_SHARE_PERIOD == TIER_SHARE_PERIOD - 1:
+            # The lower-tier slot: the next non-empty lower tier after the last one
+            # served, wrapping round, so the lower tiers take turns.
+            tier = next((t for t in lower if t > last_lower), lower[0])
+            last_lower = tier
+        else:
+            tier = primary
         families = tiers[tier]
-        while families:
-            # Popping and re-inserting moves a family/group to the back of its
-            # insertion-ordered dict: that is the round-robin.
-            family = next(iter(families))
-            groups = families.pop(family)
-            group = next(iter(groups))
-            queue = groups.pop(group)
-            key, ex = queue.popleft()
-            if queue:
-                groups[group] = queue
-            if groups:
-                families[family] = groups
-            if key in seen:
-                continue
-            seen.add(key)
-            for member_key, member in followers.get(key, ()):
-                if member_key not in seen:
-                    seen.add(member_key)
-                    if on_grouped is not None:
-                        on_grouped(member, ex)
-            yield ex
+        # Popping and re-inserting moves a family/group to the back of its
+        # insertion-ordered dict: that is the round-robin.
+        family = next(iter(families))
+        groups = families.pop(family)
+        group = next(iter(groups))
+        queue = groups.pop(group)
+        key, ex = queue.popleft()
+        if queue:
+            groups[group] = queue
+        if groups:
+            families[family] = groups
+        if not families:
+            del tiers[tier]
+        if key in seen:
+            continue      # the slot is not used up: the same turn picks again
+        picks += 1
+        seen.add(key)
+        for member_key, member in followers.get(key, ()):
+            if member_key not in seen:
+                seen.add(member_key)
+                if on_grouped is not None:
+                    on_grouped(member, ex)
+        yield ex
 
 
 def assessment_health(coverage, errors=(), *, stopped_on_confirmation=False):
@@ -234,8 +257,11 @@ def confirmed_issue_inventory(findings, run_id, proof_lookup):
         case_id, proof_id = finding.get("case_id"), finding.get("proof_id")
         if not finding.get("confirmed") or not case_id or not proof_id:
             continue
+        # A tool-reported proof (an external tool's unreproduced detection) is not
+        # a harness confirmation; it is accounted on its own (confirmed_issue_accounting).
         if any(p.get("proof_id") == proof_id and (p.get("case") or {}).get("case_id") == case_id
                and (p.get("case") or {}).get("run_id") == run_id and p.get("verdict") == "confirmed"
+               and not is_tool_reported(p)
                for p in proof_lookup(case_id)):
             proven[case_id] = {k: finding.get(k) for k in
                               ("finding_id", "case_id", "proof_id", "url", "vulnerability_class")}
@@ -270,6 +296,7 @@ def stored_proof_artifacts_resolve(proof):
 # policy fingerprint on several routes is one issue with several locations. AR-08b:
 # one set, shared with the report path's issue key (issues.py).
 from harness.issues import ROUTE_INDEPENDENT_MECHANISMS  # noqa: E402
+from harness.evidence import is_tool_reported  # noqa: E402
 _ORPHAN_REASONS = {'proof not found for case', 'proof belongs to another run', 'proof belongs to another case'}
 
 
@@ -322,7 +349,7 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             continue
         excluded.append({'case_id': case_id, 'proof_id': proof_id, 'reason': reason})
 
-    instances, groups, counted_cases = [], {}, set()
+    instances, groups, counted_cases, tool_reported_cases = [], {}, set(), set()
     # A reused result carries the original attempt's artifacts; it is a reference,
     # never a second execution (batch 08).
     first_attempt = {}
@@ -346,7 +373,11 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         structured = bool(proof.get('executed') and not proof.get('legacy', True)
                           and len(set(refs)) >= 3 and all(refs))
         resolved = bool(structured and artifact_resolver and artifact_resolver(proof))
-        kind = claimed if claimed != 'vulnerability' or resolved else 'candidate'
+        # An external tool's detection the harness did not reproduce is its own tier:
+        # never confirmed, never proof-bound, never folded into the generic candidates.
+        tool_reported = is_tool_reported(proof)
+        kind = ('tool_reported' if tool_reported
+                else claimed if claimed != 'vulnerability' or resolved else 'candidate')
         reason = (None if finding else 'not referenced by a confirmed finding')
         instance = {key: proof.get(key) for key in ('proof_id', 'validator', 'verdict', 'executed', 'legacy',
                     'baseline_artifact_id', 'attack_artifact_id', 'control_artifact_ids')}
@@ -357,7 +388,11 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         if original and original != proof_id:
             instance['reuses_attempt_of'] = original
         if finding:
-            counted_cases.add(case['case_id'])
+            if tool_reported:
+                tool_reported_cases.add(case['case_id'])
+                instance['limitation'] = 'reported by an external tool; the harness did not reproduce it'
+            else:
+                counted_cases.add(case['case_id'])
             parts = urlsplit(finding.get('url') or '')
             origin = f'{parts.scheme}://{parts.hostname or ""}'
             if parts.port:
@@ -395,21 +430,26 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         instances.append(instance)
     counts = {kind: sum(g['kind'] == kind for g in groups.values())
               for kind in ('vulnerability', 'hardening', 'reconnaissance')}
-    ledger_confirmed = [p for p in instances if p['verdict'] == 'confirmed']
+    ledger_confirmed = [p for p in instances if p['verdict'] == 'confirmed' and p['kind'] != 'tool_reported']
     orphans = [dict(e, repair='re-link the finding to a stored proof of this case and run, or re-run '
                               'its check; the link is not shown as proof') for e in excluded
                if e['reason'] in _ORPHAN_REASONS]
     return {'schema_version': 1, 'run_id': run_id,
             'units': {'confirmed_issues': 'unique proof-bound cases (compatibility count)',
                       'vulnerabilities': 'distinct structured, artifact-resolved vulnerability groups',
-                      'observations': 'presentation groups retaining route/principal proof instances'},
+                      'observations': 'presentation groups retaining route/principal proof instances',
+                      'tool_reported': 'cases whose only proof is an external tool detection the harness '
+                                       'did not reproduce (neither confirmed nor a generic candidate)'},
             'counts': {'proof_bound_cases': len(counted_cases),
                        'ledger_confirmed_proof_instances': len(ledger_confirmed),
                        'unreferenced_confirmed_proof_instances': sum(not p['referenced'] for p in ledger_confirmed),
                        'vulnerabilities': counts['vulnerability'],
                        'hardening_observations': counts['hardening'],
                        'reconnaissance': counts['reconnaissance'],
-                       'candidate_cases': len(candidate_cases), 'excluded_records': len(excluded),
+                       'candidate_cases': len(candidate_cases - tool_reported_cases),
+                       'tool_reported_cases': len(tool_reported_cases),
+                       'tool_reported_issues': sum(g['kind'] == 'tool_reported' for g in groups.values()),
+                       'excluded_records': len(excluded),
                        'executed_attempts': len(set(first_attempt.values())),
                        'reused_proof_references': sum(bool(p.get('reuses_attempt_of')) for p in instances),
                        'orphaned_proof_links': len(orphans)},

@@ -162,6 +162,10 @@ class ReportFinding:
     input_recorded: bool = True
     member_ids: list[str] = field(default_factory=list)
     principals: list[str] = field(default_factory=list)
+    # True when the row's linked proof is an external tool's detection the harness
+    # did not reproduce (store row `evidence_source`). Such a row is reported in its
+    # own section and count, never as a confirmed finding.
+    tool_reported: bool = False
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
@@ -201,6 +205,8 @@ def _from_store_dict(d: dict) -> ReportFinding:
         principal_id=d.get("principal_id", "") or "",
         workflow_state_id=d.get("workflow_state_id", "") or "",
         input_recorded=d.get("input_recorded", True) is not False,
+        tool_reported=bool(d.get("confirmed")) and __import__(
+            "harness.evidence", fromlist=["is_tool_reported"]).is_tool_reported(d),
         **finding_triage(d),
     )
 
@@ -325,7 +331,8 @@ def _rank_tuple(f: "ReportFinding") -> tuple:
     # (so a collapse never shows a weaker verdict than a member has), then more-severe,
     # then higher confidence.
     from harness.confirmation_gate import STATE_LEAD
-    return (1 if f.confirmed else 0, 1 if f.verification_state == "verified" else 0,
+    return (1 if f.confirmed else 0, 0 if f.tool_reported else 1,
+            1 if f.verification_state == "verified" else 0,
             0 if f.lifecycle_state == STATE_LEAD else 1,
             -_SEVERITY_ORDER.get(f.severity, 99), f.confidence)
 
@@ -460,7 +467,10 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
 
     individual.sort(key=lambda f: (_SEVERITY_ORDER.get(f.severity, 99), -f.confidence))
 
-    confirmed = [f for f in individual if f.confirmed]
+    # A tool-reported row (an external tool's unreproduced detection) is its own
+    # bucket: neither confirmed nor a generic unconfirmed hypothesis.
+    tool_reported = [f for f in individual if f.confirmed and f.tool_reported]
+    confirmed = [f for f in individual if f.confirmed and not f.tool_reported]
     unconfirmed = [f for f in individual if not f.confirmed]
 
     if effort_ledger is not None and unconfirmed:
@@ -475,7 +485,7 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     # chains render through a separate path that never calls
     # reconstruct_persisted, so they are deliberately excluded here.
     from harness import evidence_ledger
-    _recon_targets = confirmed + unconfirmed + leads_bucket
+    _recon_targets = confirmed + tool_reported + unconfirmed + leads_bucket
     _recon_finding_ids = [f.finding_id for f in _recon_targets if f.finding_id]
     try:
         ownership = {"engagement_id": engagement_id} if engagement_id is not None else {}
@@ -501,7 +511,10 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     lines.append("")
     _leads_note = (f", **{len(leads_bucket)} quarantined test suggestion(s)**"
                    if leads_bucket else "")
-    lines.append(f"**{len(confirmed)} confirmed finding(s)**, **{len(unconfirmed)} unconfirmed finding(s)**, "
+    _tool_note = (f"**{len(tool_reported)} tool-reported finding(s) not reproduced by the harness**, "
+                  if tool_reported else "")
+    lines.append(f"**{len(confirmed)} confirmed finding(s)**, {_tool_note}"
+                 f"**{len(unconfirmed)} unconfirmed finding(s)**, "
                  f"**{len(chains)} potential attack chain(s)**{_leads_note}.")
     if collapsed_count:
         lines.append("")
@@ -554,6 +567,16 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
             lines.append("")
             for f in confirmed_observations:
                 lines.extend(_render_finding(f, recon_map))
+
+    if tool_reported:
+        lines.append("## Tool-Reported Findings (not reproduced)")
+        lines.append("")
+        lines.append("_An external tool (e.g. sqlmap) reported these, but the harness did not reproduce "
+                     "them with its own exchanges. They are not confirmed findings; reproduce one "
+                     "before reporting it._")
+        lines.append("")
+        for f in tool_reported:
+            lines.extend(_render_finding(f, recon_map))
 
     if unconfirmed:
         lines.append("## Unconfirmed Findings")
@@ -642,7 +665,8 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
     suggested_test = issues.redact(f.suggested_test)
 
     lines = []
-    status = _STATE_BADGE.get(f.lifecycle_state, "❓ SUSPECTED (unconfirmed)")
+    status = ("🧰 TOOL-REPORTED (not reproduced by the harness)" if f.tool_reported
+              else _STATE_BADGE.get(f.lifecycle_state, "❓ SUSPECTED (unconfirmed)"))
     verification = _VERIFICATION_BADGE.get(f.verification_state, "🧪 CANDIDATE")
     lines.append(f"### {f.vulnerability_class} -- {url}")
     lines.append("")

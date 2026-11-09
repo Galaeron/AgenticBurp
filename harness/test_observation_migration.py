@@ -23,11 +23,12 @@ _LEGACY_SQL = Path(__file__).resolve().parent / "testing_fixtures" / "state_sche
 # AR-08a's proof_identity, I16's engagement_declarations and finding dedup's
 # finding_inputs side tables are the other objects added since this fixture (their
 # own legacy-read and rollback tests: test_proof_identity_migration,
-# test_i16_persist, test_finding_dedup).
+# test_i16_persist, test_finding_dedup; proof_evidence_source:
+# test_tool_reported_accounting).
 _NEW_OBJECTS = {"exchange_observations", "observation_attributions",
                 "idx_exchange_observations_scope", "idx_exchange_observations_endpoint",
                 "proof_identity", "engagement_declarations", "finding_inputs",
-                "plan_dispatch_notes"}
+                "plan_dispatch_notes", "proof_evidence_source"}
 _NEW_MARKERS = sorted([repr(("observation-schema", "1")), repr(("proof-identity-schema", "1")),
                        repr(("engagement-declarations-schema", "1")), repr(("finding-inputs-schema", "1")),
                        repr(("plan-dispatch-schema", "1"))])
@@ -153,6 +154,7 @@ class ObservationMigrationTests(unittest.TestCase):
             conn.execute("DROP TABLE engagement_declarations")
             conn.execute("DROP TABLE finding_inputs")
             conn.execute("DROP TABLE plan_dispatch_notes")
+            conn.execute("DROP TABLE proof_evidence_source")
             conn.execute("DELETE FROM state_metadata WHERE name IN ('observation-schema', 'proof-identity-schema', "
                          "'engagement-declarations-schema', 'finding-inputs-schema', 'plan-dispatch-schema')")
             conn.commit()

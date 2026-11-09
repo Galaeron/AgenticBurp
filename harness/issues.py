@@ -546,6 +546,31 @@ def _audited_oracle_state(issue: Issue, proofs_by_case: dict) -> tuple[bool, str
     return verified_any, ("verified" if verified_any else "candidate"), sorted(capsule_ids)
 
 
+def _member_tool_reported(m: dict, proofs_by_case: dict) -> bool:
+    """True when a member's own proof is an external tool's detection the harness did
+    not reproduce: the store row's `evidence_source`, else its exact recorded proof."""
+    from harness.evidence import is_tool_reported
+    if is_tool_reported(m):
+        return True
+    cid, pid = m.get("case_id") or "", m.get("proof_id") or ""
+    return any(p.get("proof_id") == pid and is_tool_reported(p)
+               for p in (_normalize_attempts(proofs_by_case.get(cid)) if cid and pid else []))
+
+
+def evidence_state(issue: Issue, proofs_by_case: dict | None = None) -> str:
+    """The issue's evidence tier: "confirmed" when a confirmed member rests on the
+    harness's own proof, "tool_reported" when every confirmed member's proof is an
+    external tool's unreproduced detection, else "candidate". A tool-reported issue
+    is neither confirmed nor a generic candidate."""
+    proofs_by_case = proofs_by_case or {}
+    confirmed = [m for m in issue.members if m.get("confirmed")]
+    if not confirmed:
+        return "candidate"
+    if all(_member_tool_reported(m, proofs_by_case) for m in confirmed):
+        return "tool_reported"
+    return "confirmed"
+
+
 def _member_evidence(issue: Issue) -> list[dict]:
     """Per-member evidence, redacted -- so grouping keeps every affected instance's
     own evidence (R10), not only the best member's."""
@@ -574,6 +599,8 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
     has_proof = any(r.get("proof_id") and r.get("availability") != "unavailable" for r in proof_refs)
     audited_verified, audited_verification_state, audited_capsule_ids = \
         _audited_oracle_state(issue, proofs_by_case)
+    state = evidence_state(issue, proofs_by_case)
+    confirmed = state == "confirmed"
 
     boundary_word = "read" if issue.authorization_boundary == "read" else "state-changing"
     first_alias = next(iter(aliases), None)
@@ -594,9 +621,11 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "vulnerability_class": issue.vulnerability_class,
         "severity": issue.severity,
         "confidence": round(issue.confidence, 3),
-        "confirmed": issue.confirmed,
+        "confirmed": confirmed,
+        # "confirmed" | "tool_reported" | "candidate" (see evidence_state).
+        "evidence_state": state,
         **__import__("harness.confirmation_gate", fromlist=["finding_triage"]).finding_triage(
-            {**best, "confirmed": issue.confirmed}),
+            {**best, "confirmed": confirmed}),
         # R01/R06: oracle verification state must survive export, distinct
         # from the legacy `confirmed` (leg fired once) axis -- a consumer
         # reading only `confirmed` cannot tell a leg-confirmed-but-unverified
@@ -628,7 +657,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
             "expected": _expected_invariant(issue),
             "observed": redact((best.get("summary") or best.get("evidence") or "")[:600]),
         },
-        "impact": _impact_line(issue),
+        "impact": _impact_line(issue, state),
         "evidence": redact((best.get("evidence") or "")[:800]),
         "member_evidence": _member_evidence(issue),
         "proof_references": proof_refs,
@@ -641,7 +670,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "captured_auth_contexts": sorted({member.get("captured_principal_id") for member in issue.members
                                           if member.get("captured_principal_id")}),
         "artifacts": {"replayable": has_proof, "missing": missing_artifacts},
-        "limitations": _limitations(issue),
+        "limitations": _limitations(issue, state),
         "retest": (
             f"Re-run the same {issue.method or 'captured'} request on a patched build; "
             f"a fix means the {boundary_word} attempt no longer succeeds. This retest "
@@ -711,17 +740,23 @@ def _expected_invariant(issue: Issue) -> str:
             "principal with valid anti-CSRF protection and enforced input validation.")
 
 
-def _impact_line(issue: Issue) -> str:
+def _impact_line(issue: Issue, state: str = "") -> str:
     n = len({m.get("url") for m in issue.members if m.get("url")})
     scope = f" across {n} observed instance(s)" if n > 1 else ""
-    verdict = "confirmed" if issue.confirmed else "suspected (unconfirmed)"
+    state = state or ("confirmed" if issue.confirmed else "candidate")
+    verdict = {"confirmed": "confirmed",
+               "tool_reported": "tool-reported (not reproduced by the harness)"}.get(
+                   state, "suspected (unconfirmed)")
     return (f"{verdict.capitalize()} {issue.vulnerability_class} at "
             f"{issue.endpoint_family or 'the host'}{scope}.")
 
 
-def _limitations(issue: Issue) -> list[str]:
+def _limitations(issue: Issue, state: str = "") -> list[str]:
     lims = []
-    if not issue.confirmed:
+    if state == "tool_reported":
+        lims.append("Reported by an external tool only; the harness did not reproduce it with "
+                    "its own exchanges, so it is not counted as confirmed.")
+    elif not issue.confirmed:
         lims.append("No member of this issue is validator-confirmed; treat as a hypothesis "
                     "pending manual verification.")
     if not issue.proof_ids:

@@ -75,17 +75,17 @@ class SeedExchangeTemplateTests(unittest.TestCase):
 
 class DeriveTests(unittest.TestCase):
     def test_object_scoped_node_derives_idor(self):
-        self.assertEqual(wi._derive_probe(OBJ)[0], "idor")
+        self.assertEqual(wi._derive_probe(OBJ)[0][0], "idor")
 
     def test_privileged_low_trust_node_derives_auth(self):
         st = _state_with([ADMIN])
         node = next(w for w in st.worklist(10) if w["path"] == "/api/admin/users")
-        self.assertEqual(wi._derive_probe(node)[0], "auth")
+        self.assertEqual(wi._derive_probe(node)[0][0], "auth")
 
     def test_benign_node_skipped(self):
         st = _state_with([BENIGN])
         node = next(w for w in st.worklist(10) if w["path"] == "/api/health")
-        self.assertIsNone(wi._derive_probe(node))
+        self.assertEqual(wi._derive_probe(node), [])
 
 
 class InvestigateTests(unittest.IsolatedAsyncioTestCase):
@@ -542,3 +542,115 @@ def _async(value):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SEARCH = {"method": "GET", "path": "/api/search", "by_role": {"user": 200, "anonymous": 200},
+          "reachable_roles": ["anonymous", "user"], "object_scoped": False}
+
+
+def _captured(st, url, method="GET", body=""):
+    """Record one capture as the user identity, the way discovery does."""
+    st.record_template(url, method, {
+        "url": url, "method": method, "request_headers": {"Authorization": "Bearer u"},
+        "request_body": body, "response_status": 200,
+        "response_headers": {"Content-Type": "application/json"}, "response_body": "[]"})
+
+
+class QueryInjectionProbeTests(unittest.IsolatedAsyncioTestCase):
+    """r5: the worklist derived one probe per node and GET-query nodes got none.
+    Driven through investigate_worklist, the real caller of _derive_probe."""
+
+    def _state(self):
+        st = _state_with([OBJ, ADMIN, SEARCH])
+        _captured(st, "http://t/api/search?q=apple&page=2")
+        _captured(st, "http://t/api/tickets/5?expand=owner")
+        _captured(st, "http://t/api/admin/users")
+        return st
+
+    async def _sweep(self, max_nodes):
+        st, calls, summary = self._state(), [], {}
+
+        async def probe(exchange, hypothesis, specialty, step_budget):
+            calls.append((exchange.url.split("?")[0].replace("http://t", ""), specialty,
+                          exchange.url, hypothesis))
+            return _nothing()
+
+        outcomes = await wi.investigate_worklist(probe, st, "http://t", ROLES,
+                                                 max_nodes=max_nodes, summary_out=summary)
+        return calls, summary, outcomes
+
+    async def _check_get_query_node_gets_an_injection_probe(self):
+        calls, summary, _ = await self._sweep(max_nodes=8)
+        search = [c for c in calls if c[0] == "/api/search"]
+        self.assertEqual([c[1] for c in search], ["injection"])
+        self.assertIn("q=apple", search[0][2])                    # the captured query replayed
+        self.assertIn("(q, page)", search[0][3])                  # names, in order
+        return calls, summary
+
+    async def test_get_node_with_a_query_string_gets_an_injection_probe(self):
+        await self._check_get_query_node_gets_an_injection_probe()
+
+    async def test_control_without_query_derivation_the_get_node_is_never_probed(self):
+        from unittest.mock import patch
+        with patch.object(wi, "_query_names", lambda template: []):
+            with self.assertRaises(AssertionError):
+                await self._check_get_query_node_gets_an_injection_probe()
+
+    async def test_object_scoped_node_keeps_idor_first_and_adds_injection_last(self):
+        calls, summary = await self._check_get_query_node_gets_an_injection_probe()
+        self.assertEqual(len(calls), 4)
+        firsts = calls[:3]
+        # every node's first probe before any second probe
+        self.assertEqual(sorted(c[0] for c in firsts),
+                         ["/api/admin/users", "/api/search", "/api/tickets/5"])
+        self.assertEqual(next(c[1] for c in firsts if c[0] == "/api/tickets/5"), "idor")
+        self.assertEqual(calls[3][:2], ("/api/tickets/5", "injection"))
+        self.assertIn("expand=owner", calls[3][2])
+        self.assertEqual((summary["investigated"], summary["extra_probes"]), (4, 1))
+        self.assertEqual(summary["eligible"], 3)
+
+    async def test_extra_probes_count_against_the_node_budget(self):
+        calls, summary, outcomes = await self._sweep(max_nodes=3)
+        self.assertEqual(len(calls), 3)                           # one per node, none extra
+        self.assertEqual(len({c[0] for c in calls}), 3)
+        self.assertEqual((summary["investigated"], summary["extra_probes"]), (3, 0))
+        extra = [s for s in summary["skipped"] if s.get("specialty") == "injection"]
+        self.assertEqual([(s["path"], s["reason"]) for s in extra],
+                         [("/api/tickets/{id}", wi.SKIP_BUDGET_EXHAUSTED)])
+        self.assertEqual(summary["skipped_by_reason"].get(wi.SKIP_BUDGET_EXHAUSTED), 1)
+        self.assertEqual(len(outcomes), 3)
+
+    async def test_a_budget_of_two_never_spends_a_second_probe_before_a_first(self):
+        calls, summary, _ = await self._sweep(max_nodes=2)
+        self.assertEqual(len({c[0] for c in calls}), 2)
+        self.assertNotIn("injection", [c[1] for c in calls if c[0] == "/api/tickets/5"])
+
+    async def test_a_confirmed_injection_drops_only_that_probe(self):
+        st = self._state()
+        st.ingest_findings("http://t/api/tickets/5", "GET", [{
+            "vulnerability_class": "sql_injection", "confirmed": True, "confidence": 0.9,
+            "severity": "high", "summary": "s", "evidence": "e", "confirmed_by_leg": "sqli"}])
+        calls = []
+
+        async def probe(exchange, hypothesis, specialty, step_budget):
+            calls.append((exchange.url.split("?")[0].replace("http://t", ""), specialty))
+            return _nothing()
+
+        await wi.investigate_worklist(probe, st, "http://t", ROLES, max_nodes=8)
+        self.assertEqual([s for p, s in calls if p == "/api/tickets/5"], ["idor"])
+
+
+class DeriveProbeListTests(unittest.TestCase):
+    def test_write_body_and_query_merge_into_one_injection_probe(self):
+        node = {"method": "POST", "path": "/api/x",
+                "template": {"body": '{"a": 1}', "query": "mode=fast", "content_type": "application/json"}}
+        probes = wi._derive_probe(node)
+        self.assertEqual([p[0] for p in probes], ["injection"])
+        self.assertIn("body parameters", probes[0][1])
+        self.assertIn("(mode)", probes[0][1])
+
+    def test_only_specialties_the_iterative_agent_already_runs(self):
+        node = dict(OBJ, template={"query": "a=1"}, reasons=["authz gap"])
+        self.assertEqual([p[0] for p in wi._derive_probe(node)], ["idor", "injection"])
+        for probe in wi._derive_probe(node):
+            self.assertIn(probe[0], wi._SPECIALTY_KEYWORDS)

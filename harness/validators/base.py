@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from harness.models import Finding, HttpExchange, TestPlan
 from harness.categories import canonicalize, distinctive_token
 
+# ValidationResult.evidence_source / ProofRecord.evidence_source: an external tool's
+# detection that the harness did not reproduce with its own exchanges.
+TOOL_REPORTED = "tool_reported"
+
 
 @dataclass
 class ValidationResult:
@@ -59,6 +63,12 @@ class ValidationResult:
     # body_form, body_json). The case driver binds a verdict to a parameter case
     # only when this names exactly that input; empty means the leg did not say.
     tested_parameters: tuple[tuple[str, str], ...] = ()
+    # Where the verdict's evidence comes from, when it is not the harness's own
+    # exchanges: TOOL_REPORTED is an external tool's detection the harness did not
+    # reproduce (sqlmap's unreproduced injection). Copied onto the ProofRecord;
+    # accounting never counts such a proof as confirmed or proof-bound. "" = the
+    # validator's own observation.
+    evidence_source: str = ""
 
     def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
         """Name the sends behind this verdict; each is an ExecutionOutcome, a
@@ -108,17 +118,22 @@ def proof_artifact_kwargs(result) -> dict:
     at least one exchange declares executed=True; anything else stays legacy."""
     if (getattr(result, "status", "") or "").lower() not in ("confirmed", "not_confirmed"):
         return {}
+    # A tool-reported verdict names no exchanges of its own; its marker still
+    # travels so the proof is accounted as tool-reported, not as a bare legacy one.
+    source = getattr(result, "evidence_source", "") or ""
     baseline = getattr(result, "baseline_artifact_id", "") or ""
     attack = getattr(result, "attack_artifact_id", "") or ""
     controls = tuple(getattr(result, "control_artifact_ids", ()) or ())
     if not (baseline or attack or controls):
-        return {}
+        return {"evidence_source": source} if source else {}
     kwargs = {"executed": True, "baseline_artifact_id": baseline,
               "attack_artifact_id": attack, "control_artifact_ids": controls}
     # AR-08a: the policy the verdict was decided under travels on the proof itself.
     policy = getattr(result, "header_fingerprint", "") or ""
     if policy:
         kwargs["policy_fingerprint"] = policy
+    if source:
+        kwargs["evidence_source"] = source
     return kwargs
 
 
