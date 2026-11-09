@@ -347,9 +347,15 @@ def _query(value):
     return {"action": "mutate", "location": "query", "param": "q", "value": value}
 
 
+def _fresh(action):
+    """`action` applied to the captured request (edits otherwise accumulate)."""
+    return dict(action, reset=True)
+
+
 _STOP = {"action": "stop", "verdict": "not_found", "thought": "done"}
 # The four distinct requests of the measured pattern, and what the fake target says.
-_A, _B, _C, _D = _path("2"), _query("beta"), _path("3"), _query("delta")
+# Each is applied to the captured request, so a repeat rebuilds the same request.
+_A, _B, _C, _D = (_fresh(a) for a in (_path("2"), _query("beta"), _path("3"), _query("delta")))
 _BODIES = {"/api/tickets/2?q=widget": (200, "ticket two body"),
            "/api/tickets/1?q=beta": (404, "no beta"),
            "/api/tickets/3?q=widget": (403, "forbidden three"),
@@ -530,7 +536,7 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
         ex = HttpExchange(url="http://localhost:5002/api/tickets", method="POST",
                           request_headers={"Content-Type": "application/json"},
                           request_body='{"subject":"x","note":"n"}', response_status=201)
-        body = lambda p, v: {"action": "mutate", "location": "body", "param": p, "value": v}
+        body = lambda p, v: _fresh({"action": "mutate", "location": "body", "param": p, "value": v})
         with patch("harness.iterative_agent.get_default_gate", return_value=gate):
             result, net, ollama = await self._drive(
                 [body("subject", "y"), body("subject", "z"), body("note", "y"),
@@ -569,7 +575,8 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
         ex = _ticket_exchange()
         ex.url = "http://localhost:5002/api/tickets/1"
         result, net, _ = await self._drive(
-            [_path("1?role=user&role=admin"), _path("1?role=admin&role=user"), _STOP], exchange=ex)
+            [_fresh(_path("1?role=user&role=admin")), _fresh(_path("1?role=admin&role=user")), _STOP],
+            exchange=ex)
         self.assertEqual(net.urls, ["http://localhost:5002/api/tickets/1?role=user&role=admin",
                                     "http://localhost:5002/api/tickets/1?role=admin&role=user"])
         self.assertEqual((result.distinct_requests, result.duplicate_proposals), (2, 0))
