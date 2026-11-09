@@ -57,8 +57,15 @@ class ToolProxy:
     def __init__(self, run, target_url: str, *, capability: str,
                  bind_host: str = "127.0.0.1",
                  client_timeout: float | None = None,
-                 max_forwarded: int | None = None, cap_stops: bool = False):
+                 max_forwarded: int | None = None, cap_stops: bool = False,
+                 case_ref: str = ""):
         self.run = run
+        # The case the tool's sends belong to. Given, each mutating send is counted
+        # against that case's mutating ceiling (SafetyGate._reserve_mutating, under
+        # `capability`), and once the ceiling is spent nothing more is sent and the
+        # scan ends (stop_reason "mutating_ceiling"). Empty: not counted (read-only
+        # tools such as ffuf).
+        self.case_ref = case_ref
         # A caller's own share of the run budget (discovery's probe budget for
         # ffuf): past it nothing more is sent, so a 13k-line wordlist cannot spend
         # more than the sweep it stands in for.
@@ -221,11 +228,15 @@ class ToolProxy:
                 self.stop_reason = self.stop_reason or "tool_cap"
                 return 503, {}, b"harness tool proxy: not sent, the tool's request cap is reached"
             return 404, {}, b"harness tool proxy: not sent, the tool's request share is spent"
+        if self.case_ref and self._ceiling_spent(method):
+            self._refuse("mutating_ceiling")
+            self.stop_reason = self.stop_reason or "mutating_ceiling"
+            return 503, {}, b"harness tool proxy: not sent, the case's mutating ceiling is spent"
         send_headers = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 
         out = await self.run.target_transport().send_creds(
             method.upper(), url, capability=self.capability, headers=send_headers,
-            body=body, max_redirects=0)
+            body=body, case_ref=self.case_ref, max_redirects=0)
         if out.outcome in ("ok", "error"):
             self.forwarded += 1
             self.forwarded_paths.add(p.path or "/")
@@ -258,6 +269,13 @@ class ToolProxy:
         if _origin(resolved) == self.target_origin and not p.path.startswith("//"):
             return (p.path or "/") + (f"?{p.query}" if p.query else "")
         return _OFF_ORIGIN_PATH
+
+    def _ceiling_spent(self, method: str) -> bool:
+        from harness.safety_gate import ActionRiskTier
+        gate = self.run.gate
+        if gate.classify(method) != ActionRiskTier.MUTATING:
+            return False
+        return gate.mutating_headroom(self.case_ref, self.capability)[0] <= 0
 
     def _timed_out(self):
         self._refuse("client_timeout")
