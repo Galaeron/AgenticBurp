@@ -37,6 +37,11 @@ def _iter_finding(**kw):
                    suggested_test="t", basis="observed", severity="high", confirmed=True, **kw)
 
 
+def _hdr():
+    return Finding(vulnerability_class="missing_headers", confidence=0.6, summary="no HSTS",
+                   evidence="e", suggested_test="t", basis="observed", severity="low")
+
+
 class IterativeAttachTests(_ProofCallerBase, unittest.TestCase):
 
     def setUp(self):
@@ -114,6 +119,28 @@ class IterativeAttachTests(_ProofCallerBase, unittest.TestCase):
         proven, new = self._split(self._issues()[1])
         self.assertEqual(len(proven), 1)
         self.assertEqual([e["confirmed"] for e in new], [False])
+
+    def test_host_wide_class_on_another_route_is_not_attached(self):
+        """issue_key drops the route for a host-wide class (missing_headers): a
+        proof of /search must not become a /login finding's proof. Same route:
+        attached (control)."""
+        proven_row = {"url": self.exchange.url, "method": "POST", "vulnerability_class": "missing_headers",
+                      "confirmed": True, "proof_id": "p-hdr", "case_id": "c-hdr",
+                      "proof_status": "resolved", "finding_id": "f-hdr",
+                      "summary": "no HSTS", "evidence": "e", "severity": "low", "confidence": 0.9}
+        other = self.exchange.model_copy(update={"url": self.exchange.url.replace("/search", "/login")})
+        real = store.all_host_findings
+        with patch.object(store, "all_host_findings",
+                          side_effect=lambda *a, **k: real(*a, **k) + [proven_row]):
+            off = asyncio.run(pivot_memory.integrate(
+                _IterResult(findings=[_hdr()]), other, persist=True))
+            on = asyncio.run(pivot_memory.integrate(
+                _IterResult(findings=[_hdr()]), self.exchange, persist=True))
+        self.assertEqual(issues.issue_key({**proven_row}),
+                         issues.issue_key({**proven_row, "url": other.url}))  # same issue key
+        self.assertEqual(off.attached, [])
+        self.assertFalse(off.held_findings[0].proof_id)
+        self.assertEqual([a["proof_id"] for a in on.attached], ["p-hdr"])
 
     def test_control_without_attach_it_is_an_unbound_duplicate(self):
         with patch.object(pivot_memory, "attach_to_proven_issues", return_value=[]):
