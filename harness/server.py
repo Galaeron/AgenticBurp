@@ -1635,6 +1635,17 @@ async def engagement_declarations_view(host: str, base_url: str = Query(max_leng
             "owners": (saved or {}).get("owners", [])}
 
 
+@app.get("/engagement/{host}/handoff")
+async def engagement_handoff_view(host: str, authorization: str | None = Header(default=None)):
+    """HU-5: the newest run's handoff for this host (what was not tested) and the
+    target change log of every run on it. Reads run artifacts; sends nothing."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import run_handoff
+    return await asyncio.to_thread(run_handoff.latest_for_host, host,
+                                   run_handoff.output_dir_for(config))
+
+
 @app.post("/engagement/{host}/investigate")
 async def engagement_investigate(host: str, req: InvestigateRequest,
                                  authorization: str | None = Header(default=None)):
@@ -1783,6 +1794,9 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             run_context.run_journal = None
             log.warning('run journal unavailable (%s); this job is not journaled', type(exc).__name__)
     output_dir = Path(runs_cfg.get('output_dir') or Path(__file__).parent / 'run-output')
+    # HU-5: the run's handoff + change log, persisted beside the manifest as it runs.
+    from harness import run_handoff
+    run_handoff.attach(run_context, host=host, base_url=req.base_url, output_dir=output_dir)
     job: dict = {"job_id": job_id, "host": host, "base_url": req.base_url,
                  "status": "running", "task": None, "result": None, "error": None,
                  "started_at": _time.time(), "finished_at": None,
@@ -1827,6 +1841,7 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                             headers={'Retry-After': '5'}) from None
 
     def _finish_manifest(status, *, result=None, error=None):
+        run_handoff.finish(run_context, status, result)
         try:
             manifest.finish(status, result=security.sanitize_data(result), error=error)
         except Exception as exc:

@@ -810,6 +810,7 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     suppressed_count = len(all_including_suppressed) - len(findings)
     host = store.host_of(url)
     reporting = (config or {}).get("reporting") or {}
+    from harness import run_handoff
     return generate_markdown_report(
         host, findings, effort_ledger=effort_ledger, suppressed_count=suppressed_count,
         quarantine_leads=bool(reporting.get("quarantine_unverified_leads", False)),
@@ -818,7 +819,7 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
         gate_uncorroborated_catchall=bool(reporting.get("gate_uncorroborated_catchall", False)),
         engagement_id=engagement_id,
         captured_principal=captured_principal,
-    )
+    ) + run_handoff.report_section(host, config)  # HU-5; "" unless reporting.handoff_section
 
 
 def issue_exports(findings: list[dict], proofs_by_case: dict | None = None,
