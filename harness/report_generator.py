@@ -720,14 +720,11 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
         lines.append("```")
         lines.append("")
     # Weakness #5: keep the reproduction field ACTUAL reproduction, not remediation.
-    if suggested_test and not _looks_like_remediation(suggested_test):
-        lines.append(f"**Steps to reproduce:** {suggested_test}")
-        lines.append("")
-    elif evidence:
-        lines.append("**Steps to reproduce:** replay the exact captured request/response shown in the "
-                     "Evidence block above, as the identity/session it was captured under, and compare "
-                     "the actual result against a secure baseline.")
-        lines.append("")
+    # HU-2 (c): the ledger's reproduction recipe when it recorded a send, else an
+    # explicit "no reproducible request recorded" -- never a generic replay hint.
+    from harness import leads
+    lines.extend(leads.report_repro_lines(
+        f.finding_id, suggested_test if suggested_test and not _looks_like_remediation(suggested_test) else ""))
     # A remediation-shaped suggested_test is surfaced as a fix note, never as repro.
     if suggested_test and _looks_like_remediation(suggested_test):
         lines.append(f"**Fix note (from the detector):** {suggested_test}")
