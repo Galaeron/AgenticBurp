@@ -909,4 +909,7 @@ def export_issues_for_host(url: str, *, config: dict | None = None, engagement_i
                 proofs_by_case[cid] = attempts
     # Legacy host-wide overrides have no engagement authority.
     merges = store.all_issue_merges(store.host_of(url)) if not engagement_id else {}
-    return issue_exports(findings, proofs_by_case=proofs_by_case, merges=merges)
+    from harness import writeups   # HU-6: no-op unless writeups.export_markdown is on
+    return writeups.attach_to_exports(issue_exports(findings, proofs_by_case=proofs_by_case, merges=merges),
+                                      proofs_by_case, config=config, engagement_id=engagement_id,
+                                      captured_principal=captured_principal)

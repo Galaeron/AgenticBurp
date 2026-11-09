@@ -967,6 +967,17 @@ access_matrix:
 app_map:
   report_section: false
 
+# HU-6: draft write-ups for proof-bound issues only (harness/writeups.py): impact,
+# redacted proof request/response, reproduction steps and remediation, all bound to
+# the recorded proof. export_markdown attaches one Markdown write-up per issue to the
+# issue export (export_issues_for_host); off = the export is unchanged.
+# model_phrasing lets the loopback model rephrase two sentences; a draft naming
+# anything absent from the proof falls back to the template. Both SHIPPED OFF.
+writeups:
+  export_markdown: false
+  model_phrasing: false
+  model: ""   # "" = agent_defaults.model
+
 # Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
 # off. When enabled, a CONFIRMED finding's host-agnostic structural shape
 # (method + normalized path template + sorted parameter NAMES -- never a
