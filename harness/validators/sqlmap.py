@@ -33,7 +33,8 @@ from harness.safety_gate import get_default_gate
 _PROXY_STOP_WHY = {"budget_exhausted": "the run's request budget ran out",
                    "session_expired": "the identity's session expired during the scan",
                    "route_unavailable": "the route answered 5xx to every request and was paused",
-                   "tool_cap": "the per-scan request cap was reached"}
+                   "tool_cap": "the per-scan request cap was reached",
+                   "mutating_ceiling": "the case's mutating-request ceiling was reached"}
 
 # Create endpoints get a light sqlmap (owner decision, #28): every request sqlmap
 # sends to one may create an object (the 8h juice-shop run: one sqlmap scan sent
@@ -42,11 +43,23 @@ _PROXY_STOP_WHY = {"budget_exhausted": "the run's request budget ran out",
 # hard per-endpoint request cap enforced by the run's tool proxy.
 LIGHT_TECHNIQUES = "BE"
 DEFAULT_CREATE_ENDPOINT_MAX_REQUESTS = 200
-# PUT/PATCH/DELETE get the same light scan with a much tighter cap (r6: a full
-# scan spent 2-3k requests on each of ~10 write endpoints). Every request may
-# change or delete state, so the harness also never replays one to reproduce a hit.
+# PUT/PATCH get the same light scan with a much tighter cap (r6: a full scan spent
+# 2-3k requests on each of ~10 write endpoints), counted against the case's
+# mutating ceiling. Every request may change state, so the harness also never
+# replays one to reproduce a hit. DELETE is not scanned at all (no restore).
 WRITE_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 WRITE_ENDPOINT_MAX_REQUESTS = 20
+# DELETE is never scanned: there is no restore for a deleted object, and every
+# sqlmap request to it may delete one.
+NO_SCAN_WRITE_METHODS = frozenset({"DELETE"})
+# The capabilities a write scan and a harness reproduction send under. A mutating
+# send is counted against the case's mutating ceiling under that name
+# (validators.mutating_ceiling_by_check, else max_mutating_requests_per_finding,
+# both capped at the gate's hard ceiling).
+_TOOL_CAPABILITY = "sqlmap_tool"
+_TECHNIQUE_PROBE_CAPABILITY = "sqlmap_technique_probe"
+_ERROR_PROBE_SENDS = 5          # baseline, breaking x2, control x2
+_UNION_PROBE_MIN_SENDS = 4      # baseline, echo control, one UNION and its repeat
 _ID_KEYS = ("id", "_id", "uuid", "guid")
 _ID_SEGMENT = re.compile(
     r"^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{24})$", re.I)
@@ -301,6 +314,45 @@ def _looks_like_db_error(resp: httpx.Response) -> bool:
     except Exception:
         return False
     return _text_has_db_error_markers(text)
+
+
+# A DB *parser* rejecting the statement, as opposed to the generic driver/ORM or
+# type-conversion text in _DB_ERROR_MARKERS ("sequelize", "sqlstate", "npgsql",
+# Postgres's "invalid input syntax for type integer"): a parameterized query that
+# rejects a non-numeric value answers those too. Only these confirm an error-based
+# point, so the breaking value must have reached SQL text.
+_DB_SYNTAX_ERROR_MARKERS = (
+    "syntax error", "sql syntax", "incorrect syntax near", "unclosed quotation mark",
+    "unrecognized token", "unterminated quoted string", "unterminated string",
+    "quoted string not properly terminated", "ora-01756", "ora-00933", "ora-00907",
+    "pg::syntaxerror",
+)
+
+
+def _looks_like_db_syntax_error(resp: httpx.Response) -> bool:
+    try:
+        lowered = resp.text.lower()
+    except Exception:
+        return False
+    return any(marker in lowered for marker in _DB_SYNTAX_ERROR_MARKERS)
+
+
+_NUMBER = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _error_probe_values(original: str, quote: str) -> tuple[str, str] | None:
+    """(breaking, control) for an error-based reproduction, or None.
+
+    The control is well formed and NOT the original value, so it exercises the same
+    path as the breaking value: in a quoted context the quote doubled, in a numeric
+    one the number minus zero (a parameterized integer field rejects "5-0" exactly as
+    it rejects "5'"; SQL text evaluates it to the original). A numeric context with a
+    non-numeric value has no such control."""
+    if quote:
+        return original + quote, original + quote * 2
+    if not _NUMBER.match(original):
+        return None
+    return original + "'", original + "-0"
 
 
 # Credential field names and auth-shaped path segments. Used ONLY to recognise an
@@ -725,9 +777,31 @@ class SqlmapValidator(Validator):
                                     summary=f"sqlmap not launched: {refusal}")
         _cancel = run.cancel if run is not None else None
         write_endpoint = exchange.method.upper() in WRITE_METHODS
+        write_case = ""
+        if exchange.method.upper() in NO_SCAN_WRITE_METHODS:
+            why = (f"{exchange.method.upper()} {urlsplit(exchange.url).path} is not scanned: "
+                   "every sqlmap request may delete an object and a deletion has no restore")
+            return ValidationResult(self.name, "skipped", finding.vulnerability_class,
+                                    summary=f"sqlmap not launched: {why}",
+                                    limitation=f"skipped: {why}; not a negative result")
         if write_endpoint:
             create_reason = f"write endpoint: {exchange.method.upper()} {urlsplit(exchange.url).path}"
             cap = min(self.create_endpoint_max_requests, WRITE_ENDPOINT_MAX_REQUESTS)
+            if run is not None:
+                # Every proxied write is counted against the case's mutating ceiling,
+                # so the scan's cap is also what that ceiling has left.
+                from harness.run_context import current_case_ref
+                write_case = finding.finding_id or current_case_ref()
+                left = (run.gate.mutating_headroom(write_case, _TOOL_CAPABILITY)[0]
+                        if write_case else 0)
+                if left <= 0:
+                    why = ("the case's mutating-request ceiling is spent" if write_case
+                           else "no case reference to count its writes against")
+                    return ValidationResult(
+                        self.name, "skipped", finding.vulnerability_class,
+                        summary=f"sqlmap not launched on {create_reason}: {why}",
+                        limitation=f"skipped: {why}; not a negative result")
+                cap = min(cap, left)
         else:
             create = create_endpoint_reason(exchange)
             create_reason = f"create endpoint: {create}" if create else ""
@@ -884,7 +958,8 @@ class SqlmapValidator(Validator):
             launch_cmd = cmd
             if run is not None:
                 from harness.tool_proxy import ToolProxy
-                proxy = await ToolProxy(run, exchange.url, capability="sqlmap_tool",
+                proxy = await ToolProxy(run, exchange.url, capability=_TOOL_CAPABILITY,
+                                        case_ref=write_case,
                                         **({"max_forwarded": cap, "cap_stops": True}
                                            if create_reason else {})).start()
                 light["proxy"] = proxy
@@ -1127,10 +1202,12 @@ class SqlmapValidator(Validator):
         injection context (the characters that close the value, e.g. ' or ') and,
         for UNION, the column count; it is never sent.
 
-        error: a breaking value (an unbalanced quote) and a balanced control (the
-          quote doubled; in a numeric context, the original value), each sent twice.
-          Confirmed only when a DB-specific error signature answers both breaking
-          sends and neither control nor the baseline. A generic 500 is no signature.
+        error: a breaking value (an unbalanced quote) and a well-formed control that
+          is not the original value (the quote doubled; in a numeric context the
+          number minus zero), each sent twice. Confirmed only when a DB *syntax* error
+          signature answers both breaking sends and no DB error answers either control
+          or the baseline. A generic 500, or a driver/ORM type-conversion message that
+          a parameterized query also gives, is no signature.
         union: one UNION SELECT per column carrying a fresh marker in that column.
           Confirmed when the marker comes back as a JSON value on two sends and an
           echo control (the marker sent as the plain value) does not return it.
@@ -1157,6 +1234,26 @@ class SqlmapValidator(Validator):
         if boundary is None:
             return None
         quote = "'" if "'" in boundary else '"' if '"' in boundary else ""
+        values_for_error = _error_probe_values(original, quote) if technique == "error" else None
+        if technique == "error" and values_for_error is None:
+            return None
+
+        # A mutating reproduction (a POST; writes never get here) counts against the
+        # case's mutating ceiling (SafetyGate._reserve_mutating, keyed by the case).
+        # Without the whole minimum sequence's headroom nothing is sent; a refusal
+        # part-way is a transport refusal below (the tool-reported lead stays).
+        case_key = ""
+        if self.run_context is not None:
+            from harness.run_context import current_case_ref
+            from harness.safety_gate import ActionRiskTier
+            case_key = finding.finding_id or current_case_ref()
+            gate = self.run_context.gate
+            if gate.classify(method) == ActionRiskTier.MUTATING:
+                if not case_key:
+                    return None
+                needed = _ERROR_PROBE_SENDS if technique == "error" else _UNION_PROBE_MIN_SENDS
+                if gate.mutating_headroom(case_key, _TECHNIQUE_PROBE_CAPABILITY)[0] < needed:
+                    return None
 
         headers = {k: v for k, v in exchange.request_headers.items()
                    if k.lower() not in {"host", "content-length"}}
@@ -1180,7 +1277,8 @@ class SqlmapValidator(Validator):
                 session, request_headers = bind_session(self.run_context, headers)
                 answer = await self.run_context.executor().execute(
                     TypedRequest(method, url, headers=request_headers, body=probe_body or None),
-                    capability="sqlmap_technique_probe", session_ref=session)
+                    capability=_TECHNIQUE_PROBE_CAPABILITY, session_ref=session,
+                    case_ref=case_key)
                 if not answer.ok:
                     raise httpx.TransportError(answer.error or answer.outcome)
                 return answer.to_httpx_response(method, url)
@@ -1192,22 +1290,23 @@ class SqlmapValidator(Validator):
         label = _point_label(point)
         try:
             baseline = await send()
-            if baseline.status_code >= 500 or _looks_like_db_error(baseline):
+            if (baseline.status_code >= 500 or _looks_like_db_error(baseline)
+                    or _looks_like_db_syntax_error(baseline)):
                 return None
             if technique == "error":
-                breaking = original + (quote or "'")
-                balanced = original + quote * 2 if quote else original
+                breaking, balanced = values_for_error
                 attack = await send(breaking)
                 control = await send(balanced)
                 repeat_control = await send(balanced)
                 repeat_attack = await send(breaking)
-                if not (_looks_like_db_error(attack) and _looks_like_db_error(repeat_attack)
-                        and not _looks_like_db_error(control)
-                        and not _looks_like_db_error(repeat_control)
+                if not (_looks_like_db_syntax_error(attack)
+                        and _looks_like_db_syntax_error(repeat_attack)
+                        and not any(_looks_like_db_error(r) or _looks_like_db_syntax_error(r)
+                                    for r in (control, repeat_control))
                         and control.status_code < 500 and repeat_control.status_code < 500):
                     return None
-                evidence = (f"{label}: breaking value {breaking!r} answered a DB error signature "
-                            f"(HTTP {attack.status_code}) on both sends; the balanced control "
+                evidence = (f"{label}: breaking value {breaking!r} answered a DB syntax error "
+                            f"signature (HTTP {attack.status_code}) on both sends; the control "
                             f"{balanced!r} (HTTP {control.status_code}) and the baseline did not")
             else:
                 columns = _union_column_count(point.get("payload", ""))
