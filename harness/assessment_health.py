@@ -11,6 +11,9 @@ from harness.models import HttpExchange
 
 # E1 review tiers, highest priority first. `review_stats.by_tier` uses these names.
 TIER_NAMES = ("authenticated_api", "anonymous_api", "other_non_html", "html")
+# review_frontier: of every TIER_SHARE_PERIOD picks, the last goes to a lower tier
+# (in turn) and the rest to the highest non-empty tier. See review_frontier.
+TIER_SHARE_PERIOD = 4
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # Response headers that carry the security posture (E1). Access-Control-Allow-* is
 # matched by prefix and Set-Cookie is reduced to its cookie names (values are
@@ -137,8 +140,15 @@ def observation_key(ex) -> str:
 def review_frontier(captured, *, seen=None, group_identical: bool = False, on_grouped=None):
     """Deduplicate exact observations, then order what is left for review.
 
-    Order (E1): tier first -- authenticated JSON/API or write, anonymous JSON/API
-    or write, other non-HTML, HTML (see capture_tier) -- and inside a tier the
+    Order (E1): by tier -- authenticated JSON/API or write, anonymous JSON/API
+    or write, other non-HTML, HTML (see capture_tier) -- interleaved so that no
+    tier starves (r5: all 71 reviews went to tier 0 and 365 captures were never
+    reached). The highest non-empty tier (tier 0 while it lasts) takes the first
+    TIER_SHARE_PERIOD - 1 picks of every TIER_SHARE_PERIOD; the remaining pick goes
+    to the lower non-empty tiers in turn. With TIER_SHARE_PERIOD = 4 and all four
+    tiers non-empty, tier 0 gets 3 of every 4 reviews and each lower tier at least
+    one in every window of N = 4 * 3 = 12 consecutive picks (fewer non-empty lower
+    tiers make the window shorter). The order is deterministic. Inside a tier the
     identity + first-path-segment families take turns, and inside a family the
     individual routes do, so polling on one route or one route family cannot
     consume the review budget before another gets its first review. Nothing is
@@ -180,29 +190,42 @@ def review_frontier(captured, *, seen=None, group_identical: bool = False, on_gr
         group = (ex.method, parts.netloc, parts.path, _identity(ex))
         tiers.setdefault(capture_tier(ex), {}).setdefault(_route_family(ex), {}) \
             .setdefault(group, deque()).append((key, ex))
-    for tier in sorted(tiers):
+    picks = 0
+    last_lower = -1
+    while tiers:
+        live = sorted(tiers)
+        primary, lower = live[0], live[1:]
+        if lower and picks % TIER_SHARE_PERIOD == TIER_SHARE_PERIOD - 1:
+            # The lower-tier slot: the next non-empty lower tier after the last one
+            # served, wrapping round, so the lower tiers take turns.
+            tier = next((t for t in lower if t > last_lower), lower[0])
+            last_lower = tier
+        else:
+            tier = primary
         families = tiers[tier]
-        while families:
-            # Popping and re-inserting moves a family/group to the back of its
-            # insertion-ordered dict: that is the round-robin.
-            family = next(iter(families))
-            groups = families.pop(family)
-            group = next(iter(groups))
-            queue = groups.pop(group)
-            key, ex = queue.popleft()
-            if queue:
-                groups[group] = queue
-            if groups:
-                families[family] = groups
-            if key in seen:
-                continue
-            seen.add(key)
-            for member_key, member in followers.get(key, ()):
-                if member_key not in seen:
-                    seen.add(member_key)
-                    if on_grouped is not None:
-                        on_grouped(member, ex)
-            yield ex
+        # Popping and re-inserting moves a family/group to the back of its
+        # insertion-ordered dict: that is the round-robin.
+        family = next(iter(families))
+        groups = families.pop(family)
+        group = next(iter(groups))
+        queue = groups.pop(group)
+        key, ex = queue.popleft()
+        if queue:
+            groups[group] = queue
+        if groups:
+            families[family] = groups
+        if not families:
+            del tiers[tier]
+        if key in seen:
+            continue      # the slot is not used up: the same turn picks again
+        picks += 1
+        seen.add(key)
+        for member_key, member in followers.get(key, ()):
+            if member_key not in seen:
+                seen.add(member_key)
+                if on_grouped is not None:
+                    on_grouped(member, ex)
+        yield ex
 
 
 def assessment_health(coverage, errors=(), *, stopped_on_confirmation=False):

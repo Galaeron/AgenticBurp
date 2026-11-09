@@ -61,6 +61,10 @@ def reviewed_urls(orch) -> list[str]:
     return [call.args[0].url for call in orch.analyze.await_args_list]
 
 
+def orch_calls(orch) -> list:
+    return [call.args[0] for call in orch.analyze.await_args_list]
+
+
 async def review(captured, **kwargs):
     orch, state = fake_orch()
     stats: dict = {}
@@ -99,11 +103,45 @@ class PriorityOrderTests(unittest.IsolatedAsyncioTestCase):
         auth_write = cap("/profile", method="PUT", auth="tok", body="<html>saved</html>", request_body="a=1")
         orch, stats, _ = await review([html, text, anon_json, anon_write, auth_json, auth_write])
         urls = reviewed_urls(orch)
-        self.assertEqual(urls[:2], [auth_json.url, auth_write.url])         # (a) authenticated API / write
-        self.assertEqual(urls[2:4], [anon_json.url, anon_write.url])        # (b) anonymous API / write
-        self.assertEqual(urls[4:], [text.url, html.url])                    # (c) other non-HTML, (d) HTML
+        # (a) authenticated API / write, then (b) anonymous API / write as the highest
+        # tier left; every 4th pick is the lower-tier slot, so (c) other non-HTML
+        # takes pick 4 between the two anonymous captures, then (d) HTML.
+        self.assertEqual(urls, [auth_json.url, auth_write.url, anon_json.url, text.url,
+                                anon_write.url, html.url])
         self.assertEqual(stats["by_tier"], {"authenticated_api": 2, "anonymous_api": 2,
                                             "other_non_html": 1, "html": 1})
+
+    async def _check_every_tier_gets_a_share_within_the_window(self):
+        # 20 captures in each tier, reviews bounded to one window of N picks.
+        captured = ([cap(f"/page{i}", body=f"<html>page {i}</html>") for i in range(20)]
+                    + [cap(f"/asset{i}.txt", ctype="text/plain", body=f"t{i}") for i in range(20)]
+                    + [json_cap(f"/api/Public{i}") for i in range(20)]
+                    + [json_cap(f"/rest/private{i}", auth="tok") for i in range(20)])
+        window = assessment_health.TIER_SHARE_PERIOD * 3
+        self.assertEqual(window, 12)
+        orch, stats, _ = await review(captured, max_reviews=window)
+        tiers = [assessment_health.capture_tier(c) for c in orch_calls(orch)]
+        self.assertEqual(tiers[0], 0)                                   # tier 0 still first
+        self.assertEqual(set(tiers), {0, 1, 2, 3})                      # every tier reviewed
+        self.assertEqual(stats["by_tier"], {"authenticated_api": 9, "anonymous_api": 1,
+                                            "other_non_html": 1, "html": 1})
+        self.assertEqual(stats["unreviewed"], len(captured) - window)
+
+    async def test_every_non_empty_tier_is_reviewed_within_one_window(self):
+        await self._check_every_tier_gets_a_share_within_the_window()
+
+    async def test_control_strict_tier_order_starves_the_lower_tiers(self):
+        # The r5 shape: with no lower-tier slot, tier 0 takes the whole budget.
+        with patch.object(assessment_health, "TIER_SHARE_PERIOD", 10 ** 9):
+            with self.assertRaises(AssertionError):
+                await self._check_every_tier_gets_a_share_within_the_window()
+
+    async def test_an_empty_tier_gives_its_turn_to_the_next_lower_tier(self):
+        captured = ([json_cap(f"/rest/private{i}", auth="tok") for i in range(10)]
+                    + [cap(f"/page{i}", body=f"<html>page {i}</html>") for i in range(10)])
+        orch, _, _ = await review(captured, max_reviews=8)
+        tiers = [assessment_health.capture_tier(c) for c in orch_calls(orch)]
+        self.assertEqual(tiers, [0, 0, 0, 3, 0, 0, 0, 3])
 
     async def test_prioritisation_drops_nothing_and_is_deterministic(self):
         captured = [cap(f"/p{i}", body=f"<html>{i}</html>") for i in range(4)] + [
