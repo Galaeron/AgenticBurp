@@ -45,6 +45,14 @@ from harness.safety_gate import get_default_gate, reset_default_gate
 
 log = logging.getLogger(__name__)
 
+# Validators that mutate an HTTP parameter or body (injection) or replay a
+# state-changing request (CSRF): not run on an Engine.IO long-polling request
+# (volatile_params.is_polling_transport). Matches planner.POLLING_EXCLUDED_CAPABILITIES.
+POLLING_EXCLUDED_VALIDATORS = frozenset({
+    "sqlmap", "nosql", "command_injection", "ssti", "xxe", "header_injection_validator",
+    "path_traversal", "open_redirect", "stored_xss", "csrf",
+})
+
 
 class ValidatorRegistry:
     def __init__(self, config: dict):
@@ -584,6 +592,13 @@ class ValidatorRegistry:
                 v.applies(c, exchange) for c in candidates)
 
         matched = [v for v in self.validators.values() if _applies(v)]
+        # An Engine.IO long-polling request's query and body are transport
+        # framing: an injection or CSRF leg against it tests nothing and cost
+        # thousands of requests per run. Websocket and passive legs still apply.
+        from harness.volatile_params import is_polling_transport
+        if is_polling_transport(getattr(exchange, "url", "") or ""):
+            matched = [v for v in matched
+                       if getattr(v, "name", "") not in POLLING_EXCLUDED_VALIDATORS]
         # W-12: within an active, scoped engagement, auto-arm cross-identity for
         # applicable object-scoped requests when registered identities exist for
         # the host -- no separate cross_identity.enabled opt-in required.

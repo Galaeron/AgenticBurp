@@ -12,7 +12,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import httpx
 
 from harness.models import Finding, HttpExchange, TestPlan
-from harness.planner import exchange_fingerprint
+from harness.planner import exchange_fingerprint, plan_key_fingerprint
 from harness.categories import canonicalize
 from .base import TOOL_REPORTED, Validator, ValidationResult
 from harness.safety_gate import get_default_gate
@@ -509,7 +509,9 @@ class SqlmapValidator(Validator):
         if not self.applies(finding, exchange):
             return None
         return TestPlan(
-            id=f"sqlmap:{finding.vulnerability_class}:{exchange_fingerprint(exchange)[:20]}",
+            # The id ignores cache-buster parameters (planner.plan_key_fingerprint);
+            # the binding below stays the exact capture.
+            id=f"sqlmap:{finding.vulnerability_class}:{plan_key_fingerprint(exchange)[:20]}",
             capability="sql_injection_validation",
             finding_class=finding.vulnerability_class,
             category=canonicalize(finding.vulnerability_class) or "sqli",

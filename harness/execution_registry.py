@@ -40,6 +40,7 @@ from urllib.parse import parse_qsl, urlsplit
 from harness.categories import canonicalize
 from harness.engagement import capture_identity_key, normalize_path
 from harness.orchestrator_helpers import _identity_signature, confirmation_cache_key
+from harness.volatile_params import stable_url
 
 # Validators whose verdict depends on the request shape, not on a particular value.
 SHAPE_KEYED = frozenset({
@@ -134,7 +135,8 @@ def _base_key(validator_name: str, exchange, finding_class: str | None) -> tuple
             identity, hashlib.sha256(response.encode("utf-8", errors="replace")).hexdigest())
     if validator_name not in SHAPE_KEYED:
         return confirmation_cache_key(validator_name, exchange, finding_class) + (identity,)
-    parts = urlsplit(exchange.url or "")
+    # A cache-buster parameter present on one capture only is not a new shape.
+    parts = urlsplit(stable_url(exchange.url or ""))
     raw_class = (finding_class or "").strip().lower()
     return (validator_name, (exchange.method or "GET").upper(), parts.netloc.lower(),
             normalize_path(exchange.url or ""),
