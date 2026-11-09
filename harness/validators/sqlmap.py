@@ -14,7 +14,7 @@ import httpx
 from harness.models import Finding, HttpExchange, TestPlan
 from harness.planner import exchange_fingerprint
 from harness.categories import canonicalize
-from .base import Validator, ValidationResult
+from .base import TOOL_REPORTED, Validator, ValidationResult
 from harness.safety_gate import get_default_gate
 
 # General-purpose parameter enumeration/mutation for the boolean-probe
@@ -996,6 +996,7 @@ class SqlmapValidator(Validator):
                 baseline=repro.baseline_artifact_id, attack=repro.attack_artifact_id,
                 controls=repro.control_artifact_ids)
         result.summary = "tool-reported, not reproduced by the harness: " + result.summary
+        result.evidence_source = TOOL_REPORTED
         return result
 
     # Cap on how many parameters this fallback probes per exchange -- this

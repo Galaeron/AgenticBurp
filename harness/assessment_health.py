@@ -257,8 +257,11 @@ def confirmed_issue_inventory(findings, run_id, proof_lookup):
         case_id, proof_id = finding.get("case_id"), finding.get("proof_id")
         if not finding.get("confirmed") or not case_id or not proof_id:
             continue
+        # A tool-reported proof (an external tool's unreproduced detection) is not
+        # a harness confirmation; it is accounted on its own (confirmed_issue_accounting).
         if any(p.get("proof_id") == proof_id and (p.get("case") or {}).get("case_id") == case_id
                and (p.get("case") or {}).get("run_id") == run_id and p.get("verdict") == "confirmed"
+               and not is_tool_reported(p)
                for p in proof_lookup(case_id)):
             proven[case_id] = {k: finding.get(k) for k in
                               ("finding_id", "case_id", "proof_id", "url", "vulnerability_class")}
@@ -293,6 +296,7 @@ def stored_proof_artifacts_resolve(proof):
 # policy fingerprint on several routes is one issue with several locations. AR-08b:
 # one set, shared with the report path's issue key (issues.py).
 from harness.issues import ROUTE_INDEPENDENT_MECHANISMS  # noqa: E402
+from harness.evidence import is_tool_reported  # noqa: E402
 _ORPHAN_REASONS = {'proof not found for case', 'proof belongs to another run', 'proof belongs to another case'}
 
 
@@ -345,7 +349,7 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             continue
         excluded.append({'case_id': case_id, 'proof_id': proof_id, 'reason': reason})
 
-    instances, groups, counted_cases = [], {}, set()
+    instances, groups, counted_cases, tool_reported_cases = [], {}, set(), set()
     # A reused result carries the original attempt's artifacts; it is a reference,
     # never a second execution (batch 08).
     first_attempt = {}
@@ -369,7 +373,11 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         structured = bool(proof.get('executed') and not proof.get('legacy', True)
                           and len(set(refs)) >= 3 and all(refs))
         resolved = bool(structured and artifact_resolver and artifact_resolver(proof))
-        kind = claimed if claimed != 'vulnerability' or resolved else 'candidate'
+        # An external tool's detection the harness did not reproduce is its own tier:
+        # never confirmed, never proof-bound, never folded into the generic candidates.
+        tool_reported = is_tool_reported(proof)
+        kind = ('tool_reported' if tool_reported
+                else claimed if claimed != 'vulnerability' or resolved else 'candidate')
         reason = (None if finding else 'not referenced by a confirmed finding')
         instance = {key: proof.get(key) for key in ('proof_id', 'validator', 'verdict', 'executed', 'legacy',
                     'baseline_artifact_id', 'attack_artifact_id', 'control_artifact_ids')}
@@ -380,7 +388,11 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         if original and original != proof_id:
             instance['reuses_attempt_of'] = original
         if finding:
-            counted_cases.add(case['case_id'])
+            if tool_reported:
+                tool_reported_cases.add(case['case_id'])
+                instance['limitation'] = 'reported by an external tool; the harness did not reproduce it'
+            else:
+                counted_cases.add(case['case_id'])
             parts = urlsplit(finding.get('url') or '')
             origin = f'{parts.scheme}://{parts.hostname or ""}'
             if parts.port:
@@ -418,21 +430,26 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         instances.append(instance)
     counts = {kind: sum(g['kind'] == kind for g in groups.values())
               for kind in ('vulnerability', 'hardening', 'reconnaissance')}
-    ledger_confirmed = [p for p in instances if p['verdict'] == 'confirmed']
+    ledger_confirmed = [p for p in instances if p['verdict'] == 'confirmed' and p['kind'] != 'tool_reported']
     orphans = [dict(e, repair='re-link the finding to a stored proof of this case and run, or re-run '
                               'its check; the link is not shown as proof') for e in excluded
                if e['reason'] in _ORPHAN_REASONS]
     return {'schema_version': 1, 'run_id': run_id,
             'units': {'confirmed_issues': 'unique proof-bound cases (compatibility count)',
                       'vulnerabilities': 'distinct structured, artifact-resolved vulnerability groups',
-                      'observations': 'presentation groups retaining route/principal proof instances'},
+                      'observations': 'presentation groups retaining route/principal proof instances',
+                      'tool_reported': 'cases whose only proof is an external tool detection the harness '
+                                       'did not reproduce (neither confirmed nor a generic candidate)'},
             'counts': {'proof_bound_cases': len(counted_cases),
                        'ledger_confirmed_proof_instances': len(ledger_confirmed),
                        'unreferenced_confirmed_proof_instances': sum(not p['referenced'] for p in ledger_confirmed),
                        'vulnerabilities': counts['vulnerability'],
                        'hardening_observations': counts['hardening'],
                        'reconnaissance': counts['reconnaissance'],
-                       'candidate_cases': len(candidate_cases), 'excluded_records': len(excluded),
+                       'candidate_cases': len(candidate_cases - tool_reported_cases),
+                       'tool_reported_cases': len(tool_reported_cases),
+                       'tool_reported_issues': sum(g['kind'] == 'tool_reported' for g in groups.values()),
+                       'excluded_records': len(excluded),
                        'executed_attempts': len(set(first_attempt.values())),
                        'reused_proof_references': sum(bool(p.get('reuses_attempt_of')) for p in instances),
                        'orphaned_proof_links': len(orphans)},
