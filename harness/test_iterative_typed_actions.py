@@ -206,6 +206,17 @@ class StringOnlyControlTests(_LoopBase):
                           self._get("/api/tickets/1"))
         self.assertEqual([s[1] for s in self.app.seen], ["/api/tickets/2", "/api/tickets/3"])
 
+    async def test_path_swap_names_the_captured_segment_after_a_colliding_swap(self):
+        """After /users/1/orders/2 -> /users/2/orders/2, a swap of "2" means the
+        captured orders id (the prompt's contract), not the users segment that an
+        earlier step happened to set to 2. A value only the current path holds
+        is still swapped in place."""
+        await self._drive([_mutate("path", "1", "2"), _mutate("path", "2", "9"),
+                           _mutate("path", "9", "5")],
+                          self._get("/api/users/1/orders/2"))
+        self.assertEqual([s[1] for s in self.app.seen],
+                         ["/api/users/2/orders/2", "/api/users/2/orders/9", "/api/users/2/orders/5"])
+
 
 if __name__ == "__main__":
     unittest.main()

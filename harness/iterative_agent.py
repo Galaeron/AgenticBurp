@@ -581,8 +581,12 @@ class IterativeAgent:
             return None, (f"{where} takes a string value, got {_json_type(value)}; typed values "
                           "(number, boolean, null, object, array) are only for a JSON body")
         if loc == "path":
-            new_url = (_mutate_path_segment(url, param, value)
-                       or _mutate_path_at_captured(url, exchange.url, param, value))
+            # `param` names a CAPTURED id segment (prompt): swap it at its captured
+            # position first, so after /users/1/orders/2 -> /users/2/orders/2 a
+            # swap of "2" still means the orders id. A value only the current
+            # path holds (an id an earlier step swapped in) is swapped in place.
+            new_url = (_mutate_path_at_captured(url, exchange.url, param, value)
+                       or _mutate_path_segment(url, param, value))
             if new_url is None:
                 return None, f"path segment {param!r} not present on the captured request path"
             return (method, new_url, headers, body), None
