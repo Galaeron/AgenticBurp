@@ -1741,6 +1741,25 @@ async def engagement_handoff_view(host: str, authorization: str | None = Header(
                                    run_handoff.output_dir_for(config))
 
 
+@app.get("/engagement/{host}/writeups")
+async def engagement_writeups(host: str, authorization: str | None = Header(default=None),
+                              engagement_id: str = Query(default="", max_length=128),
+                              captured_principal_id: str | None = Query(default=None, max_length=128)):
+    """HU-6: one Markdown write-up per proof-bound issue (harness/writeups.py), drawn
+    only from the recorded proof. Empty unless writeups.export_markdown is on. Sends nothing."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import report_generator, writeups
+    url = host if "//" in host else f"http://{host}/"
+    enabled = writeups.settings(config)["export_markdown"]
+    exports = (await asyncio.to_thread(report_generator.export_issues_for_host, url, config=config,
+                                       engagement_id=engagement_id,
+                                       captured_principal=captured_principal_id)) if enabled else []
+    items = [{"issue_id": e.get("issue_id"), **e["writeup"]} for e in exports if e.get("writeup")]
+    return {"host": host, "engagement_id": engagement_id, "enabled": enabled, "sends_traffic": False,
+            "writeup_count": len(items), "writeups": items}
+
+
 @app.post("/engagement/{host}/investigate")
 async def engagement_investigate(host: str, req: InvestigateRequest,
                                  authorization: str | None = Header(default=None)):
