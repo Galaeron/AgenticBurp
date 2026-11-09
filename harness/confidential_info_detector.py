@@ -29,6 +29,7 @@ Runs on the RESPONSE (body + headers): this is about what the application
 GAVE BACK, not what the tester sent.
 """
 from __future__ import annotations
+import json
 import re
 from dataclasses import dataclass
 
@@ -42,10 +43,14 @@ class _Pattern:
     severity: str        # info | low | medium | high | critical
     rx: re.Pattern
     luhn: bool = False   # validate the match with the Luhn checksum (card numbers)
+    # The match is driven by a FIELD NAME (e.g. "password": ...), not by a value
+    # shape. Group 1 is the value. Such a match reaches high confidence only when
+    # that value is itself shaped like a secret (see _secret_shaped).
+    name_keyed: bool = False
 
 
-def _p(name, category, severity, pattern, flags=0, luhn=False) -> _Pattern:
-    return _Pattern(name, category, severity, re.compile(pattern, flags), luhn)
+def _p(name, category, severity, pattern, flags=0, luhn=False, name_keyed=False) -> _Pattern:
+    return _Pattern(name, category, severity, re.compile(pattern, flags), luhn, name_keyed)
 
 
 # High-signal secret shapes. Ordered roughly most- to least-severe; the scan
@@ -67,7 +72,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _p("Basic-auth credentials in URL", "secret", "high",
        r"(?i)\bhttps?://[^:\s/]+:[^@\s/]+@"),
     _p("Password field in body", "secret", "medium",
-       r"(?i)[\"']?passw(?:or)?d[\"']?\s*[:=]\s*[\"'][^\"'\s]{3,}[\"']"),
+       r"(?i)[\"']?passw(?:or)?d[\"']?\s*[:=]\s*[\"']([^\"'\s]{3,})[\"']", name_keyed=True),
     # PII
     _p("Credit-card number", "pii", "high", r"\b(?:\d[ -]?){13,19}\b", luhn=True),
     _p("US SSN", "pii", "high", r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"),
@@ -83,6 +88,78 @@ _PATTERNS: tuple[_Pattern, ...] = (
 )
 
 _MAX_MATCHES_PER_PATTERN = 5
+
+# Confidence tiers. A value-shape match (key prefix, key block, Luhn card) is
+# exact; a field-name match without a secret-shaped value is only a lead; one
+# inside a UI-label / translation bundle is weaker still.
+_CONF_SHAPE = 0.9
+_CONF_NAME_ONLY = 0.3
+_CONF_LABEL_BUNDLE = 0.15
+
+# Values shaped like stored secrets: modular-crypt hashes (bcrypt, sha-crypt,
+# md5-crypt, argon2, scrypt/pbkdf2 variants), bare hex digests, and long opaque
+# tokens mixing letters and digits with no whitespace.
+_SECRET_SHAPES = (
+    re.compile(r"^\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]{53}$"),
+    re.compile(r"^\$(?:1|5|6|apr1|y|argon2(?:id|i|d)|scrypt|pbkdf2[-\w]*)\$\S{8,}$"),
+    re.compile(r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{56}|[0-9a-fA-F]{64}"
+               r"|[0-9a-fA-F]{96}|[0-9a-fA-F]{128})$"),
+    re.compile(r"^(?=[A-Za-z0-9+/=_\-.]*\d)(?=[A-Za-z0-9+/=_\-.]*[A-Za-z])[A-Za-z0-9+/=_\-.]{32,}$"),
+)
+
+# Field names that hold record timestamps (createdAt, updated_at, deletedAt,
+# modified, lastLoginTime, ...) and the values they carry.
+_TIMESTAMP_KEY = re.compile(
+    r"(?:At|_[aA][tT]|-at|_[oO][nN]|[Dd]ate|DATE|[Tt]ime|TIME|[Tt]imestamp)$"
+    r"|^(?i:created|updated|deleted|modified|inserted|timestamp)$")
+_TIMESTAMP_VALUE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})?)?"
+    r"|\d{10}|\d{13})$")
+_TIMESTAMP_PAIR = re.compile(
+    r"[\"']([A-Za-z_][\w-]*)[\"']\s*:\s*[\"']?([0-9][0-9:.+\-TZ ]{7,})[\"']?")
+
+
+def _secret_shaped(value: str) -> bool:
+    v = (value or "").strip()
+    return bool(v) and any(rx.match(v) for rx in _SECRET_SHAPES)
+
+
+def _timestamp_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of timestamp-named fields holding a date/epoch value."""
+    spans = []
+    for m in _TIMESTAMP_PAIR.finditer(text):
+        if _TIMESTAMP_KEY.search(m.group(1)) and _TIMESTAMP_VALUE.match(m.group(2).strip()):
+            spans.append(m.span(2))
+    return spans
+
+
+def _is_label_bundle(text: str) -> bool:
+    """A flat JSON map of short human-readable strings: a UI label / translation
+    bundle or a question/catalogue list. Field names there (e.g. a "PASSWORD"
+    label) describe UI text, not stored data."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)):
+        data = data["data"]
+    values: list = []
+    if isinstance(data, dict):
+        values = list(data.values())
+    elif isinstance(data, list) and all(isinstance(x, dict) for x in data):
+        # A catalogue: records whose only non-numeric fields are text/timestamps.
+        for rec in data:
+            values.extend(v for k, v in rec.items()
+                          if not isinstance(v, (int, float, bool, type(None)))
+                          and not _TIMESTAMP_KEY.search(str(k)))
+    if len(values) < 5 or not all(isinstance(v, str) for v in values):
+        return False
+    if any(_secret_shaped(v) for v in values):
+        return False
+    human = sum(1 for v in values if len(v) <= 200 and (" " in v.strip() or v.isalpha()))
+    return human >= 0.8 * len(values)
+
+
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
 
@@ -117,24 +194,38 @@ class ConfidentialMatch:
     severity: str
     location: str        # "response_body" | "header:<name>"
     redacted: str
+    confidence: float = _CONF_SHAPE
 
     def to_dict(self) -> dict:
         return {"pattern": self.pattern, "category": self.category, "severity": self.severity,
-                "location": self.location, "redacted": self.redacted}
+                "location": self.location, "redacted": self.redacted,
+                "confidence": self.confidence}
 
 
 def _scan_text(text: str, location: str) -> list[ConfidentialMatch]:
     matches: list[ConfidentialMatch] = []
     if not text:
         return matches
+    ts_spans = _timestamp_spans(text)
+    bundle = None
     for pat in _PATTERNS:
         found = 0
         for m in pat.rx.finditer(text):
             raw = m.group(0)
             if pat.luhn and not _luhn_ok(raw):
                 continue
-            matches.append(ConfidentialMatch(pat.name, pat.category, pat.severity,
-                                             location, _redact(raw)))
+            # A digit run inside a createdAt/updatedAt-style field is a date or
+            # epoch value, never a card number or ID.
+            if any(s <= m.start() < e or s < m.end() <= e for s, e in ts_spans):
+                continue
+            severity, confidence = pat.severity, _CONF_SHAPE
+            if pat.name_keyed and not _secret_shaped(m.group(1)):
+                if bundle is None:
+                    bundle = _is_label_bundle(text)
+                severity = "info" if bundle else "low"
+                confidence = _CONF_LABEL_BUNDLE if bundle else _CONF_NAME_ONLY
+            matches.append(ConfidentialMatch(pat.name, pat.category, severity,
+                                             location, _redact(raw), confidence))
             found += 1
             if found >= _MAX_MATCHES_PER_PATTERN:
                 break
@@ -179,11 +270,12 @@ def findings_from_exchange(exchange: HttpExchange) -> list[Finding]:
     findings: list[Finding] = []
     for category, ms in by_cat.items():
         severity = max((m.severity for m in ms), key=lambda s: _SEV_RANK[s])
+        confidence = max(m.confidence for m in ms)
         patterns = sorted({m.pattern for m in ms})
         samples = "; ".join(f"{m.pattern}[{m.location}]={m.redacted}" for m in ms[:6])
         findings.append(Finding(
             vulnerability_class="info_disclosure",
-            confidence=0.9,
+            confidence=confidence,
             summary=f"Confidential information in response ({category}): {', '.join(patterns)}",
             evidence=f"Deterministic response scan matched {len(ms)} item(s) (values redacted): {samples}",
             suggested_test="Confirm the value is real (not example/placeholder data) and remove it from "
