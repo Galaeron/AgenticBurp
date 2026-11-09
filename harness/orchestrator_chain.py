@@ -40,6 +40,36 @@ from harness.objective_profiles import ObjectiveTask
 _FR6_INVALID_SENTINEL = "_fr6_invalid"
 
 
+_FOLDED_SUMMARY_KEYS = frozenset({"eligible", "investigated", "extra_probes", "skipped",
+                                  "duplicates_skipped", "skipped_by_reason",
+                                  "iterative_diagnostics"})
+
+
+def _fold_worklist_summary(total: dict, sweep: dict, all_outcomes: list[dict]) -> dict:
+    """Fold one worklist sweep's summary into the run's aggregate: counters and
+    per-reason counts are summed, skipped/duplicate records concatenated, and the
+    probe diagnostics recomputed over every sweep's outcomes. `sweeps` counts the
+    sweeps folded. Mutates and returns `total`."""
+    if not sweep:
+        return total
+    total["sweeps"] = total.get("sweeps", 0) + 1
+    for k in ("eligible", "investigated", "extra_probes"):
+        total[k] = total.get(k, 0) + int(sweep.get(k) or 0)
+    for k in ("skipped", "duplicates_skipped"):
+        total[k] = list(total.get(k) or []) + list(sweep.get(k) or [])
+    by_reason = dict(total.get("skipped_by_reason") or {})
+    for reason, n in (sweep.get("skipped_by_reason") or {}).items():
+        by_reason[reason] = by_reason.get(reason, 0) + n
+    total["skipped_by_reason"] = by_reason
+    if "iterative_diagnostics" in sweep:
+        from harness import worklist_investigator
+        total["iterative_diagnostics"] = worklist_investigator.iterative_diagnostics(all_outcomes)
+    for k, v in sweep.items():          # any other key: the latest sweep's value
+        if k not in _FOLDED_SUMMARY_KEYS:
+            total[k] = v
+    return total
+
+
 class _ConfirmationCache:
     """Within-run memo of confirmation results for investigate_engagement().
 
@@ -2041,14 +2071,23 @@ class ChainMixin:
                 _objective_outcomes.append(_objective_outcome_entry)
                 break
 
+        _sweep_outcomes: list[dict] = []
+
         async def _investigate(st, rs, deadline=_investigation_deadline):
+            # One summary per sweep, folded into worklist_summary: the main sweep,
+            # every recrawl round and every chain round share it, and each sweep's
+            # update() used to replace the last, so the run reported only its final
+            # sweep beside outcomes aggregated over all of them.
+            sweep: dict = {}
             outs = await worklist_investigator.investigate_worklist(
                 _probe, st, base_url, rs, confirm_fn=_confirm, precondition_fn=_precondition,
-                max_nodes=max_nodes, step_budget=step_budget, summary_out=worklist_summary,
+                max_nodes=max_nodes, step_budget=step_budget, summary_out=sweep,
                 max_precondition_legs=_max_precondition_legs,
                 stop_on_confirm=stop_on_confirm, deadline=deadline,
                 **_worklist_kwargs)
-            timed_out = (worklist_summary.get("skipped_by_reason") or {}).get("time_budget", 0)
+            _sweep_outcomes.extend(outs)
+            _fold_worklist_summary(worklist_summary, sweep, _sweep_outcomes)
+            timed_out = (sweep.get("skipped_by_reason") or {}).get("time_budget", 0)
             if timed_out:
                 _errors.append({"phase": "worklist",
                                 "error": f"investigation time budget reached: {timed_out} "

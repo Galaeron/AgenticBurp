@@ -692,7 +692,7 @@ class CrawlLoopCallerTests(unittest.TestCase):
         store._DB_PATH, cache._cache = self._orig
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def _investigate(self, engagement=None, offer_route=True, offers=None):
+    def _investigate(self, engagement=None, offer_route=True, offers=None, sweeps=None):
         cfg = _config()
         cfg["engagement"].update(engagement or {})
         orch = Orchestrator(cfg)
@@ -707,6 +707,10 @@ class CrawlLoopCallerTests(unittest.TestCase):
                 for url in offers or [f"{BASE}api/late/1"]:
                     rc.route_feed.offer_exchange({"method": "GET", "url": url,
                                                   "response_status": 200}, source="test")
+            if sweeps:      # (summary_out update, outcomes) per sweep, as the real sweep writes
+                summary, outs = sweeps[len(seen["worklist"]) - 1]
+                kwargs["summary_out"].update(summary)
+                return list(outs)
             return []
 
         async def recrawl_state(base_url, roles, observations, **kw):
@@ -773,6 +777,37 @@ class CrawlLoopCallerTests(unittest.TestCase):
                                              offers=[f"{BASE}filter?q=1&sort=x"])
         self.assertEqual(seen["recrawled"], [])
         self.assertEqual(result["crawl_loop"]["recrawl"]["feed"]["refused"], {"known": 1})
+
+    _SWEEPS = [({"eligible": 4, "investigated": 3, "extra_probes": 1,
+                 "skipped": [{"path": "/a", "reason": "time_budget"}],
+                 "skipped_by_reason": {"time_budget": 1}, "duplicates_skipped": [],
+                 "iterative_diagnostics": {}},
+                [{"node": "GET /a", "findings_detail": []}] * 3),
+               ({"eligible": 1, "investigated": 1, "extra_probes": 0, "skipped": [],
+                 "skipped_by_reason": {}, "duplicates_skipped": [{"path": "/api/late/1"}],
+                 "iterative_diagnostics": {}},
+                [{"node": "GET /api/late/{id}", "findings_detail": []}])]
+
+    def test_worklist_summary_aggregates_every_sweep(self):
+        # The main sweep and the recrawl round share one summary: it must count both,
+        # matching the outcomes it is reported beside.
+        result, seen = self._investigate({"recrawl": {"enabled": True}}, sweeps=self._SWEEPS)
+        self.assertEqual(len(seen["worklist"]), 2)
+        ws = result["worklist_summary"]
+        self.assertEqual((ws["sweeps"], ws["eligible"], ws["investigated"], ws["extra_probes"]),
+                         (2, 5, 4, 1), ws)
+        self.assertEqual(ws["investigated"], len(result["outcomes"]))
+        self.assertEqual(ws["skipped_by_reason"], {"time_budget": 1})
+        self.assertEqual((len(ws["skipped"]), len(ws["duplicates_skipped"])), (1, 1))
+
+    def test_control_overwriting_summary_reports_only_the_last_sweep(self):
+        from harness import orchestrator_chain
+        with patch.object(orchestrator_chain, "_fold_worklist_summary",
+                          lambda total, sweep, outs: total.update(sweep)):
+            result, _ = self._investigate({"recrawl": {"enabled": True}}, sweeps=self._SWEEPS)
+        ws = result["worklist_summary"]
+        self.assertEqual(ws["investigated"], 1)                    # the pre-fix report
+        self.assertNotEqual(ws["investigated"], len(result["outcomes"]))
 
     def test_control_recrawl_off_installs_no_feed_and_runs_one_worklist(self):
         result, seen = self._investigate()
