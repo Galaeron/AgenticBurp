@@ -1688,6 +1688,48 @@ async def engagement_access_matrix_answer(host: str, req: AccessMatrixAnswersReq
                                                engagement_id=req.engagement_id)}
 
 
+def _leads_investigation(host: str, job_id: str) -> tuple[dict, dict]:
+    """(result, meta) of the named or newest finished investigation for `host`
+    whose durable result is readable; ({}, meta) when there is none."""
+    import json
+    journal = _job_store()
+    jobs = [journal.get(job_id)] if job_id else journal.list(host)
+    for job in jobs:
+        if not job or job.get("host") != host or not job.get("result_ref"):
+            continue
+        try:
+            return (json.loads(journal.read_result(job["job_id"])),
+                    {"job_id": job["job_id"], "used": True, "note": "newest readable result"})
+        except (ValueError, OSError, __import__("sqlite3").Error):
+            continue
+    return {}, {"job_id": None, "used": False,
+                "note": "no readable investigation result; blocked_on uses stored findings and the ledger only"}
+
+
+@app.get("/engagement/{host}/leads")
+async def engagement_leads(host: str, authorization: str | None = Header(default=None),
+                           engagement_id: str = Query(default="", max_length=128),
+                           captured_principal_id: str | None = Query(default=None, max_length=128),
+                           job_id: str = Query(default="", max_length=128)):
+    """HU-2: the ranked queue of unproven leads for a host, each with its recorded
+    request (secrets redacted) or an explicit no-request reason, the one change to
+    make, the expected positive/negative, and a typed blocked_on. Read-only: sends
+    no traffic. Shape documented in harness/leads.py."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import leads
+    url = host if "//" in host else f"http://{host}/"
+    investigation, meta = await asyncio.to_thread(_leads_investigation, host, job_id)
+    try:
+        items = await asyncio.to_thread(leads.build_leads, url, engagement_id=engagement_id,
+                                        captured_principal=captured_principal_id,
+                                        investigation=investigation)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"schema_version": leads.SCHEMA_VERSION, "host": host, "engagement_id": engagement_id,
+            "sends_traffic": False, "investigation": meta, "lead_count": len(items), "leads": items}
+
+
 @app.post("/engagement/{host}/investigate")
 async def engagement_investigate(host: str, req: InvestigateRequest,
                                  authorization: str | None = Header(default=None)):
