@@ -1635,6 +1635,59 @@ async def engagement_declarations_view(host: str, base_url: str = Query(max_leng
             "owners": (saved or {}).get("owners", [])}
 
 
+# --- HU-1: the operator access matrix (logic in harness/access_matrix.py) ---------
+
+class AccessMatrixAnswersRequest(_BaseModel):
+    operator: str = Field(min_length=1, max_length=64)
+    answers: list[dict] = Field(default_factory=list, max_length=500)
+    engagement_id: str = Field(default="", max_length=128)
+
+
+def _access_matrix_max_questions() -> int:
+    cfg = (orchestrator.config or {}).get("access_matrix") or {}
+    try:
+        return max(1, int(cfg.get("max_questions_per_round", 20)))
+    except (TypeError, ValueError):
+        return 20
+
+
+@app.get("/engagement/{host}/access-matrix")
+async def engagement_access_matrix_view(host: str,
+                                        engagement_id: str = Query(default="", max_length=128),
+                                        authorization: str | None = Header(default=None)):
+    """The draft access matrix for this engagement with the saved operator answers
+    and this round's ranked questions. Sends nothing; proposals are never truth."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import access_matrix
+    return await asyncio.to_thread(access_matrix.build_draft, host.lower(),
+                                   engagement_id=engagement_id,
+                                   max_questions=_access_matrix_max_questions())
+
+
+@app.put("/engagement/{host}/access-matrix")
+async def engagement_access_matrix_answer(host: str, req: AccessMatrixAnswersRequest,
+                                          authorization: str | None = Header(default=None)):
+    """Save operator answers (allowed / denied / owner_only / admin_only / unknown, or
+    null to clear) per cell, with provenance (operator, time, source=operator).
+    All-or-nothing: 422 names every invalid entry and saves none."""
+    _require_auth(authorization)
+    from harness import access_matrix
+    problems = []
+    for index, entry in enumerate(req.answers):
+        try:
+            access_matrix.clean_answer(entry)
+        except ValueError as exc:
+            problems.append(f"answers[{index}]: {exc}")
+    if problems:
+        raise HTTPException(status_code=422, detail=problems[:20])
+    saved = await asyncio.to_thread(access_matrix.save_answers, host.lower(), req.answers,
+                                    operator=req.operator, engagement_id=req.engagement_id)
+    return {"host": host.lower(), "engagement_id": req.engagement_id, "saved": len(saved),
+            "answers": await asyncio.to_thread(access_matrix.load_answers, host.lower(),
+                                               engagement_id=req.engagement_id)}
+
+
 @app.post("/engagement/{host}/investigate")
 async def engagement_investigate(host: str, req: InvestigateRequest,
                                  authorization: str | None = Header(default=None)):

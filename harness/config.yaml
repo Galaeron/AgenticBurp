@@ -945,6 +945,15 @@ reporting:
   # dict) for blind/no-oracle evaluation.
   gate_uncorroborated_catchall: false
 
+# HU-1: the operator access matrix (harness/access_matrix.py; GET/PUT
+# /engagement/{host}/access-matrix). The draft and the questions send nothing.
+# Saved operator answers are read only by the experiment cycle, which stays behind
+# engagement.experiments.enabled. report_section SHIPPED OFF so a default report
+# is byte-identical; max_questions_per_round caps each round of questions.
+access_matrix:
+  report_section: false
+  max_questions_per_round: 20
+
 # Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
 # off. When enabled, a CONFIRMED finding's host-agnostic structural shape
 # (method + normalized path template + sorted parameter NAMES -- never a

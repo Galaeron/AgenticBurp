@@ -1176,7 +1176,8 @@ class TranslateTests(unittest.TestCase):
                                     "(engagement.access_expectations)"),
             (dict(expectations=[_note_expectation(expectation="shared_with_all")]),
              "unsupported access expectation 'shared_with_all' for object 'Note' "
-             "(engagement.access_expectations supports only 'private_to_creator')"),
+             "(engagement.access_expectations supports only 'private_to_creator', 'owner_only', "
+             "'admin_only', 'denied', 'allowed')"),
             (dict(expectations=[no_pointer]),
              "no declared id extraction (JSON pointer) for POST /api/notes"),
             (dict(expectations=[_note_expectation(read={"method": "GET", "path": "/api/notes"})]),
