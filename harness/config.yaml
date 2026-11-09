@@ -405,9 +405,12 @@ engagement:
   # phase -> share for worklist, recrawl, capture_review and chain_rounds: each phase
   # gets its share of the time LEFT when it begins (time a phase leaves unused rolls
   # forward), so no phase holds the rest of the run. An explicit cap such as
-  # capture_review_seconds still applies. Empty, or investigation_seconds 0, keeps
-  # every phase's deadline as before. Example: {worklist: 4, recrawl: 1,
-  # capture_review: 2, chain_rounds: 2}.
+  # capture_review_seconds still applies. final_passes reserves a share for the
+  # passes after the chain rounds (second-order, coverage drive, server-error leads,
+  # retry rounds); without it the chain rounds get everything up to the deadline.
+  # Empty, or investigation_seconds 0, keeps every phase's deadline as before.
+  # Example: {worklist: 4, recrawl: 1, capture_review: 2, chain_rounds: 2,
+  # final_passes: 2}.
   phase_slices: {}
   # Crawl once per registered principal (harness/role_crawl.crawl_roles_for) instead
   # of once per distinct role feature: two same-role users get two discovery sweeps,

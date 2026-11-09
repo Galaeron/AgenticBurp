@@ -14,6 +14,14 @@ last sliced phase gets everything up to the deadline. Phases without a share are
 sliced. An explicit per-phase cap (capture_review_seconds) still applies: the phase
 stops at whichever comes first.
 
+`final_passes` is a share for the passes after the chain rounds: second-order
+confirmation, the coverage drive, the server-error lead pass and the retry rounds.
+Nothing asks for its deadline; it only keeps that share out of the earlier phases.
+Without it the chain rounds, the last sliced phase, are granted everything up to the
+deadline. The server-error pass, which starts no lead confirmation past the
+deadline, then dispatches nothing (r6, job a674352e19b6, ran its chain rounds to the
+deadline and never reached the later passes).
+
 OFF by default: with no `phase_slices` (or no `investigation_seconds`, the deadline
 the slices divide) every phase keeps exactly today's deadline.
 """
@@ -23,8 +31,9 @@ import time
 
 __all__ = ["PHASES", "PhaseSchedule"]
 
-# The sliceable phases of investigate_engagement, in run order.
-PHASES = ("worklist", "recrawl", "capture_review", "chain_rounds")
+# The sliceable phases of investigate_engagement, in run order. `final_passes` is the
+# time after the chain rounds (see the module docstring): it is reserved, never gated.
+PHASES = ("worklist", "recrawl", "capture_review", "chain_rounds", "final_passes")
 
 
 class PhaseSchedule:
