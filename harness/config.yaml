@@ -951,6 +951,14 @@ reporting:
   # in runs.output_dir (<run_id>.handoff.json / .changes.json) and at
   # GET /engagement/{host}/handoff. SHIPPED OFF so a default report is unchanged.
   handoff_section: false
+  # HU-8: move scanner-equivalent classes (missing security headers, CSP, CORS,
+  # clickjacking, cookie flags, verbose errors, server banners, JWT header/alg
+  # hygiene -- harness/scanner_overlap.py) out of the main report into a counted
+  # appendix, and stop worklist nodes whose only findings are of those classes from
+  # taking agent-budget slots (skip reason `scanner_overlap`). A finding whose
+  # recorded proof shows impact (a credentialed CORS read, an accepted forged JWT)
+  # stays in the main report. SHIPPED OFF so a default report and sweep are unchanged.
+  scanner_overlap_appendix: false
 
 # HU-1: the operator access matrix (harness/access_matrix.py; GET/PUT
 # /engagement/{host}/access-matrix). The draft and the questions send nothing.

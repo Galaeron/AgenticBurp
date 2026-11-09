@@ -419,6 +419,10 @@ SKIP_UNREACHABLE = "unreachable"
 SKIP_MISSING_TEMPLATE = "missing_template"
 SKIP_POLICY_BLOCKED = "policy_blocked"
 SKIP_TIME_BUDGET = "time_budget"
+# HU-8 (reporting.scanner_overlap_appendix, off by default): a node whose only
+# findings are scanner-equivalent classes (scanner_overlap.is_scanner_equivalent_node)
+# takes no agent-budget slot. Its findings are in the report's appendix.
+SKIP_SCANNER_OVERLAP = "scanner_overlap"
 
 
 def resolve_precondition_legs(value, *, time_boxed: bool) -> int | None:
@@ -435,7 +439,7 @@ def resolve_precondition_legs(value, *, time_boxed: bool) -> int | None:
 
 
 def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
-                 policy_blocked_leg: bool) -> str:
+                 policy_blocked_leg: bool, scanner_overlap: bool = False) -> str:
     """Why a node that reached the end of one sweep iteration with no agent
     probe run was left uninvestigated -- checked in priority order so a node
     that is BOTH unreachable and over budget reports the more actionable
@@ -444,6 +448,8 @@ def _skip_reason(node: dict, eligible: bool, investigated: int, max_nodes: int,
         return SKIP_POLICY_BLOCKED
     if not (node.get("reachable_roles") or []):
         return SKIP_UNREACHABLE
+    if scanner_overlap:
+        return SKIP_SCANNER_OVERLAP
     if eligible and investigated >= max_nodes:
         return SKIP_BUDGET_EXHAUSTED
     if not node.get("template"):
@@ -483,6 +489,7 @@ async def investigate_worklist(
     completed: dict[str, dict] | None = None,
     on_outcome=None,
     legs_done: set[str] | None = None,
+    scanner_overlap_appendix: bool | None = None,
 ) -> list[dict]:
     """Drive `probe_fn` over the top `max_nodes` actionable worklist nodes.
 
@@ -545,9 +552,21 @@ async def investigate_worklist(
     no agent work left is passed over without a skip entry. Each node whose legs run
     here is added (not one whose leg raised, so that leg is tried again).
 
+    `scanner_overlap_appendix` (HU-8): when True, a node whose findings are all
+    scanner-equivalent classes and that has no structural signal of its own
+    (scanner_overlap.is_scanner_equivalent_node) runs no agent probe and spends no
+    `max_nodes` slot; it is skipped as `scanner_overlap` (its shape-driven legs
+    still run). None reads `reporting.scanner_overlap_appendix` from the enclosing
+    RunContext's config; with no run or the shipped default it is off.
+
     Returns a per-node outcome list; findings are folded back into `state`."""
     from harness.coverage_tracker import _principal_of
     from harness.engagement import principal_reached
+    from harness import scanner_overlap as _scanner_overlap
+    if scanner_overlap_appendix is None:
+        from harness.run_context import current_run_context
+        scanner_overlap_appendix = _scanner_overlap.enabled(
+            getattr(current_run_context(), "config", None))
     role_headers = {r.role: dict(r.headers or {}) for r in roles}
     outcomes: list[dict] = []
     investigated = 0
@@ -599,6 +618,11 @@ async def investigate_worklist(
         open_probes = [p for p in _derive_probe(node) if not _derived_class_confirmed(node, p[0])]
         derived = open_probes[0] if open_probes else None
         eligible = derived is not None
+        overlap_skip = bool(scanner_overlap_appendix and eligible
+                            and _scanner_overlap.is_scanner_equivalent_node(node))
+        if overlap_skip:
+            # HU-8: out of the agent budget, not counted as eligible work.
+            eligible, derived, open_probes = False, None, []
         if eligible:
             eligible_count += 1
         do_agent = eligible and investigated < max_nodes
@@ -613,7 +637,8 @@ async def investigate_worklist(
         precond_possible = precondition_fn is not None and not is_junk_node
         if not do_agent and not precond_possible:
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
-                            "reason": _skip_reason(node, eligible, investigated, max_nodes, False)})
+                            "reason": _skip_reason(node, eligible, investigated, max_nodes, False,
+                                                   overlap_skip)})
             continue  # no agent hypothesis AND no shape-driven leg to run -- skip
         reach = node.get("reachable_roles", []) or []
         # probe from the lowest-trust identity that can reach it (strongest proof).
@@ -646,7 +671,8 @@ async def investigate_worklist(
             if legs_ran_before and not eligible:
                 continue  # an earlier sweep of this run attempted its legs; nothing new
             reason = (SKIP_BUDGET_EXHAUSTED if warrants
-                      else _skip_reason(node, eligible, investigated, max_nodes, False))
+                      else _skip_reason(node, eligible, investigated, max_nodes, False,
+                                        overlap_skip))
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
                             "reason": reason})
             continue
@@ -737,7 +763,7 @@ async def investigate_worklist(
         if not do_agent and not precond_findings:
             skipped.append({"path": node.get("path"), "method": node.get("method", "GET"),
                             "reason": _skip_reason(node, eligible, investigated, max_nodes,
-                                                   policy_blocked_leg)})
+                                                   policy_blocked_leg, overlap_skip)})
             continue  # a shape-scan that confirmed nothing -- don't record an empty outcome
 
         if node_findings:
@@ -837,6 +863,8 @@ async def investigate_worklist(
                 "time_budget": "Resume with additional time",
                 "policy_blocked": "Review the operation's authorization",
                 "unreachable": "Verify access with the supplied identity",
+                "scanner_overlap": "Listed in the report's scanner-equivalent appendix; "
+                                   "probe manually if its inputs matter",
             }.get(s["reason"], "Inspect the recorded prerequisite"))
             by_reason[s["reason"]] = by_reason.get(s["reason"], 0) + 1
         summary_out.update({
