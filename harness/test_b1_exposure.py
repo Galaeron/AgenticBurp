@@ -134,7 +134,8 @@ class ExposureCallerTests(unittest.TestCase):
     # ------------------------------------------------------------ positives
     def test_self_password_hash_and_totp_secret_confirm(self):
         report, proofs, used = self.dispatch(
-            {"id": "alice", "password": "a3f1c8b7a091", "totpSecret": "JBSWY3DPEHPK3PXP"})
+            {"id": 1, "username": "alice", "password": "a3f1c8b7a091",
+             "totpSecret": "JBSWY3DPEHPK3PXP"})
         self.assertEqual(report.status, "confirmed", report.summary)
         self.assertIn("field=$.password", report.evidence)
         self.assertIn("field=$.totpSecret", report.evidence)
@@ -149,41 +150,84 @@ class ExposureCallerTests(unittest.TestCase):
 
     def test_user_listing_exposing_another_users_token_confirms(self):
         report, proofs, _ = self.dispatch(
-            {"users": [{"id": "alice", "email": "a@example.test"},
-                       {"id": "bob", "email": "b@example.test", "token": "opaque-other-credential"}]})
+            {"users": [{"id": 1, "username": "alice", "email": "a@example.test"},
+                       {"id": 2, "username": "bob", "email": "b@example.test",
+                        "token": "opaque-other-credential"}]})
         self.assertEqual(report.status, "confirmed", report.summary)
         self.assertIn("field=$.users[1].token; object=$.users[1]; owner=bob; reader=alice",
                       report.evidence)
         self.assertIn("another account", report.evidence)
         self.assert_proof_bound(proofs)
 
-    def test_owner_bound_by_observed_numeric_account_id(self):
+    def test_account_document_bound_by_observed_account_email(self):
         from harness.self_ownership import SelfOwnership
 
         def observe(run):
             run.self_ownership = SelfOwnership(persist=False)
             run.self_ownership.observe(source="transport", principal_id="bob", method="GET",
                                        url=self.origin + "/api/me", status=200,
-                                       response_body='{"id":17}')
+                                       response_body='{"id":17,"email":"bob@example.test"}')
         self.observe = observe
         report, _, _ = self.dispatch([{"id": 16, "name": "x"},
-                                      {"id": 17, "apiKey": "84d6e20da53c71aa"}])
+                                      {"id": 17, "email": "Bob@example.test",
+                                       "apiKey": "84d6e20da53c71aa"}])
         self.assertEqual(report.status, "confirmed", report.summary)
         self.assertIn("owner=bob", report.evidence)
 
     # ---------------------------------------------------- negative controls
+    def _observe_bob_account_id(self, account_id=2):
+        from harness.self_ownership import SelfOwnership
+
+        def observe(run):
+            run.self_ownership = SelfOwnership(persist=False)
+            run.self_ownership.observe(source="transport", principal_id="bob", method="GET",
+                                       url=self.origin + "/api/me", status=200,
+                                       response_body=json.dumps({"id": account_id}))
+        self.observe = observe
+
+    def test_object_primary_id_colliding_with_another_account_id_is_not_ownership(self):
+        # Alice reads her own card list; the card's own primary id 2 equals bob's
+        # observed account id 2. That collision names no owner.
+        self._observe_bob_account_id(2)
+        report, _, _ = self.dispatch([{"id": 2, "cardNumber": "4111111111111111"}])
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+        self.assertNotIn("owner=bob", report.evidence)
+
+    def test_own_object_whose_id_collides_with_another_account_is_not_confirmed(self):
+        # An explicit owner key naming alice wins; the colliding primary id is not
+        # a second owner, and alice's own card number is ordinary account data.
+        from harness.self_ownership import SelfOwnership
+
+        def observe(run):
+            run.self_ownership = SelfOwnership(persist=False)
+            for pid, uid in (("alice", 1), ("bob", 2)):
+                run.self_ownership.observe(source="transport", principal_id=pid, method="GET",
+                                           url=self.origin + "/api/me", status=200,
+                                           response_body=json.dumps({"id": uid}))
+        self.observe = observe
+        report, _, _ = self.dispatch([{"id": 2, "UserId": 1, "cardNumber": "4111111111111111"}])
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+
+    def test_owner_semantics_key_naming_another_account_confirms(self):
+        # The positive twin: an explicit UserId naming bob does establish ownership.
+        self._observe_bob_account_id(2)
+        report, _, _ = self.dispatch([{"id": 7, "UserId": 2, "cardNumber": "4111111111111111"}])
+        self.assertEqual(report.status, "confirmed", report.summary)
+        self.assertIn("field=$[0].cardNumber; object=$[0]; owner=bob; reader=alice",
+                      report.evidence)
+
     def test_non_secret_and_masked_responses_are_not_confirmed(self):
         for doc in ([{"id": 1, "question": "Your first pet's name?"},
                      {"id": 2, "question": "Password recovery question?"}],
                     {"Password": "Password", "labels": {"password": "Enter password"}},
-                    {"id": "alice", "label": {"password": "Enter your password"}},
-                    {"id": "bob", "createdAt": "2026-01-01", "updatedAt": "2026-02-01"},
-                    {"id": "alice", "password": "********", "totpSecret": None},
-                    {"id": "bob", "password": "[redacted]", "totpSecret": "", "token": "xxxxxxxx"},
-                    {"id": "bob", "password": "Password", "apiKey": "null"},
-                    {"id": "alice", "token": "normal-self-session-token"},
-                    {"id": "unknown", "token": "unattributed-token"},
-                    {"id": "bob", "passwordHint": "favourite colour"}):
+                    {"userId": "alice", "label": {"password": "Enter your password"}},
+                    {"userId": "bob", "createdAt": "2026-01-01", "updatedAt": "2026-02-01"},
+                    {"userId": "alice", "password": "********", "totpSecret": None},
+                    {"userId": "bob", "password": "[redacted]", "totpSecret": "", "token": "xxxxxxxx"},
+                    {"userId": "bob", "password": "Password", "apiKey": "null"},
+                    {"userId": "alice", "token": "normal-self-session-token"},
+                    {"userId": "unknown", "token": "unattributed-token"},
+                    {"userId": "bob", "passwordHint": "favourite colour"}):
             with self.subTest(doc=doc):
                 report, _, _ = self.dispatch(doc)
                 self.assertEqual(report.status, "not_confirmed", report.summary)
@@ -194,17 +238,17 @@ class ExposureCallerTests(unittest.TestCase):
 
     def test_ambiguous_owner_is_not_confirmed(self):
         # One object naming both accounts names no single owner.
-        report, _, _ = self.dispatch({"id": "alice", "ownerId": "bob", "token": "opaque-credential"})
+        report, _, _ = self.dispatch({"userId": "alice", "ownerId": "bob", "token": "opaque-credential"})
         self.assertEqual(report.status, "not_confirmed", report.summary)
 
     def test_per_response_value_is_not_a_stored_secret(self):
         counter = itertools.count()
-        report, _, _ = self.dispatch(lambda: {"id": "bob", "token": f"nonce-{next(counter)}"})
+        report, _, _ = self.dispatch(lambda: {"userId": "bob", "token": f"nonce-{next(counter)}"})
         self.assertEqual(report.status, "not_confirmed", report.summary)
         self.assertIn("changed between two reads", report.summary)
 
     def test_unregistered_caller_sends_nothing(self):
-        report, _, _ = self.dispatch({"id": "alice", "password": "opaque-password"},
+        report, _, _ = self.dispatch({"userId": "alice", "password": "opaque-password"},
                                      caller="Bearer someone-else")
         self.assertEqual(report.status, "skipped", report.summary)
         self.assertEqual(self.server.received, [])
@@ -212,7 +256,7 @@ class ExposureCallerTests(unittest.TestCase):
     def test_versioning_and_inventory_stay_agent_only(self):
         for cls in ("api versioning", "improper inventory management"):
             with self.subTest(cls=cls):
-                report, _, _ = self.dispatch({"id": "bob", "token": "opaque-credential"}, cls=cls)
+                report, _, _ = self.dispatch({"userId": "bob", "token": "opaque-credential"}, cls=cls)
                 self.assertEqual(report.status, "skipped", report.summary)
                 self.assertEqual(self.server.received, [])
 

@@ -79,8 +79,13 @@ _SECRET_FIELDS = frozenset({
 # or card number is ordinary account data and is not.
 _SELF_SECRETS = frozenset({"password", "passwordhash", "passwd", "totpsecret",
                            "twofactorsecret", "2fasecret", "mfasecret", "otpsecret"})
-# Object keys whose scalar value names the account an object belongs to.
-_OWNER_KEYS = frozenset({"id", "userid", "owner", "ownerid", "accountid", "email",
+# Object keys whose scalar value names the account an object belongs to. An
+# object's own primary "id" is deliberately absent: a card or order id that
+# happens to equal another account's id names nobody. An account document is
+# still attributed, by its identifying fields (email, username) -- the only
+# shape in which its "id" would mean the account, and those fields name the
+# account by themselves.
+_OWNER_KEYS = frozenset({"userid", "owner", "ownerid", "accountid", "email",
                          "principalid", "username"})
 # Fixed placeholder values that never carry a secret.
 _PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined", "redacted", "masked",
