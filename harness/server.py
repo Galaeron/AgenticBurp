@@ -1741,6 +1741,19 @@ async def engagement_handoff_view(host: str, authorization: str | None = Header(
                                    run_handoff.output_dir_for(config))
 
 
+@app.get("/engagement/{host}/map")
+async def engagement_app_map_view(host: str,
+                                  engagement_id: str = Query(default="", max_length=128),
+                                  authorization: str | None = Header(default=None)):
+    """HU-3: the application map built from the store (roles, objects with owners and
+    id patterns, endpoints by role outcome, value fields, captured workflows), with
+    the stored semantic model overlaid as `proposed`. No model call; sends nothing."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import app_map
+    return await asyncio.to_thread(app_map.build_map, host.lower(), engagement_id=engagement_id)
+
+
 @app.post("/engagement/{host}/investigate")
 async def engagement_investigate(host: str, req: InvestigateRequest,
                                  authorization: str | None = Header(default=None)):

@@ -816,11 +816,12 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
         engagement_id=engagement_id,
         captured_principal=captured_principal,
     )
-    from harness import access_matrix, run_handoff
-    # HU-1 / HU-5: each section is "" unless its report option is on.
+    from harness import access_matrix, app_map, run_handoff
+    # HU-1 / HU-5 / HU-3: each section is "" unless its report option is on.
     return (report
             + access_matrix.report_section(host, config=config, engagement_id=engagement_id)
-            + run_handoff.report_section(host, config))
+            + run_handoff.report_section(host, config)
+            + app_map.report_section(host, config=config, engagement_id=engagement_id))
 
 
 def issue_exports(findings: list[dict], proofs_by_case: dict | None = None,

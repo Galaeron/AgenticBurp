@@ -961,6 +961,12 @@ access_matrix:
   report_section: false
   max_questions_per_round: 20
 
+# HU-3: the application map (harness/app_map.py; GET /engagement/{host}/map).
+# Built from the store with no model call and no traffic; model hypotheses are
+# labelled proposed. report_section SHIPPED OFF so a default report is unchanged.
+app_map:
+  report_section: false
+
 # Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
 # off. When enabled, a CONFIRMED finding's host-agnostic structural shape
 # (method + normalized path template + sorted parameter NAMES -- never a
