@@ -93,7 +93,12 @@ class WebsocketValidator(Validator):
         exchange_hash = hashlib.sha256(
             json.dumps(exchange.model_dump(), sort_keys=True).encode()
         ).hexdigest()[:16]
-        plan_id = f"ws_test_{finding.vulnerability_class}_{exchange_hash}"
+        # The id is the REQUEST with cache-buster parameters dropped
+        # (planner.plan_key_fingerprint: method, URL, headers, body): a polling
+        # request re-sent with a new t= and drawing a new response is one CSWSH
+        # check, while two requests with different headers or bodies still split.
+        from harness.planner import plan_key_fingerprint
+        plan_id = f"ws_test_{finding.vulnerability_class}_{plan_key_fingerprint(exchange)[:16]}"
 
         return TestPlan(
             id=plan_id,

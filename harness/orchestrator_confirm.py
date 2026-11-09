@@ -831,10 +831,14 @@ class ConfirmMixin:
                     summary=f"proof persistence failed: {e}", evidence=result.evidence,
                     url=getattr(exchange, "url", ""), method=getattr(exchange, "method", ""),
                     parameter=getattr(finding, "parameter_name", ""))
+            if plan is not None and not await asyncio.to_thread(
+                    store.persist_test_plans, exchange, [plan]):
+                # The plan id is already stored for another capture of this
+                # request (one that differs only in a cache-buster parameter):
+                # that row holds its own result; this capture's proof record
+                # above is kept, and no submission is bound to a foreign capture.
+                plan = None
             if plan is not None:
-                await asyncio.to_thread(
-                    store.persist_test_plans, exchange, [plan]
-                )
                 # One confirmation policy (store.capability_can_confirm): a plan
                 # whose capability cannot confirm (CSP/header and recon
                 # validators) records what it saw as an observation. The proof

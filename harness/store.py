@@ -1621,9 +1621,14 @@ def get_observation(observation_id: str, *, engagement_id: str = "") -> dict | N
         conn.close()
 
 
-def _persist_test_plans_for(host: str, url: str, plans: list[TestPlan]) -> None:
+def _persist_test_plans_for(host: str, url: str, plans: list[TestPlan]) -> list[TestPlan]:
+    """Insert each plan unless its id is already stored, and return the plans whose
+    stored row is bound to THEIR capture (source_exchange_hash). A plan id ignores
+    cache-buster parameters (planner.plan_key_fingerprint), so a second capture of
+    one request maps onto the first capture's row; it is not returned, and callers
+    must not submit or dispatch it as if the row were its own."""
     if not plans:
-        return
+        return []
     conn = _connect()
     try:
         conn.executemany(
@@ -1639,12 +1644,18 @@ def _persist_test_plans_for(host: str, url: str, plans: list[TestPlan]) -> None:
               int(p.escalated), time.time()) for p in plans],
         )
         conn.commit()
+        ids = sorted({p.id for p in plans})
+        stored = dict(conn.execute(
+            f"SELECT plan_id, source_exchange_hash FROM test_plans "
+            f"WHERE plan_id IN ({','.join('?' * len(ids))})", ids).fetchall())
+        return [p for p in plans if stored.get(p.id) == p.source_exchange_hash]
     finally:
         conn.close()
 
 
-def persist_test_plans(exchange: HttpExchange, plans: list[TestPlan]) -> None:
-    _persist_test_plans_for(host_of(exchange.url), exchange.url, plans)
+def persist_test_plans(exchange: HttpExchange, plans: list[TestPlan]) -> list[TestPlan]:
+    """See _persist_test_plans_for: returns the plans bound to this capture."""
+    return _persist_test_plans_for(host_of(exchange.url), exchange.url, plans)
 
 
 def persist_retry_plan(plan: TestPlan) -> None:
