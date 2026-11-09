@@ -672,6 +672,21 @@ class PhaseScheduleTests(unittest.TestCase):
         clock.now = 600.0
         self.assertEqual(sched.deadline_for("chain_rounds"), 1000.0)
 
+    def test_final_passes_keeps_a_share_after_the_chain_rounds(self):
+        # r6: the chain rounds, the last sliced phase, held the run to its deadline,
+        # so the server-error pass (no lead started past the deadline) sent nothing.
+        clock = _FakeClock()
+        sched = PhaseSchedule(1000.0, {"chain_rounds": 1, "final_passes": 1}, clock=clock)
+        clock.now = 600.0
+        self.assertEqual(sched.deadline_for("chain_rounds"), 800.0)
+        self.assertEqual(sched.report()["granted_seconds"], {"chain_rounds": 200.0})
+
+    def test_control_without_final_passes_the_chain_rounds_reach_the_deadline(self):
+        clock = _FakeClock()
+        sched = PhaseSchedule(1000.0, {"chain_rounds": 1}, clock=clock)
+        clock.now = 600.0
+        self.assertEqual(sched.deadline_for("chain_rounds"), 1000.0)
+
     def test_an_explicit_cap_still_binds(self):
         sched = PhaseSchedule(1000.0, {"capture_review": 1, "chain_rounds": 1},
                               clock=_FakeClock())
@@ -843,6 +858,16 @@ class CrawlLoopCallerTests(unittest.TestCase):
         _, seen = self._investigate({"investigation_seconds": 900})
         self.assertAlmostEqual(seen["worklist"][0][1] - seen["started"], 900, delta=30)
         self.assertEqual(seen["review_deadline"], seen["worklist"][0][1])
+
+    def test_a_final_passes_share_is_kept_out_of_the_sliced_phases(self):
+        _, seen = self._investigate({"investigation_seconds": 900, "phase_slices": {
+            "worklist": 1, "final_passes": 2}})
+        self.assertAlmostEqual(seen["worklist"][0][1] - seen["started"], 300, delta=30)
+
+    def test_control_without_final_passes_the_last_sliced_phase_gets_the_whole_bound(self):
+        _, seen = self._investigate({"investigation_seconds": 900, "phase_slices": {
+            "worklist": 1}})
+        self.assertAlmostEqual(seen["worklist"][0][1] - seen["started"], 900, delta=30)
 
     def test_an_explicit_review_cap_still_binds_under_slices(self):
         _, seen = self._investigate({"investigation_seconds": 900, "capture_review_seconds": 5,
