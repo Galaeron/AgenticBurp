@@ -1388,6 +1388,7 @@ class ChainMixin:
             # establishes is what that validator consults.
             ownership = self._experiment_ownership(state, run_context, base_url)
         _xid_cfg = (self.config.get("validators", {}) or {}).get("cross_identity", {}) or {}
+        from harness.config_schema import parse_validators_flags
         _xval = CrossIdentityValidator(
             allowed_hosts=self.allowed_hosts,
             timeout=float(_xid_cfg.get("timeout", 10.0)),
@@ -1395,7 +1396,12 @@ class ChainMixin:
             run_context=run_context,
             # WL-04: the registry's declared-ownership source (D1 seam); None means
             # a cross-identity match is a `supported` lead, never a confirmation.
-            ownership=ownership)
+            ownership=ownership,
+            # B1-T2: the same write policy the registry builds with, so what
+            # applies()/write_admitted() admit is what this path executes.
+            delete_restore_method=str(_xid_cfg.get("delete_restore_method", "")),
+            allow_writes=parse_validators_flags(
+                self.config.get("validators", {}) or {})["allow_mutating_replay"])
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a
