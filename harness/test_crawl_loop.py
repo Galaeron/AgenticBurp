@@ -411,6 +411,17 @@ class RouteFeedInputNameTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 self._check_new_input_on_a_known_route_is_accepted()
 
+    def test_a_cache_buster_parameter_is_not_a_new_input(self):
+        """Review: `_=<epoch ms>` / a random `t=` added by the client on a repeat
+        is not a new input (volatile_params), on both the offer and the known side."""
+        ep = type("Ep", (), {"method": "GET", "path": "/api/known",
+                             "template": {"query": "q=a&_=1762689296123"}, "capture_variants": []})()
+        feed = _feed(known=route_feed.endpoint_route_keys(ep))
+        self.assertFalse(_offer(feed, "/api/known?q=apple&_=1762689299456"))
+        self.assertFalse(_offer(feed, "/api/known?q=apple&t=Nq3xYz8"))
+        self.assertTrue(_offer(feed, "/api/known?q=apple&sort=asc"))     # control: a real input
+        self.assertEqual(route_feed.input_names("http://h/p?q=1&_=1762689296123&t=Nq3xYz8"), ("q",))
+
     def test_body_field_names_count_and_their_values_do_not(self):
         feed = _feed(known={("POST", "/api/orders", ("item",))})
         def post(body):

@@ -42,8 +42,12 @@ _MAX_BODY = 4000
 def input_names(url: str, body=None) -> tuple:
     """The sorted, distinct names of a request's inputs: its query parameter names
     and its body's top-level field names (a JSON object's keys, or form-encoded
-    names). Values are never part of it; a body that is neither gives no names."""
-    names = {k for k, _ in parse_qsl(urlsplit(url or "").query, keep_blank_values=True) if k}
+    names). Values are never part of it; a body that is neither gives no names.
+    A cache-buster query parameter (volatile_params.stable_url: `_=<epoch>`, a
+    random `t=`) is not an input, so a repeat that adds one is not a new route."""
+    from harness.volatile_params import stable_url
+    names = {k for k, _ in parse_qsl(urlsplit(stable_url(url or "")).query,
+                                     keep_blank_values=True) if k}
     text = body.strip() if isinstance(body, str) else ""
     if text.startswith("{"):
         try:
