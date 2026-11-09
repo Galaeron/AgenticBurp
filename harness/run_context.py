@@ -766,7 +766,20 @@ class TargetTransport:
                       allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
         """Send one request through scope + gate + budget, following redirects
         MANUALLY so every hop is re-checked. Captures an artifact on every path,
-        including blocks and errors."""
+        including blocks and errors. HU-5: every outcome is then offered to the
+        run's change log and handoff (bookkeeping only; it sends nothing)."""
+        outcome = await self._execute(request, capability=capability, session_ref=session_ref,
+                                      case_ref=case_ref, max_redirects=max_redirects,
+                                      allow_cancelled_cleanup=allow_cancelled_cleanup)
+        from harness import run_handoff
+        run_handoff.observe_execution(self.ctx, request, outcome, capability=capability,
+                                      case_ref=current_case_ref() or case_ref)
+        return outcome
+
+    async def _execute(self, request: TypedRequest, *, capability: str,
+                       session_ref: str | None = None, case_ref: str = "",
+                       max_redirects: int = 5,
+                       allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
         ctx = self.ctx
         # R16 accounting and the record's finding_ref: the caller's own case_ref,
         # never ambient. The record's case: the enclosing case_scope, if any.
@@ -1269,6 +1282,11 @@ _ambient_run: "contextvars.ContextVar[RunContext | None]" = contextvars.ContextV
     "harness_run_context_ambient", default=None)
 
 
+def _new_change_log(run_id: str):
+    from harness.run_handoff import ChangeLog
+    return ChangeLog(run_id)
+
+
 def current_run_context() -> "RunContext | None":
     """The RunContext whose `async with` block encloses this call, if any."""
     return _ambient_run.get()
@@ -1337,6 +1355,11 @@ class RunContext:
     # route_feed.RouteFeed, installed by an engagement with engagement.recrawl on;
     # the transport offers it every route it first sees. None: nothing is offered.
     route_feed: object = field(default=None, repr=False, compare=False)
+    # HU-5: the run's target change log (run_handoff.ChangeLog; every non-read send
+    # that ended 2xx, in memory) and its handoff (run_handoff.RunHandoff, attached
+    # by the server per job; None: no handoff is kept). Bookkeeping only.
+    change_log: object = field(default=None, repr=False, compare=False)
+    handoff: object = field(default=None, repr=False, compare=False)
     _freshness: object = field(default=None, repr=False, compare=False)
     _freshness_built: bool = field(default=False, repr=False, compare=False)
 
@@ -1389,6 +1412,7 @@ class RunContext:
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
                              if configured_namespace else resolved_run_id), timeout=timeout,
             objective_task=objective_task,
+            change_log=_new_change_log(resolved_run_id),
             self_ownership=(self_ownership.SelfOwnership(run_id=resolved_run_id)
                             if self_ownership.enabled(config_snapshot) else None))
 
