@@ -1,4 +1,4 @@
-# Current state — 2026-11-06 (`main`, after the 2026-11-06 integration merge)
+# Current state — 2026-11-09 (`integrate/r5-fixes-2026-11-06` after batch b3/b4; `main` as of 2026-11-06)
 
 ## Landed on main 2026-11-06 (integration branch `integrate/main-2026-11-06`)
 - PR #28 (request budget: SPA soft-404 pruning, sqlmap rerun collapse + verdicts, proof
@@ -50,6 +50,12 @@
   30 s, else fails fast. Other 4xx still count. Tests: harness/test_ollama_context_window.py.
 
 ## Verification
+- `integrate/r5-fixes-2026-11-06` `4b620bfe` (batch b3/b4, 2026-11-09: fair capture-review
+  tiers, multi-probe worklist, route-feed input keys, `volatile_params` dedupe + polling
+  exclusion, typed iterative actions, race/disclosure precision, tool-reported tier,
+  iterative proof attach, aggregated worklist_summary), Windows, system Python 3.14.7, on
+  the identical tree `f8d5203`: full exit 0 (harness 5736, evaluation 451 / 17 skips,
+  integrity 59, native passed). Java not rerun; no live run.
 - `integrate/r5-fixes-2026-11-06` (r5-gap fixes: proof binding, leg routing, coverage),
   2026-11-06, Windows, system Python 3.14: full on `bbed9bd0` harness 5659 OK, native 38,
   integrity 59; evaluation failed 2 stale cross-user dry-run expectations (writes no
@@ -110,8 +116,15 @@
 
 ## Open work (priority order)
 1. r6 follow-ups: reserve time for the coverage drive and end-of-job accounting (r6 was
-   cut in confirmation); bound sqlmap on write endpoints and skip /socket.io/; give
-   passive-leg proofs their exchange artifact ids. Then rerun.
+   cut in confirmation); bound sqlmap on write endpoints (polling URLs lost their
+   injection/CSRF plans in batch b3/b4); give passive-leg proofs their exchange artifact
+   ids. Confirmation gaps and briefs T1-T6 (exposure, write authz, IDOR second identity,
+   sqlmap error/UNION reproduction, NoSQL beyond login, SPA XSS):
+   `.test-work/r5-r6-detection-analysis-20261109/ANALYSIS.md` (main checkout). Batch
+   b3/b4 review leftovers: race `token` matches any segment (race_condition_validator.py:66);
+   tool-reported sqlmap rows keep confirmed=True for worklist stop logic; a resumed journal
+   can skip the query probe (worklist_investigator.py:653); skipped keys advance the
+   lower-tier rotation (assessment_health.py:190). Then rerun.
 2. Proof/issue dedup (owner, 2026-10-28): one vulnerability, one proof, keyed on host,
    mechanism, principal and check family; other routes become affected locations.
 3. Coverage drive throughput: 110 of 1380 queued sent, 1270 incomplete attempts (v8).
