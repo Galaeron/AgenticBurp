@@ -6,9 +6,11 @@ nothing about what the request tests, but it made every capture of one request a
 new plan and a new confirmation case: the same listing, fetched twice, was
 planned and validated twice. Like cache.py's `_VOLATILE_HEADER_NAMES` does for
 headers, `stable_url` drops these parameters from the URL before it is used as
-key material. The parameter is detected by its VALUE shape, never by a list of
-names, and the test is conservative: a small integer, a hex or UUID object id, a
-word or a date without a time is kept, so real identifiers still split keys.
+key material. The parameter is detected by its VALUE shape, and the test is conservative: a
+small integer, a hex or UUID object id, a word or a date without a time is kept,
+a parameter named as an identifier (`id`, `orderId`, `key`) is always kept, and a
+random token counts only under a conventional cache-buster name, so real
+identifiers still split keys.
 
 `is_polling_transport` recognises an Engine.IO long-polling request by its
 protocol markers (an `EIO` version and `transport=polling`). Its body is a
@@ -47,14 +49,33 @@ def _is_random_token(value: str) -> bool:
                 and re.search(r"[A-Z]", value) and re.search(r"\d", value))
 
 
+# A random token is a cache-buster only under a name clients conventionally give
+# one, or a name that starts with an underscore (jQuery's `_`, `_t`, `_cb`). Any
+# other short name is not enough: `v`, `p`, `k`, `ref` and `key` carry opaque
+# mixed-case object ids (a video or share id) as often as noise.
+_TOKEN_NAMES = frozenset({"t", "r", "ts", "cb", "rnd", "rand", "nc", "nocache", "cachebust",
+                          "cachebuster", "buster"})
+# A parameter named as an identifier is never dropped, whatever its value looks
+# like: `id=1762689296` is an object, not an epoch.
+# Conservative: any name ending in "id" (id, oid, orderId, user_id) counts.
+_IDENTIFIER_NAME = re.compile(r"id$|^(key|ref|sku|code|uuid|guid)$", re.I)
+
+
+def _is_identifier_name(name: str) -> bool:
+    return bool(_IDENTIFIER_NAME.search(name.strip()))
+
+
 def is_volatile_value(name: str, value: str) -> bool:
     """Whether a query parameter's value has the shape of a cache-buster.
 
-    A random token counts only under a short parameter name (at most three
-    characters, or one that starts with an underscore): a long-named parameter
-    with a mixed-case value is more likely a code or an id, and is kept."""
+    A parameter named as an identifier (`id`, `orderId`, `user_id`, `key`) is
+    never one. A random token counts only under a conventional cache-buster name
+    (`t`, `r`, `ts`, `cb`, ...) or one that starts with an underscore: any other
+    name with a mixed-case value is more likely a code or an opaque id, and is
+    kept."""
     v = (value or "").strip()
-    if not v:
+    key = (name or "").strip()
+    if not v or _is_identifier_name(key):
         return False
     if v.isdigit():
         n = int(v)
@@ -65,8 +86,7 @@ def is_volatile_value(name: str, value: str) -> bool:
         return False
     if _ISO_DATETIME.match(v) or _NAMED_DATETIME.match(v) or _RANDOM_FRACTION.match(v):
         return True
-    key = (name or "").strip()
-    return (len(key) <= 3 or key.startswith("_")) and _is_random_token(v)
+    return (key.lower() in _TOKEN_NAMES or key.startswith("_")) and _is_random_token(v)
 
 
 def _pairs(query: str) -> list[tuple[str, str, str]]:

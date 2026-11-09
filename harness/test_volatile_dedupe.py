@@ -106,6 +106,24 @@ class PlanDedupeTests(_TempDb):
         self.persist(urls)
         self.assertEqual(len(self.plan_rows()), len(urls))
 
+    def test_opaque_short_named_and_id_named_values_still_split(self):
+        """Negative control (review): a short-named parameter carrying an opaque
+        mixed-case object id (`v=dQw4w9WgXcQ`, `k=Ab3dE9xY`) and an id-named
+        parameter whose value happens to look like an epoch are objects: each
+        capture is its own plan, bound to its own capture, and its own
+        confirmation case."""
+        pairs = [("v=dQw4w9WgXcQ", "v=9bZkp7q19f0"), ("k=Ab3dE9xY", "k=Qz7kLm2P"),
+                 ("id=1762689296", "id=1762689297"), ("orderId=1762689296123", "orderId=1762689296124"),
+                 ("_id=Nq3xYz8", "_id=Pk7aBc2")]
+        urls = [f"{BASE}?{q}" for pair in pairs for q in pair]
+        bound = self.persist(urls)
+        self.assertEqual(len(self.plan_rows()), len(urls), self.plan_rows())
+        self.assertEqual([len(b) for b in bound], [1] * len(urls))
+        for a, b in pairs:
+            ea, eb = _exchange(f"{BASE}?{a}"), _exchange(f"{BASE}?{b}")
+            self.assertNotEqual(confirmation_cache_key("sqlmap", ea),
+                                confirmation_cache_key("sqlmap", eb), (a, b))
+
     def test_different_body_still_splits(self):
         """Negative control: the stable key drops query cache-busters only."""
         a = _exchange(f"{BASE}?t=Nq3xYz8", "POST", '{"q":"a"}')
@@ -201,7 +219,10 @@ class KeyTests(unittest.TestCase):
                     ("r", "0.8394712934")]
         kept = [("id", "1"), ("id", "1234567890"), ("oid", "5f8d0d55b54764421b7156c3"),
                 ("q", "Laptop"), ("from", "2026-11-09"), ("coupon", "Ab3dE9xY"),
-                ("token", "eyJhbGciOiJIUzI1NiJ9.e30.x"), ("n", "99999999999")]
+                ("token", "eyJhbGciOiJIUzI1NiJ9.e30.x"), ("n", "99999999999"),
+                ("v", "dQw4w9WgXcQ"), ("k", "Ab3dE9xY"), ("id", "1762689296"),
+                ("userId", "2026-11-09T12:34:56Z"), ("_id", "Nq3xYz8")]
+        volatile += [("_t", "Nq3xYz8"), ("cb", "Pk7aBc2"), ("r", "Nq3xYz8")]
         for name, value in volatile:
             self.assertTrue(is_volatile_value(name, value), (name, value))
         for name, value in kept:
