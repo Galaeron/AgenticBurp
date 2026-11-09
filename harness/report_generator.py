@@ -810,7 +810,7 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     suppressed_count = len(all_including_suppressed) - len(findings)
     host = store.host_of(url)
     reporting = (config or {}).get("reporting") or {}
-    return generate_markdown_report(
+    report = generate_markdown_report(
         host, findings, effort_ledger=effort_ledger, suppressed_count=suppressed_count,
         quarantine_leads=bool(reporting.get("quarantine_unverified_leads", False)),
         gate_low_confidence_generic=bool(reporting.get("gate_low_confidence_generic", False)),
@@ -819,6 +819,8 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
         engagement_id=engagement_id,
         captured_principal=captured_principal,
     )
+    from harness import access_matrix   # HU-1: "" unless access_matrix.report_section is on
+    return report + access_matrix.report_section(host, config=config, engagement_id=engagement_id)
 
 
 def issue_exports(findings: list[dict], proofs_by_case: dict | None = None,

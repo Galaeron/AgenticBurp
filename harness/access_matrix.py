@@ -132,7 +132,10 @@ def object_and_action(method: str, path: str) -> tuple[str, str] | None:
 
 
 def _article(word: str) -> str:
-    return "an" if (word[:1].lower() in "aeiou") else "a"
+    low = word.lower()
+    if low.startswith(("us", "uni", "eu", "one")):
+        return "a"           # a user, a unit: the vowel letter is not a vowel sound
+    return "an" if low[:1] in "aeiou" else "a"
 
 
 def question_text(role: str, object_type: str, action: str) -> str:
