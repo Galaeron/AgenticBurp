@@ -421,6 +421,67 @@ def parse_injection_points(output: str) -> list[dict]:
     return unique
 
 
+def _point_technique(point: dict) -> str:
+    """The technique the harness can reproduce for one sqlmap point: "boolean",
+    "error", "union", or "" (time-based and stacked queries are not replayed)."""
+    kind = point.get("type", "").lower()
+    for technique in ("boolean", "error", "union"):
+        if technique in kind:
+            return technique
+    return ""
+
+
+# Where sqlmap's payload leaves the original value: its first SQL keyword.
+_PAYLOAD_KEYWORD = re.compile(r"\s(?:AND|OR|UNION|RLIKE|PROCEDURE|HAVING)\b|\bUNION\b", re.I)
+
+
+def _payload_boundary(payload: str) -> str | None:
+    """The characters that close the injected value in sqlmap's reported payload:
+    "'" for a string, "')" for a string inside parentheses, "" for a number. Read
+    only for context. None when no SQL keyword is found or the closing characters
+    are anything else (the point is then not reproduced)."""
+    found = _PAYLOAD_KEYWORD.search(payload or "")
+    if found is None:
+        return None
+    prefix = payload[:found.start()].rstrip()
+    closing = re.search(r"[^\w\s]*$", prefix).group(0)
+    # The value's own punctuation (a JSON '"' opening the string, a sign) is not
+    # part of the closing sequence; keep only quote, parenthesis and LIKE wildcard.
+    closing = closing.lstrip(":=\"{[,-+")
+    if closing and not re.fullmatch(r"%?['\"]\)*", closing):
+        return None
+    return closing
+
+
+def _union_column_count(payload: str) -> int:
+    """How many columns sqlmap's UNION SELECT projects (top-level commas, outside
+    quotes and parentheses), or 0 when it is not a plain UNION SELECT or has more
+    than _MAX_UNION_COLUMNS columns."""
+    found = re.search(r"\bUNION\s+(?:ALL\s+)?SELECT\s+", payload or "", re.I)
+    if found is None:
+        return 0
+    depth, quote, count = 0, "", 1
+    for ch in payload[found.end():]:
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            count += 1
+        elif ch in "#-" and depth == 0:
+            break                       # the trailing comment (-- or #)
+    return count if count <= _MAX_UNION_COLUMNS else 0
+
+
+_MAX_UNION_COLUMNS = 10
+
+
 def _point_label(point: dict) -> str:
     return f"{point['place']}:{point['parameter']}"
 
@@ -1013,11 +1074,16 @@ class SqlmapValidator(Validator):
         """The confirmation for a sqlmap that reported the target injectable (Ticket 2B).
 
         sqlmap stays the authority for the verdict. Its injection points lead the
-        evidence, and each boolean-based point the harness can mutate (up to
-        _MAX_REPRODUCED_POINTS) is replayed through the boolean differential
-        restricted to that parameter. The first one that reproduces gives the result
-        the differential's baseline/attack/control artifacts; otherwise the result is
-        marked tool-reported and names no exchanges, so its proof stays a candidate."""
+        evidence, and each point the harness can mutate (up to _MAX_REPRODUCED_POINTS)
+        is reproduced by the harness itself on that parameter alone, through the run's
+        transport and with the harness's own payloads (never sqlmap's): a boolean point
+        by the true/false differential, an error-based point by a breaking value
+        against a balanced control, a UNION point by a fresh marker returned as a
+        column value. The first one that reproduces gives the result its
+        baseline/attack/control artifacts; otherwise the result is marked
+        tool-reported and names no exchanges, so its proof stays a candidate.
+        A write endpoint (PUT/PATCH/DELETE) is never replayed: every send may change
+        state, and its scan already stopped at the write cap."""
         points = parse_injection_points(output)
         result = ValidationResult(
             self.name, "confirmed", finding.vulnerability_class,
@@ -1026,22 +1092,166 @@ class SqlmapValidator(Validator):
             evidence=_points_evidence(points, output), raw_output=output, command=cmd,
             injection_points=tuple(points),
         )
-        eligible = [p for p in points
-                    if "boolean" in p["type"].lower() and p["place"] in _DIFFERENTIAL_LOCATIONS]
+        write = exchange.method.upper() in WRITE_METHODS
+        eligible = [] if write else [p for p in points if p["place"] in _DIFFERENTIAL_LOCATIONS
+                                     and _point_technique(p)]
         for point in eligible[:_MAX_REPRODUCED_POINTS]:
-            repro = await self._boolean_probe_fallback(
-                finding, exchange, only_params=[(point["place"], point["parameter"])])
+            technique = _point_technique(point)
+            if technique == "boolean":
+                repro = await self._boolean_probe_fallback(
+                    finding, exchange, only_params=[(point["place"], point["parameter"])])
+                how = "a true/false differential"
+            else:
+                repro = await self._technique_probe(finding, exchange, point, technique)
+                how = ("a DB error for a breaking value that a balanced control did not produce"
+                       if technique == "error" else "a fresh UNION marker returned as a column value")
             if repro is None or not repro.confirmed:
                 continue
             result.summary = (f"sqlmap reported injection at {_point_label(point)} ({point['type']}); "
-                              "the harness reproduced a true/false differential on the same parameter")
+                              f"the harness reproduced {how} on the same parameter")
             result.evidence = _points_evidence(points, output, repro.evidence)
             return result.with_artifacts(
                 baseline=repro.baseline_artifact_id, attack=repro.attack_artifact_id,
                 controls=repro.control_artifact_ids)
         result.summary = "tool-reported, not reproduced by the harness: " + result.summary
         result.evidence_source = TOOL_REPORTED
+        result.limitation = ("tool-reported: the harness did not reproduce the reported technique"
+                             + (" (write endpoints are not replayed)" if write else ""))
         return result
+
+    async def _technique_probe(self, finding: Finding, exchange: HttpExchange,
+                               point: dict, technique: str) -> ValidationResult | None:
+        """Harness-side reproduction of an error-based or UNION point on one parameter.
+
+        The harness's own payloads only. sqlmap's reported payload is read for the
+        injection context (the characters that close the value, e.g. ' or ') and,
+        for UNION, the column count; it is never sent.
+
+        error: a breaking value (an unbalanced quote) and a balanced control (the
+          quote doubled; in a numeric context, the original value), each sent twice.
+          Confirmed only when a DB-specific error signature answers both breaking
+          sends and neither control nor the baseline. A generic 500 is no signature.
+        union: one UNION SELECT per column carrying a fresh marker in that column.
+          Confirmed when the marker comes back as a JSON value on two sends and an
+          echo control (the marker sent as the plain value) does not return it.
+
+        None when the point cannot be reproduced this way, the evidence is not there,
+        or a send failed at the transport (the tool-reported lead stays)."""
+        location, param = point["place"], point["parameter"]
+        method = exchange.method.upper()
+        body = exchange.request_body or ""
+        if location == "query":
+            values = dict(parse_qsl(urlsplit(exchange.url).query, keep_blank_values=True))
+        elif location == "body_json":
+            try:
+                values = _json.loads(body)
+            except ValueError:
+                return None
+        else:
+            values = dict(parse_qsl(body, keep_blank_values=True))
+        if (not isinstance(values, dict) or param not in values
+                or isinstance(values[param], (dict, list, bool))):
+            return None
+        original = "" if values[param] is None else str(values[param])
+        boundary = _payload_boundary(point.get("payload", ""))
+        if boundary is None:
+            return None
+        quote = "'" if "'" in boundary else '"' if '"' in boundary else ""
+
+        headers = {k: v for k, v in exchange.request_headers.items()
+                   if k.lower() not in {"host", "content-length"}}
+        inferred_ct = _inferred_content_type_for_body(body, _content_type_of(exchange))
+        if inferred_ct is not None:
+            headers["Content-Type"] = inferred_ct
+
+        async def send(value=None):
+            url, probe_body = exchange.url, body
+            if value is not None:
+                if location == "query":
+                    url = _mutate_query_param(url, param, value)
+                else:
+                    mutate = _mutate_json_param if location == "body_json" else _mutate_form_param
+                    probe_body = mutate(body, param, value)
+                if url is None or probe_body is None:
+                    raise ValueError("the parameter could not be mutated")
+            if self.run_context is not None:
+                from harness.run_context import TypedRequest
+                from .transport import bind_session
+                session, request_headers = bind_session(self.run_context, headers)
+                answer = await self.run_context.executor().execute(
+                    TypedRequest(method, url, headers=request_headers, body=probe_body or None),
+                    capability="sqlmap_technique_probe", session_ref=session)
+                if not answer.ok:
+                    raise httpx.TransportError(answer.error or answer.outcome)
+                return answer.to_httpx_response(method, url)
+            from harness.safety_gate import GatedAsyncClient
+            async with GatedAsyncClient(get_default_gate(), self.name,
+                                        timeout=10, follow_redirects=False) as client:
+                return await client.request(method, url, headers=headers, content=probe_body or None)
+
+        label = _point_label(point)
+        try:
+            baseline = await send()
+            if baseline.status_code >= 500 or _looks_like_db_error(baseline):
+                return None
+            if technique == "error":
+                breaking = original + (quote or "'")
+                balanced = original + quote * 2 if quote else original
+                attack = await send(breaking)
+                control = await send(balanced)
+                repeat_control = await send(balanced)
+                repeat_attack = await send(breaking)
+                if not (_looks_like_db_error(attack) and _looks_like_db_error(repeat_attack)
+                        and not _looks_like_db_error(control)
+                        and not _looks_like_db_error(repeat_control)
+                        and control.status_code < 500 and repeat_control.status_code < 500):
+                    return None
+                evidence = (f"{label}: breaking value {breaking!r} answered a DB error signature "
+                            f"(HTTP {attack.status_code}) on both sends; the balanced control "
+                            f"{balanced!r} (HTTP {control.status_code}) and the baseline did not")
+            else:
+                columns = _union_column_count(point.get("payload", ""))
+                if not columns:
+                    return None
+                marker = "hx" + secrets.token_hex(10)
+
+                def returns_marker(response) -> bool:
+                    def walk(value):
+                        if isinstance(value, dict):
+                            return any(walk(v) for v in value.values())
+                        if isinstance(value, list):
+                            return any(walk(v) for v in value)
+                        return isinstance(value, str) and value == marker
+                    try:
+                        return response.status_code < 400 and walk(response.json())
+                    except ValueError:
+                        return False
+
+                control = await send(marker)          # an endpoint that echoes its input
+                if returns_marker(baseline) or returns_marker(control):
+                    return None
+                attack, hit = None, 0
+                for column in range(columns):
+                    exprs = ["NULL"] * columns
+                    exprs[column] = f"'{marker}'"
+                    value = f"{original}{boundary} UNION ALL SELECT {','.join(exprs)}-- "
+                    trial = await send(value)
+                    if returns_marker(trial):
+                        if returns_marker(await send(value)):
+                            attack, hit = trial, column + 1
+                        break
+                if attack is None:
+                    return None
+                evidence = (f"{label}: a fresh marker in UNION column {hit} of {columns} came back "
+                            "as a column value on two sends; the echo control and the baseline "
+                            "did not return it")
+        except (httpx.HTTPError, ValueError, TypeError):
+            return None
+        return ValidationResult(
+            self.name, "confirmed", finding.vulnerability_class, confirmed=True, confidence=0.9,
+            summary=evidence, evidence=evidence,
+            command=[f"{technique}-probe {method} {exchange.url} param={label}"],
+        ).with_artifacts(baseline=baseline, attack=attack, controls=[control])
 
     # Cap on how many parameters this fallback probes per exchange -- this
     # is a bounded, opt-in active check (same philosophy as
