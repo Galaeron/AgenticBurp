@@ -329,6 +329,86 @@ def _mutate_path_segment(url: str, old_value: str, new_value: str) -> str | None
             return urlunsplit((parts.scheme, parts.netloc, "/".join(segs), parts.query, parts.fragment))
     return None
 
+
+def _mutate_path_at_captured(url: str, captured_url: str, old_value: str, new_value: str) -> str | None:
+    """Mutations persist across steps, so after /tickets/1 -> /tickets/2 the
+    captured id "1" is no longer on the current path. Swap it by its CAPTURED
+    position instead, so a model that keeps naming the captured id keeps
+    enumerating it. None when the captured path lacks it or its shape changed."""
+    cur, cap = urlsplit(url), urlsplit(captured_url)
+    cur_segs, cap_segs = cur.path.split("/"), cap.path.split("/")
+    if len(cur_segs) != len(cap_segs) or old_value not in cap_segs:
+        return None
+    cur_segs[cap_segs.index(old_value)] = new_value
+    return urlunsplit((cur.scheme, cur.netloc, "/".join(cur_segs), cur.query, cur.fragment))
+
+
+# A mutate value: a string anywhere, or (JSON request bodies only) a JSON-typed
+# value whose type is preserved when the body is serialised.
+_JSON_TYPES = (str, int, float, bool, type(None), dict, list)
+
+
+def _json_type(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return {str: "string", dict: "object", list: "array"}.get(type(value), type(value).__name__)
+
+
+def _value_text(value: object) -> str:
+    """A mutate value as text: a string as itself, a typed value as its JSON."""
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def _valid_json_value(value: object) -> bool:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(value, _JSON_TYPES)
+
+
+def _set_json_path(body: str, path: str, value: object) -> tuple[str | None, str | None]:
+    """Set `path` (dot-separated keys / list indexes, e.g. items.0.qty) in the
+    JSON `body` to `value`, creating missing object keys. A list index may be
+    at most the list's length (equal appends). Returns (new_body, None) or
+    (None, reason)."""
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return None, "location 'json' requires a JSON request body"
+    segs = path.split(".")
+    if any(s == "" for s in segs):
+        return None, f"json path {_excerpt(path)!r} has an empty segment"
+    node = data
+    for i, seg in enumerate(segs):
+        last = i == len(segs) - 1
+        where = ".".join(segs[:i]) or "<root>"
+        if isinstance(node, dict):
+            if last:
+                node[seg] = value
+            else:
+                node = node.setdefault(seg, {})
+        elif isinstance(node, list):
+            if not seg.isdigit():
+                return None, f"json path segment {seg!r} must be a list index at {where!r}"
+            idx = int(seg)
+            if idx > len(node):
+                return None, (f"json path index {idx} out of range at {where!r} "
+                              f"(array length {len(node)})")
+            if idx == len(node):
+                node.append(value if last else {})
+            elif last:
+                node[idx] = value
+            if not last:
+                node = node[idx]
+        else:
+            return None, f"json path cannot index into a {_json_type(node)} at {where!r}"
+    return json.dumps(data), None
+
 # Target-distress signals: statuses that mean the service is struggling or
 # actively shedding load. An iterative agent that keeps hammering a target
 # returning these is both rude and useless -- it stops instead of piling on.
@@ -398,12 +478,19 @@ You probe ONE captured HTTP endpoint by adapting your payload to each response.
 
 Each turn, respond with ONLY a JSON object choosing exactly one action:
 
-  {{"action":"mutate","location":"query|body|path","param":"<name>","value":"<payload>","thought":"<one line>"}}
-     -- resend the captured request with one value replaced by your payload. For location "path",
-        `param` is the current id segment to swap (e.g. "1") and `value` the id to try (e.g. "2") --
+  {{"action":"mutate","location":"query|body|path|json","param":"<name>","value":"<payload>","thought":"<one line>"}}
+     -- resend the request with one value replaced by your payload. For location "path",
+        `param` is the captured id segment to swap (e.g. "1") and `value` the id to try (e.g. "2") --
         this is how you ENUMERATE an object id to test IDOR/BOLA on a path like /tickets/1.
+        For location "json", `param` is a dotted path into a JSON body (e.g. "items.0.qty");
+        missing keys are created. In a JSON body (body or json) `value` may be any JSON value
+        (-1, true, null, {{...}}, [...]) and keeps its type; query, path and form values are strings.
   {{"action":"set_header","name":"<header>","value":"<value>","thought":"<one line>"}}
-     -- resend with a request header set/overridden (persists for later steps).
+     -- resend with a request header set/overridden.
+  {{"action":"reset","thought":"<one line>"}}
+     -- go back to the captured request (sends nothing). Edits otherwise ACCUMULATE: each mutate or
+        set_header applies to the request your earlier steps built. Add "reset":true to a mutate or
+        set_header to apply it to the captured request instead.
   {{"action":"stop","verdict":"found|not_found|refused","thought":"<one line>",
     "finding":{{"vulnerability_class":"...","confidence":0.0-1.0,"severity":"info|low|medium|high|critical",
                "summary":"...","evidence":"...","suggested_test":"...","basis":"derived"}}}}
@@ -466,12 +553,14 @@ class IterativeAgent:
         # this property closes (2026-09-17 coverage-recovery plan, Step 1).
         return get_default_gate()
 
-    def _build_request(self, exchange: HttpExchange, action: dict, headers_state: dict) -> tuple:
-        """Translate a constrained action into (method, url, headers, body),
-        derived from the captured exchange. Returns (None, reason) if invalid."""
+    def _build_request(self, exchange: HttpExchange, action: dict, headers_state: dict,
+                       current: tuple[str, str] | None = None) -> tuple:
+        """Translate a constrained action into (method, url, headers, body).
+        The action applies to `current` -- the (url, body) accumulated by this
+        run's earlier steps -- or, when that is None, to the captured exchange.
+        Returns (None, reason) if invalid."""
         method = exchange.method.upper()
-        url = exchange.url
-        body = exchange.request_body or ""
+        url, body = current if current is not None else (exchange.url, exchange.request_body or "")
         headers = dict(headers_state)
 
         if action.get("action") == "set_header":
@@ -483,10 +572,17 @@ class IterativeAgent:
 
         # mutate
         loc, param, value = action.get("location"), action.get("param"), action.get("value")
-        if loc not in ("query", "body", "path") or not isinstance(param, str) or not isinstance(value, str):
-            return None, "mutate requires location(query|body|path), param, value"
+        if (loc not in ("query", "body", "path", "json") or not isinstance(param, str)
+                or "value" not in action or not _valid_json_value(value)):
+            return None, "mutate requires location(query|body|path|json), param, value"
+        is_json_body = _looks_like_json(body, _content_type_of(exchange))
+        if not isinstance(value, str) and not (loc in ("body", "json") and is_json_body):
+            where = "a form-encoded body" if loc == "body" else f"location {loc!r}"
+            return None, (f"{where} takes a string value, got {_json_type(value)}; typed values "
+                          "(number, boolean, null, object, array) are only for a JSON body")
         if loc == "path":
-            new_url = _mutate_path_segment(url, param, value)
+            new_url = (_mutate_path_segment(url, param, value)
+                       or _mutate_path_at_captured(url, exchange.url, param, value))
             if new_url is None:
                 return None, f"path segment {param!r} not present on the captured request path"
             return (method, new_url, headers, body), None
@@ -495,12 +591,12 @@ class IterativeAgent:
             if new_url is None:
                 return None, f"query param {param!r} not present on the captured request"
             return (method, new_url, headers, body), None
-        # body
-        ct = _content_type_of(exchange)
-        if _looks_like_json(body, ct):
-            nb = _mutate_json_param(body, param, value)
-        else:
-            nb = _mutate_form_param(body, param, value)
+        if loc == "json":
+            nb, err = _set_json_path(body, param, value)
+            return (None, err) if err else ((method, url, headers, nb), None)
+        # body (top-level field; the JSON helper serialises any JSON value with its type)
+        nb = (_mutate_json_param(body, param, value) if is_json_body
+              else _mutate_form_param(body, param, value))
         if nb is None:
             return None, f"body param {param!r} not present on the captured request"
         return (method, url, headers, nb), None
@@ -712,9 +808,14 @@ class IterativeAgent:
                     on_step(step_obj)
                 except Exception as e:  # a broken UI callback must never kill the run
                     log.debug("on_step callback raised: %s", e)
-        headers_state = {k: v for k, v in (exchange.request_headers or {}).items()
-                         if k.lower() not in ("host", "content-length")}
-        headers_state.setdefault("User-Agent", "harness-iterative-agent/1.0")
+        captured_headers = {k: v for k, v in (exchange.request_headers or {}).items()
+                            if k.lower() not in ("host", "content-length")}
+        captured_headers.setdefault("User-Agent", "harness-iterative-agent/1.0")
+        captured_request = (exchange.url, exchange.request_body or "")
+        # Every edit persists: each step applies to the request the earlier steps
+        # built (headers, URL and body alike) until a reset returns to the capture.
+        headers_state = dict(captured_headers)
+        request_state = captured_request
 
         system = _SYSTEM_PROMPT.format(specialty=specialty)
         diag = result.diagnostics
@@ -820,9 +921,27 @@ class IterativeAgent:
                 emit(IterativeStep(step, action, "(stop)", None, ""))
                 return result
 
+            if kind == "reset":
+                # Back to the captured request. Sends nothing; a reset of an
+                # unchanged request is a rejected no-op (bounded by no_progress).
+                if request_state == captured_request and headers_state == captured_headers:
+                    err = "reset: the request is already the captured request"
+                    diag["rejected_proposals"] += 1
+                    consecutive_no_progress += 1
+                    history.append(f"[step {step}] action rejected: {err}")
+                    emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
+                    continue
+                headers_state, request_state = dict(captured_headers), captured_request
+                history.append(f"[step {step}] reset: later edits apply to the captured request")
+                emit(IterativeStep(step, action, "(reset)", None, "reset to the captured request"))
+                continue
+
+            from_capture = action.get("reset") is True
             built, err = ((None, f"unsupported action {_excerpt(kind, 40)!r}")
                           if kind not in ("mutate", "set_header")
-                          else self._build_request(exchange, action, headers_state))
+                          else self._build_request(
+                              exchange, action, captured_headers if from_capture else headers_state,
+                              captured_request if from_capture else request_state))
             if err:
                 diag["rejected_proposals"] += 1
                 consecutive_no_progress += 1
@@ -830,8 +949,7 @@ class IterativeAgent:
                 emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
                 continue
             method, url, headers, body = built
-            if kind == "set_header":
-                headers_state = headers  # persist
+            headers_state, request_state = headers, (url, body)  # persist
             req_summary = f"{method} {url}" + (f" body={body[:80]}" if body else "")
 
             # Ticket D: reject a duplicate BEFORE transport. The key is built from
@@ -879,7 +997,7 @@ class IterativeAgent:
                 location="header" if kind == "set_header" else str(action.get("location")),
                 name=str(action.get("name") if kind == "set_header" else action.get("param")),
                 value=(_header_value_view(action.get("name"), action.get("value"))
-                       if kind == "set_header" else _excerpt(action.get("value"))),
+                       if kind == "set_header" else _excerpt(_value_text(action.get("value")))),
                 outcome=(f"HTTP {status}, {len(text)} bytes" if status is not None else text),
                 key=key)
             attempts.append(rec)
@@ -904,7 +1022,7 @@ class IterativeAgent:
                 view, signals = _response_view(
                     text, headers=self._last_response_headers,
                     baseline=exchange.response_body or None,
-                    probe=None if kind == "set_header" else action.get("value"))
+                    probe=None if kind == "set_header" else _value_text(action.get("value")))
                 line = f"[step {step}] {req_summary} -> HTTP {status}, {len(text)} bytes"
                 # Shown in full while among the latest _DETAILED_STEPS, then as the short line.
                 tag = f" [attempt {rec.attempt_id}]"
