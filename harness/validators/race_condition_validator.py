@@ -18,6 +18,15 @@ flagged as such in the result -- but a burst producing several
 identical-looking successes to an operation whose own response text
 implies it should be limited is strong circumstantial evidence
 regardless of the exact wording used.
+
+Repeated success alone is still only a LEAD, never a confirmation: plenty of
+mutating operations are legitimately repeatable. Confirming needs a state
+read-back showing more effects than a one-time limit allows. The generic burst
+has no read-back, so it reports not_confirmed with the burst as lead evidence
+(``limitation`` names the gap); only the email-race path, which reads the
+account back, can confirm. Session/token-issuing endpoints (login, token
+grants) are skipped as not applicable -- concurrent logins succeeding is the
+designed behaviour.
 """
 
 from __future__ import annotations
@@ -49,6 +58,23 @@ _REJECTION_MARKERS = re.compile(
 )
 
 _BURST_SIZE = 12
+
+# Path segments of endpoints that ISSUE a session or token. Logging in (or
+# minting a token) N times concurrently and getting N successes is the designed
+# behaviour, not a one-time limit being exceeded.
+_SESSION_ISSUING_SEGMENT = re.compile(
+    r"^(?:log-?in|log-?on|sign-?in|authenticate|oauth2?|token|tokens"
+    r"|refresh(?:-?token)?|access-?token)$", re.IGNORECASE)
+_GRANT_TYPE = re.compile(r"[\"']?grant_type[\"']?\s*[:=]", re.IGNORECASE)
+
+
+def is_session_issuing(exchange) -> bool:
+    """True for a login / token-issuance request: a path segment naming a
+    session-issuing operation, or an OAuth-style grant_type body."""
+    path = urlsplit(exchange.url or "").path or ""
+    if any(_SESSION_ISSUING_SEGMENT.match(seg) for seg in path.split("/") if seg):
+        return True
+    return bool(_GRANT_TYPE.search(exchange.request_body or ""))
 
 
 @dataclass
@@ -141,6 +167,16 @@ class RaceConditionValidator(Validator):
                     evidence="", raw_output="[]",
                 )
 
+            if is_session_issuing(exchange):
+                return ValidationResult(
+                    validator=self.get_name(), status="skipped",
+                    finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
+                    summary="Not applicable: this endpoint issues a session or token. Repeated "
+                            "concurrent logins/token grants are expected to succeed; they are not "
+                            "a single-use operation whose limit a race could exceed.",
+                    evidence="", raw_output="[]",
+                )
+
             if self._is_email_race(exchange):
                 return await self._validate_email_race(finding, exchange)
 
@@ -228,16 +264,25 @@ class RaceConditionValidator(Validator):
                 if looks_clean:
                     clean_successes += 1
 
-            vulnerable = clean_successes >= 2
-            if failures.failures and not vulnerable:
+            # Repeated success is only a LEAD: many operations are legitimately
+            # repeatable. Confirmation needs a state read-back showing more effects
+            # than a one-time limit allows, and this generic burst has no such
+            # read-back (only the email-race path does), so it never confirms.
+            repeated = clean_successes >= 2
+            if failures.failures and not repeated:
                 return failures.result(self.get_name(), finding.vulnerability_class, "Race burst")
-            if vulnerable:
+            limitation = ""
+            if repeated:
                 detail = (
                     f"{clean_successes} of {len(responses)} concurrent requests came back looking like "
                     f"a clean success (status matching the original, no rejection-language markers) -- "
                     f"if this operation is meant to succeed at most once, this is evidence the "
                     f"check-then-act isn't atomic"
                 )
+                limitation = (
+                    "Lead only: repeated success does not show a one-time limit was exceeded. "
+                    "No state read-back of the operation's effect (balance, redemption count, "
+                    "stock) was available to prove more effects than allowed.")
             else:
                 detail = (
                     f"{clean_successes} of {len(responses)} concurrent requests looked like clean "
@@ -248,11 +293,17 @@ class RaceConditionValidator(Validator):
 
             return ValidationResult(
                 validator=self.get_name(),
-                status="confirmed" if vulnerable else "not_confirmed",
+                status="not_confirmed",
                 finding_class=finding.vulnerability_class,
-                confidence=0.7 if vulnerable else 0.2,
-                confirmed=vulnerable,
-                summary=detail,
+                confidence=0.3 if repeated else 0.2,
+                confirmed=False,
+                summary=(f"Lead, not confirmed (no state read-back): {detail}"
+                         if repeated else detail),
+                limitation=limitation,
+                manual_verification=(
+                    "Read back the operation's effect (e.g. balance, coupon use count, stock) "
+                    "after the burst; confirm only if it exceeds the one-time limit."
+                    if repeated else ""),
                 evidence=f"Status code distribution across burst: {status_counts}",
                 raw_output=str({"burst_size": effective_burst_size, "requested_burst_size": self.burst_size,
                                  "completed": len(responses),
