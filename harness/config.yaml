@@ -944,6 +944,13 @@ reporting:
   # measurement overlay (config.local.yaml or the runner's explicit config
   # dict) for blind/no-oracle evaluation.
   gate_uncorroborated_catchall: false
+  # HU-5: append the run handoff (phases not run, unreviewed captures, untouched
+  # worklist nodes, skipped legs) and the target change log (every non-read 2xx
+  # write and its restore status; a failed restore is flagged as an ERROR) to the
+  # Markdown report. Recording is always on and sends nothing; the artifacts live
+  # in runs.output_dir (<run_id>.handoff.json / .changes.json) and at
+  # GET /engagement/{host}/handoff. SHIPPED OFF so a default report is unchanged.
+  handoff_section: false
 
 # HU-1: the operator access matrix (harness/access_matrix.py; GET/PUT
 # /engagement/{host}/access-matrix). The draft and the questions send nothing.

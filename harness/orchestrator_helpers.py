@@ -786,6 +786,34 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     discards it from there to review it again.
 
     Returns the count of captured exchanges that yielded >=1 finding."""
+    from harness import run_handoff
+    _handoff = run_handoff.for_run(run_context)
+    if _handoff is None:
+        return await _review_captured_exchanges(
+            orch, state, captured, max_reviews=max_reviews, run_context=run_context, seen=seen,
+            errors=errors, deadline=deadline, stats=stats, group_identical=group_identical,
+            resumed=resumed, on_review=on_review, summary_out=summary_out,
+            model_failed=model_failed)
+    # HU-5: whatever ends the review (a bound, an error, a cancellation), the handoff
+    # gets the captures it left unreviewed. Bookkeeping only.
+    seen = seen if seen is not None else set()
+    _handoff.attach_state(state)
+    try:
+        return await _review_captured_exchanges(
+            orch, state, captured, max_reviews=max_reviews, run_context=run_context, seen=seen,
+            errors=errors, deadline=deadline, stats=stats, group_identical=group_identical,
+            resumed=resumed, on_review=on_review, summary_out=summary_out,
+            model_failed=model_failed)
+    finally:
+        try:
+            _handoff.note_captures(captured, seen)
+        except Exception:
+            log.debug("handoff capture bookkeeping failed", exc_info=True)
+
+
+async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_context,
+                                     seen, errors, deadline, stats, group_identical,
+                                     resumed, on_review, summary_out, model_failed) -> int:
     produced = 0
     reviewed = 0
     stopped_by = None
@@ -911,6 +939,17 @@ async def universal_header_audit(orch, state, captured, *, max_exchanges: int = 
     Returns the count of exchanges that produced at least one confirmed finding."""
     if not hasattr(orch, 'validator_registry') or orch.validator_registry is None:
         return 0
+
+    # HU-5: every capture starts out unreviewed in the run's handoff, so a run that
+    # stops before capture review still names them. Bookkeeping only.
+    try:
+        from harness import run_handoff
+        _handoff = run_handoff.for_run(run_context)
+        if _handoff is not None:
+            _handoff.attach_state(state)
+            _handoff.note_captures(captured, ())
+    except Exception:
+        log.debug("handoff capture bookkeeping failed", exc_info=True)
 
     audit_validators = orch.validator_registry.header_audit_validators()
     if not audit_validators:
