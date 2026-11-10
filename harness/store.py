@@ -3629,6 +3629,16 @@ def wipe_engagement(host: str) -> dict:
             "DELETE FROM engagement_declarations WHERE host = lower(?) OR host || ':' || port = lower(?)",
             (host, host))
         counts["engagement_declarations"] = cur.rowcount
+        # HU-1: the operator's access-matrix answers for this host, every
+        # engagement (the bare host covers every port, host:port only that one).
+        # The table is created on first save, so a store without it has none.
+        try:
+            cur = conn.execute(
+                "DELETE FROM access_matrix_answers WHERE host = lower(?) "
+                "OR substr(host, 1, length(?) + 1) = lower(?) || ':'", (host, host, host))
+            counts["access_matrix_answers"] = cur.rowcount
+        except sqlite3.OperationalError:
+            counts["access_matrix_answers"] = 0
 
         conn.commit()
         return counts

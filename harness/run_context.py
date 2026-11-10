@@ -946,7 +946,8 @@ class TargetTransport:
                 ctx.self_ownership.observe(
                     source="transport", method=method, url=url, status=resp.status_code,
                     principal_id=session.principal_id if session and credential_destination else "",
-                    response_body=resp.text)
+                    response_body=resp.text,
+                    request_body=body if isinstance(body, str) else None)
             return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
                                     headers=dict(resp.headers), final_url=url,
                                     artifact=self._artifact(

@@ -170,6 +170,42 @@ class WipeEndpointTests(unittest.TestCase):
         self.assertEqual(store.all_host_findings(url_a, include_suppressed=True), [])
         self.assertEqual(len(store.all_host_findings(url_b)), 1)
 
+    def test_wipe_clears_this_hosts_access_matrix_answers_only(self):
+        """r7: the per-host wipe left the operator's access-matrix answers behind.
+        Answers for a.example.com (every port when the bare host is wiped) go;
+        another host's answers -- including one whose name starts with the wiped
+        host's -- survive (the control)."""
+        from harness import access_matrix
+        answer = [{"role": "user", "object_type": "Note", "action": "read", "answer": "owner_only"}]
+        for host in ("a.example.com", "a.example.com:8443", "b.example.com",
+                     "a.example.com.evil.test"):
+            access_matrix.save_answers(host, answer, operator="tester")
+            access_matrix.save_answers(host, answer, operator="tester", engagement_id="eng-2")
+        self.server._WIPE_ENDPOINT_ENABLED = True
+
+        resp = self.client.delete(
+            "/engagement/a.example.com/evidence",
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["wiped"]["access_matrix_answers"], 4)
+        for host in ("a.example.com", "a.example.com:8443"):
+            self.assertEqual(access_matrix.load_answers(host), [])
+            self.assertEqual(access_matrix.load_answers(host, engagement_id="eng-2"), [])
+        for host in ("b.example.com", "a.example.com.evil.test"):
+            self.assertEqual(len(access_matrix.load_answers(host)), 1, host)
+            self.assertEqual(len(access_matrix.load_answers(host, engagement_id="eng-2")), 1, host)
+
+    def test_wipe_without_an_answers_table_reports_zero(self):
+        self.server._WIPE_ENDPOINT_ENABLED = True
+        resp = self.client.delete(
+            "/engagement/a.example.com/evidence",
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["wiped"]["access_matrix_answers"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

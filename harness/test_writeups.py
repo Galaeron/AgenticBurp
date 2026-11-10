@@ -82,6 +82,32 @@ class WriteupCallerTests(unittest.TestCase):
             self.assertEqual(Path(paths[0]).read_text(encoding="utf-8"), md)
 
     # --- negative control: an unproven candidate ----------------------------------
+    # --- r7: a captured session is never named as the principal "captured" ---------
+    def _principals_line(self, md: str) -> str:
+        return next(l for l in md.splitlines() if l.startswith("- Principals: "))
+
+    def test_captured_session_is_named_by_the_principal_the_verdict_maps_it_to(self):
+        """The proof case's principal is the session ref "captured"; the verdict says
+        the captured read was bob's, so the write-up names bob and never "captured"."""
+        self._prove_cross_owner_read()
+        md = self._writeup()["markdown"]
+        self.assertEqual(self._principals_line(md), "- Principals: `alice` and `bob`")
+        self.assertNotIn("`captured", md)
+        self.assertNotIn(writeups.UNMAPPED_CAPTURED, md)
+
+    def test_unmapped_captured_session_gets_the_neutral_label(self):
+        """No mapping in the verdict and no attribution: the neutral label, never a
+        quoted principal "captured"; the template stays fact-bound."""
+        self._prove_cross_owner_read()
+        with patch.object(writeups, "_CAPTURED_BY_PATTERNS", ()),                 patch.object(writeups, "_OWNER_PATTERNS", ()):
+            md = self._writeup()["markdown"]
+        self.assertNotIn("`captured", md)
+        self.assertEqual(self._principals_line(md),
+                         f"- Principals: {writeups.UNMAPPED_CAPTURED} and `bob`")
+        impact = md.split("## Impact", 1)[1].split("##", 1)[0]
+        self.assertIn(f"`bob` read an object of {writeups.UNMAPPED_CAPTURED} at `GET /objects/7`",
+                      impact)
+
     def test_unproven_candidate_gets_no_writeup(self):
         resp = self.h._analyze("/objects/7")    # nothing declared: a supported lead only
         self.assertFalse(self.h._finding(resp).confirmed)
@@ -183,6 +209,58 @@ class FactBindingUnitTests(unittest.TestCase):
             with self.subTest(bad):
                 self.assertTrue(writeups.fact_binding_violations(md + f"\n\nAlso {bad}.", self.FACTS,
                                                                  allowed_text=hint))
+
+
+class CapturedNamingUnitTests(unittest.TestCase):
+    def setUp(self):
+        from harness import store
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = store._DB_PATH
+        store._DB_PATH = Path(self._tmp.name) / "state.db"
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(setattr, store, "_DB_PATH", self._orig)
+
+    def _observe(self, token: str, principal_ref: str | None, capture_id: str) -> str:
+        from harness import store
+        from harness.models import HttpExchange
+        exchange = HttpExchange(url="http://127.0.0.1:9/things/3", method="GET",
+                                request_headers={"Authorization": token}, response_status=200,
+                                response_headers={}, response_body="{}", capture_id=capture_id)
+        store.record_observation(exchange, attribution={"principal_ref": principal_ref}
+                                 if principal_ref else None)
+        return store.captured_principal_id(exchange)
+
+    def _name(self, label, texts=(), captured_principal=None):
+        return writeups._name_captured(label, texts=list(texts), engagement_id="",
+                                       captured_principal=captured_principal)
+
+    def test_attributed_captured_context_is_named_by_its_principal(self):
+        ctx = self._observe("Bearer synthetic-a", "carol", "c1")
+        self.assertTrue(ctx.startswith("captured:"))
+        self.assertEqual(self._name(ctx), "carol")
+        self.assertEqual(self._name("captured", captured_principal=ctx), "carol")
+
+    def test_unattributed_or_ambiguous_context_stays_unmapped(self):
+        bare = self._observe("Bearer synthetic-b", None, "c2")
+        self.assertEqual(self._name(bare), writeups.UNMAPPED_CAPTURED)
+        two = self._observe("Bearer synthetic-c", "dave", "c3")
+        self._observe("Bearer synthetic-c", "erin", "c4")       # same context, two principals
+        self.assertEqual(self._name(two), writeups.UNMAPPED_CAPTURED)
+        self.assertEqual(self._name("captured"), writeups.UNMAPPED_CAPTURED)
+
+    def test_control_a_named_principal_is_unchanged(self):
+        for name in ("alice", "captured_user", "capturedx", "anonymous"):
+            with self.subTest(name):
+                self.assertEqual(self._name(name, texts=["the captured read by 'bob'"]), name)
+
+    def test_unmapped_label_renders_as_prose_and_stays_bound(self):
+        facts = dict(FactBindingUnitTests.FACTS, owner=writeups.UNMAPPED_CAPTURED,
+                     principals=[writeups.UNMAPPED_CAPTURED, "u2"])
+        md = writeups.render(facts)
+        self.assertIn(f"`u2` read an object of {writeups.UNMAPPED_CAPTURED} at", md)
+        self.assertNotIn(f"`{writeups.UNMAPPED_CAPTURED}`", md)
+        hint = (report_generator._remediation_for("idor"),)
+        self.assertEqual(writeups.fact_binding_violations(md, facts, allowed_text=hint), [])
 
 
 if __name__ == "__main__":

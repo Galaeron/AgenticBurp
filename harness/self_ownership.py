@@ -78,8 +78,11 @@ _EMAIL_KEYS = ("email", "umail", "mail")
 
 
 def _stem(segment: str) -> str:
-    s = re.sub(r"[^a-z0-9]", "", segment.lower())
-    return s[:-1] if s.endswith("s") and len(s) > 1 else s
+    """The object-type key of a collection segment: the shared harness.naming
+    rule, so a fact keys the same type the business objects and the access
+    matrix name ("statuses" and "status" agree; "address" is never "addres")."""
+    from harness.naming import object_key
+    return object_key(segment)
 
 
 def _scalar(value) -> str:
@@ -178,11 +181,15 @@ class SelfOwnership:
         self._routes: dict[tuple, dict | None] = {}
         self._samples: dict[tuple, list] = {}
         self._agent_calls = 0
+        # Object-type key -> how a principal of this run CREATED one (method, path,
+        # id pointer, the redacted request body it sent): mechanics an experiment
+        # can replay when nobody declared an access expectation for the type.
+        self._creates: dict[str, dict] = {}
 
     # -- recording ---------------------------------------------------------------
 
     def observe(self, *, source: str, principal_id: str, method: str, url: str,
-                status, response_body: str) -> list[str]:
+                status, response_body: str, request_body: str | None = None) -> list[str]:
         """Record what one harness-observed exchange says about ownership. Returns
         the facts recorded (provenance strings); [] when it says nothing."""
         if source not in HARNESS_SOURCES:
@@ -223,12 +230,59 @@ class SelfOwnership:
             top = doc.get("data") if isinstance(doc.get("data"), dict) else doc
             oid = _scalar(top.get("id"))
             if oid:
-                recorded += self._own(origin, last, oid, _Owner(principal=principal),
-                                      f"id returned by POST {parts.path} as {principal}",
-                                      route=f"{parts.path.rstrip('/')}/{{id}}")
+                owned = self._own(origin, last, oid, _Owner(principal=principal),
+                                  f"id returned by POST {parts.path} as {principal}",
+                                  route=f"{parts.path.rstrip('/')}/{{id}}")
+                recorded += owned
+                if owned and not any(_ID_SEGMENT.match(s) for s in segments):
+                    self._record_create(last, parts.path, "/data/id" if top is not doc else "/id",
+                                        request_body)
         if not recorded and method in ("GET", "POST"):
             recorded = self._agent_route(origin, method, segments, principal, doc)
         return recorded
+
+    def _record_create(self, collection: str, path: str, pointer: str, request_body) -> None:
+        key = _stem(collection)
+        if key in self._creates:
+            return
+        spec = {"method": "POST", "path": path, "id_pointer": pointer}
+        if isinstance(request_body, str) and request_body.strip():
+            from harness import security
+            body = security.redact_secrets_in_body(request_body)
+            try:
+                spec["body"] = json.loads(body)
+            except (TypeError, ValueError):
+                spec["body"] = body[:4096]
+        self._creates[key] = spec
+
+    def owned_type(self, name: str) -> dict | None:
+        """What this run observed about objects of type `name` being owned per
+        principal, or None when it observed nothing usable.
+
+        Usable means: at least one object of the type owned by a run principal
+        (created by it, or served as its own account's object), and NO object of
+        the type that two different accounts were both served -- that one may be
+        shared, so nothing is inferred for the type. Returns {"principals":
+        [ids], "objects": count, "create": {...} or None}; `create` is how a
+        principal created one (no ids in its path), when that was observed."""
+        key = _stem(name or "")
+        principals: set = set()
+        objects = 0
+        for (stem, _oid), (owner, _prov) in self._objects.items():
+            if stem != key:
+                continue
+            if owner is None:
+                return None
+            owners = ({owner.principal} if owner.principal else
+                      {p for p, acc in self._accounts.items() if acc & set(owner.account)})
+            if owners:
+                principals |= owners
+                objects += 1
+        if not principals:
+            return None
+        create = self._creates.get(key)
+        return {"principals": sorted(principals), "objects": objects,
+                "create": dict(create) if create else None}
 
     # -- agent-classified routes ---------------------------------------------------
     #
