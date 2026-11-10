@@ -606,6 +606,16 @@ def shape_precondition_findings(exchange: HttpExchange) -> list[Finding]:
     capture through analyze()). GET only: the forge leg replays the request
     several times, and on a write that is several writes."""
     out: list[Finding] = []
+    # Capture-level exposure sweep: a captured GET whose response holds an
+    # unmasked allowlisted credential-secret field is tried against the exposure
+    # oracle even when no agent raised a finding on it (kept only if confirmed).
+    from harness.validators.api_security_validator import exposure_evidence
+    if exposure_evidence(None, exchange):
+        out.append(Finding(
+            vulnerability_class="excessive data exposure", confidence=0.3, severity="high",
+            summary=f"Exposure precondition: the captured GET {exchange.url} returns an "
+                    f"unmasked credential-secret field",
+            evidence="", suggested_test="", basis="derived"))
     if (exchange.method or "GET").upper() == "GET" and _carries_jwt(exchange.request_headers):
         out.append(Finding(
             vulnerability_class="jwt", confidence=0.3, severity="high",

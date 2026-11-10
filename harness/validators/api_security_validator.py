@@ -32,6 +32,12 @@ was refused), never that the endpoint is safe.
    registered sessions and observed account identifiers, never from a merely
    different id. A second read as the caller must show the same value and an
    anonymous read is the control.
+   Routed by response evidence as well as by label: a finding of any class
+   (BOLA, BFLA, IDOR, info disclosure...) on a captured GET whose response or
+   evidence body holds an allowlisted field with an unmasked value also reaches
+   this check (`exposure_fields`), in addition to its own validator. An
+   operator access-matrix answer that the caller may read the object type
+   (`allowed`) stops a confirmation on another account's object.
 
 API-versioning/inventory issues stay agent-only (whether an endpoint "looks"
 deprecated or internal is judgment), and this validator says so explicitly.
@@ -102,6 +108,35 @@ def _field_key(key) -> str:
     return re.sub(r"[^a-z0-9]", "", str(key).lower())
 
 
+# Compound secret-like names ("<prefix>Token", "client_secret", "private-key"),
+# counted ONLY on another account's object: the last word names a credential.
+_COMPOUND_LAST = frozenset({"token", "secret", "password", "passwd", "apikey"})
+_COMPOUND_PAIRS = frozenset({("api", "key"), ("private", "key")})
+_COMPOUND_EXCLUDED = frozenset({"csrf", "xsrf"})
+_NON_SECRET_LAST = frozenset({"type", "expires", "expiry", "at", "length", "len"})
+_MIN_COMPOUND_LEN = 8
+
+
+def _key_words(key) -> list[str]:
+    """camelCase, snake_case and kebab-case key split into lowercase words."""
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(key))
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    return [w for w in re.split(r"[^A-Za-z0-9]+", text.lower()) if w]
+
+
+def _compound_secret(key, value) -> bool:
+    """A compound key whose last word names a credential, holding a value that
+    can carry one: never a csrf/xsrf token, a *_type/*_expires/*_at/*length
+    attribute, a boolean or a short enum-like value."""
+    words = _key_words(key)
+    if len(words) < 2 or _COMPOUND_EXCLUDED & set(words) or words[-1] in _NON_SECRET_LAST:
+        return False
+    if words[-1] not in _COMPOUND_LAST and tuple(words[-2:]) not in _COMPOUND_PAIRS:
+        return False
+    return (isinstance(value, str) and len(value.strip()) >= _MIN_COMPOUND_LEN
+            and _secret_value(value))
+
+
 def _secret_value(value) -> bool:
     """True for a value that can carry a secret: a non-empty scalar that is not
     a fixed placeholder, not masked, and not prose (a label has whitespace)."""
@@ -152,8 +187,10 @@ def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
             object_path = path
         for key, item in value.items():
             field = _field_key(key)
-            if (owner and field in _SECRET_FIELDS and _secret_value(item)
-                    and (owner != caller_id or field in _SELF_SECRETS)):
+            exact = (field in _SECRET_FIELDS and _secret_value(item)
+                     and (owner != caller_id or field in _SELF_SECRETS))
+            # A compound name counts only on another account's object.
+            if owner and (exact or (owner != caller_id and _compound_secret(key, item))):
                 digest = hashlib.sha256(str(item).encode()).hexdigest()[:16]
                 hits.append((f"{path}.{key}", owner, object_path, digest))
             if isinstance(item, (dict, list)):
@@ -161,6 +198,64 @@ def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
 
     walk(doc, "$", "", "", 0)
     return hits
+
+
+def _json_docs(text):
+    """The JSON value in `text`: the whole text, else the first object or list
+    embedded in it (an evidence excerpt with a prefix). None when there is none."""
+    text = text or ""
+    if not text.strip():
+        return None
+    try:
+        return jsonlib.loads(text)
+    except ValueError:
+        pass
+    starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+    if not starts:
+        return None
+    try:
+        return jsonlib.JSONDecoder().raw_decode(text, min(starts))[0]
+    except ValueError:
+        return None
+
+
+def exposure_fields(text) -> list[str]:
+    """Paths of every allowlisted credential-secret field (_SECRET_FIELDS) that
+    holds an unmasked value (_secret_value) in a JSON text. Ownership is not
+    decided here -- this is the routing signal, never a confirmation."""
+    doc = _json_docs(text)
+    found: list[str] = []
+
+    def walk(value, path, depth):
+        if depth > _MAX_WALK_DEPTH or len(found) >= 50:
+            return
+        if isinstance(value, list):
+            for i, item in enumerate(value[:_MAX_LIST_ITEMS]):
+                walk(item, f"{path}[{i}]", depth + 1)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                if ((_field_key(key) in _SECRET_FIELDS and _secret_value(item))
+                        or _compound_secret(key, item)):
+                    found.append(f"{path}.{key}")
+                if isinstance(item, (dict, list)):
+                    walk(item, f"{path}.{key}", depth + 1)
+
+    if isinstance(doc, (dict, list)):
+        walk(doc, "$", 0)
+    return found
+
+
+def exposure_evidence(finding, exchange) -> list[str]:
+    """Allowlisted secret fields a finding's captured GET carries in a 2xx (or
+    unrecorded-status) response body or in the finding's own evidence body.
+    Empty for any other method: the exposure check replays a GET only."""
+    if exchange is None or (getattr(exchange, "method", "") or "GET").upper() != "GET":
+        return []
+    status = getattr(exchange, "response_status", None)
+    found = []
+    if status is None or 200 <= status < 300:
+        found = exposure_fields(getattr(exchange, "response_body", "") or "")
+    return found or exposure_fields(getattr(finding, "evidence", "") or "")
 
 
 @dataclass
@@ -279,6 +374,15 @@ class ApiSecurityValidator(Validator):
     def get_execution_plane(self) -> str:
         return "local_tool"
 
+    def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
+        """By label, or -- whatever the label -- by an allowlisted unmasked secret
+        field in the captured GET's response or the finding's evidence body."""
+        return super().applies(finding, exchange) or bool(exposure_evidence(finding, exchange))
+
+    def _routed_by_evidence(self, finding, exchange) -> bool:
+        return (not super().applies(finding, exchange)
+                and bool(exposure_evidence(finding, exchange)))
+
     def plan(self, finding: Finding, exchange: HttpExchange) -> Any:
         from harness.models import TestPlan
         from harness.categories import canonicalize
@@ -309,7 +413,7 @@ class ApiSecurityValidator(Validator):
         tests: list[ApiSecurityTestResult] = []
         fc = finding.vulnerability_class.lower().replace("_", " ")
 
-        if "excessive data exposure" in fc:
+        if "excessive data exposure" in fc or self._routed_by_evidence(finding, exchange):
             return await self._probe_exposure(finding, exchange)
 
         if "versioning" in fc or "inventory" in fc:
@@ -456,6 +560,18 @@ class ApiSecurityValidator(Validator):
             return result("not_confirmed", "The credential-like value changed between two reads "
                                            "as the same principal (a per-response value, not a "
                                            "stored secret)").with_artifacts(baseline=baseline, attack=attack)
+        allowed = self._declared_visible(exchange, caller)
+        if allowed is not None:
+            declared = [h for h in stable if h[1] != caller.id]
+            stable = [h for h in stable if h[1] == caller.id]
+            if not stable:
+                return result("not_confirmed",
+                              f"The access matrix declares that {caller.id} "
+                              f"(role {allowed['role']}) may {allowed['action']} "
+                              f"{allowed['object_type']} objects (operator "
+                              f"{allowed['operator']}); {len(declared)} other-account "
+                              "credential field(s) are not an exposure under that "
+                              "expectation").with_artifacts(baseline=baseline, attack=attack)
         control = await send(False)
         if not control.ok:
             return unsent(control, "anonymous control")
@@ -469,6 +585,26 @@ class ApiSecurityValidator(Validator):
         return result("confirmed", f"Credential-secret exposure confirmed: GET {exchange.url} as "
                                    f"{caller.id} returns {len(stable)} unmasked credential field(s)",
                       evidence).with_artifacts(baseline=baseline, attack=attack, controls=[control])
+
+    @staticmethod
+    def _declared_visible(exchange, caller) -> dict | None:
+        """The operator's access-matrix answer `allowed` for the caller (by role,
+        account id or `*`) reading this route's object type, else None. A
+        proposed, `unknown` or restrictive answer is never returned, so only an
+        explicit operator answer can stop a confirmation."""
+        from harness import access_matrix
+        from harness.engagement import normalize_path
+        try:
+            shape = access_matrix.object_and_action("GET", normalize_path(exchange.url))
+            if shape is None:
+                return None
+            found = access_matrix.expectation_for(
+                None, urlparse(exchange.url).netloc, getattr(caller, "role", "") or "",
+                shape[0], shape[1], principal_id=str(caller.id))
+        except Exception:
+            log.debug("access-matrix lookup failed", exc_info=True)
+            return None
+        return found if found and found.get("answer") == "allowed" else None
 
     @staticmethod
     def _exposure_accounts(identities, run, principal_for) -> dict:
