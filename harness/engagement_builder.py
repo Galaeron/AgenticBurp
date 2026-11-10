@@ -132,6 +132,7 @@ async def build_engagement(
                         spa_views.append({"principal": role.principal_id(),
                                           "views": len(crawl.views),
                                           "exchanges": len(crawl.exchanges),
+                                          "refused": list(getattr(crawl, "refused", []) or []),
                                           "stopped_by": crawl.stopped_by})
                         seed_errors.extend("browser spa crawl: " + e for e in crawl.errors)
                         continue
