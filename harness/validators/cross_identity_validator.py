@@ -32,11 +32,16 @@ logic (authorization_boundary_compare):
 
 Write leg (B1-T2, PUT/PATCH/DELETE): only with validators.allow_mutating_replay
 and the run's safety gate. Owner baseline read, one write as a non-privileged
-other principal changing one field to a unique marker, owner read-back, then a
+other principal changing one field (a string to a unique marker; when the write
+carries no eligible string, a number or boolean to a distinct value of its type;
+never an id, foreign key, owner/user reference, role or credential -- a fixed
+denylist), owner read-back (a single-object response envelope such as
+{"status": ..., "data": {...}} is unwrapped; a list envelope is not), then a
 MANDATORY restore check (in `finally`): a restore is sent only when a write went
 out and no owner read shows the object unchanged (a denied write sends none),
 PATCH restores only the changed field, and the restore is verified against the
-whole object minus volatile keys (timestamps, versions). A baseline with masked
+whole object minus volatile keys (timestamps, versions), and its outcome is
+recorded on the run's change log (run_handoff.mark_restore). A baseline with masked
 values is refused before any full-object write. One per-object lock spans
 baseline to verification. A failed restore is a logged `error`. Confirmed only
 when the marker persisted on an object declared to another principal; an
@@ -305,6 +310,112 @@ def _stable(obj):
                 if not _VOLATILE_KEY.match(re.sub(r"[^a-z0-9]", "", str(k).lower()))}
     if isinstance(obj, list):
         return [_stable(v) for v in obj]
+    return obj
+
+
+# r7: the fixed denylist of fields the write leg never mutates, whatever their
+# type: identifiers and foreign keys (`id`, `*Id`, `*_id`, `*ID`, uuids), owner /
+# user references, privilege or role fields, and credentials or secrets. Changing
+# any of them could move the object to another principal, change who may act on
+# it, or lock its owner out -- none of which a restore can be trusted to undo.
+_ID_FIELD = re.compile(r"(?:^(?:id|uid|uuid|guid)$|[_\-.](?:id|uid|uuid|guid)$|uuid$)",
+                       re.IGNORECASE)
+_CAMEL_ID_FIELD = re.compile(r"[a-z0-9](?:Id|ID|Uuid|UUID)$")
+# Matched anywhere in the normalized (lower-case, alphanumeric) key.
+_PROTECTED_FIELD_WORDS = (
+    # owner / user / account references
+    "owner", "user", "author", "creator", "createdby", "account", "customer",
+    "tenant", "member", "principal", "email", "login",
+    # privilege / role
+    "role", "admin", "privilege", "permission", "superuser", "access",
+    # credentials / secrets
+    "password", "passwd", "passphrase", "secret", "token", "apikey", "credential",
+    "totp", "session", "cookie",
+)
+# Short words matched only as the whole normalized key, so "shipping" or
+# "keyword" is not mistaken for a PIN or a key.
+_PROTECTED_FIELD_EXACT = frozenset({
+    "pin", "otp", "mfa", "key", "hash", "salt", "acl", "scope", "scopes", "grant",
+    "grants", "group", "groups", "staff", "isstaff", "level", "tier", "plan",
+})
+
+
+def _protected_field(key) -> bool:
+    """True for a field on the fixed write-leg denylist (see _ID_FIELD)."""
+    raw = str(key or "")
+    if _ID_FIELD.search(raw) or _CAMEL_ID_FIELD.search(raw):
+        return True
+    norm = re.sub(r"[^a-z0-9]", "", raw.lower())
+    return (not norm or norm in _PROTECTED_FIELD_EXACT
+            or any(word in norm for word in _PROTECTED_FIELD_WORDS))
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _mutation_for(value):
+    """A distinct value of the same JSON type as `value`, or None when this type
+    is not a supported mutation target. A string gets a unique marker; a number is
+    moved by one (the smallest change a validating server is likely to accept);
+    a boolean is flipped."""
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, float):
+        return value + 1.0
+    if isinstance(value, str):
+        return "harness_authz_" + secrets.token_hex(12)
+    return None
+
+
+def _choose_write_field(captured: dict, original: dict):
+    """The field the write leg mutates and restores: a key the captured write
+    itself sent, that the owner's read returns with a scalar value, and that is not
+    volatile or on the fixed denylist. A string is preferred (its unique marker
+    cannot collide); a number or boolean is used only when no string qualifies."""
+    eligible = [k for k in captured
+                if k in original and not _protected_field(k)
+                and not _VOLATILE_KEY.match(re.sub(r"[^a-z0-9]", "", str(k).lower()))]
+    for k in eligible:
+        if isinstance(original[k], str):
+            return k
+    for k in eligible:
+        if _is_number(original[k]) or isinstance(original[k], bool):
+            return k
+    return None
+
+
+# Member names that conventionally WRAP a single returned object in a response
+# envelope ({"status": "success", "data": {...}}). Only these are unwrapped, and
+# only when every other member is a scalar (status, message, code): a real object
+# that merely has one nested sub-object is never mistaken for an envelope.
+_ENVELOPE_KEYS = frozenset({"data", "result", "item", "object", "record", "payload",
+                            "resource", "entity", "body", "response", "value"})
+
+
+def _unwrap_envelope(obj):
+    """The single object `obj` wraps, else `obj` unchanged. Unwraps a one-member
+    dict (the earlier rule) or a generic envelope: exactly one non-scalar member,
+    under a conventional envelope key, holding a non-empty dict, with only scalar
+    siblings. A list envelope ({"data": [...]}) returns None: a collection is not
+    a single restorable object."""
+    for _ in range(3):
+        if not isinstance(obj, dict):
+            break
+        if len(obj) == 1 and isinstance(next(iter(obj.values())), dict):
+            obj = next(iter(obj.values()))
+            continue
+        nested = [k for k, v in obj.items() if isinstance(v, (dict, list))]
+        if len(nested) == 1 and str(nested[0]).lower() in _ENVELOPE_KEYS:
+            inner = obj[nested[0]]
+            if isinstance(inner, list):
+                return None   # a collection envelope, not one object
+            if inner:
+                obj = inner
+                continue
+        break
     return obj
 
 
@@ -793,15 +904,9 @@ class CrossIdentityValidator(Validator):
             if answer is None or not answer.ok or not 200 <= (answer.status or 0) < 300:
                 return None
             try:
-                obj = json.loads(answer.body)
+                obj = _unwrap_envelope(json.loads(answer.body))
             except (ValueError, TypeError):
                 return None
-            for _ in range(3):
-                if isinstance(obj, dict) and len(obj) == 1 and isinstance(
-                        next(iter(obj.values())), dict):
-                    obj = next(iter(obj.values()))
-                else:
-                    break
             return obj if isinstance(obj, dict) and obj else None
 
         baseline = await send("GET", owner)
@@ -814,13 +919,14 @@ class CrossIdentityValidator(Validator):
             captured = {}
         if not isinstance(captured, dict):
             captured = {}
-        forbidden = {"id", "owner", "ownerid", "userid", "role", "password", "token",
-                     "email", "username", "apikey", "sessiontoken", "totpsecret"}
-        field = next((k for k in captured if isinstance(original.get(k), str)
-                      and re.sub(r"[^a-z0-9]", "", k.lower()) not in forbidden
-                      and not _VOLATILE_KEY.match(re.sub(r"[^a-z0-9]", "", k.lower()))), None)
+        # r7: a string field is preferred, else a number or boolean; never an
+        # identifier, foreign key, owner/user reference, role or credential.
+        field = _choose_write_field(captured, original)
         if method != "DELETE" and field is None:
-            return self._skip(fc, "No existing non-credential string field in the captured write to restore")
+            return self._skip(fc, "No restorable field in the captured write: it carries no "
+                                  "existing string, number or boolean field outside the fixed "
+                                  "denylist (identifiers, foreign keys, owner/user references, "
+                                  "roles, credentials); nothing was written")
         # A full-object write (the PUT attack, its restore, and the DELETE
         # recreation PUT) sends the owner's GET body back. A read that masks a
         # value would turn that into an overwrite with the mask, so refuse the
@@ -832,7 +938,12 @@ class CrossIdentityValidator(Validator):
         if masked:
             return self._skip(fc, "Owner baseline is not safely round-trippable (masked/redacted "
                                   "value at " + ", ".join(masked[:5]) + "); nothing was written")
-        marker = "harness_authz_" + secrets.token_hex(12)
+        marker = (_mutation_for(original[field]) if field is not None
+                  else "harness_authz_" + secrets.token_hex(12))
+        if marker is None or (field is not None and marker == original[field]):
+            return self._skip(fc, f"Field {field!r} has no distinct value of its type to write; "
+                                  "nothing was written")
+        string_marker = isinstance(marker, str)
         attack_body = ({**original, field: marker} if method == "PUT" else {field: marker})
         # Minimal restore: PATCH sends back only the changed field; PUT (and the
         # DELETE recreation PUT) must carry the whole object.
@@ -850,7 +961,10 @@ class CrossIdentityValidator(Validator):
         def matches_original(obj) -> bool:
             # The whole object minus volatile keys (timestamps, versions, etags the
             # server rewrites on every save), and no trace of the marker.
-            return (obj is not None and marker not in json.dumps(obj)
+            # A numeric/boolean marker is not unique text, so only the whole-object
+            # equality (which includes the field) speaks for it.
+            return (obj is not None
+                    and not (string_marker and marker in json.dumps(obj))
                     and _stable(obj) == _stable(original))
 
         def changed(observed):
@@ -892,7 +1006,9 @@ class CrossIdentityValidator(Validator):
                     need = True   # the attack may have committed; undo it
             if not need:
                 return None, check, False
-            undo = await send(restore_method, owner, restore_body, cleanup=True)
+            from harness import run_handoff
+            with run_handoff.restore_scope(f"{case_ref}:cross_identity_restore"):
+                undo = await send(restore_method, owner, restore_body, cleanup=True)
             check = await send("GET", owner, cleanup=True)
             return undo, check, True
 
@@ -927,6 +1043,7 @@ class CrossIdentityValidator(Validator):
                           and matches_original(object_body(restored)))
         else:
             restore_ok = True
+        self._record_restore(attack, restore_sent, restore_ok, undo, exchange.url)
         evidence = (f"object={exchange.url}; owner/baseline={_principal_for(owner).id}; "
                     f"writer={_principal_for(other).id}; method={method}; "
                     f"field={field or '[deleted object]'}; marker={marker}; "
@@ -937,7 +1054,7 @@ class CrossIdentityValidator(Validator):
         if not restore_ok:
             # Loud: the target may still hold the marker (or lack the object).
             message = ("RESTORE FAILED: the original state of " + exchange.url + " could not be "
-                       "restored and verified; the target may still hold " + marker
+                       "restored and verified; the target may still hold " + repr(marker)
                        + " -- restore it manually. " + evidence + (" " + failure if failure else ""))
             log.error(message)
             if cancelled:
@@ -992,6 +1109,25 @@ class CrossIdentityValidator(Validator):
                      f"principal may modify it."),
             evidence=evidence + "; " + self._ownership_provenance(exchange),
         ).with_artifacts(baseline=baseline, attack=attack, controls=controls)
+
+    def _record_restore(self, attack, restore_sent: bool, restore_ok: bool, undo, url: str) -> None:
+        """Record the write leg's restore outcome on the run's change log (HU-5
+        run_handoff.mark_restore): `restored`, or a loud `restore_failed`. Only a
+        write that went out and was recorded (it ended 2xx) has an entry to mark.
+        Bookkeeping only: never raises, never sends."""
+        artifact = getattr(attack, "artifact_id", "") if attack is not None else ""
+        if not artifact or self.run_context is None:
+            return
+        if restore_sent:
+            detail = (f"cross_identity restore {'verified' if restore_ok else 'NOT verified'} "
+                      f"(restore HTTP {getattr(undo, 'status', None)}) on {url}")
+        else:
+            detail = f"cross_identity: owner read showed {url} unchanged; no restore needed"
+        try:
+            from harness import run_handoff
+            run_handoff.mark_restore(self.run_context, [artifact], ok=restore_ok, detail=detail)
+        except Exception:
+            log.debug("cross_identity: mark_restore failed", exc_info=True)
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         token = _ownership_method.set(exchange.method)
