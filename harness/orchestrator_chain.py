@@ -336,11 +336,24 @@ def _missing_auth_class(vc: str, method: str) -> bool:
     return "unauthenticated" in low or (("expos" in low or "disclos" in low) and "admin" in low)
 
 
-def _access_control_shape_gap(exchange) -> str:
-    """Why neither cross-identity nor idor-read can test this request ('' if one can)."""
-    from harness.validators.cross_identity_validator import CrossIdentityValidator
+def _access_control_shape_gap(exchange, xval=None) -> str:
+    """Why neither cross-identity nor idor-read can test this request ('' if one can).
+
+    A captured object write (PUT/PATCH/DELETE) is testable by `xval`'s write leg
+    when that validator was built with mutating replay permitted (B1-T2). r7: this
+    gate predated the write leg and refused every non-GET, so a write-method BOLA
+    finding never reached cross_identity even with allow_mutating_replay on."""
+    from harness.validators.cross_identity_validator import CrossIdentityValidator, _WRITE_METHODS
     from harness.validators.idor_read_validator import _locate_id
     method = (exchange.method or "GET").upper()
+    if method in _WRITE_METHODS:
+        if xval is None or not xval.write_admitted(method):
+            return (f"cross-identity write authorization for a {method} request needs "
+                    f"validators.allow_mutating_replay (and, for DELETE, a "
+                    f"delete_restore_method=PUT contract); idor-read replays GET reads only")
+        if CrossIdentityValidator.shape_applies(exchange):
+            return ""
+        return f"no object identifier in this {method} request to test write authorization on"
     if method != "GET":
         return f"cross-identity and idor-read replay GET reads only; this is a {method} request"
     if CrossIdentityValidator.shape_applies(exchange) or _locate_id(exchange) is not None:
@@ -1737,13 +1750,15 @@ class ChainMixin:
                     return
             elif (access_control_gate._is_access_control_class(vc)
                   and not _authentication_only_class(vc)):
-                _gap = _access_control_shape_gap(exchange)
+                _gap = _access_control_shape_gap(exchange, _xval)
                 if _gap:
                     # No baseline GET to a POST route, no replay of a list read.
                     _record_no_applicable_leg(finding, "cross-identity", _gap)
                     return
                 # populate the candidate baseline: the probe role's own response.
-                if exchange.response_status is None and scope_discovery.is_host_allowed(exchange.url, self.allowed_hosts):
+                # A write takes its own owner baseline inside the write leg.
+                if (_method == "GET" and exchange.response_status is None
+                        and scope_discovery.is_host_allowed(exchange.url, self.allowed_hosts)):
                     # W-16: baseline read through the single TargetTransport (this run's
                     # when present, else a standalone one). send_creds forwards the probe
                     # role's own credentials; max_redirects=0 == follow_redirects=False.
