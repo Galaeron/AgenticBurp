@@ -535,12 +535,15 @@ class ValidatorRegistry:
             if not password or not user:
                 return decision("needs_prerequisite", "missing_credentials", "captured username/password fields are required")
         if family == "nosql":
-            from .nosql_validator import _credential_names
-            if method != "POST" or "login" not in path:
-                return decision("unsupported", "unsupported_boundary", "NoSQL adapter only supports a POST login boundary")
-            if not all(_credential_names(exchange.request_body or "")):
-                return decision("needs_prerequisite", "missing_credentials", "observed login username/password fields are required")
-            mechanism = "nosql.login_operator"
+            from .nosql_validator import _login_boundary, operator_targets
+            if _login_boundary(exchange):
+                mechanism = "nosql.login_operator"
+            elif operator_targets(exchange):
+                # r7: the finding's own request, one parameter at a time.
+                mechanism = "nosql.operator_differential"
+            else:
+                return decision("needs_prerequisite", "missing_parameter",
+                                "a captured query or body parameter is required")
         if family == "csp":
             content_type = next((str(v).lower() for k,v in exchange.response_headers.items()
                                  if k.lower() == "content-type"), "")
@@ -576,7 +579,8 @@ class ValidatorRegistry:
             from .idor_read_validator import _locate_id
             if not _locate_id(exchange):
                 return decision("needs_prerequisite", "missing_object_id", "an observed object identifier is required")
-        if family in {"auth_sequence", "nosql"} and run_context is not None and not run_context.gate.config.allow_mutating_replay:
+        if ((family == "auth_sequence" or (family == "nosql" and method not in {"GET", "HEAD"}))
+                and run_context is not None and not run_context.gate.config.allow_mutating_replay):
             return decision("policy_denied", "mutating_policy_denied", "this procedure needs explicit mutating replay permission")
         return decision("ready", "ready", "exact procedure and known inputs are available")
 
