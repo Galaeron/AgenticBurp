@@ -144,6 +144,15 @@ def plans_for_findings(exchange: HttpExchange, findings: list[Finding]) -> list[
             candidates.append("open_redirect_validation")
         if category == "business_logic_enhanced":
             candidates.append("workflow_replay_compare")
+        # Route by response evidence, not only by label: a captured GET whose
+        # response (or the finding's evidence body) holds an unmasked allowlisted
+        # credential-secret field also gets the exposure oracle, in addition to
+        # the plan its own class earns (r7: BOLA/BFLA-labelled findings on
+        # responses carrying other accounts' secrets reached cross_identity only).
+        if "api_security" not in candidates:
+            from harness.validators.api_security_validator import exposure_evidence
+            if exposure_evidence(finding, exchange):
+                candidates.append("api_security")
         for hint in candidates:
             if hint == "sqlmap":
                 cap, requires, plane = "sql_injection_validation", True, "local_tool"
