@@ -299,7 +299,7 @@ _LEAD_VERDICTS = frozenset({
     "downgraded",               # cross-identity reject cap (every other identity denied)
     "rejected",                 # adversarial critique rejected the hypothesis
     # header_noise_gate.ENVIRONMENT_VERDICT: cleartext transport on a plain-HTTP
-    # loopback/private target (a fact of the test deployment, a hardening item)
+    # loopback target (a fact of the test deployment, a hardening item)
     "environment_observation",
 })
 

@@ -78,10 +78,10 @@ def apply_header_noise_gate(exchange, reports) -> int:
     return n
 
 
-# r7: a plain-HTTP target on a loopback or private address drew "Insecure
+# r7: a plain-HTTP target on a loopback address drew "Insecure
 # Transmission of Credentials/Data", "Insecure Transport" and "Token Transmission
 # over HTTP" findings on every route. On such a target the scheme is a fact of the
-# test deployment (a local container, a lab VM), not of the application: it is a
+# test deployment (a local container), not of the application: it is a
 # hardening item for production, not a vulnerability of this engagement. The same
 # classes on a public host keep their severity and stay vulnerabilities.
 ENVIRONMENT_VERDICT = "environment_observation"
@@ -101,8 +101,10 @@ def is_cleartext_transport_class(vuln_class: str) -> bool:
 
 
 def local_plain_http_host(url: str) -> str:
-    """The host of a plain-HTTP URL on a loopback or private address (localhost,
-    *.localhost, 127.0.0.0/8, ::1, RFC 1918 / ULA), else ""."""
+    """The host of a plain-HTTP URL on a loopback address (localhost, *.localhost,
+    127.0.0.0/8, ::1), else "". A private (RFC 1918 / ULA) address is deliberately
+    NOT local here: an internal engagement's real targets live there, and cleartext
+    transport is a genuine finding for them."""
     import ipaddress
     from urllib.parse import urlsplit
     try:
@@ -118,11 +120,11 @@ def local_plain_http_host(url: str) -> str:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return ""
-    return host if (ip.is_loopback or ip.is_private) and not ip.is_unspecified else ""
+    return host if ip.is_loopback else ""
 
 
 def apply_local_cleartext_gate(exchange, reports) -> int:
-    """Classify cleartext-transport findings on a plain-HTTP loopback/private
+    """Classify cleartext-transport findings on a plain-HTTP loopback
     target as environment (hardening) observations, in place: severity capped to
     `info` (pre-cap severity kept), review_verdict ENVIRONMENT_VERDICT and the
     reason in review_note. Never deletes a finding; a finding the critique
@@ -132,7 +134,7 @@ def apply_local_cleartext_gate(exchange, reports) -> int:
     if not host:
         return 0
     note = (f"Environment observation (hardening), not a vulnerability: the target is "
-            f"served over plain HTTP on the loopback/private address {host}, so cleartext "
+            f"served over plain HTTP on the loopback address {host}, so cleartext "
             f"transport describes this test deployment, not the application. Serve the "
             f"production deployment over HTTPS.")
     n = 0

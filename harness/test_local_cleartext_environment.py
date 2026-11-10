@@ -58,13 +58,13 @@ class _noop:
 class LocalCleartextEnvironmentTests(unittest.TestCase):
     def test_loopback_http_target_makes_transport_findings_environment_observations(self):
         for url in ("http://127.0.0.1:3000/rest/user/login", "http://localhost/login",
-                    "http://[::1]:8080/login", "http://10.0.0.5/login"):
+                    "http://[::1]:8080/login"):
             with self.subTest(url=url):
                 *transport, sqli = _run(url)
                 for f in transport:
                     self.assertEqual(f.review_verdict, ENVIRONMENT_VERDICT, f.vulnerability_class)
                     self.assertEqual((f.severity, f.original_severity), ("info", "medium"))
-                    self.assertIn("plain HTTP on the loopback/private address", f.review_note)
+                    self.assertIn("plain HTTP on the loopback address", f.review_note)
                     self.assertEqual(finding_lifecycle_state(f), STATE_LEAD)
                     self.assertEqual(finding_triage(f)["triage_priority"], "hardening")
                     self.assertFalse(f.summary.startswith("["), f.summary)
@@ -74,7 +74,9 @@ class LocalCleartextEnvironmentTests(unittest.TestCase):
 
     def test_control_public_http_host_keeps_them_as_vulnerabilities(self):
         for url in ("http://shop.example.com/login", "http://93.184.216.34/login",
-                    "https://127.0.0.1/login"):
+                    "https://127.0.0.1/login",
+                    # an internal engagement's target: cleartext is a real finding
+                    "http://10.0.0.5/login", "http://192.168.1.20/login"):
             with self.subTest(url=url):
                 for f in _run(url)[:3]:
                     self.assertNotEqual(f.review_verdict, ENVIRONMENT_VERDICT)
@@ -94,7 +96,7 @@ class LocalCleartextEnvironmentTests(unittest.TestCase):
         self.assertEqual(local_plain_http_host("http://127.8.0.1/"), "127.8.0.1")
         self.assertEqual(local_plain_http_host("http://app.localhost:5000/"), "app.localhost")
         for url in ("https://localhost/", "http://example.com/", "http://8.8.8.8/",
-                    "http://0.0.0.0/", "", "not a url"):
+                    "http://0.0.0.0/", "http://10.0.0.5/", "", "not a url"):
             self.assertEqual(local_plain_http_host(url), "", url)
 
 
