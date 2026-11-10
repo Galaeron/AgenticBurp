@@ -649,6 +649,11 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     return security.sanitize_text("\n".join(lines))
 
 
+# HU-8: the export tag (issue `report_section`, SARIF `reportSection`) of an item
+# the report moves to its scanner-equivalent appendix.
+SCANNER_APPENDIX_SECTION = "scanner_overlap_appendix"
+
+
 def _routes_to_scanner_appendix(raw: dict) -> bool:
     """HU-8: scanner_overlap.routes_to_appendix for a store row. A confirmed CORS
     row with a case also reads its confirmed proofs' observed_result, where the
@@ -971,21 +976,38 @@ def export_issues_for_host(url: str, *, config: dict | None = None, engagement_i
     findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal,
                                        include_chains=True)
     reporting = (config or {}).get("reporting") or {}
+    # HU-8: the Markdown report moves scanner-equivalent rows to its appendix
+    # before the lead gates; the export makes the same split. Appendix rows are
+    # grouped on their own and tagged (report_section), so every issue sits
+    # wholly in the section its rows sit in on the report.
+    appendix_rows: list = []
+    if bool(reporting.get("scanner_overlap_appendix", False)):
+        routed = [_routes_to_scanner_appendix(f) for f in findings]
+        appendix_rows = [f for f, moved in zip(findings, routed) if moved]
+        findings = [f for f, moved in zip(findings, routed) if not moved]
     if reporting:
         findings = [f for f in findings if not _demoted_by_reporting_gates(f, reporting)]
     proofs_by_case: dict = {}
-    for f in findings:
+    for f in findings + appendix_rows:
         cid = f.get("case_id")
         if cid and cid not in proofs_by_case:
             attempts = store.proofs_for_case(cid)   # every recorded attempt, append-only
             if engagement_id:
-                owned_runs = {row.get("run_id") for row in findings if row.get("case_id") == cid}
+                owned_runs = {row.get("run_id") for row in findings + appendix_rows
+                              if row.get("case_id") == cid}
                 attempts = [attempt for attempt in attempts if attempt.get("run_id") in owned_runs]
             if attempts:
                 proofs_by_case[cid] = attempts
     # Legacy host-wide overrides have no engagement authority.
     merges = store.all_issue_merges(store.host_of(url)) if not engagement_id else {}
     from harness import writeups   # HU-6: no-op unless writeups.export_markdown is on
-    return writeups.attach_to_exports(issue_exports(findings, proofs_by_case=proofs_by_case, merges=merges),
+    exports = issue_exports(findings, proofs_by_case=proofs_by_case, merges=merges)
+    if appendix_rows:
+        from harness import scanner_overlap
+        for exp in issue_exports(appendix_rows, proofs_by_case=proofs_by_case, merges=merges):
+            exp["report_section"] = SCANNER_APPENDIX_SECTION
+            exp["scanner_overlap_class"] = scanner_overlap.overlap_class(exp) or "other"
+            exports.append(exp)
+    return writeups.attach_to_exports(exports,
                                       proofs_by_case, config=config, engagement_id=engagement_id,
                                       captured_principal=captured_principal)

@@ -35,6 +35,27 @@ class HttpExchange(BaseModel):
                                          exclude_if=lambda v: v is None)
 
 
+# Marker a crawler puts in `analyst_note` when the request body it sent was a
+# guess (no schema, no form): its field names are not known parameters of the
+# endpoint. Prompts must not present such a body as the endpoint's inputs, or
+# the model names the guessed keys as vulnerable parameters (r7).
+PLACEHOLDER_BODY_NOTE = "request body is a harness-guessed placeholder, not the endpoint's known parameters"
+
+
+def body_is_placeholder(body: str) -> bool:
+    """True when `body` is one the role crawler guesses (role_crawl._synthesize_body);
+    such a body also reaches worklist templates, which carry no analyst note."""
+    from harness.role_crawl import synthesized_bodies  # (cycle: it imports us)
+    return bool((body or "").strip()) and body.strip() in synthesized_bodies()
+
+
+def request_body_is_placeholder(exchange) -> bool:
+    """True when `exchange`'s request body was guessed by the harness."""
+    body = getattr(exchange, "request_body", "") or ""
+    return bool(body) and (PLACEHOLDER_BODY_NOTE in (getattr(exchange, "analyst_note", "") or "")
+                           or body_is_placeholder(body))
+
+
 class ComponentCandidate(BaseModel):
     """
     A software component + version an agent noticed in an exchange --

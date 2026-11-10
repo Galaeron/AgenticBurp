@@ -39,7 +39,7 @@ from harness import crawler
 from harness import engagement as _engagement
 from harness import global_throttle
 import harness.missing_auth_probe as map_
-from harness.models import Finding, HttpExchange
+from harness.models import PLACEHOLDER_BODY_NOTE, Finding, HttpExchange
 
 log = logging.getLogger("harness.role_crawl")
 
@@ -147,6 +147,12 @@ def _synthesize_body(method: str, path: str) -> tuple[str, str]:
         if any(k in low for k in keywords):
             return body, "application/json"
     return _GENERIC_JSON_BODY, "application/json"
+
+
+def synthesized_bodies() -> frozenset[str]:
+    """Every body _synthesize_body can return: a template carrying one of these
+    holds the crawler's guess, not a captured request's parameters."""
+    return frozenset([_GENERIC_JSON_BODY, *(body for _, body in _BODY_HEURISTICS)])
 
 
 def _synthesize_query(path: str) -> str:
@@ -886,6 +892,9 @@ async def crawl_roles(
                 req_body, req_ctype = _synthesize_body(probe_method, path)
                 query = ((observed_queries.get(path) or _synthesize_query(path))
                          if probe_method == "GET" else "")
+            # A synthesized body is a guess: say so on the capture, so analysis
+            # does not take its keys for the endpoint's real parameters.
+            body_note = (f"; {PLACEHOLDER_BODY_NOTE}" if req_body and not form_template else "")
             url = map_._build_url(base_url, probe_path, id_fill)
             if query:
                 url = f"{url}?{query}"
@@ -939,7 +948,8 @@ async def crawl_roles(
                         request_headers=req_headers, request_body=req_body,
                         response_status=status, response_headers=resp_headers,
                         response_body=body,
-                        analyst_note=f"role_crawl discovery capture as '{r.role}' (HTTP {status})",
+                        analyst_note=(f"role_crawl discovery capture as '{r.role}' (HTTP {status})"
+                                      f"{body_note}"),
                     ).model_dump())
         result.endpoints.append(access)
 

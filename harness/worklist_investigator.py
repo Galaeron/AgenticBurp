@@ -21,6 +21,7 @@ integrate loop.
 """
 from __future__ import annotations
 
+import json
 import hashlib
 import logging
 import re
@@ -144,6 +145,20 @@ def _query_names(template: dict) -> list[str]:
     return names
 
 
+def _has_request_parameters(node: dict) -> bool:
+    """Whether the node's captured request carries query, form or JSON parameters."""
+    template = node.get("template") or {}
+    if _query_names(template):
+        return True
+    body = str(template.get("body") or "").strip()
+    if not body:
+        return False
+    try:
+        return bool(json.loads(body))
+    except ValueError:
+        return any(k for k, _ in parse_qsl(body, keep_blank_values=True))
+
+
 def _derive_probe(node: dict) -> list[tuple[str, str]]:
     """Map a worklist node to its (specialty, hypothesis) probes, most important
     first; empty to skip a node with no actionable signal. The signal is what the
@@ -181,10 +196,20 @@ def _derive_probe(node: dict) -> list[tuple[str, str]]:
             f"{method} {path} is a privileged-looking endpoint reachable by a low-trust role "
             f"({', '.join(reach) or 'unknown'}). Probe for broken function-level authorization / auth bypass.")))
     elif method.upper() in _WRITE_METHODS and (template.get("body") or "").strip():
-        hypothesis = (
-            f"{method} {path} accepts a request body ({template.get('content_type') or 'unknown type'}). "
-            f"Test its body parameters one at a time for injection (SQL, NoSQL, command, "
-            f"template) and missing input validation, keeping the captured body's shape.")
+        from harness.models import body_is_placeholder
+        if body_is_placeholder(template.get("body") or ""):
+            # r7: the crawler's guessed body is not the endpoint's input list.
+            hypothesis = (
+                f"{method} {path} accepts a request body, but its fields are unknown: the "
+                f"captured body is a placeholder the crawler guessed, so its keys are not "
+                f"known parameters. Establish which fields the endpoint reads (error "
+                f"messages, echoed fields) before testing any of them for injection (SQL, "
+                f"NoSQL, command, template) or missing input validation.")
+        else:
+            hypothesis = (
+                f"{method} {path} accepts a request body ({template.get('content_type') or 'unknown type'}). "
+                f"Test its body parameters one at a time for injection (SQL, NoSQL, command, "
+                f"template) and missing input validation, keeping the captured body's shape.")
         if query_names:
             hypothesis += " " + query_text
         return [("injection", hypothesis)]
@@ -556,7 +581,8 @@ async def investigate_worklist(
     scanner-equivalent classes and that has no structural signal of its own
     (scanner_overlap.is_scanner_equivalent_node) runs no agent probe and spends no
     `max_nodes` slot; it is skipped as `scanner_overlap` (its shape-driven legs
-    still run). None reads `reporting.scanner_overlap_appendix` from the enclosing
+    still run). A node whose request carries query, form or JSON parameters keeps
+    its injection probe either way. None reads `reporting.scanner_overlap_appendix` from the enclosing
     RunContext's config; with no run or the shipped default it is off.
 
     Returns a per-node outcome list; findings are folded back into `state`."""
@@ -620,6 +646,13 @@ async def investigate_worklist(
         eligible = derived is not None
         overlap_skip = bool(scanner_overlap_appendix and eligible
                             and _scanner_overlap.is_scanner_equivalent_node(node))
+        if overlap_skip and _has_request_parameters(node):
+            # r7: scanner-class findings say nothing about the node's inputs. A node
+            # with query, form or JSON parameters keeps its injection probe; only
+            # the probes its scanner findings would have prompted are dropped.
+            open_probes = [p for p in open_probes if p[0] == "injection"]
+            overlap_skip = not open_probes
+            derived = open_probes[0] if open_probes else None
         if overlap_skip:
             # HU-8: out of the agent budget, not counted as eligible work.
             eligible, derived, open_probes = False, None, []

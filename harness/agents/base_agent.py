@@ -3,7 +3,8 @@ from abc import ABC, abstractmethod
 from typing import NamedTuple
 
 from harness.ollama_client import OllamaClient, OllamaError, model_stage
-from harness.models import HttpExchange, AgentReport, Finding, ComponentCandidate, sanitize_agent_finding
+from harness.models import (HttpExchange, AgentReport, Finding, ComponentCandidate, sanitize_agent_finding,
+                            request_body_is_placeholder)
 from harness import knowledge
 import secrets
 
@@ -158,6 +159,13 @@ Rules:
   software and (ideally) its version; an empty list is fine and expected
   most of the time.
 """
+
+
+PLACEHOLDER_BODY_PROMPT = (
+    "(withheld: the harness crawler sent a guessed placeholder body to reach this "
+    "endpoint. Its field names are NOT parameters of this endpoint, and the endpoint's "
+    "real body parameters are unknown. Do not name a body parameter, or argue from the "
+    "body's content, on the basis of this request.)")
 
 
 class _PromptView(NamedTuple):
@@ -350,6 +358,13 @@ class BaseAgent(ABC):
         exchange_url = view.url
         request_body, response_body = view.request_body, view.response_body
 
+        if request_body_is_placeholder(exchange):
+            # r7: a crawler's guessed body ({"name": "probe", ...}) rendered as
+            # the request made the model name its keys as vulnerable inputs.
+            request_body_text = PLACEHOLDER_BODY_PROMPT
+        else:
+            request_body_text = trunc_and_fence(request_body) or "(empty)"
+
         prior_block = ""
         if prior_context:
             prior_block = f"""
@@ -409,7 +424,7 @@ URL: {exchange_url}
 </request-headers>
 
 <request-body>
-{trunc_and_fence(request_body) or "(empty)"}
+{request_body_text}
 </request-body>
 
 RESPONSE STATUS: {exchange.response_status if exchange.response_status is not None else "(no response captured)"}

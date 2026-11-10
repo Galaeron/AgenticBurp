@@ -71,6 +71,9 @@ class _Store(unittest.TestCase):
 class ReportAppendixTests(_Store):
     def setUp(self):
         super().setUp()
+        self._seed_mixed()
+
+    def _seed_mixed(self):
         self._seed("/a", "missing_headers", "HDR-1 missing X-Content-Type-Options")
         self._seed("/b", "Content Security Policy missing", "CSP-1 no policy")
         self._seed("/c", "cors", "CORS-1 wildcard origin hypothesis")
@@ -116,6 +119,49 @@ class ReportAppendixTests(_Store):
         for marker in ("HDR-2", "HDR-3", "CSP-1", "CORS-1", "ERR-1", "SQLI-1"):
             self.assertIn(marker, default, marker)
         self.assertNotEqual(default, report_generator.generate_report_for_host(_URL, config=_ON))
+
+
+class ExportSplitTests(_Store):
+    """HU-8 (r7): the issue/SARIF export ignored the appendix. With the option on,
+    the issues the report moves carry report_section (SARIF: reportSection) and
+    no issue mixes main and appendix rows; off, the export is unchanged."""
+
+    def setUp(self):
+        super().setUp()
+        ReportAppendixTests._seed_mixed(self)
+
+    def _exports(self, config):
+        return report_generator.export_issues_for_host(_URL, config=config)
+
+    def _sarif(self, config):
+        from harness import sarif_adapter
+        return sarif_adapter.export_issues_to_sarif(self._exports(config))
+
+    def test_on_tags_exactly_the_moved_items_in_issues_and_sarif(self):
+        exports = self._exports(_ON)
+        tagged = [e for e in exports if e.get("report_section")]
+        untagged = [e for e in exports if not e.get("report_section")]
+        self.assertTrue(tagged)
+        self.assertEqual({e["report_section"] for e in tagged},
+                         {report_generator.SCANNER_APPENDIX_SECTION})
+        self.assertTrue(all(e["scanner_overlap_class"] for e in tagged))
+        self.assertEqual([e["vulnerability_class"] for e in untagged], ["sqli"])
+        results = self._sarif(_ON)["runs"][0]["results"]
+        self.assertEqual(len(results), len(exports))
+        sections = [r["properties"].get("reportSection") for r in results]
+        self.assertEqual(sections.count(report_generator.SCANNER_APPENDIX_SECTION), len(tagged))
+        self.assertEqual(sections.count(None), 1)
+
+    def test_off_export_and_sarif_are_unchanged(self):
+        default = self._exports(None)
+        self.assertEqual(default, self._exports(_OFF))
+        self.assertFalse(any("report_section" in e for e in default))
+        off = self._sarif(_OFF)
+        self.assertFalse(any("reportSection" in r["properties"]
+                             for r in off["runs"][0]["results"]))
+        # Off and on carry the same set of classes: the split tags, it never drops.
+        self.assertEqual(sorted(e["vulnerability_class"] for e in default),
+                         sorted(e["vulnerability_class"] for e in self._exports(_ON)))
 
 
 class ProvenCorsStaysTests(_Store):
@@ -198,11 +244,12 @@ def _state() -> engagement.EngagementState:
     return st
 
 
-def _sweep(state, **kwargs):
-    probed: list[str] = []
+def _sweep(state, *, with_specialty=False, **kwargs):
+    probed: list = []
 
     async def probe(exchange, hypothesis, specialty, step_budget):
-        probed.append(exchange.url.split("?")[0].rsplit("/", 1)[-1])
+        name = exchange.url.split("?")[0].rsplit("/", 1)[-1]
+        probed.append((name, specialty) if with_specialty else name)
         return {"findings": []}
 
     summary: dict = {}
@@ -211,18 +258,57 @@ def _sweep(state, **kwargs):
     return probed, summary
 
 
+def _scanner_prompted_probes(node):
+    """Stand-in for a probe a node's scanner findings would prompt (no such probe
+    kind exists in _derive_probe today): the noise nodes get a `misconfig` probe
+    ahead of their real injection probe."""
+    probes = _REAL_DERIVE(node)
+    if node.get("path", "").startswith("/noise"):
+        return [("misconfig", "scanner-prompted")] + probes
+    return probes
+
+
+_REAL_DERIVE = wi._derive_probe
+
+
 class WorklistBudgetTests(unittest.TestCase):
     def test_ranking_puts_noise_first(self):
         order = [n["path"] for n in _state().worklist()]
         self.assertEqual(order[-1], "/real")
 
-    def test_on_noise_takes_no_slot_and_the_real_node_is_investigated(self):
-        probed, summary = _sweep(_state(), scanner_overlap_appendix=True)
+    def test_on_query_bearing_noise_nodes_keep_their_injection_probe(self):
+        """r7: a GET node with query parameters whose findings are all scanner
+        classes lost its agent injection probe. It keeps it, on or off."""
+        on, on_summary = _sweep(_state(), with_specialty=True, scanner_overlap_appendix=True)
+        off, off_summary = _sweep(_state(), with_specialty=True)
+        self.assertEqual(on, off)
+        self.assertEqual(len(on), 1)
+        self.assertEqual(on[0][1], "injection")
+        self.assertNotIn(on[0][0], ("real",))  # the top-ranked (noise) node is probed
+        self.assertEqual(on_summary["eligible"], 3)
+        self.assertNotIn(wi.SKIP_SCANNER_OVERLAP, on_summary["skipped_by_reason"])
+        self.assertEqual(on_summary["skipped_by_reason"], off_summary["skipped_by_reason"])
+
+    def test_on_scanner_prompted_probes_take_no_slot_but_injection_stays(self):
+        from unittest.mock import patch
+        with patch.object(wi, "_derive_probe", _scanner_prompted_probes):
+            on, _ = _sweep(_state(), with_specialty=True, scanner_overlap_appendix=True)
+            off, _ = _sweep(_state(), with_specialty=True)
+        # Off: the noise node's scanner-prompted probe spends the one slot.
+        self.assertEqual(off[0][1], "misconfig")
+        # On: that probe is dropped; the node's injection probe takes the slot.
+        self.assertEqual(on[0][1], "injection")
+        self.assertNotIn("misconfig", [s for _, s in on])
+
+    def test_parameterless_noise_node_is_still_skipped(self):
+        from unittest.mock import patch
+        st = _state()
+        for path in ("/noise1", "/noise2"):
+            st._ep("GET", path).template = {"query": "", "body": "", "content_type": ""}
+        with patch.object(wi, "_derive_probe", _scanner_prompted_probes):
+            probed, summary = _sweep(st, scanner_overlap_appendix=True)
         self.assertEqual(probed, ["real"])
-        self.assertEqual(summary["investigated"], 1)
-        self.assertEqual(summary["eligible"], 1)
         self.assertEqual(summary["skipped_by_reason"], {wi.SKIP_SCANNER_OVERLAP: 2})
-        self.assertEqual(sorted(s["path"] for s in summary["skipped"]), ["/noise1", "/noise2"])
         self.assertTrue(all(s["next_action"] for s in summary["skipped"]))
 
     def test_off_behaviour_is_unchanged(self):
@@ -233,25 +319,31 @@ class WorklistBudgetTests(unittest.TestCase):
         self.assertEqual(_sweep(_state(), scanner_overlap_appendix=False), (probed, summary))
 
     def test_option_is_read_from_the_enclosing_run_config(self):
+        from unittest.mock import patch
         from harness.run_context import RunContext
 
         async def go(cfg):
-            probed: list[str] = []
+            probed: list = []
 
             async def probe(exchange, hypothesis, specialty, step_budget):
-                probed.append(exchange.url.split("?")[0].rsplit("/", 1)[-1])
+                probed.append(specialty)
                 return {"findings": []}
             async with RunContext.create(allowed_hosts=["overlap.invalid"], config=cfg):
                 await wi.investigate_worklist(probe, _state(), "http://overlap.invalid",
                                               _ROLES, max_nodes=1)
             return probed
-        self.assertEqual(asyncio.run(go(_ON)), ["real"])
-        self.assertNotEqual(asyncio.run(go(_OFF)), ["real"])
+        with patch.object(wi, "_derive_probe", _scanner_prompted_probes):
+            self.assertEqual(asyncio.run(go(_ON)), ["injection"])
+            self.assertEqual(asyncio.run(go(_OFF)), ["misconfig"])
 
     def test_a_structural_signal_keeps_a_noisy_node_in_the_budget(self):
+        from unittest.mock import patch
         st = _state()
+        for path in ("/noise1", "/noise2"):
+            st._ep("GET", path).template = {"query": "", "body": "", "content_type": ""}
         st._ep("GET", "/noise1").object_scoped = True
-        probed, summary = _sweep(st, scanner_overlap_appendix=True)
+        with patch.object(wi, "_derive_probe", _scanner_prompted_probes):
+            probed, summary = _sweep(st, scanner_overlap_appendix=True)
         self.assertEqual(probed, ["noise1"])
         self.assertEqual(summary["skipped_by_reason"].get(wi.SKIP_SCANNER_OVERLAP), 1)
 
