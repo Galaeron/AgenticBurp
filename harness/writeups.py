@@ -64,6 +64,52 @@ _ACTOR_PATTERNS = (re.compile(r"Cross-identity \(([^)\s]+)\)"),
                    re.compile(r"non-privileged identity '([^']+)'"),
                    re.compile(r"does not include '([^']+)'"))
 _OWNER_PATTERNS = (re.compile(r"entitled principal '([^']+)'"),)
+# Who the captured session belongs to, when the verdict says so.
+_CAPTURED_BY_PATTERNS = (re.compile(r"the captured read by '([^']+)'"),)
+
+# A captured session is a session reference ("captured") or an opaque captured
+# auth context ("captured:<digest>"), never a principal. A write-up names the
+# principal behind it when the run maps it to one, and this label otherwise.
+UNMAPPED_CAPTURED = "a captured session (unmapped)"
+_CAPTURED_LABEL = re.compile(r"^captured(?::[0-9a-f]+)?$")
+
+
+def _is_captured(label: str) -> bool:
+    return bool(_CAPTURED_LABEL.match(label or ""))
+
+
+def _attributed_principal(captured_id: str, engagement_id: str) -> str:
+    """The analyst-attributed principal of an opaque captured auth context: the
+    one principal_ref every current attribution of its observations names, or ''."""
+    from harness import store
+    if not captured_id.startswith("captured:"):
+        return ""
+    conn = store._connect()
+    try:
+        rows = conn.execute(
+            "SELECT a.principal_ref FROM observation_attributions a JOIN exchange_observations o "
+            "ON o.observation_id = a.observation_id WHERE o.captured_principal_id = ? "
+            "AND o.engagement_id = ? AND a.revision = (SELECT MAX(b.revision) FROM "
+            "observation_attributions b WHERE b.observation_id = a.observation_id)",
+            (captured_id, engagement_id or "")).fetchall()
+    except Exception:
+        return ""
+    finally:
+        conn.close()
+    names = {r[0] for r in rows}
+    return next(iter(names)) if len(names) == 1 and next(iter(names)) else ""
+
+
+def _name_captured(label: str, *, texts, engagement_id: str, captured_principal: str | None) -> str:
+    """`label` itself unless it is a captured session; then the principal the run
+    maps it to, or UNMAPPED_CAPTURED."""
+    if not _is_captured(label):
+        return label
+    named = _first(_CAPTURED_BY_PATTERNS, texts)
+    if named and not _is_captured(named):
+        return named
+    context = label if label != "captured" else (captured_principal or "")
+    return _attributed_principal(context, engagement_id) or UNMAPPED_CAPTURED
 
 
 def _first(patterns, texts) -> str:
@@ -215,11 +261,15 @@ def _proof_facts(export: dict, proof: dict, *, engagement_id: str = "",
                                          captured_principal=captured_principal):
             if e.get("event_type") == "validation_decision":
                 texts.append(str((e.get("data") or {}).get("evidence") or ""))
-    actor = _first(_ACTOR_PATTERNS, texts)
-    owner = _first(_OWNER_PATTERNS, texts) or (case.get("principal_id") or "")
+    def name(label: str) -> str:
+        return _name_captured(label, texts=texts, engagement_id=engagement_id,
+                              captured_principal=captured_principal) if label else ""
+    case_principal = name(case.get("principal_id") or "")
+    actor = name(_first(_ACTOR_PATTERNS, texts))
+    owner = name(_first(_OWNER_PATTERNS, texts)) or case_principal
     if owner == actor:
         owner = ""
-    principals = {p for p in (actor, owner, case.get("principal_id") or "") if p}
+    principals = {p for p in (actor, owner, case_principal) if p}
 
     attack_fields = _response_fields(attack["response"])
     base_fields = _response_fields(baseline["response"]) if baseline else {}
@@ -319,7 +369,16 @@ _CHECKS = (
 
 
 def _code(x) -> str:
-    return f"`{x}`"
+    # The unmapped-captured label is prose, not a principal name to quote.
+    return x if x == UNMAPPED_CAPTURED else f"`{x}`"
+
+
+def _object_of(owner: str) -> str:
+    """'`alice`'s object', or for the unmapped captured label 'an object of a
+    captured session (unmapped)'."""
+    if owner == UNMAPPED_CAPTURED:
+        return f"an object of {UNMAPPED_CAPTURED}"
+    return f"{_code(owner)}'s object"
 
 
 def _join(items) -> str:
@@ -354,7 +413,7 @@ def _impact(facts: dict) -> str:
     field_phrase = (f"the fields {_join(fields)}" if fields
                     else f"an HTTP {facts['attack_status']} response")
     if _is_access(facts) and facts["actor"]:
-        whose = f"{_code(facts['owner'])}'s" if facts["owner"] else "another principal's"
+        whose = _object_of(facts["owner"]) if facts["owner"] else "another principal's object"
         sensitive = (f", including {_join(facts['sensitive_fields'])} (values redacted here)"
                      if facts["sensitive_fields"] else "")
         if _is_function_level(facts):
@@ -363,7 +422,7 @@ def _impact(facts: dict) -> str:
                     f"{_code(facts['owner']) if facts['owner'] else 'a privileged principal'} gets"
                     f"{_control_phrase(facts)}. This lets {_code(facts['actor'])} use a privileged "
                     f"function its role should not reach{sensitive}.")
-        return (f"{_code(facts['actor'])} read {whose} object at {endpoint} and received "
+        return (f"{_code(facts['actor'])} read {whose} at {endpoint} and received "
                 f"{field_phrase}{_control_phrase(facts)}. This lets {_code(facts['actor'])} read "
                 f"objects that belong to other principals{sensitive} by requesting their reference "
                 f"directly.")
@@ -388,7 +447,7 @@ def _specific_remediation(facts: dict) -> str:
                      "verify the requesting principal owns it or is explicitly entitled to it")
         deny = ""
         if facts["actor"]:
-            whose = f"{_code(facts['owner'])}'s object" if facts["owner"] else "the object"
+            whose = _object_of(facts["owner"]) if facts["owner"] else "the object"
             deny = f" {_code(facts['actor'])} must get a denial (403 or 404) for {whose}"
             if facts["sensitive_fields"]:
                 deny += f", and never its {_join(facts['sensitive_fields'])}"
