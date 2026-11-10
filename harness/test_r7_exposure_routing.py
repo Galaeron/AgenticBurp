@@ -330,5 +330,49 @@ class AccessMatrixExpectationTests(_Base):
                 self.assertEqual(self.validate().status, "confirmed")
 
 
+class CompoundSecretKeyTests(_Base):
+    """Compound secret-like names count on another account's object only."""
+
+    def validate(self, doc):
+        self.server.doc = doc
+        orch, cfg = self._orch()
+        ex = self._exchange(doc)
+
+        async def body(run):
+            reports, _ = await orch._validate_findings(
+                ex, [AgentReport(agent="idor", model="fake", findings=[_finding()])],
+                run_context=run)
+            return [r for r in reports if r.validator == "api_security_validator"]
+        return self._run(orch, cfg, body)
+
+    def test_another_accounts_compound_token_confirms(self):
+        mine = self.validate({"users": [{"username": "alice", "fooToken": "opaque-alice-value"},
+                                        {"username": "bob", "fooToken": "opaque-bob-value"}]})
+        self.assertEqual([r.status for r in mine], ["confirmed"])
+        self.assertIn("field=$.users[1].fooToken; object=$.users[1]; owner=bob", mine[0].evidence)
+        self.assertNotIn("$.users[0]", mine[0].evidence)
+        self.assertNotIn("opaque-bob-value", mine[0].evidence)
+
+    def test_callers_own_compound_token_does_not_confirm(self):
+        mine = self.validate({"username": "alice", "fooToken": "opaque-alice-value"})
+        self.assertEqual([r.status for r in mine], ["not_confirmed"])
+
+    def test_csrf_and_non_secret_compound_names_never_confirm(self):
+        for key, value in (("csrfToken", "opaque-csrf-value"), ("XSRF-TOKEN", "opaque-csrf-value"),
+                           ("token_type", "bearer-long-value"), ("fooTokenExpires", "2026-01-01T00"),
+                           ("refresh_token_length", "12345678"), ("fooToken", True),
+                           ("fooToken", "ACTIVE")):
+            with self.subTest(key=key):
+                self.server.received.clear()
+                mine = self.validate({"username": "bob", key: value})
+                self.assertFalse([r for r in mine if r.confirmed], mine)
+
+    def test_masked_compound_key_does_not_confirm(self):
+        for value in ("********", None, "", "[redacted]"):
+            with self.subTest(value=value):
+                mine = self.validate({"username": "bob", "fooToken": value})
+                self.assertFalse([r for r in mine if r.confirmed], mine)
+
+
 if __name__ == "__main__":
     unittest.main()

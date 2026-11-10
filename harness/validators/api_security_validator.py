@@ -108,6 +108,35 @@ def _field_key(key) -> str:
     return re.sub(r"[^a-z0-9]", "", str(key).lower())
 
 
+# Compound secret-like names ("<prefix>Token", "client_secret", "private-key"),
+# counted ONLY on another account's object: the last word names a credential.
+_COMPOUND_LAST = frozenset({"token", "secret", "password", "passwd", "apikey"})
+_COMPOUND_PAIRS = frozenset({("api", "key"), ("private", "key")})
+_COMPOUND_EXCLUDED = frozenset({"csrf", "xsrf"})
+_NON_SECRET_LAST = frozenset({"type", "expires", "expiry", "at", "length", "len"})
+_MIN_COMPOUND_LEN = 8
+
+
+def _key_words(key) -> list[str]:
+    """camelCase, snake_case and kebab-case key split into lowercase words."""
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(key))
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    return [w for w in re.split(r"[^A-Za-z0-9]+", text.lower()) if w]
+
+
+def _compound_secret(key, value) -> bool:
+    """A compound key whose last word names a credential, holding a value that
+    can carry one: never a csrf/xsrf token, a *_type/*_expires/*_at/*length
+    attribute, a boolean or a short enum-like value."""
+    words = _key_words(key)
+    if len(words) < 2 or _COMPOUND_EXCLUDED & set(words) or words[-1] in _NON_SECRET_LAST:
+        return False
+    if words[-1] not in _COMPOUND_LAST and tuple(words[-2:]) not in _COMPOUND_PAIRS:
+        return False
+    return (isinstance(value, str) and len(value.strip()) >= _MIN_COMPOUND_LEN
+            and _secret_value(value))
+
+
 def _secret_value(value) -> bool:
     """True for a value that can carry a secret: a non-empty scalar that is not
     a fixed placeholder, not masked, and not prose (a label has whitespace)."""
@@ -158,8 +187,10 @@ def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
             object_path = path
         for key, item in value.items():
             field = _field_key(key)
-            if (owner and field in _SECRET_FIELDS and _secret_value(item)
-                    and (owner != caller_id or field in _SELF_SECRETS)):
+            exact = (field in _SECRET_FIELDS and _secret_value(item)
+                     and (owner != caller_id or field in _SELF_SECRETS))
+            # A compound name counts only on another account's object.
+            if owner and (exact or (owner != caller_id and _compound_secret(key, item))):
                 digest = hashlib.sha256(str(item).encode()).hexdigest()[:16]
                 hits.append((f"{path}.{key}", owner, object_path, digest))
             if isinstance(item, (dict, list)):
@@ -203,7 +234,8 @@ def exposure_fields(text) -> list[str]:
                 walk(item, f"{path}[{i}]", depth + 1)
         elif isinstance(value, dict):
             for key, item in value.items():
-                if _field_key(key) in _SECRET_FIELDS and _secret_value(item):
+                if ((_field_key(key) in _SECRET_FIELDS and _secret_value(item))
+                        or _compound_secret(key, item)):
                     found.append(f"{path}.{key}")
                 if isinstance(item, (dict, list)):
                     walk(item, f"{path}.{key}", depth + 1)
