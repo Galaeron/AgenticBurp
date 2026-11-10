@@ -48,7 +48,11 @@ fs = None
 if "-fs" in args and not os.environ.get("FAKE_FFUF_IGNORE_FS"):
     fs = int(args[args.index("-fs") + 1])
 words = open(os.environ["FAKE_FFUF_WORDLIST"], encoding="utf-8").read().split()
-for word in words:
+hang_after = int(os.environ.get("FAKE_FFUF_HANG_AFTER", "-1"))
+for n, word in enumerate(words):
+    if n == hang_after:          # a scan still running when its timeout fires
+        import time
+        time.sleep(120)
     req = urllib.request.Request(url.replace("FUZZ", word), headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -246,6 +250,38 @@ class FfufInRunTests(unittest.TestCase):
             result, _ = self._discover()
         self.assertEqual(self.launched, [])
         self.assertTrue(any("not pinned by digest" in e for e in result.errors), result.errors)
+
+    def _discover_timing_out(self, hang_after):
+        from harness import ffuf_runner
+        self.env["FAKE_FFUF_HANG_AFTER"] = str(hang_after)
+        with patch.object(ffuf_runner, "in_run_timeout", return_value=4.0) as timeout:
+            out = self._discover()
+        self.assertTrue(timeout.called, "the in-run timeout was not asked for")
+        return out
+
+    def test_a_timed_out_scan_keeps_the_hits_it_printed(self):
+        """r7: ffuf hit its timeout and every hit it had printed was lost."""
+        result, run = self._discover_timing_out(hang_after=2)   # sent items, nothing
+        self.assertIn("/api/items", {r.path for r in result.routes})
+        self.assertTrue(any("ffuf timed out: kept 1 hit(s)" in e for e in result.errors),
+                        result.errors)
+        self.assertFalse(any(e.startswith("ffuf error") for e in result.errors), result.errors)
+        # Covered: the path ffuf saw a response for is not guessed again; one it
+        # never reached is still swept by the harness.
+        self.assertEqual(self._sent("/api/nothing"), 1)
+        self.assertEqual(self._sent("/v1/nothing"), 1)
+        self.assertChargedToTheRun(result, run)
+
+    def test_control_a_timeout_with_no_output_is_an_error_and_covers_nothing(self):
+        self.WORDS = ["api/nothing", "v1/nothing", "api/items"]
+        Path(self.wordlist).write_text("\n".join(self.WORDS), encoding="utf-8")
+        result, run = self._discover_timing_out(hang_after=2)
+        self.assertTrue(any("ffuf error: ffuf timed out after 4s with no results" in e
+                            for e in result.errors), result.errors)
+        # ffuf's verdict on what it sent is lost, so the sweep guesses it again.
+        self.assertEqual(self._sent("/api/nothing"), 2)
+        self.assertFalse(any("ffuf covered" in e for e in result.errors), result.errors)
+        self.assertChargedToTheRun(result, run)
 
     def test_negative_control_ffuf_stays_off_in_runs_by_default(self):
         result, run = self._discover(ffuf_in_runs=False)

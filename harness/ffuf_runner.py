@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import subprocess
 from dataclasses import dataclass, field
 
 from harness import tool_runner
@@ -66,6 +67,24 @@ def pin_image(image: str = DEFAULT_IMAGE) -> tuple[str | None, str]:
 
 DEFAULT_THREADS = 40
 DEFAULT_TIMEOUT = 180.0
+# Inside a run every ffuf request is replayed through the run's ToolProxy (gate,
+# budget, scope, one connection per request), which is much slower than ffuf
+# against a target directly: r7 measured about 65 forwarded requests/s, so a
+# ~12k request share overran the flat 180 s twice. The in-run timeout therefore
+# scales with the share it may send, at a third of that measured rate (headroom
+# for a slower target or host), plus a fixed allowance for the container start
+# and for the wordlist tail the proxy answers locally once the share is spent.
+# Floor: DEFAULT_TIMEOUT. Ceiling: the broker's own MAX_BROKER_TIMEOUT. A run
+# cancel or a proxy stop still ends the scan early, so the longer bound only
+# lets a scan that is making progress finish the share it was given.
+IN_RUN_REQUESTS_PER_SECOND = 20.0
+IN_RUN_FIXED_ALLOWANCE = 60.0
+
+
+def in_run_timeout(share: int) -> float:
+    """Broker timeout for an in-run ffuf scan allowed to send `share` requests."""
+    scaled = IN_RUN_FIXED_ALLOWANCE + max(0, int(share)) / IN_RUN_REQUESTS_PER_SECOND
+    return min(tool_runner.MAX_BROKER_TIMEOUT, max(DEFAULT_TIMEOUT, scaled))
 
 
 @dataclass
@@ -78,6 +97,8 @@ class FfufResult:
     used_fallback: bool = False   # #10: the strict-JSON parse found nothing and we
                                   # fell back to the line parser -- surfaced so a
                                   # caller never silently trusts scavenged output.
+    truncated: bool = False       # the scan hit its timeout: `routes` are the hits it
+                                  # printed before it was stopped, not the whole list.
 
 
 def ffuf_available(image: str = DEFAULT_IMAGE) -> tuple[bool, str]:
@@ -202,6 +223,8 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
         rc, stdout, stderr = broker.run(args, cancel=cancel)
     except tool_runner.ToolCleanupFailed:
         raise   # a container that may still run is not an ordinary ffuf error
+    except subprocess.TimeoutExpired as e:
+        return _timed_out_result(e, timeout)
     except Exception as e:
         return FfufResult(error=f"ffuf container failed: {e}")
 
@@ -215,6 +238,28 @@ def run_sync(target_url: str, *, image: str = DEFAULT_IMAGE,
     if not result.routes:
         result.routes = parse_silent_lines(stdout)
         result.used_fallback = bool(result.routes)   # #10: surface fallback use
+    return result
+
+
+def _text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _timed_out_result(exc: subprocess.TimeoutExpired, timeout: float) -> FfufResult:
+    """The scan was stopped at its timeout (the container was already proved
+    removed, or ToolCleanupFailed would have been raised instead). The -json
+    lines it printed before then are real hits: keep them as a truncated result.
+    Only the strict JSON parser is used here -- a line cut off mid-write is
+    dropped, never scavenged into a path. No hit at all stays an error."""
+    stdout, stderr = _text(exc.output), _text(exc.stderr)
+    result = FfufResult(raw_stdout=stdout, raw_stderr=stderr, returncode=-1,
+                        truncated=True, routes=parse_json_lines(stdout))
+    if not result.routes:
+        result.error = f"ffuf timed out after {timeout:g}s with no results"
     return result
 
 

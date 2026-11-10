@@ -74,7 +74,9 @@ class ToolProxy:
         # tool whose every request may create state (sqlmap on a create endpoint);
         # without it the tool is answered 404 and finishes its list (ffuf).
         self.cap_stops = cap_stops
-        self.forwarded_paths: set[str] = set()   # paths actually sent through the run
+        # Paths whose response actually came back through the run (a transport
+        # error or a refusal is not one): what the tool really saw.
+        self.forwarded_paths: set[str] = set()
         self.target_origin = _origin(target_url)
         self.capability = capability
         self.bind_host = bind_host
@@ -239,6 +241,7 @@ class ToolProxy:
             body=body, case_ref=self.case_ref, max_redirects=0)
         if out.outcome in ("ok", "error"):
             self.forwarded += 1
+        if out.outcome == "ok":
             self.forwarded_paths.add(p.path or "/")
         if out.outcome != "ok":
             self._refuse(out.outcome)
