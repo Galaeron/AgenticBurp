@@ -524,6 +524,9 @@ class _IdentityRouter:
         self.label = label
         # visit()'s ExecutionObservation: what was sent, blocked or cancelled.
         self.obs = obs
+        # Main-frame redirects refused by scope/policy (target origin and reason,
+        # never the query): a crawl reports such a view as refused, not failed.
+        self.refused_redirects: list[str] = []
         extra, cookies = _extra_headers_and_cookies(headers, url)
         self.identity_headers = {k.lower(): v for k, v in (extra or {}).items()}
         self.identity_cookies = {c["name"]: c["value"] for c in cookies}
@@ -651,6 +654,8 @@ class _IdentityRouter:
                     log.info("%s: blocked redirect %s -> %s (%s)", self.label, url, next_url,
                              hop.reason)
                     self._blocked(hop.reason)
+                    self.refused_redirects.append(
+                        f"redirect to {ScopePolicy.origin_of(next_url)} refused ({hop.reason})")
                     await route.abort()
                     return
                 await self._fulfill_navigation_hop(route, request, fulfilled, next_url)
@@ -1063,7 +1068,8 @@ class PlaywrightDriver:
         `location.hash` (the app stays loaded, as a click would leave it); any
         other view is a routed main-frame navigation. Returns a
         `spa_navigation.SpaCrawlResult`."""
-        from harness.spa_navigation import LINK_TARGETS_JS, SpaCrawlResult, crawl_views
+        from harness.spa_navigation import (LINK_TARGETS_JS, SpaCrawlResult, ViewRefused,
+                                            crawl_views, describe_error)
         effective_scope = scope if scope is not None else ScopePolicy(
             allowed_hosts=frozenset({ScopePolicy.host_of(url)}))
         if is_cancelled(cancel):
@@ -1099,15 +1105,38 @@ class PlaywrightDriver:
                         asyncio.ensure_future(_js_issued_exchange(req, ""))))
 
                     class _Adapter:
+                        # After a navigation that failed or was aborted the page's
+                        # document is unknown (Chromium may still be committing an
+                        # error page under the old URL): the next view is a full
+                        # navigation, not a hash change into a dying context.
+                        stale = False
+
                         async def open(self, target: str) -> None:
                             current = page.url or ""
                             same_doc = (current.split("#", 1)[0] == target.split("#", 1)[0]
-                                        and "#" in target and current not in ("", "about:blank"))
+                                        and "#" in target and current not in ("", "about:blank")
+                                        and not self.stale)
+                            self.stale = False
                             if same_doc:
                                 await page.evaluate("h => { location.hash = h; }",
                                                     "#" + target.split("#", 1)[1])
                             else:
-                                await router.goto(page, target, timeout_ms)
+                                refused = len(router.refused_redirects)
+                                try:
+                                    await router.goto(page, target, timeout_ms)
+                                except Exception as exc:
+                                    self.stale = True
+                                    # Let the error page Chromium commits for the
+                                    # aborted navigation finish first, or it interrupts
+                                    # the next view's navigation.
+                                    if not (page.url or "").startswith("chrome-error:"):
+                                        await _quietly(page.wait_for_event(
+                                            "framenavigated", timeout=min(timeout_ms, 3000)))
+                                    # The router aborted a redirect out of scope: the
+                                    # view is refused, the navigation did not fail.
+                                    if len(router.refused_redirects) > refused:
+                                        raise ViewRefused(router.refused_redirects[-1]) from exc
+                                    raise
                             await page.wait_for_timeout(wait_ms)
 
                         async def links(self) -> list:
@@ -1135,7 +1164,7 @@ class PlaywrightDriver:
                     await _quietly(browser.close())
         except Exception as e:
             result = SpaCrawlResult(start_url=url)
-            result.errors.append(f"{e.__class__.__name__}: {e}")
+            result.errors.append(describe_error(e))
             return result
         finally:
             await router.aclose()

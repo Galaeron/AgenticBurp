@@ -303,6 +303,62 @@ class ChangeLogTest(unittest.TestCase):
         self.assertLess(section.index("NOT restored"), section.index("Target change log"))
 
 
+class ToolProxyChangeLogTest(unittest.TestCase):
+    """A tool's writes reach the change log: the ToolProxy replays each request
+    through the run's transport, whose execute() hook records every 2xx non-read
+    send (r7's change log holds sqlmap_tool writes this way)."""
+
+    def setUp(self):
+        self.out = Path(tempfile.mkdtemp(prefix="hu5_tool_changes_"))
+        self.addCleanup(shutil.rmtree, self.out, True)
+
+    def _through_proxy(self, requests):
+        import urllib.error
+        import urllib.request
+        from harness.tool_proxy import ToolProxy
+
+        def client(proxy_url, method, body):
+            req = urllib.request.Request(proxy_url, method=method,
+                                         data=body.encode() if body else None,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        with _item_app() as (base, app):
+            async def go():
+                rc = RunContext.create(run_id="hu5tool", allowed_hosts=["127.0.0.1"], config={},
+                                       gate_config={"active_enabled": True,
+                                                    "allow_mutating_replay": True})
+                run_handoff.attach(rc, host="127.0.0.1", base_url=base, output_dir=self.out)
+                async with rc:
+                    proxy = await ToolProxy(rc, base, capability="tool_x",
+                                            case_ref="case-7").start()
+                    try:
+                        for method, path, body in requests:
+                            await asyncio.to_thread(client, proxy.url_for(base + path),
+                                                    method, body)
+                    finally:
+                        await proxy.close()
+                return rc
+            rc = asyncio.run(go())
+            return rc, app
+
+    def test_a_tool_write_through_the_proxy_is_in_the_change_log(self):
+        rc, app = self._through_proxy([("GET", "/items", ""), ("POST", "/items", '{"n":1}')])
+        self.assertEqual(len(app.store), 1)
+        entries = json.loads((self.out / "hu5tool.changes.json").read_text(encoding="utf-8"))["entries"]
+        self.assertEqual([(e["method"], e["path"], e["status"], e["capability"], e["case_ref"])
+                          for e in entries], [("POST", "/items", 201, "tool_x", "case-7")])
+        self.assertEqual(entries[0]["object_ref"], "created:101")
+
+    def test_negative_control_tool_reads_are_not_changes(self):
+        rc, _ = self._through_proxy([("GET", "/items", ""), ("GET", "/items/1", "")])
+        self.assertEqual(rc.change_log.entries(), [])
+
+
 class ReportExportTest(unittest.TestCase):
     def test_report_for_host_appends_section_only_when_enabled(self):
         from harness import report_generator, store

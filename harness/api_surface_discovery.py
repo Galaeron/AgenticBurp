@@ -757,12 +757,16 @@ class SurfaceDiscovery:
                     proxy.url_for(self.base_url + "/"), image=pinned, require_digest=True,
                     headers=self.headers or None, filter_size=self._soft404_bytes,
                     wordlist=self.ffuf_wordlist,
+                    timeout=ffuf_runner.in_run_timeout(share),
                     cancel=lambda: run.cancel.cancelled or proxy.stop_requested,
                     egress=tool_runner.EgressPolicy(allowed_hosts=(tool_runner._HOST_ALIAS,)))
             finally:
                 await proxy.close()
             self._probes += proxy.forwarded
             result.ffuf_requests = proxy.forwarded
+            # Covered: only paths whose response came back through the run (a
+            # transport error or a refused send is not), and only when ffuf's
+            # verdict on them was not lost (see below).
             base_path = urlsplit(self.base_url).path.rstrip("/")
             covered = {path[len(base_path):] for path in proxy.forwarded_paths
                        if path.startswith(base_path + "/")}
@@ -774,9 +778,13 @@ class SurfaceDiscovery:
                 note += f"; stopped: {proxy.stop_reason}"
             result.errors.append(note)
         if ffuf_result.error:
+            # ffuf's verdict on what it sent is lost: nothing counts as covered, so
+            # the Python sweep still guesses those paths itself.
             result.errors.append(f"ffuf error: {ffuf_result.error}")
-            self._ffuf_covered = covered
             return 0
+        if ffuf_result.truncated:
+            result.errors.append(f"ffuf timed out: kept {len(ffuf_result.routes)} hit(s) it "
+                                 "printed before it was stopped (scan truncated)")
         count = 0
         matches_before = self._soft404_matches
         for route in ffuf_result.routes:

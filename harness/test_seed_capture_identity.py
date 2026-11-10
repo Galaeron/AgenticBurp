@@ -148,12 +148,47 @@ class SeedCaptureIdentityTests(unittest.TestCase):
         _, result = self._build([
             self._capture("/api/alice/mixed", {"Authorization": f"Bearer {ALICE_TOKEN}",
                                                "Cookie": f"sid={MALLORY_SID}"}),
-            self._capture("/api/anon/cookie", {"Cookie": "theme=dark"}),
+            self._capture("/api/anon/cookie", {"Cookie": "session_id=undeclared-77"}),
         ])
         self.assertEqual(self._seeded(result, "/api/alice/mixed"), set())
         self.assertEqual(self._seeded(result, "/api/anon/cookie"), set())
         reasons = [e for e in result.errors if e.startswith("capture unbound")]
         self.assertEqual(len(reasons), 2, result.errors)
+        self._assert_no_secret(result)
+
+    def test_preference_only_cookies_bind_to_anonymous(self):
+        """r7: anonymous setup captures carried only consent/language/banner cookies
+        (no name any role declares, none session-like) and were all dropped."""
+        _, result = self._build([
+            self._capture("/api/anon/prefs", {"Cookie": "language=en; consent=dismissed;"
+                                                        " banner_seen=1"}),
+            self._capture("/api/anon/theme", {"Cookie": "theme=dark"}),
+        ])
+        self.assertEqual(self._seeded(result, "/api/anon/prefs"), {"anonymous"}, result.errors)
+        self.assertEqual(self._seeded(result, "/api/anon/theme"), {"anonymous"}, result.errors)
+        self.assertFalse([e for e in result.errors if e.startswith("capture unbound")],
+                         result.errors)
+
+    def test_control_session_like_or_declared_cookies_never_bind_to_anonymous(self):
+        _, result = self._build([
+            # Undeclared, but named like a session: could be someone's login.
+            self._capture("/api/x/a", {"Cookie": "language=en; session_id=undeclared-77"}),
+            self._capture("/api/x/b", {"Cookie": "remember_me=1"}),
+            self._capture("/api/x/c", {"Cookie": "AUTH_TOKEN=abc"}),
+            # A name carol declares, with another value: another principal's session.
+            self._capture("/api/x/d", {"Cookie": f"language=en; sid={MALLORY_SID}"}),
+        ])
+        for path in ("/api/x/a", "/api/x/b", "/api/x/c", "/api/x/d"):
+            self.assertEqual(self._seeded(result, path), set(), path)
+        reasons = [e for e in result.errors if e.startswith("capture unbound")]
+        self.assertEqual(len(reasons), 4, result.errors)
+        self._assert_no_secret(result)
+
+    def test_a_declared_cookie_role_still_wins_over_anonymous(self):
+        _, result = self._build([
+            self._capture("/api/carol/prefs", {"Cookie": f"language=en; sid={CAROL_SID}"}),
+        ])
+        self.assertEqual(self._seeded(result, "/api/carol/prefs"), {"carol"}, result.errors)
         self._assert_no_secret(result)
 
 

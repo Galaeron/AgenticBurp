@@ -31,8 +31,30 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from harness.browser_driver import is_cancelled
 
-__all__ = ["LINK_TARGETS_JS", "SpaCrawlResult", "ViewAdapter", "crawl_views", "resolve_view",
-           "view_key"]
+__all__ = ["LINK_TARGETS_JS", "SpaCrawlResult", "ViewAdapter", "ViewRefused", "crawl_views",
+           "describe_error", "resolve_view", "view_key"]
+
+
+class ViewRefused(Exception):
+    """A view the run refused to enter (e.g. its navigation redirected out of
+    scope): recorded as refused, not as a crawl error."""
+
+
+# A URL's query/fragment inside an error message (it may carry a token): dropped.
+_URL_TAIL = re.compile(r"([a-z][a-z0-9+.-]*://[^\s?#]*)[?#][^\s]*", re.IGNORECASE)
+
+
+def describe_error(exc: BaseException) -> str:
+    """`Type: first line of the message` -- a browser error's message runs to a
+    multi-line call log, and some (Playwright's own `Error`) are useless by type
+    alone. URL queries are cut; an empty message falls back to its cause."""
+    name = type(exc).__name__
+    text = next((line.strip() for line in str(exc).splitlines() if line.strip()), "")
+    text = _URL_TAIL.sub(r"\1?...", text)[:200]
+    if text:
+        return f"{name}: {text}"
+    cause = exc.__cause__ or exc.__context__
+    return f"{name} ({describe_error(cause)})" if cause is not None else name
 
 # Read by page.evaluate(): every link target the rendered DOM exposes, raw.
 LINK_TARGETS_JS = """() => {
@@ -112,6 +134,7 @@ class SpaCrawlResult:
     exchanges: list[dict] = field(default_factory=list)     # XHR/fetch request templates
     skipped: dict = field(default_factory=dict)             # reason -> count
     errors: list[str] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)        # views the run refused to enter
     stopped_by: str = ""                                    # "" | max_views | budget | ...
 
     def skip(self, reason: str) -> None:
@@ -181,8 +204,12 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         url, depth = queue.pop(0)
         try:
             await adapter.open(url)
+        except ViewRefused as exc:
+            result.skip("refused_redirect")
+            result.refused.append(f"view {view_key(url)}: {exc}")
+            continue
         except Exception as exc:
-            result.errors.append(f"view {view_key(url)}: {type(exc).__name__}")
+            result.errors.append(f"view {view_key(url)}: {describe_error(exc)}")
             continue
         result.views.append(url)
         current = adapter.current_url() or url
@@ -190,7 +217,7 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
             fired = await adapter.drain()
         except Exception as exc:
             fired = []
-            result.errors.append(f"capture {view_key(url)}: {type(exc).__name__}")
+            result.errors.append(f"capture {view_key(url)}: {describe_error(exc)}")
         for exchange in fired:
             key = (exchange.get("method"), exchange.get("url"), exchange.get("request_body"))
             if key in captured_keys or len(result.exchanges) >= max_captured:
@@ -205,7 +232,7 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         try:
             targets = await adapter.links()
         except Exception as exc:
-            result.errors.append(f"links {view_key(url)}: {type(exc).__name__}")
+            result.errors.append(f"links {view_key(url)}: {describe_error(exc)}")
             continue
         for raw in targets:
             admit(resolve_view(current, raw), depth + 1)

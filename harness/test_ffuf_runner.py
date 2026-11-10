@@ -286,5 +286,53 @@ class StrictSilentParseTests(unittest.TestCase):
         self.assertEqual([r.path for r in result.routes], ["/api/x"])
 
 
+class TimeoutSalvageTests(unittest.TestCase):
+    """r7: a timed-out scan kept none of the hits it had already printed."""
+
+    @staticmethod
+    def _timeout(stdout):
+        import subprocess
+        return subprocess.TimeoutExpired(["docker"], 180.0, output=stdout, stderr="")
+
+    def test_timeout_with_partial_json_output_keeps_its_routes(self):
+        lines = "\n".join(json.dumps({"input": {"FUZZ": _b64(w)}, "status": 200, "length": 5})
+                          for w in ("api/a", "admin/b"))
+        cut = lines + '\n{"input": {"FUZZ": "YXBp'          # a line cut off mid-write
+        with patch("harness.tool_runner.run", side_effect=self._timeout(cut)):
+            result = ffuf_runner.run_sync("http://localhost:5002", timeout=5.0)
+        self.assertIsNone(result.error)
+        self.assertTrue(result.truncated)
+        self.assertEqual([r.path for r in result.routes], ["/api/a", "/admin/b"])
+
+    def test_timeout_bytes_output_is_decoded(self):
+        line = json.dumps({"input": {"FUZZ": _b64("api/a")}, "status": 200, "length": 5})
+        with patch("harness.tool_runner.run", side_effect=self._timeout(line.encode())):
+            result = ffuf_runner.run_sync("http://localhost:5002")
+        self.assertEqual([r.path for r in result.routes], ["/api/a"])
+
+    def test_control_timeout_without_output_is_still_an_error(self):
+        for out in (None, "", "not json at all\n"):
+            with patch("harness.tool_runner.run", side_effect=self._timeout(out)):
+                result = ffuf_runner.run_sync("http://localhost:5002", timeout=7.0)
+            self.assertEqual(result.routes, [], out)
+            self.assertIn("timed out after 7s", result.error or "", out)
+
+    def test_cleanup_failure_still_propagates(self):
+        from harness import tool_runner
+        with patch("harness.tool_runner.run",
+                   side_effect=tool_runner.ToolCleanupFailed("container may still run")):
+            with self.assertRaises(tool_runner.ToolCleanupFailed):
+                ffuf_runner.run_sync("http://localhost:5002")
+
+
+class InRunTimeoutTests(unittest.TestCase):
+    def test_scales_with_the_share_between_floor_and_broker_ceiling(self):
+        from harness import tool_runner
+        self.assertEqual(ffuf_runner.in_run_timeout(0), ffuf_runner.DEFAULT_TIMEOUT)
+        self.assertEqual(ffuf_runner.in_run_timeout(100), ffuf_runner.DEFAULT_TIMEOUT)
+        self.assertEqual(ffuf_runner.in_run_timeout(12000), 660.0)
+        self.assertEqual(ffuf_runner.in_run_timeout(10 ** 9), tool_runner.MAX_BROKER_TIMEOUT)
+
+
 if __name__ == "__main__":
     unittest.main()

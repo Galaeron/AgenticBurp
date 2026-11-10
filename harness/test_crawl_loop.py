@@ -253,6 +253,131 @@ class PlaywrightSpaCrawlTests(unittest.TestCase):
         self.assertEqual(res.stopped_by, "max_views")
 
 
+class _FailingSpa(_FakeSpa):
+    """Opening a listed view raises the given exception."""
+
+    def __init__(self, views, failures):
+        super().__init__(views)
+        self.failures = failures
+
+    async def open(self, url):
+        exc = self.failures.get(view_key(url))
+        if exc is not None:
+            raise exc
+        await super().open(url)
+
+
+class CrawlErrorDetailTests(unittest.TestCase):
+    """r7: crawl errors read "view /#/search: Error" -- Playwright's own `Error`
+    type with its message dropped."""
+
+    def _crawl(self, failures):
+        spa = _FailingSpa({"/#/home": (["#/search", "#/basket", "#/away"], [])}, failures)
+        return asyncio.run(crawl_views(spa, "http://shop.test/#/home",
+                                       in_scope=lambda u: "shop.test" in u))
+
+    def test_an_error_carries_its_type_and_first_message_line_without_query_values(self):
+        class Error(Exception):     # what Playwright raises, by name
+            pass
+        res = self._crawl({"/#/search": Error(
+            "Page.goto: net::ERR_ABORTED at http://shop.test/x?token=s3cr3t\nCall log:\n  - nav")})
+        self.assertEqual(res.errors, ["view /#/search: Error: Page.goto: net::ERR_ABORTED at "
+                                      "http://shop.test/x?..."])
+
+    def test_an_empty_message_falls_back_to_its_cause(self):
+        try:
+            try:
+                raise TimeoutError("waiting for load")
+            except TimeoutError as inner:
+                raise RuntimeError() from inner
+        except RuntimeError as exc:
+            res = self._crawl({"/#/search": exc})
+        self.assertEqual(res.errors, ["view /#/search: RuntimeError (TimeoutError: waiting for load)"])
+
+    def test_a_refused_view_is_not_an_error(self):
+        from harness.spa_navigation import ViewRefused
+        res = self._crawl({"/#/away": ViewRefused("redirect to https://x.test refused (scope)")})
+        self.assertEqual(res.errors, [])
+        self.assertEqual(res.refused, ["view /#/away: redirect to https://x.test refused (scope)"])
+        self.assertEqual(res.skipped.get("refused_redirect"), 1)
+
+    def test_control_views_that_open_record_nothing(self):
+        res = self._crawl({})
+        self.assertEqual((res.errors, res.refused), ([], []))
+        self.assertEqual(len(res.views), 4)
+
+
+_REDIRECT_PAGE = r"""<!doctype html><html><body>
+<a href="/out?to=elsewhere">Out</a> <a href="#/search">Search</a>
+<script>
+function load() {
+  const view = (location.hash.replace(/^#\//, '') || 'home').split('/')[0];
+  fetch('/api/' + view);
+}
+window.addEventListener('hashchange', load);
+load();
+</script></body></html>"""
+
+
+class _RedirectHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        self.server.received.append(path)
+        if path == "/out" and self.server.redirect:
+            self.send_response(302)
+            self.send_header("Location", "https://elsewhere.example/landing")
+            data = b""
+        elif path in ("/", "/out"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            data = _REDIRECT_PAGE.encode()
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            data = b"{}"
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@unittest.skipUnless(playwright_available(), "Playwright Chromium is not installed")
+class PlaywrightRefusedRedirectTests(unittest.TestCase):
+    """r7: a view whose navigation redirected out of scope was reported as
+    "view /redirect: Error", and the next hash view then failed in the dying
+    document ("view /#/search: Error")."""
+
+    def _crawl(self, redirect):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        httpd.received, httpd.redirect = [], redirect
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        scope = ScopePolicy(allowed_hosts=frozenset({"127.0.0.1"}))
+        res = asyncio.run(PlaywrightDriver().crawl_spa(f"{base}/", wait_ms=300, headers={},
+                                                       scope=scope))
+        return res, base, httpd.received
+
+    def test_an_out_of_scope_redirect_is_refused_and_the_crawl_goes_on(self):
+        res, base, received = self._crawl(redirect=True)
+        self.assertEqual(res.errors, [])
+        self.assertEqual(len(res.refused), 1, res.refused)
+        self.assertIn("view /out: redirect to https://elsewhere.example refused", res.refused[0])
+        self.assertNotIn("to=elsewhere", res.refused[0])
+        self.assertIn(f"{base}/#/search", res.views)
+        self.assertIn("/api/search", received)
+
+    def test_control_without_the_redirect_the_view_simply_opens(self):
+        res, base, _ = self._crawl(redirect=False)
+        self.assertEqual((res.errors, res.refused), ([], []))
+        self.assertIn(f"{base}/out?to=elsewhere", res.views)
+
+
 def _two_users():
     return [RoleSession("anonymous", {}),
             RoleSession("user", {"Authorization": "Bearer U1"}, name="eval-user-1"),

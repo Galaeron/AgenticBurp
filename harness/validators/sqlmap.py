@@ -841,7 +841,12 @@ class SqlmapValidator(Validator):
                    "--level", "1" if create_reason else str(self.level),
                    "--risk", "1" if create_reason else str(self.risk),
                    "--threads", "1", "--timeout", "10", "--retries", "1",
-                   "--flush-session", "--disable-coloring"]
+                   "--flush-session", "--disable-coloring",
+                   # sqlmap's heuristic WAF/IPS probe sends one request with a random
+                   # parameter carrying a UNION/xp_cmdshell/script payload; the run's
+                   # gate hard-denies it as destructive (91 blocked sends in r7), so
+                   # the probe only spends budget and never learns anything.
+                   "--skip-waf"]
             if create_reason:
                 cmd += ["--technique", LIGHT_TECHNIQUES]
             if only:
