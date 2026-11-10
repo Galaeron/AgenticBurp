@@ -21,6 +21,7 @@ integrate loop.
 """
 from __future__ import annotations
 
+import json
 import hashlib
 import logging
 import re
@@ -142,6 +143,20 @@ def _query_names(template: dict) -> list[str]:
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _has_request_parameters(node: dict) -> bool:
+    """Whether the node's captured request carries query, form or JSON parameters."""
+    template = node.get("template") or {}
+    if _query_names(template):
+        return True
+    body = str(template.get("body") or "").strip()
+    if not body:
+        return False
+    try:
+        return bool(json.loads(body))
+    except ValueError:
+        return any(k for k, _ in parse_qsl(body, keep_blank_values=True))
 
 
 def _derive_probe(node: dict) -> list[tuple[str, str]]:
@@ -566,7 +581,8 @@ async def investigate_worklist(
     scanner-equivalent classes and that has no structural signal of its own
     (scanner_overlap.is_scanner_equivalent_node) runs no agent probe and spends no
     `max_nodes` slot; it is skipped as `scanner_overlap` (its shape-driven legs
-    still run). None reads `reporting.scanner_overlap_appendix` from the enclosing
+    still run). A node whose request carries query, form or JSON parameters keeps
+    its injection probe either way. None reads `reporting.scanner_overlap_appendix` from the enclosing
     RunContext's config; with no run or the shipped default it is off.
 
     Returns a per-node outcome list; findings are folded back into `state`."""
@@ -630,6 +646,13 @@ async def investigate_worklist(
         eligible = derived is not None
         overlap_skip = bool(scanner_overlap_appendix and eligible
                             and _scanner_overlap.is_scanner_equivalent_node(node))
+        if overlap_skip and _has_request_parameters(node):
+            # r7: scanner-class findings say nothing about the node's inputs. A node
+            # with query, form or JSON parameters keeps its injection probe; only
+            # the probes its scanner findings would have prompted are dropped.
+            open_probes = [p for p in open_probes if p[0] == "injection"]
+            overlap_skip = not open_probes
+            derived = open_probes[0] if open_probes else None
         if overlap_skip:
             # HU-8: out of the agent budget, not counted as eligible work.
             eligible, derived, open_probes = False, None, []

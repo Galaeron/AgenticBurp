@@ -150,6 +150,12 @@ def export_issues_to_sarif(issue_exports: list[dict], *, source_revision: str = 
             "id": rule_id, "name": rule_id,
             "properties": {"toolVersion": _HARNESS_VERSION},
         })
+        props = {}
+        if exp.get("report_section"):
+            # HU-8: the report section this issue sits in (only set when the
+            # scanner-overlap appendix moved it), so a consumer can make the split.
+            props = {"reportSection": exp["report_section"],
+                     "scannerOverlapClass": exp.get("scanner_overlap_class", "")}
         results.append({
             "ruleId": rule_id,
             "level": _LEVEL_BY_SEVERITY.get((exp.get("severity") or "info").lower(), "note"),
@@ -176,6 +182,7 @@ def export_issues_to_sarif(issue_exports: list[dict], *, source_revision: str = 
                 # I16: the issue's next step (no SARIF slot; advisory text only).
                 "suggestedTest": exp.get("suggested_test", ""),
                 "propertiesSchemaVersion": "1",
+                **props,
             },
         })
     return {
