@@ -96,6 +96,63 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual((rep["routes_with_5xx"], rep["errors_5xx"], rep["untracked_5xx"]), (1, 2, 1))
 
 
+class CleanRoutesDoNotFillTheTableTests(unittest.TestCase):
+    """r7: a fuzz pass filled every route slot with routes that never failed, so all
+    later 5xx went untracked. Clean routes are counted apart; a slot is a 5xx route."""
+
+    def test_through_the_transport_clean_routes_leave_room_for_the_failing_route(self):
+        import asyncio
+        from harness.run_context import RunContext
+        server = _SearchServer()
+        self.addCleanup(server.close)
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], config={})
+
+        async def go():
+            try:
+                tx = ctx.target_transport()
+                for i in range(510):   # more clean routes than the 500-route cap
+                    await tx.send("GET", f"{server.origin}/assets/file_{i}x.js",
+                                  capability="discovery")
+                await tx.send("GET", f"{server.origin}/rest/products/search?q=apple",
+                              capability="sqli_probe")
+                await tx.send("GET", f"{server.origin}/rest/products/search?q=%27))--",
+                              capability="sqli_probe")
+            finally:
+                await ctx.aclose()
+        asyncio.run(go())
+        self.assertEqual(len(server.paths), 512)
+        rep = ctx.server_errors.report()
+        self.assertEqual((rep["routes_with_5xx"], rep["untracked_5xx"]), (1, 0))
+        row = rep["routes"][0]
+        self.assertEqual((row["route"], row["errors_5xx"], row["responses"]),
+                         ("GET /rest/products/search", 1, 2))
+        lead = [f for f in ctx.server_errors.findings()
+                if f["vulnerability_class"] == "sql_injection"]
+        self.assertEqual(len(lead), 1)
+        self.assertEqual(lead[0]["parameter_name"], "q")
+        self.assertIn("1 of 2", lead[0]["summary"])
+
+    def test_control_the_cap_still_bounds_distinct_5xx_routes(self):
+        led = ServerErrorLedger(max_routes=500)
+        for i in range(600):
+            _observe(led, f"{ORIGIN}/broken/r{i}x", 500)
+        rep = led.report()
+        self.assertEqual((rep["routes_with_5xx"], rep["untracked_5xx"], rep["errors_5xx"]),
+                         (500, 100, 600))
+        self.assertEqual(len(led._routes), 500)
+
+    def test_control_the_clean_table_is_bounded_too(self):
+        led = ServerErrorLedger(max_routes=2, max_clean_routes=3)
+        for i in range(10):
+            _observe(led, f"{ORIGIN}/ok/r{i}x", 200)
+        self.assertEqual(len(led._clean), 3)
+        self.assertEqual(led.report()["uncounted_responses"], 7)
+        _observe(led, f"{ORIGIN}/ok/r0x", 500)   # a counted clean route is promoted
+        row = led.report()["routes"][0]
+        self.assertEqual((row["errors_5xx"], row["responses"], row["all_5xx"]), (1, 2, False))
+        self.assertEqual(len(led._clean), 2)
+
+
 class ConfigTests(unittest.TestCase):
     def test_shipped_config_dispatches_no_lead_and_passive_forces_none(self):
         from pathlib import Path

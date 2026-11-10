@@ -40,6 +40,8 @@ except Exception:  # pragma: no cover - categories is always present in the harn
         return (x or "").lower().strip() or None
 
 _SEV_W = {"critical": 1.0, "high": 0.75, "medium": 0.5, "low": 0.25, "info": 0.1}
+# Presentation assets: nothing in them takes input (is_parameterless_static).
+_STATIC_ASSET = re.compile(r"\.(?:css|js|mjs|png|jpe?g|gif|svg|ico|webp|bmp|woff2?|ttf|eot|otf)$", re.I)
 _TIER_W = {"critical": 1.0, "high": 0.75, "medium": 0.5, "low": 0.25, "info": 0.1, "unscored": 0.1}
 
 # Path shapes that read as privileged/sensitive -- used to flag the high-value
@@ -504,6 +506,26 @@ class SurfaceEndpoint:
         tmpl = self.template or {}
         return bool(tmpl.get("body") or tmpl.get("query") or self.object_scoped)
 
+    def captured_parameters(self) -> list[str]:
+        """`location:name` of each query, form or JSON parameter a capture of this
+        endpoint carried, blank values included (coverage_model.captured_parameter_names)."""
+        from harness.coverage_model import captured_parameter_names
+        return captured_parameter_names({"template": self.template,
+                                         "capture_variants": self.capture_variants})
+
+    def is_parameterless_static(self) -> bool:
+        """A GET/HEAD of a presentation asset (stylesheet, script, image, font) with
+        no captured parameter, no object id and no confirmed finding: nothing to
+        inject into, so it should not hold a worklist slot ahead of a route that
+        takes input. Decided by method, extension and captured shape only."""
+        if self.method not in ("GET", "HEAD") or self.object_scoped:
+            return False
+        if not _STATIC_ASSET.search(self.path or ""):
+            return False
+        if any(f.get("confirmed") for f in self.findings or []):
+            return False
+        return not self.captured_parameters()
+
     def best_finding(self) -> dict | None:
         if not self.findings:
             return None
@@ -614,6 +636,13 @@ class SurfaceEndpoint:
         if self.is_input_bearing():
             score += 0.2
             reasons.append("input-bearing route (body/query/object-id) -- concrete probe available")
+        # r7: a search route whose captures carried a (blank) query parameter tied
+        # with parameterless routes and was skipped for time. A named parameter a
+        # capture carried is a concrete injection point: rank it ahead.
+        params = self.captured_parameters()
+        if params:
+            score += 0.3
+            reasons.append(f"captured parameter(s) {', '.join(params[:3])} -- injection point")
 
         # P2-1: business impact from the Application Semantic Model (a
         # value-bearing checkout/payment/role endpoint outranks a generic static
@@ -642,6 +671,9 @@ class SurfaceEndpoint:
         if self.is_repeat_5xx_artifact():
             score *= 0.05
             reasons.append("every probed role got a server error here -- dead endpoint (deprioritized)")
+        if not params and self.is_parameterless_static():
+            score *= 0.2
+            reasons.append("parameterless static resource (deprioritized)")
 
         return round(score, 4), reasons
 

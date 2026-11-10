@@ -7,8 +7,9 @@ exchanges, never the harness's own probes. The 10 h Juice Shop run of 2026-11-05
 (r5) drew 3,779 server errors that way -- 251 of 509 product searches, 82 POST
 logins -- and examined none of them.
 
-`ServerErrorLedger` is the passive record. Per route (method, origin, template) it
-keeps the response and 5xx counts, the capabilities whose sends drew the errors,
+`ServerErrorLedger` is the passive record. Per route (method, origin, template) that
+answered at least one 5xx it keeps the response and 5xx counts (clean routes hold
+only a response count, in a separate bounded table), the capabilities whose sends drew the errors,
 and, for the first `max_scans` 5xx bodies of the route, the verbose-error pattern
 names (validators.verbose_error_validator), the database-error signatures, the
 names of the parameters that carried suspect input, and one short redacted snippet.
@@ -118,12 +119,21 @@ class ServerErrorLedger:
     docstring). Shared by every transport of the run; thread-safe."""
 
     def __init__(self, *, max_scans: int = 3, max_routes: int = 500,
-                 max_body_chars: int = 200_000):
+                 max_body_chars: int = 200_000, max_clean_routes: int | None = None):
         self.max_scans = max(0, int(max_scans))
         self.max_routes = max(1, int(max_routes))
         self.max_body_chars = max(1, int(max_body_chars))
+        # A route enters `_routes` on its first 5xx only. Responses of routes that
+        # have not failed (yet) are counted in `_clean`, a separate bounded table, so
+        # the "N of M responses" ratio survives promotion. Before r7 every response
+        # created a route: a discovery fuzz pass filled all 500 slots with routes that
+        # never failed and every later 5xx went untracked.
+        self.max_clean_routes = max(1, int(max_clean_routes if max_clean_routes is not None
+                                           else self.max_routes * 20))
         self._routes: dict[tuple, _Route] = {}
+        self._clean: dict[tuple, int] = {}
         self._overflow_5xx = 0
+        self._uncounted_responses = 0
         self._lock = threading.Lock()
 
     def observe(self, *, method: str, url: str, status, capability: str = "",
@@ -146,10 +156,16 @@ class ServerErrorLedger:
         with self._lock:
             route = self._routes.get(key)
             if route is None:
-                if len(self._routes) >= self.max_routes:
-                    self._overflow_5xx += int(is_5xx)
+                if not is_5xx:   # a clean response: a count only, never a route slot
+                    if key in self._clean or len(self._clean) < self.max_clean_routes:
+                        self._clean[key] = self._clean.get(key, 0) + 1
+                    else:
+                        self._uncounted_responses += 1
                     return
-                route = self._routes[key] = _Route()
+                if len(self._routes) >= self.max_routes:
+                    self._overflow_5xx += 1
+                    return
+                route = self._routes[key] = _Route(responses=self._clean.pop(key, 0))
             route.responses += 1
             if not is_5xx:
                 return
@@ -208,6 +224,7 @@ class ServerErrorLedger:
             return {"routes_with_5xx": len(rows),
                     "errors_5xx": sum(x["errors_5xx"] for x in rows) + self._overflow_5xx,
                     "untracked_5xx": self._overflow_5xx,
+                    "uncounted_responses": self._uncounted_responses,
                     "routes": rows}
 
     def findings(self) -> list[dict]:

@@ -369,10 +369,37 @@ def derive_input_cases_from_template(template: dict | None,
 # Applicability predicates — shape-based, deterministic (I1/I5)
 # ---------------------------------------------------------------------------
 
+_CAPTURED_INPUT_LOCATIONS = frozenset({"query", "body_form", "body_json"})
+
+
+def captured_parameter_names(endpoint: dict) -> list[str]:
+    """`location:name` of every query, form or JSON-body parameter a capture of the
+    endpoint carried (its template and each capture variant), blank values
+    included: `?q=` names `q`. A JSON body's root container names no input."""
+    templates = [endpoint.get("template")] + [
+        (v or {}).get("template") for v in (endpoint.get("capture_variants") or [])]
+    names: list[str] = []
+    for tmpl in templates:
+        if not isinstance(tmpl, dict):
+            continue
+        for case in derive_input_cases_from_template(tmpl):
+            label = f"{case.parameter_location}:{case.parameter_name}"
+            if (case.parameter_location in _CAPTURED_INPUT_LOCATIONS
+                    and case.parameter_name not in ("", "/") and label not in names):
+                names.append(label)
+    return names
+
+
 def _has_params(endpoint: dict) -> tuple[bool, str]:
     path = endpoint.get("path", "")
     if "?" in path or "{" in path or re.search(r"/\d+(?:/|$)", path):
         return True, "endpoint has parameters or path variables"
+    # The endpoint key's path is normalized without its query, so a GET whose
+    # captures carry `?q=` (even blank) was never read as taking input: r7's search
+    # endpoint got no injection cell at all. The captured request decides.
+    captured = captured_parameter_names(endpoint)
+    if captured:
+        return True, f"a captured request carries parameter(s) {', '.join(captured[:3])}"
     methods = endpoint.get("methods", ())
     if any(m in ("POST", "PUT", "PATCH") for m in methods):
         return True, "endpoint accepts body-bearing methods"
