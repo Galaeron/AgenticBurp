@@ -135,6 +135,8 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             seed=config["ollama"].get("seed"),  # run-level reproducibility seed; None => omit
             transient_retries=config["ollama"].get("transient_retries", 2),  # bounded; 0 => off
             think=config["ollama"].get("think"),  # AR-10 P2 opt-in; unset => think off
+            # ollama.api / max_output_tokens / reasoning_effort; unset => Ollama, unchanged
+            **backend_options(config["ollama"]),
         )
         
         # Configuration

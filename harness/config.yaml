@@ -77,6 +77,22 @@ ollama:
   # call, or a list of model_stage labels (e.g. [iterative, critique]). The run
   # manifest records the setting under model_versions.think; the reasoning
   # trace is never parsed or stored, only its length.
+  #
+  # Backend keys, all left unset here (unset = Ollama, payload unchanged). Set
+  # them only in config.local.yaml:
+  # - api: "openai" sends every model call to an OpenAI-compatible server at
+  #   base_url instead (llama.cpp's llama-server; vLLM, LM Studio): POST
+  #   /v1/chat/completions with response_format json_object, GET /v1/models,
+  #   and llama-server's GET /props for the context window. Set num_ctx to the
+  #   server's per-slot window (-c divided by -np); it is not sent, only used by
+  #   the context guard and prompt_budget. `think` must stay unset with it.
+  # - reasoning_effort: low | medium | high, api "openai" only (gpt-oss reads it
+  #   from its chat template). Measured on gpt-oss-20b: low gives 24/24 valid
+  #   agent actions; medium often spends the reply on reasoning.
+  # - max_output_tokens: an integer cap on each reply (num_predict / max_tokens),
+  #   reasoning included. A reply that reaches it is discarded and counted as
+  #   output_capped, so a model stuck repeating itself fails fast instead of
+  #   running to timeout_seconds.
 
 # Context-window budget for agent and critique prompts (harness/prompt_budget.py).
 # The context is `ollama.num_ctx` when set, else `model_context_tokens` below;

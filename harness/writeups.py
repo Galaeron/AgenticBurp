@@ -640,7 +640,7 @@ def _run(coro):
 
 def _model_rephrase(facts: dict, impact: str, remediation: str, config: dict) -> dict | None:
     """{"impact", "remediation"} from the configured loopback model, or None."""
-    from harness.ollama_client import OllamaClient
+    from harness.ollama_client import OllamaClient, backend_options
     base_url = ((config or {}).get("ollama") or {}).get("base_url") or "http://localhost:11434"
     if not _loopback(base_url):
         return None   # nothing goes off-host
@@ -652,7 +652,8 @@ def _model_rephrase(facts: dict, impact: str, remediation: str, config: dict) ->
         "principals", "fields", "sensitive_fields", "parameter", "attack_status")},
         "impact": impact, "remediation": remediation})
     try:
-        reply = _run(OllamaClient(base_url).chat_json(model, _SYSTEM, user, temperature=0.1))
+        client = OllamaClient(base_url, **backend_options((config or {}).get("ollama")))
+        reply = _run(client.chat_json(model, _SYSTEM, user, temperature=0.1))
     except Exception:
         return None
     if not isinstance(reply, dict):

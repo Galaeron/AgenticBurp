@@ -22,7 +22,7 @@ import httpx
 from harness import global_throttle
 from harness import host_dep_dedup
 
-from harness.ollama_client import OllamaClient, OllamaError
+from harness.ollama_client import OllamaClient, OllamaError, backend_options
 from harness.models import (
     HttpExchange,
     AnalysisResponse,

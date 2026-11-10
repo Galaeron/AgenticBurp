@@ -68,6 +68,16 @@ class OllamaInvalidJSONError(OllamaError):
     pass
 
 
+class OllamaOutputCappedError(OllamaInvalidJSONError):
+    """The reply reached `ollama.max_output_tokens` before it finished, so it is
+    not a complete answer and is discarded. Without a cap a model stuck repeating
+    itself (qwen3:8b on a 14k-character JWT prompt: over 10 minutes of repeated
+    base64) generates until the request timeout; with one, the call fails fast.
+    A subclass of OllamaInvalidJSONError on purpose: every caller already treats
+    an unusable reply as one bounded, counted failure, and the circuit breaker
+    ignores it (a model-output fault, not an outage)."""
+
+
 class OllamaTransientError(OllamaError):
     """A fault that is plausibly gone on the next attempt: HTTP 500/502/503/504,
     a request timeout, a refused/failed connection, or a connection dropped
@@ -154,6 +164,8 @@ _CONTEXT_PROBE_TIMEOUT = httpx.Timeout(2.0, connect=1.0)
 # The engagement preflight's prompt size when this client has measured none
 # larger: the largest prompt of job 0574e29a0799 (Ollama's own log, gemma4).
 ESTIMATED_LARGEST_PROMPT_TOKENS = 8118
+# The context-window cache key for an OpenAI-compatible server (one model).
+_OPENAI_SERVER_KEY = "*server*"
 
 
 def is_cloud_model(model: str) -> bool:
@@ -419,7 +431,116 @@ def think_setting(value) -> dict:
     return {"setting": "off", "stages": []}
 
 
-def _chat_options(temperature, num_ctx, seed) -> dict:
+# Wire protocol of the model server (`ollama.api`). "ollama", the default, speaks
+# Ollama's /api/chat, /api/tags and /api/ps exactly as before this key existed.
+# "openai" speaks the OpenAI-compatible API that llama.cpp's llama-server (and
+# vLLM, LM Studio, ...) serve: POST /v1/chat/completions with response_format
+# json_object, GET /v1/models, and llama-server's GET /props for the context
+# window. Everything else -- prompt validation, sanitising, retries, the circuit
+# breaker, rate limit, audit log, context guard, metrics -- is the same code for
+# both, so callers get the same results and the same error types.
+API_OLLAMA = "ollama"
+API_OPENAI = "openai"
+REASONING_EFFORTS = ("low", "medium", "high")
+_MAX_OUTPUT_TOKENS_CEILING = 131072
+
+
+def parse_backend_settings(api=None, max_output_tokens=None, reasoning_effort=None,
+                           think=None) -> tuple[str, int | None, str | None]:
+    """(`ollama.api`, `ollama.max_output_tokens`, `ollama.reasoning_effort`),
+    validated. Strict like `ollama.think`: a wrong type, or a key that does not
+    apply to the chosen api, raises at startup instead of being ignored.
+
+    - api: unset/"ollama" or "openai".
+    - max_output_tokens: unset (no cap, as before) or an int in 1..131072. Sent as
+      options.num_predict (ollama) or max_tokens (openai). On a reasoning model
+      the trace counts against it.
+    - reasoning_effort: "low" | "medium" | "high", api "openai" only. Sent as
+      chat_template_kwargs.reasoning_effort, which llama-server passes to the
+      model's chat template (gpt-oss reads it).
+    - think: must stay unset with api "openai"; such a server's model reasons per
+      its template, steered by reasoning_effort."""
+    api_value = API_OLLAMA if api is None else api
+    if api_value not in (API_OLLAMA, API_OPENAI):
+        raise ValueError('invalid ollama config: ollama.api must be "ollama" or "openai", '
+                         f"got {api!r}")
+    cap = max_output_tokens
+    if cap is not None and (type(cap) is not int or not 1 <= cap <= _MAX_OUTPUT_TOKENS_CEILING):
+        raise ValueError("invalid ollama config: ollama.max_output_tokens must be an unquoted "
+                         f"integer from 1 to {_MAX_OUTPUT_TOKENS_CEILING}, got {cap!r}")
+    if reasoning_effort is not None:
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("invalid ollama config: ollama.reasoning_effort must be one of "
+                             f"{', '.join(REASONING_EFFORTS)}, got {reasoning_effort!r}")
+        if api_value != API_OPENAI:
+            raise ValueError('invalid ollama config: ollama.reasoning_effort applies only to '
+                             'ollama.api: "openai"')
+    if api_value == API_OPENAI and parse_think_setting(
+            think if not isinstance(think, frozenset) else sorted(think)):
+        raise ValueError('invalid ollama config: ollama.think applies only to ollama.api: '
+                         '"ollama"; set ollama.reasoning_effort for an OpenAI-compatible server')
+    return api_value, cap, reasoning_effort
+
+
+def backend_options(ollama_config: dict | None) -> dict:
+    """The backend keyword arguments for OllamaClient(...) from a config's `ollama`
+    block, so every construction site passes the same three keys."""
+    cfg = ollama_config or {}
+    return {"api": cfg.get("api"), "max_output_tokens": cfg.get("max_output_tokens"),
+            "reasoning_effort": cfg.get("reasoning_effort")}
+
+
+def backend_setting(ollama_config: dict | None) -> dict:
+    """Plain-data description of the backend settings for run provenance:
+    {"api", "max_output_tokens", "reasoning_effort"}, validated."""
+    api, cap, effort = parse_backend_settings(**backend_options(ollama_config))
+    return {"api": api, "max_output_tokens": cap, "reasoning_effort": effort}
+
+
+def _openai_envelope(data: dict) -> dict:
+    """An OpenAI-compatible chat completion, rewritten as the Ollama /api/chat
+    envelope the rest of this client reads: message.content, message.thinking
+    (llama-server's reasoning_content; dropped later, only its length kept),
+    prompt_eval_count / eval_count from usage, eval_duration / prompt_eval_duration
+    from llama-server's timings, done_reason "length" when finish_reason is."""
+    choices = data.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    if not isinstance(choice, dict):
+        raise OllamaInvalidJSONError("OpenAI-compatible server returned no choices")
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    content = message.get("content")
+    out_message = {"role": "assistant", "content": content if isinstance(content, str) else ""}
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        out_message["thinking"] = reasoning
+    envelope = {"model": data.get("model"), "message": out_message, "done": True,
+                "done_reason": "length" if choice.get("finish_reason") == "length" else "stop"}
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    for src, dst in (("prompt_tokens", "prompt_eval_count"), ("completion_tokens", "eval_count")):
+        if type(usage.get(src)) is int and usage[src] >= 0:
+            envelope[dst] = usage[src]
+    timings = data.get("timings") if isinstance(data.get("timings"), dict) else {}
+    for src, dst in (("prompt_ms", "prompt_eval_duration"), ("predicted_ms", "eval_duration")):
+        value = timings.get(src)
+        if type(value) in (int, float) and value >= 0:
+            envelope[dst] = int(value * 1_000_000)
+    return envelope
+
+
+def _openai_context_error(resp) -> bool:
+    """True for llama-server's HTTP 400 "the request exceeds the available context
+    size" (error.type exceed_context_size_error): a prompt too large for the
+    server's window, which llama-server refuses instead of cutting silently."""
+    try:
+        err = resp.json().get("error") or {}
+    except Exception:
+        return False
+    return isinstance(err, dict) and (
+        err.get("type") == "exceed_context_size_error"
+        or "context size" in str(err.get("message") or "").lower())
+
+
+def _chat_options(temperature, num_ctx, seed, num_predict=None) -> dict:
     """Build Ollama's `options` for a chat call.
 
     `temperature` is always present. `num_ctx` and `seed` are opt-in and gated on
@@ -432,6 +553,8 @@ def _chat_options(temperature, num_ctx, seed) -> dict:
         options["num_ctx"] = num_ctx
     if seed is not None:
         options["seed"] = seed
+    if num_predict:
+        options["num_predict"] = num_predict
     return options
 
 
@@ -444,8 +567,14 @@ class OllamaClient:
     def __init__(self, base_url: str, timeout_seconds: float = 120.0,
                  num_ctx: int | None = None, seed: int | None = None,
                  transient_retries: int | None = DEFAULT_TRANSIENT_RETRIES,
-                 think: bool | list[str] | None = None):
+                 think: bool | list[str] | None = None, *, api: str | None = None,
+                 max_output_tokens: int | None = None, reasoning_effort: str | None = None):
         self.base_url = base_url.rstrip("/")
+        # `ollama.api` / `ollama.max_output_tokens` / `ollama.reasoning_effort`
+        # (see parse_backend_settings). All unset => the Ollama payload is
+        # byte-identical to the one sent before these keys existed.
+        self.api, self.max_output_tokens, self.reasoning_effort = parse_backend_settings(
+            api, max_output_tokens, reasoning_effort, think)
         # AR-10 P2: opt-in thinking mode (`ollama.think`, see
         # parse_think_setting). Default off, so every payload keeps
         # `"think": False` byte-identical unless a config sets it.
@@ -522,6 +651,8 @@ class OllamaClient:
         # last looked up; the largest prompt each model was sent.
         self.model_context_truncated_count = 0
         self.model_context_truncated_by_kind = {"prompt": 0, "reply": 0}
+        # Replies discarded because they reached max_output_tokens unfinished.
+        self.model_output_capped_count = 0
         self._context_windows: dict[str, int] = {}
         self._context_probed_at: dict[str, float] = {}
         self._max_prompt_tokens: dict[str, int] = {}
@@ -596,7 +727,11 @@ class OllamaClient:
                            "retries": self.model_retry_count,
                            "retry_recovered": self.model_retry_recovered_count,
                            "unknown_usage": self.model_unknown_usage_count,
-                           "context_truncated": self.model_context_truncated_count},
+                           "context_truncated": self.model_context_truncated_count,
+                           "output_capped": self.model_output_capped_count},
+                # Which wire protocol served the run, and its output cap.
+                "backend": {"api": self.api, "max_output_tokens": self.max_output_tokens,
+                            "reasoning_effort": self.reasoning_effort},
                 # Whether this run measured reasoning mode: the configured
                 # setting plus the calls that actually sent think on.
                 "think": {**think_setting(self.think),
@@ -611,13 +746,17 @@ class OllamaClient:
     def _context_window_rows(self) -> list[dict]:
         if self.num_ctx:
             return [{"model": "*", "context_length": self.num_ctx, "source": "num_ctx"}]
-        return [{"model": key, "context_length": length, "source": "api_ps"}
+        return [{"model": key, "context_length": length, "source": self._window_source()}
                 for key, length in sorted(self._context_windows.items()) if length]
 
     async def _probe_context_windows(self) -> None:
         """One GET /api/ps: cache the context window of every model it lists.
         Best-effort and short-timeout; a failed lookup leaves the cache as it was
-        and never fails the model call that asked for it."""
+        and never fails the model call that asked for it. With api "openai" it is
+        GET /props instead (llama-server: one model, one per-slot window)."""
+        if self.api == API_OPENAI:
+            await self._probe_openai_window()
+            return
         try:
             async with httpx.AsyncClient(timeout=_CONTEXT_PROBE_TIMEOUT) as client:
                 resp = await client.get(f"{self.base_url}/api/ps")
@@ -636,6 +775,28 @@ class OllamaClient:
                 if isinstance(name, str) and name:
                     self._context_windows[_model_key(name)] = length
 
+    async def _probe_openai_window(self) -> None:
+        """llama-server's GET /props: default_generation_settings.n_ctx is the
+        window of each slot, the most one request can use. Cached under one
+        server key: the server answers for whatever model name a call carries."""
+        try:
+            async with httpx.AsyncClient(timeout=_CONTEXT_PROBE_TIMEOUT) as client:
+                resp = await client.get(f"{self.base_url}/props")
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            log.debug("context window lookup (GET /props) failed: %s", e)
+            return
+        settings = data.get("default_generation_settings") if isinstance(data, dict) else None
+        length = settings.get("n_ctx") if isinstance(settings, dict) else None
+        self._context_windows[_OPENAI_SERVER_KEY] = length if type(length) is int and length > 0 else 0
+
+    def _window_key(self, model: str) -> str:
+        return _OPENAI_SERVER_KEY if self.api == API_OPENAI else _model_key(model)
+
+    def _window_source(self) -> str:
+        return "props" if self.api == API_OPENAI else "api_ps"
+
     async def _context_window(self, model: str, prompt_tokens=None) -> tuple[int | None, str | None]:
         """(window, source) a call to `model` runs in: the configured num_ctx, else
         the window /api/ps reports the model loaded with ("api_ps"). (None, None)
@@ -646,28 +807,41 @@ class OllamaClient:
             return None, None
         if self.num_ctx:
             return self.num_ctx, "num_ctx"
-        key = _model_key(model)
+        key = self._window_key(model)
+        source = self._window_source()
         cached = self._context_windows.get(key)
         if cached == 0:
             return None, None
         if cached and not (isinstance(prompt_tokens, int) and prompt_tokens > cached):
-            return cached, "api_ps"
+            return cached, source
         probed_at = self._context_probed_at.get(key)
         if probed_at is None or time.monotonic() - probed_at >= _CONTEXT_PROBE_RETRY_SECONDS:
             self._context_probed_at[key] = time.monotonic()
             await self._probe_context_windows()
             cached = self._context_windows.get(key)
-        return (cached, "api_ps") if cached else (None, None)
+        return (cached, source) if cached else (None, None)
 
     async def _check_context(self, model, payload, prompt_tokens, completion_tokens,
                              done_reason, measurement) -> None:
         """Raise OllamaContextTruncatedError when this call did not fit the model's
         context window (see context_overflow), or a local model's reply stopped
-        for length (the harness never sets num_predict, so only the window can
-        stop it); count and report it first. A call too small to fill any
+        for length while under ollama.max_output_tokens (so only the window can
+        have stopped it); count and report it first. A reply that reached the
+        configured output cap raises OllamaOutputCappedError instead. A call too small to fill any
         plausible window, and any cloud-model call, costs no lookup."""
         if is_cloud_model(model):
             return
+        if (done_reason == "length" and self.max_output_tokens
+                and isinstance(completion_tokens, int)
+                and completion_tokens >= self.max_output_tokens):
+            self.model_output_capped_count += 1
+            measurement["outcome"] = "output_capped"
+            err = OllamaOutputCappedError(
+                f"Model '{model}': the reply reached ollama.max_output_tokens "
+                f"({self.max_output_tokens}) before it finished; reply discarded")
+            self.audit_logger.log_llm_error(model=model, error=err)
+            log.warning("%s", err)
+            raise err
         window = source = kind = None
         prompt_chars = sum(len(m.get("content") or "") for m in payload.get("messages") or []
                            if isinstance(m, dict))
@@ -675,7 +849,11 @@ class OllamaClient:
                 self.num_ctx or prompt_tokens + (completion_tokens or 0)
                 >= _MIN_PLAUSIBLE_WINDOW // 2 - _WINDOW_SLACK_TOKENS):
             window, source = await self._context_window(model, prompt_tokens)
-            kind = context_overflow(prompt_tokens, completion_tokens, prompt_chars, window)
+            # An OpenAI-compatible server refuses an oversized prompt (HTTP 400,
+            # see _send_once) instead of cutting it, so the characters-per-token
+            # test for a silent cut does not apply: 0 characters disables it.
+            kind = context_overflow(prompt_tokens, completion_tokens,
+                                    0 if self.api == API_OPENAI else prompt_chars, window)
         stopped_for_length = kind is None and done_reason == "length"
         if stopped_for_length:
             kind = "reply"
@@ -686,8 +864,10 @@ class OllamaClient:
         self._stage_row()["context_truncated"] += 1
         measurement["outcome"] = "context_truncated"
         measurement["context_truncated"] = kind
-        advice = (f"set ollama.num_ctx: {recommended_num_ctx(max(window or 0, ESTIMATED_LARGEST_PROMPT_TOKENS))} "
-                  "in harness/config.local.yaml or use a cloud model")
+        larger = recommended_num_ctx(max(window or 0, ESTIMATED_LARGEST_PROMPT_TOKENS))
+        advice = (f"start the server with -c {larger} (per slot) and set ollama.num_ctx: {larger}"
+                  if self.api == API_OPENAI else
+                  f"set ollama.num_ctx: {larger} in harness/config.local.yaml or use a cloud model")
         if kind == "prompt":
             what = (f"Ollama cut the {prompt_chars}-character prompt to {prompt_tokens} tokens "
                     f"to fit the {window}-token context window ({source})")
@@ -736,8 +916,8 @@ class OllamaClient:
             if self.num_ctx:
                 window, source = self.num_ctx, "num_ctx"
             else:
-                window = self._context_windows.get(_model_key(name)) or None
-                source = "api_ps" if window else None
+                window = self._context_windows.get(self._window_key(name)) or None
+                source = self._window_source() if window else None
             status = "unknown" if window is None else ("too_small" if window < largest else "ok")
             rows.append({"model": name, "status": status, "context_length": window, "source": source})
             if status == "unknown":
@@ -846,6 +1026,11 @@ class OllamaClient:
             user_prompt=validated_user,
         )
         
+        if self.api == API_OPENAI:
+            payload = self._openai_payload(model, validated_system, validated_user, temperature,
+                                           seed if seed is not None else self.seed)
+            return await self._send_with_retries(f"{self.base_url}/v1/chat/completions", payload,
+                                                 model, measurement, validated_system, validated_user)
         think = self._think_for_call()
         if think:
             self.model_think_call_count += 1
@@ -870,7 +1055,9 @@ class OllamaClient:
                 # Per-call seed overrides the client's run-level default; when the
                 # call supplies none, fall back to the client default. `is not
                 # None` on both so seed=0 is honored at either level.
-                seed if seed is not None else self.seed),
+                seed if seed is not None else self.seed,
+                # ollama.max_output_tokens, opt-in like num_ctx: omitted unless set.
+                self.max_output_tokens),
             # Every call site here wants fast, structured JSON classification
             # output, never a reasoning trace -- but a "thinking"-capable
             # model (Qwen3, Gemma 4, etc.) defaults to thinking ON when this
@@ -888,7 +1075,36 @@ class OllamaClient:
             "think": think,
         }
         url = f"{self.base_url}/api/chat"
+        return await self._send_with_retries(url, payload, model, measurement,
+                                             validated_system, validated_user)
 
+    def _openai_payload(self, model, system_prompt, user_prompt, temperature, seed) -> dict:
+        """The /v1/chat/completions body. num_ctx is never sent (an OpenAI-compatible
+        server's window is fixed when it starts, llama-server -c); the client still
+        uses it as the window for the context guard and the prompt budget."""
+        payload = {
+            "model": model,
+            "messages": [{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": user_prompt}],
+            "stream": False,
+            "temperature": temperature,
+            # Constrains the final answer to one JSON object, as Ollama's
+            # format: json does. Measured on gpt-oss-20b (llama.cpp b12084): 24/24
+            # valid agent actions with it, 21/24 without (a stray closing brace).
+            "response_format": {"type": "json_object"},
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        if self.max_output_tokens:
+            payload["max_tokens"] = self.max_output_tokens
+        if self.reasoning_effort:
+            payload["chat_template_kwargs"] = {"reasoning_effort": self.reasoning_effort}
+        return payload
+
+    async def _send_with_retries(self, url, payload, model, measurement,
+                                 validated_system, validated_user) -> tuple[dict, dict]:
+        """One logical call: breaker, rate limiter and bounded transient retry
+        around _send_once, shared by both wire protocols."""
         # Use circuit breaker and rate limiter. Resolved AT CALL TIME (not
         # self.circuit_breaker, cached at __init__) via current_ollama_breaker
         # (AR-2, LOOP half): when a RunContext has pushed a per-run breaker,
@@ -990,6 +1206,8 @@ class OllamaClient:
             raise OllamaTransientError("Ollama closed the connection unexpectedly") from e
 
         if resp.status_code != 200:
+            if self.api == API_OPENAI and resp.status_code == 400 and _openai_context_error(resp):
+                self._raise_openai_prompt_too_large(model, measurement)
             if resp.status_code == 429:
                 retry_after = _retry_after_seconds(resp.headers.get("retry-after"))
                 err = OllamaRateLimitedError(
@@ -1025,6 +1243,8 @@ class OllamaClient:
         data = resp.json()
         if not isinstance(data, dict):
             raise OllamaInvalidJSONError("Ollama returned an invalid response envelope")
+        if self.api == API_OPENAI:
+            data = _openai_envelope(data)
         def count(key):
             value = data.get(key)
             return value if type(value) is int and value >= 0 else None
@@ -1104,6 +1324,25 @@ class OllamaClient:
                 "Response content omitted."
             ) from e
 
+    def _raise_openai_prompt_too_large(self, model, measurement):
+        """llama-server refused the prompt as larger than its window: a context
+        fault (counted and raised as one, kept out of the breaker), not an outage."""
+        self.model_context_truncated_count += 1
+        self.model_context_truncated_by_kind["prompt"] += 1
+        self._stage_row()["context_truncated"] += 1
+        measurement["outcome"] = "context_truncated"
+        measurement["context_truncated"] = "prompt"
+        window = self.num_ctx or self._context_windows.get(_OPENAI_SERVER_KEY) or None
+        err = OllamaContextTruncatedError(
+            f"Model '{model}': the prompt exceeds the server's context window; nothing was "
+            "generated. Start llama-server with a larger -c (per slot) and set "
+            "ollama.num_ctx to match",
+            kind="prompt", window=window,
+            window_source="num_ctx" if self.num_ctx else ("props" if window else None))
+        self.audit_logger.log_llm_error(model=model, error=err)
+        log.warning("%s", err)
+        raise err
+
     async def list_models(self) -> list[str]:
         """Model tags Ollama reports via GET /api/tags. Best-effort: returns []
         on any failure (unreachable, bad response) rather than raising -- this
@@ -1111,7 +1350,7 @@ class OllamaClient:
         local list, never a crash. NOTE cloud model tags (e.g. *-cloud) are
         reachable via /api/chat but do NOT appear here -- the server merges
         those in from config (models.cloud); see server.py /models."""
-        url = f"{self.base_url}/api/tags"
+        url = self._models_url()
         try:
             async with httpx.AsyncClient(timeout=min(self.timeout_seconds, 15.0)) as client:
                 resp = await client.get(url)
@@ -1120,9 +1359,18 @@ class OllamaClient:
         except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
             log.warning("list_models: could not list Ollama models: %s", e)
             return []
-        models = data.get("models", []) if isinstance(data, dict) else []
-        names = [m.get("name") for m in models if isinstance(m, dict) and m.get("name")]
-        return sorted(set(names))
+        return self._model_names(data)
+
+    def _models_url(self) -> str:
+        """GET /api/tags (Ollama) or GET /v1/models (OpenAI-compatible)."""
+        return f"{self.base_url}/v1/models" if self.api == API_OPENAI else f"{self.base_url}/api/tags"
+
+    def _model_names(self, data) -> list[str]:
+        if self.api == API_OPENAI:
+            rows, field = (data.get("data", []) if isinstance(data, dict) else []), "id"
+        else:
+            rows, field = (data.get("models", []) if isinstance(data, dict) else []), "name"
+        return sorted({m.get(field) for m in rows if isinstance(m, dict) and m.get(field)})
 
     async def health_check(self, timeout: float = 3.0) -> dict:
         """Fast liveness probe for GET /health: is the Ollama backend reachable,
@@ -1131,7 +1379,7 @@ class OllamaClient:
         when Ollama is down. Returns {"reachable": bool, "models": [..],
         "error": str|None}. A refused connection (the common 'ollama not running'
         case) resolves near-instantly; `error` carries a short reason otherwise."""
-        url = f"{self.base_url}/api/tags"
+        url = self._models_url()
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.get(url)
@@ -1139,9 +1387,7 @@ class OllamaClient:
             data = resp.json()
         except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
             return {"reachable": False, "models": [], "error": f"{type(e).__name__}: {e}"}
-        models = data.get("models", []) if isinstance(data, dict) else []
-        names = sorted({m.get("name") for m in models if isinstance(m, dict) and m.get("name")})
-        return {"reachable": True, "models": names, "error": None}
+        return {"reachable": True, "models": self._model_names(data), "error": None}
 
     async def chat_json(
         self,

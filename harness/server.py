@@ -1958,7 +1958,11 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                         # AR-10 P2: whether Ollama calls ran with thinking on
                         # (ollama.think); "off" means no reasoning-mode result.
                         "think": __import__("harness.ollama_client", fromlist=["think_setting"]).think_setting(
-                            (config.get("ollama") or {}).get("think"))})
+                            (config.get("ollama") or {}).get("think")),
+                        # Which wire protocol served the model calls (ollama.api) and
+                        # the output cap / reasoning effort it ran with.
+                        "model_backend": __import__("harness.ollama_client", fromlist=["backend_setting"]).backend_setting(
+                            config.get("ollama"))})
     except Exception:
         job.update(status='error', finished_at=_time.time(),
                    error='job manifest initialization failed; no work was scheduled')
