@@ -35,7 +35,52 @@ import uuid
 from collections import deque
 
 
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_PHASE_TURN = {"parameter": 0, "endpoint": 1, "domain": 2}
+
+
+def _check_of(item):
+    check = item[2]
+    return check if isinstance(check, Check) else CHECKS_BY_ID.get(check)
+
+
 def _fair_cells(items, unauthenticated=frozenset()):
+    """Order queued cells so a budget is shared across check classes, and within
+    each check across identities and routes.
+
+    One queue per check id, each in `_spread_cells` order; the queues are visited
+    round-robin, one cell per check per pass, so a check applicable to every route
+    (CORS, CSP, function-level authz on each read) cannot use the budget a check
+    with few cells (an injection leg on a captured parameter) needed. In r7 the
+    drive spent its time on per-route endpoint checks: one cell per (identity,
+    route) per pass let a read route finish its four checks while a write route
+    got four of its twenty, and 913 legs stayed queued, most PUT/PATCH
+    function-level authz cells and the search route's injection among them.
+    Within a pass, parameter-phase checks come first, then endpoint, then domain
+    checks; an authorization check (WSTG-ATHZ) takes its write-method cells first,
+    because a write is where a missing function-level check does harm."""
+    queues: dict[str, deque] = {}
+    turn: dict[str, tuple] = {}
+    for item in _spread_cells(items, unauthenticated):
+        check = _check_of(item)
+        cid = getattr(check, "id", None) or str(item[2])
+        queues.setdefault(cid, deque()).append(item)
+        if cid not in turn:
+            phase = getattr(getattr(check, "phase", None), "value", "")
+            turn[cid] = (_PHASE_TURN.get(phase, 1), len(turn))
+    for cid, queue in queues.items():
+        if cid.startswith("WSTG-ATHZ"):
+            queues[cid] = deque(sorted(queue, key=lambda it: str(it[1]).partition(" ")[0].upper()
+                                       not in _WRITE_METHODS))
+    ordered = [queues[cid] for cid in sorted(queues, key=turn.__getitem__)]
+    while ordered:
+        for queue in list(ordered):
+            yield queue.popleft()
+            if not queue:
+                ordered.remove(queue)
+
+
+def _spread_cells(items, unauthenticated=frozenset()):
     """Order queued cells so a small leg budget spreads over identities and routes.
 
     One group per (identity, endpoint), visited endpoint by endpoint with that
