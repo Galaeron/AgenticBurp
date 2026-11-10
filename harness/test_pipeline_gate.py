@@ -156,6 +156,14 @@ class _PipelineRun:
         _prev_rate = _tstats["rate_per_second"] if _tstats["enabled"] else 0.0
         _prev_burst = _tstats["burst"] if _tstats["enabled"] else None
         global_throttle.configure(0)
+        # The ledger's write-failure count is process-wide and sticky by design
+        # (evidence_write_status). A failed write in an earlier test, against that
+        # test's own database, would mark every event of this run's fresh database
+        # "persistence degraded" and its reconstruction incomplete: the run's own
+        # ledger assertions then depended on test order. Start from this run's own
+        # clean status, and give the earlier one back afterwards.
+        _prev_failures = evidence_ledger._PERSISTENCE_FAILURES
+        evidence_ledger._PERSISTENCE_FAILURES = 0
         fx = DiscoveryPipelineFixture(self.mode)
         try:
             cfg = _gate_config()
@@ -182,6 +190,8 @@ class _PipelineRun:
             yield result, fx
         finally:
             fx.close()
+            evidence_ledger._PERSISTENCE_FAILURES = (
+                _prev_failures + evidence_ledger._PERSISTENCE_FAILURES)
             global_throttle.configure(_prev_rate, _prev_burst)
             store._DB_PATH, cache._cache = orig_db, orig_cache
             shutil.rmtree(tmp, ignore_errors=True)
