@@ -298,6 +298,9 @@ _LEAD_VERDICTS = frozenset({
     "inconclusive_unverified",  # live-verified leg for the class, but none ran a negative
     "downgraded",               # cross-identity reject cap (every other identity denied)
     "rejected",                 # adversarial critique rejected the hypothesis
+    # header_noise_gate.ENVIRONMENT_VERDICT: cleartext transport on a plain-HTTP
+    # loopback/private target (a fact of the test deployment, a hardening item)
+    "environment_observation",
 })
 
 
@@ -361,6 +364,8 @@ def finding_triage(finding) -> dict[str, str]:
         maturity, priority = "controlled_negative", "review_negative"
     elif verdict in {"rejected", "downgraded"}:
         maturity, priority = "review_rejected", "review_negative"
+    elif verdict == "environment_observation":
+        maturity, priority = "environment_observation", "hardening"
     else:
         maturity = "unverified_no_leg" if leg_tier(get("vulnerability_class")) == "none" else "unverified"
         priority = "manual_verification"
@@ -754,6 +759,8 @@ def apply_confirmation_suppression(
         for finding in report.findings:
             if finding.confirmed:
                 continue  # a leg proved it -- ships at true severity/confidence
+            if (finding.review_verdict or "") == "environment_observation":
+                continue  # already classified as a test-deployment fact, not a claim
             tier = leg_tier(finding.vulnerability_class, live_verified_markers)
             if tier == "none":
                 continue  # no leg could have confirmed it -- not the gate's business
