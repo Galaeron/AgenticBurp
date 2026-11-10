@@ -84,19 +84,15 @@ CREATE TABLE IF NOT EXISTS access_matrix_answers (
 
 
 def _singular(word: str) -> str:
-    low = word.lower()
-    if low.endswith("ies") and len(word) > 4:
-        return word[:-3] + ("Y" if word[-3:].isupper() else "y")
-    if low.endswith(("sses", "xes", "ches", "shes")):
-        return word[:-2]
-    if low.endswith("s") and not low.endswith("ss") and len(word) > 2:
-        return word[:-1]
-    return word
+    from harness.naming import singular
+    return singular(word)
 
 
 def object_key(name: str) -> str:
-    """The comparison key of an object type: "Notes", "note" and "NOTE" agree."""
-    return re.sub(r"[^a-z0-9]", "", _singular(str(name or "").strip()).lower())
+    """The comparison key of an object type: "Notes", "note" and "NOTE" agree
+    (the shared rule in harness.naming)."""
+    from harness.naming import object_key as key
+    return key(name)
 
 
 def display_name(segment: str) -> str:
@@ -555,6 +551,9 @@ def expectation_for(store_module, host: str, role: str, object_type: str, action
     key, action = object_key(object_type), str(action or "").lower()
     if not key or action not in ACTIONS:
         return None
+    from harness.naming import legacy_object_key
+    # An answer saved under the pre-r7 key ("statu" for "status") still applies.
+    keys = [key] + [k for k in (legacy_object_key(object_type),) if k and k != key]
     hosts = [(host or "").lower()]
     if ":" in hosts[0]:
         hosts.append(hosts[0].split(":", 1)[0])
@@ -562,7 +561,8 @@ def expectation_for(store_module, host: str, role: str, object_type: str, action
         answers = {(a["role"], a["object_key"], a["action"]): a
                    for a in load_answers(candidate_host, engagement_id=engagement_id)}
         for who in [r for r in (role, principal_id, WILDCARD_ROLE) if r]:
-            found = answers.get((who, key, action))
+            found = next((answers[(who, k, action)] for k in keys
+                          if (who, k, action) in answers), None)
             if found is None:
                 continue
             if found["answer"] not in EXPECTATION_KIND:

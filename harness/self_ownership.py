@@ -78,8 +78,11 @@ _EMAIL_KEYS = ("email", "umail", "mail")
 
 
 def _stem(segment: str) -> str:
-    s = re.sub(r"[^a-z0-9]", "", segment.lower())
-    return s[:-1] if s.endswith("s") and len(s) > 1 else s
+    """The object-type key of a collection segment: the shared harness.naming
+    rule, so a fact keys the same type the business objects and the access
+    matrix name ("statuses" and "status" agree; "address" is never "addres")."""
+    from harness.naming import object_key
+    return object_key(segment)
 
 
 def _scalar(value) -> str:
