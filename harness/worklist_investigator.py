@@ -181,10 +181,20 @@ def _derive_probe(node: dict) -> list[tuple[str, str]]:
             f"{method} {path} is a privileged-looking endpoint reachable by a low-trust role "
             f"({', '.join(reach) or 'unknown'}). Probe for broken function-level authorization / auth bypass.")))
     elif method.upper() in _WRITE_METHODS and (template.get("body") or "").strip():
-        hypothesis = (
-            f"{method} {path} accepts a request body ({template.get('content_type') or 'unknown type'}). "
-            f"Test its body parameters one at a time for injection (SQL, NoSQL, command, "
-            f"template) and missing input validation, keeping the captured body's shape.")
+        from harness.models import body_is_placeholder
+        if body_is_placeholder(template.get("body") or ""):
+            # r7: the crawler's guessed body is not the endpoint's input list.
+            hypothesis = (
+                f"{method} {path} accepts a request body, but its fields are unknown: the "
+                f"captured body is a placeholder the crawler guessed, so its keys are not "
+                f"known parameters. Establish which fields the endpoint reads (error "
+                f"messages, echoed fields) before testing any of them for injection (SQL, "
+                f"NoSQL, command, template) or missing input validation.")
+        else:
+            hypothesis = (
+                f"{method} {path} accepts a request body ({template.get('content_type') or 'unknown type'}). "
+                f"Test its body parameters one at a time for injection (SQL, NoSQL, command, "
+                f"template) and missing input validation, keeping the captured body's shape.")
         if query_names:
             hypothesis += " " + query_text
         return [("injection", hypothesis)]
