@@ -27,7 +27,7 @@ def _capped(cap, *, prompt_tokens=900):
                          completion_tokens=cap, reasoning="x" * 4000)
 
 
-class CappedReplyRetryTests(_Base):
+class CappedReplyRetryTests(_Base, unittest.IsolatedAsyncioTestCase):  # async-capable, stated here for the hygiene scan
 
     async def test_a_capped_reply_is_asked_again_with_twice_the_cap(self):
         self.fake.chat_replies = [_capped(2048), _openai_reply(_ANSWER, completion_tokens=2600)]

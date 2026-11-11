@@ -16,9 +16,11 @@ ROOT = Path(__file__).resolve().parent.parent
 CASE_BASE_MODULES = frozenset({
     'harness.coverage_evidence_case',
     'harness.test_pairing_contract',
+    'harness.test_param_dispatch_caller',
     'harness.test_experiment_cycle',
     'harness.test_retry_rounds',
     'harness.test_role_crawl',
+    'harness.test_run_journal',
     'harness.test_security_headers_validator',
 })
 
