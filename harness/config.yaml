@@ -434,6 +434,16 @@ engagement:
   # Example: {worklist: 4, recrawl: 1, capture_review: 2, chain_rounds: 2,
   # final_passes: 2}.
   phase_slices: {}
+  # Capture review beside the request-bound phases (harness/review_overlap.py). When
+  # the capture_review slice ends with captures left and a model reviews them, the
+  # review keeps going in the background while the chain rounds, second-order pass,
+  # coverage drive and server-error pass send their requests (r9: the model sat idle
+  # about 2 h through those passes), bounded by capture_review_seconds and
+  # investigation_seconds as before, and stops before the retry rounds. Its sends
+  # spend the same run request budget; with a coverage_request_reserve it stops when
+  # the drive starts. Inert without a capture_review slice; false runs the review
+  # inline, cut at its slice, as before.
+  review_overlap: true
   # Crawl once per registered principal (harness/role_crawl.crawl_roles_for) instead
   # of once per distinct role feature: two same-role users get two discovery sweeps,
   # two browser crawls and two feature crawls. DEFAULT OFF: it multiplies crawl traffic.

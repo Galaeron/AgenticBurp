@@ -972,12 +972,22 @@ class CrawlLoopCallerTests(unittest.TestCase):
         self.assertEqual(result["crawl_loop"]["recrawl"]["rounds"], 0)
 
     def test_phase_slices_keep_time_for_review_and_the_chain_rounds(self):
-        _, seen = self._investigate({"investigation_seconds": 900, "phase_slices": {
+        # The inline review (review_overlap off) stops at its slice.
+        _, seen = self._investigate({"investigation_seconds": 900, "review_overlap": False,
+                                     "phase_slices": {
             "worklist": 1, "capture_review": 1, "chain_rounds": 1}})
         worklist_deadline = seen["worklist"][0][1]
         self.assertAlmostEqual(worklist_deadline - seen["started"], 300, delta=30)
         self.assertLess(seen["review_deadline"], seen["started"] + 900 - 300 + 30)
         self.assertGreater(seen["review_deadline"], worklist_deadline)
+
+    def test_with_review_overlap_the_slice_no_longer_ends_the_review(self):
+        # review_overlap on (the default): the slice only bounds how long the
+        # engagement waits; the review itself keeps the investigation deadline.
+        result, seen = self._investigate({"investigation_seconds": 900, "phase_slices": {
+            "worklist": 1, "capture_review": 1, "chain_rounds": 1}})
+        self.assertAlmostEqual(seen["review_deadline"] - seen["started"], 900, delta=30)
+        self.assertIsNotNone(result["crawl_loop"]["review_overlap"])
 
     def test_control_without_slices_the_worklist_gets_the_whole_bound(self):
         _, seen = self._investigate({"investigation_seconds": 900})

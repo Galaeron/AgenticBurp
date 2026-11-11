@@ -22,6 +22,11 @@ deadline. The server-error pass, which starts no lead confirmation past the
 deadline, then dispatches nothing (r6, job a674352e19b6, ran its chain rounds to the
 deadline and never reached the later passes).
 
+The capture_review slice bounds how long the engagement WAITS for the review. With
+`engagement.review_overlap` (on by default) a model-bound review its slice cuts short
+goes on in the background beside the request-bound passes after it, up to its own
+deadline (harness/review_overlap.py); with it off the review stops at its slice.
+
 OFF by default: with no `phase_slices` (or no `investigation_seconds`, the deadline
 the slices divide) every phase keeps exactly today's deadline.
 """

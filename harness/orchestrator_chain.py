@@ -27,6 +27,7 @@ from harness.run_context import transport_for, ExecutionOutcome, case_scope, cou
 from harness.execution_registry import ExecutionRegistry
 from harness.validators.injection_targets import REQUEST_LEVEL_INPUTS, case_target
 from harness import run_journal
+from harness import review_overlap
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
 # same shadowing reason as above (several methods below have a `run_context` parameter).
 from harness import run_context as _run_context_mod
@@ -1052,7 +1053,10 @@ class ChainMixin:
 
     # Roles registered as replay identities below are owned by this engagement
     # and released when it ends (never leak into a later engagement on the host).
+    # A capture review left running beside the later phases is cancelled and awaited
+    # when the engagement ends, however it ends (harness/review_overlap.py).
     @identity_headers.leased
+    @review_overlap.reaps_review_overlaps
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
                                      discovery_max_endpoints: int | None = None,
@@ -2243,16 +2247,36 @@ class ChainMixin:
         if _investigation_deadline is not None:
             _review_deadline = min(_review_deadline or _investigation_deadline,
                                    _investigation_deadline)
+        _review_budget = _review_deadline
         # phase_slices: review gets its share of what is left, so the chain rounds
         # after it are not starved; an explicit capture_review_seconds still binds.
         _review_deadline = _schedule.deadline_for("capture_review", _review_deadline)
+        # engagement.review_overlap: when that share would stop a model-bound review
+        # short of its own deadline, the review keeps going in the background while
+        # the request-bound phases below send theirs, and is drained before the retry
+        # rounds (harness/review_overlap.py). Otherwise it runs inline as before.
+        _overlap = None
         if not (stop_on_confirm and _early_confirmed):
-            await review_captured_exchanges(
-                self, state, _all_captured, run_context=run_context,
-                seen=_reviewed_captures, errors=_errors, stats=_review_stats,
-                max_reviews=self.capture_review_limit, deadline=_review_deadline,
-                **_review_kwargs)
-            _journal_phase("review")
+            if (_review_deadline is not None
+                    and (_review_budget is None or _review_deadline < _review_budget)
+                    and review_overlap.enabled(self.config)
+                    and review_overlap.review_uses_model(self)):
+                async def _overlap_review(captured, **bounds):
+                    return await review_captured_exchanges(
+                        self, state, captured, run_context=run_context,
+                        seen=_reviewed_captures, errors=_errors, stats=_review_stats,
+                        max_reviews=self.capture_review_limit, **bounds, **_review_kwargs)
+
+                _overlap = review_overlap.ReviewOverlap(
+                    _overlap_review, deadline=_review_budget).start(list(_all_captured))
+                await _overlap.hold(_review_deadline)
+            else:
+                await review_captured_exchanges(
+                    self, state, _all_captured, run_context=run_context,
+                    seen=_reviewed_captures, errors=_errors, stats=_review_stats,
+                    max_reviews=self.capture_review_limit, deadline=_review_deadline,
+                    **_review_kwargs)
+                _journal_phase("review")
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
         # credential (url -> {headers, body}), built from the real captured
@@ -2307,7 +2331,9 @@ class ChainMixin:
                 discovery_max_probes=discovery_max_probes, run_context=run_context,
                 **self._discovery_ffuf_kw())
             outs2, new_findings = await _investigate(st2, derived, deadline=_chain_deadline)
-            if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
+            _review_round = not (stop_on_confirm and any(f.get("confirmed") for f in new_findings))
+            _round_in_background = _review_round and _overlap is not None and _overlap.accepting
+            if _review_round and not _round_in_background:
                 await review_captured_exchanges(
                     self, st2, getattr(rc2, "captured", None), run_context=run_context,
                     seen=_reviewed_captures, errors=_errors, stats=_review_stats,
@@ -2320,6 +2346,8 @@ class ChainMixin:
             # in the final summary/worklist/coverage/report -- not just in a local
             # list. Also feed the re-crawl's responses into credential detection.
             state.merge_from(st2)
+            if _round_in_background:   # reviewed into the merged state, in the background
+                _overlap.extend(list(getattr(rc2, "captured", None) or []))
             _responses.update(_responses_from(getattr(rc2, "captured", None)))
             link = chain_linker.link_findings(state, all_findings, responses=_responses)
             chains = list(link["chain_findings"])
@@ -2486,6 +2514,8 @@ class ChainMixin:
         _instr.phases.begin("coverage_drive")
         _requests_before_coverage = getattr(_run_budget, "used", None)
         if _coverage_hold:
+            if _overlap is not None:   # the reserve is the drive's: the review stops here
+                await _overlap.drain("coverage request reserve")
             _run_budget.release_hold()
         _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds
                               if self.coverage_drive_seconds > 0 else None)
@@ -2940,6 +2970,14 @@ class ChainMixin:
             log.warning("investigate_engagement: server-error follow-up failed: %s", e)
             _errors.append({"phase": "server_errors", "error": f"{type(e).__name__}: {e}"})
 
+        # The request-bound phases are over: a background capture review stops taking
+        # captures (the one in flight finishes); the retry rounds review what is left.
+        if _overlap is not None:
+            await _overlap.drain()
+            if _overlap.error:
+                _errors.append({"phase": "capture_review", "error": _overlap.error})
+            _journal_phase("review")
+
         # engagement.retry_rounds: until reserve_seconds before the deadline, sweep the
         # worklist and review captures again with growing budgets, for the nodes and
         # captures earlier passes left (harness/retry_rounds.py). Off by default.
@@ -2984,18 +3022,18 @@ class ChainMixin:
             log.info("investigate_engagement: retry rounds -- %d round(s), stopped by %s",
                      len(_retry_report.get("rounds") or []), _retry_report.get("stopped_by"))
 
-        if _retry_ledger is not None and _retry_report.get("rounds"):
-            try:   # the server errors the rounds' own sends drew
+        if (_retry_ledger is not None and _retry_report.get("rounds")) or _overlap is not None:
+            try:   # the server errors the rounds' (or the background review's) sends drew
                 _server_error_changed += await _server_error_pass()
             except Exception as e:
                 log.warning("investigate_engagement: server-error follow-up failed: %s", e)
                 _errors.append({"phase": "server_errors", "error": f"{type(e).__name__}: {e}"})
         if run_context is not None and _server_error_report["enabled"]:
             _server_error_report["ledger"] = run_context.server_errors.report()
-        # The matrix was built before the rounds and the server-error follow-up: record
-        # what they found into it.
-        if coverage and (_server_error_changed or (_retry_ledger is not None
-                                                   and _retry_report.get("rounds"))):
+        # The matrix was built before the rounds and the server-error follow-up (and
+        # while a background review was still running): record what they found into it.
+        if coverage and (_server_error_changed or _overlap is not None
+                         or (_retry_ledger is not None and _retry_report.get("rounds"))):
             try:
                 if _coverage_trackers:
                     coverage = coverage_tracker.refresh_after_retry_rounds(
@@ -3111,6 +3149,7 @@ class ChainMixin:
                 "spa_views": getattr(rc, "spa_views", None) or [],
                 "recrawl": _recrawl_report,
                 "phase_schedule": _schedule.report() if _schedule.active else None,
+                "review_overlap": _overlap.report() if _overlap is not None else None,
                 "retry_rounds": _retry_report,
                 "session_events": list(getattr(run_context.freshness(), "events", []) or [])
                                   if run_context is not None and hasattr(run_context, "freshness") else [],
