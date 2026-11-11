@@ -740,6 +740,43 @@ def _prompt_fits(resp) -> list[dict]:
     return fitted
 
 
+def _review_bookkeeping(captured, seen, *, errors, stats, stopped_by, reviewed,
+                        produced, grouped, elided, tier_counts, outcome_out) -> None:
+    """The end of one review_captured_exchanges call, however it ended: log it, report
+    what a bound left unreviewed, and add its counts to `stats` / `outcome_out`."""
+    from harness import assessment_health
+    from harness.assessment_health import review_frontier
+    if reviewed:
+        log.info("review_captured_exchanges: reviewed %d captured 2xx exchanges, "
+                 "%d produced findings", reviewed, produced)
+    if elided:
+        log.info("review_captured_exchanges: %d capture(s) had model prompts cut to fit "
+                 "the context window (review_stats.elided)", len(elided))
+    remaining = 0
+    if stopped_by:
+        remaining = sum(1 for _ in review_frontier(captured, seen=set(seen)))
+        if remaining:
+            log.info("review_captured_exchanges: %s reached, %d captured exchange(s) "
+                     "not reviewed", stopped_by, remaining)
+            if errors is not None:
+                errors.append({"phase": "capture_review",
+                               "error": f"{stopped_by} reached: {remaining} captured "
+                                        "exchange(s) not reviewed"})
+    if stats is not None:
+        base = assessment_health.new_review_stats()
+        for name, empty in base.items():
+            stats.setdefault(name, empty)
+        stats["reviewed"] += reviewed
+        stats["grouped"].extend(grouped)
+        stats["elided"].extend(elided)
+        stats["unreviewed"] += remaining
+        for name, count in tier_counts.items():
+            stats["by_tier"][name] = stats["by_tier"].get(name, 0) + count
+    if outcome_out is not None:
+        outcome_out.update(stopped_by=stopped_by, reviewed=reviewed, produced=produced,
+                           remaining=remaining)
+
+
 async def review_captured_exchanges(orch, state, captured, *, max_reviews: int = 200,
                                     run_context=None, seen=None, errors=None,
                                     deadline: float | None = None, stats: dict | None = None,
@@ -747,7 +784,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
                                     resumed: dict | None = None, on_review=None,
                                     summary_out: dict | None = None,
                                     model_failed: set | None = None,
-                                    journal_key=None) -> int:
+                                    journal_key=None, should_stop=None,
+                                    outcome_out: dict | None = None) -> int:
     """Phase 0.1: route every substantive 2xx captured during discovery through
     full content-level review and fold its findings into `state`.
 
@@ -799,6 +837,14 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     ships its findings unreviewed). The capture stays in `seen`; a retry round
     discards it from there to review it again.
 
+    `should_stop()`, when given, is asked before each capture is taken; a reason it
+    returns ends the review like a bound does (harness/review_overlap.py stops a
+    background review this way). A cancellation is a bound too: the capture being
+    analyzed when it lands, and the captures grouped under it, are put back as
+    unreviewed (out of `seen`, out of the counts), the leftovers are reported as
+    above, and the cancellation is re-raised. `outcome_out`, when given a dict, gets
+    {stopped_by, reviewed, produced, remaining} for this call.
+
     Returns the count of captured exchanges that yielded >=1 finding."""
     from harness import run_handoff
     _handoff = run_handoff.for_run(run_context)
@@ -807,7 +853,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             orch, state, captured, max_reviews=max_reviews, run_context=run_context, seen=seen,
             errors=errors, deadline=deadline, stats=stats, group_identical=group_identical,
             resumed=resumed, on_review=on_review, summary_out=summary_out,
-            model_failed=model_failed, journal_key=journal_key)
+            model_failed=model_failed, journal_key=journal_key,
+            should_stop=should_stop, outcome_out=outcome_out)
     # HU-5: whatever ends the review (a bound, an error, a cancellation), the handoff
     # gets the captures it left unreviewed. Bookkeeping only.
     seen = seen if seen is not None else set()
@@ -817,7 +864,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             orch, state, captured, max_reviews=max_reviews, run_context=run_context, seen=seen,
             errors=errors, deadline=deadline, stats=stats, group_identical=group_identical,
             resumed=resumed, on_review=on_review, summary_out=summary_out,
-            model_failed=model_failed, journal_key=journal_key)
+            model_failed=model_failed, journal_key=journal_key,
+            should_stop=should_stop, outcome_out=outcome_out)
     finally:
         try:
             _handoff.note_captures(captured, seen)
@@ -828,7 +876,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
 async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_context,
                                      seen, errors, deadline, stats, group_identical,
                                      resumed, on_review, summary_out, model_failed,
-                                     journal_key=None) -> int:
+                                     journal_key=None, should_stop=None,
+                                     outcome_out=None) -> int:
     produced = 0
     reviewed = 0
     stopped_by = None
@@ -849,100 +898,108 @@ async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_
 
     frontier = review_frontier(captured, seen=seen, group_identical=group_identical,
                                on_grouped=_grouped)
-    while True:
-        if reviewed >= max_reviews:
-            stopped_by = "capture review limit"
-            break
-        if deadline is not None and time.monotonic() >= deadline:
-            stopped_by = "capture review time budget"
-            break
-        grouped_before = len(grouped)
-        cap = next(frontier, None)
-        if cap is None:
-            break
-        try:
-            ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
-        except Exception:
-            continue
-        reviewed += 1
-        tier_counts[assessment_health.TIER_NAMES[assessment_health.capture_tier(ex)]] += 1
-        # R05: record the captured request template on its endpoint so the graph +
-        # coverage replay the real body/query/content-type/object-id, not an empty
-        # fabricated shape. Cheap and additive; failure must not sink the review.
-        try:
-            state.record_template(ex.url, ex.method, ex)
-        except Exception:
-            pass
-        key = assessment_health.observation_key(ex)
-        unit_key = key
-        if journal_key is not None and (resumed is not None or on_review is not None):
+    # The capture being analyzed: (its observation key, its tier name, where its
+    # grouped followers start). A cancellation puts it back as unreviewed.
+    in_flight = None
+    try:
+        while True:
+            if reviewed >= max_reviews:
+                stopped_by = "capture review limit"
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                stopped_by = "capture review time budget"
+                break
+            if should_stop is not None:
+                stopped_by = should_stop() or None
+                if stopped_by:
+                    break
+            grouped_before = len(grouped)
+            cap = next(frontier, None)
+            if cap is None:
+                break
             try:
-                unit_key = journal_key(ex)
-            except Exception:   # a key that cannot be built is a journal miss, never an error
-                unit_key = key
-        if resumed is not None and unit_key in resumed:
-            findings = list(resumed[unit_key].get("findings") or [])
-            if summary_out is not None:
-                summary_out["resumed"] = summary_out.get("resumed", 0) + 1
-        else:
-            try:
-                resp = await orch.analyze(ex, _from_discovery=True, run_context=run_context)
-            except Exception as e:  # one capture's failure must not sink the rest
-                # Captures grouped under this representative were not actually reviewed:
-                # unmark them, so a later review round (a chain round) can still take them.
-                for entry in grouped[grouped_before:]:
-                    entry["representative_review"] = "failed"
-                for grouped_key in grouped_keys[grouped_before:]:
-                    seen.discard(grouped_key)
-                if errors is not None:
-                    errors.append({"phase": "capture_review", "error": type(e).__name__})
-                if model_failed is not None:
-                    model_failed.add(key)
-                log.debug("review_captured_exchanges: analyze failed on %s: %s",
-                          getattr(ex, "url", "?"), e)
+                ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
+            except Exception:
                 continue
-            # A failed stage (today: the critique, which then ships its findings
-            # unreviewed) is a failed model call too, so a retry round reviews it again.
-            if model_failed is not None and (
-                    any(getattr(r, "raw_error", None) for r in resp.agent_reports)
-                    or any(getattr(o, "status", None) == "failed"
-                           for o in getattr(resp, "stage_outcomes", None) or ())):
-                model_failed.add(key)
-            findings = [f.model_dump() for r in resp.agent_reports for f in r.findings]
-            fitted = _prompt_fits(resp)
-            if fitted:
-                elided.append({"capture": ex.url, "method": ex.method, "prompts": fitted})
-            if on_review is not None:
-                on_review(unit_key, {"findings": findings})
-        if findings:
-            state.ingest_findings(ex.url, ex.method, findings)
-            produced += 1
-    if reviewed:
-        log.info("review_captured_exchanges: reviewed %d captured 2xx exchanges, "
-                 "%d produced findings", reviewed, produced)
-    if elided:
-        log.info("review_captured_exchanges: %d capture(s) had model prompts cut to fit "
-                 "the context window (review_stats.elided)", len(elided))
-    remaining = 0
-    if stopped_by:
-        remaining = sum(1 for _ in review_frontier(captured, seen=set(seen)))
-        if remaining:
-            log.info("review_captured_exchanges: %s reached, %d captured exchange(s) "
-                     "not reviewed", stopped_by, remaining)
-            if errors is not None:
-                errors.append({"phase": "capture_review",
-                               "error": f"{stopped_by} reached: {remaining} captured "
-                                        "exchange(s) not reviewed"})
-    if stats is not None:
-        base = assessment_health.new_review_stats()
-        for name, empty in base.items():
-            stats.setdefault(name, empty)
-        stats["reviewed"] += reviewed
-        stats["grouped"].extend(grouped)
-        stats["elided"].extend(elided)
-        stats["unreviewed"] += remaining
-        for name, count in tier_counts.items():
-            stats["by_tier"][name] = stats["by_tier"].get(name, 0) + count
+            reviewed += 1
+            tier = assessment_health.TIER_NAMES[assessment_health.capture_tier(ex)]
+            tier_counts[tier] += 1
+            # R05: record the captured request template on its endpoint so the graph +
+            # coverage replay the real body/query/content-type/object-id, not an empty
+            # fabricated shape. Cheap and additive; failure must not sink the review.
+            try:
+                state.record_template(ex.url, ex.method, ex)
+            except Exception:
+                pass
+            key = assessment_health.observation_key(ex)
+            unit_key = key
+            if journal_key is not None and (resumed is not None or on_review is not None):
+                try:
+                    unit_key = journal_key(ex)
+                except Exception:   # a key that cannot be built is a journal miss, never an error
+                    unit_key = key
+            if resumed is not None and unit_key in resumed:
+                findings = list(resumed[unit_key].get("findings") or [])
+                if summary_out is not None:
+                    summary_out["resumed"] = summary_out.get("resumed", 0) + 1
+            else:
+                in_flight = (key, tier, grouped_before)
+                try:
+                    resp = await orch.analyze(ex, _from_discovery=True, run_context=run_context)
+                except Exception as e:  # one capture's failure must not sink the rest
+                    in_flight = None
+                    # Captures grouped under this representative were not actually reviewed:
+                    # unmark them, so a later review round (a chain round) can still take them.
+                    for entry in grouped[grouped_before:]:
+                        entry["representative_review"] = "failed"
+                    for grouped_key in grouped_keys[grouped_before:]:
+                        seen.discard(grouped_key)
+                    if errors is not None:
+                        errors.append({"phase": "capture_review", "error": type(e).__name__})
+                    if model_failed is not None:
+                        model_failed.add(key)
+                    log.debug("review_captured_exchanges: analyze failed on %s: %s",
+                              getattr(ex, "url", "?"), e)
+                    continue
+                in_flight = None
+                # A failed stage (today: the critique, which then ships its findings
+                # unreviewed) is a failed model call too, so a retry round reviews it again.
+                if model_failed is not None and (
+                        any(getattr(r, "raw_error", None) for r in resp.agent_reports)
+                        or any(getattr(o, "status", None) == "failed"
+                               for o in getattr(resp, "stage_outcomes", None) or ())):
+                    model_failed.add(key)
+                findings = [f.model_dump() for r in resp.agent_reports for f in r.findings]
+                fitted = _prompt_fits(resp)
+                if fitted:
+                    elided.append({"capture": ex.url, "method": ex.method, "prompts": fitted})
+                if on_review is not None:
+                    on_review(unit_key, {"findings": findings})
+            if findings:
+                state.ingest_findings(ex.url, ex.method, findings)
+                produced += 1
+    except asyncio.CancelledError:
+        # Cancelled mid-analysis (a hard deadline, the engagement ending): the capture
+        # in flight was not reviewed, nor were the captures grouped under it.
+        if in_flight is not None:
+            key, tier, grouped_before = in_flight
+            seen.discard(key)
+            for grouped_key in grouped_keys[grouped_before:]:
+                seen.discard(grouped_key)
+            del grouped[grouped_before:]
+            del grouped_keys[grouped_before:]
+            reviewed -= 1
+            tier_counts[tier] -= 1
+        stopped_by = ((should_stop() if should_stop is not None else None)
+                      or ("capture review time budget"
+                          if deadline is not None and time.monotonic() >= deadline
+                          else "cancellation"))
+        raise
+    finally:
+        _review_bookkeeping(captured, seen, errors=errors, stats=stats,
+                            stopped_by=stopped_by, reviewed=reviewed, produced=produced,
+                            grouped=grouped, elided=elided, tier_counts=tier_counts,
+                            outcome_out=outcome_out)
     return produced
 
 
