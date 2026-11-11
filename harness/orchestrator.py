@@ -375,6 +375,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         self.coverage_request_reserve = self.engagement_policy.coverage_request_reserve
         self.investigation_seconds = self.engagement_policy.investigation_seconds
         self.coverage_drive_seconds = self.engagement_policy.coverage_drive_seconds
+        self.coverage_endpoint_check_share = self.engagement_policy.coverage_endpoint_check_share
         # P2-1: business-context planning agent (BusinessContextAgent). DEFAULT
         # OFF. When on, investigate_engagement runs ONE application-context pass
         # that builds an Application Semantic Model (roles/objects/workflows/

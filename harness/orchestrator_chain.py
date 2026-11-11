@@ -2664,12 +2664,32 @@ class ChainMixin:
                 # worked out ONCE here rather than per check. Only requests that were
                 # observed as that identity count; nothing is built for an identity
                 # that was never probed or captured on the endpoint.
-                from harness.engagement import capture_identity_key, replayable_variants
+                from harness.engagement import (capture_identity_key, identity_variants,
+                                                replayable_variants)
                 _identity_role = {_pid(r): r.role for r in roles}
                 _replayable = {
                     (ep_key, identity): replayable_variants(ep, capture_identity_key(headers))
                     for ep_key, ep in state.endpoints.items() if ep.capture_variants
                     for identity, headers in _role_headers.items()}
+                # Captures merged into one replay (replay_dedupe), for the report.
+                _replay_merge = {"captures": 0, "replays": 0, "endpoints": set()}
+                for (ep_key, identity), kept in _replayable.items():
+                    every = identity_variants(state.endpoints[ep_key],
+                                              capture_identity_key(_role_headers[identity]))
+                    _replay_merge["captures"] += len(every)
+                    _replay_merge["replays"] += len(kept)
+                    if len(kept) < len(every):
+                        _replay_merge["endpoints"].add(ep_key)
+                # Per-(endpoint, check) wall-time bound while the drive is time-bound:
+                # one slow endpoint (a long-poll route captured 23 times in r9) must
+                # not take the time every other endpoint's checks needed. Access-control
+                # checks compare identities, so each identity gets its own share.
+                _share = float(getattr(self, "coverage_endpoint_check_share", 0.0) or 0.0)
+                _endpoint_check_cap = (self.coverage_drive_seconds * _share
+                                       if self.coverage_drive_seconds > 0 and _share > 0 else None)
+                _endpoint_check_spent: dict = {}
+                _endpoint_check_capped: dict = {}
+                _PER_IDENTITY_SHARE = frozenset({"cross_identity", "idor_read"})
 
                 def _captured_readiness(identity, method, path, check):
                     if check.id == "WSTG-CRYP-01":
@@ -2742,7 +2762,9 @@ class ChainMixin:
                         return _VR(check.confirmation, "inconclusive", check.vulnerability_class,
                                    summary="missing_principal: capture the request as this identity")
                     selected_roles = [r for r in roles if _pid(r) == identity]
-                    outcomes = []
+                    outcomes, held_back = [], []
+                    share_key = (ep_key, check.id) + (
+                        (identity,) if check.confirmation in _PER_IDENTITY_SHARE else ())
                     for node in worklist_investigator.captured_nodes(
                             dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles,
                             include_probes=True):
@@ -2750,9 +2772,34 @@ class ChainMixin:
                         if problem:
                             outcomes.append(_VR(check.confirmation, "inconclusive", check.vulnerability_class,
                                                 summary=problem + ": supply a complete authorized capture"))
+                        elif (_endpoint_check_cap is not None
+                              and _endpoint_check_spent.get(share_key, 0.0) >= _endpoint_check_cap):
+                            # A started replay always finishes; only the next one waits.
+                            capped = _endpoint_check_capped.setdefault(share_key, {
+                                "endpoint": ep_key, "check": check.id,
+                                "identity": identity if len(share_key) > 2 else None,
+                                "seconds_spent": 0.0, "replays_not_run": 0})
+                            capped["seconds_spent"] = round(_endpoint_check_spent[share_key], 1)
+                            capped["replays_not_run"] += 1
+                            held_back.append(_VR(
+                                check.confirmation, "inconclusive", check.vulnerability_class,
+                                summary=("endpoint_check_time_share: this check used its "
+                                         f"{_endpoint_check_cap:.1f} s share of the coverage drive "
+                                         "on this endpoint; this capture was not replayed")))
                         else:
-                            outcomes.append(await _run_captured_leg(identity, method, path, check, case_key,
-                                                                    node, remainder_only=remainder_only))
+                            started = time.monotonic()
+                            try:
+                                outcomes.append(await _run_captured_leg(
+                                    identity, method, path, check, case_key, node,
+                                    remainder_only=remainder_only))
+                            finally:
+                                _endpoint_check_spent[share_key] = (
+                                    _endpoint_check_spent.get(share_key, 0.0)
+                                    + time.monotonic() - started)
+                    # A replay the time share held back leaves the cell open, unless
+                    # another capture of it already confirmed (that proof was recorded).
+                    if not any(r is not None and r.confirmed for r in outcomes):
+                        outcomes += held_back
                     # A passive leg judges each captured response on its own; one it
                     # skips (a redirect, a body that was not kept) says nothing about
                     # the cell, so it never hides another capture's verdict.
@@ -2796,6 +2843,18 @@ class ChainMixin:
                                     "error": "coverage drive time budget reached: "
                                              f"{coverage.get('queued_not_attempted', 0)} queued "
                                              "leg(s) not attempted"})
+                if _replay_merge["replays"] < _replay_merge["captures"]:
+                    coverage["replay_merge"] = {
+                        "captures": _replay_merge["captures"], "replays": _replay_merge["replays"],
+                        "endpoints": sorted(_replay_merge["endpoints"])}
+                if _endpoint_check_capped:
+                    capped = sorted(_endpoint_check_capped.values(),
+                                    key=lambda c: (c["endpoint"], c["check"], c["identity"] or ""))
+                    coverage["endpoint_check_time_capped"] = capped
+                    _errors.append({"phase": "coverage_drive",
+                                    "error": "per-endpoint check time share reached: "
+                                             f"{sum(c['replays_not_run'] for c in capped)} captured "
+                                             f"replay(s) not run on {len(capped)} endpoint check(s)"})
             else:
                 coverage = coverage_tracker.build_coverage(state, roles,
                                                            investigated_keys=investigated_keys)

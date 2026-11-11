@@ -77,15 +77,29 @@ _REDIRECT = (301, 302, 303, 307, 308)
 
 def _locate_id(exchange: HttpExchange):
     """Return (kind, key, value) for the object id in the request, or None.
-    kind is 'query' (key is the param name) or 'path' (key is the segment index)."""
+    kind is 'query' (key is the param name) or 'path' (key is the segment index).
+
+    In order: a query key from the conventional `_ID_QUERY_KEYS`, then a path
+    segment that looks like an id, then any other query key NAMED as an identifier
+    (`basketId`, `invoice_id`, `uuid`: volatile_params' identifier rule) whose
+    value looks like an id (numeric, hex or UUID). The last step finds ids a fixed
+    key list misses without moving the id an earlier step already found. Engine.IO
+    framing on a polling request (`sid`) is transport state, never an object id."""
+    from harness.volatile_params import _is_identifier_name, is_polling_transport
     parts = urlsplit(exchange.url)
-    for key, val in parse_qsl(parts.query, keep_blank_values=True):
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    for key, val in pairs:
         if key.lower() in _ID_QUERY_KEYS and val:
             return ("query", key, val)
     segs = [s for s in (parts.path or "").split("/")]
     for i, seg in enumerate(segs):
         if seg and _ID_SEGMENT.match(seg):
             return ("path", i, seg)
+    polling = is_polling_transport(exchange.url)
+    for key, val in pairs:
+        if (val and _is_identifier_name(key) and _ID_SEGMENT.match(val.strip())
+                and not (polling and key == "sid")):
+            return ("query", key, val)
     return None
 
 

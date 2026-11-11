@@ -417,6 +417,12 @@ engagement:
   coverage_request_reserve: 0
   investigation_seconds: 0
   coverage_drive_seconds: 0
+  # While coverage_drive_seconds bounds the drive, one check may spend at most this
+  # share of it on one endpoint (0.05 of a 4 h drive = 12 min), all identities
+  # together; access-control checks get the share once per identity. Variants left
+  # by the bound are reported as inconclusive (endpoint_check_time_share) and listed
+  # under coverage.endpoint_check_time_capped. A fraction from 0 to 1; 0 = no bound.
+  coverage_endpoint_check_share: 0.05
   # Phase time-slices of investigation_seconds (harness/phase_schedule.py). A map of
   # phase -> share for worklist, recrawl, capture_review and chain_rounds: each phase
   # gets its share of the time LEFT when it begins (time a phase leaves unused rolls

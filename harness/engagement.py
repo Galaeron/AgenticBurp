@@ -210,7 +210,7 @@ def identity_probe_variant(probe: dict) -> dict:
     return variant
 
 
-def replayable_variants(ep, identity_key: str) -> list:
+def identity_variants(ep, identity_key: str) -> list:
     """The variants a check can replay AS this identity: its full captures, plus
     its access-matrix probe unless a full capture already holds the same request
     (the full one also carries the response). Empty when the identity was never
@@ -222,6 +222,15 @@ def replayable_variants(ep, identity_key: str) -> list:
     held = {shapes(v) for v in full}
     return full + [v for v in mine if v.get("source") == ACCESS_MATRIX_SOURCE
                    and shapes(v) not in held]
+
+
+def replayable_variants(ep, identity_key: str) -> list:
+    """`identity_variants`, with captures that differ only by throwaway values and
+    drew the same response replayed once (replay_dedupe.distinct_replays). Object
+    ids, identities and differing responses are never merged."""
+    from harness.replay_dedupe import distinct_replays
+    return distinct_replays(identity_variants(ep, identity_key),
+                            endpoint_variants=getattr(ep, "capture_variants", None) or [])
 
 
 _RESULT_BODY_HEAD = 200

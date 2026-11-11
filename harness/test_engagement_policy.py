@@ -84,7 +84,7 @@ class EnumerationSafeDefaultsTests(unittest.TestCase):
             "coverage_leg_budget", "engagement_coverage_case_drive",
             "coverage_case_budget", "coverage_parameter_field_cap", "capture_review_limit",
             "capture_review_seconds", "coverage_request_reserve",
-            "investigation_seconds", "coverage_drive_seconds",
+            "investigation_seconds", "coverage_drive_seconds", "coverage_endpoint_check_share",
         }
         self.assertEqual(set(d.keys()), expected_fields)
 
@@ -128,6 +128,9 @@ class ParityTests(unittest.TestCase):
             coverage_request_reserve=int(eng_cfg.get("coverage_request_reserve", 0)),
             investigation_seconds=float(eng_cfg.get("investigation_seconds", 0)),
             coverage_drive_seconds=float(eng_cfg.get("coverage_drive_seconds", 0)),
+            # Added after the refactor: the per-(endpoint, check) share of a
+            # time-bound coverage drive.
+            coverage_endpoint_check_share=float(eng_cfg.get("coverage_endpoint_check_share", 0.05)),
         )
 
     def test_parity_on_committed_config(self):
@@ -164,6 +167,7 @@ class ParityTests(unittest.TestCase):
                 "coverage_request_reserve": "1500",
                 "investigation_seconds": "3600",
                 "coverage_drive_seconds": "900",
+                "coverage_endpoint_check_share": "0.1",
             },
         }
         policy = EngagementPolicy.from_config(config)

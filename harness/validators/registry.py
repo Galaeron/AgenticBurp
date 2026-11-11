@@ -516,6 +516,15 @@ class ValidatorRegistry:
             return decision("needs_prerequisite", "missing_capture", "an authorized capture is required")
         if run_context is not None and not run_context.scope.in_scope(exchange.url):
             return decision("policy_denied", "scope_rejected", "capture is outside the owning run scope")
+        # Same rule as for_finding: an Engine.IO long-poll's query and body are
+        # transport framing, so injection and CSRF legs against it test nothing.
+        # The coverage drive dispatches by check, not by finding, so it needs the
+        # rule here too (r9 spent about 2 h of its drive on these legs).
+        from harness.volatile_params import is_polling_transport
+        if (is_polling_transport(exchange.url or "")
+                and {family, getattr(validator, "name", "")} & POLLING_EXCLUDED_VALIDATORS):
+            return decision("unsupported", "protocol_inapplicable",
+                            "a long-polling transport request carries framing, not application input")
         method = (exchange.method or "GET").upper()
         path = urlsplit(exchange.url).path.lower()
         if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03"}:
