@@ -62,12 +62,17 @@ def captured_nodes(node, base_url, roles, include_probes=False):
 
 def node_key(node) -> str:
     """A worklist node's identity across runs (E7): method, normalized route, the
-    identity key and capture id of the capture it replays, and its principal. All
-    of them come from the discovery state, so the same state gives the same key."""
+    capture it replays (engagement.stable_capture_id) and its principal. None of them
+    depends on a credential value: a resumed run whose roles logged in again (new
+    tokens) gives a finished node the same key (r9: the identity key and capture id
+    were in the key, so every finished authenticated node ran again). The principal
+    stands for the identity: captured_nodes pairs a capture only with the role whose
+    credentials sent it."""
+    from harness.engagement import stable_capture_id
     capture = node.get("capture") or {}
     principal = getattr(node.get("probe_session"), "principal_id", None)
     return "|".join([str(node.get("method") or "GET").upper(), str(node.get("path") or ""),
-                     str(capture.get("identity_key") or ""), str(capture.get("capture_id") or ""),
+                     stable_capture_id(capture) if capture else "",
                      str(principal() if callable(principal) else "")])
 
 

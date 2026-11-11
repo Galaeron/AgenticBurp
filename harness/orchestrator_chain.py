@@ -1211,6 +1211,7 @@ class ChainMixin:
                     for unit, payload in _journal.units("review:").items()}, {})
                             if _resuming else None),
                 "on_review": lambda key, payload: _journal_put(f"review:{key}", payload),
+                "journal_key": _journal.exchange_key,
                 "summary_out": _review_summary}
         # engagement.retry_rounds (off by default): record what every sweep and review
         # settles, so the time left after the coverage drive goes to the work they left.

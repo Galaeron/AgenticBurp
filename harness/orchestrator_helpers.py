@@ -746,7 +746,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
                                     group_identical: bool = True,
                                     resumed: dict | None = None, on_review=None,
                                     summary_out: dict | None = None,
-                                    model_failed: set | None = None) -> int:
+                                    model_failed: set | None = None,
+                                    journal_key=None) -> int:
     """Phase 0.1: route every substantive 2xx captured during discovery through
     full content-level review and fold its findings into `state`.
 
@@ -787,7 +788,10 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     findings an earlier, interrupted run got from it; such a capture skips
     `orch.analyze` and contributes those findings. `on_review(key, {"findings": [...]})`
     is called for each capture analyzed here, so a journal can record it. `summary_out`
-    gets the count of captures taken from `resumed` under "resumed".
+    gets the count of captures taken from `resumed` under "resumed". `journal_key(ex)`,
+    when given, is the key `resumed` and `on_review` use instead (the journal's
+    credential-free RunJournal.exchange_key); `seen` and `model_failed` keep the
+    observation key.
 
     `model_failed`, when given a set, gets the observation key of each capture whose
     analysis raised, had an agent report a `raw_error` (a model call that failed or
@@ -803,7 +807,7 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             orch, state, captured, max_reviews=max_reviews, run_context=run_context, seen=seen,
             errors=errors, deadline=deadline, stats=stats, group_identical=group_identical,
             resumed=resumed, on_review=on_review, summary_out=summary_out,
-            model_failed=model_failed)
+            model_failed=model_failed, journal_key=journal_key)
     # HU-5: whatever ends the review (a bound, an error, a cancellation), the handoff
     # gets the captures it left unreviewed. Bookkeeping only.
     seen = seen if seen is not None else set()
@@ -813,7 +817,7 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             orch, state, captured, max_reviews=max_reviews, run_context=run_context, seen=seen,
             errors=errors, deadline=deadline, stats=stats, group_identical=group_identical,
             resumed=resumed, on_review=on_review, summary_out=summary_out,
-            model_failed=model_failed)
+            model_failed=model_failed, journal_key=journal_key)
     finally:
         try:
             _handoff.note_captures(captured, seen)
@@ -823,7 +827,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
 
 async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_context,
                                      seen, errors, deadline, stats, group_identical,
-                                     resumed, on_review, summary_out, model_failed) -> int:
+                                     resumed, on_review, summary_out, model_failed,
+                                     journal_key=None) -> int:
     produced = 0
     reviewed = 0
     stopped_by = None
@@ -869,8 +874,14 @@ async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_
         except Exception:
             pass
         key = assessment_health.observation_key(ex)
-        if resumed is not None and key in resumed:
-            findings = list(resumed[key].get("findings") or [])
+        unit_key = key
+        if journal_key is not None and (resumed is not None or on_review is not None):
+            try:
+                unit_key = journal_key(ex)
+            except Exception:   # a key that cannot be built is a journal miss, never an error
+                unit_key = key
+        if resumed is not None and unit_key in resumed:
+            findings = list(resumed[unit_key].get("findings") or [])
             if summary_out is not None:
                 summary_out["resumed"] = summary_out.get("resumed", 0) + 1
         else:
@@ -902,7 +913,7 @@ async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_
             if fitted:
                 elided.append({"capture": ex.url, "method": ex.method, "prompts": fitted})
             if on_review is not None:
-                on_review(key, {"findings": findings})
+                on_review(unit_key, {"findings": findings})
         if findings:
             state.ingest_findings(ex.url, ex.method, findings)
             produced += 1

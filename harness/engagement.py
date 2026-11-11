@@ -189,6 +189,28 @@ def capture_variant(exchange) -> dict:
     return variant
 
 
+def _variant_digest(fields: dict) -> str:
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+
+def stable_capture_id(variant: dict) -> str:
+    """A capture's id without its credentials: capture_id's digest over the same
+    fields minus `identity_key`. identity_key (and so capture_id) hashes the
+    credential VALUES, which a re-login changes; this does not (r9: a resumed run
+    whose roles logged in again re-ran every finished authenticated worklist node)."""
+    return _variant_digest({k: v for k, v in (variant or {}).items()
+                            if k not in ("capture_id", "identity_key")})
+
+
+def rekey_variant(variant: dict, identity_key: str) -> dict:
+    """The same capture under another identity key (the same principal after a
+    re-login), with capture_id recomputed the way capture_variant() computes it."""
+    moved = {k: v for k, v in variant.items() if k != "capture_id"}
+    moved["identity_key"] = identity_key
+    moved["capture_id"] = _variant_digest(moved)
+    return moved
+
+
 # Marks a variant built from an access-matrix probe rather than a full capture.
 ACCESS_MATRIX_SOURCE = "access_matrix"
 
