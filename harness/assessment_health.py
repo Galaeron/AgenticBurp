@@ -321,7 +321,7 @@ def stored_proof_artifacts_resolve(proof):
 # Batch 08: mechanisms whose proven flaw is a host trust policy, not a route: the same
 # policy fingerprint on several routes is one issue with several locations. AR-08b:
 # one set, shared with the report path's issue key (issues.py).
-from harness.issues import ROUTE_INDEPENDENT_MECHANISMS  # noqa: E402
+from harness.issues import ROUTE_INDEPENDENT_MECHANISMS, issue_class  # noqa: E402
 from harness.evidence import is_tool_reported  # noqa: E402
 _ORPHAN_REASONS = {'proof not found for case', 'proof belongs to another run', 'proof belongs to another case'}
 
@@ -398,7 +398,9 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             continue
         finding = referenced.get(proof_id)
         validator = proof.get('validator', '')
-        cls = ((finding or {}).get('vulnerability_class') or case.get('check_id') or validator).lower()
+        # The report's class (issues.issue_class), not the raw label: r9 grouped
+        # "info_disclosure" and "information_disclosure" on one origin as two issues.
+        cls = issue_class((finding or {}).get('vulnerability_class') or case.get('check_id') or validator)
         claimed = ('hardening' if validator in ('csp_validator', 'crypto_validator', 'verbose_error_validator',
                                                 'security_headers_validator', 'error_handling_validator',
                                                 'content_exposure_validator')

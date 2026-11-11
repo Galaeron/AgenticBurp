@@ -142,7 +142,9 @@ class ClassFreeKeyTests(unittest.TestCase):
     def test_control_the_r9_key_scans_once_per_class(self):
         with patch.object(execution_registry, "TOOL_SCAN_KEYED", frozenset()):
             _results, validator = self._validate_each()
-        self.assertEqual(len(validator.calls), len(self.CLASSES))
+        # "sql_injection" now reads as sqli (categories), so the class-keyed control
+        # scans once per class: sqli and the access-control class.
+        self.assertEqual(len(validator.calls), 2)
 
     def test_other_shape_keyed_legs_still_split_on_the_class(self):
         a = execution_registry.execution_key("ssti", _ex("http://127.0.0.1/a?q=1"), "ssti")

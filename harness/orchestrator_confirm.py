@@ -553,6 +553,12 @@ class ConfirmMixin:
         _template_id = evidence._short(
             (exchange.method or "").upper(), exchange.url or "", exchange.request_body or "")
         from harness.categories import canonicalize as _vf_canon
+        # The identity whose credentials the capture carries: a finding naming no
+        # principal is that identity's, not an anonymous "captured" one (r9 split
+        # one forged-JWT root cause between the user's name and "captured").
+        _sessions = getattr(run_context, "sessions", None)
+        _capture_principal = (_sessions.identity_principal(exchange.request_headers or {})
+                              if hasattr(_sessions, "identity_principal") else "")
 
         def _case_for(finding, report, report_index: int, finding_index: int):
             check = _vf_canon(finding.vulnerability_class) or (finding.vulnerability_class or "")
@@ -563,7 +569,7 @@ class ConfirmMixin:
             return evidence.TestCaseRef.make(
                 run_id=_run_id,
                 request_template_id=finding.request_template_id or _template_id,
-                check_id=check, principal_id=finding.principal_id or "captured",
+                check_id=check, principal_id=finding.principal_id or _capture_principal or "captured",
                 parameter_location=finding.parameter_location,
                 parameter_name=finding.parameter_name,
                 workflow_state_id=finding.workflow_state_id,

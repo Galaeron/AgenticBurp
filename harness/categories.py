@@ -220,6 +220,10 @@ _DEDUP_SYNONYMS: dict[str, str] = {
     # Object-level only: bare "Broken Access Control" stays unmapped on purpose (it spans
     # idor/auth/business_logic; test_categories and the generic-guess gate rely on it).
     "broken object level access control": "idor",
+    # r9: the CSP validator's findings were filed as "CSP Weakness" beside "Missing
+    # Content Security Policy" and grouped as two observations of one header.
+    "csp weakness": "csp", "weak csp": "csp", "weak content security policy": "csp",
+    "content security policy weakness": "csp",
 }
 
 
@@ -256,9 +260,24 @@ def _lookup(key: str, categories, table: dict[str, str]) -> str | None:
     return table.get(normalized)
 
 
+def _spaced(key: str) -> str:
+    """snake_case read as words: the tables list "sql injection", the model also
+    writes "sql_injection"."""
+    return key.replace("_", " ")
+
+
 def _lookup_current(key: str) -> str | None:
-    return (_lookup(key, CANONICAL_CATEGORIES, _SYNONYMS)
-            or _lookup(key, CANONICAL_CATEGORIES, _DEDUP_SYNONYMS))
+    found = (_lookup(key, CANONICAL_CATEGORIES, _SYNONYMS)
+             or _lookup(key, CANONICAL_CATEGORIES, _DEDUP_SYNONYMS))
+    if found or "_" not in key:
+        return found
+    # r9 filed one class under both spellings ("sql_injection" and "SQL Injection",
+    # "insecure_direct_object_reference" and "Insecure Direct Object Reference") and
+    # reported each spelling as its own issue. The current reading folds the
+    # underscores; legacy_canonicalize keys the stored fingerprint and does not.
+    spaced = _spaced(key)
+    return (_lookup(spaced, CANONICAL_CATEGORIES, _SYNONYMS)
+            or _lookup(spaced, CANONICAL_CATEGORIES, _DEDUP_SYNONYMS))
 
 
 # Umbrella terms left unmapped on purpose (see _DEDUP_SYNONYMS): as one part of a
@@ -288,7 +307,7 @@ def canonicalize(raw: str | None) -> str | None:
     if whole or "/" not in key:
         return whole
     parts = [part.strip() for part in key.split("/") if part.strip()]
-    if any(_normalize(part) in _AMBIGUOUS_PARTS for part in parts):
+    if any(_spaced(_normalize(part)) in _AMBIGUOUS_PARTS for part in parts):
         return None
     mapped = {c for c in (_lookup_current(part) for part in parts) if c}
     return next(iter(mapped)) if len(mapped) == 1 else None

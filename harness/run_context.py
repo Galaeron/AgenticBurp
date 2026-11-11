@@ -408,6 +408,20 @@ class SessionManager:
                     if not is_identity_credential_header(k)}
         return None, supplied
 
+    def identity_principal(self, headers: dict | None) -> str:
+        """The principal of the run identity whose credentials `headers` carry, else "".
+
+        A capture made with a configured user's token is that user's request. r9
+        filed its proofs under "captured" and the same user's role-session proofs
+        under the user's name, so one forged-JWT root cause was two issues. Only a
+        named identity answers: not the capture's own credential alias ("captured",
+        registered when no identity owns the credentials) nor a one-send session."""
+        ref, _ = self.bind_headers(headers)
+        session = self._by_id.get(ref) if ref else None
+        if session is None or session.ephemeral or session.session_id == "captured":
+            return ""
+        return session.principal_id or ""
+
     async def aclose(self) -> None:
         for s in self._by_id.values():
             await s.aclose()

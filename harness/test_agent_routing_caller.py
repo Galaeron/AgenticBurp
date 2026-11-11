@@ -70,21 +70,21 @@ class AgentRoutingCallerTests(unittest.TestCase):
         self.assertFalse(finding.confirmed)
 
     def test_mislabelled_fallback_survives_real_plan_and_validate(self):
-        commands, validations, plans, finding = self.exercise("sql_injection", "sqli")
+        commands, validations, plans, finding = self.exercise("database_query_manipulation", "sqli")
         self.assertEqual(len(commands), 1, "agent fallback must survive plan/validate applies rechecks")
         self.assertEqual([v.status for v in validations], ["not_confirmed"])
         self.assertEqual(plans, 1)
         self.assertFalse(finding.confirmed)
 
     def test_unknown_agent_does_not_recover_mislabelled_finding(self):
-        commands, validations, plans, finding = self.exercise("sql_injection", "unknown")
+        commands, validations, plans, finding = self.exercise("database_query_manipulation", "unknown")
         self.assertEqual((commands, validations, plans), ([], [], 0))
         self.assertFalse(finding.confirmed)
 
     def test_active_and_scope_controls_prevent_execution(self):
         for active, scoped in ((False, True), (True, False)):
             with self.subTest(active=active, scoped=scoped):
-                commands, validations, plans, finding = self.exercise("sql_injection", "sqli", active, scoped)
+                commands, validations, plans, finding = self.exercise("database_query_manipulation", "sqli", active, scoped)
                 self.assertEqual((commands, validations, plans), ([], [], 0))
                 self.assertFalse(finding.confirmed)
 
@@ -120,10 +120,10 @@ class RoutingIdentityTests(unittest.IsolatedAsyncioTestCase):
         caller = ConfirmMixin()
         caller.config, caller.allowed_hosts = config, ["routing.invalid"]
         caller.validator_registry = ValidatorRegistry(config)
-        original_leg = SyntheticValidator("original", "sql_injection")
+        original_leg = SyntheticValidator("original", "database_query_manipulation")
         fallback_leg = SyntheticValidator("fallback", "sqli")
         caller.validator_registry.validators = {"original": original_leg, "fallback": fallback_leg}
-        finding = Finding(vulnerability_class="sql_injection", confidence=0.6, severity="medium",
+        finding = Finding(vulnerability_class="database_query_manipulation", confidence=0.6, severity="medium",
                           summary="hypothesis", evidence="original evidence", suggested_test="test", basis="derived",
                           finding_id="original-id", parameter_name="id", principal_id="principal")
         report = AgentReport(agent="sqli", model="synthetic", findings=[finding])
@@ -135,7 +135,7 @@ class RoutingIdentityTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(caller, "_oracle_gate", AsyncMock()) as oracle, \
                  patch("harness.store.persist_validation_submission", return_value=(True, "")):
                 validations, _ = await caller._validate_findings(exchange, [report], run_context=context)
-            self.assertEqual([v.finding_class for v in validations], ["sql_injection"] * 2)
+            self.assertEqual([v.finding_class for v in validations], ["database_query_manipulation"] * 2)
             self.assertIs(observed[0][1], finding)
             routed = observed[1][1]
             self.assertIsNot(routed, finding)
@@ -147,7 +147,7 @@ class RoutingIdentityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(fallback_leg.run_context)
             self.assertTrue(finding.confirmed)
             self.assertEqual((finding.vulnerability_class, finding.evidence),
-                             ("sql_injection", "original evidence"))
+                             ("database_query_manipulation", "original evidence"))
             self.assertEqual(oracle.call_args.kwargs["routing_finding"], routed)
             self.assertIs(oracle.call_args.args[0], finding)
             self.assertTrue(all(call.kwargs["finding_ref"] == "original-id" for call in proof.call_args_list))
@@ -213,7 +213,7 @@ class RoutingIdentityTests(unittest.IsolatedAsyncioTestCase):
         caller = ConfirmMixin()
         caller.config = {}
         caller.validator_registry = ValidatorRegistry({})
-        finding = Finding(vulnerability_class="sql_injection", confidence=0.6, severity="medium",
+        finding = Finding(vulnerability_class="database_query_manipulation", confidence=0.6, severity="medium",
                           summary="hypothesis", evidence="original", suggested_test="test", basis="derived", finding_id="id")
         routed = finding.model_copy(update={"vulnerability_class": "sqli"})
         exchange = HttpExchange(url="https://routing.invalid/items", method="GET")
@@ -224,7 +224,7 @@ class RoutingIdentityTests(unittest.IsolatedAsyncioTestCase):
         select.assert_called_once_with(routed, exchange, passive_only=True)
         active.assert_not_called()
         stamp.assert_called_once_with(finding, None)
-        self.assertEqual(finding.vulnerability_class, "sql_injection")
+        self.assertEqual(finding.vulnerability_class, "database_query_manipulation")
 
 
 class AgentForwardingMutationTests(unittest.TestCase):
