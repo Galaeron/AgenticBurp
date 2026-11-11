@@ -68,6 +68,9 @@ for i in range(int(os.environ.get("I05D_REQUESTS", "0"))):
     except Exception:
         refused += 1
 print(f"tool done ok={ok} refused={refused}", flush=True)
+if os.environ.get("I05D_PRINT"):        # recorded sqlmap output, after the real sends
+    with open(os.environ["I05D_PRINT"], encoding="utf-8") as f:
+        print(f.read(), flush=True)
 '''
 
 

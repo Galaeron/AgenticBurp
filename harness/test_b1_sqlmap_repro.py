@@ -76,6 +76,19 @@ _UNREACHABLE = _BANNER + """
 [12:00:21] [CRITICAL] unable to connect to the target URL ('Network is unreachable')
 """
 
+# r9: the container's network dropped single requests mid-scan. sqlmap retried, gave
+# up on one, carried on and reached its verdict.
+_ANSWERED_THROUGH_BLIPS = _BANNER + """
+[12:00:01] [INFO] testing connection to the target URL
+[12:00:02] [WARNING] heuristic (basic) test shows that GET parameter 'id' might not be SQL injectable
+[12:00:20] [CRITICAL] unable to connect to the target URL ('Network is unreachable'). sqlmap is going to retry the request(s)
+[12:00:20] [WARNING] most likely web server instance hasn't recovered yet from previous timed based payload.
+[12:00:30] [CRITICAL] unable to connect to the target URL ('Network is unreachable')
+[12:00:40] [CRITICAL] unable to connect to the target URL ('Network is unreachable'). sqlmap is going to retry the request(s)
+[12:00:50] [WARNING] GET parameter 'id' does not seem to be injectable
+[12:00:50] [CRITICAL] all tested parameters do not appear to be injectable. Try to increase values for '--level'/'--risk' options
+"""
+
 _ANSWERED_WITH_A_RETRY = _BANNER + """
 [12:00:01] [INFO] testing connection to the target URL
 [12:00:11] [WARNING] connection timed out to the target URL. sqlmap is going to retry the request(s)
@@ -628,6 +641,36 @@ class ConnectionFailureTests(_AccountingFixture, unittest.TestCase):
         self.assertEqual(len(self.launched), 1, "sqlmap was not launched")
         self.assertEqual(result.status, "error", result.summary)
         self.assertIn("failed at the transport", result.summary)
+
+    def _blip_scan(self, output: str, sends: int):
+        """The stand-in sqlmap sends `sends` real requests through the run's proxy,
+        then prints `output` as sqlmap's own."""
+        printed = Path(self._tmp) / "sqlmap-output.txt"
+        printed.write_text(output, encoding="utf-8")
+        self.env.update(I05D_REQUESTS=str(sends), I05D_PRINT=str(printed))
+        result = self._run_get(f"{self.target.base}/api/records/7")
+        self.assertEqual(len(self.launched), 1, "sqlmap was not launched")
+        return result
+
+    def test_connection_blips_inside_an_answered_scan_are_not_a_failure(self):
+        result = self._blip_scan(_ANSWERED_THROUGH_BLIPS, sends=3)
+        self.assertEqual(result.status, "not_confirmed", result.summary)
+        self.assertIn("retried 2 request(s) after a transport failure and gave up on 1",
+                      result.limitation)
+        self.assertIn("all tested parameters do not appear to be injectable", result.limitation)
+
+    def test_control_blips_when_the_proxy_answered_nothing_stay_an_error(self):
+        result = self._blip_scan(_ANSWERED_THROUGH_BLIPS, sends=0)
+        self.assertEqual(result.status, "error", result.summary)
+        self.assertIn("unable to connect", result.summary)
+
+    def test_control_a_verdict_after_too_many_lost_requests_stays_an_error(self):
+        lost = "[12:00:45] [CRITICAL] unable to connect to the target URL ('Network is unreachable')\n"
+        output = _ANSWERED_THROUGH_BLIPS.replace(
+            "[12:00:50] [WARNING] GET parameter", lost * 2 + "[12:00:50] [WARNING] GET parameter")
+        result = self._blip_scan(output, sends=3)
+        self.assertEqual(result.status, "error", result.summary)
+        self.assertIn("not a negative result", result.limitation)
 
     def test_negative_control_an_answered_scan_with_one_retry_is_not_confirmed(self):
         with patch("harness.tool_runner.run_process", return_value=_Proc(_ANSWERED_WITH_A_RETRY)):

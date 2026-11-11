@@ -114,20 +114,66 @@ def _light_note(reason: str, cap: int, proxy) -> str:
 # sqlmap's own "could not reach the target" verdicts. Only [CRITICAL] lines (and the
 # OS's "network is unreachable") count: a single "[WARNING] connection timed out ...
 # sqlmap is going to retry" during an otherwise answered scan is not a failure.
+_CONNECTION_WORDS = (r"unable to connect|connection refused|connection reset|connection timed out|"
+                     r"can't establish|cannot connect|failed to establish a new connection|"
+                     r"host .* does not exist|name or service not known")
 _CONNECTION_FAILURE_RE = re.compile(
-    r"network is unreachable|\[CRITICAL\][^\n]*(?:unable to connect|connection refused|"
-    r"connection reset|connection timed out|can't establish|cannot connect|"
-    r"failed to establish a new connection|host .* does not exist|name or service not known)",
-    re.I)
+    rf"network is unreachable|\[CRITICAL\][^\n]*(?:{_CONNECTION_WORDS})", re.I)
+# One connection line per request. "... sqlmap is going to retry the request(s)" is a
+# retry; the same line without it is a request sqlmap gave up on. Inside a test it
+# then moves on to the next payload, so the scan still ends in a verdict.
+_CONNECTION_LINE_RE = re.compile(rf"\[CRITICAL\][^\n]*(?:{_CONNECTION_WORDS})[^\n]*", re.I)
+# sqlmap's negative conclusion on the parameters it tested: it reached the end of
+# its tests, which a scan that never got an answer does not.
+_PARAMETER_VERDICT_RE = re.compile(
+    r"all tested parameters do not appear to be injectable|does not seem to be injectable", re.I)
+# A scan that reached its verdict but gave up on more requests than this is not
+# trusted as answered. In r9 the container's network dropped single requests
+# ("Network is unreachable") in 16 scans that each lost at most one.
+_MAX_LOST_REQUESTS = 2
+
+
+def _connection_blips(output: str) -> tuple[int, int]:
+    """(retried, lost): sqlmap's connection failures it retried, and the requests it
+    gave up on after its retries."""
+    retried = lost = 0
+    for line in _CONNECTION_LINE_RE.findall(output or ""):
+        if "going to retry" in line.lower():
+            retried += 1
+        else:
+            lost += 1
+    return retried, lost
+
+
+def _answered_through_blips(output: str, proxy) -> bool:
+    """sqlmap's connection failures were blips inside a scan the target answered:
+    it reached its verdict on the parameters, lost at most _MAX_LOST_REQUESTS
+    requests, and inside a run the proxy answered at least one of its requests."""
+    if not _PARAMETER_VERDICT_RE.search(output or ""):
+        return False
+    if proxy is not None and proxy.forwarded - proxy.refused.get("error", 0) <= 0:
+        return False
+    return _connection_blips(output)[1] <= _MAX_LOST_REQUESTS
+
+
+def _blip_note(output: str) -> str:
+    """The limitation for an answered scan that had connection blips, or ""."""
+    retried, lost = _connection_blips(output)
+    if not (retried or lost):
+        return ""
+    return (f"sqlmap retried {retried} request(s) after a transport failure"
+            + (f" and gave up on {lost}; a lost request may hide a finding" if lost else ""))
 
 
 def _connection_failure(output: str, proxy) -> str:
     """Why sqlmap never got an answer from the target, or "". Either sqlmap said so,
     or inside a run every request it sent through the tool proxy failed at the
     transport (the proxy answers those 502, which sqlmap reads as a page, not as a
-    connection failure)."""
+    connection failure). Connection lines inside a scan the target answered
+    (_answered_through_blips) are not a failure: r9 marked 16 finished scans as
+    "could not reach the target" this way, and the retry rounds ran them again."""
     found = _CONNECTION_FAILURE_RE.search(output or "")
-    if found:
+    if found and not _answered_through_blips(output, proxy):
         return found.group(0).replace("[CRITICAL]", "").strip()[:160]
     if proxy is not None and proxy.forwarded and proxy.refused.get("error", 0) >= proxy.forwarded:
         return f"all {proxy.forwarded} request(s) sqlmap sent failed at the transport"
@@ -1140,13 +1186,15 @@ class SqlmapValidator(Validator):
                             "-- not a negative result",
                     evidence=verdict_evidence, raw_output=output, command=cmd,
                     control_outcome=NAMED_PARAMETER_UNTESTED, limitation=verdict)
+            blips = _blip_note(output)
             return ValidationResult(
                 self.name, "not_confirmed", finding.vulnerability_class,
                 confidence=0.2 if proc.returncode == 0 else 0.0,
                 confirmed=False,
                 summary="sqlmap did not establish SQL injection for the captured request"
                         + (f" ({verdict_lines(output)[-1]})" if verdict else ""),
-                evidence=verdict_evidence, raw_output=output, command=cmd, limitation=verdict,
+                evidence=verdict_evidence, raw_output=output, command=cmd,
+                limitation="; ".join(x for x in (blips, verdict) if x),
             )
 
     async def _sqlmap_confirmation(self, finding: Finding, exchange: HttpExchange,
