@@ -426,7 +426,7 @@ class ExecutionRegistryTests(unittest.TestCase):
         self.assertEqual((stats["misses"], stats["hits"], stats["sends_saved"]), (1, 2, 14))
         self.assertEqual(stats["by_validator"]["sqlmap"],
                          {"hits": 2, "misses": 1, "inflight_joins": 0, "sends_saved": 14,
-                          "retry_limited": 0, "full_scan_covers": 0})
+                          "retry_limited": 0, "full_scan_covers": 0, "shell_covers": 0})
         self.assertEqual(budget.used, 7)
 
 

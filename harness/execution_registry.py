@@ -36,6 +36,13 @@ and identity that reached that input (the validator's `full_scan_covers`), and a
 incomplete tool scan the target answered at least `answered_floor` times is not
 retried: what stopped it (its timeout, a per-scan cap) stops the next one the same
 way, unless the result says the cause may clear by itself (`transient_stop`).
+
+r9 (F4): a single-page app answers every client-side route (/, /about, /accounting,
+/address/create, ...) with one HTML document, and each route was a new shape: ssti
+sent 238 payloads to each. A shape-keyed leg's clean result on a GET whose captured
+response is a full HTML document also covers another route whose capture is the
+same document byte for byte (`_shell_key`): the server answered both with one
+catch-all, so injecting there tests the catch-all again.
 """
 from __future__ import annotations
 
@@ -128,6 +135,39 @@ def execution_key(validator_name: str, exchange, finding_class: str | None = Non
     return key + (("parameter", tuple(parameter)),) if any(parameter) else key
 
 
+_SHELL_MIN_CHARS = 256
+
+
+def _html_document(exchange) -> bool:
+    """A 200 GET whose captured response is a full HTML document."""
+    if (exchange.method or "GET").upper() != "GET" or exchange.response_status != 200:
+        return False
+    body = exchange.response_body or ""
+    if len(body) < _SHELL_MIN_CHARS:
+        return False
+    ctype = next((str(v) for k, v in (exchange.response_headers or {}).items()
+                  if str(k).lower() == "content-type"), "")
+    head = body.lstrip()[:64].lower()
+    looks_html = head.startswith("<!doctype html") or head.startswith("<html")
+    return looks_html and (not ctype or "html" in ctype.lower())
+
+
+def _shell_key(validator_name: str, exchange, finding_class: str | None, conditions) -> tuple | None:
+    """The key a shape-keyed leg's result is also kept under when its capture is a
+    full HTML document: the document (by content) instead of the route template and
+    parameters, so another route the server answered with the same catch-all
+    document finds it. None for any other leg or response."""
+    if validator_name not in SHAPE_KEYED or not _html_document(exchange):
+        return None
+    raw_class = (finding_class or "").strip().lower()
+    family = "" if validator_name in TOOL_SCAN_KEYED else (canonicalize(raw_class) or raw_class)
+    digest = hashlib.sha256((exchange.response_body or "").encode("utf-8", errors="replace"))
+    return ("html-document", validator_name, urlsplit(exchange.url or "").netloc.lower(),
+            digest.hexdigest(), _identity_signature(exchange.request_headers),
+            capture_identity_key(exchange.request_headers), family,
+            str(conditions.get("mechanism_version", "1")), conditions.get("state", "") or "")
+
+
 def _base_key(validator_name: str, exchange, finding_class: str | None) -> tuple:
     # _identity_signature reads Authorization and Cookie only; capture_identity_key
     # adds every non-public header, so an X-Api-Key identity is not shared either.
@@ -209,11 +249,42 @@ class ExecutionRegistry:
         self._flying: dict[tuple, asyncio.Future] = {}
         self._active: list[dict] = []     # calls in progress, for overlap detection
         self._by_validator: dict[str, dict[str, int]] = {}
+        # html-document key -> (route template it ran on, its stored result).
+        self._shells: dict[tuple, tuple[str, _Stored]] = {}
 
     def _tally(self, name: str) -> dict:
         return self._by_validator.setdefault(
             name, {"hits": 0, "misses": 0, "inflight_joins": 0, "sends_saved": 0,
-                   "retry_limited": 0, "full_scan_covers": 0})
+                   "retry_limited": 0, "full_scan_covers": 0, "shell_covers": 0})
+
+    def _shell_cover(self, shell_key, route, case_ref, tally):
+        """A covered copy of a clean result another route's identical HTML document
+        drew, or None (no such result, or it ran on this very route)."""
+        held = self._shells.get(shell_key) if shell_key is not None else None
+        if held is None or held[0] == route:
+            return None
+        other_route, stored = held
+        tally["hits"] += 1
+        tally["shell_covers"] += 1
+        tally["sends_saved"] += stored.sent_count
+        covered = self._covered_copy(stored, case_ref)
+        covered.tested_parameters = ()
+        covered.summary = (f"covered by {stored.case_ref}: this route's captured response is "
+                           f"the same HTML document {other_route} returned, so the server "
+                           f"answered both with one catch-all page and the clean "
+                           f"{stored.result.validator} check there tested it: "
+                           f"{stored.result.summary or ''}")
+        return covered
+
+    def _keep_shell(self, shell_key, route, key):
+        """Keep a clean, complete result under its html-document key (first wins)."""
+        stored = self._stored.get(key)
+        if shell_key is None or stored is None or shell_key in self._shells:
+            return
+        one = stored.result
+        if (getattr(one, "status", None) == "not_confirmed" and not getattr(one, "confirmed", False)
+                and not getattr(one, "control_outcome", "")):
+            self._shells[shell_key] = (route, stored)
 
     async def run(self, validator, finding, exchange, *, case_ref, call):
         """Return the validator's result for this execution key.
@@ -231,9 +302,13 @@ class ExecutionRegistry:
         A tool scan's parameter-only case is also served by a clean full scan of the
         same shape and identity that reached its input (`_full_scan_cover`)."""
         name = getattr(validator, "name", "") or "validator"
+        conditions = _conditions(validator, finding)
         key = execution_key(name, exchange, getattr(finding, "vulnerability_class", None),
-                            **_conditions(validator, finding))
+                            **conditions)
         full_key = self._full_scan_key(validator, finding, exchange)
+        shell_key = _shell_key(name, exchange, getattr(finding, "vulnerability_class", None),
+                               conditions)
+        route = normalize_path(exchange.url or "")
         tally = self._tally(name)
         while True:
             stored = self._stored.get(key)
@@ -246,6 +321,9 @@ class ExecutionRegistry:
                                                 case_ref, tally)
                 if covered is not None:
                     return covered
+            covered = self._shell_cover(shell_key, route, case_ref, tally)
+            if covered is not None:
+                return covered
             flight = self._flying.get(key)
             if flight is None and full_key is not None:
                 # A full scan in flight may cover this case once it lands.
@@ -258,8 +336,10 @@ class ExecutionRegistry:
             tally["inflight_joins"] += 1
             # shield: cancelling this waiter must not cancel the run others share.
             await asyncio.shield(flight)
-        return await self._miss([key], tally, call, case_ref,
-                                tool_scan=name in TOOL_SCAN_KEYED)
+        result = await self._miss([key], tally, call, case_ref,
+                                  tool_scan=name in TOOL_SCAN_KEYED)
+        self._keep_shell(shell_key, route, key)
+        return result
 
     @staticmethod
     def _full_scan_key(validator, finding, exchange):
