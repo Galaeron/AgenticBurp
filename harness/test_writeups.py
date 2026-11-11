@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 import yaml
 
 from harness import report_generator, writeups
+from harness.run_context import SessionManager
 from harness import test_cross_identity_ownership_gate as xid
 
 _CONFIG = Path(__file__).resolve().parent / "config.yaml"
@@ -97,8 +98,11 @@ class WriteupCallerTests(unittest.TestCase):
 
     def test_unmapped_captured_session_gets_the_neutral_label(self):
         """No mapping in the verdict and no attribution: the neutral label, never a
-        quoted principal "captured"; the template stays fact-bound."""
-        self._prove_cross_owner_read()
+        quoted principal "captured"; the template stays fact-bound. The capture's
+        credentials are owned by no identity, so its proof's principal stays the
+        session ref "captured"."""
+        with patch.object(SessionManager, "identity_principal", lambda self, headers: ""):
+            self._prove_cross_owner_read()
         with patch.object(writeups, "_CAPTURED_BY_PATTERNS", ()),                 patch.object(writeups, "_OWNER_PATTERNS", ()):
             md = self._writeup()["markdown"]
         self.assertNotIn("`captured", md)
@@ -107,6 +111,18 @@ class WriteupCallerTests(unittest.TestCase):
         impact = md.split("## Impact", 1)[1].split("##", 1)[0]
         self.assertIn(f"`bob` read an object of {writeups.UNMAPPED_CAPTURED} at `GET /objects/7`",
                       impact)
+
+    def test_a_capture_made_with_an_identitys_credentials_names_it_without_the_verdict(self):
+        """r9: the capture was made with bob's token, so its proof names bob; the
+        write-up needs no wording-based mapping and shows no captured-session label."""
+        self._prove_cross_owner_read()
+        with patch.object(writeups, "_CAPTURED_BY_PATTERNS", ()),                 patch.object(writeups, "_OWNER_PATTERNS", ()):
+            md = self._writeup()["markdown"]
+        self.assertEqual(self._principals_line(md), "- Principals: `bob`")
+        self.assertNotIn("`captured", md)
+        self.assertNotIn(writeups.UNMAPPED_CAPTURED, md)
+        impact = md.split("## Impact", 1)[1].split("##", 1)[0]
+        self.assertIn("`bob` read another principal's object at `GET /objects/7`", impact)
 
     def test_unproven_candidate_gets_no_writeup(self):
         resp = self.h._analyze("/objects/7")    # nothing declared: a supported lead only
