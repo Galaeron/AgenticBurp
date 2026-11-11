@@ -510,6 +510,27 @@ async def _quietly(awaitable) -> None:
         pass
 
 
+_ROUTE_DRAIN_SECONDS = 5.0
+
+
+async def _close_context(context) -> None:
+    """Close a browser context once its route handlers have finished.
+
+    Every request the page makes goes through the identity router's handler,
+    which sends it through the run and then fulfills it. A context closed while
+    a handler was still awaiting its send left Playwright's `_on_route` task
+    pending on a connection that no longer answers: r9 logged 174 "Task was
+    destroyed but it is pending!". Waiting for the handlers first (bounded; past
+    the bound they are released and their late errors ignored) lets them end."""
+    unroute_all = getattr(context, "unroute_all", None)
+    if callable(unroute_all):
+        try:
+            await asyncio.wait_for(unroute_all(behavior="wait"), _ROUTE_DRAIN_SECONDS)
+        except Exception:
+            await _quietly(unroute_all(behavior="ignoreErrors"))
+    await _quietly(context.close())
+
+
 class _IdentityRouter:
     """The route handler, browser launch flags and main-frame navigation shared
     by `visit` and `capture_requests` (I05-D; see the block comment above)."""
@@ -936,10 +957,7 @@ class PlaywrightDriver:
                                 '(node, marker) => node.textContent.includes(marker) || node.innerHTML.includes(marker)', observe_marker))
                 finally:
                     if context is not None:
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
+                        await _close_context(context)
                     # A locally-launched browser is ours to terminate; a
                     # connected one is only disconnected (never kill a shared
                     # container browser out from under other sessions).
@@ -1035,10 +1053,7 @@ class PlaywrightDriver:
                         await page.wait_for_timeout(wait_ms)
                 finally:
                     if context is not None:
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
+                        await _close_context(context)
                     try:
                         await browser.close()
                     except Exception:
@@ -1160,7 +1175,7 @@ class PlaywrightDriver:
                         deadline=deadline)
                 finally:
                     if context is not None:
-                        await _quietly(context.close())
+                        await _close_context(context)
                     await _quietly(browser.close())
         except Exception as e:
             result = SpaCrawlResult(start_url=url)
@@ -1344,10 +1359,7 @@ class PlaywrightDriver:
                             obs.readback_body = ""
                 finally:
                     if context is not None:
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
+                        await _close_context(context)
                     try:
                         await browser.close()
                     except Exception:
