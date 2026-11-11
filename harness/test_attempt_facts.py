@@ -141,11 +141,37 @@ class AttemptFactTests(unittest.TestCase):
 
     def test_sqlmap_per_parameter_dispatch_records_one_fresh_attempt_per_input(self):
         """Per-parameter dispatch: sqlmap is sent once for `q`, once for `sort` and
-        once at request level for the path id it cannot target alone. Each send is
-        a fresh attempt on its own case; the untargetable sibling keeps the cell
-        executed but incomplete."""
+        once for the path id (its `*` marker, r9 review). Each send is a fresh attempt
+        on its own case, and with every input tested on its own the request-level case
+        needs no send and the cell is complete."""
         run = _Run(self.target, bind_cases=True)
         report = run.drive(build_coverage_cases_driven, _state(self.target.base, "/items/1?q=1&sort=a"))
+        matrix, parent = _cell(report)
+        self.assertEqual(self.target.requests, 3)
+        self.assertEqual(parent.status, CellStatus.NOT_DETECTED)
+        self.assertTrue(parent.executed)
+        self.assertEqual(len(parent.attempts), 3)
+        cases = {ck.parameter_name: r for ck, r in matrix.cases_for_cell("anonymous", ITEMS, CHECK)}
+        for name in ("q", "sort", "object_id"):
+            self.assertEqual(cases[name].status, CellStatus.NOT_DETECTED, name)
+            self.assertEqual(len(cases[name].attempts), 1, name)
+            self.assertEqual(cases[name].attempts[0]["sent"], 1, name)
+        self.assertEqual(len({cases[n].attempts[0]["id"] for n in ("q", "sort", "object_id")}), 3)
+        self.assertEqual(cases[""].status, CellStatus.NOT_DETECTED)
+        self.assertFalse(cases[""].attempts)
+        self.assertIn("every input (3) tested on its own", cases[""].reason)
+
+    def test_control_without_path_dispatch_the_path_id_leaves_the_cell_incomplete(self):
+        """The r9 shape: sqlmap cannot target the path id alone, so it is sent at
+        request level and the untargetable sibling keeps the cell executed but
+        incomplete."""
+        from harness.validators import injection_targets
+        locations = {**injection_targets.PER_PARAMETER_LOCATIONS,
+                     "sqlmap": frozenset({"query", "body_form"})}
+        run = _Run(self.target, bind_cases=True)
+        with unittest.mock.patch.dict(injection_targets.PER_PARAMETER_LOCATIONS, locations):
+            report = run.drive(build_coverage_cases_driven,
+                               _state(self.target.base, "/items/1?q=1&sort=a"))
         matrix, parent = _cell(report)
         self.assertEqual(self.target.requests, 3)
         self.assertEqual(parent.status, CellStatus.PENDING)       # not endpoint-complete
