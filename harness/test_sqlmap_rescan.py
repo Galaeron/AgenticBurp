@@ -40,6 +40,12 @@ def _drive_config(*, mutating):
     return cfg
 
 
+def _split_marked(scans):
+    """(unmarked scans, scans of a path segment carrying sqlmap's `*` marker)."""
+    marked = [c for c in scans if "*" in c[c.index("-u") + 1]]
+    return [c for c in scans if c not in marked], marked
+
+
 class PerParameterCaseTests(_EngagementCallerBase, unittest.TestCase):
     """The worklist scans the capture in full; the drive's per-parameter case for its
     query parameter is covered by that scan instead of launching `sqlmap -p`."""
@@ -56,9 +62,12 @@ class PerParameterCaseTests(_EngagementCallerBase, unittest.TestCase):
 
     def test_the_parameter_case_is_covered_by_the_full_scan(self):
         result, _rc, _model, launches, _ = self._drive(("/api/items/1", "q=a"))
-        scans = launches.on("/api/items/")
+        scans, marked = _split_marked(launches.on("/api/items/"))
         self.assertEqual(len(scans), 1, scans)
         self.assertNotIn("-p", scans[0])
+        # The path object id is a case of its own: a full scan of a URL with a query
+        # never reaches a path segment, so it gets its one marked scan.
+        self.assertEqual(len(marked), 1, marked)
         stats = result["execution_registry"]["by_validator"]["sqlmap"]
         self.assertGreaterEqual(stats["full_scan_covers"], 1, stats)
 
@@ -66,7 +75,7 @@ class PerParameterCaseTests(_EngagementCallerBase, unittest.TestCase):
         result, _rc, _model, launches, _ = self._drive(
             ("/api/items/1", "q=a"),
             extra=[patch.object(SqlmapValidator, "full_scan_covers", lambda *a: None)])
-        scans = launches.on("/api/items/")
+        scans, _marked = _split_marked(launches.on("/api/items/"))
         self.assertEqual(len(scans), 2, scans)                 # the r9 repeat
         self.assertEqual([c[c.index("-p") + 1] for c in scans if "-p" in c], ["q"])
 

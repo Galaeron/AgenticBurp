@@ -128,6 +128,22 @@ def _looks_privileged(path: str) -> bool:
     return bool(_PRIVILEGED.search(path or ""))
 
 
+# The request template's object_id: the LAST path segment of digits or of 8+ hex
+# or dash characters. The coverage case CaseKey("path", "object_id") names it, so a
+# leg that injects into that case's input finds the segment with this same rule.
+_LEAF_OBJECT_ID_SEGMENT = re.compile(r"\d+|[0-9a-fA-F-]{8,}")
+
+
+def leaf_object_id_index(path: str) -> int | None:
+    """Index, in `path.split("/")`, of the segment template_from_exchange records as
+    the request's object_id (the leaf object id); None when the path has none."""
+    found = None
+    for i, seg in enumerate((path or "").split("/")):
+        if seg and _LEAF_OBJECT_ID_SEGMENT.fullmatch(seg):
+            found = i
+    return found
+
+
 def template_from_exchange(ex) -> dict:
     """A compact, replayable request TEMPLATE captured from a real exchange (R05):
     method, query string, request body, content-type, and the observed leaf object
@@ -143,10 +159,8 @@ def template_from_exchange(ex) -> dict:
     body = get("request_body", "") or ""
     parts = urlsplit(url)
     ctype = next((v for k, v in headers.items() if (k or "").lower() == "content-type"), "")
-    obj_id = None
-    for seg in [s for s in (parts.path or "").split("/") if s]:
-        if re.fullmatch(r"\d+|[0-9a-fA-F-]{8,}", seg):
-            obj_id = seg  # keep the LAST matching segment -> the leaf object id
+    leaf = leaf_object_id_index(parts.path or "")
+    obj_id = (parts.path or "").split("/")[leaf] if leaf is not None else None
     # object_id is the LEAF id only. path_ids keeps every id in path order, so a
     # nested route (/accounts/17/orders/42) can be replayed with each parameter
     # intact rather than the leaf id copied into every slot.

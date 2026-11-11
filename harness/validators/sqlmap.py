@@ -14,6 +14,7 @@ import httpx
 from harness.models import Finding, HttpExchange, TestPlan
 from harness.planner import exchange_fingerprint, plan_key_fingerprint
 from harness.categories import canonicalize
+from harness.engagement import leaf_object_id_index
 from .base import TOOL_REPORTED, Validator, ValidationResult
 from harness.safety_gate import get_default_gate
 
@@ -288,6 +289,27 @@ def _addressable_params(loc: str, exchange) -> list[str]:
     if loc == "body_form" and not _looks_like_json(body, _content_type_of(exchange)):
         return _form_top_level_params(body)
     return []
+
+
+# sqlmap's custom injection marker. A URL carrying it is tested at the marked point
+# only: sqlmap then leaves the query string unparsed (lib/core/target.py), and
+# `--param-filter URI` keeps a body's parameters out too.
+_URI_MARK = "*"
+
+
+def _marked_path_url(url: str, name: str) -> str | None:
+    """`url` with sqlmap's marker after the path input a coverage case names: the
+    leaf object id (CaseKey("path", "object_id")). None for any other path input,
+    or a path without an object id: that input is not tested."""
+    if name != "object_id":
+        return None
+    parts = urlsplit(url)
+    segments = (parts.path or "").split("/")
+    leaf = leaf_object_id_index(parts.path or "")
+    if leaf is None:
+        return None
+    segments[leaf] += _URI_MARK
+    return urlunsplit((parts.scheme, parts.netloc, "/".join(segments), parts.query, ""))
 
 
 def _query_top_level_params(url: str) -> list[str]:
@@ -775,7 +797,13 @@ class SqlmapValidator(Validator):
         if getattr(finding, "parameter_only", False):
             from .injection_targets import NAMED_PARAMETER_UNTESTED  # (cycle: it imports us)
             loc, name = _named_input(finding)
-            if name not in _addressable_params(loc, exchange):
+            if loc == "path" and _marked_path_url(exchange.url, name) is None:
+                return ValidationResult(
+                    self.name, "skipped", finding.vulnerability_class,
+                    summary=f"the path input {name!r} is not an object id in the replayed "
+                            "request's path, so it was not tested",
+                    control_outcome=NAMED_PARAMETER_UNTESTED)
+            if loc != "path" and name not in _addressable_params(loc, exchange):
                 return ValidationResult(
                     self.name, "skipped", finding.vulnerability_class,
                     summary=f"the {loc or 'unnamed'} parameter {name!r} is not a query or form "
@@ -829,6 +857,15 @@ class SqlmapValidator(Validator):
             if quick is not None and quick.confirmed:
                 quick.summary = "Bounded boolean preflight confirmed SQL injection: " + quick.summary
                 return quick
+            if self.quick_only and quick is None and only and only[0][0] == "path":
+                # The preflight mutates query and body parameters only: a path input
+                # it could not reach is untested, not a negative.
+                from .injection_targets import NAMED_PARAMETER_UNTESTED
+                return ValidationResult(
+                    self.name, "skipped", finding.vulnerability_class,
+                    summary="the bounded boolean preflight cannot inject into a path "
+                            "segment, and sqlmap is not launched (quick_only); untested",
+                    control_outcome=NAMED_PARAMETER_UNTESTED)
             if self.quick_only:
                 return quick or ValidationResult(
                     self.name, "not_confirmed", finding.vulnerability_class,
@@ -913,7 +950,10 @@ class SqlmapValidator(Validator):
             request_file = Path(td) / "request.txt"
             request_file.write_text(self._raw_request(exchange), encoding="utf-8")
 
-            cmd = [self.binary, "-u", exchange.url, "--batch",
+            # A path input is marked in the URL itself (sqlmap has no `-p` name for it).
+            path_point = bool(only) and only[0][0] == "path"
+            target_url = _marked_path_url(exchange.url, only[0][1]) if path_point else exchange.url
+            cmd = [self.binary, "-u", target_url, "--batch",
                    "--level", "1" if create_reason else str(self.level),
                    "--risk", "1" if create_reason else str(self.risk),
                    "--threads", "1", "--timeout", "10", "--retries", "1",
@@ -925,7 +965,9 @@ class SqlmapValidator(Validator):
                    "--skip-waf"]
             if create_reason:
                 cmd += ["--technique", LIGHT_TECHNIQUES]
-            if only:
+            if path_point:
+                cmd += ["--param-filter", "URI"]
+            elif only:
                 cmd += ["-p", only[0][1]]
             # Deliberately no --smart: verified directly against a live
             # target (OWASP Juice Shop's login endpoint, a genuinely
@@ -1045,7 +1087,7 @@ class SqlmapValidator(Validator):
                                            if create_reason else {})).start()
                 light["proxy"] = proxy
                 launch_cmd = list(cmd)
-                launch_cmd[launch_cmd.index("-u") + 1] = proxy.url_for(exchange.url)
+                launch_cmd[launch_cmd.index("-u") + 1] = proxy.url_for(target_url)
                 _cancel = lambda: run.cancel.cancelled or proxy.stop_requested  # noqa: E731
             run_cmd = launch_cmd
             _use_container = False

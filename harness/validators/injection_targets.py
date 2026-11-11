@@ -95,12 +95,13 @@ def tested_inputs(finding, targets) -> tuple[tuple[str, str], ...]:
 
 # Coverage case driving: legs that can test ONE input per dispatch, by the case
 # locations each can address on its own. sqlmap's `-p` naming of JSON body keys
-# is unverified, so its JSON keys stay request-level; browser_xss injects only
-# into the query string.
+# is unverified, so its JSON keys stay request-level; it reaches the path's object
+# id through its custom injection marker (r9: those cases were never tested).
+# browser_xss injects only into the query string.
 PER_PARAMETER_LOCATIONS = {
     "ssti": frozenset({"query", "body_form", "body_json"}),
     "command_injection": frozenset({"query", "body_form", "body_json"}),
-    "sqlmap": frozenset({"query", "body_form"}),
+    "sqlmap": frozenset({"query", "body_form", "path"}),
     "open_redirect": frozenset({"query", "body_form", "body_json"}),
     "ssrf": frozenset({"query", "body_form", "body_json"}),
     "browser_xss": frozenset({"query"}),
