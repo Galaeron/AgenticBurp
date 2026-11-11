@@ -225,7 +225,9 @@ class TransientFailureRecoveryTests(_Base):
         faults = {"http_500": 500, "http_503": 503,
                   "timeout": httpx.ReadTimeout("synthetic timeout"),
                   "connect": httpx.ConnectError("synthetic refused"),
-                  "dropped": httpx.RemoteProtocolError("synthetic drop")}
+                  "dropped": httpx.RemoteProtocolError("synthetic drop"),
+                  "read_reset": httpx.ReadError("synthetic reset"),
+                  "write_reset": httpx.WriteError("synthetic reset")}
         for name, fault in faults.items():
             with self.subTest(fault=name):
                 self.fresh_breakers()
@@ -251,6 +253,16 @@ class TransientFailureRecoveryTests(_Base):
     async def test_the_metered_call_path_is_retried_too(self):
         await self._check_one_failure_continues_to_the_verdict(
             503, effort_budget=EffortBudget(mode=BudgetMode.HARD, total_tokens=1_000_000))
+
+    async def test_control_a_raw_connection_reset_ends_the_probe(self):
+        # As seen live before the fix: llama-server restarted mid-call, the raw
+        # httpx.ReadError escaped the client and the probe stopped with "error".
+        wire = _Wire(_MUTATE, httpx.ReadError("synthetic reset"), _FOUND)
+        with patch.object(oc, "_DROPPED_CONNECTION_ERRORS", ()):
+            result = await self.probe(wire, self.client(transient_retries=0))
+        self.assertEqual(result.stop_reason, "error")
+        self.assertEqual(wire.chat_calls, 2, "the raw error is not retried")
+        self.assertEqual(result.diagnostics["model_error_retries"], 0)
 
     async def test_control_recovery_needs_the_in_step_retry(self):
         with patch.object(IterativeAgent, "_retry_wait", lambda *a: None):
