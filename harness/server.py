@@ -1482,6 +1482,26 @@ def _evict_expired_jobs(now: float | None = None) -> None:
         raise HTTPException(status_code=503, detail='durable job status unavailable') from None
 
 
+def _attempt_findings(base_url: str, attempts) -> list[dict]:
+    """Stored findings of every attempt of this assessment, oldest attempt first."""
+    return [row for run_id in attempts for row in store.all_host_findings(base_url, run_id=run_id)]
+
+
+def _attempt_accounting(attempts, findings) -> tuple[list, dict]:
+    """(proof-bound case refs, issue accounting) over every attempt of this
+    assessment: a resumed job's own run and the runs it resumed (r9). One attempt
+    is the single-run accounting, unchanged."""
+    from harness.assessment_health import (confirmed_issue_inventory, confirmed_issue_accounting,
+                                           stored_proof_artifacts_resolve)
+    scope = attempts[0] if len(attempts) == 1 else list(attempts)
+    proven = confirmed_issue_inventory(findings, scope, store.proofs_for_case)
+    accounting = confirmed_issue_accounting(
+        findings, scope, store.proofs_for_case,
+        run_proofs=[p for run_id in attempts for p in store.proofs_for_run(run_id)],
+        artifact_resolver=stored_proof_artifacts_resolve)
+    return proven, accounting
+
+
 def _job_public(job: dict, *, include_result: bool = False) -> dict:
     """The JSON-safe view of a job (never leaks the asyncio Task)."""
     from harness.job_status import JobStatusStore
@@ -1854,6 +1874,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     journal_on = bool((config.get('runs', {}) or {}).get('journal', False))
     journal_root = None
     journal_key = _journal_context_key(config, req) if journal_on else ''
+    # The attempts this job continues (oldest first): its accounting counts them all.
+    prior_attempts: list[str] = []
 
     if req.resume_job_id:
         journal = _job_store()
@@ -1867,6 +1889,9 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             raise HTTPException(status_code=409, detail='prior job is not terminal or has a different target origin')
         from harness.coverage_tracker import resume_context_key
         prior_root = prior.get('journal_root') or req.resume_job_id
+        # A job saved before attempt_run_ids existed names its root and itself.
+        prior_attempts = [r for r in (prior.get('attempt_run_ids') or []) if isinstance(r, str) and r] \
+            or [prior_root, req.resume_job_id]
         result_missing = False
         try:
             import json
@@ -1929,7 +1954,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                  "started_at": _time.time(), "finished_at": None,
                  "manifest_path": str(output_dir / f'{job_id}.json'), "run_context": run_context,
                  "journal_root": (run_context.run_journal.root_job_id
-                                  if run_context.run_journal is not None else None)}
+                                  if run_context.run_journal is not None else None),
+                 "attempt_run_ids": list(dict.fromkeys([*prior_attempts, job_id]))}
     try:
         _, admitted = _job_store().create(job)
         if not admitted:
@@ -2009,19 +2035,15 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                 job["result"].setdefault("declarations_source", declarations_source)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
             job["result"].setdefault("request_count", run_context.budget.used)
-            # Use the persisted, proof-resolved projection and this run only.
-            # Raw model flags and repeated validator records are not issue counts.
-            rows = store.all_host_findings(req.base_url, run_id=run_context.run_id)
-            from harness.assessment_health import (confirmed_issue_inventory, confirmed_issue_accounting,
-                                                   stored_proof_artifacts_resolve)
-            proven = confirmed_issue_inventory(
-                [*rows, *job["result"].get("findings", [])], run_context.run_id, store.proofs_for_case)
+            # Use the persisted, proof-resolved projection of this run and the
+            # attempts it resumed. Raw model flags and repeated validator records
+            # are not issue counts.
+            attempts = job["attempt_run_ids"]
+            rows = _attempt_findings(req.base_url, attempts)
+            proven, accounting = _attempt_accounting(attempts, [*rows, *job["result"].get("findings", [])])
+            job["result"]["attempt_run_ids"] = list(attempts)
             job["result"]["confirmed_issues"] = len(proven)
             job["result"]["confirmed_issue_refs"] = proven
-            accounting = confirmed_issue_accounting(
-                [*rows, *job['result'].get('findings', [])], run_context.run_id, store.proofs_for_case,
-                run_proofs=store.proofs_for_run(run_context.run_id),
-                artifact_resolver=stored_proof_artifacts_resolve)
             job['result']['issue_accounting'] = accounting
             job['result']['confirmed_vulnerabilities'] = accounting['counts']['vulnerabilities']
             job['result']['confirmed_issues_unit'] = 'proof_bound_cases'
@@ -2035,9 +2057,22 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             job["status"] = "cancelled"
             # Persist evidence already produced by this run even if the chain
             # never returned its final result. Recovery never resumes execution.
+            attempts = job["attempt_run_ids"]
             job['result'] = {'partial': True, 'run_id': run_context.run_id,
+                             'attempt_run_ids': list(attempts),
                              'request_count': run_context.budget.used,
-                             'findings': store.all_host_findings(req.base_url, run_id=run_context.run_id)}
+                             'findings': _attempt_findings(req.base_url, attempts)}
+            # r9's last attempt was cancelled and reported no count at all. The
+            # accounting is best effort here: it must never hide the cancel.
+            try:
+                proven, accounting = _attempt_accounting(attempts, job['result']['findings'])
+                job['result'].update(
+                    confirmed_issues=len(proven), confirmed_issue_refs=proven,
+                    issue_accounting=accounting, confirmed_issues_unit='proof_bound_cases',
+                    confirmed_vulnerabilities=accounting['counts']['vulnerabilities'])
+            except Exception as exc:
+                job['result']['accounting_error'] = type(exc).__name__
+                log.warning("cancelled job %s: issue accounting failed (%s)", job_id, type(exc).__name__)
             _finish_manifest("cancelled", result=job['result'])
             raise
         except Exception as e:  # a failed job must report, never crash the server
