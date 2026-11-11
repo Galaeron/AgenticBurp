@@ -36,6 +36,14 @@ _PROXY_STOP_WHY = {"budget_exhausted": "the run's request budget ran out",
                    "tool_cap": "the per-scan request cap was reached",
                    "mutating_ceiling": "the case's mutating-request ceiling was reached"}
 
+# Stops whose cause may clear by itself, so a later retry can finish the scan.
+_TRANSIENT_STOPS = frozenset({"session_expired", "route_unavailable"})
+
+
+def _transient(proxy) -> bool:
+    return getattr(proxy, "stop_reason", "") in _TRANSIENT_STOPS
+
+
 # Create endpoints get a light sqlmap (owner decision, #28): every request sqlmap
 # sends to one may create an object (the 8h juice-shop run: one sqlmap scan sent
 # 4,765 requests to POST /api/Users and 685 of them created accounts). Level 1,
@@ -264,6 +272,22 @@ def _extract_token(html: str, field: str) -> str | None:
         return m.group(1)
     m = re.search(rf'value=["\']([^"\']+)["\'][^>]*name=["\']{re.escape(field)}["\']', html or "")
     return m.group(1) if m else None
+
+
+def _named_input(finding) -> tuple[str, str]:
+    return ((getattr(finding, "parameter_location", "") or "").strip().lower(),
+            (getattr(finding, "parameter_name", "") or "").strip())
+
+
+def _addressable_params(loc: str, exchange) -> list[str]:
+    """The parameters `-p` can name at case location `loc`: the query string's, or a
+    urlencoded (not JSON) body's. Empty for any other location."""
+    if loc == "query":
+        return _query_top_level_params(exchange.url)
+    body = exchange.request_body or ""
+    if loc == "body_form" and not _looks_like_json(body, _content_type_of(exchange)):
+        return _form_top_level_params(body)
+    return []
 
 
 def _query_top_level_params(url: str) -> list[str]:
@@ -673,6 +697,17 @@ class SqlmapValidator(Validator):
         # Hard cap on the requests one light (create-endpoint) sqlmap scan may send.
         self.create_endpoint_max_requests = max(1, int(create_endpoint_max_requests))
 
+    def full_scan_covers(self, finding: Finding, exchange: HttpExchange):
+        """(location, name) of the parameter-only finding's input when a full scan
+        of `exchange` (no -p) tests it as `-p` would: a query or urlencoded form
+        parameter present in the request. None for any other input; the execution
+        registry then runs the case on its own (r9: per-parameter cases re-ran
+        sqlmap on one-parameter requests the worklist had already scanned)."""
+        if not getattr(finding, "parameter_only", False):
+            return None
+        loc, name = _named_input(finding)
+        return (loc, name) if name and name in _addressable_params(loc, exchange) else None
+
     @staticmethod
     def _raw_request(exchange: HttpExchange) -> str:
         parts = urlsplit(exchange.url)
@@ -739,13 +774,8 @@ class SqlmapValidator(Validator):
         only = None
         if getattr(finding, "parameter_only", False):
             from .injection_targets import NAMED_PARAMETER_UNTESTED  # (cycle: it imports us)
-            loc = (finding.parameter_location or "").strip().lower()
-            name = (finding.parameter_name or "").strip()
-            present = (_query_top_level_params(exchange.url) if loc == "query" else
-                       _form_top_level_params(exchange.request_body or "")
-                       if loc == "body_form" and not _looks_like_json(
-                           exchange.request_body or "", _content_type_of(exchange)) else [])
-            if name not in present:
+            loc, name = _named_input(finding)
+            if name not in _addressable_params(loc, exchange):
                 return ValidationResult(
                     self.name, "skipped", finding.vulnerability_class,
                     summary=f"the {loc or 'unnamed'} parameter {name!r} is not a query or form "
@@ -1132,7 +1162,8 @@ class SqlmapValidator(Validator):
                            else _PROXY_STOP_WHY.get(proxy.stop_reason if proxy is not None else "",
                                                     "the run was cancelled"))
                     return ValidationResult(self.name, "skipped", finding.vulnerability_class,
-                                            summary=f"sqlmap stopped: {why}", command=cmd)
+                                            summary=f"sqlmap stopped: {why}", command=cmd,
+                                            transient_stop=_transient(proxy))
                 return ValidationResult(self.name, "error", finding.vulnerability_class,
                                         summary=f"sqlmap execution failed: {exc}", command=cmd)
             finally:
@@ -1152,7 +1183,8 @@ class SqlmapValidator(Validator):
                     self.name, "skipped", finding.vulnerability_class,
                     summary=f"sqlmap incomplete: {why} after {proxy.forwarded} request(s) "
                             "were sent through the run -- not a negative result",
-                    evidence=verdict_evidence, raw_output=output, command=cmd, limitation=verdict)
+                    evidence=verdict_evidence, raw_output=output, command=cmd, limitation=verdict,
+                    transient_stop=_transient(proxy))
             unreachable = _connection_failure(output, proxy)
             if unreachable:
                 # sqlmap never got an answer to test: "we don't know", not a negative.

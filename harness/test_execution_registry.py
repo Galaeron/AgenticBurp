@@ -107,11 +107,15 @@ class ExecutionKeyTests(unittest.TestCase):
                                            _ALICE, method="POST"))
         self.assertNotEqual(base, self.key("sqlmap", "http://localhost/rest/basket/1?q=a", _ALICE))
         self.assertNotEqual(base, self.key("sqlmap", "http://127.0.0.1/rest/orders/1?q=a", _ALICE))
-        self.assertNotEqual(base, self.key("sqlmap", "http://127.0.0.1/rest/basket/1?q=a",
+        ssti = self.key("ssti", "http://127.0.0.1/rest/basket/1?q=a", _ALICE, cls="ssti")
+        self.assertNotEqual(ssti, self.key("ssti", "http://127.0.0.1/rest/basket/1?q=a",
                                            _ALICE, cls="xss"))
         # ... while two spellings of one class are the same family.
         self.assertEqual(base, self.key("sqlmap", "http://127.0.0.1/rest/basket/1?q=a",
                                         _ALICE, cls="SQL Injection"))
+        # A tool scan keys on no class at all (r9; test_sqlmap_rescan.py).
+        self.assertEqual(base, self.key("sqlmap", "http://127.0.0.1/rest/basket/1?q=a",
+                                        _ALICE, cls="xss"))
 
     def test_body_parameter_names_not_values_key_json_and_form_bodies(self):
         json_headers = {**_ALICE, "Content-Type": "application/json"}
@@ -422,7 +426,7 @@ class ExecutionRegistryTests(unittest.TestCase):
         self.assertEqual((stats["misses"], stats["hits"], stats["sends_saved"]), (1, 2, 14))
         self.assertEqual(stats["by_validator"]["sqlmap"],
                          {"hits": 2, "misses": 1, "inflight_joins": 0, "sends_saved": 14,
-                          "retry_limited": 0})
+                          "retry_limited": 0, "full_scan_covers": 0})
         self.assertEqual(budget.used, 7)
 
 
