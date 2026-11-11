@@ -245,6 +245,10 @@ class ManagedSession:
     role: str = "user"
     name: str = ""
     principal: object | None = None
+    # A one-request credential (send_creds): headers a check or the agent supplied
+    # for its own send, which no configured identity owns. It carries that send's
+    # credentials and cookie jar; it is never one of the run's identities.
+    ephemeral: bool = False
     # Bumped each time the session's credentials are replaced (a refresh or
     # SessionManager.replace_headers). A caller that caches anything derived from
     # the credentials -- a token, decoded claims, a cache key -- must key it on
@@ -304,7 +308,7 @@ class SessionManager:
 
     def register(self, session_id: str, principal_id: str, headers: dict | None = None, *,
                  allowed_origins=None, role: str = "user", name: str = "",
-                 principal=None) -> ManagedSession:
+                 principal=None, ephemeral: bool = False) -> ManagedSession:
         normalized = frozenset(ScopePolicy.origin_of(o) for o in (allowed_origins or []))
         if "" in normalized:
             raise ValueError("sessions require valid HTTP(S) allowed origins")
@@ -312,7 +316,8 @@ class SessionManager:
             raise ValueError("credential-bearing sessions require an explicit allowed origin")
         s = ManagedSession(session_id=session_id, principal_id=principal_id,
                            headers=dict(headers or {}), allowed_origins=normalized,
-                           role=role, name=name or principal_id, principal=principal)
+                           role=role, name=name or principal_id, principal=principal,
+                           ephemeral=ephemeral)
         self._by_id[session_id] = s
         return s
 
@@ -328,6 +333,14 @@ class SessionManager:
 
     def all(self) -> list[ManagedSession]:
         return list(self._by_id.values())
+
+    def identities(self) -> list[ManagedSession]:
+        """The run's identities: every session except the ephemeral ones send_creds
+        registers for one check's own credentials. A check that replays "as each
+        identity" reads this. r9: the agent's empty `Bearer ` header and other
+        one-off credentials had become identities, and cross_identity re-sent
+        each later check as them (355 refused sends)."""
+        return [s for s in self._by_id.values() if not s.ephemeral]
 
     # -- E5a: session health -------------------------------------------------
 
@@ -655,7 +668,8 @@ class TargetTransport:
             session_ref, non_cred = self.ctx.sessions.bind_headers(hdrs)
             if session_ref is None:
                 sid = f"w16-ephemeral-{uuid.uuid4().hex[:8]}"
-                self.ctx.sessions.register(sid, sid, headers=cred, allowed_origins=[url])
+                self.ctx.sessions.register(sid, sid, headers=cred, allowed_origins=[url],
+                                           ephemeral=True)
                 session_ref = sid
                 non_cred = {k: v for k, v in hdrs.items()
                             if not is_identity_credential_header(k)}

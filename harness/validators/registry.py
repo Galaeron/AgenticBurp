@@ -571,11 +571,11 @@ class ValidatorRegistry:
                 return decision("needs_prerequisite", "undecodable_jwt", "a complete decodable observed JWT is required")
         if family == "cross_identity" and run_context is not None and not any(
                 s.headers and s.principal_id != "anonymous" and s.health != "expired"
-                for s in run_context.sessions.all()):
+                for s in run_context.sessions.identities()):
             return decision("needs_prerequisite", "missing_principal", "a registered non-expired authenticated principal is required")
         if family == "cross_identity" and run_context is not None and not any(
                 s.principal_id == "anonymous" and s.health != "expired"
-                for s in run_context.sessions.all()):
+                for s in run_context.sessions.identities()):
             return decision("needs_prerequisite", "missing_anonymous_control", "an explicit anonymous control session is required")
         if family == "cross_identity" and method not in {"GET", "PUT", "PATCH", "DELETE"}:
             return decision("unsupported", "unsupported_method", "cross-identity supports GET and reversible object writes")

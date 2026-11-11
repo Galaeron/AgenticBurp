@@ -411,7 +411,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
                 return self.validator_registry.ownership  # preserve explicitly injected ledgers
             identities = identity_headers.identities_for_host(urlsplit(url).hostname or "")
             if run_context is not None:
-                identities += [{"name": session.principal_id} for session in run_context.sessions.all()]
+                identities += [{"name": session.principal_id} for session in run_context.sessions.identities()]
             ledger = load_ownership(self.config, url, identities, engagement_owners=engagement_owners)
             if run_context is not None:
                 cached[origin] = ledger

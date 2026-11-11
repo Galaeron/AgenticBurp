@@ -541,13 +541,13 @@ class CrossIdentityValidator(Validator):
         return [{"name": s.name or s.principal_id, "role": s.role,
                  "headers": dict(s.headers), "session_ref": s.session_id,
                  "principal_id": s.principal_id, "principal": s.principal}
-                for s in self.run_context.sessions.all()
+                for s in self.run_context.sessions.identities()
                 if s.principal_id != "anonymous"]
 
     def _anonymous_session_ref(self) -> str | None:
         if self.run_context is None:
             return None
-        for session in self.run_context.sessions.all():
+        for session in self.run_context.sessions.identities():
             if session.principal_id == "anonymous":
                 return session.session_id
         return None

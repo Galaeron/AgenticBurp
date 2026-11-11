@@ -1155,7 +1155,7 @@ def run_sessions(run_context) -> list:
     found = RunSessions(
         SessionIdentity(s.session_id, s.principal_id,
                         s.role or getattr(getattr(s, "principal", None), "role", ""))
-        for s in run_context.sessions.all()
+        for s in run_context.sessions.identities()
         if s.headers and s.session_id != "anonymous" and s.principal_id not in ("", ANON)
         and s.health != "expired")
     found.self_ownership = getattr(run_context, "self_ownership", None)
