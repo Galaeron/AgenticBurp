@@ -443,6 +443,23 @@ API_OLLAMA = "ollama"
 API_OPENAI = "openai"
 REASONING_EFFORTS = ("low", "medium", "high")
 _MAX_OUTPUT_TOKENS_CEILING = 131072
+# r9 (gpt-oss-20b, reasoning_effort low, cap 2048): 40 replies reached the cap and
+# were discarded, most of them the injection agent's. A capped reply is asked once
+# more with this many times the cap, within the context window.
+_CAPPED_RETRY_FACTOR = 2
+
+
+def _payload_cap(payload: dict) -> int | None:
+    """The output cap a chat payload carries (max_tokens, or Ollama's num_predict)."""
+    cap = payload.get("max_tokens") or (payload.get("options") or {}).get("num_predict")
+    return cap if isinstance(cap, int) and cap > 0 else None
+
+
+def _with_cap(payload: dict, cap: int) -> dict:
+    """A copy of `payload` asking for at most `cap` output tokens."""
+    if "max_tokens" in payload:
+        return {**payload, "max_tokens": cap}
+    return {**payload, "options": {**(payload.get("options") or {}), "num_predict": cap}}
 
 
 def parse_backend_settings(api=None, max_output_tokens=None, reasoning_effort=None,
@@ -651,8 +668,11 @@ class OllamaClient:
         # last looked up; the largest prompt each model was sent.
         self.model_context_truncated_count = 0
         self.model_context_truncated_by_kind = {"prompt": 0, "reply": 0}
-        # Replies discarded because they reached max_output_tokens unfinished.
+        # Replies discarded because they reached max_output_tokens unfinished; the
+        # calls asked once more with a larger cap, and those that then answered.
         self.model_output_capped_count = 0
+        self.model_output_capped_retry_count = 0
+        self.model_output_capped_recovered_count = 0
         self._context_windows: dict[str, int] = {}
         self._context_probed_at: dict[str, float] = {}
         self._max_prompt_tokens: dict[str, int] = {}
@@ -728,7 +748,9 @@ class OllamaClient:
                            "retry_recovered": self.model_retry_recovered_count,
                            "unknown_usage": self.model_unknown_usage_count,
                            "context_truncated": self.model_context_truncated_count,
-                           "output_capped": self.model_output_capped_count},
+                           "output_capped": self.model_output_capped_count,
+                           "output_capped_retried": self.model_output_capped_retry_count,
+                           "output_capped_recovered": self.model_output_capped_recovered_count},
                 # Which wire protocol served the run, and its output cap.
                 "backend": {"api": self.api, "max_output_tokens": self.max_output_tokens,
                             "reasoning_effort": self.reasoning_effort},
@@ -831,14 +853,16 @@ class OllamaClient:
         plausible window, and any cloud-model call, costs no lookup."""
         if is_cloud_model(model):
             return
-        if (done_reason == "length" and self.max_output_tokens
+        # The call's own cap: a capped reply's retry asks for more than the setting.
+        cap = _payload_cap(payload) or self.max_output_tokens
+        if (done_reason == "length" and cap
                 and isinstance(completion_tokens, int)
-                and completion_tokens >= self.max_output_tokens):
+                and completion_tokens >= cap):
             self.model_output_capped_count += 1
             measurement["outcome"] = "output_capped"
             err = OllamaOutputCappedError(
-                f"Model '{model}': the reply reached ollama.max_output_tokens "
-                f"({self.max_output_tokens}) before it finished; reply discarded")
+                f"Model '{model}': the reply reached its output cap "
+                f"({cap} tokens) before it finished; reply discarded")
             self.audit_logger.log_llm_error(model=model, error=err)
             log.warning("%s", err)
             raise err
@@ -1122,6 +1146,7 @@ class OllamaClient:
         breaker = circuit_breaker.current_ollama_breaker("ollama")
         retries_done = 0
         timeout_retries_done = 0
+        capped_retried = False
         async with breaker:
             while True:
                 attempt_queue_started = queue_started if retries_done == 0 else time.monotonic()
@@ -1132,6 +1157,22 @@ class OllamaClient:
                             waited_ms if measurement["queue_ms"] is None
                             else measurement["queue_ms"] + waited_ms)
                         parsed, data = await self._send_once(url, payload, model, measurement)
+                except OllamaOutputCappedError:
+                    larger = (None if capped_retried or _cancellation_requested()
+                              else self._capped_retry_cap(model, payload, measurement))
+                    if larger is None:
+                        raise
+                    capped_retried = True
+                    log.warning("Model %s: reply reached its %d-token cap unfinished; asking once "
+                                "more with %d", model, _payload_cap(payload), larger)
+                    payload = _with_cap(payload, larger)
+                    self.model_output_capped_retry_count += 1
+                    self.audit_logger.log_llm_prompt(
+                        model=model,
+                        system_prompt=validated_system,
+                        user_prompt=validated_user,
+                    )
+                    continue
                 except OllamaTransientError as exc:
                     retry_after = getattr(exc, "retry_after", None)
                     if not self._may_retry(retries_done) or (
@@ -1167,7 +1208,23 @@ class OllamaClient:
                     self.model_retry_recovered_count += 1
                     log.info("Ollama call for model %s recovered after %d transient retr%s",
                              model, retries_done, "y" if retries_done == 1 else "ies")
+                if capped_retried:
+                    self.model_output_capped_recovered_count += 1
                 return parsed, data
+
+    def _capped_retry_cap(self, model: str, payload: dict, measurement: dict) -> int | None:
+        """The cap a capped reply is asked again with: _CAPPED_RETRY_FACTOR times the
+        call's cap, within what the context window leaves after the prompt. None when
+        the cap cannot grow (no cap, or the window is already full)."""
+        cap = _payload_cap(payload)
+        if not cap:
+            return None
+        larger = min(cap * _CAPPED_RETRY_FACTOR, _MAX_OUTPUT_TOKENS_CEILING)
+        window = self.num_ctx or self._context_windows.get(self._window_key(model)) or None
+        prompt_tokens = measurement.get("prompt_tokens")
+        if window and isinstance(prompt_tokens, int):
+            larger = min(larger, window - prompt_tokens - _WINDOW_SLACK_TOKENS)
+        return larger if larger > cap else None
 
     def _may_retry(self, retries_done: int) -> bool:
         """True while another transient retry is allowed: under the configured

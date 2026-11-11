@@ -54,6 +54,9 @@ class _FakeServer:
         self.ollama_reply: dict = {"message": {"role": "assistant", "content": "{\"verdict\": \"ok\"}"},
                                    "done": True, "prompt_eval_count": 7, "eval_count": 3}
         self.props: dict = {"default_generation_settings": {"n_ctx": 16384}}
+        # Replies served in order before chat_reply / ollama_reply (one per POST).
+        self.chat_replies: list[dict] = []
+        self.ollama_replies: list[dict] = []
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -80,9 +83,11 @@ class _FakeServer:
                 body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 fake.requests.append(("POST", self.path, body))
                 if self.path == "/v1/chat/completions":
-                    self._answer(fake.chat_status, fake.chat_reply)
+                    self._answer(fake.chat_status,
+                                 fake.chat_replies.pop(0) if fake.chat_replies else fake.chat_reply)
                 elif self.path == "/api/chat":
-                    self._answer(200, fake.ollama_reply)
+                    self._answer(200, fake.ollama_replies.pop(0) if fake.ollama_replies
+                                 else fake.ollama_reply)
                 else:
                     self._answer(404, {"error": "not found"})
 
@@ -200,9 +205,11 @@ class OpenAIWireTests(_Base):
 
 class OutputCapTests(_Base):
     async def test_openai_reply_at_the_cap_is_discarded_as_capped(self):
-        # gpt-oss spent the whole budget reasoning: no content, finish length.
-        self.fake.chat_reply = _openai_reply(content="", finish="length", prompt_tokens=900,
-                                             completion_tokens=2048, reasoning="x" * 4000)
+        # gpt-oss spent the whole budget reasoning: no content, finish length -- and
+        # again when asked once more with twice the cap (test_capped_reply_retry).
+        self.fake.chat_replies = [
+            _openai_reply(content="", finish="length", prompt_tokens=900,
+                          completion_tokens=cap, reasoning="x" * 4000) for cap in (2048, 4096)]
         client = self._orchestrator(**_OPENAI).ollama
         before = self._breaker_failures()
         with self.assertRaises(OllamaOutputCappedError) as caught:
@@ -210,21 +217,23 @@ class OutputCapTests(_Base):
         # Every caller that bounds unusable output (the iterative agent) catches it.
         self.assertIsInstance(caught.exception, OllamaInvalidJSONError)
         snapshot = client.metrics_snapshot()
-        self.assertEqual(snapshot["client"]["output_capped"], 1)
+        self.assertEqual(snapshot["client"]["output_capped"], 2)
         self.assertEqual(snapshot["client"]["context_truncated"], 0)
         self.assertEqual(self._breaker_failures(), before, "a capped reply is not an outage")
 
     async def test_ollama_mode_sends_num_predict_and_raises_capped_at_the_cap(self):
-        self.fake.ollama_reply = {"message": {"role": "assistant", "content": "{\"a\": \"aaaa"},
-                                  "done": True, "done_reason": "length",
-                                  "prompt_eval_count": 900, "eval_count": 512}
+        self.fake.ollama_replies = [
+            {"message": {"role": "assistant", "content": "{\"a\": \"aaaa"}, "done": True,
+             "done_reason": "length", "prompt_eval_count": 900, "eval_count": cap}
+            for cap in (512, 1024)]
         client = self._orchestrator(max_output_tokens=512).ollama
         with self.assertRaises(OllamaOutputCappedError):
             await client.chat_json("m", "sys", "user")
-        sent = self.fake.bodies()[0]
-        self.assertEqual(self.fake.paths(), ["/api/chat"])
-        self.assertEqual(sent["options"], {"temperature": 0.1, "num_predict": 512})
-        self.assertEqual(client.metrics_snapshot()["client"]["output_capped"], 1)
+        first, retry = self.fake.bodies()
+        self.assertEqual(self.fake.paths(), ["/api/chat"] * 2)
+        self.assertEqual(first["options"], {"temperature": 0.1, "num_predict": 512})
+        self.assertEqual(retry["options"], {"temperature": 0.1, "num_predict": 1024})
+        self.assertEqual(client.metrics_snapshot()["client"]["output_capped"], 2)
 
     async def test_length_stop_under_the_cap_is_still_a_context_fault(self):
         # Control: the cap was not reached, so only the window can have stopped it.
