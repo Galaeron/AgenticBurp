@@ -255,7 +255,7 @@ async def _unconfirmed_reason(method: str, url: str, unauth_body: str, outcome: 
         baseline_ref = "missing-auth:baseline"
         run_context.sessions.register(
             baseline_ref, baseline_ref, credentials,
-            allowed_origins=[ScopePolicy.origin_of(url)], role="baseline")
+            allowed_origins=[ScopePolicy.origin_of(url)], role="baseline", ephemeral=True)
         send_headers = plain
     else:
         send_headers = dict(baseline_headers or {})
@@ -361,7 +361,8 @@ async def probe(
             garbage_ref = "missing-auth:garbage"
             run_context.sessions.register(
                 garbage_ref, garbage_ref, {"Authorization": _GARBAGE_TOKEN},
-                allowed_origins=[ScopePolicy.origin_of(url)], role="negative-control")
+                allowed_origins=[ScopePolicy.origin_of(url)], role="negative-control",
+                ephemeral=True)
             garb_headers = {k: v for k, v in garb_headers.items()
                             if k.lower() != "authorization"}
         g_status, g_body = await _send(

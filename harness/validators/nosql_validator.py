@@ -138,7 +138,7 @@ class NosqlValidator(Validator):
             return None
         sid = f"nosql-login-{uuid.uuid4().hex[:10]}"
         ctx.sessions.register(sid, sid, allowed_origins=[exchange.url],
-                              role="anonymous", name="nosql pre-auth")
+                              role="anonymous", name="nosql pre-auth", ephemeral=True)
         transport = ctx.target_transport()
         await global_throttle.acquire()
         page = await transport.send(
