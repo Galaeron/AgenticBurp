@@ -413,11 +413,12 @@ class RequestLevelCeilingCallerTest(_LoopbackDrive):
         self.assertEqual(matrix.get(*key(TRAVERSAL)).status, CellStatus.NOT_DETECTED)
 
     def test_control_a_ceiling_refusal_read_as_one_unsendable_payload_reads_clean(self):
-        """Defect injection: the leg files each ceiling refusal as one unsendable
-        payload (the former behaviour), so the cut leg ends not_confirmed and the
-        cell reads clean. The cut-off test above sees it."""
+        """Defect injection: the leg neither plans within the ceiling (r9) nor reads
+        a ceiling refusal as the end of the leg, so it files each refusal as one
+        unsendable payload (the former behaviour): the cut leg ends not_confirmed
+        and the cell reads clean. The cut-off test above sees it."""
         from harness.validators.path_traversal_validator import PathTraversalValidator
-        with patch.object(PathTraversalValidator, "_ceiling_spent", return_value=False):
+        with patch.object(PathTraversalValidator, "_ceiling_spent", return_value=False),                 patch.object(PathTraversalValidator, "_write_allowance", return_value=None):
             matrix, key, cases = self._traversal_run(4)
         self.assertEqual(cases(TRAVERSAL)[""].status, CellStatus.NOT_DETECTED)
         self.assertEqual(matrix.get(*key(TRAVERSAL)).status, CellStatus.NOT_DETECTED)
