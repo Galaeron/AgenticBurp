@@ -196,7 +196,12 @@ async def build_engagement(
                             max_views=max(1, int(capture_config.get("max_views", 30))),
                             max_depth=max(0, int(capture_config.get("max_depth", 4))),
                             declared_views=max(0, int(capture_config.get("declared_views", 0))),
-                            extra_views=extra_views)
+                            extra_views=extra_views,
+                            # File inputs: a benign file attached, the upload held
+                            # and captured (driver_capture.file_uploads; off).
+                            **({"file_uploads": True, "max_uploads": max(
+                                0, int(capture_config.get("max_uploads", 4)))}
+                               if capture_config.get("file_uploads", False) else {}))
                         supplied.extend(crawl.exchanges[:200 - len(supplied)])
                         _collect_spa_routes(client_routes, crawl)
                         spa_views.append({"principal": role.principal_id(),
@@ -205,6 +210,8 @@ async def build_engagement(
                                           "refused": list(getattr(crawl, "refused", []) or []),
                                           "declared": list(getattr(crawl, "declared", []) or []),
                                           "guarded": list(getattr(crawl, "guarded", []) or []),
+                                          **({"uploads": list(getattr(crawl, "uploads", []) or [])}
+                                             if capture_config.get("file_uploads", False) else {}),
                                           "stopped_by": crawl.stopped_by})
                         seed_errors.extend("browser spa crawl: " + e for e in crawl.errors)
                         continue

@@ -104,6 +104,28 @@ class FileUploadValidator(Validator):
                  if x.name and (x.type or "").lower() != "file"}
         return f.action, file_field, extra
 
+    @staticmethod
+    def _captured_multipart(exchange: HttpExchange):
+        """(file field, other text fields) of a captured multipart upload -- e.g. one
+        a page's script issued with no HTML form to re-read -- or None."""
+        import re
+        ctype = next((str(v) for k, v in (exchange.request_headers or {}).items()
+                      if (k or "").lower() == "content-type"), "")
+        boundary = re.search(r'boundary="?([^";]+)"?', ctype, re.I)
+        if "multipart/form-data" not in ctype.lower() or not boundary:
+            return None
+        file_field, extra = None, {}
+        for part in (exchange.request_body or "").split("--" + boundary.group(1)):
+            head, sep, value = part.partition("\r\n\r\n")
+            name = re.search(r'\bname="([^"]*)"', head)
+            if not sep or not name or not name.group(1):
+                continue
+            if re.search(r'\bfilename="', head):
+                file_field = file_field or name.group(1)
+            else:
+                extra.setdefault(name.group(1), value[:-2] if value.endswith("\r\n") else value)
+        return (file_field, extra) if file_field else None
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
@@ -138,6 +160,9 @@ class FileUploadValidator(Validator):
                                                              source_failures)
                 if found is not None:
                     url, file_field, extra_fields = found
+                elif (captured := self._captured_multipart(exchange)) is not None:
+                    # No form to re-read: the captured upload's own field names.
+                    file_field, extra_fields = captured
                 read_headers = {k: v for k, v in (headers or {}).items()
                                 if (k or "").lower() != "content-type"}
                 files_data = {file_field: (filename, io.BytesIO(marker.encode()), "text/html")}
