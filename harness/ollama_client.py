@@ -13,6 +13,7 @@ from harness import prompt_validator
 from harness import circuit_breaker
 from harness import rate_limiter
 from harness import audit_logger
+from harness import model_activity
 
 log = logging.getLogger("harness.ollama_client")
 
@@ -989,6 +990,9 @@ class OllamaClient:
                        "attempted": True, "completed": False, "usable": False,
                        "queue_ms": None, "connection_ms": None,
                        "generation_ms": None, "wall_ms": None, "outcome": "error"}
+        # Who is using the model, and when it last worked (harness/model_activity.py):
+        # a call waiting for the one local slot counts as in flight.
+        activity_owner = model_activity.ACTIVITY.begin()
         try:
             parsed, raw = await self._chat_impl(model, system_prompt, user_prompt,
                                                temperature, measurement, seed=seed)
@@ -1008,6 +1012,7 @@ class OllamaClient:
             setattr(exc, "inference_usage", measurement)
             raise
         finally:
+            model_activity.ACTIVITY.end(activity_owner)
             measurement["wall_ms"] = (time.monotonic() - started) * 1000.0
             stage["wall_ms"] += measurement["wall_ms"]
 
