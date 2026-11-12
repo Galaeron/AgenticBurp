@@ -97,14 +97,17 @@ def tested_inputs(finding, targets) -> tuple[tuple[str, str], ...]:
 # locations each can address on its own. sqlmap's `-p` naming of JSON body keys
 # is unverified, so its JSON keys stay request-level; it reaches the path's object
 # id through its custom injection marker (r9: those cases were never tested).
-# browser_xss injects only into the query string.
+# browser_xss injects into the query string and, like dom_xss, into a client-side
+# route input the page reads (client_routes.py: "route" is a parameter of the
+# fragment route, "page" one of the HTML page's own query).
 PER_PARAMETER_LOCATIONS = {
     "ssti": frozenset({"query", "body_form", "body_json"}),
     "command_injection": frozenset({"query", "body_form", "body_json"}),
     "sqlmap": frozenset({"query", "body_form", "path"}),
     "open_redirect": frozenset({"query", "body_form", "body_json"}),
     "ssrf": frozenset({"query", "body_form", "body_json"}),
-    "browser_xss": frozenset({"query"}),
+    "browser_xss": frozenset({"query", "route", "page"}),
+    "dom_xss": frozenset({"route", "page"}),
     "path_traversal": frozenset({"query", "body_form", "body_json"}),
 }
 # Legs whose request-level attempt also tests an input that no parameter case

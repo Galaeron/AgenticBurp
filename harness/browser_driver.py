@@ -298,6 +298,9 @@ class ExecutionObservation:
     requests_sent: int = 0
     blocked_requests: list[str] = field(default_factory=list)
     cancelled: bool = False
+    # The HTML each navigation's final answer carried (bounded): dom_xss reads it to
+    # tell a payload the server reflected from one only page script could place.
+    navigation_bodies: list[str] = field(default_factory=list)
 
     def all_text(self) -> str:
         return "\n".join(self.dialogs + self.console + self.page_errors)
@@ -462,6 +465,9 @@ def _extra_headers_and_cookies(headers: dict | None, url: str):
 
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECT_HOPS = 10
+# ExecutionObservation.navigation_bodies: at most this many documents, each cut here.
+_MAX_NAVIGATION_BODIES = 4
+_NAVIGATION_BODY_BYTES = 262_144
 # Request headers the router does not copy from the browser's request when it
 # sends that request itself (connection-level, or rebuilt by the router).
 _UNFORWARDED_REQUEST_HEADERS = frozenset({
@@ -664,6 +670,10 @@ class _IdentityRouter:
                     fulfilled["set-cookie"] = "\n".join(hop_set_cookies + ([final] if final else []))
                 if (resource_type or "").lower() in _JS_ISSUED_RESOURCE_TYPES:
                     self._offer_route(url, method, body, response)
+                if (is_navigation and self.obs is not None
+                        and len(self.obs.navigation_bodies) < _MAX_NAVIGATION_BODIES):
+                    self.obs.navigation_bodies.append(
+                        bytes(response.content[:_NAVIGATION_BODY_BYTES]).decode("utf-8", "replace"))
                 await route.fulfill(status=response.status_code, headers=fulfilled,
                                     body=response.content)
                 return
