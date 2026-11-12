@@ -120,6 +120,21 @@ def interleave(groups: list[list[Candidate]], limit: int) -> list[Candidate]:
     return out
 
 
+# The URL standard's fragment percent-encode set: what a browser itself encodes in
+# a fragment it navigates to (C0 controls, space, `"`, `<`, `>`, backtick).
+_FRAGMENT_ENCODE = {c: f"%{ord(c):02X}" for c in ' "<>`'} | {chr(i): f"%{i:02X}" for i in range(32)}
+
+
+def browser_fragment(fragment: str) -> str:
+    """`fragment` as the browser sends it to location.hash: the characters the
+    browser would encode on navigation are encoded here, everything else is kept.
+    The page sees the same location.hash either way, but a URL with a raw space in
+    it is not a URL the run's scope policy parses, so the browser driver would know
+    no origin for it: it would refuse the page without a run scope, and send it
+    without the captured identity's cookies and headers with one."""
+    return "".join(_FRAGMENT_ENCODE.get(c, c) for c in fragment)
+
+
 def origin_of(url: str) -> str:
     """`scheme://host[:port]/` of a candidate URL, for the scope check: a payload's
     raw characters in the fragment or query must not decide where it is sent."""

@@ -131,9 +131,12 @@ class DomXssValidator(Validator):
     def _fragment_candidates(self, exchange: HttpExchange, a: int, b: int) -> list[Candidate]:
         """One candidate per payload: the captured URL (query preserved) with the
         payload as the whole FRAGMENT. The fragment is never sent to the server, so
-        execution can only be client-side (DOM XSS)."""
+        execution can only be client-side (DOM XSS). The fragment is encoded as the
+        browser would encode it (route_candidates.browser_fragment), so the page
+        sees the same location.hash and the driver can tell the URL's origin."""
         parts = urlsplit(exchange.url)
-        return [Candidate(urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, pl)),
+        return [Candidate(urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query,
+                                      route_candidates.browser_fragment(pl))),
                           route_candidates.FRAGMENT, "", pl)
                 for pl in _fragment_payloads(a, b)]
 
