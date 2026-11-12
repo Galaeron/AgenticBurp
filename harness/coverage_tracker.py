@@ -171,6 +171,7 @@ def resume_context_key(config):
     return hashlib.sha256((source['sha256'] + config_fingerprint(config)).encode()).hexdigest()
 
 from harness.categories import canonicalize
+from harness.client_routes import CLIENT_ROUTE_LEGS, CLIENT_ROUTE_LOCATIONS
 from harness.validators.injection_targets import (PER_PARAMETER_FIELD_CAP, PER_PARAMETER_LOCATIONS,
                                                   REQUEST_LEVEL_INPUTS, case_target)
 from harness.coverage_model import (
@@ -662,6 +663,11 @@ class CoverageTracker:
             params = []
             if check.phase == Phase.PARAMETER:
                 params = derive_input_cases_from_template(ep.get("template"))
+                if check.confirmation not in CLIENT_ROUTE_LEGS:
+                    # A client-side route input is loaded in a browser; no other
+                    # leg reaches it, so it is no input of that leg's cell.
+                    params = [c for c in params
+                              if c.parameter_location not in CLIENT_ROUTE_LOCATIONS]
             elif check.confirmation in PER_PARAMETER_LOCATIONS:
                 # An endpoint check whose leg can test one parameter alone (path
                 # traversal) fans out over the inputs at the locations that leg
@@ -1145,7 +1151,36 @@ def endpoint_view(state) -> dict[str, dict]:
             "template": getattr(ep, "template", None),
             "capture_variants": getattr(ep, "capture_variants", []),
         }
+    _add_client_routes(out, getattr(state, "client_routes", None))
     return out
+
+
+def _add_client_routes(out: dict[str, dict], routes) -> None:
+    """Give each client-side route input (client_routes.py) its coverage cells.
+    A history route that is also a captured endpoint carries its page-query
+    parameters on that endpoint's template; any other route becomes an endpoint of
+    its own, `GET /doc#/route` or `GET /doc`, that only the browser XSS legs load
+    (Check.applies)."""
+    if routes is None:
+        return
+    try:
+        inputs = routes.inputs()
+    except Exception as e:  # a malformed restored map must not stop coverage
+        log.warning("client routes unreadable for coverage: %s", e)
+        return
+    for route in inputs:
+        key = route.endpoint_key
+        tmpl = route.template()
+        if key in out:
+            base = dict(out[key].get("template") or {})
+            base["client_route"] = tmpl["client_route"]
+            out[key] = {**out[key], "template": base}
+            continue
+        out[key] = {
+            "path": route.path, "methods": ("GET",), "access": {}, "reachable_roles": [],
+            "access_by_principal": {}, "object_scoped": False, "findings": [],
+            "template": tmpl, "capture_variants": [], "client_route_only": True,
+        }
 
 
 def _reaches(ident: str, ep: dict, identity_roles: dict[str, str]) -> bool:
