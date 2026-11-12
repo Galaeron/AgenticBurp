@@ -166,6 +166,14 @@ class SafeDefaultGuardTests(unittest.TestCase):
         ("engagement.server_errors.max_lead_confirmations",
          lambda cfg: not cfg.get("engagement", {}).get("server_errors", {}).get(
              "max_lead_confirmations", 0)),
+        # Form templates (passive, but a new capture path) and their baseline submit
+        # (a write); the browser file-input capture triggers an upload.
+        ("engagement.form_templates.enabled",
+         lambda cfg: cfg.get("engagement", {}).get("form_templates", {}).get("enabled", False) is False),
+        ("engagement.form_templates.baseline",
+         lambda cfg: cfg.get("engagement", {}).get("form_templates", {}).get("baseline", False) is False),
+        ("driver_capture.file_uploads",
+         lambda cfg: cfg.get("driver_capture", {}).get("file_uploads", False) is False),
     ]
 
     def test_passive_privacy_guard(self):
@@ -192,6 +200,24 @@ class SafeDefaultGuardTests(unittest.TestCase):
         kept = config_schema.resolve_operating_profile(cfg, "workstation")
         self.assertIs(kept["engagement"]["experiments"]["enabled"], True)
 
+    def test_passive_only_forces_the_form_and_upload_writes_off(self):
+        """The form baseline submit and the browser file-input capture are writes:
+        passive-only forces both off even when explicitly enabled; template mining
+        itself (passive) is left as configured."""
+        for knob in ("engagement.form_templates.baseline", "driver_capture.file_uploads"):
+            self.assertIn(knob, config_schema._PASSIVE_FORCE_OFF_KNOBS)
+        cfg = self._load_committed_config()
+        cfg["engagement"]["form_templates"].update(enabled=True, baseline=True)
+        cfg["driver_capture"].update(file_uploads=True)
+        effective = config_schema.resolve_operating_profile(cfg, "passive-only")
+        self.assertIs(effective["engagement"]["form_templates"]["baseline"], False)
+        self.assertIs(effective["driver_capture"]["file_uploads"], False)
+        self.assertIs(effective["engagement"]["form_templates"]["enabled"], True)
+        # Negative control: another profile leaves the explicit switches alone.
+        kept = config_schema.resolve_operating_profile(cfg, "workstation")
+        self.assertIs(kept["engagement"]["form_templates"]["baseline"], True)
+        self.assertIs(kept["driver_capture"]["file_uploads"], True)
+
     # Unsafe replacement value used to flip each flag for the negative control.
     UNSAFE_VALUES = {
         "server.allowed_hosts": ["evil.example.com"],
@@ -213,6 +239,9 @@ class SafeDefaultGuardTests(unittest.TestCase):
         "engagement.experiments.planner": True,
         "engagement.retry_rounds.enabled": True,
         "engagement.server_errors.max_lead_confirmations": 2,
+        "engagement.form_templates.enabled": True,
+        "engagement.form_templates.baseline": True,
+        "driver_capture.file_uploads": True,
     }
 
     @staticmethod
