@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 __all__ = ["CLIENT_ROUTE_LEGS", "CLIENT_ROUTE_LOCATIONS", "ClientRoute", "ClientRouteMap",
-           "HASH", "HISTORY", "PAGE", "ROUTE", "fragment_route", "payload_url",
+           "HASH", "HISTORY", "PAGE", "ROUTE", "declared_views", "fragment_route", "payload_url",
            "route_params_of_template"]
 
 HASH, HISTORY = "hash", "history"
@@ -90,6 +90,32 @@ def _excluded(path: str) -> bool:
     """A route that looks destructive (logout, delete, ...) or is a file download."""
     from harness.spa_navigation import _DESTRUCTIVE, _DOWNLOAD
     return bool(_DESTRUCTIVE.search(path) or _DOWNLOAD.search(path))
+
+
+def _router_config_paths(text: str) -> list[str]:
+    """`path: '...'` entries of a router config, cleaned, in order: no path
+    parameter (`:id`), wildcard, file name or absolute URL."""
+    out: list[str] = []
+    for m in _ROUTER_PATH.finditer(text):
+        raw = m.group(1)
+        if (":" in raw or "*" in raw or "." in raw.rsplit("/", 1)[-1]
+                or raw.startswith(("http", "//"))):
+            continue
+        path = _clean_route_path(raw)
+        if path is not None and path not in out:
+            out.append(path)
+    return out
+
+
+def declared_views(body: str, limit: int = MAX_ROUTES) -> tuple[list[str], bool]:
+    """The client routes a script's router config declares that take no
+    parameter, as `(paths, hash_hint)`. The paths are in order and none is the
+    root or looks destructive or like a download. `hash_hint` says whether the
+    script configures hash routing. The SPA crawl visits these paths as views
+    when nothing links to them (driver_capture.declared_views)."""
+    text = (body or "")[:5_000_000]
+    paths = [p for p in _router_config_paths(text) if p != "/" and not _excluded(p)]
+    return paths[:max(0, limit)], bool(_HASH_HINTS.search(text))
 
 
 def fragment_route(fragment: str) -> tuple[str, str, str] | None:
@@ -379,13 +405,8 @@ class ClientRouteMap:
         text = body[:5_000_000]
         if _HASH_HINTS.search(text):
             self.hash_hint = True
-        for m in _ROUTER_PATH.finditer(text):
-            raw = m.group(1)
-            if (":" in raw or "*" in raw or "." in raw.rsplit("/", 1)[-1]
-                    or raw.startswith(("http", "//"))):
-                continue
-            path = _clean_route_path(raw)
-            if path is not None and len(self.router_paths) < MAX_ROUTES:
+        for path in _router_config_paths(text):
+            if len(self.router_paths) < MAX_ROUTES:
                 self.router_paths.add(path)
         for m in _HASH_LITERAL.finditer(text):
             if self.origin is None:

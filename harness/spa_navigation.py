@@ -17,7 +17,10 @@ What counts as a view: `<a href>`, Angular `routerLink` (and its dev-mode
 `to` attributes and hash routes (`#/basket`, `#!/basket`). Every target is resolved
 against the current view, kept only when it is on the start origin AND in the run's
 scope, and dropped when it looks destructive (logout, delete, reset, ...) or is a
-download. The walk stops at `max_views`, at `max_depth`, on cancellation, at the
+download. With `declared_views` it also visits, under a cap of its own, the
+parameter-less routes the app's router config declares and nothing links to;
+one the app does not stay on (a guard, a redirect to login) is `guarded`, not a
+view. The walk stops at `max_views`, at `max_depth`, on cancellation, at the
 deadline and when the request budget is spent; the browser's own route handler still
 decides every request (scope, gate, credentials, budget), exactly as for one page.
 """
@@ -142,6 +145,10 @@ class SpaCrawlResult:
     # client_routes.py maps an API call back to the route that issued it.
     links: list[str] = field(default_factory=list)
     view_calls: list[tuple] = field(default_factory=list)
+    # Router-declared views nothing linked to (declared_views > 0): the ones the
+    # app stayed on, and the ones it did not ("requested -> landed" or the status).
+    declared: list[str] = field(default_factory=list)
+    guarded: list[str] = field(default_factory=list)
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -156,23 +163,57 @@ def _budget_spent(budget: Any) -> bool:
     return value is not None and value <= 0
 
 
+def _same_view(a: str, b: str) -> bool:
+    """Whether two URLs are the same view, a trailing slash aside."""
+    def norm(url: str) -> str:
+        path, _, frag = view_key(url).partition("#")
+        return (path.rstrip("/") or "/") + "#" + ((frag.rstrip("/") or "/") if frag else "")
+    return norm(a) == norm(b)
+
+
+def _declared_url(current: str, path: str, hash_hint: bool) -> str | None:
+    """A router-declared path as a view of the app at `current`: a hash route in a
+    hash-routed app (the current view's fragment is a route, or the bundle says
+    so), a history route otherwise."""
+    if not _hash_routed(current) and hash_hint:
+        return resolve_view(current, "#" + path)
+    return resolve_view(current, path)
+
+
 async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_views: int = 30,
                       max_depth: int = 4, max_captured: int = 200, extra_views=(),
+                      declared_views: int = 0,
                       cancel: Any = None, budget: Any = None,
                       deadline: float | None = None) -> SpaCrawlResult:
     """Breadth-first walk of the app's client-side views from `start_url`.
 
     `in_scope(url) -> bool` is the run's scope check. `extra_views` seeds the
     queue with routes learned elsewhere (route feedback), resolved like links.
-    Each exchange the adapter drains is tagged with the view that fired it."""
+    Each exchange the adapter drains is tagged with the view that fired it.
+
+    `declared_views` > 0 also visits up to that many routes the app's router
+    config declares without a parameter and nothing links to (an adapter with
+    `scripts()` hands over the same-origin script bodies the views loaded). They
+    count against this cap, not `max_views`; the links they expose are followed
+    like any view's, under `max_views`, so a route that is both declared and
+    linked loses nothing. One the app does not stay on (a guard cancels it, it
+    redirects, to login or elsewhere, or the document answers an error status)
+    is recorded in `guarded`, never as a view, and its links are not followed;
+    the calls fired meanwhile are still captured, tagged with the view the app
+    landed on."""
     result = SpaCrawlResult(start_url=start_url)
     origin = urlsplit(start_url)[:2]
-    queue: list[tuple[str, int]] = [(start_url, 0)]
+    queue: list[tuple[str, int, bool]] = [(start_url, 0, False)]
     seen = {view_key(start_url)}
     captured_keys: set = set()
     seen_links: set = set()
+    declared_room = max(0, int(declared_views or 0))
+    declared_paths: list[str] = []
+    hash_hint = False
+    linked_views = 0
+    landed: set = set()      # where each opened view ended up (a redirect's target)
 
-    def admit(url: str | None, depth: int) -> None:
+    def admit(url: str | None, depth: int, declared: bool = False) -> None:
         if url is None:
             result.skip("not_a_view")
             return
@@ -186,14 +227,35 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         if _DOWNLOAD.search(parts.path) or _DOWNLOAD.search(parts.fragment.split("?", 1)[0]):
             result.skip("download")
             return
-        if url not in seen_links and len(result.links) < 500:
+        if not declared and url not in seen_links and len(result.links) < 500:
             seen_links.add(url)
             result.links.append(url)
         key = view_key(url)
         if key in seen:
             return
         seen.add(key)
-        queue.append((url, depth))
+        queue.append((url, depth, declared))
+
+    async def mine_declared(current: str) -> None:
+        nonlocal declared_room, hash_hint
+        from harness.client_routes import declared_views as declared_of
+        try:
+            bodies = await adapter.scripts()
+        except Exception as exc:
+            result.errors.append(f"scripts {view_key(current)}: {describe_error(exc)}")
+            return
+        for body in bodies or ():
+            paths, hinted = declared_of(body)
+            hash_hint = hash_hint or hinted
+            declared_paths.extend(p for p in paths if p not in declared_paths)
+        while declared_paths and declared_room > 0:
+            url = _declared_url(current, declared_paths.pop(0), hash_hint)
+            if url is None or view_key(url) in seen or view_key(url) in landed:
+                continue
+            before = len(queue)
+            admit(url, 1, declared=True)
+            if len(queue) > before:
+                declared_room -= 1
 
     for extra in extra_views or ():
         admit(resolve_view(start_url, extra), 1)
@@ -208,10 +270,13 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         if _budget_spent(budget):
             result.stopped_by = "budget"
             break
-        if len(result.views) >= max_views:
+        if linked_views >= max_views:
+            # A declared view has a cap of its own: only those still queued go on.
             result.stopped_by = "max_views"
-            break
-        url, depth = queue.pop(0)
+            queue = [entry for entry in queue if entry[2]]
+            if not queue:
+                break
+        url, depth, declared = queue.pop(0)
         try:
             await adapter.open(url)
         except ViewRefused as exc:
@@ -221,8 +286,24 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         except Exception as exc:
             result.errors.append(f"view {view_key(url)}: {describe_error(exc)}")
             continue
-        result.views.append(url)
         current = adapter.current_url() or url
+        landed.add(view_key(current))
+        guarded = ""
+        if declared:
+            status_of = getattr(adapter, "status", None)
+            status = status_of() if callable(status_of) else None
+            if isinstance(status, int) and status >= 400:
+                guarded = f"{view_key(url)} -> status {status}"
+            elif not _same_view(current, url):
+                guarded = f"{view_key(url)} -> {view_key(current)}"
+        if guarded:
+            result.guarded.append(guarded)
+        else:
+            result.views.append(url)
+            if declared:
+                result.declared.append(view_key(url))
+            else:
+                linked_views += 1
         try:
             fired = await adapter.drain()
         except Exception as exc:
@@ -238,17 +319,18 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
             captured_keys.add(key)
             exchange = dict(exchange)
             exchange["analyst_note"] = ("driver_capture: JS-issued request observed on view "
-                                        f"{view_key(url)} (spa navigation)")
+                                        f"{view_key(current if guarded else url)} (spa navigation)")
             result.exchanges.append(exchange)
-        if depth >= max_depth:
-            continue
-        try:
-            targets = await adapter.links()
-        except Exception as exc:
-            result.errors.append(f"links {view_key(url)}: {describe_error(exc)}")
-            continue
-        for raw in targets:
-            admit(resolve_view(current, raw), depth + 1)
+        if depth < max_depth and not guarded:
+            try:
+                targets = await adapter.links()
+            except Exception as exc:
+                targets = []
+                result.errors.append(f"links {view_key(url)}: {describe_error(exc)}")
+            for raw in targets:
+                admit(resolve_view(current, raw), depth + 1)
+        if declared_room > 0 and callable(getattr(adapter, "scripts", None)):
+            await mine_declared(current)
     else:
         result.stopped_by = result.stopped_by or "exhausted"
     return result

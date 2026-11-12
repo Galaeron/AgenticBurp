@@ -166,6 +166,7 @@ async def build_engagement(
                             cancel=run_context.cancel, wait_ms=wait_ms, max_captured=room,
                             max_views=max(1, int(capture_config.get("max_views", 30))),
                             max_depth=max(0, int(capture_config.get("max_depth", 4))),
+                            declared_views=max(0, int(capture_config.get("declared_views", 0))),
                             extra_views=extra_views)
                         supplied.extend(crawl.exchanges[:200 - len(supplied)])
                         _collect_spa_routes(client_routes, crawl)
@@ -173,6 +174,8 @@ async def build_engagement(
                                           "views": len(crawl.views),
                                           "exchanges": len(crawl.exchanges),
                                           "refused": list(getattr(crawl, "refused", []) or []),
+                                          "declared": list(getattr(crawl, "declared", []) or []),
+                                          "guarded": list(getattr(crawl, "guarded", []) or []),
                                           "stopped_by": crawl.stopped_by})
                         seed_errors.extend("browser spa crawl: " + e for e in crawl.errors)
                         continue

@@ -468,6 +468,10 @@ _MAX_REDIRECT_HOPS = 10
 # ExecutionObservation.navigation_bodies: at most this many documents, each cut here.
 _MAX_NAVIGATION_BODIES = 4
 _NAVIGATION_BODY_BYTES = 262_144
+# _IdentityRouter.script_bodies (crawl_spa with declared_views): at most this many
+# same-origin scripts per crawl, each cut here (client_routes reads no more).
+_MAX_SCRIPT_BODIES = 6
+_SCRIPT_BODY_BYTES = 5_000_000
 # Request headers the router does not copy from the browser's request when it
 # sends that request itself (connection-level, or rebuilt by the router).
 _UNFORWARDED_REQUEST_HEADERS = frozenset({
@@ -554,6 +558,10 @@ class _IdentityRouter:
         # Main-frame redirects refused by scope/policy (target origin and reason,
         # never the query): a crawl reports such a view as refused, not failed.
         self.refused_redirects: list[str] = []
+        # crawl_spa(declared_views=...): the run origin's script bodies, for the
+        # router config they declare. None (the default) keeps none.
+        self.script_bodies: list[str] | None = None
+        self._scripts_kept = 0
         extra, cookies = _extra_headers_and_cookies(headers, url)
         self.identity_headers = {k.lower(): v for k, v in (extra or {}).items()}
         self.identity_cookies = {c["name"]: c["value"] for c in cookies}
@@ -674,6 +682,13 @@ class _IdentityRouter:
                         and len(self.obs.navigation_bodies) < _MAX_NAVIGATION_BODIES):
                     self.obs.navigation_bodies.append(
                         bytes(response.content[:_NAVIGATION_BODY_BYTES]).decode("utf-8", "replace"))
+                if (self.script_bodies is not None and (resource_type or "").lower() == "script"
+                        and 200 <= response.status_code < 300
+                        and self._scripts_kept < _MAX_SCRIPT_BODIES
+                        and ScopePolicy.origin_of(url) == self.run_origin):
+                    self._scripts_kept += 1
+                    self.script_bodies.append(
+                        bytes(response.content[:_SCRIPT_BODY_BYTES]).decode("utf-8", "replace"))
                 await route.fulfill(status=response.status_code, headers=fulfilled,
                                     body=response.content)
                 return
@@ -1082,6 +1097,7 @@ class PlaywrightDriver:
                         budget: "RequestBudget | None" = None,
                         max_views: int = 30, max_depth: int = 4,
                         max_captured: int = 200, extra_views=(),
+                        declared_views: int = 0,
                         deadline: float | None = None):
         """`capture_requests` across the app's client-side views: load `url`, then
         follow the in-app links and router targets the rendered DOM exposes
@@ -1091,7 +1107,10 @@ class PlaywrightDriver:
         -- gets the identical scope/credential/gate/budget decision. A view that
         differs from the current one only by its hash route is entered by setting
         `location.hash` (the app stays loaded, as a click would leave it); any
-        other view is a routed main-frame navigation. Returns a
+        other view is a routed main-frame navigation. `declared_views` > 0 keeps
+        the run origin's script bodies so the crawl also visits, up to that many,
+        the parameter-less routes their router config declares (by GET
+        navigation, through the same router). Returns a
         `spa_navigation.SpaCrawlResult`."""
         from harness.spa_navigation import (LINK_TARGETS_JS, SpaCrawlResult, ViewRefused,
                                             crawl_views, describe_error)
@@ -1111,6 +1130,8 @@ class PlaywrightDriver:
                                  cancel=cancel, gate=gate, budget=budget,
                                  timeout_s=self.launch_timeout_ms / 1000,
                                  label="browser_driver.crawl_spa")
+        if declared_views > 0:
+            router.script_bodies = []
         timeout_ms = self.launch_timeout_ms
         try:
             async with async_playwright() as p:
@@ -1135,6 +1156,9 @@ class PlaywrightDriver:
                         # error page under the old URL): the next view is a full
                         # navigation, not a hash change into a dying context.
                         stale = False
+                        # The last main-frame document's status; None after a
+                        # hash change (the document stayed).
+                        last_status = None
 
                         async def open(self, target: str) -> None:
                             current = page.url or ""
@@ -1142,13 +1166,15 @@ class PlaywrightDriver:
                                         and "#" in target and current not in ("", "about:blank")
                                         and not self.stale)
                             self.stale = False
+                            self.last_status = None
                             if same_doc:
                                 await page.evaluate("h => { location.hash = h; }",
                                                     "#" + target.split("#", 1)[1])
                             else:
                                 refused = len(router.refused_redirects)
                                 try:
-                                    await router.goto(page, target, timeout_ms)
+                                    response = await router.goto(page, target, timeout_ms)
+                                    self.last_status = getattr(response, "status", None)
                                 except Exception as exc:
                                     self.stale = True
                                     # Let the error page Chromium commits for the
@@ -1178,11 +1204,20 @@ class PlaywrightDriver:
                         def current_url(self) -> str:
                             return page.url or ""
 
+                        def status(self):
+                            return self.last_status
+
+                        async def scripts(self) -> list:
+                            bodies = list(router.script_bodies or [])
+                            if router.script_bodies:
+                                router.script_bodies.clear()
+                            return bodies
+
                     return await crawl_views(
                         _Adapter(), url, in_scope=effective_scope.in_scope,
                         max_views=max_views, max_depth=max_depth, max_captured=max_captured,
-                        extra_views=extra_views, cancel=cancel, budget=budget,
-                        deadline=deadline)
+                        extra_views=extra_views, declared_views=max(0, int(declared_views)),
+                        cancel=cancel, budget=budget, deadline=deadline)
                 finally:
                     if context is not None:
                         await _close_context(context)
