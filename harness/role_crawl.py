@@ -692,6 +692,8 @@ async def crawl_roles(
     discovery_ffuf: bool = False,
     discovery_ffuf_wordlist: str = "harness",
     discovery_ffuf_image: str = "harness/ffuf:2.1.0",
+    discovery_recursion_depth: int = 0,
+    discovery_recursion_max_requests: int = 0,
     per_principal: bool = False,
 ) -> RoleCrawlResult:
     """Crawl `base_url` once per role, union the surface, probe every endpoint
@@ -812,6 +814,10 @@ async def crawl_roles(
                                             ffuf_in_runs=discovery_ffuf,
                                             ffuf_wordlist=discovery_ffuf_wordlist,
                                             ffuf_image=discovery_ffuf_image,
+                                            **({"recursion_depth": discovery_recursion_depth,
+                                                "recursion_max_requests":
+                                                    discovery_recursion_max_requests}
+                                               if discovery_recursion_depth > 0 else {}),
                                             session_ref=(session_refs[roles.index(sr)]
                                                          if session_refs is not None else None))
                     sres = await disc.discover()
@@ -830,7 +836,8 @@ async def crawl_roles(
                     # Expansion bounds are reported with the run, never silent.
                     result.discovery_bounds.extend(
                         e for e in sres.errors
-                        if e.startswith("backup suffixes") and e not in result.discovery_bounds)
+                        if e.startswith(("backup suffixes", "recursive discovery"))
+                        and e not in result.discovery_bounds)
                 except Exception as e:
                     result.errors.append(f"[discovery] sweep as {sr.role!r} failed: {e.__class__.__name__}")
             log.info("role_crawl: active discovery swept %d role(s) -> %d routes (%d probes), "

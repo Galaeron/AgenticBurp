@@ -87,6 +87,8 @@ async def build_engagement(
     discovery_ffuf: bool = False,
     discovery_ffuf_wordlist: str = "harness",
     discovery_ffuf_image: str = "",
+    discovery_recursion_depth: int = 0,
+    discovery_recursion_max_requests: int = 0,
     per_principal: bool = False,
     extra_views=(),
 ) -> tuple[engagement.EngagementState, role_crawl.RoleCrawlResult]:
@@ -221,6 +223,9 @@ async def build_engagement(
         **({"discovery_ffuf_wordlist": discovery_ffuf_wordlist}
            if discovery_ffuf_wordlist != "harness" else {}),
         **({"discovery_ffuf_image": discovery_ffuf_image} if discovery_ffuf_image else {}),
+        **({"discovery_recursion_depth": discovery_recursion_depth,
+            "discovery_recursion_max_requests": discovery_recursion_max_requests}
+           if discovery_recursion_depth > 0 and discovery_recursion_max_requests > 0 else {}),
     )
 
     state = engagement.EngagementState(host=host or _host_of(base_url))

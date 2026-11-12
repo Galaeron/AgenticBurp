@@ -1051,6 +1051,27 @@ class ChainMixin:
                 **({"discovery_ffuf_wordlist": wordlist} if wordlist != "harness" else {}),
                 **({"discovery_ffuf_image": image} if image else {})}
 
+    def _discovery_recursion_kw(self) -> dict:
+        """engagement.discovery_recursion_depth (default 0: off) with its request
+        cap engagement.discovery_recursion_max_requests; passed on only when both
+        are positive integers, so the default sends nothing new."""
+        cfg = self.config if isinstance(self.config, dict) else {}
+        eng = cfg.get("engagement") or {}
+
+        def count(key: str) -> int:
+            value = eng.get(key)
+            if isinstance(value, bool):        # passive-only forces the knob to False
+                return 0
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+        depth = count("discovery_recursion_depth")
+        cap = count("discovery_recursion_max_requests")
+        if not depth or not cap:
+            return {}
+        return {"discovery_recursion_depth": depth, "discovery_recursion_max_requests": cap}
+
     # Roles registered as replay identities below are owned by this engagement
     # and released when it ends (never leak into a later engagement on the host).
     # A capture review left running beside the later phases is cancelled and awaited
@@ -1175,6 +1196,7 @@ class ChainMixin:
                 active_discovery=active_discovery,
                 discovery_max_probes=discovery_max_probes, run_context=run_context,
                 **self._discovery_ffuf_kw(),
+                **self._discovery_recursion_kw(),
                 **({"per_principal": True} if _per_principal else {}),
                 **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
                 **({"driver_capture_config": self.config["driver_capture"]}
@@ -2329,7 +2351,7 @@ class ChainMixin:
                 max_endpoints=discovery_max_endpoints,
                 active_discovery=active_discovery,
                 discovery_max_probes=discovery_max_probes, run_context=run_context,
-                **self._discovery_ffuf_kw())
+                **self._discovery_ffuf_kw(), **self._discovery_recursion_kw())
             outs2, new_findings = await _investigate(st2, derived, deadline=_chain_deadline)
             _review_round = not (stop_on_confirm and any(f.get("confirmed") for f in new_findings))
             _round_in_background = _review_round and _overlap is not None and _overlap.accepting
