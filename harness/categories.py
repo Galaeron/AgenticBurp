@@ -101,6 +101,11 @@ _SYNONYMS: dict[str, str] = {
     "lfi": "path_traversal", "local file inclusion": "path_traversal",
     "file path traversal": "path_traversal", "file inclusion": "path_traversal",
     "arbitrary file read": "path_traversal", "dot dot slash": "path_traversal",
+    # AV-FILTER-01: a NUL encoding past a file-extension allow-list reads a file the
+    # filter refuses (CWE-158), the same arbitrary-read outcome.
+    "path_filter_bypass": "path_traversal", "path filter bypass": "path_traversal",
+    "extension_filter_bypass": "path_traversal", "extension filter bypass": "path_traversal",
+    "poison null byte": "path_traversal", "poison_null_byte": "path_traversal",
     "info_disclosure": "info_disclosure", "information disclosure": "info_disclosure",
     "info disclosure": "info_disclosure", "information leak": "info_disclosure",
     "data leak": "info_disclosure", "sensitive data exposure": "info_disclosure",
