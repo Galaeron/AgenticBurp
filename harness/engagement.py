@@ -946,6 +946,10 @@ class EngagementState:
     # persisted or logged with the surface.
     observed_values: dict = field(default_factory=dict)
     semantic_model: "object" = None
+    # client_routes.ClientRouteMap: the app's client-side routes and the parameter
+    # NAMES they read (never values). Persisted; coverage gives each route input
+    # its own cells (coverage_tracker.endpoint_view).
+    client_routes: "object" = None
 
     def __post_init__(self):
         from harness import task_graph
@@ -1008,6 +1012,12 @@ class EngagementState:
         theirs = getattr(other, "protected_paths", None)
         if isinstance(theirs, list) and isinstance(self.protected_paths, list):
             self.protected_paths.extend(p for p in theirs if p not in self.protected_paths)
+        routes = getattr(other, "client_routes", None)
+        if routes is not None:
+            if self.client_routes is None:
+                from harness.client_routes import ClientRouteMap
+                self.client_routes = ClientRouteMap()
+            self.client_routes.merge(routes)
         return added
 
     def ingest_role_crawl(self, result: dict) -> int:
@@ -1274,6 +1284,8 @@ class EngagementState:
             d["owners"] = self.owners
         if self.protected_paths:
             d["protected_paths"] = self.protected_paths
+        if self.client_routes is not None:
+            d["client_routes"] = self.client_routes.to_dict()
         return d
 
     @classmethod
@@ -1291,6 +1303,9 @@ class EngagementState:
             st.owners = d["owners"]
         if d.get("protected_paths") is not None:
             st.protected_paths = d["protected_paths"]
+        if d.get("client_routes"):
+            from harness.client_routes import ClientRouteMap
+            st.client_routes = ClientRouteMap.from_dict(d["client_routes"])
         return st
 
 

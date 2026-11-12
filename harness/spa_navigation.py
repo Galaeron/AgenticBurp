@@ -136,6 +136,12 @@ class SpaCrawlResult:
     errors: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)        # views the run refused to enter
     stopped_by: str = ""                                    # "" | max_views | budget | ...
+    # Every in-scope link target the rendered views exposed, resolved, query and
+    # route fragment kept (a link to a known view shape is still a route input),
+    # and every request each view fired as (view URL as loaded, method, url, body):
+    # client_routes.py maps an API call back to the route that issued it.
+    links: list[str] = field(default_factory=list)
+    view_calls: list[tuple] = field(default_factory=list)
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -164,6 +170,7 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     queue: list[tuple[str, int]] = [(start_url, 0)]
     seen = {view_key(start_url)}
     captured_keys: set = set()
+    seen_links: set = set()
 
     def admit(url: str | None, depth: int) -> None:
         if url is None:
@@ -179,6 +186,9 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         if _DOWNLOAD.search(parts.path) or _DOWNLOAD.search(parts.fragment.split("?", 1)[0]):
             result.skip("download")
             return
+        if url not in seen_links and len(result.links) < 500:
+            seen_links.add(url)
+            result.links.append(url)
         key = view_key(url)
         if key in seen:
             return
@@ -219,6 +229,9 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
             fired = []
             result.errors.append(f"capture {view_key(url)}: {describe_error(exc)}")
         for exchange in fired:
+            if len(result.view_calls) < 2000:
+                result.view_calls.append((current, exchange.get("method") or "GET",
+                                          exchange.get("url") or "", exchange.get("request_body") or ""))
             key = (exchange.get("method"), exchange.get("url"), exchange.get("request_body"))
             if key in captured_keys or len(result.exchanges) >= max_captured:
                 continue
