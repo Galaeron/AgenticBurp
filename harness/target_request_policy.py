@@ -7,7 +7,7 @@ from urllib.parse import unquote, urlsplit
 from harness.scope_lock import parse_scope_url
 
 
-def _canonical_path(path):
+def _decoded_path(path):
     if not isinstance(path, str) or not path.startswith('/') or '\\' in path:
         return None
     for _ in range(4):
@@ -15,13 +15,39 @@ def _canonical_path(path):
             return None
         decoded = unquote(path, errors='strict')
         if decoded == path:
-            break
+            return path
         path = decoded
-    else:
-        return None  # ambiguous deeper encoding cannot bypass an exclusion
+    return None  # ambiguous deeper encoding cannot bypass an exclusion
+
+
+def _normalized(path):
     if '\\' in path or any(ord(c) < 32 or ord(c) == 127 for c in path):
         return None
     return '/' + posixpath.normpath('/' + path.lstrip('/')).lstrip('/')
+
+
+def _canonical_path(path):
+    decoded = _decoded_path(path)
+    return None if decoded is None else _normalized(decoded)
+
+
+def _target_paths(path):
+    """Every path a server may resolve this request path to, or None if ambiguous.
+
+    A decoded NUL is the one control character that servers are known to read
+    two ways. A C-string file layer stops at it, and a sanitizer may strip it.
+    Both readings are returned so that an exclusion holds for either one. This
+    lets a path-filter probe such as `name.bak%2500.md` be sent without it ever
+    reaching an excluded path. Any other control character stays ambiguous.
+    """
+    decoded = _decoded_path(path)
+    if decoded is None:
+        return None
+    if '\x00' not in decoded:
+        single = _normalized(decoded)
+        return None if single is None else (single,)
+    readings = tuple(_normalized(r) for r in (decoded.split('\x00', 1)[0], decoded.replace('\x00', '')))
+    return None if None in readings else readings
 
 
 @dataclass(frozen=True)
@@ -64,13 +90,13 @@ class TargetRequestPolicy:
         if parse_scope_url(url) is None:
             return 'malformed target URL'
         try:
-            path = _canonical_path(urlsplit(url).path or '/')
+            paths = _target_paths(urlsplit(url).path or '/')
         except (UnicodeError, ValueError):
-            path = None
-        if path is None:
+            paths = None
+        if paths is None:
             return 'ambiguous target path'
         if any(prefix == '/' or path == prefix or path.startswith(prefix + '/')
-               for prefix in self.excluded_path_prefixes):
+               for path in paths for prefix in self.excluded_path_prefixes):
             return 'target endpoint excluded by path policy; no request sent'
         return ''
 
