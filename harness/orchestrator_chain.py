@@ -2155,6 +2155,31 @@ class ChainMixin:
                          _recrawl_report["rounds"], len(fresh), len(outs3))
             _recrawl_report["feed"] = feed.stats()
 
+        # engagement.review_on_idle_seconds (0, off, by default): once the model has sat
+        # idle that long while the worklist and recrawl rounds send their requests, the
+        # capture review starts beside them, over the same captures, seen set, limit and
+        # time budget as the capture_review pass; that pass, which drains it first, then
+        # takes only what it left (harness/review_overlap.py, IdleReview).
+        _idle_review = None
+        _review_groups: dict | None = None
+        if (not _objective_outcomes and not stop_on_confirm
+                and review_overlap.idle_seconds(self.config) > 0
+                and review_overlap.review_uses_model(self)):
+            _review_groups = {}
+
+            async def _idle_review_call(captured, **bounds):
+                return await review_captured_exchanges(
+                    self, state, captured, run_context=run_context,
+                    seen=_reviewed_captures, errors=_errors, stats=_review_stats,
+                    groups=_review_groups, report_left=False, **bounds, **_review_kwargs)
+
+            _idle_review = review_overlap.IdleReview(
+                _idle_review_call, lambda: _all_captured,
+                idle_seconds=review_overlap.idle_seconds(self.config),
+                max_reviews=self.capture_review_limit, deadline=_investigation_deadline,
+                review_seconds=(self.capture_review_seconds
+                                if self.capture_review_seconds > 0 else None)).start()
+
         if _objective_outcomes:
             outcomes = _objective_outcomes
             all_findings = [f for o in outcomes for f in o["findings_detail"]]
@@ -2241,8 +2266,20 @@ class ChainMixin:
             # an open-ended model review of unrelated vulnerability classes.
             return _objective_result(False)
         _instr.phases.begin("capture_review")
+        # The review taken up while the model sat idle stops here (its capture in flight
+        # finishes): this pass reviews only what it left, within what it left of the
+        # review limit and time budget.
+        _main_limit = self.capture_review_limit
+        _review_seconds = float(self.capture_review_seconds)
+        if _idle_review is not None:
+            await _idle_review.drain()
+            if _idle_review.error:
+                _errors.append({"phase": "capture_review", "error": _idle_review.error})
+            _main_limit = max(0, self.capture_review_limit - _idle_review.reviewed)
+            if _review_seconds > 0:
+                _review_seconds = max(0.0, _review_seconds - _idle_review.busy_seconds)
         # One review time budget covers this pass and every chain round's pass.
-        _review_deadline = (time.monotonic() + self.capture_review_seconds
+        _review_deadline = (time.monotonic() + _review_seconds
                             if self.capture_review_seconds > 0 else None)
         if _investigation_deadline is not None:
             _review_deadline = min(_review_deadline or _investigation_deadline,
@@ -2261,21 +2298,28 @@ class ChainMixin:
                     and (_review_budget is None or _review_deadline < _review_budget)
                     and review_overlap.enabled(self.config)
                     and review_overlap.review_uses_model(self)):
+                _main_batch = list(_all_captured)
+
                 async def _overlap_review(captured, **bounds):
+                    # This pass's batch shares the idle review's limit and content
+                    # groups; a chain round's batch is its own call, as before.
+                    main = captured is _main_batch
                     return await review_captured_exchanges(
                         self, state, captured, run_context=run_context,
                         seen=_reviewed_captures, errors=_errors, stats=_review_stats,
-                        max_reviews=self.capture_review_limit, **bounds, **_review_kwargs)
+                        max_reviews=_main_limit if main else self.capture_review_limit,
+                        groups=_review_groups if main else None,
+                        **bounds, **_review_kwargs)
 
                 _overlap = review_overlap.ReviewOverlap(
-                    _overlap_review, deadline=_review_budget).start(list(_all_captured))
+                    _overlap_review, deadline=_review_budget).start(_main_batch)
                 await _overlap.hold(_review_deadline)
             else:
                 await review_captured_exchanges(
                     self, state, _all_captured, run_context=run_context,
                     seen=_reviewed_captures, errors=_errors, stats=_review_stats,
-                    max_reviews=self.capture_review_limit, deadline=_review_deadline,
-                    **_review_kwargs)
+                    max_reviews=_main_limit, deadline=_review_deadline,
+                    groups=_review_groups, **_review_kwargs)
                 _journal_phase("review")
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
@@ -3150,6 +3194,7 @@ class ChainMixin:
                 "recrawl": _recrawl_report,
                 "phase_schedule": _schedule.report() if _schedule.active else None,
                 "review_overlap": _overlap.report() if _overlap is not None else None,
+                "idle_review": _idle_review.report() if _idle_review is not None else None,
                 "retry_rounds": _retry_report,
                 "session_events": list(getattr(run_context.freshness(), "events", []) or [])
                                   if run_context is not None and hasattr(run_context, "freshness") else [],

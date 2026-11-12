@@ -444,6 +444,20 @@ engagement:
   # the drive starts. Inert without a capture_review slice; false runs the review
   # inline, cut at its slice, as before.
   review_overlap: true
+  # Capture review while the model sits idle before capture_review (IdleReview in
+  # harness/review_overlap.py). r9/r10: the worklist's model-driven probes were done by
+  # about hour 3.7 of its 7.8 h slice; the rest was validator legs, and model calls
+  # stayed flat while target requests grew by about 24k an hour. When > 0: once no
+  # other model call has run for this many seconds during the worklist sweep and
+  # recrawl rounds, the capture review starts beside them, over the captures so far
+  # (and those the recrawl adds). It pauses before its next capture whenever anything
+  # else uses the model (the capture in flight finishes), and capture_review drains it
+  # and reviews only what it left. It shares the seen set, capture_review_limit,
+  # capture_review_seconds and identical-content grouping with that pass, so the same
+  # captures are reviewed once; investigation_seconds stays a hard bound. Works with
+  # or without review_overlap. 0 (DEFAULT) off: the review waits for capture_review.
+  # Example for a long single-slot run (config.local.yaml): 300.
+  review_on_idle_seconds: 0
   # Crawl once per registered principal (harness/role_crawl.crawl_roles_for) instead
   # of once per distinct role feature: two same-role users get two discovery sweeps,
   # two browser crawls and two feature crawls. DEFAULT OFF: it multiplies crawl traffic.

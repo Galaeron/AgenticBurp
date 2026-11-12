@@ -26,6 +26,9 @@ The capture_review slice bounds how long the engagement WAITS for the review. Wi
 `engagement.review_overlap` (on by default) a model-bound review its slice cuts short
 goes on in the background beside the request-bound passes after it, up to its own
 deadline (harness/review_overlap.py); with it off the review stops at its slice.
+With `engagement.review_on_idle_seconds` (0, off, by default) the review can also
+start earlier, inside the worklist and recrawl slices, once the model has sat idle
+that long (IdleReview); the capture_review slice then takes only what it left.
 
 OFF by default: with no `phase_slices` (or no `investigation_seconds`, the deadline
 the slices divide) every phase keeps exactly today's deadline.
