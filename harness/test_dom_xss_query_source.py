@@ -22,18 +22,22 @@ Covered here:
 """
 import asyncio
 import json
+import os
+import shutil
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qsl, urlsplit
 
-from harness import engagement, global_throttle
+from harness import cache, engagement, global_throttle, store
 from harness.coverage_model import CoverageMatrix, CellStatus
 from harness.models import Finding, HttpExchange
 from harness.role_crawl import RoleSession
-from harness.test_spa_route_xss import _CHROMIUM, _Server, _config
+from harness.test_spa_route_xss import _CHROMIUM, _config
 from harness.validators.dom_xss_validator import DomXssValidator
 from harness.validators.injection_targets import (NAMED_PARAMETER_UNTESTED, PER_PARAMETER_LOCATIONS,
                                                   REQUEST_LEVEL_INPUTS, case_target)
@@ -88,10 +92,14 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-class _QueryServer(_Server):
+class _QueryServer(unittest.TestCase):
+    """The query fixture on loopback, with a store and cache of its own."""
     @classmethod
     def setUpClass(cls):
-        super().setUpClass()
+        cls._tmp = tempfile.mkdtemp(prefix="dom_xss_query_")
+        cls._orig_store_db, cls._orig_cache = store._DB_PATH, cache._cache
+        store._DB_PATH = Path(cls._tmp) / "state.db"
+        cache.init_cache(db_path=os.path.join(cls._tmp, "cache.db"))
         cls.qserver = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         cls.qbase = f"http://127.0.0.1:{cls.qserver.server_address[1]}"
         threading.Thread(target=cls.qserver.serve_forever, daemon=True).start()
@@ -100,7 +108,8 @@ class _QueryServer(_Server):
     def tearDownClass(cls):
         cls.qserver.shutdown()
         cls.qserver.server_close()
-        super().tearDownClass()
+        store._DB_PATH, cache._cache = cls._orig_store_db, cls._orig_cache
+        shutil.rmtree(cls._tmp, ignore_errors=True)
 
     def setUp(self):
         global_throttle.configure(0)
