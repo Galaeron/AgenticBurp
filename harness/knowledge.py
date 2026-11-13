@@ -39,7 +39,7 @@ _CORPUS: list[dict] = [
                 "response itself.",
     },
     {
-        "tags": ["idor", "access_control", "business_logic"],
+        "tags": ["idor", "access_control", "business_logic", "business_logic_enhanced"],
         "note": "IDOR is only proven by a differential test across two identities: same "
                 "object ID, two different session tokens, compare responses -- or same "
                 "token, two different IDs. A single request showing a plausible-looking "
@@ -57,7 +57,7 @@ _CORPUS: list[dict] = [
                 "confirmed at all.",
     },
     {
-        "tags": ["business_logic", "race", "workflow"],
+        "tags": ["business_logic", "race", "workflow", "race_condition", "business_logic_enhanced"],
         "note": "Race-condition-shaped findings (redemption, balance transfer, "
                 "limited-quantity purchase) need concurrent requests, not sequential "
                 "ones -- firing the same request twice one after another rarely "
@@ -80,7 +80,7 @@ _CORPUS: list[dict] = [
                 "signing key is.",
     },
     {
-        "tags": ["ai_llm", "prompt", "injection"],
+        "tags": ["ai_llm", "prompt", "injection", "ai_security"],
         "note": "Prompt injection testing separates two different risks that get "
                 "conflated: direct injection (the user's own message tries to override "
                 "instructions) and indirect injection (untrusted third-party content -- "
@@ -90,7 +90,7 @@ _CORPUS: list[dict] = [
                 "the app directly.",
     },
     {
-        "tags": ["supply_chain", "dependency", "lockfile", "ci", "github", "actions"],
+        "tags": ["supply_chain", "dependency", "lockfile", "github", "actions"],
         "note": "An exposed lockfile is a reconnaissance gift, not a vulnerability by "
                 "itself -- the actual risk is whichever named version turns out to have "
                 "a disclosed advisory, which is exactly what the deterministic "
@@ -109,6 +109,186 @@ _CORPUS: list[dict] = [
                 "underlying bug exists. Effort is better spent on components where no "
                 "advisory was found, since that's the only case where independent "
                 "analysis is actually adding information.",
+    },
+    # SKL-2: one note per specialist agent whose own name matched no tag above.
+    # Each tag set leads with the exact agent-name token and adds only
+    # distinctive words, so a neutral exchange never drags in another class.
+    # Every note states the PROOF rule the matching validator applies.
+    {
+        "tags": ["command_injection", "os-command", "rce"],
+        "note": "Command injection is proven out-of-band: the injected value should do "
+                "nothing except make the host fetch a unique, single-use listener URL, and "
+                "the inbound callback is the evidence. Output that merely looks like a "
+                "command result, or an error mentioning a shell, stays a candidate; a "
+                "timing difference counts only against a no-op control of the same shape.",
+    },
+    {
+        "tags": ["xxe", "xml-entity", "dtd"],
+        "note": "XXE is confirmed when the XML parser itself reaches out: declare an "
+                "external entity that points at a unique listener URL and wait for the "
+                "fetch. That works for blind parsers too, so whether entity content is "
+                "echoed back does not matter. An endpoint that merely accepts XML, or "
+                "returns a parser error on a DOCTYPE, is a candidate only.",
+    },
+    {
+        "tags": ["deserialization", "serialized", "pickle", "viewstate"],
+        "note": "Recognising a serialized-object format (by its leading byte signature) "
+                "establishes a candidate, not a vulnerability. Execution is proven only by "
+                "a benign beacon -- a crafted object whose sole effect is an out-of-band "
+                "fetch of a unique URL. Never build or send a destructive gadget chain; "
+                "when the format is not one the harness can beacon, name the finding and "
+                "leave exploitability to an analyst.",
+    },
+    {
+        "tags": ["ssti", "template-injection"],
+        "note": "Template injection is told apart from plain reflection by evaluation: "
+                "submit an arithmetic expression between unique nonce markers and look for "
+                "the computed result between those markers. Seeing the literal expression "
+                "back means reflection (perhaps XSS), not SSTI. The arithmetic result is the "
+                "whole proof; no OS-level payload is needed or wanted.",
+    },
+    {
+        "tags": ["nosql", "mongodb", "operator-injection"],
+        "note": "NoSQL operator injection on a login is proven with a paired test in two "
+                "fresh sessions: an operator expression that cannot match any user must "
+                "leave you at the login page (negative control), while the same shape "
+                "aimed at a known identity must land on that identity's authenticated "
+                "page. A changed error message or status alone is not proof.",
+    },
+    {
+        "tags": ["csrf", "xsrf", "samesite"],
+        "note": "A CSRF claim needs an observed state change, not a 200: show that a request "
+                "lacking the anti-forgery token changed something, then read the new value "
+                "back independently. Check the session cookie's SameSite attribute first -- "
+                "Strict blocks cross-site submission, Lax still allows top-level GET "
+                "navigation. A token-stripped replay that returns success is an observation.",
+    },
+    {
+        "tags": ["file_upload", "upload", "multipart"],
+        "note": "Upload filter bypass is proven by retrieval, not by the upload response: "
+                "send a harmless file with a disallowed extension or content type, then "
+                "fetch the stored URL and confirm the same content is served back. "
+                "Acceptance messages alone prove nothing. Do not upload anything that "
+                "executes; stored-and-served is the claim, server-side execution is not.",
+    },
+    {
+        "tags": ["header_injection", "crlf"],
+        "note": "Response header injection is proven when a line break in a parameter "
+                "produces a separate, harness-chosen marker header in the raw response. A "
+                "value that is only reflected inside an existing header is a candidate. "
+                "Mail-header injection through a form cannot be seen from the HTTP "
+                "response, so it stays unconfirmed unless the resulting message is observed.",
+    },
+    {
+        "tags": ["http_request_smuggling", "smuggling", "desync"],
+        "note": "A smuggling probe that times out or returns an odd status is a candidate, "
+                "never a confirmation: a single connection cannot show that a front end and "
+                "back end disagreed. Confirmation needs a paired effect -- a smuggled prefix "
+                "that visibly changes the response to a separate follow-up request -- and "
+                "should run only against an owned or test pair of servers.",
+    },
+    {
+        "tags": ["web_cache_poisoning", "cache-poisoning", "cache-deception"],
+        "note": "Cache poisoning needs two observations: an unkeyed input (such as a "
+                "forwarding header) changes the response, AND a later clean request without "
+                "that input still gets the altered response. Use a unique cache-buster so "
+                "real users never receive the poisoned copy. For cache deception, show an "
+                "authenticated page served from cache under a static-looking suffix.",
+    },
+    {
+        "tags": ["open_redirect", "redirect", "returnurl"],
+        "note": "An open redirect is proven by the Location header, not the body: set the "
+                "redirect parameter to a unique off-origin host, do not follow redirects, "
+                "and confirm a 3xx whose Location host is that host. The value appearing in "
+                "page text or a same-origin redirect is not the finding.",
+    },
+    {
+        "tags": ["websocket", "cswsh"],
+        "note": "Cross-site WebSocket hijacking is proven when the handshake completes "
+                "(101) despite a foreign Origin header while the session rides on cookies. "
+                "A server that rejects the foreign Origin is the negative result. Issues "
+                "inside messages, like missing per-message authorization, need a live "
+                "session and a second identity, so report them as unconfirmed.",
+    },
+    {
+        "tags": ["oauth", "oidc", "pkce", "redirect_uri"],
+        "note": "Missing state or PKCE on an authorization request, or a token in the URL, "
+                "can be read off one exchange and is a configuration observation. "
+                "redirect_uri enforcement is tested with one probe that changes the "
+                "redirect_uri: acceptance of a foreign value is the finding, rejection is "
+                "the negative control. Full flow abuse needs a real consenting user.",
+    },
+    {
+        "tags": ["csp", "clickjacking", "frame-ancestors"],
+        "note": "Judge the policy the browser actually enforces: re-fetch the page and "
+                "parse its directives, and remember a report-only header enforces nothing. "
+                "Framing protection exists if either X-Frame-Options or frame-ancestors "
+                "restricts it. A weak directive is a hardening gap; calling it exploitable "
+                "needs a separate injection sink.",
+    },
+    {
+        "tags": ["crypto", "tls", "hsts", "cipher"],
+        "note": "Transport claims should come from an independent TLS handshake (negotiated "
+                "protocol, cipher, certificate expiry and hostname), not from what the "
+                "proxy displays. HSTS and cookie Secure flags are read from the captured "
+                "headers. A weak-hash or weak-key claim needs the algorithm shown in the "
+                "evidence, not inferred from a field name.",
+    },
+    {
+        "tags": ["info_disclosure", "stacktrace", "verbose-error"],
+        "note": "Quote exactly what leaked and rank it: a credential or key outranks a file "
+                "path or internal hostname, which outranks a library version. A generic "
+                "error page naming nothing is not a finding. Repeat with a well-formed "
+                "control request: detail that only appears on malformed input is the real "
+                "signal; detail on every page is a configuration issue.",
+    },
+    {
+        "tags": ["graphql", "introspection"],
+        "note": "Reachable introspection is a directly observable over-exposure finding. "
+                "Missing per-field or per-object authorization is proven like IDOR: the "
+                "same query under two identities, compared. Keep query depth, aliasing and "
+                "batching findings (cost and rate-limit bypass) separate from data-exposure "
+                "findings, since they need different evidence.",
+    },
+    {
+        "tags": ["api_security", "mass-assignment", "bola"],
+        "note": "Mass assignment is confirmed only by a controlled change: read the object "
+                "first (field absent or different), send the write with the extra field, "
+                "then read it back independently and see the new value. An echo in the "
+                "write response is not proof. An oversized page or limit value proves "
+                "missing bounds only if the server returns more than its usual cap.",
+    },
+    {
+        "tags": ["rate_limit", "lockout", "brute-force"],
+        "note": "Missing rate limiting is shown by a bounded burst of identical replays "
+                "that all reach the application with no 429, no Retry-After and no "
+                "lockout after a sensible threshold. Stay within the configured burst "
+                "ceiling; a reduced burst gives lower confidence, not a skip. Never vary "
+                "credentials to guess real passwords -- the replay is the test.",
+    },
+    {
+        "tags": ["recon", "attack-surface"],
+        "note": "Reconnaissance expands what to test; it does not prove a vulnerability. "
+                "Record each new path, host or API base with where it was seen (link, "
+                "script, comment, header), and rank it by what it unlocks next. A framework "
+                "banner with no follow-on test is low value; a referenced internal host or "
+                "exposed source map is high.",
+    },
+    {
+        "tags": ["subdomain_takeover", "dangling", "cname"],
+        "note": "A takeover candidate is a hostname pointing at a third-party service whose "
+                "response matches that provider's known unclaimed-resource fingerprint. "
+                "Do not register or claim the resource to prove it. No fingerprint match "
+                "means only that the known signatures did not match, not that the host is "
+                "safe.",
+    },
+    {
+        "tags": ["anomaly", "outlier"],
+        "note": "An anomaly is a deviation from a stated baseline, not a bug in itself: say "
+                "what normal looks like for this route (status, header set, size, content "
+                "type) and how this exchange differs. Repeat the request once to rule out "
+                "flakiness. Hand a reproducible deviation to the matching specialist rather "
+                "than assigning it severity.",
     },
 ]
 
