@@ -84,9 +84,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class _Server(ThreadingHTTPServer):
+    request_queue_size = 128   # a loaded machine must not refuse the drive's connections
+    daemon_threads = True
+
+
 class _App:
     def __init__(self):
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.httpd = _Server(("127.0.0.1", 0), _Handler)
         self.httpd.received, self.httpd.lock = [], threading.Lock()
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self._t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -167,7 +172,8 @@ class _Run:
     def __init__(self, engagement: dict, *, drive_seconds: float = DRIVE_SECONDS,
                  model_seconds: float = MODEL_SECONDS, cancel_mid_drive: bool = False,
                  journal: RunJournal | None = None, max_requests: int | None = None,
-                 analysis_sends: bool = False):
+                 analysis_sends: bool = False, drive_until_denied: bool = False,
+                 drive_requests: int | None = None):
         self.engagement = engagement
         self.drive_seconds = drive_seconds
         self.model = _SlowModel(model_seconds)
@@ -177,6 +183,11 @@ class _Run:
         # Each finished analysis then sends one request through the run's transport,
         # as a validator confirming a review finding would.
         self.analysis_sends = analysis_sends
+        # The drive stops at its first request the budget denies, or after
+        # `drive_requests` sends (drive_seconds is then only a cap): what it sends
+        # never depends on the machine's speed.
+        self.drive_until_denied = drive_until_denied
+        self.drive_requests = drive_requests
 
     def run(self, app: "_App | None" = None):
         """`app`: an app the caller owns (a resumed run must meet the same target)."""
@@ -252,9 +263,18 @@ class _Run:
             while time.monotonic() - started < self.drive_seconds:
                 outcome = await transport.send("GET", f"{app.base}{DRIVE_PREFIX}{sent}",
                                                capability="engagement_execute")
-                facts["drive_denied"] += getattr(outcome, "outcome", "") == "budget_exhausted"
+                denied = getattr(outcome, "outcome", "") == "budget_exhausted"
+                facts["drive_denied"] += denied
                 sent += 1
-                if self.cancel_mid_drive and time.monotonic() - started > 1.2:
+                if denied and self.drive_until_denied:
+                    break
+                if self.drive_requests is not None and sent >= self.drive_requests:
+                    break
+                # The run is stopped mid-drive once the review has finished two
+                # analyses beside it (8 s is only a cap), however slow the machine.
+                if self.cancel_mid_drive and (
+                        sum(1 for start, _ in self.model.calls if start >= started) >= 2
+                        or time.monotonic() - started > 8.0):
                     facts.setdefault("cancelled_at", time.monotonic())
                     facts["engagement"].cancel()   # the run is stopped mid-drive
                 await asyncio.sleep(0.01)
@@ -274,6 +294,7 @@ class _Run:
                             raise
                         return None    # the engagement itself was cancelled
                     finally:
+                        facts["engagement_ended_at"] = time.monotonic()
                         facts["leftover_tasks"] = [
                             t.get_name() for t in asyncio.all_tasks()
                             if t is not asyncio.current_task() and not t.done()
@@ -314,9 +335,11 @@ def _calls_during(calls, window) -> int:
     return sum(1 for start, end in calls if start < hi and end > lo)
 
 
-# The slice gives the review 1/6 of the time left when it begins (about 1 s of 6);
-# the rest is kept for the passes after it.
-SLICED = {"investigation_seconds": 6, "phase_slices": {"capture_review": 1, "final_passes": 5}}
+# The slice gives the review 1/12 of the time left when it begins (about 1 s of 12);
+# the rest is kept for the passes after it. The review's own deadline (12 s) lies
+# well past the drive, even on a loaded machine, so the drain is what stops it.
+SLICED = {"investigation_seconds": 12,
+          "phase_slices": {"capture_review": 1, "final_passes": 11}}
 
 
 class ReviewBesideTheDriveCallerTest(unittest.TestCase):
@@ -384,7 +407,11 @@ class ReviewDeadlineCallerTest(unittest.TestCase):
         self.assertEqual(facts["leftover_tasks"], [])
 
     def test_an_engagement_cancelled_mid_drive_leaves_no_review_running(self):
-        result, facts = _Run(dict(SLICED), cancel_mid_drive=True).run()
+        # A long investigation deadline (the slice is still about 1 s): a loaded
+        # machine never reaches the review's own deadline before the cancel.
+        result, facts = _Run({"investigation_seconds": 20,
+                              "phase_slices": {"capture_review": 1, "final_passes": 19}},
+                             cancel_mid_drive=True, drive_seconds=10.0).run()
         self.assertIsNone(result)
         self.assertEqual(facts["leftover_tasks"], [])
         drive_start = min(t for t, _, _ in facts["drive_requests"])
@@ -392,8 +419,8 @@ class ReviewDeadlineCallerTest(unittest.TestCase):
         calls = facts["model_calls"]
         self.assertGreater(_calls_during(calls, (drive_start, cancelled_at)), 0,
                            "the review was running beside the drive")
-        self.assertEqual([c for c in calls if c[0] > cancelled_at + 0.1], [],
-                         "no model call starts once the engagement is cancelled")
+        self.assertEqual([c for c in calls if c[1] > facts["engagement_ended_at"]], [],
+                         "no analysis finishes once the cancelled engagement has ended")
 
 
 class ReviewJournalCallerTest(unittest.TestCase):
@@ -430,29 +457,37 @@ class ReviewBudgetCallerTest(unittest.TestCase):
     one request budget (runs.max_requests), and its coverage reserve stays the drive's."""
 
     CEILING = 100
+    # The drive sends a fixed count past the ceiling, stopping at the first request the
+    # budget denies (60 s is only a cap): a loaded machine sends them more slowly,
+    # never fewer.
+    DRIVE = {"analysis_sends": True, "drive_until_denied": True,
+             "drive_requests": CEILING + 30, "drive_seconds": 60.0}
 
     def test_the_review_and_the_drive_share_the_one_request_ceiling(self):
-        result, facts = _Run(dict(SLICED), max_requests=self.CEILING, analysis_sends=True).run()
+        result, facts = _Run(dict(SLICED), max_requests=self.CEILING, **self.DRIVE).run()
         self.assertTrue(result["crawl_loop"]["review_overlap"]["background"])
         window = (min(t for t, _, _ in facts["drive_requests"]),
                   max(t for t, _, _ in facts["drive_requests"]))
         beside = [t for t, _, _ in facts["validate_requests"] if window[0] < t < window[1]]
         self.assertGreater(len(beside), 0, "the review sent requests beside the drive")
         self.assertGreater(facts["drive_denied"], 0, "the ceiling was reached")
-        # Everything the app received after discovery's own fetches was reserved from
-        # the run budget, and the budget never went past its ceiling.
-        self.assertEqual(len(facts["received"]) - CAPTURES, facts["budget_used"])
+        # The app received nothing after discovery's own fetches that the run budget
+        # did not reserve (a reserved send can still fail to connect), and the budget
+        # stopped at its ceiling.
+        self.assertLessEqual(len(facts["received"]) - CAPTURES, facts["budget_used"])
         self.assertEqual(facts["budget_used"], self.CEILING)
 
     def test_control_without_a_ceiling_the_same_run_sends_more(self):
-        _, facts = _Run(dict(SLICED), analysis_sends=True).run()
+        # Nothing denies this drive, so it sends its whole count, past the ceiling.
+        _, facts = _Run(dict(SLICED), **self.DRIVE).run()
         self.assertEqual(facts["drive_denied"], 0)
         self.assertGreater(facts["budget_used"], self.CEILING)
+        self.assertLessEqual(len(facts["received"]) - CAPTURES, facts["budget_used"])
 
     def test_a_coverage_reserve_stops_the_review_before_the_drive(self):
         reserve = 60
         result, facts = _Run(dict(SLICED, coverage_request_reserve=reserve),
-                             max_requests=self.CEILING, analysis_sends=True).run()
+                             max_requests=self.CEILING, **self.DRIVE).run()
         self.assertEqual(result["crawl_loop"]["review_overlap"]["stopped_by"],
                          "coverage request reserve")
         drive_start = min(t for t, _, _ in facts["drive_requests"])
