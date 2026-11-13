@@ -1556,7 +1556,9 @@ class ChainMixin:
                 return next(iter(points))
             return "", ""
 
-        async def _bind_stored(finding, res, validator_name, exchange):
+        async def _bind_stored(finding, res, validator_name, exchange, **binding):
+            # `binding`: store.bind_confirmation_proof's narrowing keywords; the
+            # coverage drive passes them (its proofs prove no particular row).
             try:
                 location, name = _proven_parameter(finding, res)
                 proven = Finding(
@@ -1571,7 +1573,7 @@ class ChainMixin:
                     confirmed_by_leg=validator_name,
                     parameter_location=location, parameter_name=name)
                 await asyncio.to_thread(store.bind_confirmation_proof, exchange, proven,
-                                        validator_name)
+                                        validator_name, **binding)
             except Exception as e:  # bookkeeping never sinks the graph loop
                 log.debug("r5: binding %s proof to stored findings failed on %s: %s",
                           validator_name, exchange.url, e)
@@ -2691,6 +2693,25 @@ class ChainMixin:
                             cf["case_id"] = case_id
                         state.ingest_findings(ex.url, method, [cf])
                         all_findings.append(cf)
+                        # r10: the stored findings (findings API, report) must hear of
+                        # the proof too, as the graph loop's do (_bind_stored). Only a
+                        # confirmed, persisted proof binds; no request is sent here.
+                        if res.status == "confirmed" and res.confirmed and proof_id and case_id:
+                            leg_name = res.validator or check.confirmation
+
+                            def _speaks_for(vulnerability_class, _v=validator, _ex=ex):
+                                return _v.applies(_as_finding(
+                                    {"vulnerability_class": vulnerability_class},
+                                    vulnerability_class), _ex)
+                            proven = dict(cf)
+                            if target is not None:
+                                proven.update(parameter_location=target[0],
+                                              parameter_name=target[1])
+                            await _bind_stored(
+                                proven, res, leg_name, ex, principal_bound=True,
+                                accepts_class=_speaks_for,
+                                proof_note=f"{leg_name} CONFIRMED: " + (res.summary or "")
+                                + (f" ({res.evidence})" if res.evidence else ""))
                     return res
 
                 # E5b: whether each (endpoint, identity) has a request to replay,

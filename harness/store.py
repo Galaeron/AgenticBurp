@@ -968,58 +968,114 @@ def persist_findings(exchange: HttpExchange, agent_name: str, findings: list[Fin
 
 
 def bind_confirmation_proof(exchange: HttpExchange, finding: Finding, agent_name: str, *,
-                            engagement_id: str = "") -> int:
+                            engagement_id: str = "", principal_bound: bool = False,
+                            accepts_class=None, proof_note: str = "") -> int:
     """Bind a persisted confirmation proof to the stored finding(s) it proves.
 
     The engagement graph loop confirms dict findings in engagement state; the
     findings table (findings API, report) never heard of those proofs (r5:
     sqlmap proved SQLi on POST /rest/user/login, the stored login rows stayed
     unconfirmed). This marks confirmed only the UNCONFIRMED rows on the same
-    host, method and url whose class is the proof's own class (the fingerprint's
-    canonical reading) and whose recorded parameter is the proven one, or is
-    unnamed. A row of any other class or another parameter is never touched.
-    When no row matches and none is already confirmed, the proven finding is
-    persisted as its own row. `finding` must carry proof_id and case_id; a
-    finding without them binds nothing. Returns the number of rows bound/added."""
+    host, method and route (`_normalize_endpoint`: query values dropped, names
+    kept, the endpoint the fingerprint keys on) whose class is the proof's own
+    class (the fingerprint's canonical reading) and whose recorded parameter is
+    the proven one, or is unnamed. A row of any other class or another parameter
+    is never touched. When no row matches and none is already confirmed, the
+    proven finding is persisted as its own row. `finding` must carry proof_id and
+    case_id; a finding without them binds nothing. Returns the number of rows
+    bound/added.
+
+    The coverage drive's proofs were not dispatched for any stored row, so it
+    narrows the match (r10: 143 confirmed coverage proofs, AV-EXPOSURE-01 among
+    them, were never bound, so the report showed none of them):
+    - principal_bound: the proof ran as one principal. Only rows recorded under
+      the same captured principal (`captured_principal_id(exchange)`) are bound,
+      and a row the proof creates records that principal.
+    - accepts_class(vulnerability_class) -> bool: whether the proving validator
+      speaks for a row of that class (its own `applies` routing). A broad class
+      (info_disclosure, misconfig) covers unrelated claims; a row the validator
+      would not have been routed stays as it was, and the proof gets its own row.
+      Rows this agent already recorded always count as its own.
+    - proof_note: what the proof showed, appended to each bound row's evidence.
+
+    Review precedence: as before, a bound row's verdict becomes
+    'validator-confirmed'. That is the PASS1 rule (orchestrator_confirm): a
+    deterministic proof outranks a demoting review verdict. The findings table has
+    no review_note column, so a superseded verdict is recorded in the row's
+    evidence with the proof that superseded it, never dropped silently."""
     if not (finding.confirmed and finding.proof_id and finding.case_id):
         return 0
+    from urllib.parse import urlsplit
     from harness.categories import legacy_canonicalize
 
     def _check(cls: str) -> str:
         return legacy_canonicalize(cls) or (cls or "").lower()
 
+    def _accepts(cls: str) -> bool:
+        try:
+            return bool(accepts_class(cls))
+        except Exception:
+            return False
+
     check = _check(finding.vulnerability_class)
     param = finding.parameter_name or ""
     host = host_of(exchange.url)
+    route = _normalize_endpoint(exchange.url)
+    parts = urlsplit(exchange.url or "")
+    base = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    principal = captured_principal_id(exchange) if principal_bound else None
     engagement_id = _engagement_partition(engagement_id)
     conn = _connect()
     try:
         rows = conn.execute(
             """SELECT f.id, f.vulnerability_class, f.confirmed,
-                      COALESCE(fi.parameter_name, ''), f.fingerprint FROM findings f
+                      COALESCE(fi.parameter_name, ''), f.fingerprint, f.url,
+                      COALESCE(f.captured_principal_id, ''), COALESCE(f.review_verdict, ''),
+                      f.agent FROM findings f
                LEFT JOIN finding_inputs fi ON fi.fingerprint = f.fingerprint
                                           AND fi.case_id = f.case_id
-               WHERE f.host = ? AND f.method = ? AND f.url = ?
+               WHERE f.host = ? AND f.method = ?
+                 AND (f.url IN (?, ?) OR substr(f.url, 1, ?) = ?)
                  AND f.engagement_id IN (?, '')""",
-            (host, (exchange.method or "").upper(), exchange.url, engagement_id)).fetchall()
-        same = [r for r in rows if _check(r[1]) == check and r[3] in (param, "")]
-        bind = sorted({r[0] for r in same if not r[2]})
-        if bind:
-            marks = ",".join("?" for _ in bind)
-            conn.execute(
-                f"""UPDATE findings SET confirmed = 1, proof_id = ?, case_id = ?,
-                        review_verdict = 'validator-confirmed',
-                        confidence = MAX(confidence, ?)
-                    WHERE id IN ({marks}) AND confirmed = 0""",
-                (finding.proof_id, finding.case_id, float(finding.confidence or 0.0), *bind))
+            (host, (exchange.method or "").upper(), exchange.url, base, len(base) + 1, base + "?",
+             engagement_id)).fetchall()
+        same = [r for r in rows if _normalize_endpoint(r[5]) == route and _check(r[1]) == check
+                and r[3] in (param, "") and (principal is None or r[6] == principal)]
+        if accepts_class is not None:
+            same = [r for r in same if r[8] == agent_name or _accepts(r[1])]
+        # One row per fingerprint can carry the proof's case (the findings index is
+        # unique on fingerprint + case_id): the oldest unconfirmed row takes it and a
+        # same-identity duplicate stays as it was (it groups into the same issue).
+        bound = []
+        now = time.time()
+        for r in sorted({r[0]: r for r in same if not r[2]}.values()):
+            notes = []
+            if r[7] and r[7] != "validator-confirmed":
+                notes.append(f"prior review verdict '{r[7]}' superseded by "
+                             f"{agent_name} proof {finding.proof_id}")
+            if proof_note:
+                notes.append(proof_note)
+            try:
+                conn.execute(
+                    """UPDATE findings SET confirmed = 1, proof_id = ?, case_id = ?,
+                            review_verdict = 'validator-confirmed',
+                            confidence = MAX(confidence, ?),
+                            evidence = COALESCE(evidence, '') || ?
+                        WHERE id = ? AND confirmed = 0""",
+                    (finding.proof_id, finding.case_id, float(finding.confidence or 0.0),
+                     "".join(" || " + n for n in notes), r[0]))
+            except sqlite3.IntegrityError:
+                continue
+            bound.append(r)
+        if bound:
             # The row's recorded input is keyed by its case; re-key it to the proof's.
             conn.executemany(
                 "INSERT OR IGNORE INTO finding_inputs (fingerprint, case_id, parameter_location, "
                 "parameter_name, created_at) VALUES (?, ?, ?, ?, ?)",
-                sorted({(r[4], finding.case_id, finding.parameter_location or "", param, time.time())
-                        for r in same if r[0] in bind}))
+                sorted({(r[4], finding.case_id, finding.parameter_location or "", param, now)
+                        for r in bound}))
             conn.commit()
-            return len(bind)
+            return len(bound)
         if any(r[2] for r in same):
             return 0
     finally:
