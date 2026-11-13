@@ -34,6 +34,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -106,7 +107,8 @@ class RaceConditionValidator(Validator):
                  burst_size: int = _BURST_SIZE, run_context=None,
                  target_email: str | None = None,
                  mailbox_url: str | None = None,
-                 email_race_rounds: int = 6):
+                 email_race_rounds: int = 6,
+                 clock=None):
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.burst_size = burst_size
@@ -114,6 +116,8 @@ class RaceConditionValidator(Validator):
         self.target_email = target_email
         self.mailbox_url = mailbox_url
         self.email_race_rounds = max(1, min(int(email_race_rounds), 12))
+        # SKL-1: injectable monotonic clock for burst dispatch timing.
+        self._clock = clock or time.perf_counter
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -201,43 +205,67 @@ class RaceConditionValidator(Validator):
             failures = SendFailures()
             label = SendFailures.label(exchange.method, exchange.url)
 
-            async def fire_one():
-                failures.attempted += 1
-                try:
-                    if self.run_context is not None:
-                        from types import SimpleNamespace
-                        from harness.run_context import TypedRequest
-                        from .transport import bind_session
+            def send_failed(e: Exception) -> None:
+                failures.exception(label, e)
+
+            # SKL-1: every copy is fully prepared (session binding, typed
+            # request, client) BEFORE the shared release, so the copies'
+            # sends are separated only by event-loop scheduling, not by
+            # per-copy setup. The overlap is the point: all N requests are
+            # genuinely in flight together. effective_burst_size, not
+            # self.burst_size: the gate may have clamped it down to the
+            # operator's or the hard ceiling.
+            body_bytes = exchange.request_body.encode() if exchange.request_body else None
+            if self.run_context is not None:
+                from types import SimpleNamespace
+                from harness.run_context import TypedRequest
+                from .transport import bind_session
+                executor = self.run_context.executor()
+
+                def prepare_one():
+                    failures.attempted += 1
+                    try:
                         session_ref, request_headers = bind_session(self.run_context, headers)
-                        result = await self.run_context.executor().execute(
-                            TypedRequest(exchange.method, exchange.url,
-                                         headers=request_headers,
-                                         body=exchange.request_body or None),
-                            capability=self.get_name(), session_ref=session_ref)
+                        typed = TypedRequest(exchange.method, exchange.url,
+                                             headers=request_headers,
+                                             body=exchange.request_body or None)
+                    except Exception as e:
+                        failures.exception(label, e)
+                        log.debug(f"Burst request preparation failed: {e}")
+                        return None
+
+                    async def send():
+                        result = await executor.execute(
+                            typed, capability=self.get_name(), session_ref=session_ref)
                         if not result.ok:
                             failures.outcome(label, result)
                             return None
                         return SimpleNamespace(status_code=result.status, text=result.body,
                                                headers=result.headers)
-                    async with httpx.AsyncClient(
-                        timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
-                    ) as client:
-                        return await client.request(
-                            exchange.method, exchange.url,
-                            headers=headers,
-                            content=exchange.request_body.encode() if exchange.request_body else None,
-                        )
-                except Exception as e:
-                    failures.exception(label, e)
-                    log.debug(f"Burst request failed: {e}")
-                    return None
+                    return send
 
-            # The overlap is the point -- gather, not a loop with awaits in
-            # between, so all N requests are genuinely in flight together.
-            # effective_burst_size, not self.burst_size: the gate may have
-            # clamped it down to the operator's or the hard ceiling.
-            responses = await asyncio.gather(*[fire_one() for _ in range(effective_burst_size)])
-            responses = [r for r in responses if r is not None]
+                sends = [prepare_one() for _ in range(effective_burst_size)]
+                raw_responses, dispatch = await self._fire_together(sends, on_error=send_failed)
+            else:
+                # One shared client sized for the whole burst instead of a
+                # fresh client (and connection pool) per copy.
+                limit = max(1, effective_burst_size)
+                async with httpx.AsyncClient(
+                    timeout=self.timeout, follow_redirects=False, max_redirects=self.max_redirects,
+                    limits=httpx.Limits(max_connections=limit, max_keepalive_connections=limit),
+                ) as client:
+                    def prepare_fallback():
+                        failures.attempted += 1
+
+                        async def send():
+                            return await client.request(
+                                exchange.method, exchange.url,
+                                headers=headers, content=body_bytes)
+                        return send
+                    sends = [prepare_fallback() for _ in range(effective_burst_size)]
+                    raw_responses, dispatch = await self._fire_together(sends, on_error=send_failed)
+            responses = [r for r in raw_responses if r is not None]
+            dispatch_note = self._dispatch_note(dispatch)
 
             if len(responses) < 2:
                 if failures.refused or (responses and failures.failures):
@@ -247,7 +275,7 @@ class RaceConditionValidator(Validator):
                     finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
                     summary=f"Only {len(responses)}/{effective_burst_size} burst requests completed -- "
                             "too few to draw a conclusion, target may be rate-limiting the burst itself",
-                    evidence="", raw_output="[]",
+                    evidence=dispatch_note, raw_output="[]",
                 )
 
             original_status = exchange.response_status
@@ -304,10 +332,11 @@ class RaceConditionValidator(Validator):
                     "Read back the operation's effect (e.g. balance, coupon use count, stock) "
                     "after the burst; confirm only if it exceeds the one-time limit."
                     if repeated else ""),
-                evidence=f"Status code distribution across burst: {status_counts}",
+                evidence=f"Status code distribution across burst: {status_counts}; {dispatch_note}",
                 raw_output=str({"burst_size": effective_burst_size, "requested_burst_size": self.burst_size,
                                  "completed": len(responses),
-                                 "clean_successes": clean_successes, "status_counts": status_counts}),
+                                 "clean_successes": clean_successes, "status_counts": status_counts,
+                                 "dispatch": dispatch}),
             )
         except Exception as e:
             log.error(f"Race condition validation error: {e}")
@@ -316,6 +345,80 @@ class RaceConditionValidator(Validator):
                 finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
                 summary=f"Race condition validation failed: {e}", evidence="", raw_output=str(e),
             )
+
+    async def _fire_together(self, sends: list, on_error=None) -> tuple[list, dict]:
+        """Release already-prepared sends together and time each one (SKL-1).
+
+        ``sends`` holds zero-argument coroutine functions (or None for a copy
+        whose preparation failed, which yields None without sending). Every
+        task parks on one shared Event; the event is set only after all of
+        them are parked, so no send starts before every copy is prepared and
+        waiting. A send that raises yields None and is passed to ``on_error``
+        (the caller's send-failure accounting). Times are ms relative to the
+        release; ``send_start`` is the moment the copy enters its send call,
+        ``complete`` when that call returns.
+        """
+        clock = getattr(self, "_clock", None) or time.perf_counter
+        n = len(sends)
+        release = asyncio.Event()
+        all_parked = asyncio.Event()
+        parked = 0
+        starts: list[float | None] = [None] * n
+        completes: list[float | None] = [None] * n
+
+        async def run(i, send):
+            nonlocal parked
+            parked += 1
+            if parked == n:
+                all_parked.set()
+            await release.wait()
+            if send is None:
+                return None
+            starts[i] = clock()
+            try:
+                return await send()
+            except Exception as e:
+                if on_error is not None:
+                    on_error(e)
+                log.debug(f"Burst request failed: {e}")
+                return None
+            finally:
+                completes[i] = clock()
+
+        tasks = [asyncio.ensure_future(run(i, s)) for i, s in enumerate(sends)]
+        try:
+            if n:
+                await all_parked.wait()
+            released_at = clock()
+            release.set()
+            results = list(await asyncio.gather(*tasks))
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+        def rel(v):
+            return None if v is None else round((v - released_at) * 1000.0, 3)
+
+        sent = [s for s in starts if s is not None]
+        spread = round((max(sent) - min(sent)) * 1000.0, 3) if sent else None
+        dispatch = {
+            "copies": n, "sent": len(sent), "spread_ms": spread,
+            "send_start_ms": [rel(v) for v in starts],
+            "complete_ms": [rel(v) for v in completes],
+        }
+        return results, dispatch
+
+    @staticmethod
+    def _dispatch_note(dispatch: dict) -> str:
+        spread = dispatch.get("spread_ms")
+        if spread is None:
+            return f"dispatch: 0/{dispatch.get('copies', 0)} copies sent"
+        done = [v for v in dispatch.get("complete_ms", []) if v is not None]
+        last = max(done) if done else None
+        return (f"dispatch spread {spread:.3f} ms across {dispatch['sent']}/{dispatch['copies']} "
+                f"sends released together after preparation (send start = transport call "
+                f"entry; last response at {last} ms after release)")
 
     def _is_email_race(self, exchange: HttpExchange) -> bool:
         if not (self.target_email and self.mailbox_url and self.run_context):
@@ -369,6 +472,11 @@ class RaceConditionValidator(Validator):
         account_url = urljoin(exchange.url, "/my-account")
         seen_links: set[str] = set()
         sent_pairs = 0
+        pair_spreads: list[float | None] = []
+
+        def spread_note() -> str:
+            known = [s for s in pair_spreads if s is not None]
+            return (f" Max pair dispatch spread {max(known):.3f} ms." if known else "")
 
         current_pairs = list(pairs)
 
@@ -390,11 +498,15 @@ class RaceConditionValidator(Validator):
             failures.outcome(label, result)
             return result
 
-        async def send_change(email_value: str):
-            return await execute(
-                TypedRequest(exchange.method, exchange.url,
-                             headers=request_headers, body=body_for(email_value)),
-                capability=self.get_name(), session_ref=session_ref)
+        def prepare_change(email_value: str):
+            # SKL-1: build the typed request before the shared release.
+            typed = TypedRequest(exchange.method, exchange.url,
+                                 headers=request_headers, body=body_for(email_value))
+
+            async def send():
+                return await execute(
+                    typed, capability=self.get_name(), session_ref=session_ref)
+            return send
 
         async def fetch(url: str, *, bound: bool = False):
             return await execute(
@@ -422,11 +534,11 @@ class RaceConditionValidator(Validator):
                     fresh_pairs = parse_qsl(form.body(), keep_blank_values=True)
                     if any(k.lower() == "email" for k, _ in fresh_pairs):
                         current_pairs = fresh_pairs
-            responses = await asyncio.gather(
-                send_change(self.target_email), send_change(controlled),
-                return_exceptions=True)
+            responses, dispatch = await self._fire_together(
+                [prepare_change(self.target_email), prepare_change(controlled)])
+            pair_spreads.append(dispatch["spread_ms"])
             sent_pairs += 1
-            if not any(not isinstance(r, Exception) and getattr(r, "ok", False)
+            if not any(r is not None and getattr(r, "ok", False)
                        for r in responses):
                 continue
 
@@ -471,9 +583,11 @@ class RaceConditionValidator(Validator):
                                  "a link delivered to the controlled mailbox changed the "
                                  "authenticated account to the independently declared target address."),
                         evidence=(f"Independent account readback contained target address after "
-                                  f"{sent_pairs} bounded request pair(s); mailbox/token values redacted."),
+                                  f"{sent_pairs} bounded request pair(s); mailbox/token values redacted."
+                                  + spread_note()),
                         raw_output=str({"pairs": sent_pairs, "readback": True,
-                                        "controlled_mailbox": "[REDACTED]"}))
+                                        "controlled_mailbox": "[REDACTED]",
+                                        "pair_spread_ms": pair_spreads}))
 
         if failures.failures:
             return failures.result(self.get_name(), finding.vulnerability_class, "Email race")
@@ -483,5 +597,7 @@ class RaceConditionValidator(Validator):
             confirmed=False,
             summary=("Bounded concurrent email changes did not produce a controlled-mailbox "
                      "confirmation whose account readback contained the target address."),
-            evidence=f"Tried {sent_pairs} request pair(s); no target-address readback.",
-            raw_output=str({"pairs": sent_pairs, "readback": False}))
+            evidence=(f"Tried {sent_pairs} request pair(s); no target-address readback."
+                      + spread_note()),
+            raw_output=str({"pairs": sent_pairs, "readback": False,
+                            "pair_spread_ms": pair_spreads}))
