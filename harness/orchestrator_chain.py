@@ -1460,6 +1460,18 @@ class ChainMixin:
         _deser = DeserializationOobValidator(allowed_hosts=self.allowed_hosts)
         _auth = AuthSequenceValidator(allowed_hosts=self.allowed_hosts)
         _ct = ClientTrustValidator(allowed_hosts=self.allowed_hosts)
+        # Write integrity: creates (or updates) that are read back and undone. Its
+        # restore routes are the operator's declarations plus every route this
+        # engagement observed; nothing is written for a create with no DELETE route.
+        from harness.validators.write_integrity_validator import (
+            WriteIntegrityValidator, chain_routes as _wi_routes)
+        _wi_cfg = ((self.config.get("validators", {}) or {}).get("write_integrity", {}) or {})
+        _wi = WriteIntegrityValidator(allowed_hosts=self.allowed_hosts, run_context=run_context,
+                                      restore_routes=_wi_cfg.get("restore_routes") or (),
+                                      route_inventory=lambda: list(state.endpoints),
+                                      allow_writes=parse_validators_flags(
+                                          self.config.get("validators", {}) or {})["allow_mutating_replay"])
+        _wi.ownership = ownership
         _sxss = StoredXssValidator(allowed_hosts=self.allowed_hosts, run_context=run_context)
         _rate = RateLimitValidator(allowed_hosts=self.allowed_hosts,
                                    run_context=run_context)
@@ -1751,6 +1763,15 @@ class ChainMixin:
                             if _hint and _hint not in _previous:
                                 finding["suggested_test"] = (
                                     f"{_hint}\n\n{_previous}" if _previous else _hint)
+                except Exception:
+                    return
+            elif _wi_routes(vc, exchange) and (self.config.get("validators", {}) or {}).get(
+                    "write_integrity", {}).get("enabled", True) is not False:
+                # Before access control: "cross_identity_write" and friends are
+                # creates this leg reads back and deletes, not object reads.
+                try:
+                    await _apply(finding, await _cached_validate(_wi, _as_finding(finding, "write_integrity"), exchange),
+                           "write-integrity", 0.9, exchange)
                 except Exception:
                     return
             elif (access_control_gate._is_access_control_class(vc)
@@ -2552,7 +2573,7 @@ class ChainMixin:
                     "command_injection": _cmdi, "ssti": _ssti, "path_traversal": _path,
                     "open_redirect": _redir, "sequence": _seq, "deserialization_oob": _deser,
                     "auth_sequence": _auth, "rate_limit": _rate, "reset_token": _reset,
-                    "dom_xss": _domxss, "toctou": _toctou,
+                    "dom_xss": _domxss, "toctou": _toctou, "write_integrity": _wi,
                     "verb_tamper": VerbTamperValidator(allowed_hosts=self.allowed_hosts,
                                                          run_context=run_context),
                     "csrf": CsrfValidator(allowed_hosts=self.allowed_hosts,

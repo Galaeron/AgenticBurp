@@ -479,6 +479,13 @@ def _accepts_body(endpoint: dict) -> tuple[bool, str]:
     return False, "endpoint does not accept request bodies"
 
 
+def _accepts_create(endpoint: dict) -> tuple[bool, str]:
+    methods = endpoint.get("methods", ())
+    if "POST" in methods:
+        return True, "endpoint accepts POST (a create)"
+    return False, "endpoint accepts no POST create"
+
+
 # Predicate type: endpoint dict → (applicable: bool, reason: str)
 ApplicabilityPredicate = Callable[[dict], tuple[bool, str]]
 
@@ -753,6 +760,59 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "Concurrent copies of an authority-changing write race a check-then-write "
           "window; confirm a privilege field flipped under concurrency via re-read",
           "Race conditions"),
+    # Write-path checks (write_integrity): each create is answered by a plain-create
+    # control, read back by every registered identity, and DELETEd again before the
+    # verdict; a path with no restore route is skipped, never written.
+    Check("AV-WRITE-XID-01", "Cross-identity write (another principal's object referenced)",
+          Phase.ENDPOINT, "cross_identity_write", _accepts_body, "write_integrity",
+          "A write must not attach to, or create under, an object another principal owns; "
+          "swap the owner reference for the second identity's id and read the result back.",
+          "Access control vulnerabilities",
+          external_refs=(
+              ExternalRef("OWASP API Security Top 10 2023", "API1:2023",
+                          "https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/",
+                          "Broken Object Level Authorization"),
+          )),
+    Check("AV-WRITE-AUTHOR-01", "Forged authorship (author/owner field set by the client)",
+          Phase.ENDPOINT, "forged_authorship", _accepts_body, "write_integrity",
+          "The server must derive an author or owner field from the session; send another "
+          "identity's value and verify the stored object keeps the caller's own.",
+          "Access control vulnerabilities",
+          external_refs=(
+              ExternalRef("OWASP API Security Top 10 2023", "API3:2023",
+                          "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/",
+                          "Broken Object Property Level Authorization"),
+          )),
+    Check("AV-WRITE-BIZ-01", "Business-rule tampering (quantity, rating or amount bounds)",
+          Phase.ENDPOINT, "business_rule_tamper", _accepts_body, "write_integrity",
+          "A write must reject a negative or out-of-range quantity, rating or amount; send the "
+          "in-range control and the tampered value, read both back, and restore the original.",
+          "Business logic vulnerabilities",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-BUSL-01",
+                          "https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/01-Test_Business_Logic_Data_Validation",
+                          "Test Business Logic Data Validation", version="4.2"),
+          )),
+    Check("AV-MASSASSIGN-02", "Mass assignment at create (privileged field on a new object)",
+          Phase.ENDPOINT, "mass_assignment_create", _accepts_create, "write_integrity",
+          "A create must not let a client set server-controlled fields; create once plainly and "
+          "once with role/admin fields, read both back, and delete both.",
+          "Mass assignment",
+          external_refs=(
+              ExternalRef("OWASP API Security Top 10 2023", "API3:2023",
+                          "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/",
+                          "Broken Object Property Level Authorization (subsumes mass assignment)"),
+          )),
+    Check("AV-WRITE-VALID-01", "Weak create validation (empty required fields, duplicates)",
+          Phase.ENDPOINT, "create_validation", _accepts_create, "write_integrity",
+          "A create must reject empty required fields and a duplicate of a unique field; "
+          "send each, read the stored objects back, and delete them.",
+          "Business logic vulnerabilities",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-BUSL-01",
+                          "https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/01-Test_Business_Logic_Data_Validation",
+                          "Test Business Logic Data Validation", version="4.2"),
+          )),
 )
 
 CHECKS_BY_ID: dict[str, Check] = {c.id: c for c in CHECK_CATALOG}

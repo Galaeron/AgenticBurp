@@ -884,6 +884,16 @@ validators:
     enabled: true
     timeout: 10.0
     burst_size: 12
+  # Write-path checks (write_integrity): cross-identity writes, forged authorship,
+  # quantity/rating/amount tampering, mass assignment at create, weak create
+  # validation. Inert unless allow_mutating_replay is on. Each create is preceded
+  # by a plain-create control that must be DELETEd and verified gone first, so a
+  # create runs only when its DELETE route is known: observed in the engagement,
+  # or listed here ("DELETE /api/things/{id}"). Needs a per-case write ceiling,
+  # mutating_ceiling_by_check: {write_integrity: 8} (4 for one create + attack).
+  write_integrity:
+    enabled: true
+    restore_routes: []
 
 # Autonomous scope-discovery MVP (harness/scope_discovery.py). Off by
 # default -- the harness has never, until this option exists, decided on
