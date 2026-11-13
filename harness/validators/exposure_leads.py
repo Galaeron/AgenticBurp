@@ -24,6 +24,12 @@ what such a capture points at and keep the exchanges as proof artifacts.
   OpenMetrics text). A credential-free GET must return the exposition. A
   credential-free GET of a sibling path that does not exist must not. It records what
   the exposition reveals: family names, prefixes, label keys and build-info versions.
+- SensitiveFileValidator: the capture is one file, not a listing, and the listing
+  classifier calls it sensitive (an information_disclosure lead on a confidential
+  document, say). A credential-free GET must still return a sensitive file. A
+  credential-free GET of a nonexistent sibling with the same extension must not
+  return the same body. If it does, the route is a catch-all and the verdict is
+  inconclusive.
 - WellKnownValidator: once per origin, fetches /.well-known/security.txt
   (RFC 9116) and /.well-known/csaf/provider-metadata.json. It reports what is
   published as an observation (severity info), never as a vulnerability.
@@ -273,12 +279,36 @@ _PRIVATE_KEY = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|-----BEG
 _CREDENTIAL = re.compile(
     r"""(?im)^[\s"']*(?:export\s+)?[\w.\-]*(?:password|passwd|pwd|secret|api[_-]?key|apikey|"""
     r"""access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|"""
-    r"""connection[_-]?string|db[_-]?pass)[\w.\-]*["']?\s*[:=]\s*["']?[^\s"'<>,;]{4,}""")
+    r"""connection[_-]?string|db[_-]?pass)[\w.\-]*["']?\s*[:=]\s*"""
+    r"""(?:"(?P<dq>[^"\r\n]*)"|'(?P<sq>[^'\r\n]*)'|(?P<bare>[^\s"'<>,;]+))""")
+# A value that names the field (a UI label such as "Repeat Password"), a reference
+# to elsewhere, or a placeholder is not a secret.
+_LABEL_WORDS = re.compile(r"(?i)pass|pwd|secret|key|token|auth|credential|login")
+_PLACEHOLDER = re.compile(
+    r"(?i)^(?:true|false|null|none|nil|undefined|changeme|change_me|example|sample|redacted|"
+    r"required|optional|string|\*+|x+|\.+|<[^>]*>|\$\{[^}]*\}|\{\{.*\}\}|%[^%]*%|\$[A-Za-z_]\w*|"
+    r"(?:process\.env|os\.environ|env)\b.*)$")
 _CONFIDENTIAL = re.compile(
     r"(?i)\b(?:confidential|internal use only|for internal use|do not (?:distribute|share)|"
     r"proprietary and confidential|strictly private|restricted distribution|not for distribution)\b")
 _SQL_CONTENT = re.compile(r"(?i)\b(?:CREATE TABLE|INSERT INTO)\b")
 _MANIFEST_CONTENT = re.compile(r'"(?:dependencies|devDependencies|require|packages|lockfileVersion)"\s*:')
+
+
+_MARKED_DOCUMENT_SUFFIXES = tuple(s for s in _DOCUMENT_SUFFIXES if s not in (".html", ".htm"))
+
+
+def _assigns_credential(body: str) -> bool:
+    """A line that assigns a password, secret, key or token a literal value. The
+    value must have no spaces, not name the field, and not be a placeholder."""
+    for match in _CREDENTIAL.finditer(body):
+        value = next(v for v in (match["dq"], match["sq"], match["bare"]) if v is not None).strip()
+        if len(value) < 4 or any(c.isspace() for c in value):
+            continue
+        if _LABEL_WORDS.search(value) or _PLACEHOLDER.match(value):
+            continue
+        return True
+    return False
 
 
 def _base_of_backup(name: str) -> str | None:
@@ -308,12 +338,13 @@ def _classify_by_name_and_body(name: str, body: str) -> Sensitivity | None:
     if low.endswith(_DB_SUFFIXES) and (_SQL_CONTENT.search(body) or body.startswith("SQLite format 3")
                                         or low.endswith((".sqlite", ".sqlite3", ".db", ".mdb", ".bson"))):
         return Sensitivity("database_or_dump", "high", "a database file or SQL dump")
-    if _CREDENTIAL.search(body):
+    if _assigns_credential(body):
         return Sensitivity("credentials", "high", "body assigns a password, secret, key or token value")
     if low in _MANIFEST_NAMES or (low.endswith(".json") and _MANIFEST_CONTENT.search(body)):
         return Sensitivity("package_manifest", "low",
                            "a package manifest or lock file (dependency names and versions)")
-    if _CONFIDENTIAL.search(body[:20000]):
+    # Only a document is "marked confidential"; the word in a JSON or script string is not.
+    if low.endswith(_MARKED_DOCUMENT_SUFFIXES) and _CONFIDENTIAL.search(body[:20000]):
         return Sensitivity("confidential_document", "medium",
                            "the document is marked confidential / internal / not for distribution")
     if low.endswith(_CONFIG_SUFFIXES) and not low.endswith((".json", ".xml")):
@@ -855,6 +886,107 @@ class MetricsExposureValidator(_GetLeg):
                 f"nonexistent sibling control {sibling} answered HTTP {control.status} with no exposition",
                 "sample values not recorded"]),
         ).with_artifacts(baseline=baseline, attack=attack, controls=[control])
+
+
+# --------------------------------------------------------------------------- #
+# A sensitive file captured on its own (not through a listing)
+# --------------------------------------------------------------------------- #
+
+def direct_file_sensitivity(exchange) -> tuple[str, Sensitivity] | None:
+    """(file name, why it is sensitive) when the capture is a 2xx GET of one file.
+    The last path segment must name a file, and the capture must not be a listing.
+    Otherwise None."""
+    if exchange is None or not _is_get(exchange):
+        return None
+    path = urlsplit(exchange.url).path or "/"
+    if path.endswith("/"):
+        return None
+    leaf = unquote(path.rsplit("/", 1)[-1])
+    low = leaf.lower()
+    if not leaf or not (_HAS_EXTENSION.search(leaf) or low in _KEY_NAMES or low in _MANIFEST_NAMES):
+        return None
+    if parse_listing(exchange):
+        return None
+    found = classify_listed_file(leaf, exchange.response_status, exchange.response_headers,
+                                 exchange.response_body or "")
+    return (leaf, found) if found else None
+
+
+def _sensitive_file_class_matches(finding) -> bool:
+    raw, canonical = _class_tokens(finding)
+    tokens = ("exposure", "exposed", "disclosure", "sensitive", "backup", "confidential", "leak",
+              "file", "credential", "secret", "config", "dump", "manifest", "discovery")
+    return any(t in raw for t in tokens) or canonical in {"info_disclosure", "misconfig", "recon"}
+
+
+class SensitiveFileValidator(_GetLeg):
+    """A sensitive file, captured on its own, that is served without credentials."""
+
+    name = "sensitive_file_validator"
+    capability = "sensitive_file"
+    finding_classes = {"sensitive_file_exposure", "backup_file_exposure", "exposed_backup_file",
+                       "exposed_file", "confidential_document_exposure", "credential_exposure",
+                       "config_file_exposure", "exposed_configuration", "information_disclosure",
+                       "info_disclosure"}
+
+    def applies(self, finding, exchange) -> bool:
+        return direct_file_sensitivity(exchange) is not None and (
+            super().applies(finding, exchange) or _sensitive_file_class_matches(finding))
+
+    async def validate(self, finding, exchange) -> ValidationResult:
+        early = self._precheck(finding, exchange)
+        if early is not None:
+            return early
+        found = direct_file_sensitivity(exchange)
+        if found is None:
+            return self._result(finding, "skipped",
+                                "not_a_sensitive_file: the capture is not a 2xx GET of a sensitive file")
+        name, _captured = found
+        session_ref, headers = self._captured_identity(exchange)
+        baseline = await self._get(finding, exchange.url, headers, session_ref)
+        if not baseline.executed:
+            return self._result(finding, "skipped", f"file replay declined: {self._refusal(baseline)}")
+        anonymous = _without_credentials(headers)
+        attack = await self._get(finding, exchange.url, anonymous, None)
+        parts = urlsplit(exchange.url)
+        directory = parts.path.rsplit("/", 1)[0] + "/"
+        sibling = urlunsplit((parts.scheme, parts.netloc,
+                              directory + _absent_name(exchange.url, _extension(name)), "", ""))
+        control = await self._get(finding, sibling, anonymous, None)
+        if not (baseline.ok and attack.ok and control.ok):
+            refused = next(o for o in (baseline, attack, control) if not o.ok)
+            return self._result(finding, "inconclusive",
+                                f"file check incomplete: {self._refusal(refused)}; not a negative result")
+        artifacts = dict(baseline=baseline, attack=attack, controls=[control])
+        served = classify_listed_file(name, attack.status, attack.headers, attack.body or "")
+        if served is None:
+            authed = classify_listed_file(name, baseline.status, baseline.headers, baseline.body or "")
+            why = ("it is served only with the captured credential" if authed and session_ref
+                   else "it is no longer served as a sensitive file")
+            return self._result(
+                finding, "not_confirmed",
+                f"Without credentials {exchange.url} answered HTTP {attack.status}: {why}",
+                confidence=0.9).with_artifacts(**artifacts)
+        if _is_2xx(control.status) and (control.body or "") and (
+                control.body == attack.body
+                or classify_listed_file(name, control.status, control.headers, control.body or "")):
+            return self._result(
+                finding, "inconclusive",
+                f"a nonexistent sibling {sibling} is served the same way (HTTP {control.status}); the "
+                f"file cannot be told apart from a catch-all; not a negative result",
+            ).with_artifacts(**artifacts)
+        size = len((attack.body or "").encode("utf-8", errors="replace"))
+        return self._result(
+            finding, "confirmed",
+            f"Sensitive file {exchange.url} is served without authentication: {served.label} "
+            f"({served.reason})",
+            confirmed=True, severity=served.severity,
+            evidence="; ".join([
+                f"{name}: {served.label} ({served.severity}) -- {served.reason}",
+                f"credential-free GET HTTP {attack.status}, {size} bytes, sha256 {_sha(attack.body or '')}",
+                f"nonexistent sibling control answered HTTP {control.status}",
+                "file values redacted"]),
+        ).with_artifacts(**artifacts)
 
 
 # Once per (run, origin): the origin's .well-known result.

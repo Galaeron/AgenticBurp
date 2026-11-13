@@ -56,7 +56,7 @@ _OTHER_LEGS = ("sqlmap", "browser_xss", "stored_xss", "dom_xss", "command_inject
                "sequence", "auth_sequence", "verb_tamper", "csrf", "file_upload", "rate_limit",
                "reset_token", "toctou", "race_condition", "csp", "cors", "header_injection",
                "http_request_smuggling", "listing_exposure", "filter_bypass", "metrics_exposure",
-               "well_known")
+               "sensitive_file", "well_known")
 
 
 class _Handler(BaseHTTPRequestHandler):

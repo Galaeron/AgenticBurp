@@ -708,6 +708,18 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("CWE", "CWE-306", "https://cwe.mitre.org/data/definitions/306.html",
                           "Missing Authentication for Critical Function"),
           )),
+    Check("AV-EXPOSURE-04", "Sensitive file served without authentication", Phase.ENDPOINT,
+          "info_disclosure", _always_applicable, "sensitive_file",
+          "When a captured 2xx GET is a single file whose name and content classify as "
+          "sensitive (backup, key, credentials, dump, confidential document, manifest), GET "
+          "it without credentials (must still classify) and GET a nonexistent sibling with "
+          "the same extension (must not serve it); file values are never recorded",
+          external_refs=(
+              ExternalRef("CWE", "CWE-538", "https://cwe.mitre.org/data/definitions/538.html",
+                          "Insertion of Sensitive Information into Externally-Accessible File or Directory"),
+              ExternalRef("CWE", "CWE-530", "https://cwe.mitre.org/data/definitions/530.html",
+                          "Exposure of Backup File to an Unauthorized Control Sphere"),
+          )),
     Check("AV-WELLKNOWN-01", "security.txt and CSAF provider metadata", Phase.DOMAIN,
           "recon", _always_applicable, "well_known",
           "Once per origin, GET /.well-known/security.txt (RFC 9116) and "
