@@ -12,7 +12,9 @@ fragment route (`/#/r?p=`, location "route") and a parameter of the page's own q
 - `mapped_routes`: the captured request is an API call that a crawled view was seen
   issuing (ClientRouteMap.routes_for_api), so the view's route parameter is tried.
   An API call answers JSON, and no page script runs on JSON, so the page that issued
-  the call is the place where the payload can run.
+  the call is the place where the payload can run. The map is the run's; a
+  validator run without one (no run context, or a run that built none) reads the
+  one the host's stored engagement snapshot carries (`stored_routes`).
 - `own_query`: the captured URL is an HTML page, so a page script may read each
   of its own query parameters from location.search (dom_xss).
 
@@ -23,6 +25,7 @@ the run's scope, gate and budget.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlsplit
 
@@ -127,10 +130,47 @@ def renders_script(exchange) -> bool | None:
     return any(t in ctype for t in _SCRIPTED_TYPES)
 
 
+# stored_routes: (database path, host) -> (read at, ClientRouteMap or None), for
+# this many seconds, so a batch of standalone validations reads the snapshot once.
+_STORED_TTL_S = 30.0
+_STORED: dict[tuple[str, str], tuple[float, object]] = {}
+
+
+def stored_routes(url: str):
+    """The client route map of the stored engagement snapshot for `url`'s host
+    (store.load_engagement, the bound engagement partition), or None when there is
+    none. It is what an engagement run on the host discovered (persist_surface
+    keeps it); a run with a map of its own uses that instead (mapped_routes)."""
+    host = urlsplit(url or "").netloc
+    if not host:
+        return None
+    from harness import store
+    key = (str(getattr(store, "_DB_PATH", "")), host)
+    now = time.monotonic()
+    hit = _STORED.get(key)
+    if hit is not None and now - hit[0] < _STORED_TTL_S:
+        return hit[1]
+    routes = None
+    try:
+        data = (store.load_engagement(host) or {}).get("client_routes")
+        if data:
+            from harness.client_routes import ClientRouteMap
+            routes = ClientRouteMap.from_dict(data)
+    except Exception:
+        routes = None
+    if len(_STORED) > 64:
+        _STORED.clear()
+    _STORED[key] = (now, routes)
+    return routes
+
+
 def mapped_routes(exchange, payloads: list[str], run_context) -> list[list[Candidate]]:
     """One group per (route, route parameter) a crawled view showed issuing this
-    request."""
+    request: from the run's route map, or, for a validator run without one (no run
+    context, or a run that built none), from the host's stored engagement snapshot."""
     routes = getattr(run_context, "client_routes", None) if run_context is not None else None
+    if routes is None:
+        routes = stored_routes(getattr(exchange, "url", "") or "")
     if routes is None:
         return []
     try:
