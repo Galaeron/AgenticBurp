@@ -61,6 +61,7 @@ CLIENT_ROUTE_LEGS = frozenset({"browser_xss", "dom_xss"})
 MAX_ROUTES = 200
 MAX_PARAMS = 8
 MAX_API_LINKS = 400
+MAX_API_VIEWS = 200
 MAX_READ_NAMES = 64
 MAX_PENDING_CALLS = 2000
 
@@ -519,6 +520,10 @@ class ClientRouteMap:
         self.hash_hint = False
         # "METHOD path" -> [{"route": dedup key as list, "route_param", "api_param"}]
         self.api_links: dict[str, list[dict]] = {}
+        # "GET path" -> [[kind, document, route]]: the views a crawl saw read that
+        # API, the route only (never a value). A value the API returns may be
+        # rendered by any of them (views_for_api; stored_xss loads them).
+        self.api_views: dict[str, list[list[str]]] = {}
         # In memory only, never persisted: (view url, method, api url, body).
         self._pending: list[tuple[str, str, str, str]] = []
         # Query-bearing path literals from bundles, kept until the router config
@@ -725,6 +730,9 @@ class ClientRouteMap:
         for key, links in other.api_links.items():
             for link in links:
                 self._link(key, link)
+        for key, views in other.api_views.items():
+            for kind, document, route in views:
+                self._view_link(key, ClientRoute(kind, document, route))
         self._pending.extend(other._pending[:max(0, MAX_PENDING_CALLS - len(self._pending))])
         for literal in other._literals:
             if len(self._literals) < MAX_ROUTES and literal not in self._literals:
@@ -805,6 +813,10 @@ class ClientRouteMap:
                           if _ok_name(k)]
             api_params += _body_params(body)
             api_key = f"{method} {normalize_path(api_url)}"
+            if (method == "GET" and api_parts.netloc in ("", parts.netloc)
+                    and not _excluded(clean)):
+                # The view read this API: what the API returns, the view may render.
+                self._view_link(api_key, route)
             for api_name, api_value in api_params:
                 route_param = next((k for k, v in values.items() if v == api_value), None)
                 if (route_param is None and api_name in self.read_names
@@ -837,6 +849,25 @@ class ClientRouteMap:
                 out.append((route, link.get("route_param", ""), link.get("api_param", "")))
         return out
 
+    def _view_link(self, api_key: str, route: ClientRoute) -> None:
+        view = [route.kind, route.document, route.route]
+        views = self.api_views.get(api_key) or []
+        if view in views or sum(len(v) for v in self.api_views.values()) >= MAX_API_VIEWS:
+            return
+        self.api_views[api_key] = views + [view]
+
+    def views_for_api(self, method: str, url: str) -> list[str]:
+        """The page URLs, on `url`'s origin with no parameter set, of the views a
+        crawl saw read this API path (object ids collapsed), in the order seen."""
+        from harness.engagement import normalize_path
+        out: list[str] = []
+        for kind, document, route in self.api_views.get(
+                f"{(method or 'GET').upper()} {normalize_path(url)}") or []:
+            view = ClientRoute(kind, document, route).seed_url(url)
+            if view not in out:
+                out.append(view)
+        return out
+
     # --- persistence (names only, never values) ---
 
     def to_dict(self) -> dict:
@@ -846,6 +877,7 @@ class ClientRouteMap:
                 "read_names": list(self.read_names),
                 "hash_hint": self.hash_hint,
                 "api_links": {k: list(v) for k, v in self.api_links.items()},
+                "api_views": {k: [list(v) for v in vs] for k, vs in self.api_views.items()},
                 "literals": [[p, list(n)] for p, n in self._literals],
                 "origin": list(self.origin) if self.origin else None}
 
@@ -865,6 +897,8 @@ class ClientRouteMap:
         m.read_names = list(d.get("read_names") or [])
         m.hash_hint = bool(d.get("hash_hint"))
         m.api_links = {k: list(v) for k, v in (d.get("api_links") or {}).items()}
+        m.api_views = {k: [list(v) for v in vs if isinstance(v, (list, tuple)) and len(v) == 3]
+                       for k, vs in (d.get("api_views") or {}).items()}
         m._literals = [(p, list(n)) for p, n in (d.get("literals") or [])][:MAX_ROUTES]
         return m
 

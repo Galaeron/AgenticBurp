@@ -26,7 +26,16 @@ data-flow confirmation (#5): the value provably crosses requests.
                 a CSP) stores it without running it, and with no browser there is
                 no execution proof. A JSON API that stores-and-returns the string
                 escaped, or in a non-HTML content type, is NOT a candidate -- the
-                same precision line browser_xss draws (no HTML sink, no confirm).
+                same precision line browser_xss draws (no HTML sink, no confirm)
+                -- unless a client view renders it:
+  4. VIEWS   -- a JSON render that holds the payload in one of its strings
+                (however the serializer escaped it) runs no script, but a page
+                script that fetches it may render it. The client views a crawl
+                saw read that API (client_routes.views_for_api: the run's route
+                map, or the host's stored engagement snapshot) are loaded in the
+                browser as the captured identity, and only the same computed
+                value confirms. A view that raised a dialog or a page error, or
+                no browser to load one, leaves a candidate, never a negative.
 
 Scope-gated; the plant is a mutating write, so it self-gates on
 validators.allow_mutating_replay and routes through the safety gate.
@@ -92,6 +101,51 @@ def _unmatched_signal(obs) -> tuple[str, str]:
 # candidate note that asks for a manual check (RV-O O8).
 _DIALOG_ONLY = "Execution was shown by a dialog only, not by the console."
 _CHECK_MANUALLY = "check manually"
+
+# Client views loaded after a JSON render held the payload: at most this many per
+# payload, each given this long to fetch the API and render it.
+_MAX_VIEWS = 3
+_VIEW_WAIT_MS = 2500
+
+
+def _in_json(text: str, payload: str) -> bool:
+    """Whether a JSON body holds `payload` intact in one of its strings, however
+    the serializer escaped it (`\\u003c`, `\\/`)."""
+    try:
+        doc = json.loads(text or "")
+    except (ValueError, TypeError):
+        return False
+    stack, seen = [doc], 0
+    while stack and seen < 50_000:
+        node = stack.pop()
+        seen += 1
+        if isinstance(node, str):
+            if payload in node:
+                return True
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
+def _identity_headers(headers: dict | None) -> dict:
+    """The headers of a captured API call that carry its identity (Authorization,
+    Cookie, X-* tokens), for loading a page as the same user. Accept, Origin and
+    the like describe the API call, not the page the browser loads."""
+    keep = {}
+    for k, v in (headers or {}).items():
+        low = (k or "").lower()
+        if low in ("authorization", "cookie", "proxy-authorization") or (
+                low.startswith("x-") and low != "x-requested-with"
+                and not low.startswith("x-forwarded")):
+            keep[k] = v
+    return keep
+
+
+def _view_label(view: str) -> str:
+    parts = urlsplit(view)
+    return (parts.path or "/") + (f"#{parts.fragment}" if parts.fragment else "")
 
 
 def _keep(candidate, payload: str, rurl: str, note: str):
@@ -388,6 +442,10 @@ class StoredXssValidator(Validator):
         a, b, expected = _challenge()
         candidate = None
         read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+        # (view, note) for each client view loaded after a JSON render held the
+        # payload; no_browser is the note of a view no browser could load.
+        viewed: list[tuple[str, str]] = []
+        no_browser = ""
         for payload in _payloads(a, b):
             body, ctype = self._plant_body(exchange, payload)
             planted_headers = dict(headers); planted_headers["Content-Type"] = ctype
@@ -398,6 +456,7 @@ class StoredXssValidator(Validator):
                                            f"plant {method} {write_path}",
                                            headers=planted_headers, content=body) is None:
                         continue  # this payload never landed; try the next shape
+                    json_renders: list[str] = []
                     for rurl in render_urls:
                         r = await self._request(client, "GET", rurl, attempts,
                                                 f"render GET {urlsplit(rurl).path}",
@@ -405,6 +464,8 @@ class StoredXssValidator(Validator):
                         if r is None:
                             continue
                         ct = (r.headers.get("content-type") or "").lower()
+                        if "html" not in ct and _in_json(r.text or "", payload):
+                            json_renders.append(rurl)
                         if "html" in ct and payload in (r.text or ""):
                             # R19: an unescaped string is not execution (an inert
                             # <textarea>, a comment, a CSP). Only the payload's
@@ -417,17 +478,97 @@ class StoredXssValidator(Validator):
                             if executed is None:
                                 return self._unproven(method, write_path, *candidate)
                             break  # inert here; try the next payload shape
+                    if json_renders and not no_browser:
+                        executed, view, rurl, note = await self._confirm_in_views(
+                            json_renders, expected, read_headers, viewed)
+                        if executed:
+                            return self._executed_in_view(method, write_path, payload, rurl,
+                                                          view, note)
+                        if executed is None and view:
+                            no_browser = note
             except SafetyGateBlocked:
                 break  # recorded by _request; the gate or run refuses every further send
         if candidate:
             return self._unproven(method, write_path, *candidate)
         if any(kind != "ok" for kind, _ in attempts):
             return self._incomplete(attempts, method, write_path)
+        flagged = next(((v, n) for v, n in viewed if _CHECK_MANUALLY in n), None)
+        if no_browser or flagged:
+            view, note = flagged or ("", no_browser)
+            return self._view_unproven(method, write_path, view, note)
+        labels = sorted({_view_label(v) for v, _ in viewed})
         return ValidationResult(
             self.name, "not_confirmed", "xss", confidence=0.0, confirmed=False,
-            summary="No stored XSS: planted payloads were not reflected unescaped in an HTML render",
+            summary="No stored XSS: planted payloads were not reflected unescaped in an HTML render"
+                    + (", nor run by the client views that read the JSON API" if viewed else ""),
             evidence=f"Planted script-executable payloads via {method} and re-read {len(render_urls)} "
-                     f"endpoint(s); none returned the payload unescaped in a text/html response.")
+                     f"endpoint(s); none returned the payload unescaped in a text/html response."
+                     + (f" A JSON response returned it, and {len(viewed)} load(s) of the client "
+                        f"view(s) that read that API ({', '.join(labels)}) did not run it."
+                        if viewed else ""))
+
+    def _client_views(self, api_url: str) -> list[str]:
+        """The page URLs of the client views a crawl saw read `api_url`, in scope:
+        from the run's route map, or, for a run without one, from the host's stored
+        engagement snapshot (route_candidates.stored_routes)."""
+        rc = self.run_context
+        routes = getattr(rc, "client_routes", None) if rc is not None else None
+        if routes is None:
+            from harness.validators.route_candidates import stored_routes
+            routes = stored_routes(api_url)
+        try:
+            views = routes.views_for_api("GET", api_url) if routes is not None else []
+        except Exception:
+            return []
+        return [v for v in views
+                if not self.allowed_hosts or scope_lock.host_in_scope(v, self.allowed_hosts)]
+
+    async def _confirm_in_views(self, json_renders: list[str], expected: str, headers: dict,
+                                viewed: list) -> tuple:
+        """Load the client views that read the JSON renders holding the payload (at
+        most _MAX_VIEWS), as the captured identity, and look for the computed value
+        (_browser_confirm). Returns (executed, view, render url, note) for the first
+        view that ran it or that no browser could load, else for the last one
+        loaded; view is "" when no view is known. Each load goes into `viewed`."""
+        views: list[tuple[str, str]] = []
+        for rurl in json_renders:
+            for view in self._client_views(rurl):
+                if len(views) < _MAX_VIEWS and view not in [v for v, _ in views]:
+                    views.append((view, rurl))
+        last = (False, "", "", "")
+        for view, rurl in views:
+            executed, note = await self._browser_confirm(
+                view, expected, headers=_identity_headers(headers), wait_ms=_VIEW_WAIT_MS)
+            if executed is not None:
+                viewed.append((view, note))
+            last = (executed, view, rurl, note)
+            if executed or executed is None:
+                break
+        return last
+
+    def _executed_in_view(self, method: str, write_path: str, payload: str, api_url: str,
+                          view: str, note: str) -> ValidationResult:
+        shown = " (shown by a dialog only)" if note.endswith(_DIALOG_ONLY) else ""
+        api_path = urlsplit(api_url).path
+        return ValidationResult(
+            self.name, "confirmed", "xss", confidence=0.95, confirmed=True,
+            summary=f"Stored XSS confirmed{shown}: a payload written via {method} {write_path} "
+                    f"executed when the client view {_view_label(view)} rendered it from "
+                    f"{api_path}.",
+            evidence=(f"Planted {payload!r}; an independent GET of {api_url} returned it in a JSON "
+                      f"response, and loading {view}, a client view a crawl saw read {api_path}, "
+                      f"ran it -- stored, then rendered by the page's own script. {note}"))
+
+    def _view_unproven(self, method: str, write_path: str, view: str,
+                       note: str) -> ValidationResult:
+        where = f"the client view {_view_label(view)}" if view else "a client view"
+        return ValidationResult(
+            self.name, "inconclusive", "xss", confidence=0.4, confirmed=False,
+            summary=f"Stored XSS candidate, not confirmed: a payload written via {method} {write_path} "
+                    f"comes back in a JSON response that {where} reads, but execution was not "
+                    f"observed.",
+            evidence=(f"Planted script-executable payloads; an independent read returned one intact "
+                      f"in a JSON response, and a crawl saw {where} read that API. {note}"))
 
     def _executed(self, method: str, write_path: str, payload: str, rurl: str, note: str,
                   via: str = "") -> ValidationResult:
@@ -451,7 +592,8 @@ class StoredXssValidator(Validator):
                       f"text/html response. A raw string match is not execution (an inert context such "
                       f"as <textarea>, or a CSP, stops it). {note}"))
 
-    async def _browser_confirm(self, url: str, expected: str) -> tuple[bool | None, str]:
+    async def _browser_confirm(self, url: str, expected: str, *, headers: dict | None = None,
+                               wait_ms: int = 1200) -> tuple[bool | None, str]:
         """Load the rendered page in a headless browser and look for a console
         message, or an alert/confirm/prompt dialog, exactly equal to
         ``expected``, the value THIS attempt's payload computes when it runs
@@ -460,7 +602,8 @@ class StoredXssValidator(Validator):
         run, the note saying so when a dialog or page error fired; None when no
         browser could check. Any other output, including a message that merely
         contains the payload's text, is the page's own (E2: a page that logs
-        the stored source echoes it without running it)."""
+        the stored source echoes it without running it). `headers` (an identity's,
+        for a client view) go to the driver only when given."""
         driver = self._driver
         try:
             if driver is None:
@@ -471,7 +614,9 @@ class StoredXssValidator(Validator):
             rc = self.run_context
             visit_kw = (dict(scope=rc.scope, gate=rc.gate, budget=rc.budget, cancel=rc.cancel)
                         if rc is not None else {})
-            obs = await driver.visit(url, wait_ms=1200, **visit_kw)
+            if headers:
+                visit_kw["headers"] = headers
+            obs = await driver.visit(url, wait_ms=wait_ms, **visit_kw)
         except Exception as e:
             return None, f"The browser check of {url} failed ({type(e).__name__}); execution unproven."
         if getattr(obs, "load_error", None):
