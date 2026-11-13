@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 __all__ = ["CLIENT_ROUTE_LEGS", "CLIENT_ROUTE_LOCATIONS", "ClientRoute", "ClientRouteMap",
@@ -100,12 +101,81 @@ def _excluded(path: str) -> bool:
     return bool(_DESTRUCTIVE.search(path) or _DOWNLOAD.search(path))
 
 
+# A router config's `path:` entries, a child route joined to its parents' paths.
+# The scan skips string, comment and regular-expression literals, so a bracket in
+# one never shifts the nesting. `path` and `open`/`close` are the tokens it acts on.
+_ROUTER_ANY_PATH = re.compile(r"\bpath\s*:\s*[\"'`]([\w\-./:?$*]*)[\"'`]")
+_ROUTE_SCAN = re.compile(
+    r"\bpath\s*:\s*([\"'`])(?P<path>[\w\-./:?$*]*)\1"
+    r"|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`"
+    r"|(?<=[(,=:\[!&|?{};])/(?![*/])(?:\\.|\[(?:\\.|[^\]\\\n])*\]|[^/\\\n\[])+/"
+    r"|/\*[\s\S]*?\*/|//[^\n]*"
+    r"|(?P<open>[{\[])|(?P<close>[}\]])")
+_CHILDREN_KEY = re.compile(r"[\"']?\bchildren[\"']?\s*:\s*$")
+_MAX_NESTING = 2000
+
+
+def _flat_router_entries(text: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(m.group(1) for m in _ROUTER_ANY_PATH.finditer(text)))
+
+
+@lru_cache(maxsize=2)
+def _router_entries(text: str) -> tuple[str, ...]:
+    """Every `path: '...'` value of a script's router config, raw and in order,
+    each child route (an object in another's `children: [...]`) prefixed with its
+    parents' paths: `{path: 'admin', children: [{path: 'users'}]}` declares `admin`
+    and `admin/users`. A child path starting with `/` is absolute and kept as is;
+    a parent with no path (a layout route) adds nothing. A script with no
+    `children` key, or nesting too deep to be a config, is read flat."""
+    if "children" not in text:
+        return _flat_router_entries(text)
+    stack: list[dict] = []
+    entries: list[tuple] = []
+    for m in _ROUTE_SCAN.finditer(text):
+        raw, opener, closer = m.group("path"), m.group("open"), m.group("close")
+        if raw is not None:
+            frame = stack[-1] if stack and stack[-1]["t"] == "{" else None
+            if frame is not None and frame["path"] is None:
+                frame["path"] = raw
+            entries.append((frame, raw))
+        elif opener == "{":
+            top = stack[-1] if stack else None
+            stack.append({"t": "{", "path": None,
+                          "parent": top["of"] if top is not None and top["t"] == "[" else None})
+        elif opener == "[":
+            top = stack[-1] if stack else None
+            of = top if (top is not None and top["t"] == "{"
+                         and _CHILDREN_KEY.search(text, max(0, m.start() - 40), m.start())) else None
+            stack.append({"t": "[", "of": of})
+        elif closer:
+            want = "{" if closer == "}" else "["
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i]["t"] == want:
+                    del stack[i:]
+                    break
+        if len(stack) > _MAX_NESTING:
+            return _flat_router_entries(text)
+    out: dict[str, None] = {}
+    for frame, raw in entries:
+        parts = [raw]
+        parent = frame["parent"] if frame is not None else None
+        hops = 0
+        while parent is not None and hops < 12 and not parts[0].startswith("/"):
+            if parent["path"]:
+                parts.insert(0, parent["path"])
+            parent = parent["parent"]
+            hops += 1
+        joined = "/".join(p.strip("/") for p in parts if p.strip("/"))
+        out[("/" if parts[0].startswith("/") else "") + joined] = None
+    return tuple(out)
+
+
 def _router_config_paths(text: str) -> list[str]:
-    """`path: '...'` entries of a router config, cleaned, in order: no path
-    parameter (`:id`), wildcard, file name or absolute URL."""
+    """`path: '...'` entries of a router config (child routes under their parents'
+    paths), cleaned, in order: no path parameter (`:id`), wildcard, file name or
+    absolute URL."""
     out: list[str] = []
-    for m in _ROUTER_PATH.finditer(text):
-        raw = m.group(1)
+    for raw in _router_entries(text):
         if (":" in raw or "*" in raw or "." in raw.rsplit("/", 1)[-1]
                 or raw.startswith(("http", "//"))):
             continue
@@ -117,7 +187,6 @@ def _router_config_paths(text: str) -> list[str]:
 
 _SEGMENT_NAME = re.compile(r"^:([A-Za-z_$][\w$]*)\??$")
 _PLAIN_SEGMENT = re.compile(r"^[\w\-.~%]+$")
-_ROUTER_SEGMENT_PATH = re.compile(r"\bpath\s*:\s*[\"'`](/?[\w\-./]*:[\w\-./:?$]*)[\"'`]")
 
 
 def route_segments(path: str) -> list[str]:
@@ -155,11 +224,13 @@ def _segment_route_path(raw: str) -> str | None:
 
 
 def _router_segment_paths(text: str) -> list[str]:
-    """`path: '...'` entries of a router config that have a `:name` segment,
-    cleaned, in order."""
+    """`path: '...'` entries of a router config that have a `:name` segment (child
+    routes under their parents' paths), cleaned, in order."""
     out: list[str] = []
-    for m in _ROUTER_SEGMENT_PATH.finditer(text):
-        path = _segment_route_path(m.group(1))
+    for raw in _router_entries(text):
+        if ":" not in raw:
+            continue
+        path = _segment_route_path(raw)
         if path is not None and path not in out and len(out) < MAX_ROUTES:
             out.append(path)
     return out
@@ -368,7 +439,6 @@ class ClientRoute:
 # --- JavaScript bundle patterns (generic router idioms, no application names) ---
 _Q = r"[\"'`]"
 _HASH_LITERAL = re.compile(_Q + r"#(!?/[\w\-./~%]*)(?:\?([^\"'`\s<>]*))?" + _Q)
-_ROUTER_PATH = re.compile(r"\bpath\s*:\s*" + _Q + r"([\w\-./]*)" + _Q)
 _PATH_QUERY_LITERAL = re.compile(_Q + r"(/[\w\-./~%]*)\?((?:[\w\-$.\[\]]+=[^\"'`&\s<>]*&?)+)")
 _NAVIGATE_QP = re.compile(
     r"navigate\(\s*\[\s*" + _Q + r"(/?[\w\-./]*)" + _Q + r"[^\]]{0,200}\]\s*,\s*\{[^{}]{0,200}?"

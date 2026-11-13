@@ -176,6 +176,28 @@ def _same_view(a: str, b: str) -> bool:
     return norm(a) == norm(b)
 
 
+# A declared view that stays on its URL but renders a denial in place. It counts
+# only when the phrase is new to the view: the first view the crawl opened did
+# not show it (so a shell banner never makes every view a denial).
+_DENIED_IN_PLACE = re.compile(
+    r"\b(?:access (?:is )?denied|permission denied|forbidden|not authori[sz]ed|unauthori[sz]ed"
+    r"|not (?:allowed|permitted) to (?:view|access|see|open)"
+    r"|you (?:must|need to|have to) (?:be )?(?:logged in|signed in|log ?in|sign ?in)"
+    r"|please (?:log ?in|sign ?in) (?:to|first)"
+    r"|(?:log ?in|sign ?in|authentication) (?:is )?required)\b", re.I)
+
+
+def _denial_in_place(text: str, baseline: str) -> str:
+    """The first denial phrase in a view's text that the baseline view's text
+    does not have, lowercased with its whitespace collapsed, or ""."""
+    base = " ".join((baseline or "").lower().split())
+    for m in _DENIED_IN_PLACE.finditer(" ".join((text or "").split())):
+        phrase = m.group(0).lower()
+        if phrase not in base:
+            return phrase
+    return ""
+
+
 # At most this many parameter names go into one probe.
 MAX_PROBE_NAMES = 16
 
@@ -232,6 +254,10 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     the calls fired meanwhile are still captured, tagged with the view the app
     landed on.
 
+    A declared view the app stays on is guarded too when its rendered text (an
+    adapter with `text()`) shows a denial the first view did not ("access denied",
+    "not authorized", "please log in to ...").
+
     `route_probes` > 0 loads up to that many views once more, by GET navigation,
     with a marker value in each parameter name the same-origin scripts read
     (client_routes.read_names_of) and the view does not carry yet. A name whose
@@ -253,6 +279,8 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     probe_room = max(0, int(route_probes or 0))
     read_names: list[str] = []
     probed: set = set()
+    baseline_text: str | None = None   # the first view's text (in-place denials)
+    text_of = getattr(adapter, "text", None)
 
     def admit(url: str | None, depth: int, declared: bool = False) -> None:
         if url is None:
@@ -401,6 +429,12 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         current = adapter.current_url() or url
         landed.add(view_key(current))
         guarded = ""
+        if baseline_text is None and not declared and declared_room > 0 and callable(text_of):
+            try:
+                baseline_text = (await text_of() or "").lower()
+            except Exception as exc:
+                baseline_text = ""
+                result.errors.append(f"text {view_key(url)}: {describe_error(exc)}")
         if declared:
             status_of = getattr(adapter, "status", None)
             status = status_of() if callable(status_of) else None
@@ -408,6 +442,14 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
                 guarded = f"{view_key(url)} -> status {status}"
             elif not _same_view(current, url):
                 guarded = f"{view_key(url)} -> {view_key(current)}"
+            elif callable(text_of):
+                try:
+                    denial = _denial_in_place(await text_of() or "", baseline_text or "")
+                except Exception as exc:
+                    denial = ""
+                    result.errors.append(f"text {view_key(url)}: {describe_error(exc)}")
+                if denial:
+                    guarded = f"{view_key(url)} -> denied in place ({denial})"
         if guarded:
             result.guarded.append(guarded)
         else:
