@@ -149,6 +149,11 @@ class SpaCrawlResult:
     # app stayed on, and the ones it did not ("requested -> landed" or the status).
     declared: list[str] = field(default_factory=list)
     guarded: list[str] = field(default_factory=list)
+    # Route probes (route_probes > 0): each view loaded once more with a marker
+    # value in every parameter name the bundles read, as {"url": the probe URL,
+    # "view": its view key, "names": the names whose marker the view showed or
+    # sent, "calls": [(method, url, body), ...] it fired}.
+    probes: list[dict] = field(default_factory=list)
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -171,6 +176,31 @@ def _same_view(a: str, b: str) -> bool:
     return norm(a) == norm(b)
 
 
+# At most this many parameter names go into one probe.
+MAX_PROBE_NAMES = 16
+
+
+def _markers(names: list[str]) -> dict[str, str]:
+    """A marker value per name: nine random lowercase letters, a shared stem and
+    a two-letter index, so no marker contains another and none looks like an id
+    or a cache-buster."""
+    import secrets
+    import string
+    stem = "".join(secrets.choice(string.ascii_lowercase) for _ in range(7))
+    letters = string.ascii_lowercase
+    return {name: stem + letters[i // 26] + letters[i % 26] for i, name in enumerate(names)}
+
+
+def _route_query_names(url: str) -> set[str]:
+    """The parameter names a view URL already carries in its route query."""
+    from harness.client_routes import fragment_route
+    from urllib.parse import parse_qsl
+    parts = urlsplit(url)
+    fr = fragment_route(parts.fragment)
+    query = fr[2] if fr is not None else parts.query
+    return {k for k, _v in parse_qsl(query, keep_blank_values=True)}
+
+
 def _declared_url(current: str, path: str, hash_hint: bool) -> str | None:
     """A router-declared path as a view of the app at `current`: a hash route in a
     hash-routed app (the current view's fragment is a route, or the bundle says
@@ -182,7 +212,7 @@ def _declared_url(current: str, path: str, hash_hint: bool) -> str | None:
 
 async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_views: int = 30,
                       max_depth: int = 4, max_captured: int = 200, extra_views=(),
-                      declared_views: int = 0,
+                      declared_views: int = 0, route_probes: int = 0,
                       cancel: Any = None, budget: Any = None,
                       deadline: float | None = None) -> SpaCrawlResult:
     """Breadth-first walk of the app's client-side views from `start_url`.
@@ -200,7 +230,15 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     redirects, to login or elsewhere, or the document answers an error status)
     is recorded in `guarded`, never as a view, and its links are not followed;
     the calls fired meanwhile are still captured, tagged with the view the app
-    landed on."""
+    landed on.
+
+    `route_probes` > 0 loads up to that many views once more, by GET navigation,
+    with a marker value in each parameter name the same-origin scripts read
+    (client_routes.read_names_of) and the view does not carry yet. A name whose
+    marker the rendered view shows (`text()`: the visible text and the form
+    values) or sends in a call is a route input of that view (`probes`). Its own
+    cap, apart from max_views; a probe the app does not stay on records nothing,
+    and the calls it fired are captured all the same."""
     result = SpaCrawlResult(start_url=start_url)
     origin = urlsplit(start_url)[:2]
     queue: list[tuple[str, int, bool]] = [(start_url, 0, False)]
@@ -212,6 +250,9 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     hash_hint = False
     linked_views = 0
     landed: set = set()      # where each opened view ended up (a redirect's target)
+    probe_room = max(0, int(route_probes or 0))
+    read_names: list[str] = []
+    probed: set = set()
 
     def admit(url: str | None, depth: int, declared: bool = False) -> None:
         if url is None:
@@ -236,9 +277,21 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         seen.add(key)
         queue.append((url, depth, declared))
 
-    async def mine_declared(current: str) -> None:
-        nonlocal declared_room, hash_hint
-        from harness.client_routes import declared_views as declared_of
+    def capture(exchange: dict, note_view: str, how: str = "spa navigation") -> None:
+        key = (exchange.get("method"), exchange.get("url"), exchange.get("request_body"))
+        if key in captured_keys or len(result.exchanges) >= max_captured:
+            return
+        captured_keys.add(key)
+        exchange = dict(exchange)
+        exchange["analyst_note"] = ("driver_capture: JS-issued request observed on view "
+                                    f"{note_view} ({how})")
+        result.exchanges.append(exchange)
+
+    async def absorb_scripts(current: str) -> None:
+        """The same-origin script bodies the views loaded since the last call:
+        the router-declared paths and the parameter names they read."""
+        nonlocal hash_hint
+        from harness.client_routes import declared_views as declared_of, read_names_of
         try:
             bodies = await adapter.scripts()
         except Exception as exc:
@@ -248,6 +301,65 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
             paths, hinted = declared_of(body)
             hash_hint = hash_hint or hinted
             declared_paths.extend(p for p in paths if p not in declared_paths)
+            for name in read_names_of(body):
+                if name not in read_names and len(read_names) < 64:
+                    read_names.append(name)
+
+    async def probe(current: str) -> None:
+        """Load `current` with a marker in each read name it lacks; record the
+        names the view showed or sent."""
+        nonlocal probe_room
+        from harness.client_routes import probe_url
+        key = view_key(current)
+        if key in probed:
+            return
+        have = _route_query_names(current)
+        names = [n for n in read_names if n not in have][:MAX_PROBE_NAMES]
+        if not names:
+            return
+        probed.add(key)
+        markers = _markers(names)
+        target = probe_url(current, markers)
+        if target is None or urlsplit(target)[:2] != origin or not in_scope(target):
+            result.skip("probe_out_of_scope")
+            return
+        probe_room -= 1
+        try:
+            await adapter.open(target)
+        except ViewRefused as exc:
+            result.skip("refused_redirect")
+            result.refused.append(f"probe {key}: {exc}")
+            return
+        except Exception as exc:
+            result.errors.append(f"probe {key}: {describe_error(exc)}")
+            return
+        stayed = _same_view(adapter.current_url() or target, target)
+        text = ""
+        text_of = getattr(adapter, "text", None)
+        if stayed and callable(text_of):
+            try:
+                text = (await text_of() or "").lower()
+            except Exception as exc:
+                result.errors.append(f"probe text {key}: {describe_error(exc)}")
+        try:
+            fired = await adapter.drain()
+        except Exception as exc:
+            fired = []
+            result.errors.append(f"probe capture {key}: {describe_error(exc)}")
+        calls = []
+        for exchange in fired:
+            calls.append((exchange.get("method") or "GET", exchange.get("url") or "",
+                          exchange.get("request_body") or ""))
+            capture(exchange, key, "route probe")
+        if not stayed:
+            result.skip("probe_redirected")
+            return
+        sent = " ".join(f"{u} {b}" for _m, u, b in calls).lower()
+        found = [n for n, m in markers.items() if m in text or m in sent]
+        result.probes.append({"url": target, "view": key, "names": found, "calls": calls})
+
+    async def mine_declared(current: str) -> None:
+        nonlocal declared_room
         while declared_paths and declared_room > 0:
             url = _declared_url(current, declared_paths.pop(0), hash_hint)
             if url is None or view_key(url) in seen or view_key(url) in landed:
@@ -313,14 +425,7 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
             if len(result.view_calls) < 2000:
                 result.view_calls.append((current, exchange.get("method") or "GET",
                                           exchange.get("url") or "", exchange.get("request_body") or ""))
-            key = (exchange.get("method"), exchange.get("url"), exchange.get("request_body"))
-            if key in captured_keys or len(result.exchanges) >= max_captured:
-                continue
-            captured_keys.add(key)
-            exchange = dict(exchange)
-            exchange["analyst_note"] = ("driver_capture: JS-issued request observed on view "
-                                        f"{view_key(current if guarded else url)} (spa navigation)")
-            result.exchanges.append(exchange)
+            capture(exchange, view_key(current if guarded else url))
         if depth < max_depth and not guarded:
             try:
                 targets = await adapter.links()
@@ -329,6 +434,10 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
                 result.errors.append(f"links {view_key(url)}: {describe_error(exc)}")
             for raw in targets:
                 admit(resolve_view(current, raw), depth + 1)
+        if (declared_room > 0 or probe_room > 0) and callable(getattr(adapter, "scripts", None)):
+            await absorb_scripts(current)
+        if probe_room > 0 and not guarded:
+            await probe(current)
         if declared_room > 0 and callable(getattr(adapter, "scripts", None)):
             await mine_declared(current)
     else:

@@ -468,6 +468,17 @@ _MAX_REDIRECT_HOPS = 10
 # ExecutionObservation.navigation_bodies: at most this many documents, each cut here.
 _MAX_NAVIGATION_BODIES = 4
 _NAVIGATION_BODY_BYTES = 262_144
+# crawl_spa's route probes read a view back as its title, its visible text and the
+# values of its form fields (a password field's value never), capped.
+_VIEW_TEXT_JS = """() => {
+  const parts = [document.title || "", document.body ? (document.body.innerText || "") : ""];
+  for (const el of document.querySelectorAll("input, textarea, select")) {
+    if ((el.type || "").toLowerCase() !== "password") parts.push(el.value || "");
+  }
+  return parts.join("\\n").slice(0, 200000);
+}"""
+
+
 # _IdentityRouter.script_bodies (crawl_spa with declared_views): at most this many
 # same-origin scripts per crawl, each cut here (client_routes reads no more).
 _MAX_SCRIPT_BODIES = 6
@@ -1097,7 +1108,7 @@ class PlaywrightDriver:
                         budget: "RequestBudget | None" = None,
                         max_views: int = 30, max_depth: int = 4,
                         max_captured: int = 200, extra_views=(),
-                        declared_views: int = 0,
+                        declared_views: int = 0, route_probes: int = 0,
                         deadline: float | None = None):
         """`capture_requests` across the app's client-side views: load `url`, then
         follow the in-app links and router targets the rendered DOM exposes
@@ -1110,8 +1121,10 @@ class PlaywrightDriver:
         other view is a routed main-frame navigation. `declared_views` > 0 keeps
         the run origin's script bodies so the crawl also visits, up to that many,
         the parameter-less routes their router config declares (by GET
-        navigation, through the same router). Returns a
-        `spa_navigation.SpaCrawlResult`."""
+        navigation, through the same router). `route_probes` > 0 also keeps them,
+        to load up to that many views once more with a marker in each parameter
+        name the scripts read (spa_navigation.crawl_views; the rendered text and
+        form values are read back). Returns a `spa_navigation.SpaCrawlResult`."""
         from harness.spa_navigation import (LINK_TARGETS_JS, SpaCrawlResult, ViewRefused,
                                             crawl_views, describe_error)
         effective_scope = scope if scope is not None else ScopePolicy(
@@ -1130,7 +1143,7 @@ class PlaywrightDriver:
                                  cancel=cancel, gate=gate, budget=budget,
                                  timeout_s=self.launch_timeout_ms / 1000,
                                  label="browser_driver.crawl_spa")
-        if declared_views > 0:
+        if declared_views > 0 or route_probes > 0:
             router.script_bodies = []
         timeout_ms = self.launch_timeout_ms
         try:
@@ -1213,10 +1226,15 @@ class PlaywrightDriver:
                                 router.script_bodies.clear()
                             return bodies
 
+                        async def text(self) -> str:
+                            found = await page.evaluate(_VIEW_TEXT_JS)
+                            return found if isinstance(found, str) else ""
+
                     return await crawl_views(
                         _Adapter(), url, in_scope=effective_scope.in_scope,
                         max_views=max_views, max_depth=max_depth, max_captured=max_captured,
                         extra_views=extra_views, declared_views=max(0, int(declared_views)),
+                        route_probes=max(0, int(route_probes)),
                         cancel=cancel, budget=budget, deadline=deadline)
                 finally:
                     if context is not None:

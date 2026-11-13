@@ -40,7 +40,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 __all__ = ["CLIENT_ROUTE_LEGS", "CLIENT_ROUTE_LOCATIONS", "ClientRoute", "ClientRouteMap",
            "HASH", "HISTORY", "PAGE", "QUERY", "ROUTE", "declared_views", "fragment_route",
-           "payload_url", "route_params_of_template"]
+           "payload_url", "probe_url", "read_names_of", "route_params_of_template"]
 
 HASH, HISTORY = "hash", "history"
 # Coverage case locations: a parameter of the fragment route, a parameter of the page query.
@@ -151,6 +151,26 @@ def _set_param(query: str, name: str, value: str) -> str:
     if not placed:
         out.append((name, value))
     return urlencode(out, quote_via=quote, safe="")
+
+
+def probe_url(url: str, values: dict[str, str]) -> str | None:
+    """The view URL with each of `values` set as a route input: in the fragment
+    route's query for a hash route (`/#/r?name=value`), in the page's own query
+    otherwise (a fragment that is no route is dropped). None for no values."""
+    if not values:
+        return None
+    parts = urlsplit(url)
+    fr = fragment_route(parts.fragment)
+    if fr is not None:
+        prefix, path, query = fr
+        for name, value in values.items():
+            query = _set_param(query, name, value)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query,
+                           f"{prefix}{path}?{query}"))
+    query = parts.query
+    for name, value in values.items():
+        query = _set_param(query, name, value)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", query, ""))
 
 
 def payload_url(url: str, location: str, name: str, payload: str) -> str | None:
@@ -266,11 +286,34 @@ _PUSH_QUERY = re.compile(
 _READS = [
     re.compile(r"queryParamMap\.get\(\s*" + _Q + r"([\w\-$]+)" + _Q),
     re.compile(r"queryParams\s*\[\s*" + _Q + r"([\w\-$]+)" + _Q + r"\s*\]"),
+    # `snapshot.queryParams.q`, `location.query.q`: a property read, not a call.
+    re.compile(r"\b(?:queryParams|location\.query)\.([A-Za-z_$][\w$]*)\b(?!\s*\()"),
     re.compile(r"searchParams\.get\(\s*" + _Q + r"([\w\-$]+)" + _Q),
     re.compile(r"URLSearchParams\([^()]{0,120}\)\.get\(\s*" + _Q + r"([\w\-$]+)" + _Q),
     re.compile(r"\broute\.query\.([A-Za-z_$][\w$]*)"),
     re.compile(r"\broute\.query\[\s*" + _Q + r"([\w\-$]+)" + _Q),
 ]
+# Property names of the router objects themselves, never a parameter name.
+_READ_STOPWORDS = frozenset({"get", "getAll", "has", "keys", "pipe", "subscribe", "value",
+                             "length", "forEach", "toString", "then", "map", "params"})
+
+
+def read_names_of(body: str, limit: int = 64) -> list[str]:
+    """The route-parameter names a JavaScript bundle reads from the router or from
+    location.search, in order (`URLSearchParams(...).get("q")`,
+    `queryParamMap.get("q")`, `queryParams.q`, `route.query.q`, ...). A name read
+    is not yet a route input: nothing says which route reads it."""
+    text = (body or "")[:5_000_000]
+    out: list[str] = []
+    for pattern in _READS:
+        for m in pattern.finditer(text):
+            name = m.group(1)
+            if (_ok_name(name) and name not in _READ_STOPWORDS and name not in out
+                    and len(out) < limit):
+                out.append(name)
+    return out
+
+
 _HASH_HINTS = re.compile(r"useHash\s*:\s*(?:!0|true)\b|createWebHashHistory|HashLocationStrategy|"
                          r"\bHashRouter\b|\bmode\s*:\s*[\"']hash[\"']")
 _HTML_ROUTE_ATTR = re.compile(
@@ -442,11 +485,9 @@ class ClientRouteMap:
                 self._put_router(path, names, "bundle")
             elif len(self._literals) < MAX_ROUTES and (path, names) not in self._literals:
                 self._literals.append((path, names))
-        for pattern in _READS:
-            for m in pattern.finditer(text):
-                name = m.group(1)
-                if _ok_name(name) and name not in self.read_names and len(self.read_names) < MAX_READ_NAMES:
-                    self.read_names.append(name)
+        for name in read_names_of(text, MAX_READ_NAMES):
+            if name not in self.read_names and len(self.read_names) < MAX_READ_NAMES:
+                self.read_names.append(name)
 
     def add_view_calls(self, view_url: str, calls) -> None:
         """The API calls (method, url, body) a crawled view fired, kept in memory
@@ -458,6 +499,33 @@ class ClientRouteMap:
             if len(self._pending) >= MAX_PENDING_CALLS:
                 return
             self._pending.append((view_url, (method or "GET").upper(), url or "", body or ""))
+
+    def add_probe(self, probe_url: str, names, calls) -> None:
+        """A route probe (spa_navigation's `route_probes`): the crawl loaded a view
+        with a marker value in each parameter name the bundles read. `names` are
+        the ones the view showed or sent, which become the route's inputs. The calls
+        fired then are mapped back like any view's: finalize matches a call's
+        values to the markers in `probe_url`. The probe URL itself is no view, so a
+        name in it that the view neither showed nor sent is no input."""
+        if not self._same_origin(probe_url):
+            return
+        parts = urlsplit(probe_url)
+        fr = fragment_route(parts.fragment)
+        if fr is not None:
+            prefix, path, _query = fr
+            clean = _clean_route_path(path)
+            route = None if clean is None else ClientRoute(HASH, parts.path or "/", prefix + clean)
+        else:
+            clean = _clean_route_path(parts.path or "/")
+            route = None if clean is None else ClientRoute(HISTORY, clean)
+        if route is None or _excluded(clean):
+            return
+        if names:
+            self._put(route, [n for n in names if _ok_name(n)], "probe")
+        for method, url, body in calls or ():
+            if len(self._pending) >= MAX_PENDING_CALLS:
+                return
+            self._pending.append((probe_url, (method or "GET").upper(), url or "", body or ""))
 
     def merge(self, other: "ClientRouteMap | None") -> None:
         if other is None:

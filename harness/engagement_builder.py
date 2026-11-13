@@ -72,7 +72,8 @@ def register_role_sessions(run_context, base_url: str, roles) -> list[str] | Non
 
 def _collect_spa_routes(routes, crawl) -> None:
     """Fold one browser crawl into the client route map: every view it loaded
-    (fragment included), every link target it saw, and the calls each view fired."""
+    (fragment included), every link target it saw, the calls each view fired, and
+    the route inputs its probes found."""
     try:
         for url in getattr(crawl, "views", None) or []:
             routes.add_url(url, "crawl")
@@ -83,8 +84,21 @@ def _collect_spa_routes(routes, crawl) -> None:
             by_view.setdefault(view, []).append((method, url, body))
         for view, calls in by_view.items():
             routes.add_view_calls(view, calls)
+        for probe in getattr(crawl, "probes", None) or []:
+            routes.add_probe(probe.get("url") or "", probe.get("names") or [],
+                             probe.get("calls") or [])
     except Exception as exc:  # discovery bookkeeping never sinks the build
         log.warning("build_engagement: client route collection failed: %s", exc)
+
+
+def _probe_kwargs(capture_config) -> dict:
+    """crawl_spa's `route_probes`, passed only when on (0, the default, keeps the
+    call as it was)."""
+    try:
+        probes = max(0, int(capture_config.get("route_probes", 0) or 0))
+    except (TypeError, ValueError):
+        probes = 0
+    return {"route_probes": probes} if probes else {}
 
 
 def _mine_capture_routes(routes, exchange) -> None:
@@ -167,7 +181,8 @@ async def build_engagement(
                             max_views=max(1, int(capture_config.get("max_views", 30))),
                             max_depth=max(0, int(capture_config.get("max_depth", 4))),
                             declared_views=max(0, int(capture_config.get("declared_views", 0))),
-                            extra_views=extra_views)
+                            extra_views=extra_views,
+                            **_probe_kwargs(capture_config))
                         supplied.extend(crawl.exchanges[:200 - len(supplied)])
                         _collect_spa_routes(client_routes, crawl)
                         spa_views.append({"principal": role.principal_id(),
@@ -176,6 +191,8 @@ async def build_engagement(
                                           "refused": list(getattr(crawl, "refused", []) or []),
                                           "declared": list(getattr(crawl, "declared", []) or []),
                                           "guarded": list(getattr(crawl, "guarded", []) or []),
+                                          "probes": [{"view": p.get("view"), "names": p.get("names")}
+                                                     for p in getattr(crawl, "probes", None) or []],
                                           "stopped_by": crawl.stopped_by})
                         seed_errors.extend("browser spa crawl: " + e for e in crawl.errors)
                         continue
