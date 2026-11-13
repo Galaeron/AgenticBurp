@@ -43,7 +43,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
-from harness.client_routes import PAGE, QUERY, ROUTE, fragment_route
+from harness.client_routes import PAGE, QUERY, ROUTE, SEGMENT, fragment_route
 from .base import Validator, ValidationResult
 from . import route_candidates
 from .injection_targets import NAMED_PARAMETER_UNTESTED, tested_inputs
@@ -200,6 +200,17 @@ class DomXssValidator(Validator):
                     f"page script read the route parameter from location.hash and wrote it to a "
                     f"DOM sink. This is DOM-based XSS, not server reflection.{dialog_note} "
                     f"URL: {c.url[:300]}")
+        if c.location == SEGMENT:
+            sent = route_candidates.segment_sent(c.url)
+            source = "location.pathname" if sent else "location.hash"
+            served = (" The HTML document the server returned did not carry the payload "
+                      "verbatim." if sent else "")
+            return (f"DOM-based XSS executed in a real browser via the route path segment "
+                    f":{c.parameter} at {c.url[:200]}{tail}",
+                    f"Payload placed in {route_candidates.describe(c)} ran: {shown}, {product} -- "
+                    f"page script read the segment from {source} and wrote it to a DOM sink."
+                    f"{served} This is DOM-based XSS, not server reflection.{dialog_note} "
+                    f"URL: {c.url[:300]}")
         kind = "page query parameter" if c.location == PAGE else "query parameter"
         return (f"DOM-based XSS executed in a real browser via the {kind} "
                 f"{c.parameter!r} at {c.url.split('?')[0]}{tail}",
@@ -247,6 +258,10 @@ class DomXssValidator(Validator):
                     reachable = False
                     why = ("is answered with a document no page script runs in (not HTML), "
                            "so nothing there reads location.search")
+            elif location == SEGMENT:
+                reachable = bool(only) and only in route_candidates.segment_names(exchange.url)
+                if not reachable:
+                    why = "is not a path segment of the replayed URL's route"
             else:
                 reachable = bool(only) and (
                     location == PAGE
@@ -296,12 +311,14 @@ class DomXssValidator(Validator):
             # fragment text carries a*b, not the product, so it never confirms.
             how = ("console" if any(str(m).strip() == expected for m in obs.console) else
                    "dialog" if expected in _dialog_messages(obs) else "")
-            if how and c.location in (PAGE, QUERY):
-                # The query reaches the server. Execution is DOM-based only when
-                # the document the server returned did not carry the payload.
+            if how and (c.location in (PAGE, QUERY) or (
+                    c.location == SEGMENT and route_candidates.segment_sent(c.url))):
+                # The query (or a history route's path) reaches the server.
+                # Execution is DOM-based only when the document the server
+                # returned did not carry the payload.
                 served = route_candidates.served_payload(obs, c.payload)
                 if served is not False:
-                    which = "page query" if c.location == PAGE else "query"
+                    which = {PAGE: "page query", QUERY: "query"}.get(c.location, "page path")
                     if signal is None:
                         signal = (url, (f"the payload executed from the {which}, but the server "
                                         "returned it in the document (reflected XSS, browser_xss's "

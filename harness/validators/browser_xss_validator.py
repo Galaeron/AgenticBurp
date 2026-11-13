@@ -38,7 +38,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from .base import Validator, ValidationResult
-from harness.client_routes import PAGE, ROUTE, fragment_route
+from harness.client_routes import PAGE, ROUTE, SEGMENT, fragment_route
 from . import route_candidates
 from .injection_targets import NAMED_PARAMETER_UNTESTED, tested_inputs
 from .route_candidates import Candidate
@@ -211,15 +211,23 @@ class BrowserXssValidator(Validator):
                     f"Injected payload executed: {shown}, {computed}. The payload was in "
                     f"{route_candidates.describe(c)}, so page script read it from the route "
                     f"and wrote it to a sink.{dialog_note}")
-        if c.location == PAGE:
+        if c.location == SEGMENT and not route_candidates.segment_sent(c.url):
+            return (f"Client-side (DOM-based) XSS executed in a real browser via the route path "
+                    f"segment :{c.parameter} at {c.url[:200]}{tail}",
+                    f"Injected payload executed: {shown}, {computed}. The payload was in "
+                    f"{route_candidates.describe(c)}, so page script read it from the route "
+                    f"and wrote it to a sink.{dialog_note}")
+        if c.location in (PAGE, SEGMENT):
+            what = (f"the page query parameter {c.parameter!r} at {c.url.split('?')[0]}"
+                    if c.location == PAGE else
+                    f"the route path segment :{c.parameter} at {c.url[:200]}")
             served = route_candidates.served_payload(obs, c.payload)
             origin = ("" if served is None else
                       " The document the server returned carried the payload verbatim "
                       "(server reflection)." if served else
                       " The document the server returned did not carry the payload "
                       "verbatim, so page script placed it in the DOM.")
-            return (f"XSS executed in a real browser via the page query parameter "
-                    f"{c.parameter!r} at {c.url.split('?')[0]}{tail}",
+            return (f"XSS executed in a real browser via {what}{tail}",
                     f"Injected payload executed: {shown}, {computed}.{origin}{dialog_note}")
         return (f"Reflected XSS executed in a real browser at {c.url.split('?')[0]}{tail}",
                 f"Injected payload executed: {shown}, {computed}.{dialog_note}")
@@ -256,6 +264,9 @@ class BrowserXssValidator(Validator):
                 # A route parameter lives in the replayed URL's fragment route.
                 reachable = bool(only) and fragment_route(urlsplit(exchange.url).fragment) is not None
                 why = "has no fragment route in the replayed URL"
+            elif location == SEGMENT:
+                reachable = bool(only) and only in route_candidates.segment_names(exchange.url)
+                why = "is not a path segment of the replayed URL's route"
             elif location == PAGE:
                 reachable, why = bool(only), "is unnamed"
             else:

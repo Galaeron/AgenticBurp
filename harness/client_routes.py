@@ -22,12 +22,13 @@ This module models both shapes generically:
       resolves them;
     * views: every URL the browser crawl navigated to, fragment included;
     * bundles: route-shaped strings in same-origin JavaScript. These are `"#/r?p="`
-      literals, router navigation calls that name query parameters, and `"/r?p="`
-      strings whose path the router config declares;
+      literals, router navigation calls that name query parameters, `"/r?p="`
+      strings whose path the router config declares, and router config paths with
+      a `:name` segment (`/item/:id`), whose segment is an input of its own;
     * api_map: an API call a view fired, mapped back to that view's route where the
       crawl shows it. The call either carries the value of one of the route's
       parameters, or names a parameter the bundles read from the router.
-- `payload_url`: the page URL with one route or page parameter set to a payload.
+- `payload_url`: the page URL with one route, page or segment input set to a payload.
 
 Nothing here is specific to an application: there are no route or field names.
 """
@@ -39,8 +40,9 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 __all__ = ["CLIENT_ROUTE_LEGS", "CLIENT_ROUTE_LOCATIONS", "ClientRoute", "ClientRouteMap",
-           "HASH", "HISTORY", "PAGE", "QUERY", "ROUTE", "declared_views", "fragment_route",
-           "payload_url", "probe_url", "read_names_of", "route_params_of_template"]
+           "HASH", "HISTORY", "PAGE", "QUERY", "ROUTE", "SEGMENT", "declared_views",
+           "fragment_route", "payload_url", "probe_url", "read_names_of",
+           "route_params_of_template", "route_segments", "route_segments_of_template"]
 
 HASH, HISTORY = "hash", "history"
 # Coverage case locations: a parameter of the fragment route, a parameter of the page query.
@@ -48,6 +50,9 @@ ROUTE, PAGE = "route", "page"
 # A parameter of a captured URL's own query, which a page script may also read
 # from location.search (dom_xss). It is the coverage model's own "query" input.
 QUERY = "query"
+# A `:name` segment of a route path the router config declares (`/item/:id`). The
+# route's URL keeps the `:name` placeholder, and a payload replaces that segment.
+SEGMENT = "segment"
 CLIENT_ROUTE_LOCATIONS = frozenset({ROUTE, PAGE})
 # The legs that load the page in a browser and so can test a client-side route input.
 CLIENT_ROUTE_LEGS = frozenset({"browser_xss", "dom_xss"})
@@ -110,6 +115,56 @@ def _router_config_paths(text: str) -> list[str]:
     return out
 
 
+_SEGMENT_NAME = re.compile(r"^:([A-Za-z_$][\w$]*)\??$")
+_PLAIN_SEGMENT = re.compile(r"^[\w\-.~%]+$")
+_ROUTER_SEGMENT_PATH = re.compile(r"\bpath\s*:\s*[\"'`](/?[\w\-./]*:[\w\-./:?$]*)[\"'`]")
+
+
+def route_segments(path: str) -> list[str]:
+    """The names of a route path's `:name` segments, in order (`/item/:id` -> ["id"])."""
+    out: list[str] = []
+    for seg in (path or "").split("/"):
+        m = _SEGMENT_NAME.match(seg)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def _segment_route_path(raw: str) -> str | None:
+    """A router-config path with at least one `:name` segment, cleaned (`item/:id?`
+    -> `/item/:id`), or None for a wildcard, a file, an absolute URL, a malformed
+    segment or a destructive-looking route."""
+    raw = (raw or "").strip()
+    if not raw or "*" in raw or raw.startswith(("http", "//")):
+        return None
+    out = []
+    for seg in [s for s in raw.split("/") if s]:
+        m = _SEGMENT_NAME.match(seg)
+        if m:
+            out.append(":" + m.group(1))
+        elif _PLAIN_SEGMENT.match(seg):
+            out.append(seg)
+        else:
+            return None
+    if not any(s.startswith(":") for s in out) or len(out) > 12:
+        return None
+    if not out[-1].startswith(":") and "." in out[-1]:
+        return None
+    path = "/" + "/".join(out)
+    return path if len(path) <= 200 and not _excluded(path) else None
+
+
+def _router_segment_paths(text: str) -> list[str]:
+    """`path: '...'` entries of a router config that have a `:name` segment,
+    cleaned, in order."""
+    out: list[str] = []
+    for m in _ROUTER_SEGMENT_PATH.finditer(text):
+        path = _segment_route_path(m.group(1))
+        if path is not None and path not in out and len(out) < MAX_ROUTES:
+            out.append(path)
+    return out
+
+
 def declared_views(body: str, limit: int = MAX_ROUTES) -> tuple[list[str], bool]:
     """The client routes a script's router config declares that take no
     parameter, as `(paths, hash_hint)`. The paths are in order and none is the
@@ -132,6 +187,12 @@ def fragment_route(fragment: str) -> tuple[str, str, str] | None:
         return None
     path, _, query = frag.partition("?")
     return prefix, path, query
+
+
+def _fill_segment(path: str, token: str, payload: str) -> str:
+    """`path` with its `token` segment set to `payload`, percent-encoded with no safe
+    character, so a `/` in the payload stays inside that one segment."""
+    return "/".join(quote(payload, safe="") if s == token else s for s in path.split("/"))
 
 
 def _set_param(query: str, name: str, value: str) -> str:
@@ -179,8 +240,10 @@ def payload_url(url: str, location: str, name: str, payload: str) -> str | None:
     `route`: a parameter of the fragment route (`/#/r?name=<payload>`), which is never
     sent to the server. `page`: a parameter of the page's own query
     (`/r?name=<payload>`). `query`: a parameter of the captured URL's own query,
-    with its fragment kept. Returns None when `url` has no fragment route for a
-    `route` input."""
+    with its fragment kept. `segment`: the route path's `:name` segment (the fragment
+    route's for a hash route, the page path's otherwise). Returns None when `url`
+    has no fragment route for a `route` input, or no `:name` segment for a
+    `segment` input."""
     parts = urlsplit(url)
     if location == ROUTE:
         fr = fragment_route(parts.fragment)
@@ -195,6 +258,20 @@ def payload_url(url: str, location: str, name: str, payload: str) -> str | None:
     if location == QUERY:
         return urlunsplit((parts.scheme, parts.netloc, parts.path or "/",
                            _set_param(parts.query, name, payload), parts.fragment))
+    if location == SEGMENT:
+        token = ":" + (name or "")
+        fr = fragment_route(parts.fragment)
+        if fr is not None:
+            prefix, path, query = fr
+            if token not in path.split("/"):
+                return None
+            frag = prefix + _fill_segment(path, token, payload) + (f"?{query}" if query else "")
+            return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query, frag))
+        path = parts.path or "/"
+        if token not in path.split("/"):
+            return None
+        return urlunsplit((parts.scheme, parts.netloc, _fill_segment(path, token, payload),
+                           parts.query, ""))
     return None
 
 
@@ -208,6 +285,14 @@ def route_params_of_template(template: dict | None) -> tuple[str, list[str]]:
     if location not in CLIENT_ROUTE_LOCATIONS:
         return "", []
     return location, [p for p in (cr.get("params") or []) if isinstance(p, str) and p]
+
+
+def route_segments_of_template(template: dict | None) -> list[str]:
+    """The `:name` segment names of the client route a coverage template carries."""
+    cr = (template or {}).get("client_route") if isinstance(template, dict) else None
+    if not isinstance(cr, dict) or (cr.get("location") or "") not in CLIENT_ROUTE_LOCATIONS:
+        return []
+    return [s for s in (cr.get("segments") or []) if isinstance(s, str) and _ok_name(s)]
 
 
 @dataclass
@@ -229,6 +314,12 @@ class ClientRoute:
     @property
     def location(self) -> str:
         return ROUTE if self.kind == HASH else PAGE
+
+    @property
+    def segments(self) -> list[str]:
+        """The names of the route path's `:name` segments (router-declared path
+        parameters), in order."""
+        return route_segments(self.route if self.kind == HASH else self.document)
 
     @property
     def endpoint_key(self) -> str:
@@ -260,7 +351,8 @@ class ClientRoute:
         return {"method": "GET", "query": "", "body": "", "content_type": "", "object_id": None,
                 "path_ids": [],
                 "client_route": {"kind": self.kind, "location": self.location,
-                                 "params": list(self.params), "sources": list(self.sources)}}
+                                 "params": list(self.params), "segments": self.segments,
+                                 "sources": list(self.sources)}}
 
     def to_dict(self) -> dict:
         return {"kind": self.kind, "document": self.document, "route": self.route,
@@ -400,6 +492,15 @@ class ClientRouteMap:
             self._router[key] = known = ClientRoute(kind="", document="/", route=path)
         known.add_params(names, source)
 
+    def _put_segment_route(self, path: str, names, source: str) -> None:
+        """A router path with a `:name` segment (already cleaned by
+        _segment_route_path, which _clean_route_path would reject)."""
+        key = _route_template(path)
+        if key not in self._router and len(self._router) < MAX_ROUTES:
+            self._router[key] = ClientRoute(kind="", document="/", route=path)
+        if key in self._router:
+            self._router[key].add_params(names, source)
+
     # --- sources ---
 
     def add_url(self, url: str, source: str) -> ClientRoute | None:
@@ -458,6 +559,9 @@ class ClientRouteMap:
         for path in _router_config_paths(text):
             if len(self.router_paths) < MAX_ROUTES:
                 self.router_paths.add(path)
+        for path in _router_segment_paths(text):
+            # A path parameter: the route's `:name` segment is its input.
+            self._put_segment_route(path, (), "router")
         for m in _HASH_LITERAL.finditer(text):
             if self.origin is None:
                 continue
@@ -539,7 +643,10 @@ class ClientRouteMap:
                 self._put(ClientRoute(route.kind, route.document, route.route), (), s)
         for route in other._router.values():
             for s in route.sources or [""]:
-                self._put_router(route.route, route.params, s)
+                if route_segments(route.route):
+                    self._put_segment_route(route.route, route.params, s)
+                else:
+                    self._put_router(route.route, route.params, s)
         self.router_paths |= set(list(other.router_paths)[:MAX_ROUTES])
         for name in other.read_names:
             if name not in self.read_names and len(self.read_names) < MAX_READ_NAMES:
@@ -589,8 +696,8 @@ class ClientRouteMap:
         return list(out.values())
 
     def inputs(self) -> list[ClientRoute]:
-        """The routes that read at least one parameter."""
-        return [r for r in self.routes() if r.params]
+        """The routes that read at least one parameter or have a `:name` segment."""
+        return [r for r in self.routes() if r.params or r.segments]
 
     def route_for_key(self, endpoint_key: str) -> ClientRoute | None:
         return next((r for r in self.inputs() if r.endpoint_key == endpoint_key), None)

@@ -26,7 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlsplit
 
-from harness.client_routes import PAGE, QUERY, ROUTE, fragment_route, payload_url
+from harness.client_routes import (PAGE, QUERY, ROUTE, SEGMENT, fragment_route, payload_url,
+                                   route_segments)
 
 FRAGMENT = "fragment"
 
@@ -73,6 +74,20 @@ def route_names(url: str) -> list[str]:
         if k and k not in names:
             names.append(k)
     return names
+
+
+def segment_names(url: str) -> list[str]:
+    """The `:name` placeholders of a URL's route path: the fragment route's for a
+    hash route, the page path's otherwise."""
+    parts = urlsplit(url)
+    fr = fragment_route(parts.fragment)
+    return route_segments(fr[1] if fr is not None else parts.path)
+
+
+def segment_sent(url: str) -> bool:
+    """Whether a segment input of `url` reaches the server: a history route's path
+    does, a fragment route's never."""
+    return fragment_route(urlsplit(url).fragment) is None
 
 
 def own_route(url: str, payloads: list[str]) -> list[list[Candidate]]:
@@ -204,4 +219,7 @@ def describe(c: Candidate) -> str:
         return f"the page query parameter {c.parameter!r}"
     if c.location == FRAGMENT:
         return "the URL fragment (never sent to the server)"
+    if c.location == SEGMENT:
+        return (f"the route path segment :{c.parameter}"
+                + ("" if segment_sent(c.url) else " (never sent to the server)"))
     return f"the query parameter {c.parameter!r}" if c.parameter else "the query string"

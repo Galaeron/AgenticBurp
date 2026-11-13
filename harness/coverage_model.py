@@ -27,7 +27,8 @@ from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
 from harness.categories import canonicalize
-from harness.client_routes import CLIENT_ROUTE_LEGS, PAGE, route_params_of_template
+from harness.client_routes import (CLIENT_ROUTE_LEGS, PAGE, SEGMENT, route_params_of_template,
+                                   route_segments_of_template)
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +377,11 @@ def derive_input_cases_from_template(template: dict | None,
             ck = CaseKey(location, name, 0, workflow_state_id, name)
             if all(c.coord_id() != ck.coord_id() for c in cases):
                 cases.append(ck)
+    # A router-declared `:name` segment of the route path (`/item/:id`).
+    for name in route_segments_of_template(template):
+        ck = CaseKey(SEGMENT, name, 0, workflow_state_id, name)
+        if all(c.coord_id() != ck.coord_id() for c in cases):
+            cases.append(ck)
     return cases
 
 
@@ -549,6 +555,7 @@ class Check:
         applies to the browser XSS legs only. A route the run knows only from the
         page (no captured request of its own) is that leg's endpoint alone."""
         location, names = route_params_of_template(endpoint.get("template"))
+        names = names + [":" + s for s in route_segments_of_template(endpoint.get("template"))]
         if endpoint.get("client_route_only"):
             if self.confirmation in CLIENT_ROUTE_LEGS and names:
                 return True, (f"client-side route reads {location} parameter(s) "
