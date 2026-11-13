@@ -210,7 +210,11 @@ class FamilyRunner:
         body_budget = self._body_budget(max_body_chars)
         reported_budget = agent._reported_body_budget(body_budget, max_body_chars)
         try:
-            user_prompt = agent._user_prompt(exchange, body_budget, prior_context)
+            # SKL-5: ground every routed member, not just the primary --
+            # one built-in note per member under knowledge.FAMILY_NOTE_CAP.
+            user_prompt = agent._user_prompt(
+                exchange, body_budget, prior_context,
+                knowledge_members=[member.name for member in self.members])
             from harness.passive_inference import passive_chat_json
             from harness.ollama_client import model_stage
             with model_stage(label):

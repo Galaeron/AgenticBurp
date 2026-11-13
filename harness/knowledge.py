@@ -386,3 +386,77 @@ def retrieve(agent_name: str, exchange: HttpExchange, top_k: int = 2, engagement
         if len(top) >= top_k:
             break
     return "\n".join(f"- {note}" for note in top)
+
+
+# SKL-5: a family call (`coordinator.routing_mode: "families"`) covers several
+# dispatched members in ONE prompt. Retrieving with only the first member's
+# name grounded that member alone, so the family prompt gets at most one
+# built-in note per routed member instead, under a fixed total cap. Agents mode
+# never calls this: its prompt keeps `retrieve(self.name, ...)` unchanged.
+# Budget: agents mode carries up to top_k=2 notes per prompt; a family prompt
+# carries up to FAMILY_NOTE_CAP lines and FAMILY_NOTE_MAX_CHARS characters of
+# notes, inside the user-prompt line reserve (base_agent._PROMPT_OVERHEAD_LINES)
+# and prompt_validator's character limits. MAX_CHARS fits FAMILY_NOTE_CAP
+# built-in notes at the 600-character note ceiling that
+# test_knowledge_coverage enforces, so the character cap trims only an
+# oversized external note.
+FAMILY_NOTE_CAP = 4
+FAMILY_NOTE_MAX_CHARS = 2500
+
+
+def _own_class_notes(member_name: str, exchange_tokens: set[str]) -> list[str]:
+    """Built-in notes tagged with a token of `member_name` (that member's own
+    class notes), best first: overlap with the member's name plus the exchange
+    tokens, the same score `retrieve` uses, ties in corpus order."""
+    name_tokens = _tokenize(member_name)
+    query_tokens = name_tokens | exchange_tokens
+    scored = [(len(query_tokens & set(entry["tags"])), idx, entry["note"])
+              for idx, entry in enumerate(_CORPUS) if name_tokens & set(entry["tags"])]
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [note for _, _, note in scored]
+
+
+def retrieve_for_family(member_names: list[str], exchange: HttpExchange, *,
+                        cap: int = FAMILY_NOTE_CAP, max_chars: int = FAMILY_NOTE_MAX_CHARS,
+                        engagement_id: str = "", include_external: bool = True) -> str:
+    """SKL-5: the methodology block for one family call. Each routed member, in
+    dispatch order, contributes its best own-class built-in note that is not
+    already in the block, until `cap` notes are chosen. Slots left after every
+    member has had its turn go to stored external notes (tester writeups,
+    remembered findings) scored against all member names plus the exchange,
+    as `retrieve` scores them. The block never exceeds `cap` notes or
+    `max_chars` characters; a note that would cross `max_chars` is skipped.
+    `engagement_id` and `include_external` mean what they mean for `retrieve`.
+    Same "- note" line format as `retrieve`."""
+    exchange_tokens = _tokenize(exchange.url) | _tokenize(exchange.request_body[:500])
+    chosen: list[str] = []
+    used = 0
+
+    def take(note: str) -> bool:
+        nonlocal used
+        cost = len(note) + 2 + (1 if chosen else 0)  # "- " prefix, "\n" separator
+        if note in chosen or used + cost > max_chars:
+            return False
+        chosen.append(note)
+        used += cost
+        return True
+
+    for name in member_names:
+        if len(chosen) >= cap:
+            break
+        for note in _own_class_notes(name, exchange_tokens):
+            if take(note):
+                break
+
+    if include_external and len(chosen) < cap:
+        family_tokens = exchange_tokens.union(*(_tokenize(name) for name in member_names))
+        external = [(len(family_tokens & entry["tags"]), entry["note"])
+                    for entry in _external_notes(engagement_id=engagement_id)]
+        external = [item for item in external if item[0] > 0]
+        external.sort(key=lambda t: -t[0])  # stable: store order on equal scores
+        for _, note in external:
+            if len(chosen) >= cap:
+                break
+            take(note)
+
+    return "\n".join(f"- {note}" for note in chosen)

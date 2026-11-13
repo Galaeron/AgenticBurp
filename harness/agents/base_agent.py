@@ -295,11 +295,16 @@ class BaseAgent(ABC):
 
     def _user_prompt(self, exchange: HttpExchange, max_body_chars: int, prior_context: str = "",
                      *, include_knowledge: bool = True, context_fit: bool = False,
-                     omitted: list[str] | tuple = ()) -> str:
+                     omitted: list[str] | tuple = (),
+                     knowledge_members: list[str] | None = None) -> str:
         """`include_knowledge=False` leaves out the methodology notes; `context_fit` marks a
         body cut as made to fit the context window; `omitted` names the parts left
         out for it (prompt_budget.fit_agent_prompts). The defaults are unchanged.
-        `exchange` may be a _prompt_view of the exchange, built once for many prompts."""
+        `exchange` may be a _prompt_view of the exchange, built once for many prompts.
+        `knowledge_members` (SKL-5) is set only by a family call
+        (agent_families.FamilyRunner): the methodology block then covers
+        every routed member via knowledge.retrieve_for_family. None (every
+        agents-mode call) keeps the per-agent knowledge.retrieve block."""
         view = exchange if isinstance(exchange, _PromptView) else self._prompt_view(exchange)
         exchange = view.exchange
         prior_context = security.sanitize_text(prior_context)
@@ -380,8 +385,13 @@ more or less significant in light of what's already known):
         from harness import store
         retrieved = ""
         if include_knowledge:
-            retrieved = knowledge.retrieve(self.name, exchange,
-                                           include_external=not bool(store._CURRENT_CAPTURED_PRINCIPAL.get()))
+            include_external = not bool(store._CURRENT_CAPTURED_PRINCIPAL.get())
+            if knowledge_members is None:
+                retrieved = knowledge.retrieve(self.name, exchange,
+                                               include_external=include_external)
+            else:
+                retrieved = knowledge.retrieve_for_family(
+                    knowledge_members, exchange, include_external=include_external)
             retrieved = security.sanitize_text(retrieved)
         knowledge_block = ""
         if retrieved:
