@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from typing import NamedTuple
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from harness.categories import canonicalize, distinctive_token
@@ -116,6 +117,202 @@ def _route_independent_identity(finding: dict) -> str:
         return ""
     return "\x1f".join(("mechanism", validator, policy, finding.get("principal_id") or "",
                         finding.get("workflow_state_id") or ""))
+
+
+# --------------------------------------------------------------------------- #
+# Header-policy identity from the recorded policy (r10 report noise, 2026-11-13)
+# --------------------------------------------------------------------------- #
+# r10 reported one csp issue per route (101 confirmed rows over 45 routes, one absent
+# CSP) and one misconfig issue per route for one missing X-Content-Type-Options. Stored
+# rows carry no fingerprint (a coverage or passive proof names no artifact), so E2 fell
+# back to the endpoint key. A header-policy row now keys on origin + class + header
+# name + the observed policy, read from what the row recorded, strongest first:
+#   1. the persisted or in-run policy fingerprint: E2's key, unchanged;
+#   2. the csp validator's observed values (CSP, report-only CSP, X-Frame-Options) in
+#      its own evidence: the same fingerprint E2 computes in-run, so issue ids agree;
+#   3. the security-header audit's failure lines (header name, absent or bad value);
+#   4. the csp validator's failing-test lines when no value is recorded (a proof bound
+#      to a model row): a partial record, the values themselves unknown;
+#   5. nothing recorded: origin + class + header name, and the issue says so.
+# The identity is the recorded value, so two routes whose recorded values differ never
+# share a key. 4 and 5, and a value the validator recorded cut short, are "not
+# recorded": the export and the report say the routes may differ.
+#
+# Classes (categories.py): csp -- a missing or weak CSP, and framing protection, which
+# the taxonomy files as csp ("clickjacking", "missing x frame options"); missing_headers
+# -- missing security headers, HSTS among them; and a misconfig row whose record is the
+# security-header audit (security_headers_validator files WSTG-CONF-02 as misconfig;
+# any other misconfig row keeps its endpoint key). A label the taxonomy does not map
+# that names a policy header and its absence ("Missing Strict-Transport-Security
+# Header", "csp_missing") is read as that header's class, for issue grouping only.
+# cors and insecure_transport keep E2: a CORS grant depends on the request Origin and
+# the route, and transport is the scheme the origin already carries.
+
+class HeaderPolicy(NamedTuple):
+    vulnerability_class: str          # the issue's class
+    headers: tuple[str, ...]          # lower-case response header names
+    identity: str                     # the observed policy: the issue key's last element
+    recorded: bool                    # False: the value is not recorded; routes may differ
+    observed: tuple[tuple[str, str], ...] = ()   # (header, value as recorded) for display
+
+
+_CSP_VALIDATOR = "csp_validator"
+_AUDIT_VALIDATOR = "security_headers_validator"
+_CSP_HEADERS = ("content-security-policy", "content-security-policy-report-only", "x-frame-options")
+# Validator write limits: csp_validator cuts a value at 300 characters and appends
+# "...", security_headers_validator quotes the first 60 characters of a bad value.
+_CSP_VALUE_LIMIT = 300
+_AUDIT_VALUE_LIMIT = 60
+# csp and missing_headers key on the record while E2 groups them (_HEADER_POLICY_CLASSES).
+_RECORDED_POLICY_CLASSES = frozenset({"csp", "missing_headers"})
+
+# Policy header -> (class, label phrases that name it, read as words).
+_POLICY_HEADERS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "content-security-policy": ("csp", ("content security policy", "csp")),
+    "x-frame-options": ("csp", ("x frame options", "clickjacking", "frame ancestors")),
+    "strict-transport-security": ("missing_headers", ("strict transport security", "hsts")),
+    "x-content-type-options": ("missing_headers", ("x content type options", "nosniff")),
+    "referrer-policy": ("missing_headers", ("referrer policy",)),
+    "permissions-policy": ("missing_headers", ("permissions policy", "feature policy")),
+}
+_ABSENCE_RE = re.compile(r"\b(?:missing|absent|lacks?|lacking|no|without|weak|not set)\b")
+
+_CSP_OBSERVED_RE = re.compile(
+    r"Content-Security-Policy: (?P<csp>.*?) \| Content-Security-Policy-Report-Only: (?P<ro>.*?)"
+    r" \| X-Frame-Options: (?P<xfo>.*?)(?= \| |$)", re.S)
+_CSP_TEST_RE = re.compile(r"(CSP Presence|CSP Directive Analysis|Framing Protection): ")
+_CSP_TEST_HEADER = {"CSP Presence": "content-security-policy",
+                    "CSP Directive Analysis": "content-security-policy",
+                    "Framing Protection": "x-frame-options"}
+_AUDIT_RE = re.compile(
+    r"(?P<nosniff>X-Content-Type-Options) is (?:missing|(?P<q>['\"])(?P<value>.*?)(?P=q), not 'nosniff')"
+    r"|(?P<referrer>Referrer-Policy) resolves to '(?P<policy>[^']*)'")
+
+
+def _label_words(text: str) -> str:
+    return " ".join(re.sub(r"[-_‐-―]", " ", (text or "").lower()).split())
+
+
+def _named_headers(label: str) -> tuple[str, ...]:
+    words = _label_words(label)
+    return tuple(h for h, (_, phrases) in _POLICY_HEADERS.items()
+                 if any(re.search(rf"\b{re.escape(p)}\b", words) for p in phrases))
+
+
+def _header_label_class(label: str) -> str:
+    """The header-policy class a label names, else "". Grouping only: a label the
+    taxonomy recognises keeps its own class, and categories.canonicalize (which routes
+    validators) is not changed."""
+    if canonicalize(label) or distinctive_token(label):
+        return ""
+    words = _label_words(label)
+    found = canonicalize(re.sub(r"\s+headers?$", "", words))
+    if found in _RECORDED_POLICY_CLASSES:
+        return found
+    classes = {_POLICY_HEADERS[h][0] for h in _named_headers(label)}
+    return next(iter(classes)) if len(classes) == 1 and _ABSENCE_RE.search(words) else ""
+
+
+def _recorded_texts(finding: dict, owner: str) -> list[str]:
+    """What the owning validator recorded for this row: the evidence when it wrote the
+    row, and, when the row's linked proof is its own, that proof's observed result and
+    the proof note the binding appended (`<validator> CONFIRMED: ...`,
+    store.bind_confirmation_proof). A model's own wording is never read."""
+    head, *notes = (finding.get("evidence") or "").split(" || ")
+    texts = [head] if (finding.get("agent") or "") == owner else []
+    if (finding.get("validator") or "") == owner:
+        marker = f"{owner} CONFIRMED: "
+        texts.append(finding.get("proof_observed_result") or "")
+        texts += [note[len(marker):] for note in notes if note.startswith(marker)]
+    return [t for t in texts if t]
+
+
+def _policy_identity(headers: tuple[str, ...], values: tuple) -> str:
+    from harness.validators.base import header_fingerprint
+    return "hdr:" + ",".join(headers) + "=" + header_fingerprint(*values)
+
+
+def _shown(value) -> str:
+    return "absent" if value is None else (value or "(empty)")
+
+
+def _csp_policy(finding: dict, label: str) -> HeaderPolicy:
+    from harness.validators.base import header_fingerprint
+    fingerprint = _policy_of(finding)
+    if fingerprint:
+        return HeaderPolicy("csp", _CSP_HEADERS, fingerprint, True)
+    texts = _recorded_texts(finding, _CSP_VALIDATOR)
+    for text in texts:
+        m = _CSP_OBSERVED_RE.search(text)
+        if not m:
+            continue
+        raw = (m.group("csp"), m.group("ro"), m.group("xfo"))
+        values = tuple(None if v == "absent" else ("" if v == "(empty)" else v) for v in raw)
+        cut = any(v and len(v) > _CSP_VALUE_LIMIT and v.endswith("...") for v in values)
+        observed = tuple(zip(_CSP_HEADERS, (_shown(v) for v in values)))
+        if cut:   # only a prefix is recorded: equal prefixes may still differ
+            return HeaderPolicy("csp", _CSP_HEADERS, "hdr~" + header_fingerprint(*values),
+                                False, observed)
+        return HeaderPolicy("csp", _CSP_HEADERS, header_fingerprint(*values), True, observed)
+    tests: dict[str, str] = {}
+    for text in texts:
+        marks = list(_CSP_TEST_RE.finditer(text))
+        for here, after in zip(marks, marks[1:] + [None]):
+            detail = text[here.end():after.start() if after else len(text)]
+            detail = re.sub(r"\s*(?:\((?:critical|high|medium|low|info)\))?\s*[|-]?\s*$", "", detail)
+            tests.setdefault(here.group(1), " ".join(detail.split()).lower())
+    if tests:
+        headers = tuple(sorted({_CSP_TEST_HEADER[t] for t in tests}))
+        return HeaderPolicy("csp", headers, "tests:" + _short(*sorted(f"{t}: {d}" for t, d in tests.items())),
+                            False)
+    headers = tuple(h for h in _named_headers(label) if _POLICY_HEADERS[h][0] == "csp") \
+        or ("content-security-policy",)
+    return HeaderPolicy("csp", headers, "hdr:" + ",".join(headers) + "=?", False)
+
+
+def _audit_policy(finding: dict, cls: str) -> HeaderPolicy | None:
+    """The security-header audit's recorded failures (WSTG-CONF-02), or None."""
+    for text in _recorded_texts(finding, _AUDIT_VALIDATOR):
+        states: dict[str, str | None] = {}
+        for m in _AUDIT_RE.finditer(text):
+            if m.group("nosniff"):
+                states.setdefault("x-content-type-options", m.group("value"))
+            else:
+                states.setdefault("referrer-policy", m.group("policy"))
+        if states:
+            headers = tuple(sorted(states))
+            values = tuple(states[h] for h in headers)
+            cut = any(v is not None and len(v) >= _AUDIT_VALUE_LIMIT for v in values)
+            observed = tuple(zip(headers, (_shown(v) for v in values)))
+            return HeaderPolicy(cls, headers, ("hdr~" if cut else "") + _policy_identity(headers, values),
+                                not cut, observed)
+    return None
+
+
+def header_policy(finding: dict) -> HeaderPolicy | None:
+    """The response-header policy a finding is about, read from its record (see the
+    block comment above), or None when it is not a header-policy finding."""
+    vc = finding.get("vulnerability_class", "") or ""
+    if _is_dependency_class(vc):
+        return None
+    canon = issue_class(vc)
+    if canon == "misconfig":
+        return _audit_policy(finding, "misconfig")
+    if canon not in _RECORDED_POLICY_CLASSES:
+        canon = _header_label_class(vc)
+    if canon not in _RECORDED_POLICY_CLASSES or canon not in _HEADER_POLICY_CLASSES:
+        return None
+    if canon == "csp":
+        return _csp_policy(finding, vc)
+    fingerprint = _policy_of(finding)
+    headers = _named_headers(vc)
+    if fingerprint:
+        return HeaderPolicy(canon, headers, fingerprint, True)
+    audited = _audit_policy(finding, canon)
+    if audited:
+        return audited
+    # Unnamed headers keep E2's host-wide key ("") and issue id.
+    return HeaderPolicy(canon, headers, ("hdr:" + ",".join(headers) + "=?") if headers else "", False)
 
 
 # --------------------------------------------------------------------------- #
@@ -264,6 +461,19 @@ class Issue:
         """Every member's finding id (fingerprint when it has none), in member order."""
         return [m.get("finding_id") or m.get("fingerprint") or "" for m in self.members]
 
+    @property
+    def header_policy(self) -> HeaderPolicy | None:
+        """The members' header policy (see `header_policy`): every header named, and
+        recorded only when every member recorded its value. None when no member is a
+        header-policy finding."""
+        policies = [p for p in (header_policy(m) for m in self.members) if p is not None]
+        if not policies:
+            return None
+        return HeaderPolicy(policies[0].vulnerability_class,
+                            tuple(sorted({h for p in policies for h in p.headers})),
+                            policies[0].identity, all(p.recorded for p in policies),
+                            next((p.observed for p in policies if p.observed), ()))
+
 
 def verdict_rank(m: dict) -> tuple:
     """Order observations strongest-verdict first, then severity, then confidence."""
@@ -289,7 +499,7 @@ def _host_of(url: str) -> str:
     return f"{p.scheme}://{p.netloc}" if p.scheme else p.netloc
 
 
-def issue_key(finding: dict) -> tuple:
+def issue_key(finding: dict, *, recorded_policy: bool = True) -> tuple:
     """The conservative grouping key (T06). Application namespace (scheme+host),
     endpoint family (object ids collapsed), method, canonical class, affected
     input, and authorization boundary. When the affected input is UNKNOWN, a
@@ -324,6 +534,11 @@ def issue_key(finding: dict) -> tuple:
     family or method. insecure_transport and missing_headers do too, and also when
     the policy is unknown (`_HOST_WIDE_CLASSES`).
 
+    Recorded-policy exception (2026-11-13): a header-policy row (`header_policy`) groups
+    by host + class + the header names and observed policy its record holds, a stored
+    row as much as an in-run one. `recorded_policy=False` gives the key as it was before
+    (pivot_memory's same-route attach reads that one, so binding is unchanged).
+
     AR-08b exception: a finding confirmed by a route-independent mechanism (see
     `ROUTE_INDEPENDENT_MECHANISMS`) with a known policy groups by host + class +
     affected input (the carrier) + read/write boundary + `_route_independent_identity`
@@ -336,6 +551,9 @@ def issue_key(finding: dict) -> tuple:
     if _is_dependency_class(vc):
         return (host, "", "", canonicalize(vc) or vc.strip().lower(), "", "read", "")
     canon = issue_class(vc)
+    policy = header_policy(finding) if recorded_policy else None
+    if policy is not None:
+        return (host, "", "", policy.vulnerability_class, "", "read", policy.identity)
     # Without a fingerprint (a model finding, or a proof stored before AR-08a) nothing
     # says the policy is the same, so it keeps the endpoint-family key below rather
     # than matching every route -- except for the host-wide classes (see above).
@@ -571,6 +789,24 @@ def evidence_state(issue: Issue, proofs_by_case: dict | None = None) -> str:
     return "confirmed"
 
 
+_ROUTE_STATE_RANK = {"candidate": 0, "tool_reported": 1, "confirmed": 2}
+
+
+def _route_status(issue: Issue, proofs_by_case: dict) -> dict[str, str]:
+    """Each affected route's own state, strongest member first: "confirmed" (the
+    harness's own proof), "tool_reported" (an external tool's only), else "candidate"."""
+    status: dict[str, str] = {}
+    for m in issue.members:
+        if not m.get("url"):
+            continue
+        route = normalize_path(m["url"])
+        state = ("candidate" if not m.get("confirmed") else
+                 "tool_reported" if _member_tool_reported(m, proofs_by_case) else "confirmed")
+        if _ROUTE_STATE_RANK[state] >= _ROUTE_STATE_RANK[status.get(route, "candidate")]:
+            status[route] = state
+    return dict(sorted(status.items()))
+
+
 def _member_evidence(issue: Issue) -> list[dict]:
     """Per-member evidence, redacted -- so grouping keeps every affected instance's
     own evidence (R10), not only the best member's."""
@@ -601,6 +837,7 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         _audited_oracle_state(issue, proofs_by_case)
     state = evidence_state(issue, proofs_by_case)
     confirmed = state == "confirmed"
+    policy = issue.header_policy
 
     boundary_word = "read" if issue.authorization_boundary == "read" else "state-changing"
     first_alias = next(iter(aliases), None)
@@ -665,8 +902,13 @@ def export_issue(issue: Issue, *, proofs_by_case: dict | None = None) -> dict:
         "instances_count": len(issue.members),
         "member_ids": issue.member_ids,
         **({"affected_routes": sorted({normalize_path(u) for u in issue.affected_instances})}
-           if issue.vulnerability_class in _HEADER_POLICY_CLASSES
+           if policy is not None or issue.vulnerability_class in _HEADER_POLICY_CLASSES
            or any(_route_independent_identity(m) for m in issue.members) else {}),
+        # A header-policy issue names its headers, whether their value is recorded
+        # (False: grouped by header name, the routes may differ) and each route's state.
+        **({"header_policy": {"headers": list(policy.headers), "recorded": policy.recorded,
+                              "observed": dict(policy.observed)},
+            "route_status": _route_status(issue, proofs_by_case)} if policy is not None else {}),
         "captured_auth_contexts": sorted({member.get("captured_principal_id") for member in issue.members
                                           if member.get("captured_principal_id")}),
         "artifacts": {"replayable": has_proof, "missing": missing_artifacts},
@@ -761,6 +1003,12 @@ def _limitations(issue: Issue, state: str = "") -> list[str]:
                     "pending manual verification.")
     if not issue.proof_ids:
         lims.append("No structured proof is linked to this issue; evidence is unstructured.")
+    policy = issue.header_policy
+    if policy is not None and not policy.recorded:
+        routes = {normalize_path(u) for u in issue.affected_instances}
+        lims.append("The observed header value was not recorded for every member"
+                    + ("; these routes are grouped by header name only and may differ."
+                       if len(routes) > 1 else "."))
     if not issue.affected_input:
         lims.append("The specific affected input was not attributed; the issue is scoped to "
                     "the whole request.")

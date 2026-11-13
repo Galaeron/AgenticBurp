@@ -2155,7 +2155,8 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
                       s.fingerprint IS NOT NULL AS suppressed,
                       f.oracle_verified, f.verification_state, f.oracle_capsule_id,
                       f.exchange_id, f.run_id, f.captured_principal_id,
-                      p.validator, p.workflow_state_id, i.policy_fingerprint, es.evidence_source
+                      p.validator, p.workflow_state_id, i.policy_fingerprint, es.evidence_source,
+                      p.observed_result
                FROM findings f
                LEFT JOIN finding_suppressions s ON s.fingerprint = f.fingerprint
                LEFT JOIN proof_records p ON p.proof_id = f.proof_id AND f.proof_id != ''
@@ -2174,7 +2175,7 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
     # method + the finding's case coordinates (parameter_location/parameter_name/
     # principal_id, from its linked proof) are surfaced for T06 issue grouping and
     # export -- additive keys; existing consumers read by name and are unaffected.
-    from harness import confirmation_gate
+    from harness import confirmation_gate, security
     results = [
         {"url": u, "vulnerability_class": vc, "severity": sev, "confidence": conf, "summary": s,
          "evidence": ev, "suggested_test": st, "owasp_category": oc, "basis": basis,
@@ -2208,11 +2209,14 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
          "validator": validator or "", "workflow_state_id": workflow_state_id or "",
          "policy_fingerprint": policy_fingerprint or "",
          # The linked proof's evidence source ("tool_reported"), only when it has one.
-         **({"evidence_source": evidence_source} if evidence_source else {})}
+         **({"evidence_source": evidence_source} if evidence_source else {}),
+         # What the linked proof observed (secret shapes masked), so issues.header_policy
+         # can key a header-policy row on the policy its proof recorded. '' when unlinked.
+         "proof_observed_result": security.sanitize_text(observed_result or "")}
         for (u, vc, sev, conf, s, ev, st, oc, basis, confirmed, agent, fp,
              finding_id, case_id, proof_id, method, rv, ploc, pname, principal, suppressed,
              oracle_verified, vstate, capsule_id, exchange_id, run_id, captured_principal_id,
-             validator, workflow_state_id, policy_fingerprint, evidence_source) in rows
+             validator, workflow_state_id, policy_fingerprint, evidence_source, observed_result) in rows
     ]
     _resolve_confirmation_proofs(results)
     if not include_suppressed:
