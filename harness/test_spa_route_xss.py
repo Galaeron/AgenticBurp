@@ -346,11 +346,13 @@ def _finding(**kw):
 
 
 class RouteCandidateTest(_Server):
-    def _visits(self, validator_cls, url, rc=None, max_visits=8, **finding_kw):
+    def _visits(self, validator_cls, url, rc=None, max_visits=8, response_headers=None,
+                **finding_kw):
         driver = _Recorder()
         v = validator_cls(driver=driver, allowed_hosts=["127.0.0.1"], max_visits=max_visits,
                           run_context=rc)
-        res = asyncio.run(v.validate(_finding(**finding_kw), HttpExchange(url=url, method="GET")))
+        res = asyncio.run(v.validate(_finding(**finding_kw), HttpExchange(
+            url=url, method="GET", response_headers=response_headers or {})))
         return res, driver.visited
 
     def test_dom_xss_keeps_the_raw_fragment_and_adds_the_route_parameter(self):
@@ -403,10 +405,15 @@ class RouteCandidateTest(_Server):
                                         parameter_only=True)
             self.assertEqual((res.status, res.control_outcome, visited),
                              ("skipped", NAMED_PARAMETER_UNTESTED, []), cls.__name__)
+        # dom_xss reads a query parameter from location.search only in a page: a
+        # JSON answer runs no page script, so its query parameter is not loaded.
         res, visited = self._visits(DomXssValidator, f"{self.base}/api/items?q=1",
+                                    response_headers={"Content-Type": "application/json"},
                                     parameter_location="query", parameter_name="q",
                                     parameter_only=True)
-        self.assertEqual((res.status, visited), ("skipped", []))
+        self.assertEqual((res.status, res.control_outcome, visited),
+                         ("skipped", NAMED_PARAMETER_UNTESTED, []))
+        self.assertIn("location.search", res.summary)
 
     def test_every_candidate_url_has_an_origin_the_driver_can_tell(self):
         """The browser driver sends the captured identity's cookies and headers only

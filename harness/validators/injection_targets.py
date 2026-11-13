@@ -99,7 +99,9 @@ def tested_inputs(finding, targets) -> tuple[tuple[str, str], ...]:
 # id through its custom injection marker (r9: those cases were never tested).
 # browser_xss injects into the query string and, like dom_xss, into a client-side
 # route input the page reads (client_routes.py: "route" is a parameter of the
-# fragment route, "page" one of the HTML page's own query).
+# fragment route, "page" one of the HTML page's own query); dom_xss also places
+# its payload in one query parameter, which a page script reads from
+# location.search.
 PER_PARAMETER_LOCATIONS = {
     "ssti": frozenset({"query", "body_form", "body_json"}),
     "command_injection": frozenset({"query", "body_form", "body_json"}),
@@ -107,7 +109,7 @@ PER_PARAMETER_LOCATIONS = {
     "open_redirect": frozenset({"query", "body_form", "body_json"}),
     "ssrf": frozenset({"query", "body_form", "body_json"}),
     "browser_xss": frozenset({"query", "route", "page"}),
-    "dom_xss": frozenset({"route", "page"}),
+    "dom_xss": frozenset({"query", "route", "page"}),
     "path_traversal": frozenset({"query", "body_form", "body_json"}),
 }
 # Legs whose request-level attempt also tests an input that no parameter case
@@ -116,7 +118,10 @@ PER_PARAMETER_LOCATIONS = {
 # parameter inputs it can test alone; once each was tested alone, its
 # request-level attempt still runs, bound to that location only, so it never
 # repeats the parameters' probes (and each input keeps its own R16 account).
-REQUEST_LEVEL_INPUTS = {"path_traversal": "path"}
+# dom_xss's request-level attempt places its payload in the raw URL fragment
+# (location.hash), which no parameter case names, and loads the routes of the
+# views a crawl saw issuing the request.
+REQUEST_LEVEL_INPUTS = {"path_traversal": "path", "dom_xss": "fragment"}
 # At most this many parameter cases of one cell are dispatched one by one (the
 # legs' own six-parameter cap); the rest stay inconclusive.
 PER_PARAMETER_FIELD_CAP = 6

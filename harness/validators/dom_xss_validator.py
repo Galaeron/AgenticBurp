@@ -30,7 +30,9 @@ parameter of the URL's own fragment route and of each page route a crawled view
 showed issuing the captured request (client_routes.py); for a history-routed
 page it places the payload in the page's own query, and confirms DOM-based XSS
 there only when the HTML document the server returned did not carry the
-payload (otherwise it is server reflection, browser_xss's verdict).
+payload (otherwise it is server reflection, browser_xss's verdict). A captured
+HTML page's own query parameters are location.search sources too: each one gets
+the payload alone, under the same served-document rule.
 """
 from __future__ import annotations
 from harness import scope_lock
@@ -41,7 +43,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
-from harness.client_routes import PAGE, ROUTE, fragment_route
+from harness.client_routes import PAGE, QUERY, ROUTE, fragment_route
 from .base import Validator, ValidationResult
 from . import route_candidates
 from .injection_targets import NAMED_PARAMETER_UNTESTED, tested_inputs
@@ -148,18 +150,28 @@ class DomXssValidator(Validator):
                     location: str, run_context) -> list[Candidate]:
         """Every URL this validation loads, bounded by max_visits.
 
-        A per-parameter dispatch tests its one client-side route input: a parameter
-        in the fragment route (`route`) or of the page's own query (`page`).
-        Otherwise the raw-fragment candidates are kept and taken in turn with the
-        parameters of the URL's own fragment route and of each page route a
-        crawled view showed issuing this request (client_routes.py). A hash-routed
-        app reads its input from inside the route, so a payload that replaces the
+        A per-parameter dispatch tests its one input: a parameter in the fragment
+        route (`route`), of the page's own query (`page`), or of the captured
+        URL's query (`query`). The coverage driver's request-level remainder
+        (`fragment`, every parameter case of the cell already tested alone) tests
+        what no parameter case names: the raw fragment, and each page route a
+        crawled view showed issuing this request. Otherwise the raw-fragment
+        candidates are kept and taken in turn with the parameters of the URL's own
+        fragment route, of its own query when the captured response is an HTML
+        page, and of each mapped page route (client_routes.py). A hash-routed app
+        reads its input from inside the route, so a payload that replaces the
         whole fragment only reaches a sink that reads the raw hash."""
         dom = route_candidates.dom_payloads(a, b)
+        if only is not None and location == route_candidates.FRAGMENT:
+            groups = [self._fragment_candidates(exchange, a, b)]
+            groups += route_candidates.mapped_routes(exchange, dom, run_context)
+            return route_candidates.interleave(groups, self.max_visits)
         if only is not None:
             return route_candidates.per_parameter(exchange.url, location, only, dom)[: self.max_visits]
         groups = [self._fragment_candidates(exchange, a, b)]
         groups += route_candidates.own_route(exchange.url, dom)
+        if route_candidates.renders_script(exchange):
+            groups += route_candidates.own_query(exchange.url, dom)
         groups += route_candidates.mapped_routes(exchange, dom, run_context)
         return route_candidates.interleave(groups, self.max_visits)
 
@@ -188,7 +200,8 @@ class DomXssValidator(Validator):
                     f"page script read the route parameter from location.hash and wrote it to a "
                     f"DOM sink. This is DOM-based XSS, not server reflection.{dialog_note} "
                     f"URL: {c.url[:300]}")
-        return (f"DOM-based XSS executed in a real browser via the page query parameter "
+        kind = "page query parameter" if c.location == PAGE else "query parameter"
+        return (f"DOM-based XSS executed in a real browser via the {kind} "
                 f"{c.parameter!r} at {c.url.split('?')[0]}{tail}",
                 f"Payload placed in {route_candidates.describe(c)} ran: {shown}, {product}. The "
                 f"HTML document the server returned did not carry the payload verbatim, so page "
@@ -219,15 +232,31 @@ class DomXssValidator(Validator):
             # so the verdict is bound to it. Any other input is not tested at all.
             only = (finding.parameter_name or "").strip()
             location = (finding.parameter_location or "").strip().lower()
-            reachable = bool(only) and (
-                location == PAGE
-                or (location == ROUTE and fragment_route(urlsplit(exchange.url).fragment) is not None))
+            why = "is not a client-side route input of the replayed URL"
+            if location == route_candidates.FRAGMENT:
+                # The request-level remainder: the raw fragment names no parameter.
+                reachable = True
+            elif location == QUERY:
+                reachable = bool(only) and only in route_candidates.query_names(exchange.url)
+                if not reachable:
+                    why = "is not a query parameter of the replayed URL"
+                elif route_candidates.renders_script(exchange) is False:
+                    # A JSON or plain-text answer runs no page script: nothing
+                    # there reads location.search. The page that issued the
+                    # call is tested through its route.
+                    reachable = False
+                    why = ("is answered with a document no page script runs in (not HTML), "
+                           "so nothing there reads location.search")
+            else:
+                reachable = bool(only) and (
+                    location == PAGE
+                    or (location == ROUTE
+                        and fragment_route(urlsplit(exchange.url).fragment) is not None))
             if not reachable:
                 return ValidationResult(
                     validator=self.name, status="skipped", finding_class="dom_xss",
-                    summary=(f"the {finding.parameter_location or 'unnamed'} parameter {only!r} is "
-                             "not a client-side route input of the replayed URL, so it was not "
-                             "tested"),
+                    summary=(f"the {finding.parameter_location or 'unnamed'} parameter {only!r} "
+                             f"{why}, so it was not tested"),
                     control_outcome=NAMED_PARAMETER_UNTESTED)
         tested = tested_inputs(finding, [only] if only is not None else [])
 
@@ -267,16 +296,17 @@ class DomXssValidator(Validator):
             # fragment text carries a*b, not the product, so it never confirms.
             how = ("console" if any(str(m).strip() == expected for m in obs.console) else
                    "dialog" if expected in _dialog_messages(obs) else "")
-            if how and c.location == PAGE:
-                # The page query reaches the server. Execution is DOM-based only
-                # when the document the server returned did not carry the payload.
+            if how and c.location in (PAGE, QUERY):
+                # The query reaches the server. Execution is DOM-based only when
+                # the document the server returned did not carry the payload.
                 served = route_candidates.served_payload(obs, c.payload)
                 if served is not False:
+                    which = "page query" if c.location == PAGE else "query"
                     if signal is None:
-                        signal = (url, ("the payload executed from the page query, but the server "
+                        signal = (url, (f"the payload executed from the {which}, but the server "
                                         "returned it in the document (reflected XSS, browser_xss's "
                                         "verdict)" if served else
-                                        "the payload executed from the page query, but the document "
+                                        f"the payload executed from the {which}, but the document "
                                         "the server returned was not kept, so a server reflection "
                                         "cannot be ruled out"),
                                   f"computed product {expected}")

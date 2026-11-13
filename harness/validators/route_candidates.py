@@ -13,6 +13,8 @@ fragment route (`/#/r?p=`, location "route") and a parameter of the page's own q
   issuing (ClientRouteMap.routes_for_api), so the view's route parameter is tried.
   An API call answers JSON, and no page script runs on JSON, so the page that issued
   the call is the place where the payload can run.
+- `own_query`: the captured URL is an HTML page, so a page script may read each
+  of its own query parameters from location.search (dom_xss).
 
 `interleave` takes the candidate groups in turn, so each kind of input gets a visit
 before `max_visits` cuts the list. Every URL keeps the captured URL's origin. The
@@ -24,10 +26,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlsplit
 
-from harness.client_routes import PAGE, ROUTE, fragment_route, payload_url
+from harness.client_routes import PAGE, QUERY, ROUTE, fragment_route, payload_url
 
 FRAGMENT = "fragment"
-QUERY = "query"
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,38 @@ def route_names(url: str) -> list[str]:
 def own_route(url: str, payloads: list[str]) -> list[list[Candidate]]:
     """One group per parameter of the URL's own fragment route."""
     return [per_parameter(url, ROUTE, name, payloads) for name in route_names(url)]
+
+
+def query_names(url: str) -> list[str]:
+    """The parameter names in a URL's own query, in order."""
+    names = []
+    for k, _v in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+        if k and k not in names:
+            names.append(k)
+    return names
+
+
+def own_query(url: str, payloads: list[str]) -> list[list[Candidate]]:
+    """One group per parameter of the URL's own query (fragment kept)."""
+    return [per_parameter(url, QUERY, name, payloads) for name in query_names(url)]
+
+
+# Content types of a document a browser runs page script in.
+_SCRIPTED_TYPES = ("html", "xml", "svg")
+
+
+def renders_script(exchange) -> bool | None:
+    """Whether the captured response is a document the browser runs page script in:
+    True for an HTML, XHTML, XML or SVG content type, False for any other declared
+    type (JSON, plain text, an image), None when the capture declares none."""
+    ctype = ""
+    for k, v in (getattr(exchange, "response_headers", None) or {}).items():
+        if str(k).lower() == "content-type":
+            ctype = str(v or "").lower()
+            break
+    if not ctype:
+        return None
+    return any(t in ctype for t in _SCRIPTED_TYPES)
 
 
 def mapped_routes(exchange, payloads: list[str], run_context) -> list[list[Candidate]]:

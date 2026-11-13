@@ -39,12 +39,15 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 __all__ = ["CLIENT_ROUTE_LEGS", "CLIENT_ROUTE_LOCATIONS", "ClientRoute", "ClientRouteMap",
-           "HASH", "HISTORY", "PAGE", "ROUTE", "declared_views", "fragment_route", "payload_url",
-           "route_params_of_template"]
+           "HASH", "HISTORY", "PAGE", "QUERY", "ROUTE", "declared_views", "fragment_route",
+           "payload_url", "route_params_of_template"]
 
 HASH, HISTORY = "hash", "history"
 # Coverage case locations: a parameter of the fragment route, a parameter of the page query.
 ROUTE, PAGE = "route", "page"
+# A parameter of a captured URL's own query, which a page script may also read
+# from location.search (dom_xss). It is the coverage model's own "query" input.
+QUERY = "query"
 CLIENT_ROUTE_LOCATIONS = frozenset({ROUTE, PAGE})
 # The legs that load the page in a browser and so can test a client-side route input.
 CLIENT_ROUTE_LEGS = frozenset({"browser_xss", "dom_xss"})
@@ -155,7 +158,8 @@ def payload_url(url: str, location: str, name: str, payload: str) -> str | None:
 
     `route`: a parameter of the fragment route (`/#/r?name=<payload>`), which is never
     sent to the server. `page`: a parameter of the page's own query
-    (`/r?name=<payload>`). Returns None when `url` has no fragment route for a
+    (`/r?name=<payload>`). `query`: a parameter of the captured URL's own query,
+    with its fragment kept. Returns None when `url` has no fragment route for a
     `route` input."""
     parts = urlsplit(url)
     if location == ROUTE:
@@ -168,6 +172,9 @@ def payload_url(url: str, location: str, name: str, payload: str) -> str | None:
     if location == PAGE:
         return urlunsplit((parts.scheme, parts.netloc, parts.path or "/",
                            _set_param(parts.query, name, payload), ""))
+    if location == QUERY:
+        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/",
+                           _set_param(parts.query, name, payload), parts.fragment))
     return None
 
 
