@@ -270,6 +270,8 @@ class TransientRetryTests(RetryTestBase):
             "connect": lambda r: httpx.ConnectError("synthetic refused", request=r),
             "timeout": lambda r: httpx.ReadTimeout("synthetic timeout", request=r),
             "protocol": lambda r: httpx.RemoteProtocolError("synthetic closed", request=r),
+            "read_reset": lambda r: httpx.ReadError("synthetic reset", request=r),
+            "write_reset": lambda r: httpx.WriteError("synthetic reset", request=r),
             "502": 502, "503": 503, "504": 504,
         }
         for name, fault in faults.items():

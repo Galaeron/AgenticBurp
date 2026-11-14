@@ -274,6 +274,13 @@ _BACKOFF_CAP_SECONDS = 8.0
 # Longest 429 Retry-After that is waited out before a retry; a longer one fails
 # the call now rather than stalling it.
 _MAX_RETRY_AFTER_SECONDS = 30.0
+# A connection the server reset after accepting it: while the request was being
+# sent (WriteError) or while the reply was being read (ReadError). Seen live when
+# llama-server was restarted mid-call: the raw ReadError escaped the client and
+# ended the caller's agent loop. A refused connection (ConnectError) and a close
+# before the reply was complete (RemoteProtocolError) are handled separately.
+# Not httpx.NetworkError as a whole: ConnectError has its own message.
+_DROPPED_CONNECTION_ERRORS = (httpx.ReadError, httpx.WriteError)
 
 
 def _retry_after_seconds(value) -> float | None:
@@ -1261,6 +1268,12 @@ class OllamaClient:
                 error=OllamaError(safe_error_summary(e)),
             )
             raise OllamaTransientError("Ollama closed the connection unexpectedly") from e
+        except _DROPPED_CONNECTION_ERRORS as e:
+            self.audit_logger.log_llm_error(
+                model=model,
+                error=OllamaError(safe_error_summary(e)),
+            )
+            raise OllamaTransientError("Ollama connection dropped mid-request") from e
 
         if resp.status_code != 200:
             if self.api == API_OPENAI and resp.status_code == 400 and _openai_context_error(resp):
