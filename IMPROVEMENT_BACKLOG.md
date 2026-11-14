@@ -4728,3 +4728,387 @@ Juice Shop.
   - A Java unit test: an in-scope response is enqueued once per route signature.
   - Out-of-scope traffic never reaches the harness (negative control).
   - Active legs are never triggered from this path.
+
+## External skills-library read — 2026-11-12 (SKL-*)
+
+Filed from a user-requested evaluation of `mukul975/anthropic-cybersecurity-skills` (818 Claude
+Code skills, Apache-2.0; ~146 touch web/API testing). **Decision: do NOT install it as a plugin
+or copy its skills/scripts in.** Reasons (VERIFIED this session): the harness's reasoning runs on
+local Ollama/llama.cpp models that never load Claude Code skills; the 818 descriptions are
+~89k tokens of skill listing per Claude Code session; nearly every web class it covers already has
+an agent + validator here; the sampled race-condition skill's helper script calls "more than one
+200" a race with no baseline or state check, weaker than this repo's oracle rules; and each skill
+ships a third-party `scripts/agent.py`. Only the additive remainder is filed below.
+
+**Provenance rule:** reimplement ideas in our own words and code. Do not paste SKILL.md text or
+scripts. The race-sync technique in SKL-1 comes from public HTTP research, not from the skills repo.
+**Owner table:** these items post-date the 2026-10-17 I01 owner table and have no I-ticket.
+**Freeze compliance:** SKL-3/SKL-4 add detection surface after P2-2 decided COLLAPSE, so (as with
+ER-3/ER-5) they are **DEPRIORITIZED**, not pickable. **Loop pick order:** SKL-2 → SKL-1 → SKL-5. The
+non-negotiables at the top of this file apply.
+
+### [~] SKL-1 — Tighten and measure the race-condition burst's dispatch window
+- **Domain:** Validator soundness · **Effort:** S-M · **Depends on:** none ·
+  **Mode:** LOOP (offline, stubbed transport); efficacy on a real race stays OWNER/LIVE.
+- **Evidence (VERIFIED):** `harness/validators/race_condition_validator.py` builds each burst
+  request inside `fire_one()` (`:164`) and launches them with `asyncio.gather` (`:196`). The
+  no-run-context fallback opens a fresh `httpx.AsyncClient` per request (`:180`), so every copy
+  pays its own TCP/TLS setup before sending. The verdict is `clean_successes >= 2` (`:222`). The
+  result records no send timing, so a `not_confirmed` cannot show whether the copies actually
+  overlapped at the server.
+- **Problem:** per-request setup jitter can spread the burst wider than a check-then-act window.
+  A real race then reads as `not_confirmed`, and nothing in the evidence shows the burst was loose.
+- **Recommendation:** (1) do all per-request preparation (session binding, client/connection
+  setup the transport already allows) before a shared release barrier, then send together;
+  (2) record each copy's send-start/response times and the dispatch spread (max − min send start)
+  in the result's evidence/raw output; (3) keep the verdict rule unchanged. Stay inside
+  `run_context.executor().execute()` and its scope/gate/budget/evidence path. No raw sockets, no
+  extra warm-up requests the gate does not count. True single-packet HTTP/2 or last-byte sync needs
+  its own transport, so it is out of scope here; file it separately if the measured spread shows
+  a need.
+- **Acceptance criteria:** a caller-level test with a recording fake transport shows no copy is
+  sent before the barrier releases and the spread is recorded; a gate-clamped burst still sends
+  only the allowed count; negative control: an identical set of responses gives the same verdict as
+  before the change; `test_race_condition_transport` and the other race tests stay green; `full`
+  green.
+- **Result (2026-11-12, uncommitted):** VERIFIED (offline). Every burst copy, including the
+  email-race pair, is prepared before one shared release and then sent. Per-copy send/complete
+  times and the dispatch spread go into `raw_output["dispatch"]` and the evidence text; the
+  no-run-context fallback shares one `httpx.AsyncClient` sized to the burst. The verdict rule and
+  the gate-clamped, blocked and error paths are unchanged. `harness.test_race_condition_dispatch`
+  (7 tests, with a negative control against the old verdict) plus the transport, email-race,
+  safety-gate and transport-inventory tests pass under 3.14 and 3.12 (93 OK). `harness.suite full`
+  on 3.14: harness unittest 3914 OK, testing 440 OK, evaluation_integrity 59 OK, pytest 38 passed.
+  Efficacy on a real race stays OWNER/LIVE.
+
+### [~] SKL-2 — Give every specialist agent a matching built-in knowledge note
+- **Domain:** AI grounding · **Effort:** S-M · **Depends on:** none ·
+  **Mode:** LOOP (offline retrieval test); effect on detection quality stays OWNER/LIVE.
+- **Evidence (VERIFIED):** `harness/knowledge.py` `_CORPUS` (`:22`) has 10 entries.
+  `retrieve()` scores tag overlap against `_tokenize(agent_name)` (`:116-117`; the regex keeps
+  underscores, so `race_condition` is one token), and `base_agent.py:279` passes `self.name`.
+  Of 36 registered agent names, 25 match no corpus tag through their own name: ai_security,
+  anomaly, api_security, business_logic_enhanced, command_injection, crypto, csp, csrf,
+  deserialization, file_upload, graphql, header_injection, http_request_smuggling,
+  info_disclosure, nosql, oauth, open_redirect, race_condition (the race note is tagged `race`),
+  rate_limit, recon, ssti, subdomain_takeover, web_cache_poisoning, websocket, xxe.
+- **Problem:** most specialists get no methodology grounding unless URL/body words happen to
+  overlap a tag. One mismatch is a plain bug: the race note never reaches the `race_condition` agent.
+- **Recommendation:** add the exact agent-name tokens to existing entries where a note already fits
+  (e.g. `race_condition`), and write short new hand-written notes for the rest. Use the existing
+  style: 2–4 sentences, operational, stating the proof oracle (differential test, negative control,
+  second identity, out-of-band callback) rather than payload lists. Check whether family routing
+  (`harness/agent_families.py`) builds prompts through a path that calls `retrieve()`, and with
+  which name. Cover family names too if it does. Keep per-note size small enough that top_k=2
+  stays well inside current prompt budgets.
+- **Acceptance criteria:** a test asserts every registered agent name (and family name, if
+  applicable) retrieves at least one built-in note from a neutral exchange. A negative control
+  shows a neutral exchange does not pull an unrelated class's note (e.g. `xss` does not get the
+  deserialization note). `test_knowledge_rag` stays green, and `full` is green. The Result notes
+  that prompt text changed, so benchmark comparisons across this commit are not like-for-like.
+- **Result (2026-11-12, uncommitted):** SUPPORTED. `_CORPUS` grew from 10 to 32 entries: 22 new
+  proof-rule notes plus exact-name tags (`race_condition`, `business_logic_enhanced`,
+  `ai_security`). Every registered agent retrieves a built-in note from a neutral exchange, and a
+  12-pair negative control shows no cross-class leak (`harness.test_knowledge_coverage`). The dead
+  two-character `ci` tag (below the tokenizer minimum) was dropped from the supply-chain note.
+  Family routing passes the first member's name to `retrieve()`, never a family name, so no family
+  tags were added (that gap is SKL-5). Prompt text changed, so benchmark comparisons across this
+  change are not like-for-like; analysis-cache keys do not include knowledge text, so use a fresh
+  cache for a live comparison. `full` green as recorded on SKL-1. Detection-quality effect stays
+  OWNER/LIVE.
+
+### [ ] SKL-3 — Server-side prototype pollution (JSON `__proto__` / `constructor.prototype`)  [DEPRIORITIZED — P2-2 decided COLLAPSE]
+- **Domain:** Coverage · **Effort:** M-L · **Mode:** design LOOP; any live leg OWNER/LIVE.
+- **Evidence (VERIFIED):** no non-test module under `harness/` mentions `__proto__`, `prototype`
+  or prototype pollution.
+- **Note:** a real leg would sit in the `injection` or `api_logic` family. Pollution can persist
+  in the target process for every later user, so a leg needs a benign, self-identifying and
+  reversible marker, plus an explicit owner opt-in beyond `active_enabled`.
+- **Reopen when:** a corpus or live run shows a missed prototype-pollution finding.
+
+### [ ] SKL-4 — HTTP parameter pollution (duplicated query/body parameters)  [DEPRIORITIZED — P2-2 decided COLLAPSE]
+- **Domain:** Coverage · **Effort:** M · **Mode:** design LOOP; live leg OWNER/LIVE.
+- **Evidence (VERIFIED):** no non-test module under `harness/` tests duplicated parameters. The only
+  hit, `harness/principals.py:49`, preserves repeated parameters during parsing.
+- **Note:** a sound leg is differential: the same request with the parameter once vs duplicated
+  (first/last value swapped), compared against a control. It would extend existing legs, not add an
+  agent.
+- **Reopen when:** a corpus or live run shows a parsing-split miss (e.g. authorization checks one
+  copy, the action uses the other).
+
+### [~] SKL-5 — Family prompts carry only the first member's knowledge note
+- **Domain:** AI grounding · **Effort:** S · **Depends on:** SKL-2 ·
+  **Mode:** LOOP (offline prompt test); effect on detection quality stays OWNER/LIVE.
+- **Evidence (VERIFIED):** `FamilyRunner.run` (`harness/agent_families.py:198-201`) builds the
+  family's user prompt with `self._primary._user_prompt(...)`, where `_primary = members[0]`
+  (`:188`). `BaseAgent._user_prompt` retrieves notes with `knowledge.retrieve(self.name, ...)`
+  (`base_agent.py:279`). With `coordinator.routing_mode: "families"` (the P2-2 COLLAPSE setting,
+  opt-in through `config.local.yaml`), the `injection` family's prompt gets the `sqli` note, and
+  the nosql, command_injection, ssti, xss and xxe notes never match by agent name.
+- **Problem:** in family mode, SKL-2's per-agent grounding reaches only one member per family.
+- **Recommendation:** in family mode, retrieve at most one built-in note per routed member, with a
+  fixed total cap so the prompt stays within the current budget. Keep the agents-mode prompt
+  byte-identical.
+- **Acceptance criteria:** a caller-level test shows a routed family prompt contains a note for
+  each routed member, up to the cap. Negative control: the agents-mode prompt for the same exchange
+  is unchanged. `test_agent_families` stays green, and `full` is green.
+- **Result (2026-11-12, uncommitted):** VERIFIED (offline). `FamilyRunner.run` passes every
+  routed member's name as `knowledge_members`, so `_user_prompt` calls the new
+  `knowledge.retrieve_for_family`: one own-class built-in note per member in dispatch order, then
+  matching external notes in any leftover slots (external notes stay off under a captured
+  principal), capped at 4 notes / 2500 characters (`FAMILY_NOTE_CAP`, `FAMILY_NOTE_MAX_CHARS`). A
+  routed 6-member family prompt passes `PromptValidator`. `harness.test_family_knowledge` (15 tests,
+  caller-level through `AgentManager.run_multiple_agents`): a family prompt holds a note per routed
+  member up to the cap; negative control: agents-mode blocks equal `retrieve()` and never call
+  `retrieve_for_family`, and all 72 agents-mode prompts (36 agents x 2 exchanges) are byte-identical
+  before and after. Reverting to primary-only retrieval fails 4 of the 5 family tests.
+  `test_agent_families` green; `harness.suite full` on 3.14: harness unittest 3948 OK, testing 440
+  OK, evaluation_integrity 59 OK, pytest 38 passed, coverage gate passed. Family routing
+  still ships OFF; the effect on detection quality stays OWNER/LIVE.
+
+**Considered, not filed:** WAF-bypass skills (an evasion technique, not a finding class; conflicts
+with passive defaults); broken-link hijacking (needs lookups of third-party domains outside scope;
+`subdomain_takeover` covers the adjacent case); GraphQL depth/alias abuse (already in
+`harness/agents/graphql_agent.py` guidance).
+
+## OWASP WSTG gap review — 2026-11-12 (WG-*)
+
+Filed from a user-requested review of all 117 tests in the current WSTG checklist against this
+checkout. The per-test table, tiers and evidence are in `docs/WSTG_GAP_REVIEW_2026-11-12.md`
+(VERIFIED against code on that date; live detection quality stays OWNER/LIVE). Result: 36 tests
+confirmed by a validator, 12 by a deterministic check, 20 partial, 16 agent-only, 30 with nothing,
+3 out of reach. The coverage catalog also cites the wrong WSTG test for 13 of its 38 rows.
+**Owner table:** these items post-date the 2026-10-17 I01 owner table and have no I-ticket.
+**Freeze compliance:** WG-1..WG-3 add no detection class (bookkeeping, and a Python port of a
+capability the Java plane already runs). WG-4 adds passive detection surface, so it waits for an
+owner decision. WG-6 is new classes, so (as with ER-3/ER-5 and SKL-3/SKL-4) it is
+**DEPRIORITIZED**, not pickable. **Loop pick order (after SKL-5):** WG-1 → WG-2 → WG-3. The
+non-negotiables at the top of this file apply.
+
+### [~] WG-1 — Re-key the coverage catalog to current WSTG IDs, keeping v4.2 aliases
+- **Domain:** Reporting correctness · **Effort:** M · **Depends on:** none · **Mode:** LOOP.
+- **Evidence (VERIFIED):** `CHECK_CATALOG` (`harness/coverage_model.py:494`) tags all 38 rows
+  `wstg_version="4.2"`. v4.2 has no IDs for JWT, CSP, deserialization or mass assignment, so rows
+  borrowed neighbouring IDs. 13 rows name a different WSTG test: CONF-05 (CSP; actually admin
+  interfaces), CONF-08 (CORS; dropped Flash test), CONF-02 (headers; platform config), ATHN-01
+  (bypass; encrypted credentials), BUSV-04 (smuggling; no such category), INPV-14 (CRLF;
+  incubated), INPV-06 (NoSQL; LDAP), INPV-17 (open redirect; Host header), CRYP-04 (JWT; weak
+  encryption), INPV-11 (deserialization; code injection), BUSL-07 (race; misuse defenses),
+  BUSL-08 (TOCTOU; unexpected file types), plus internal AV-MASSASSIGN-01 (now INJT-20). The
+  same drift is in `coverage_manifest.py:174` (calls INPV-17 "a genuine WSTG id"), the MFA legs
+  bound to ATHN-01 (`coverage_manifest.py:203-206`; MFA is ATHN-11), and validator docstrings
+  (`csrf_validator` SESS-09, `toctou_validator` BUSL-07, `file_upload_validator` BUSL-09).
+  `check_id` is persisted (`store.py:234`), keys coverage cells (`coverage_model.py:688`), and
+  `coverage_tracker.py:135-137` maps classes to IDs.
+- **Problem:** coverage reports cite WSTG tests the harness does not run (a CSP check reported as
+  "WSTG-CONF-05 admin interfaces"), so anyone mapping results onto WSTG gets wrong answers.
+- **Recommendation:** move every row to the current WSTG ID and title family (INJT-*, CLNT-07,
+  SESS-10, CONF-12/14, INJT-20, ATHN-04/11, BUSL-05), set `wstg_version` to the current release,
+  and keep each old ID in one alias table so cells and ledgers stored under old IDs (r9, r10 and
+  earlier) still resolve. Fix the manifest comment, MFA bindings and docstrings. Do not change
+  applicability or confirmation kinds here (that is WG-2). Leave the r10 worktree alone.
+- **Acceptance criteria:** a test with a vendored list of current WSTG IDs (no network) asserts
+  every non-internal catalog ID is in it; a test asserts each corrected row's hand-checked
+  mapping; a cell stored under an old ID loads under the new one; negative control: an ID in
+  neither the current list nor the alias table is rejected, not silently aliased;
+  `python -m harness.coverage_manifest --check` keeps its requirement count; `full` green.
+- **Result (2026-11-12, uncommitted):** VERIFIED (offline). 20 `CHECK_CATALOG` rows re-keyed to
+  the current IDs (INJT-01/02/05/07/12/15/16/18/19/20/23, INJT-05.6 NoSQL, CLNT-04, CLNT-07,
+  CONF-12/14, ATHN-04, SESS-10, BUSL-05, ATHZ-03); `wstg_version` is "latest" (upstream has no
+  newer numbered release than v4.2). The vendored list is the new `harness/wstg_ids.py` (117 tests
+  + 12 sub-tests from OWASP/wstg master @ 4d58b98e, 2026-11-11). The one alias table is
+  `coverage_model.LEGACY_CHECK_ID_ALIASES` (20 entries) with `resolve_check_id`, which raises
+  `UnknownCheckIdError` for an ID in neither table; an import guard rejects a row missing from the
+  vendored list or an alias that shadows a current ID. Old IDs resolve in `CoverageMatrix.from_dict`
+  (a current-ID entry wins over a legacy duplicate), `coverage_manifest.load_evidence` /
+  `write_evidence` (unknown IDs refused) and `coverage_tracker` events; `proof_records.check_id` is
+  not rewritten (it feeds the `case_id` hash). Manifest comment fixed; the MFA legs move to ATHN-04
+  until WG-2 adds an ATHN-11 row; csrf (SESS-05), toctou (ATHZ-03) and file_upload (BUSL-08)
+  docstrings and the two fixture docstrings fixed. `harness.test_wstg_catalog_ids` (19 tests):
+  vendored-list membership, hand-checked mapping per row, an old cell/evidence/event lands on the new
+  ID, and negative controls (unknown and v4.2-only IDs are rejected, never aliased). Making
+  `resolve_check_id` the identity in each reader fails its alias tests. `coverage_manifest --check`
+  keeps 38 requirements; standalone statuses are identical before and after (22 unimplemented,
+  13 skipped, 3 manual), and inside `full` the 13 are covered_partial on fresh evidence.
+  `harness.suite full` on 3.14: harness unittest 3948 OK, testing 440 OK, evaluation_integrity 59
+  OK, pytest 38 passed, coverage gate passed. Applicability and confirmation kinds unchanged
+  (WG-2).
+
+### [~] WG-2 — Give existing validators catalog rows and fix stale confirmation kinds
+- **Domain:** Reporting correctness · **Effort:** M · **Depends on:** WG-1 · **Mode:** LOOP.
+- **Evidence (VERIFIED):** catalog confirmation kinds are stale: CSRF (SESS-05) and file upload
+  say `manual`, NoSQL says `agent`, although `csrf_validator`, `file_upload_validator` and
+  `nosql_validator` are registered. SESS-01 routes to `auth_sequence`, but the token
+  predictability check is `reset_token_validator.analyze_tokens`. Registered checks with no
+  catalog row: cookie attributes (`crypto_validator.py:242`, SESS-02), clickjacking
+  (`csp_validator`, CLNT-09), subdomain takeover (CONF-10), WebSockets (CLNT-10), OAuth
+  (ATHZ-05), username enumeration and MFA bypass (`auth_sequence`, IDNT-04/ATHN-11), missing
+  authentication (`missing_auth_probe`, ATHN-04), verb tampering (INJT-03), client trust
+  (BUSL-02), second-order (INJT-14), cache poisoning/deception (INJT-17/CONF-13), privilege
+  escalation (`sequence`/`toctou`, ATHZ-03).
+- **Problem:** the coverage ledger never shows these checks as run, so gap reports (including
+  `docs/COVERAGE_GAP_CLASSIFICATION_2026-10-17.md`) undercount real coverage.
+- **Recommendation:** add rows with conservative applicability (only where the exchange shape
+  fits: a WebSocket upgrade, OAuth parameters, a login form), with the confirmation kind set to
+  the registered validator. Fix the three stale kinds and the SESS-01 routing. More rows mean
+  more coverage-drive work in live runs (r9 left 3,588 cells pending), so measure the cell-count
+  change on a fixed fixture engagement and record it in the Result.
+- **Acceptance criteria:** a test asserts every non-`manual` confirmation kind names a registered
+  validator (`validators/registry.py`), and every registered validator either has a row or sits on
+  an explicit exclusion list with a reason; negative control: a row naming an unregistered
+  validator fails that test; the fixture cell-count delta is in the Result;
+  `coverage_manifest --check` and `full` green.
+- **Result (2026-11-12, uncommitted):** VERIFIED (offline). `CHECK_CATALOG` grew from 38 to 50
+  rows. WG-2 added 11: CLNT-09 (`csp`), CONF-10 (`subdomain_takeover`), SESS-02 (`crypto`), IDNT-04
+  and ATHN-11 (`auth_sequence`), ATHZ-05 (`oauth`), CLNT-10 (`websocket`), INJT-03 (`verb_tamper`),
+  BUSL-02 (`client_trust`), INJT-17 and CONF-13 (`web_cache_poisoning`); SESS-06 came with WG-3.
+  New narrow predicates: `_issues_session_cookie`, `_has_oauth_params`, `_is_websocket_endpoint`,
+  `_has_denied_role`, `_has_client_value_field`, `_is_get`, `_is_authed_get`; the two domain rows
+  follow CONF-12/CRYP-01. Kinds fixed: SESS-05 -> `csrf` (the manifest keeps the manual PoC
+  aspect), INJT-05.6 -> `nosql`, SESS-01 -> `reset_token` (narrowed to `_has_auth_endpoint`). MFA
+  bindings moved to ATHN-11. `coverage_model.catalog_kind_problems` with `VALIDATOR_ROW_EXCLUSIONS`
+  (file_upload, api_security, deserialization, idor_read, verbose_error) and `EXCLUDED_CATALOG_ROWS`
+  (INJT-14) backs the new `harness.test_catalog_validator_rows` (11 tests); negative controls flag an
+  unregistered kind, an unexplained registered validator, a stale exclusion and an excluded ID
+  that has a row. Applicable cells for the 11 WG-2 rows: `discovery_pipeline` OpenAPI fixture
+  118 -> 138 (driver-backed pending 46 -> 48), `open_redirect` fixture 16 -> 22 (6 -> 8); SESS-06
+  adds as many as SESS-03 (same predicate). Manifest: 50 requirements; inside `full` 14
+  covered_partial, 33 unimplemented, 3 manual. `harness.suite full` on 3.14 after WG-2 + WG-3:
+  harness unittest 3972 OK, testing 440 OK, evaluation_integrity 59 OK, pytest 38 passed,
+  coverage gate passed (the first run's one failure was the no-orphan lint on the new logout test
+  file, fixed before this run).
+  **Open:** (1) no BUSL-08 row: "WSTG-BUSL-08" is still the legacy alias for TOCTOU, so a row would
+  re-read pre-WG-1 TOCTOU cells as file-upload cells; it needs version-aware alias reading. (2) No
+  INJT-14 row: second-order classes canonicalize to nothing. (3) IDNT-04/ATHN-11 (like ATHN-04/07)
+  carry class `auth`; the coverage driver passes the row class (`orchestrator_chain.py` `_run_leg_core`)
+  and auth_sequence routes bare `auth` to no check, so those cells are never driven. (4)
+  `coverage_tracker.record_findings` marks every row sharing a class: WG-2 widened `auth` from 3 to
+  5 rows and made `crypto`, `csp` and `web_cache_poisoning` shared, so one finding can fill
+  unrelated cells. (5) nosql, client_trust, websocket, oauth, csp, crypto, subdomain_takeover and
+  cache rows are not in `_LEG_CONFIRMATIONS`, so their cells stay pending or skipped.
+- **Result, open items (3) and (4) (2026-11-13, uncommitted):** VERIFIED (offline). `Check` gains
+  `specific_classes` and `leg_class`; all 22 rows in the eight shared-class groups declare
+  `specific_classes` (from validator `finding_classes`, `categories.py` synonyms and the IDOR/BFLA
+  words), and the pure guard `shared_class_specificity_problems` requires that, with no token on two
+  rows. `CoverageTracker.resolve_class(cls, validator)`: a specific token picks one row; otherwise the
+  shared class narrows to rows whose `confirmation` is the finding's `validator`/`confirmed_by_leg`;
+  a confirmed finding still matching several rows is recorded DETECTED, never CONFIRMED, on each,
+  with the reason. Bare `idor` now goes to ATHZ-04 only (it also filled ATHZ-02); bare `csp` to
+  CONF-12. `_run_leg_core` passes `leg_class or vulnerability_class`: IDNT-04 `username_enumeration`,
+  ATHN-11 `2fa_bypass`, ATHN-07 `weak_password` now reach auth_sequence's enum/mfa/weak checks;
+  SESS-01 `token entropy` (reset_token already ran its check; the class is now honest). New
+  `harness.test_coverage_shared_class_attribution` (16 tests) plus two caller-level tests in
+  `test_coverage_blocked_leg_rvf` through `investigate_engagement` on a `/login` fixture. Restoring
+  the old `checks_for_class` fails 6 of the 16; reverting the driver line fails the caller test.
+  Fixture with seeded findings: confirmed cells 4 -> 3 (ATHZ-02 and INJT-01 no longer filled by idor
+  and stored-xss findings; IDNT-04 now filled where `username_enumeration` used to match no row),
+  detected 7 -> 7. `harness.suite full` on 3.14: unittest 3990 OK, testing 440 OK,
+  evaluation_integrity 59 OK, pytest 38 passed, coverage gate passed. Still open: (1), (2), (5);
+  ATHN-04 has no bypass leg and spends one driver slot per identity per auth endpoint on a skip.
+
+### [~] WG-3 — Python leg for logout invalidation (WSTG-SESS-06); end its Java-only status
+- **Domain:** Validator coverage / Safety · **Effort:** M · **Depends on:** none ·
+  **Mode:** LOOP (fixture with matched control); efficacy on a real target stays OWNER/LIVE.
+- **Evidence (VERIFIED):** `session_timeout` is a canonical class with logout-invalidation
+  aliases (`categories.py:181-183`). The auth agent reports it (`agents/auth_agent.py:74-82`), and
+  the planner maps it to `logout_invalidation_compare` (`planner.py:39`).
+  `execution_planes.py:219` records that capability as Java-only: `SessionLifecycleLogic.java`
+  runs it through Burp with no Python SafetyGate or evidence-ledger visibility.
+  `auth_sequence_validator` dispatches session fixation, weak password policy, username
+  enumeration and MFA bypass, but not logout.
+- **Problem:** in Python-driven runs a `session_timeout` hypothesis is never confirmed. In Burp
+  runs it is confirmed outside the gate (the RB-6 residual).
+- **Recommendation:** add a `session_timeout` leg to `auth_sequence`, reusing its login replay and
+  authenticated-page oracle (`auth_sequence_validator.py:300-343`). Use a fresh throwaway login,
+  never the operator's captured session, so the tester is not logged out. Prove that session
+  reaches an authenticated page, send the captured logout request on it, then replay the
+  authenticated request with the old cookie. Confirm only when the replay still shows the
+  positive authenticated signal and an anonymous request is denied. Keep the existing
+  auth_sequence gates (`validators.allow_mutating_replay`), and make the capability dual-plane
+  and Python-authoritative in `execution_planes.py`. Idle and absolute timeout (SESS-07) need
+  waits of minutes to hours, so they are out of scope.
+- **Acceptance criteria:** a caller-level test through registry dispatch on a `session_timeout`
+  finding confirms against a fixture whose logout only clears the cookie client-side; negative
+  control: a fixture that invalidates the session server-side stays `not_confirmed`; a
+  gate-blocked run sends nothing; `test_execution_planes` updated and green; `full` green.
+- **Result (2026-11-12, uncommitted):** VERIFIED (offline). `auth_sequence_validator` gains
+  `_check_logout_invalidation`, dispatched as `"logout"` before the MFA branch for `session_timeout`
+  and logout-invalidation classes (`_is_logout_class`). A bare "logout" or a bare "not invalidated"
+  does not match, so "csrf on logout", "reset token not invalidated" and "session not invalidated
+  after password change" keep their own routing (the chain's auth branch precedes reset_token).
+  The fresh session comes from replaying the captured username+password login without its Cookie
+  header; the logout is the same-origin logout form or link the authenticated page (or the captured
+  login response) offers, never a guessed path. Oracle: the fresh cookie alone reaches a page with
+  the positive signal (`_authenticated_signal`, now shared with fixation) and the anonymous request
+  is denied; the logout is sent on the fresh cookie; the page is replayed with the pre-logout
+  cookie. Confirmed only if the replay still shows the signal; not_confirmed on a denial or login
+  redirect; inconclusive otherwise (no cookie issued, no logout control, logout >= 400 or answering
+  with another logout control). A non-login exchange is skipped and sends nothing. Every send goes
+  through `GatedAsyncClient`; `validate()` requires `validators.allow_mutating_replay`, which covers
+  a GET logout. `orchestrator_chain` routes via `_is_logout_class`; `CONFIRMABLE_CLASS_MARKERS`
+  lists the aliases (not live-verified: no `leg_self_test` case, so provisional). `execution_planes`:
+  logout_invalidation is `_dual`, Python-authoritative (dual 26 -> 27, Java-only 3 -> 2, Python-only
+  14). New `harness.test_auth_logout_invalidation` (10 tests): confirm on a client-side-only logout
+  with the operator's cookie never sent; server-side invalidation stays not_confirmed; no fresh
+  session, no logout control and gate-off each send nothing to logout; routing positives and
+  near-miss negatives. Removing the dispatch branch fails the confirm test. Catalog row
+  WSTG-SESS-06 (`session_timeout`, `_has_auth_endpoint`, `auth_sequence`) with confirm and control
+  bound in `coverage_manifest`; covered_partial inside `full`. **Open:** cookie sessions only (token
+  auth -> inconclusive); the fresh login uses the operator's account, so an app that ends every
+  session of a user on logout would also end the tester's; with `allow_mutating_replay` on, the
+  coverage driver now fires this leg on auth-endpoint cells; efficacy on a real target is
+  OWNER/LIVE.
+
+### [ ] WG-4 — Passive hygiene checks: headers, caching, tokens in URLs, cleartext forms  [NEEDS OWNER DECISION — adds passive detection surface]
+- **Domain:** Coverage (passive) · **Effort:** S-M · **Mode:** LOOP once the owner approves.
+- **Evidence (VERIFIED):** no validator checks X-Content-Type-Options, Referrer-Policy or
+  Permissions-Policy (CONF-14). Nothing checks `Cache-Control: no-store` on authenticated
+  responses (ATHN-06). Session parameter names are on the redaction list (`security.py:136-147`)
+  but a token in a URL is never reported (SESS-04). No check exists for `http://` form actions or
+  mixed content on HTTPS pages (CRYP-03). `confidential_info_detector` finds secrets but not HTML
+  comments or source-map references (INFO-05).
+- **Note:** these are cheap, passive and deterministic, and fit the passive defaults. They still
+  add detection surface after P2-2 COLLAPSE, and low-severity hygiene findings can bury real
+  ones. Reverse tabnabbing (CLNT-14) is left out: current browsers default to `noopener`.
+- **Recommendation (if approved):** put them in the existing passive paths (`csp_validator`
+  header audit, `crypto_validator` cookie/transport audit, `confidential_info_detector`). Report
+  them as informational hygiene, never as confirmed vulnerabilities, behind a config flag that
+  ships OFF.
+- **Acceptance criteria:** each check has a positive fixture and a matched negative (header
+  present; `no-store` set; token in the body, not the URL); the default config produces no new
+  findings; `full` green.
+
+### [ ] WG-5 — Password-reset flow logic and Host-header reset poisoning (ATHN-09, INJT-17)  [BLOCKED — needs an owner-provided mail sink]
+- **Domain:** Validator coverage · **Effort:** M-L · **Mode:** design LOOP; live legs OWNER/LIVE.
+- **Evidence (VERIFIED):** `reset_token_validator` tests only token predictability.
+  `web_cache_poisoning_validator` tests `X-Forwarded-Host` reflection in cached responses only.
+  No leg tests reset-token reuse, a swapped user parameter in the reset request, or a Host /
+  `X-Forwarded-Host` value ending up in the emailed reset link.
+- **Note:** the poisoning oracle is the link in the email, so a leg needs a mail sink the owned
+  test target sends to (for example a mail-catcher container in the test environment). The
+  reuse and user-swap legs can be checked in-band on fixtures once the design is agreed.
+- **Reopen when:** the owner provides a mail sink, or a run shows a missed reset-flow finding.
+
+### [ ] WG-6 — WSTG tests with no confirming leg (new detection work)  [DEPRIORITIZED — P2-2 decided COLLAPSE]
+- **Domain:** Coverage · **Mode:** design LOOP per class; live legs OWNER/LIVE.
+- **Most likely to matter on current targets:** client-side template injection (CLNT-15); a
+  GraphQL introspection/batching leg (APIT-99, agent exists); DOM-driven redirects (CLNT-04,
+  extend the `dom_xss` source-to-sink check); postMessage handlers (CLNT-11); workflow
+  step-skipping (BUSL-06; the Java `workflow_replay_compare` covers numeric boundaries only);
+  backup variants of discovered paths (CONF-04); eval-style code injection (INJT-11). Prototype
+  pollution and parameter pollution are SKL-3 and SKL-4.
+- **Legacy or rare:** LDAP (INJT-06), XPath (INJT-09), SSI (INJT-08), IMAP/SMTP (INJT-10), format
+  string (INJT-13), CSV/formula (INJT-21), padding oracle (CRYP-02), HTML-only injection
+  (CLNT-03), CSS injection (CLNT-05), client-side resource manipulation (CLNT-06), XSSI (CLNT-13),
+  DOM clobbering (CLNT-16), browser storage (CLNT-12), cloud-storage ACLs (CONF-11), file
+  extension handling (CONF-03), feature flags (CONF-15), session puzzling (SESS-08), concurrent
+  sessions (SESS-11), weak cryptographic primitives (CRYP-04).
+- **Reopen when:** a corpus or live run shows a missed finding of that class.
+
+**Considered, not filed:** search-engine recon (INFO-01), network scanning (CONF-01) and file
+permissions (CONF-09) are out of reach by design. Default-credential guessing (ATHN-02) conflicts
+with passive defaults and risks lockouts. Alternative channels (ATHN-10) and SAML (ATHN-12) need
+other clients or an identity provider. Remember-password, security questions, role definitions,
+provisioning and username policy (ATHN-05/08, IDNT-01/03/05) are manual design reviews. Idle and
+absolute session timeout (SESS-07) needs long waits; it can become an opt-in on WG-3 later.
+WebAssembly recon (WASM-01) would be all-new surface.

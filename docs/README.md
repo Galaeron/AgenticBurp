@@ -20,6 +20,7 @@
 | Retained observations (supplied captures with or without findings) | [OBSERVATION_MEMORY.md](OBSERVATION_MEMORY.md) |
 | Why a coverage check has (or lacks) a deterministic adapter (`check_adapter_missing`) | [COVERAGE_ADAPTERS.md](COVERAGE_ADAPTERS.md) |
 | Enable and read the write-path checks (cross-identity writes, tampering, mass assignment at create) | [WRITE_CHECKS.md](WRITE_CHECKS.md) |
+| Map coverage onto OWASP WSTG (all 117 tests; catalog ID errors) | [2026-11-12 WSTG gap review](WSTG_GAP_REVIEW_2026-11-12.md) |
 
 Historical measurements, plans and reviews describe their named revisions, not
 current capability. Code is authoritative for routing/configuration; executed
