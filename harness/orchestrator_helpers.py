@@ -741,9 +741,12 @@ def _prompt_fits(resp) -> list[dict]:
 
 
 def _review_bookkeeping(captured, seen, *, errors, stats, stopped_by, reviewed,
-                        produced, grouped, elided, tier_counts, outcome_out) -> None:
+                        produced, grouped, elided, tier_counts, outcome_out,
+                        report_left: bool = True) -> None:
     """The end of one review_captured_exchanges call, however it ended: log it, report
-    what a bound left unreviewed, and add its counts to `stats` / `outcome_out`."""
+    what a bound left unreviewed (unless `report_left` is False: a review that pauses
+    and is taken up again later leaves nothing behind), and add its counts to `stats` /
+    `outcome_out`."""
     from harness import assessment_health
     from harness.assessment_health import review_frontier
     if reviewed:
@@ -753,7 +756,7 @@ def _review_bookkeeping(captured, seen, *, errors, stats, stopped_by, reviewed,
         log.info("review_captured_exchanges: %d capture(s) had model prompts cut to fit "
                  "the context window (review_stats.elided)", len(elided))
     remaining = 0
-    if stopped_by:
+    if stopped_by and report_left:
         remaining = sum(1 for _ in review_frontier(captured, seen=set(seen)))
         if remaining:
             log.info("review_captured_exchanges: %s reached, %d captured exchange(s) "
@@ -785,7 +788,9 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
                                     summary_out: dict | None = None,
                                     model_failed: set | None = None,
                                     journal_key=None, should_stop=None,
-                                    outcome_out: dict | None = None) -> int:
+                                    outcome_out: dict | None = None,
+                                    groups: dict | None = None,
+                                    report_left: bool = True) -> int:
     """Phase 0.1: route every substantive 2xx captured during discovery through
     full content-level review and fold its findings into `state`.
 
@@ -845,6 +850,14 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
     above, and the cancellation is re-raised. `outcome_out`, when given a dict, gets
     {stopped_by, reviewed, produced, remaining} for this call.
 
+    `groups`, when given a dict, carries `group_identical` across calls that share it
+    (harness/review_overlap.py's IdleReview and the capture_review pass after it): each
+    representative whose review finished is kept under its content key, and a later
+    call groups an unseen capture with that content under it, as one call over all the
+    captures would, instead of reviewing the same content again. `report_left=False`
+    (a review that will be taken up again) reports nothing as left unreviewed: no
+    truncation error, no `unreviewed` count, `remaining` 0.
+
     Returns the count of captured exchanges that yielded >=1 finding."""
     from harness import run_handoff
     _handoff = run_handoff.for_run(run_context)
@@ -854,7 +867,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             errors=errors, deadline=deadline, stats=stats, group_identical=group_identical,
             resumed=resumed, on_review=on_review, summary_out=summary_out,
             model_failed=model_failed, journal_key=journal_key,
-            should_stop=should_stop, outcome_out=outcome_out)
+            should_stop=should_stop, outcome_out=outcome_out, groups=groups,
+            report_left=report_left)
     # HU-5: whatever ends the review (a bound, an error, a cancellation), the handoff
     # gets the captures it left unreviewed. Bookkeeping only.
     seen = seen if seen is not None else set()
@@ -865,7 +879,8 @@ async def review_captured_exchanges(orch, state, captured, *, max_reviews: int =
             errors=errors, deadline=deadline, stats=stats, group_identical=group_identical,
             resumed=resumed, on_review=on_review, summary_out=summary_out,
             model_failed=model_failed, journal_key=journal_key,
-            should_stop=should_stop, outcome_out=outcome_out)
+            should_stop=should_stop, outcome_out=outcome_out, groups=groups,
+            report_left=report_left)
     finally:
         try:
             _handoff.note_captures(captured, seen)
@@ -877,7 +892,8 @@ async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_
                                      seen, errors, deadline, stats, group_identical,
                                      resumed, on_review, summary_out, model_failed,
                                      journal_key=None, should_stop=None,
-                                     outcome_out=None) -> int:
+                                     outcome_out=None, groups=None,
+                                     report_left=True) -> int:
     produced = 0
     reviewed = 0
     stopped_by = None
@@ -896,6 +912,21 @@ async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_
                         "covered_by": representative.url,
                         "reason": "identical response content, no input"})
 
+    if groups is not None and group_identical:
+        # Content an earlier call sharing `groups` already reviewed: group it there.
+        for cap in captured or []:
+            try:
+                ex = cap if isinstance(cap, HttpExchange) else HttpExchange(**cap)
+            except Exception:
+                continue
+            key = assessment_health.observation_key(ex)
+            if key in seen:
+                continue
+            content = assessment_health._group_key(ex)
+            representative = groups.get(content) if content is not None else None
+            if representative is not None and assessment_health.observation_key(representative) != key:
+                seen.add(key)
+                _grouped(ex, representative)
     frontier = review_frontier(captured, seen=seen, group_identical=group_identical,
                                on_grouped=_grouped)
     # The capture being analyzed: (its observation key, its tier name, where its
@@ -975,6 +1006,10 @@ async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_
                     elided.append({"capture": ex.url, "method": ex.method, "prompts": fitted})
                 if on_review is not None:
                     on_review(unit_key, {"findings": findings})
+            if groups is not None and group_identical:
+                content = assessment_health._group_key(ex)
+                if content is not None:
+                    groups.setdefault(content, ex)
             if findings:
                 state.ingest_findings(ex.url, ex.method, findings)
                 produced += 1
@@ -999,7 +1034,7 @@ async def _review_captured_exchanges(orch, state, captured, *, max_reviews, run_
         _review_bookkeeping(captured, seen, errors=errors, stats=stats,
                             stopped_by=stopped_by, reviewed=reviewed, produced=produced,
                             grouped=grouped, elided=elided, tier_counts=tier_counts,
-                            outcome_out=outcome_out)
+                            outcome_out=outcome_out, report_left=report_left)
     return produced
 
 
