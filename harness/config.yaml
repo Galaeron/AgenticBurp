@@ -391,6 +391,16 @@ engagement:
   # audited build, harness/ffuf@sha256:<digest> or sha256:<image id>; it must match
   # the local image (never pulled) or ffuf is skipped. Only read with discovery_ffuf.
   discovery_ffuf_image: ""
+  # Bounded recursive content discovery: after the first-level sweep, probe the
+  # wordlist (or in-run ffuf, when discovery_ffuf is on) under each directory it
+  # found (a route ending "/", a redirect to path + "/", a directory index), then
+  # under the directories that turns up, this many levels deep (at most 5). GET
+  # only, every probe through the run's scope lock and safety gate.
+  # DEFAULT 0: off, the current behaviour (nothing below the first level).
+  discovery_recursion_depth: 0
+  # The recursion's own request cap, spent from the discovery probe budget and
+  # shared evenly by the directories of a level. Only read when the depth is on.
+  discovery_recursion_max_requests: 1500
   coverage_leg_budget: 80
   # Case-granular driving (coverage_drive_cases) dispatches ssti, command injection
   # and sqlmap once per parameter; coverage_parameter_field_cap caps how many

@@ -148,6 +148,19 @@ _COMMON_BACKUP_BASES = (
 # Discovered file-like routes per directory that get backup variants. The cap is
 # reported in SurfaceResult.backup_capped_prefixes, never applied silently.
 _BACKUP_BASES_PER_DIR = 8
+# Recursive discovery never goes deeper than this many levels below the
+# directories discovery found, whatever the configured depth.
+_MAX_RECURSION_DEPTH = 5
+
+
+def _non_negative_int(value) -> int:
+    """An operator count; a bool, a non-number or a negative value is 0 (off)."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _has_backup_suffix(segment: str) -> bool:
@@ -265,7 +278,8 @@ class SurfaceDiscovery:
                  use_ffuf: bool = True, ffuf_image: str = "harness/ffuf:2.1.0",
                  run_context=None, session_ref: str | None = None,
                  soft404_prune_after: int = 16, ffuf_in_runs: bool = False,
-                 ffuf_wordlist: str = "harness"):
+                 ffuf_wordlist: str = "harness", recursion_depth: int = 0,
+                 recursion_max_requests: int = 0):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
         self.allowed_hosts = allowed_hosts or []
@@ -339,6 +353,30 @@ class SurfaceDiscovery:
         self._wildcard_suppressed = 0
         self._backup_mirrored = 0
         self._backup_capped: dict[str, int] = {}
+        # Bounded recursion into the directories discovery found (see
+        # _recurse_directories). 0 levels or 0 requests: off, today's behaviour.
+        self.recursion_depth = min(_MAX_RECURSION_DEPTH, _non_negative_int(recursion_depth))
+        self.recursion_max_requests = _non_negative_int(recursion_max_requests)
+        # Paths whose GET redirected to the same path plus "/" on this origin: a
+        # directory (filled by _probe).
+        self._dir_redirects: set[str] = set()
+        # The in-run ffuf launch that worked (pinned image, its pin note): reused to
+        # scan each directory the recursion expands. None: the Python sweep does it.
+        self._ffuf_in_run_image: tuple[str, str] | None = None
+
+    def _note_dir_redirect(self, path: str, location_url: str) -> None:
+        """A GET of /x answered with a redirect to /x/ on this origin names a
+        directory. A redirect anywhere else is not followed or recorded here."""
+        if not location_url or path.endswith("/") or "?" in path:
+            return
+        try:
+            url = self.base_url + path
+            target, here = urlsplit(urljoin(url, location_url)), urlsplit(url)
+        except ValueError:
+            return
+        if (target.scheme, target.netloc) == (here.scheme, here.netloc) \
+                and target.path == here.path + "/":
+            self._dir_redirects.add(path + "/")
 
     async def _probe(self, method: str, path: str):
         """One live request. A method seam so tests inject a canned responder and
@@ -362,6 +400,9 @@ class SurfaceDiscovery:
                 if outcome.final_url and outcome.final_url != url:
                     # The status and body are the redirect target's, not this path's.
                     self._redirected_to[path] = urlsplit(outcome.final_url).path or "/"
+                    self._note_dir_redirect(path, outcome.final_url)
+                elif 300 <= (outcome.status or 0) < 400:
+                    self._note_dir_redirect(path, _header_value(outcome.headers, "Location"))
             return outcome.status or 0, outcome.body or "", _header_value(outcome.headers, "Allow")
         from harness import global_throttle
         await global_throttle.acquire()
@@ -372,6 +413,8 @@ class SurfaceDiscovery:
             return None
         if method == "GET":
             self._content_types[path] = _header_value(resp.headers, "Content-Type")
+            if 300 <= resp.status_code < 400:
+                self._note_dir_redirect(path, _header_value(resp.headers, "Location"))
         return resp.status_code, (resp.text or ""), _header_value(resp.headers, "Allow")
 
     def _budget_left(self) -> bool:
@@ -648,6 +691,12 @@ class SurfaceDiscovery:
         #     enters role_crawl's probe set and gets Phase-0.1 content review.
         await self._probe_sensitive_files()
 
+        # 4c'. Bounded recursion (engagement.discovery_recursion_depth, default off):
+        #     the wordlist (or, inside a run with ffuf on, ffuf) under each
+        #     directory found so far, then under the directories that turns up, to
+        #     the configured depth and within its own request cap.
+        await self._recurse_directories(result)
+
         # 4d. Deep nesting: three-segment paths under live 2-segment prefixes
         #     (e.g. /api/admin/diagnostics/ping). Only fans out under namespaces
         #     that already proved live, so the cost is adaptive.
@@ -747,36 +796,10 @@ class SurfaceDiscovery:
             if pinned is None:
                 result.errors.append(f"ffuf skipped: image not pinned by digest: {pin_reason}")
                 return 0
-            from harness import tool_runner
-            from harness.tool_proxy import ToolProxy
-            run = self.run_context
-            proxy = await ToolProxy(run, self.base_url, capability="surface_discovery_ffuf",
-                                    max_forwarded=share).start()
-            try:
-                ffuf_result = await ffuf_runner.ffuf_discover(
-                    proxy.url_for(self.base_url + "/"), image=pinned, require_digest=True,
-                    headers=self.headers or None, filter_size=self._soft404_bytes,
-                    wordlist=self.ffuf_wordlist,
-                    timeout=ffuf_runner.in_run_timeout(share),
-                    cancel=lambda: run.cancel.cancelled or proxy.stop_requested,
-                    egress=tool_runner.EgressPolicy(allowed_hosts=(tool_runner._HOST_ALIAS,)))
-            finally:
-                await proxy.close()
-            self._probes += proxy.forwarded
-            result.ffuf_requests = proxy.forwarded
-            # Covered: only paths whose response came back through the run (a
-            # transport error or a refused send is not), and only when ffuf's
-            # verdict on them was not lost (see below).
-            base_path = urlsplit(self.base_url).path.rstrip("/")
-            covered = {path[len(base_path):] for path in proxy.forwarded_paths
-                       if path.startswith(base_path + "/")}
-            capped = proxy.refused.get("tool_cap", 0)
-            note = f"ffuf ({pin_reason}) sent {proxy.forwarded} request(s) through the run"
-            if capped:
-                note += f"; {capped} wordlist request(s) past its share were not sent"
-            if proxy.stop_reason:
-                note += f"; stopped: {proxy.stop_reason}"
-            result.errors.append(note)
+            ffuf_result, covered, _capped = await self._ffuf_through_run(result, "/", share,
+                                                                         pinned, pin_reason)
+            if not ffuf_result.error:
+                self._ffuf_in_run_image = (pinned, pin_reason)
         if ffuf_result.error:
             # ffuf's verdict on what it sent is lost: nothing counts as covered, so
             # the Python sweep still guesses those paths itself.
@@ -800,6 +823,160 @@ class SurfaceDiscovery:
         if count:
             result.errors.append(f"ffuf seeded {count} routes")
         return count
+
+    async def _ffuf_through_run(self, result: SurfaceResult, dir_path: str, share: int,
+                                pinned: str, pin_reason: str):
+        """One in-run ffuf scan of `dir_path` (a directory under base_url, "/" for
+        the root) through a loopback ToolProxy: every request it sends is replayed
+        through the run (budget, scope, gate) and at most `share` are sent. The
+        requests count as probes. Returns (ffuf result, paths it covered, wordlist
+        requests past the share that were not sent)."""
+        from harness import ffuf_runner, tool_runner
+        from harness.tool_proxy import ToolProxy
+        run = self.run_context
+        proxy = await ToolProxy(run, self.base_url, capability="surface_discovery_ffuf",
+                                max_forwarded=share).start()
+        try:
+            ffuf_result = await ffuf_runner.ffuf_discover(
+                proxy.url_for(self.base_url + dir_path), image=pinned, require_digest=True,
+                headers=self.headers or None, filter_size=self._soft404_bytes,
+                wordlist=self.ffuf_wordlist,
+                timeout=ffuf_runner.in_run_timeout(share),
+                cancel=lambda: run.cancel.cancelled or proxy.stop_requested,
+                egress=tool_runner.EgressPolicy(allowed_hosts=(tool_runner._HOST_ALIAS,)))
+        finally:
+            await proxy.close()
+        self._probes += proxy.forwarded
+        result.ffuf_requests += proxy.forwarded
+        # Covered: only paths whose response came back through the run (a
+        # transport error or a refused send is not), and only when ffuf's
+        # verdict on them was not lost (the caller drops them on an error).
+        base_path = urlsplit(self.base_url).path.rstrip("/")
+        covered = {path[len(base_path):] for path in proxy.forwarded_paths
+                   if path.startswith(base_path + "/")}
+        capped = proxy.refused.get("tool_cap", 0)
+        note = f"ffuf ({pin_reason}) sent {proxy.forwarded} request(s) through the run"
+        if dir_path != "/":
+            note += f" under {dir_path}"
+        if capped:
+            note += f"; {capped} wordlist request(s) past its share were not sent"
+        if proxy.stop_reason:
+            note += f"; stopped: {proxy.stop_reason}"
+        result.errors.append(note)
+        return ffuf_result, covered, capped
+
+    def _directories(self, paths) -> list[str]:
+        """The directories among discovered `paths`, each as "/dir/": a route that
+        ends in "/", one whose GET redirected to itself plus "/", and one whose 2xx
+        body is a web-server directory index. Only routes discovery saw answer
+        (not spec-listed ones), never the root and never a query."""
+        found: set[str] = set()
+        for path in paths:
+            route = self._seen.get(path)
+            if route is None or not route.status or path == "/" or "?" in path or "{" in path:
+                continue
+            if path.endswith("/"):
+                found.add(path)
+            elif path + "/" in self._dir_redirects or (
+                    path in self._bodies and _sig_directory_listing(self._bodies[path])):
+                found.add(path + "/")
+        return sorted(found)
+
+    def _directory_pruned(self, directory: str) -> bool:
+        """A directory under a namespace already shown to be a wildcard or a dead
+        soft-404 branch: its guessed children would only be suppressed."""
+        return (any(directory.startswith(p) for p in self._wildcard_prefixes)
+                or any(p in self._soft404_dead
+                       for p in self._ancestor_prefixes(directory + "x")))
+
+    async def _scan_directory(self, result: SurfaceResult, directory: str,
+                              words: list[str]) -> bool:
+        """Probe the children of one directory within the current phase limit:
+        through in-run ffuf when it already ran in this run, else the Python
+        wordlist. True when every child was tried."""
+        if self._ffuf_in_run_image is not None:
+            remaining = min(self.max_probes, self._phase_limit) - self._probes
+            # Keep a fifth for the harness re-check of ffuf's hits.
+            share = remaining - remaining // 5
+            if share > 0:
+                pinned, pin_reason = self._ffuf_in_run_image
+                ffuf_result, covered, capped = await self._ffuf_through_run(
+                    result, directory, share, pinned, pin_reason)
+                if not ffuf_result.error:
+                    for route in ffuf_result.routes:
+                        path = directory.rstrip("/") + route.path
+                        if path not in self._seen:
+                            await self._check(path, "ffuf")
+                    self._ffuf_covered |= covered
+                    return not (ffuf_result.truncated or capped)
+                result.errors.append(f"ffuf error under {directory}: {ffuf_result.error}; "
+                                     "the Python wordlist scanned it instead")
+        for word in words:
+            if not self._budget_left():
+                return False
+            await self._check(directory + word, "recursive")
+        return True
+
+    async def _recurse_directories(self, result: SurfaceResult) -> None:
+        """Bounded recursive content discovery. Each level probes the wordlist (the
+        REST nouns and the sensitive-file names, or in-run ffuf's own list) under
+        every directory found so far that was not yet expanded, then the
+        directories that turned up feed the next level, up to recursion_depth
+        levels. Every probe goes through _check (one GET, scope- and gate-checked,
+        wildcard/soft-404 controls included) and the whole recursion spends at
+        most recursion_max_requests of the discovery budget, shared evenly by the
+        directories of a level. Off (0) by default."""
+        depth, cap = self.recursion_depth, self.recursion_max_requests
+        if depth <= 0 or cap <= 0:
+            return
+        saved_limit, start = self._phase_limit, self._probes
+        recursion_limit = min(saved_limit, start + cap)
+        words = [w.lstrip("/") for w in dict.fromkeys(list(self.nouns) + list(self.sensitive_files))
+                 if w.strip("/")]
+        frontier = self._directories(list(self._seen))
+        expanded: set[str] = set()
+        level = deepest = found = scanned = pruned = partial = not_reached = 0
+        try:
+            while frontier and level < depth:
+                level += 1
+                before = set(self._seen)
+                for index, directory in enumerate(frontier):
+                    left = recursion_limit - self._probes
+                    if left <= 0:
+                        not_reached = len(frontier) - index
+                        break
+                    expanded.add(directory)
+                    if self._directory_pruned(directory):
+                        pruned += 1
+                        continue
+                    scanned += 1
+                    deepest = level
+                    # An even share of what is left for the directories still to go,
+                    # so the first directory cannot spend the whole cap.
+                    self._phase_limit = self._probes + max(1, left // (len(frontier) - index))
+                    if not await self._scan_directory(result, directory, words):
+                        partial += 1
+                    self._phase_limit = recursion_limit
+                new = [path for path in self._seen if path not in before]
+                found += len(new)
+                frontier = [d for d in self._directories(new) if d not in expanded]
+                if not_reached:
+                    break
+        finally:
+            self._phase_limit = saved_limit
+        spent = self._probes - start
+        note = (f"recursive discovery: {scanned} director(ies) expanded over {deepest} of {depth} "
+                f"level(s); {spent} of {cap} request(s); {found} new route(s)")
+        if pruned:
+            note += f"; {pruned} under a wildcard or dead soft-404 namespace skipped"
+        if partial or not_reached:
+            why = ("its request cap" if recursion_limit == start + cap
+                   else "the discovery budget")
+            note += (f"; {partial + not_reached} director(ies) left partly or wholly "
+                     f"unexpanded at {why}")
+        if frontier and level >= depth:
+            note += f"; {len(frontier)} director(ies) found at the depth cap were not expanded"
+        result.errors.append(note)
 
     async def _derive_prefixes(self, max_new: int = 8) -> None:
         """Phase 0.2(a): sweep the namespaces the app actually exposes, not only

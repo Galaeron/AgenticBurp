@@ -329,6 +329,9 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     "engagement.coverage_drive_legs",
     # ffuf inside runs sends its own wordlist traffic to the target.
     "engagement.discovery_ffuf",
+    # Recursive discovery sends wordlist traffic below the first level (False
+    # reads as depth 0: off).
+    "engagement.discovery_recursion_depth",
     "coordinator.cloud_primary",
     "coordinator.cloud_reasoning",
     # P2-1: the business-context planning pass re-ranks the worklist and proposes

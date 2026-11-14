@@ -51,6 +51,7 @@ import httpx
 from harness import evidence
 from harness import scope_lock
 from harness.server_errors import ServerErrorLedger
+from harness.run_observations import RunObservations
 from harness.safety_gate import SafetyGate, SafetyGateConfig
 from harness.security import is_credential_header, is_identity_credential_header
 from harness.tls_policy import TLSPolicy
@@ -961,6 +962,16 @@ class TargetTransport:
                 except Exception:   # feedback is additive; never fail the send
                     pass
 
+            observations = getattr(ctx, "observations", None)
+            if observations is not None and capability != _HEALTH_CAPABILITY:
+                # Passive, before any redirect is followed: an off-scope follow is
+                # refused, so this hop is the only place its Location is seen.
+                try:
+                    observations.observe(method=method, url=url, status=resp.status_code,
+                                         headers=dict(resp.headers),
+                                         body_fn=lambda: getattr(resp, "text", ""))
+                except Exception:   # feedback is additive; never fail the send
+                    pass
             if resp.status_code in _REDIRECT_CODES and resp.headers.get("location") and _hop < max_redirects:
                 nxt = urljoin(url, resp.headers["location"])
                 if not ctx.scope.same_origin(url, nxt):
@@ -1343,6 +1354,10 @@ class RunContext:
     # The server errors this run's own sends drew, scanned for the follow-up
     # (harness.server_errors; investigate_engagement turns it into findings/leads).
     server_errors: ServerErrorLedger = field(default_factory=ServerErrorLedger, repr=False)
+    # Passive facts learned from this run's own answers (harness.run_observations):
+    # the external targets an endpoint redirected to, and public keys a body served.
+    observations: RunObservations = field(default_factory=RunObservations, repr=False,
+                                          compare=False)
     # What safety_gate.push_gate returned when this run installed its gate as
     # ambient -- the gate (or None) that was ambient before it, to restore on
     # aclose(). Not a contextvars.Token: see push_gate's docstring for why.

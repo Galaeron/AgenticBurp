@@ -143,6 +143,9 @@ class SafeDefaultGuardTests(unittest.TestCase):
          lambda cfg: cfg.get("engagement", {}).get("coverage_drive_legs", False) is False),
         ("engagement.discovery_ffuf",
          lambda cfg: cfg.get("engagement", {}).get("discovery_ffuf", False) is False),
+        # Recursive discovery below the first level: 0 (off) is the safe default.
+        ("engagement.discovery_recursion_depth",
+         lambda cfg: not cfg.get("engagement", {}).get("discovery_recursion_depth", 0)),
         ("coordinator.cloud_primary",
          lambda cfg: cfg.get("coordinator", {}).get("cloud_primary", False) is False),
         ("coordinator.cloud_reasoning",
@@ -204,6 +207,7 @@ class SafeDefaultGuardTests(unittest.TestCase):
         "engagement.feature_crawl": True,
         "engagement.coverage_drive_legs": True,
         "engagement.discovery_ffuf": True,
+        "engagement.discovery_recursion_depth": 2,
         "coordinator.cloud_primary": True,
         "coordinator.cloud_reasoning": True,
         "business_context.enabled": True,

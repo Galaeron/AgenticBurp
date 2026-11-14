@@ -13,6 +13,16 @@ the parameter merely appearing in the body.
 Fires on open_redirect findings, or -- shape-decoupled -- on any request with a
 redirect-shaped parameter. Scope-gated; active (validators.active_enabled). The
 sends are read-only follows (a non-GET capture still routes through the gate).
+
+An allowlisted redirect answers the four sentinel shapes with a refusal. When the
+run has seen the endpoint redirect a GET parameter to an allowed external target
+(the handed exchange, the run's own answers in RunContext.observations, or the
+engagement's captures), that parameter also gets the textbook allowlist-bypass
+shapes: the allowed URL in the query, fragment or path of a sentinel URL, and the
+allowed host as the sentinel URL's userinfo. A check that matches the allowed URL
+as a substring or prefix, rather than comparing the parsed host, accepts them.
+The confirmation rule does not change: a redirect status whose Location's parsed
+host is the sentinel. GET only.
 """
 from __future__ import annotations
 from harness import scope_lock
@@ -24,6 +34,7 @@ import httpx
 
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
+from harness.run_observations import allowed_redirect_targets
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
 from .injection_targets import (param_targets, mutate, replay_headers, select_targets,
@@ -39,6 +50,10 @@ _SENTINEL_HOST = "oob-openredirect.example"
 # status (a 200, a 300 choice page, a 304) is not a redirect (R16).
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):(.*)$", re.DOTALL)
+# Allowed targets a parameter's bypass shapes are built from, and the captures
+# scanned for them: a bound on the extra sends (4 per target).
+_MAX_ALLOWED_TARGETS = 2
+_MAX_CAPTURES_SCANNED = 2000
 
 
 def _destination_host(location: str, request_url: str) -> str:
@@ -75,6 +90,48 @@ def _redirects_to_sentinel(resp, request_url: str) -> bool:
             and _destination_host(resp.headers.get("location", ""), request_url) == _SENTINEL_HOST)
 
 
+def _location_of(headers) -> str:
+    return next((str(v) for k, v in (headers or {}).items()
+                 if str(k or "").lower() == "location"), "")
+
+
+def _same_endpoint(a: str, b: str) -> bool:
+    try:
+        pa, pb = urlsplit(a), urlsplit(b)
+    except ValueError:
+        return False
+    return ((pa.scheme or "").lower(), (pa.netloc or "").lower(), pa.path or "/") == \
+        ((pb.scheme or "").lower(), (pb.netloc or "").lower(), pb.path or "/")
+
+
+def _captured_answer(item) -> tuple[str, object, dict]:
+    """(url, status, response headers) of one capture, an HttpExchange or a dict."""
+    if isinstance(item, dict):
+        return (str(item.get("url") or ""), item.get("response_status"),
+                item.get("response_headers") or {})
+    return (str(getattr(item, "url", "") or ""), getattr(item, "response_status", None),
+            getattr(item, "response_headers", None) or {})
+
+
+def _bypass_payloads(token: str, allowed: str) -> list[tuple[str, str]]:
+    """(shape, payload): the sentinel URL with the allowed URL where a substring or
+    prefix allowlist finds it but a browser does not navigate to it."""
+    parts = urlsplit(allowed)
+    scheme = (parts.scheme or "https").lower()
+    host = parts.hostname or ""
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    authority = host + (f":{port}" if port else "")
+    out = [("allowed URL in the query", f"https://{_SENTINEL_HOST}/{token}?{allowed}"),
+           ("allowed URL in the fragment", f"https://{_SENTINEL_HOST}/{token}#{allowed}")]
+    if authority:
+        out.append(("allowed host as userinfo", f"{scheme}://{authority}@{_SENTINEL_HOST}/{token}"))
+    out.append(("allowed URL in the path", f"https://{_SENTINEL_HOST}/{token}/{allowed}"))
+    return out
+
+
 def _redirect_params(exchange: HttpExchange) -> list[tuple[str, str]]:
     qs = dict(parse_qsl(urlsplit(exchange.url).query, keep_blank_values=True))
     out = []
@@ -107,6 +164,51 @@ class OpenRedirectValidator(Validator):
                 f"//{_SENTINEL_HOST}/{token}",
                 f"https:/{_SENTINEL_HOST}/{token}",
                 f"/\\{_SENTINEL_HOST}/{token}"]
+
+    def _allowed_targets(self, exchange: HttpExchange, param: str) -> list[str]:
+        """The external URLs this endpoint was seen redirecting `param` to: from the
+        handed exchange's own answer, the run's observed answers, and the
+        engagement's captures of the same endpoint. Learned, never configured."""
+        found: list[str] = []
+
+        def add(pairs):
+            for name, value in pairs:
+                # This check's own confirmed redirects reach the observer too.
+                if (name == param and value not in found and len(found) < _MAX_ALLOWED_TARGETS
+                        and (urlsplit(value).hostname or "").lower() != _SENTINEL_HOST):
+                    found.append(value)
+
+        add(allowed_redirect_targets(exchange.url, exchange.response_status,
+                                     _location_of(exchange.response_headers)))
+        run = self.run_context
+        observations = getattr(run, "observations", None)
+        if observations is not None:
+            try:
+                add((param, v) for v in observations.redirect_targets(exchange.url, param))
+            except Exception:
+                pass
+        context = getattr(run, "experiment_context", None)
+        captured = (context.get("captured") if isinstance(context, dict) else None) or ()
+        for item in list(captured)[:_MAX_CAPTURES_SCANNED]:
+            if len(found) >= _MAX_ALLOWED_TARGETS:
+                break
+            url, status, headers = _captured_answer(item)
+            if url and _same_endpoint(url, exchange.url):
+                add(allowed_redirect_targets(url, status, _location_of(headers)))
+        return found
+
+    def _attempts(self, exchange: HttpExchange, method: str, loc: str, param: str
+                  ) -> list[tuple[str, str]]:
+        """(shape, payload) for one parameter: the four sentinel shapes, then, for a
+        GET query parameter the run saw redirect to an allowed external target, the
+        allowlist-bypass shapes built from each such target."""
+        token = f"{loc}-{param}"
+        out = [("", payload) for payload in self._payloads(token)]
+        if method == "GET" and loc == "query":
+            for allowed in self._allowed_targets(exchange, param):
+                out += [(f"{shape} ({allowed})", payload)
+                        for shape, payload in _bypass_payloads(token, allowed)]
+        return out
 
     async def _proof_send(self, method: str, url: str, headers: dict, body: str):
         """One extra exchange a confirmation's proof names (Ticket 6); None when
@@ -146,12 +248,14 @@ class OpenRedirectValidator(Validator):
         # Sends that got no response: a check that never reached the target is
         # not a negative (RV-L L2). The gate's refusal stops the remaining sends.
         refused, errors, sends = "", [], 0
+        bypass_tried = 0   # allowlist-bypass shapes sent (an observed allowed target)
         for loc, param in targets:
-            for payload in self._payloads(f"{loc}-{param}"):
+            for shape, payload in self._attempts(exchange, method, loc, param):
                 if refused:
                     break
                 url, body = mutate(exchange, loc, param, payload)
                 sends += 1
+                bypass_tried += 1 if shape else 0
                 try:
                     await global_throttle.acquire()
                     async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
@@ -185,13 +289,16 @@ class OpenRedirectValidator(Validator):
                     # path must not reach the sentinel host. Unsent or redirecting, it names nothing.
                     if control is not None and _redirects_to_sentinel(control, control_url):
                         control = None
+                    bypass = (f" The parameter's allowlist accepted it: {shape}, so the check "
+                              f"matches the allowed URL as text, not the parsed host."
+                              if shape else "")
                     return ValidationResult(
                         self.name, "confirmed", "open_redirect", confidence=0.9, confirmed=True,
                         summary=f"Open redirect confirmed: the {loc} parameter {param!r} controls the "
                                 f"Location the server redirects to.",
                         evidence=f"Set {param!r} to `{payload}`; the server responded with HTTP "
                                  f"{resp.status_code}, a redirect to the off-origin sentinel host "
-                                 f"{_SENTINEL_HOST!r} (Location: {location}).",
+                                 f"{_SENTINEL_HOST!r} (Location: {location}).{bypass}",
                         tested_parameters=tested,
                     ).with_artifacts(baseline=baseline, attack=resp, controls=[control])
                 if not candidate and _SENTINEL_HOST in location.lower():
@@ -223,5 +330,8 @@ class OpenRedirectValidator(Validator):
             summary="No off-origin redirect observed -- the redirect target is not attacker-controlled",
             evidence=f"Tried {len(targets)} parameter(s) "
                      f"({', '.join(repr(p) for _l, p in targets)}); no Location pointed at the sentinel host."
+                     + (f" {bypass_tried} allowlist-bypass shape(s), built from an allowed external "
+                        f"target the endpoint was seen redirecting to, were refused too."
+                        if bypass_tried else "")
                      + coverage_note(coverage, finding),
             control_outcome=coverage, tested_parameters=tested)
