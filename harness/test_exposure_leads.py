@@ -1,5 +1,5 @@
 """Exposure leads -> verdicts (r9): directory listings, extension-filter bypass,
-metrics and .well-known.
+metrics, sensitive files captured on their own, and .well-known.
 
 r9 raised `exposed_directory_listing`, `exposed_metrics_endpoint` and
 `public_metrics_endpoint` leads. No validator matched them, so each got "no
@@ -10,12 +10,14 @@ The fixture is a generic loopback app. It has an HTML directory index whose file
 pass through an extension allow-list that a NUL encoding defeats, a JSON file
 listing, a listing of harmless files, a metrics route, a credential-gated metrics
 route, a plain-text status route, an HTML page with no listing, and security.txt
-with CSAF provider metadata. A second mode makes the filter strict, so the bypass
-fails.
+with CSAF provider metadata. It also serves unlisted files: a confidential document,
+a harmless note, a credential-gated file, a catch-all route that answers any name,
+and a UI-strings JSON that names credential fields without holding any. A second
+mode makes the filter strict, so the bypass fails.
 
 Two production callers are driven. Orchestrator._validate_findings handles agent
 leads. Orchestrator.investigate_engagement runs the coverage drive and owns the
-AV-EXPOSURE-02/03, AV-FILTER-01 and AV-WELLKNOWN-01 cells. Each confirmation must
+AV-EXPOSURE-02/03/04, AV-FILTER-01 and AV-WELLKNOWN-01 cells. Each confirmation must
 name three distinct exchanges that strict accounting resolves. Each behaviour also
 has a negative control.
 """
@@ -54,6 +56,14 @@ _METRICS = ("# HELP http_requests_total Requests served.\n# TYPE http_requests_t
             'app_build_info{version="4.2.1",runtime_version="v20.11.0"} 1\n'
             "# HELP process_resident_memory_bytes Resident memory.\n"
             "# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes 5.1e+07\n")
+# Files served on their own (no listing links them).
+_SHARE = {"roadmap.md": _FILES["plan.md"], "notes.md": _FILES["notes.md"]}
+_PAYROLL = b"name,team\nCONFIDENTIAL - do not distribute\nalice,ops\n"
+# UI strings that name credential fields: labels, not secrets.
+_LOCALE = json.dumps({"LABEL_PASSWORD": "Password", "LABEL_REPEAT_PASSWORD": "Repeat Password",
+                      "API_KEY_HINT": "Your API key", "LABEL_SECRET": "Secret question",
+                      "TOKEN_PLACEHOLDER": "<token>", "CONFIDENTIAL_NOTE": "Confidential"},
+                     indent=2).encode()
 
 
 def _index(title, directory, names, *, relative=False):
@@ -118,6 +128,17 @@ class _App(BaseHTTPRequestHandler):
             if not self.headers.get("Authorization"):
                 return self.reply(401, b'{"error":"login required"}', "application/json")
             return self.reply(200, _METRICS.encode(), "text/plain; version=0.0.4")
+        if path.startswith("/share/") and path[7:] in _SHARE:
+            return self.reply(200, _SHARE[path[7:]], "text/markdown")
+        if path == "/share/payroll.csv":
+            if not self.headers.get("Authorization"):
+                return self.reply(401, b'{"error":"login required"}', "application/json")
+            return self.reply(200, _PAYROLL, "text/csv")
+        if path.startswith("/mirror/") and path.endswith(".md"):
+            # A catch-all: every .md name answers with the same document.
+            return self.reply(200, _FILES["plan.md"], "text/markdown")
+        if path == "/locale/en.json":
+            return self.reply(200, _LOCALE, "application/json")
         if path == "/status":
             return self.reply(200, b"status: ok\nuptime_seconds 12\nqueue_depth 3\n")
         if path == "/page":
@@ -221,6 +242,14 @@ class OracleTests(_Fixture):
         self.assertIsNone(kind("notes.md", "# Notes\nMeeting on Tuesday.\n"))
         self.assertIsNone(kind("secret.bak", "<!DOCTYPE html><html><body>app</body></html>"))
         self.assertIsNone(classify_listed_file("app.conf.bak", 403, {}, "Only .md allowed"))
+        # Field labels, placeholders and references are not credential values, and
+        # "confidential" in a JSON string does not mark a document.
+        for body in ('"LABEL_PASSWORD": "Repeat Password"', "password: <your password>",
+                     "api_key = ${API_KEY}", "secret: changeme", "token: process.env.TOKEN",
+                     "password = ********", '"PWD_HINT": "pwd"', "db_pass: null"):
+            self.assertIsNone(kind("settings.txt", body + "\n"), body)
+        self.assertIsNone(kind("en.json", _LOCALE.decode()))
+        self.assertEqual(kind("settings.txt", 'client_secret: "s3cr3t-9f2a"\n'), "credentials")
 
     def test_metrics_and_security_txt_oracles(self):
         self.assertTrue(is_metrics_exposition(200, {"Content-Type": "text/plain"}, _METRICS))
@@ -239,7 +268,8 @@ class OracleTests(_Fixture):
     def test_coverage_cells_are_legs(self):
         from harness.coverage_tracker import _LEG_CONFIRMATIONS, _PASSIVE_LEG_CONFIRMATIONS
         for check_id, family in (("AV-EXPOSURE-02", "listing_exposure"), ("AV-FILTER-01", "filter_bypass"),
-                                 ("AV-EXPOSURE-03", "metrics_exposure"), ("AV-WELLKNOWN-01", "well_known")):
+                                 ("AV-EXPOSURE-03", "metrics_exposure"), ("AV-EXPOSURE-04", "sensitive_file"),
+                                 ("AV-WELLKNOWN-01", "well_known")):
             check = CHECKS_BY_ID[check_id]
             self.assertEqual(check.confirmation, family)
             self.assertIn(family, _LEG_CONFIRMATIONS)
@@ -273,7 +303,8 @@ class AgentLeadCallerTests(_Fixture):
         orch.ollama = model
         for a in orch.agent_manager.agents.values():
             a.ollama = model
-        keep = ("listing_exposure", "filter_bypass", "metrics_exposure", "well_known", "content_exposure")
+        keep = ("listing_exposure", "filter_bypass", "metrics_exposure", "sensitive_file", "well_known",
+                "content_exposure")
         orch.validator_registry.validators = {k: v for k, v in orch.validator_registry.validators.items()
                                               if k in keep}
 
@@ -369,6 +400,48 @@ class AgentLeadCallerTests(_Fixture):
         self.assertNotIn("metrics_exposure_validator", reports)
         self.assertEqual(sent, [])
 
+    def test_r9_direct_file_shapes_reach_a_verdict(self):
+        # r9: an information_disclosure lead on a confidential .md captured on its own.
+        for cls, agent in (("information_disclosure", "info_disclosure"),
+                           ("sensitive_file_exposure", "info_disclosure"),
+                           ("exposed_file", "recon")):
+            with self.subTest(cls=cls):
+                reports, proofs, sent = self.dispatch("/share/roadmap.md", cls, agent=agent)
+                report = reports["sensitive_file_validator"]
+                self.assertEqual(report.status, "confirmed", report.summary)
+                self.assertIn("roadmap.md: confidential_document (medium)", report.evidence)
+                self.assertIn("file values redacted", report.evidence)
+                self.assertNotIn("Q3 targets", report.evidence + report.summary)
+                self.assert_proof_bound(proofs, "sensitive_file_validator")
+                self.assertTrue(any(p.startswith("/share/av-absent-") and p.endswith(".md") for p in sent),
+                                sent)
+                self.assertTrue(all(p.startswith("/share/") for p in sent), sent)
+
+    def test_harmless_or_label_only_file_routes_no_file_leg(self):
+        for path in ("/share/notes.md", "/locale/en.json"):
+            with self.subTest(path=path):
+                reports, _proofs, sent = self.dispatch(path, "information_disclosure")
+                self.assertNotIn("sensitive_file_validator", reports)
+                self.assertEqual(sent, [])
+
+    def test_credential_gated_file_is_not_exposed(self):
+        reports, proofs, _sent = self.dispatch("/share/payroll.csv", "sensitive_file_exposure",
+                                               headers={"Authorization": "Bearer a"})
+        report = reports["sensitive_file_validator"]
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+        self.assertIn("HTTP 401", report.summary)
+        self.assertIn("only with the captured credential", report.summary)
+
+    def test_catch_all_file_route_is_inconclusive(self):
+        reports, _proofs, _sent = self.dispatch("/mirror/roadmap.md", "information_disclosure")
+        report = reports["sensitive_file_validator"]
+        self.assertEqual(report.status, "inconclusive", report.summary)
+        self.assertIn("catch-all", report.summary)
+
+    def test_listing_capture_routes_no_file_leg(self):
+        reports, _proofs, _sent = self.dispatch("/files", "information_disclosure")
+        self.assertNotIn("sensitive_file_validator", reports)
+
 
 class StrictFilterCallerTests(AgentLeadCallerTests):
     """A filter that decodes fully and refuses NULs: the bypass must not confirm."""
@@ -389,14 +462,20 @@ class StrictFilterCallerTests(AgentLeadCallerTests):
     test_r9_metrics_shapes_reach_a_verdict = None
     test_credential_gated_metrics_is_not_exposed = None
     test_non_metrics_text_route_routes_no_metrics_leg = None
+    test_r9_direct_file_shapes_reach_a_verdict = None
+    test_harmless_or_label_only_file_routes_no_file_leg = None
+    test_credential_gated_file_is_not_exposed = None
+    test_catch_all_file_route_is_inconclusive = None
+    test_listing_capture_routes_no_file_leg = None
 
 
 # --------------------------------------------------------------------------- #
 # Coverage cells through Orchestrator.investigate_engagement
 # --------------------------------------------------------------------------- #
 
-_DRIVEN = ("/files", "/docs", "/exports", "/metrics", "/status", "/page")
-_FAMILIES = ("listing_exposure", "filter_bypass", "metrics_exposure", "well_known")
+_DRIVEN = ("/files", "/docs", "/exports", "/metrics", "/status", "/page", "/share/roadmap.md",
+           "/share/notes.md")
+_FAMILIES = ("listing_exposure", "filter_bypass", "metrics_exposure", "sensitive_file", "well_known")
 
 
 class CoverageDriveCallerTests(_Fixture):
@@ -456,9 +535,13 @@ class CoverageDriveCallerTests(_Fixture):
         self.assertEqual(status("AV-EXPOSURE-02", "/exports"), {CellStatus.CONFIRMED.value})
         self.assertEqual(status("AV-EXPOSURE-02", "/docs"), {CellStatus.NOT_DETECTED.value})
         self.assertEqual(status("AV-EXPOSURE-03", "/metrics"), {CellStatus.CONFIRMED.value})
-        # Shape gates: no listing, no exposition -> never attempted, never a negative.
+        self.assertEqual(status("AV-EXPOSURE-04", "/share/roadmap.md"), {CellStatus.CONFIRMED.value})
+        # Shape gates: no listing, no exposition, no sensitive file -> never attempted,
+        # never a negative.
         for check, path in (("AV-EXPOSURE-02", "/page"), ("AV-EXPOSURE-03", "/status"),
-                            ("AV-FILTER-01", "/page"), ("AV-EXPOSURE-03", "/files")):
+                            ("AV-FILTER-01", "/page"), ("AV-EXPOSURE-03", "/files"),
+                            ("AV-EXPOSURE-04", "/share/notes.md"), ("AV-EXPOSURE-04", "/files"),
+                            ("AV-EXPOSURE-04", "/metrics"), ("AV-EXPOSURE-02", "/share/roadmap.md")):
             rows = self.rows(cells, check, path)
             self.assertTrue(rows and all(not r["attempted"] for r in rows), (check, path, rows))
         self.assertEqual(status("AV-FILTER-01", "/files"), {CellStatus.CONFIRMED.value})
@@ -480,17 +563,21 @@ class CoverageDriveCallerTests(_Fixture):
         observation = by_leg.get("well_known_validator", [])
         self.assertTrue(observation and all(f["severity"] == "info" for f in observation), observation)
         self.assertTrue(by_leg.get("metrics_exposure_validator"))
+        direct = by_leg.get("sensitive_file_validator", [])
+        self.assertTrue(direct and all(f.get("proof_id") for f in direct), direct)
         self.assertTrue(all(not p.startswith(("/status", "/page")) for p in sent), sent)
+        self.assertNotIn("/share/notes.md", sent)
 
     def test_disabled_legs_are_unavailable_and_send_nothing(self):
         cells, findings, sent = self.drive(enabled=False)
-        for check in ("AV-EXPOSURE-02", "AV-FILTER-01", "AV-EXPOSURE-03", "AV-WELLKNOWN-01"):
+        for check in ("AV-EXPOSURE-02", "AV-FILTER-01", "AV-EXPOSURE-03", "AV-EXPOSURE-04",
+                      "AV-WELLKNOWN-01"):
             rows = self.rows(cells, check)
             self.assertTrue(rows and all(not r["attempted"] for r in rows), (check, rows))
-        legs = {"listing_exposure_validator", "filter_bypass_validator",
-                "metrics_exposure_validator", "well_known_validator"}
+        legs = {"listing_exposure_validator", "filter_bypass_validator", "metrics_exposure_validator",
+                "sensitive_file_validator", "well_known_validator"}
         self.assertFalse([f for f in findings if f.get("confirmed_by_leg") in legs])
-        self.assertFalse([p for p in sent if p.startswith(("/files/", "/.well-known/"))], sent)
+        self.assertFalse([p for p in sent if p.startswith(("/files/", "/.well-known/", "/share/"))], sent)
 
 
 class StrictFilterDriveTests(CoverageDriveCallerTests):

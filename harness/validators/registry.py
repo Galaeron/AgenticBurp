@@ -369,11 +369,12 @@ class ValidatorRegistry:
         if cfg.get("content_exposure", {}).get("enabled", True):
             self.validators["content_exposure"] = ContentExposureValidator()
 
-        # r9 exposure leads (AV-EXPOSURE-02/03, AV-FILTER-01, AV-WELLKNOWN-01): GET-only
+        # r9 exposure leads (AV-EXPOSURE-02/03/04, AV-FILTER-01, AV-WELLKNOWN-01): GET-only
         # legs that fetch what a listing or metrics capture points at, and the origin's
         # .well-known files. Active: they run only under validators.active_enabled.
         from .exposure_leads import (FilterBypassValidator, ListingExposureValidator,
-                                     MetricsExposureValidator, WellKnownValidator)
+                                     MetricsExposureValidator, SensitiveFileValidator,
+                                     WellKnownValidator)
         le_cfg = cfg.get("listing_exposure", {})
         if le_cfg.get("enabled", True):
             self.validators["listing_exposure"] = ListingExposureValidator(
@@ -386,6 +387,10 @@ class ValidatorRegistry:
         if me_cfg.get("enabled", True):
             self.validators["metrics_exposure"] = MetricsExposureValidator(
                 allowed_hosts=_allowed, timeout=float(me_cfg.get("timeout", 10.0)))
+        sf_cfg = cfg.get("sensitive_file", {})
+        if sf_cfg.get("enabled", True):
+            self.validators["sensitive_file"] = SensitiveFileValidator(
+                allowed_hosts=_allowed, timeout=float(sf_cfg.get("timeout", 10.0)))
         wk_cfg = cfg.get("well_known", {})
         if wk_cfg.get("enabled", True):
             self.validators["well_known"] = WellKnownValidator(
@@ -594,7 +599,8 @@ class ValidatorRegistry:
                 return decision("needs_prerequisite", "missing_response_media_type", "observed response media type is required")
             if "html" not in content_type:
                 return decision("unsupported", "non_html_response", "this CSP procedure requires an HTML response")
-        if family in {"listing_exposure", "filter_bypass", "metrics_exposure"} and method != "GET":
+        if family in {"listing_exposure", "filter_bypass", "metrics_exposure",
+                      "sensitive_file"} and method != "GET":
             return decision("unsupported", "unsupported_method", "this procedure replays a captured GET")
         if family in {"listing_exposure", "filter_bypass"}:
             from .exposure_leads import parse_listing
@@ -607,6 +613,11 @@ class ValidatorRegistry:
                                          exchange.response_body or ""):
                 return decision("unsupported", "not_metrics",
                                 "the captured response is not a metrics exposition")
+        if family == "sensitive_file":
+            from .exposure_leads import direct_file_sensitivity
+            if direct_file_sensitivity(exchange) is None:
+                return decision("unsupported", "not_a_sensitive_file",
+                                "the captured response is not a sensitive file")
         if family == "jwt_forge":
             from .jwt_forge_validator import _extract_jwt, _decode
             if method != "GET":

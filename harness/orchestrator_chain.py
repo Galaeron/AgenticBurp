@@ -2657,11 +2657,11 @@ class ChainMixin:
                 # establish each individual header, metadata, method or TLS check.
                 # security_headers, error_handling and content_exposure are passive:
                 # they judge the captured response. listing_exposure, filter_bypass,
-                # metrics_exposure and well_known send GETs (exposure_leads).
+                # metrics_exposure, sensitive_file and well_known send GETs (exposure_leads).
                 for name in ("csp", "cors", "header_injection", "http_request_smuggling",
                              "race_condition", "security_headers", "error_handling",
                              "content_exposure", "listing_exposure", "filter_bypass",
-                             "metrics_exposure", "well_known"):
+                             "metrics_exposure", "sensitive_file", "well_known"):
                     registered = self.validator_registry.validators.get(name)
                     if registered is not None:
                         _val_by_conf[name] = self.validator_registry.bind_run_context(

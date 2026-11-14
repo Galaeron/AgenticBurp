@@ -305,6 +305,10 @@ _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
     _python_only("metrics_exposure", "metrics_exposure",
                  note="AV-EXPOSURE-03 leg: a metrics exposition re-fetched without credentials, "
                       "with a nonexistent-sibling control. GET-only; no Java case."),
+    _python_only("sensitive_file", "sensitive_file",
+                 note="AV-EXPOSURE-04 leg: a sensitive file captured on its own, re-fetched "
+                      "without credentials, with a nonexistent-sibling control. GET-only; no "
+                      "Java case."),
     _python_only("well_known", "well_known",
                  note="AV-WELLKNOWN-01 leg: security.txt and CSAF provider metadata once per "
                       "origin, reported as observations. GET-only; no Java case."),
