@@ -20,6 +20,11 @@ Bounded and safe:
     each visit passes through the global request throttle.
   - The operands are fresh per validate() call (from `secrets`), so a page that
     happens to contain some number can't produce a false confirm.
+  - Client-side routes (client_routes.py): a payload also goes into a parameter of
+    the URL's own fragment route (`/#/r?p=`) and of each page route a crawled view
+    showed issuing the captured request, so an API call whose JSON runs no script
+    is tested where its value is rendered. A per-parameter dispatch may name a
+    `route` or `page` input; it is tested alone.
   - Degrades cleanly: with no headless browser installed it returns
     status="skipped" naming what to install, never an error or a crash. The
     whole validator is exercised in tests via an injected fake driver.
@@ -33,7 +38,10 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from .base import Validator, ValidationResult
+from harness.client_routes import PAGE, ROUTE, SEGMENT, fragment_route
+from . import route_candidates
 from .injection_targets import NAMED_PARAMETER_UNTESTED, tested_inputs
+from .route_candidates import Candidate
 
 log = logging.getLogger("harness.browser_xss_validator")
 
@@ -124,35 +132,105 @@ class BrowserXssValidator(Validator):
         host = (urlsplit(url).hostname or "").lower()
         return scope_lock.host_in_scope(url, self.allowed_hosts)
 
-    def _candidate_urls(self, exchange: HttpExchange, a: int, b: int,
-                        only: str | None = None) -> list[str]:
-        """One URL per (query param, payload): the captured URL with a single
-        parameter's value replaced by an execution payload. Bounded by
-        max_visits. When the URL has no query params, the payloads are tried as
-        a single synthetic `q` parameter so a bare reflected endpoint is still
-        probed. `only` (a per-parameter dispatch) mutates that parameter alone."""
+    def _query_candidates(self, exchange: HttpExchange, a: int, b: int,
+                          only: str | None = None) -> list[Candidate]:
+        """One candidate per (query param, payload): the captured URL with a single
+        parameter's value replaced by an execution payload. When the URL has no
+        query params, the payloads are tried as a single synthetic `q` parameter so
+        a bare reflected endpoint is still probed. `only` (a per-parameter
+        dispatch) mutates that parameter alone. The fragment is dropped."""
         parts = urlsplit(exchange.url)
         params = parse_qsl(parts.query, keep_blank_values=True)
         payloads = _payloads(a, b)
-        urls: list[str] = []
+
+        def build(query: str, name: str, pl: str) -> Candidate:
+            return Candidate(urlunsplit((parts.scheme, parts.netloc, parts.path, query, "")),
+                             route_candidates.QUERY, name, pl)
+
+        out: list[Candidate] = []
         if only is not None:
             i = next(n for n, (k, _v) in enumerate(params) if k == only)
             for pl in payloads:
                 mutated = list(params)
                 mutated[i] = (only, pl)
-                urls.append(urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(mutated), "")))
+                out.append(build(urlencode(mutated), only, pl))
         elif not params:
             for pl in payloads:
-                q = urlencode([("q", pl)])
-                urls.append(urlunsplit((parts.scheme, parts.netloc, parts.path, q, "")))
+                out.append(build(urlencode([("q", pl)]), "q", pl))
         else:
             for i in range(len(params)):
                 for pl in payloads:
                     mutated = list(params)
                     mutated[i] = (params[i][0], pl)
-                    q = urlencode(mutated)
-                    urls.append(urlunsplit((parts.scheme, parts.netloc, parts.path, q, "")))
-        return urls[: self.max_visits]
+                    out.append(build(urlencode(mutated), params[i][0], pl))
+        return out
+
+    def _candidate_urls(self, exchange: HttpExchange, a: int, b: int,
+                        only: str | None = None) -> list[str]:
+        """The query candidates' URLs, bounded by max_visits."""
+        return [c.url for c in self._query_candidates(exchange, a, b, only)][: self.max_visits]
+
+    def _candidates(self, exchange: HttpExchange, a: int, b: int, only: str | None,
+                    location: str, run_context) -> list[Candidate]:
+        """Every URL this validation loads, bounded by max_visits.
+
+        A per-parameter dispatch tests its one input: a query parameter as before,
+        or a client-side route input (`route`: a parameter in the URL's fragment
+        route; `page`: a parameter of the page's own query, loaded as the HTML
+        document). Otherwise the query candidates are kept and taken in turn with
+        the parameters of the URL's own fragment route and of each page route a
+        crawled view showed issuing this request (client_routes.py)."""
+        if only is not None and location == route_candidates.QUERY:
+            return self._query_candidates(exchange, a, b, only)[: self.max_visits]
+        dom = route_candidates.dom_payloads(a, b)
+        if only is not None:
+            return route_candidates.per_parameter(exchange.url, location, only, dom)[: self.max_visits]
+        groups = [self._query_candidates(exchange, a, b)]
+        groups += route_candidates.own_route(exchange.url, dom)
+        groups += route_candidates.mapped_routes(exchange, dom, run_context)
+        return route_candidates.interleave(groups, self.max_visits)
+
+    @staticmethod
+    def _executed(c: Candidate, obs, how: str, expected: str, a: int, b: int) -> tuple[str, str]:
+        """(summary, evidence) for an execution `how` showed, worded by the input
+        the candidate placed its payload in."""
+        dialog_only = how == "dialog"
+        tail = " (shown by a dialog only)" if dialog_only else ""
+        shown = (f"a browser dialog showed {expected}" if dialog_only
+                 else f"the browser console logged {expected}")
+        computed = (f"the product of {a}*{b}, which the payload computes but does not "
+                    f"contain, when loading {c.url[:300]}")
+        dialog_note = (" Execution was shown by the dialog only, not by the console."
+                       if dialog_only else "")
+        if c.location == ROUTE:
+            parts = urlsplit(c.url)
+            page = (f"{parts.scheme}://{parts.netloc}{parts.path}"
+                    f"#{parts.fragment.split('?', 1)[0]}")
+            return (f"Client-side (DOM-based) XSS executed in a real browser via the fragment "
+                    f"route parameter {c.parameter!r} at {page}{tail}",
+                    f"Injected payload executed: {shown}, {computed}. The payload was in "
+                    f"{route_candidates.describe(c)}, so page script read it from the route "
+                    f"and wrote it to a sink.{dialog_note}")
+        if c.location == SEGMENT and not route_candidates.segment_sent(c.url):
+            return (f"Client-side (DOM-based) XSS executed in a real browser via the route path "
+                    f"segment :{c.parameter} at {c.url[:200]}{tail}",
+                    f"Injected payload executed: {shown}, {computed}. The payload was in "
+                    f"{route_candidates.describe(c)}, so page script read it from the route "
+                    f"and wrote it to a sink.{dialog_note}")
+        if c.location in (PAGE, SEGMENT):
+            what = (f"the page query parameter {c.parameter!r} at {c.url.split('?')[0]}"
+                    if c.location == PAGE else
+                    f"the route path segment :{c.parameter} at {c.url[:200]}")
+            served = route_candidates.served_payload(obs, c.payload)
+            origin = ("" if served is None else
+                      " The document the server returned carried the payload verbatim "
+                      "(server reflection)." if served else
+                      " The document the server returned did not carry the payload "
+                      "verbatim, so page script placed it in the DOM.")
+            return (f"XSS executed in a real browser via {what}{tail}",
+                    f"Injected payload executed: {shown}, {computed}.{origin}{dialog_note}")
+        return (f"Reflected XSS executed in a real browser at {c.url.split('?')[0]}{tail}",
+                f"Injected payload executed: {shown}, {computed}.{dialog_note}")
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         driver = self._driver
@@ -172,24 +250,36 @@ class BrowserXssValidator(Validator):
             return ValidationResult(validator=self.name, status="skipped", finding_class="xss",
                                     summary="target out of scope", evidence=urlsplit(exchange.url).hostname or "")
 
-        only = None
+        only, location = None, ""
         if getattr(finding, "parameter_only", False):
-            # Per-parameter dispatch: test the named query parameter alone, so the
-            # verdict is bound to it; any other input is not tested at all.
+            # Per-parameter dispatch: test the named input alone, so the verdict is
+            # bound to it; any other input is not tested at all.
             only = (finding.parameter_name or "").strip()
-            present = [k for k, _v in parse_qsl(urlsplit(exchange.url).query, keep_blank_values=True)]
-            if (finding.parameter_location or "").strip().lower() != "query" or only not in present:
+            location = (finding.parameter_location or "").strip().lower()
+            if location == route_candidates.QUERY:
+                present = [k for k, _v in parse_qsl(urlsplit(exchange.url).query,
+                                                    keep_blank_values=True)]
+                reachable, why = only in present, "is not a query parameter of the replayed URL"
+            elif location == ROUTE:
+                # A route parameter lives in the replayed URL's fragment route.
+                reachable = bool(only) and fragment_route(urlsplit(exchange.url).fragment) is not None
+                why = "has no fragment route in the replayed URL"
+            elif location == SEGMENT:
+                reachable = bool(only) and only in route_candidates.segment_names(exchange.url)
+                why = "is not a path segment of the replayed URL's route"
+            elif location == PAGE:
+                reachable, why = bool(only), "is unnamed"
+            else:
+                reachable, why = False, "is not a query parameter of the replayed URL"
+            if not reachable:
                 return ValidationResult(
                     validator=self.name, status="skipped", finding_class="xss",
-                    summary=f"the {finding.parameter_location or 'unnamed'} parameter {only!r} is "
-                            "not a query parameter of the replayed URL, so it was not tested",
+                    summary=(f"the {finding.parameter_location or 'unnamed'} parameter {only!r} "
+                             f"{why}, so it was not tested"),
                     control_outcome=NAMED_PARAMETER_UNTESTED)
         tested = tested_inputs(finding, [only] if only is not None else [])
 
         a, b, expected = _challenge()
-        urls = self._candidate_urls(exchange, a, b, only)
-        errors: list[str] = []
-        signal: tuple[str, str, str] | None = None  # (url, note, detail) of the first candidate
         # R7: forwarded only when a RunContext is actually bound -- omitted
         # entirely otherwise, so a standalone/no-context caller (and every
         # fake driver in the test suite, which doesn't accept these kwargs)
@@ -197,9 +287,23 @@ class BrowserXssValidator(Validator):
         # I03: fall back to the enclosing run when this instance was not bound.
         from harness.run_context import current_run_context
         rc = self.run_context or current_run_context()
+        candidates = self._candidates(exchange, a, b, only, location, rc)
+        if not candidates:
+            return ValidationResult(
+                validator=self.name, status="skipped", finding_class="xss",
+                summary=f"no candidate URL places a payload in {location or 'an'} input {only!r}",
+                control_outcome=NAMED_PARAMETER_UNTESTED)
+        errors: list[str] = []
+        signal: tuple[str, str, str] | None = None  # (url, note, detail) of the first candidate
         visit_kw = (dict(scope=rc.scope, gate=rc.gate, budget=rc.budget, cancel=rc.cancel)
                     if rc is not None else {})
-        for url in urls:
+        for c in candidates:
+            url = c.url
+            if not self._host_allowed(route_candidates.origin_of(url)):
+                # Every candidate keeps the captured URL's origin; a mapped route's
+                # page is checked again all the same.
+                errors.append(f"{url[:120]}: out of scope")
+                continue
             await global_throttle.acquire()
             try:
                 # R25: drive the browser AS the captured identity (auth headers +
@@ -215,46 +319,35 @@ class BrowserXssValidator(Validator):
             # RV-L L7 / RV-O O8: an exact console message, or dialog message,
             # equal to the computed product. A page that shows the payload's own
             # text carries a*b, never the product, so it cannot match.
-            if any(str(m).strip() == expected for m in obs.console):
+            how = ("console" if any(str(m).strip() == expected for m in obs.console) else
+                   "dialog" if expected in _dialog_messages(obs) else "")
+            if how:
+                summary, evidence = self._executed(c, obs, how, expected, a, b)
                 return ValidationResult(
                     validator=self.name, status="confirmed", finding_class="xss",
-                    confidence=0.95, confirmed=True,
-                    summary=f"Reflected XSS executed in a real browser at {url.split('?')[0]}",
-                    evidence=(f"Injected payload executed: the browser console logged {expected}, "
-                              f"the product of {a}*{b}, which the payload computes but does not "
-                              f"contain, when loading {url[:300]}"),
-                    raw_output=obs.all_text()[:800], tested_parameters=tested)
-            if expected in _dialog_messages(obs):
-                return ValidationResult(
-                    validator=self.name, status="confirmed", finding_class="xss",
-                    confidence=0.95, confirmed=True,
-                    summary=(f"Reflected XSS executed in a real browser at {url.split('?')[0]} "
-                             f"(shown by a dialog only)"),
-                    evidence=(f"Injected payload executed: a browser dialog showed {expected}, the "
-                              f"product of {a}*{b}, which the payload computes but does not "
-                              f"contain, when loading {url[:300]}. Execution was shown by the "
-                              f"dialog only, not by the console."),
+                    confidence=0.95, confirmed=True, summary=summary, evidence=evidence,
                     raw_output=obs.all_text()[:800], tested_parameters=tested)
             note, detail = _unmatched_signal(obs)
             if note and signal is None:
                 signal = (url, note, detail)
 
+        n = len(candidates)
         if signal is not None:
             url, note, detail = signal
             return ValidationResult(
                 validator=self.name, status="inconclusive", finding_class="xss",
                 confidence=0.0, confirmed=False,
                 summary=f"Reflected XSS candidate, not confirmed: {note}",
-                evidence=(f"Tried {len(urls)} candidate URL(s); neither the console nor a dialog "
+                evidence=(f"Tried {n} candidate URL(s); neither the console nor a dialog "
                           f"showed the computed product {expected}. Loading {url[:300]}: {note} "
                           f"({detail})." + (f" Errors: {'; '.join(errors[:3])}" if errors else "")),
                 raw_output="")
-        status = "not_confirmed" if not errors or len(errors) < len(urls) else "error"
+        status = "not_confirmed" if not errors or len(errors) < n else "error"
         return ValidationResult(
             validator=self.name, status=status, finding_class="xss",
             confidence=0.0, confirmed=False,
             summary="No script execution observed in a headless browser",
-            evidence=(f"Tried {len(urls)} candidate URL(s); neither the console nor a dialog showed "
-                      f"the computed product {expected}."
+            evidence=(f"Tried {n} candidate URL(s){route_candidates.kinds(candidates)}; neither "
+                      f"the console nor a dialog showed the computed product {expected}."
                       + (f" Errors: {'; '.join(errors[:3])}" if errors else "")),
             raw_output="", tested_parameters=tested if status == "not_confirmed" else ())

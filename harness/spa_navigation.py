@@ -17,7 +17,10 @@ What counts as a view: `<a href>`, Angular `routerLink` (and its dev-mode
 `to` attributes and hash routes (`#/basket`, `#!/basket`). Every target is resolved
 against the current view, kept only when it is on the start origin AND in the run's
 scope, and dropped when it looks destructive (logout, delete, reset, ...) or is a
-download. The walk stops at `max_views`, at `max_depth`, on cancellation, at the
+download. With `declared_views` it also visits, under a cap of its own, the
+parameter-less routes the app's router config declares and nothing links to;
+one the app does not stay on (a guard, a redirect to login) is `guarded`, not a
+view. The walk stops at `max_views`, at `max_depth`, on cancellation, at the
 deadline and when the request budget is spent; the browser's own route handler still
 decides every request (scope, gate, credentials, budget), exactly as for one page.
 """
@@ -136,6 +139,21 @@ class SpaCrawlResult:
     errors: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)        # views the run refused to enter
     stopped_by: str = ""                                    # "" | max_views | budget | ...
+    # Every in-scope link target the rendered views exposed, resolved, query and
+    # route fragment kept (a link to a known view shape is still a route input),
+    # and every request each view fired as (view URL as loaded, method, url, body):
+    # client_routes.py maps an API call back to the route that issued it.
+    links: list[str] = field(default_factory=list)
+    view_calls: list[tuple] = field(default_factory=list)
+    # Router-declared views nothing linked to (declared_views > 0): the ones the
+    # app stayed on, and the ones it did not ("requested -> landed" or the status).
+    declared: list[str] = field(default_factory=list)
+    guarded: list[str] = field(default_factory=list)
+    # Route probes (route_probes > 0): each view loaded once more with a marker
+    # value in every parameter name the bundles read, as {"url": the probe URL,
+    # "view": its view key, "names": the names whose marker the view showed or
+    # sent, "calls": [(method, url, body), ...] it fired}.
+    probes: list[dict] = field(default_factory=list)
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -150,22 +168,121 @@ def _budget_spent(budget: Any) -> bool:
     return value is not None and value <= 0
 
 
+def _same_view(a: str, b: str) -> bool:
+    """Whether two URLs are the same view, a trailing slash aside."""
+    def norm(url: str) -> str:
+        path, _, frag = view_key(url).partition("#")
+        return (path.rstrip("/") or "/") + "#" + ((frag.rstrip("/") or "/") if frag else "")
+    return norm(a) == norm(b)
+
+
+# A declared view that stays on its URL but renders a denial in place. It counts
+# only when the phrase is new to the view: the first view the crawl opened did
+# not show it (so a shell banner never makes every view a denial).
+_DENIED_IN_PLACE = re.compile(
+    r"\b(?:access (?:is )?denied|permission denied|forbidden|not authori[sz]ed|unauthori[sz]ed"
+    r"|not (?:allowed|permitted) to (?:view|access|see|open)"
+    r"|you (?:must|need to|have to) (?:be )?(?:logged in|signed in|log ?in|sign ?in)"
+    r"|please (?:log ?in|sign ?in) (?:to|first)"
+    r"|(?:log ?in|sign ?in|authentication) (?:is )?required)\b", re.I)
+
+
+def _denial_in_place(text: str, baseline: str) -> str:
+    """The first denial phrase in a view's text that the baseline view's text
+    does not have, lowercased with its whitespace collapsed, or ""."""
+    base = " ".join((baseline or "").lower().split())
+    for m in _DENIED_IN_PLACE.finditer(" ".join((text or "").split())):
+        phrase = m.group(0).lower()
+        if phrase not in base:
+            return phrase
+    return ""
+
+
+# At most this many parameter names go into one probe.
+MAX_PROBE_NAMES = 16
+
+
+def _markers(names: list[str]) -> dict[str, str]:
+    """A marker value per name: nine random lowercase letters, a shared stem and
+    a two-letter index, so no marker contains another and none looks like an id
+    or a cache-buster."""
+    import secrets
+    import string
+    stem = "".join(secrets.choice(string.ascii_lowercase) for _ in range(7))
+    letters = string.ascii_lowercase
+    return {name: stem + letters[i // 26] + letters[i % 26] for i, name in enumerate(names)}
+
+
+def _route_query_names(url: str) -> set[str]:
+    """The parameter names a view URL already carries in its route query."""
+    from harness.client_routes import fragment_route
+    from urllib.parse import parse_qsl
+    parts = urlsplit(url)
+    fr = fragment_route(parts.fragment)
+    query = fr[2] if fr is not None else parts.query
+    return {k for k, _v in parse_qsl(query, keep_blank_values=True)}
+
+
+def _declared_url(current: str, path: str, hash_hint: bool) -> str | None:
+    """A router-declared path as a view of the app at `current`: a hash route in a
+    hash-routed app (the current view's fragment is a route, or the bundle says
+    so), a history route otherwise."""
+    if not _hash_routed(current) and hash_hint:
+        return resolve_view(current, "#" + path)
+    return resolve_view(current, path)
+
+
 async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_views: int = 30,
                       max_depth: int = 4, max_captured: int = 200, extra_views=(),
+                      declared_views: int = 0, route_probes: int = 0,
                       cancel: Any = None, budget: Any = None,
                       deadline: float | None = None) -> SpaCrawlResult:
     """Breadth-first walk of the app's client-side views from `start_url`.
 
     `in_scope(url) -> bool` is the run's scope check. `extra_views` seeds the
     queue with routes learned elsewhere (route feedback), resolved like links.
-    Each exchange the adapter drains is tagged with the view that fired it."""
+    Each exchange the adapter drains is tagged with the view that fired it.
+
+    `declared_views` > 0 also visits up to that many routes the app's router
+    config declares without a parameter and nothing links to (an adapter with
+    `scripts()` hands over the same-origin script bodies the views loaded). They
+    count against this cap, not `max_views`; the links they expose are followed
+    like any view's, under `max_views`, so a route that is both declared and
+    linked loses nothing. One the app does not stay on (a guard cancels it, it
+    redirects, to login or elsewhere, or the document answers an error status)
+    is recorded in `guarded`, never as a view, and its links are not followed;
+    the calls fired meanwhile are still captured, tagged with the view the app
+    landed on.
+
+    A declared view the app stays on is guarded too when its rendered text (an
+    adapter with `text()`) shows a denial the first view did not ("access denied",
+    "not authorized", "please log in to ...").
+
+    `route_probes` > 0 loads up to that many views once more, by GET navigation,
+    with a marker value in each parameter name the same-origin scripts read
+    (client_routes.read_names_of) and the view does not carry yet. A name whose
+    marker the rendered view shows (`text()`: the visible text and the form
+    values) or sends in a call is a route input of that view (`probes`). Its own
+    cap, apart from max_views; a probe the app does not stay on records nothing,
+    and the calls it fired are captured all the same."""
     result = SpaCrawlResult(start_url=start_url)
     origin = urlsplit(start_url)[:2]
-    queue: list[tuple[str, int]] = [(start_url, 0)]
+    queue: list[tuple[str, int, bool]] = [(start_url, 0, False)]
     seen = {view_key(start_url)}
     captured_keys: set = set()
+    seen_links: set = set()
+    declared_room = max(0, int(declared_views or 0))
+    declared_paths: list[str] = []
+    hash_hint = False
+    linked_views = 0
+    landed: set = set()      # where each opened view ended up (a redirect's target)
+    probe_room = max(0, int(route_probes or 0))
+    read_names: list[str] = []
+    probed: set = set()
+    baseline_text: str | None = None   # the first view's text (in-place denials)
+    text_of = getattr(adapter, "text", None)
 
-    def admit(url: str | None, depth: int) -> None:
+    def admit(url: str | None, depth: int, declared: bool = False) -> None:
         if url is None:
             result.skip("not_a_view")
             return
@@ -179,11 +296,106 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         if _DOWNLOAD.search(parts.path) or _DOWNLOAD.search(parts.fragment.split("?", 1)[0]):
             result.skip("download")
             return
+        if not declared and url not in seen_links and len(result.links) < 500:
+            seen_links.add(url)
+            result.links.append(url)
         key = view_key(url)
         if key in seen:
             return
         seen.add(key)
-        queue.append((url, depth))
+        queue.append((url, depth, declared))
+
+    def capture(exchange: dict, note_view: str, how: str = "spa navigation") -> None:
+        key = (exchange.get("method"), exchange.get("url"), exchange.get("request_body"))
+        if key in captured_keys or len(result.exchanges) >= max_captured:
+            return
+        captured_keys.add(key)
+        exchange = dict(exchange)
+        exchange["analyst_note"] = ("driver_capture: JS-issued request observed on view "
+                                    f"{note_view} ({how})")
+        result.exchanges.append(exchange)
+
+    async def absorb_scripts(current: str) -> None:
+        """The same-origin script bodies the views loaded since the last call:
+        the router-declared paths and the parameter names they read."""
+        nonlocal hash_hint
+        from harness.client_routes import declared_views as declared_of, read_names_of
+        try:
+            bodies = await adapter.scripts()
+        except Exception as exc:
+            result.errors.append(f"scripts {view_key(current)}: {describe_error(exc)}")
+            return
+        for body in bodies or ():
+            paths, hinted = declared_of(body)
+            hash_hint = hash_hint or hinted
+            declared_paths.extend(p for p in paths if p not in declared_paths)
+            for name in read_names_of(body):
+                if name not in read_names and len(read_names) < 64:
+                    read_names.append(name)
+
+    async def probe(current: str) -> None:
+        """Load `current` with a marker in each read name it lacks; record the
+        names the view showed or sent."""
+        nonlocal probe_room
+        from harness.client_routes import probe_url
+        key = view_key(current)
+        if key in probed:
+            return
+        have = _route_query_names(current)
+        names = [n for n in read_names if n not in have][:MAX_PROBE_NAMES]
+        if not names:
+            return
+        probed.add(key)
+        markers = _markers(names)
+        target = probe_url(current, markers)
+        if target is None or urlsplit(target)[:2] != origin or not in_scope(target):
+            result.skip("probe_out_of_scope")
+            return
+        probe_room -= 1
+        try:
+            await adapter.open(target)
+        except ViewRefused as exc:
+            result.skip("refused_redirect")
+            result.refused.append(f"probe {key}: {exc}")
+            return
+        except Exception as exc:
+            result.errors.append(f"probe {key}: {describe_error(exc)}")
+            return
+        stayed = _same_view(adapter.current_url() or target, target)
+        text = ""
+        text_of = getattr(adapter, "text", None)
+        if stayed and callable(text_of):
+            try:
+                text = (await text_of() or "").lower()
+            except Exception as exc:
+                result.errors.append(f"probe text {key}: {describe_error(exc)}")
+        try:
+            fired = await adapter.drain()
+        except Exception as exc:
+            fired = []
+            result.errors.append(f"probe capture {key}: {describe_error(exc)}")
+        calls = []
+        for exchange in fired:
+            calls.append((exchange.get("method") or "GET", exchange.get("url") or "",
+                          exchange.get("request_body") or ""))
+            capture(exchange, key, "route probe")
+        if not stayed:
+            result.skip("probe_redirected")
+            return
+        sent = " ".join(f"{u} {b}" for _m, u, b in calls).lower()
+        found = [n for n, m in markers.items() if m in text or m in sent]
+        result.probes.append({"url": target, "view": key, "names": found, "calls": calls})
+
+    async def mine_declared(current: str) -> None:
+        nonlocal declared_room
+        while declared_paths and declared_room > 0:
+            url = _declared_url(current, declared_paths.pop(0), hash_hint)
+            if url is None or view_key(url) in seen or view_key(url) in landed:
+                continue
+            before = len(queue)
+            admit(url, 1, declared=True)
+            if len(queue) > before:
+                declared_room -= 1
 
     for extra in extra_views or ():
         admit(resolve_view(start_url, extra), 1)
@@ -198,10 +410,13 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         if _budget_spent(budget):
             result.stopped_by = "budget"
             break
-        if len(result.views) >= max_views:
+        if linked_views >= max_views:
+            # A declared view has a cap of its own: only those still queued go on.
             result.stopped_by = "max_views"
-            break
-        url, depth = queue.pop(0)
+            queue = [entry for entry in queue if entry[2]]
+            if not queue:
+                break
+        url, depth, declared = queue.pop(0)
         try:
             await adapter.open(url)
         except ViewRefused as exc:
@@ -211,31 +426,62 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         except Exception as exc:
             result.errors.append(f"view {view_key(url)}: {describe_error(exc)}")
             continue
-        result.views.append(url)
         current = adapter.current_url() or url
+        landed.add(view_key(current))
+        guarded = ""
+        if baseline_text is None and not declared and declared_room > 0 and callable(text_of):
+            try:
+                baseline_text = (await text_of() or "").lower()
+            except Exception as exc:
+                baseline_text = ""
+                result.errors.append(f"text {view_key(url)}: {describe_error(exc)}")
+        if declared:
+            status_of = getattr(adapter, "status", None)
+            status = status_of() if callable(status_of) else None
+            if isinstance(status, int) and status >= 400:
+                guarded = f"{view_key(url)} -> status {status}"
+            elif not _same_view(current, url):
+                guarded = f"{view_key(url)} -> {view_key(current)}"
+            elif callable(text_of):
+                try:
+                    denial = _denial_in_place(await text_of() or "", baseline_text or "")
+                except Exception as exc:
+                    denial = ""
+                    result.errors.append(f"text {view_key(url)}: {describe_error(exc)}")
+                if denial:
+                    guarded = f"{view_key(url)} -> denied in place ({denial})"
+        if guarded:
+            result.guarded.append(guarded)
+        else:
+            result.views.append(url)
+            if declared:
+                result.declared.append(view_key(url))
+            else:
+                linked_views += 1
         try:
             fired = await adapter.drain()
         except Exception as exc:
             fired = []
             result.errors.append(f"capture {view_key(url)}: {describe_error(exc)}")
         for exchange in fired:
-            key = (exchange.get("method"), exchange.get("url"), exchange.get("request_body"))
-            if key in captured_keys or len(result.exchanges) >= max_captured:
-                continue
-            captured_keys.add(key)
-            exchange = dict(exchange)
-            exchange["analyst_note"] = ("driver_capture: JS-issued request observed on view "
-                                        f"{view_key(url)} (spa navigation)")
-            result.exchanges.append(exchange)
-        if depth >= max_depth:
-            continue
-        try:
-            targets = await adapter.links()
-        except Exception as exc:
-            result.errors.append(f"links {view_key(url)}: {describe_error(exc)}")
-            continue
-        for raw in targets:
-            admit(resolve_view(current, raw), depth + 1)
+            if len(result.view_calls) < 2000:
+                result.view_calls.append((current, exchange.get("method") or "GET",
+                                          exchange.get("url") or "", exchange.get("request_body") or ""))
+            capture(exchange, view_key(current if guarded else url))
+        if depth < max_depth and not guarded:
+            try:
+                targets = await adapter.links()
+            except Exception as exc:
+                targets = []
+                result.errors.append(f"links {view_key(url)}: {describe_error(exc)}")
+            for raw in targets:
+                admit(resolve_view(current, raw), depth + 1)
+        if (declared_room > 0 or probe_room > 0) and callable(getattr(adapter, "scripts", None)):
+            await absorb_scripts(current)
+        if probe_room > 0 and not guarded:
+            await probe(current)
+        if declared_room > 0 and callable(getattr(adapter, "scripts", None)):
+            await mine_declared(current)
     else:
         result.stopped_by = result.stopped_by or "exhausted"
     return result

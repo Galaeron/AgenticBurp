@@ -506,6 +506,11 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             "security_headers_validator.py",
             "error_handling_validator.py",
             "content_exposure_validator.py",
+            # Client-route candidates for the browser XSS legs: exchange.method is the
+            # key of a ClientRouteMap lookup (which page route issued this API call).
+            # The module holds no client and sends nothing; its candidates are page
+            # URLs the browser loads by GET navigation.
+            "route_candidates.py",
         }
 
         violations = []

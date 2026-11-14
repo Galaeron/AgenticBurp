@@ -27,6 +27,8 @@ from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
 from harness.categories import canonicalize
+from harness.client_routes import (CLIENT_ROUTE_LEGS, PAGE, SEGMENT, route_params_of_template,
+                                   route_segments_of_template)
 
 
 # ---------------------------------------------------------------------------
@@ -359,10 +361,28 @@ def derive_input_cases_from_template(template: dict | None,
     """Convenience over `derive_input_cases` for an endpoint `template` dict
     (engagement.template_from_exchange: method/query/body/content_type/object_id)."""
     template = template or {}
-    return derive_input_cases(
+    cases = derive_input_cases(
         query=template.get("query", "") or "", body=template.get("body", "") or "",
         content_type=template.get("content_type", "") or "",
         object_id=template.get("object_id"), workflow_state_id=workflow_state_id)
+    # A client-side route (client_routes.py) adds the inputs page script reads: a
+    # parameter of the fragment route ("route") or of the page query ("page"). A
+    # page parameter the captured query already names is that query case.
+    location, names = route_params_of_template(template)
+    if location:
+        have = {c.parameter_name for c in cases if c.parameter_location == "query"}
+        for name in names:
+            if location == PAGE and name in have:
+                continue
+            ck = CaseKey(location, name, 0, workflow_state_id, name)
+            if all(c.coord_id() != ck.coord_id() for c in cases):
+                cases.append(ck)
+    # A router-declared `:name` segment of the route path (`/item/:id`).
+    for name in route_segments_of_template(template):
+        ck = CaseKey(SEGMENT, name, 0, workflow_state_id, name)
+        if all(c.coord_id() != ck.coord_id() for c in cases):
+            cases.append(ck)
+    return cases
 
 
 # ---------------------------------------------------------------------------
@@ -536,8 +556,23 @@ class Check:
     origin_scoped: bool = False  # A transport/deployment fact, not a response policy.
 
     def applies(self, endpoint: dict) -> tuple[bool, str]:
-        """Deterministic applicability + the rationale for WHY it applies or doesn't."""
-        return self.applicability(endpoint)
+        """Deterministic applicability + the rationale for WHY it applies or doesn't.
+
+        A client-side route input (client_routes.py) is loaded in a browser, so it
+        applies to the browser XSS legs only. A route the run knows only from the
+        page (no captured request of its own) is that leg's endpoint alone."""
+        location, names = route_params_of_template(endpoint.get("template"))
+        names = names + [":" + s for s in route_segments_of_template(endpoint.get("template"))]
+        if endpoint.get("client_route_only"):
+            if self.confirmation in CLIENT_ROUTE_LEGS and names:
+                return True, (f"client-side route reads {location} parameter(s) "
+                              f"{', '.join(names[:3])}")
+            return False, "client-side route: only the browser XSS legs load it"
+        applicable, reason = self.applicability(endpoint)
+        if not applicable and self.confirmation in CLIENT_ROUTE_LEGS and names:
+            return True, (f"client-side route reads {location} parameter(s) "
+                          f"{', '.join(names[:3])}")
+        return applicable, reason
 
     def canonical_class(self) -> str | None:
         return canonicalize(self.vulnerability_class)

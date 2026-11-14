@@ -618,6 +618,9 @@ class RoleCrawlResult:
     # has no slot for.
     cross_role_outcomes: list = field(default_factory=list)
     sensitive_file_evidence: list = field(default_factory=list)  # WL-05: SurfaceResult records
+    # client_routes.ClientRouteMap: the client-side routes every role's crawl mined
+    # (names only). Kept out of to_dict(); build_engagement puts it on the state.
+    client_routes: object = None
 
     def to_dict(self) -> dict:
         return {
@@ -753,6 +756,12 @@ async def crawl_roles(
                                      run_context=run_context,
                                      session_ref=(session_refs[role_index]
                                                   if session_refs is not None else None))
+            mined_routes = getattr(cr, "client_routes", None)
+            if mined_routes is not None:
+                if result.client_routes is None:
+                    from harness.client_routes import ClientRouteMap
+                    result.client_routes = ClientRouteMap()
+                result.client_routes.merge(mined_routes)
             for endpoint in sorted(cr.endpoints):
                 discovered_path, observed_query = _split_discovered_endpoint(endpoint)
                 _remember_observed_ids(urlsplit(endpoint).path or "/", discovered_path)

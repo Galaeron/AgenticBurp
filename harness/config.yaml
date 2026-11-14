@@ -306,6 +306,19 @@ driver_capture:
   spa_navigation: false
   max_views: 30
   max_depth: 4
+  # Router-declared views: also visit, by GET navigation, up to this many routes
+  # the app's router config (in its same-origin scripts) declares without a
+  # parameter and nothing links to, as the crawling identity. A view the app does
+  # not stay on (a guard, a redirect to login, an error status) is recorded as
+  # guarded, not as a view. Its own cap, apart from max_views. 0 = off.
+  declared_views: 0
+  # spa: true only. Route probes: load up to this many views once more with a
+  # random marker value in each route parameter name the app's scripts read
+  # (URLSearchParams.get, queryParamMap.get, queryParams.x, ...). A name whose
+  # marker the view then shows or sends to an API becomes a route input of that
+  # view, so the XSS legs test it. GET navigation only, as the crawling identity.
+  # Its own cap, apart from max_views. 0 = off.
+  route_probes: 0
 
 # Cross-site browser PoC for CSRF confirmation -- LB-5 (harness/browser_driver.py
 # PlaywrightDriver.cross_site_submit + harness/validators/csrf_validator.py).

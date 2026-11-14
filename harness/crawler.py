@@ -29,6 +29,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from harness import global_throttle
+from harness.client_routes import ClientRouteMap
 from harness.feature_workflow import FormAction, extract_forms
 from harness.js_endpoint_extractor import extract_endpoints, extract_call_shapes, CallShape
 
@@ -76,6 +77,9 @@ class CrawlResult:
     call_shapes: list[CallShape] = field(default_factory=list)
     suppressed_navigation: set[str] = field(default_factory=set)  # observed state-changing-looking links
     errors: list[str] = field(default_factory=list)
+    # Client-side routes and the parameters they read (client_routes.py), mined from
+    # every HTML page and script fetched. Names only; kept out of to_dict().
+    client_routes: ClientRouteMap = field(default_factory=ClientRouteMap)
 
     def to_dict(self) -> dict:
         return {
@@ -216,6 +220,14 @@ async def crawl(
                 p for p in found.from_request_calls
                 if not _DESTRUCTIVE_NAVIGATION.search(urlsplit(p).path or "/")
             }
+            try:
+                if is_script:
+                    result.client_routes.mine_script(body)
+                elif "<" in body[:4096]:
+                    result.client_routes.mine_html(body, final_url)
+                    result.client_routes.mine_script(body)   # inline scripts
+            except Exception as exc:  # route mining never sinks the crawl
+                result.errors.append(f"{norm_url}: client route mining failed: {type(exc).__name__}")
             known_shapes = set(result.call_shapes)
             for shape in extract_call_shapes(body):
                 if shape not in known_shapes and not _DESTRUCTIVE_NAVIGATION.search(shape.path):

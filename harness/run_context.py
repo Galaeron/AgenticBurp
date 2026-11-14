@@ -1399,6 +1399,10 @@ class RunContext:
     # route_feed.RouteFeed, installed by an engagement with engagement.recrawl on;
     # the transport offers it every route it first sees. None: nothing is offered.
     route_feed: object = field(default=None, repr=False, compare=False)
+    # client_routes.ClientRouteMap of the engagement this run is investigating, set
+    # once discovery is built or restored. The XSS legs read it to load the page
+    # route that issued an API call (routes_for_api). None: no route is known.
+    client_routes: object = field(default=None, repr=False, compare=False)
     # HU-5: the run's target change log (run_handoff.ChangeLog; every non-read send
     # that ended 2xx, in memory) and its handoff (run_handoff.RunHandoff, attached
     # by the server per job; None: no handoff is kept). Bookkeeping only.

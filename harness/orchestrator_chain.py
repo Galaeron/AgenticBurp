@@ -1208,6 +1208,11 @@ class ChainMixin:
                 except Exception as e:
                     log.warning("investigate_engagement: journaling discovery failed: %s", e)
 
+        # Client-side routes (client_routes.py), built or restored with discovery: the
+        # XSS legs load the page route that issued an API call.
+        if run_context is not None and getattr(state, "client_routes", None) is not None:
+            run_context.client_routes = state.client_routes
+
         # I16: the operator's declarations for this engagement, added after discovery
         # (built or restored) so both paths carry them. Malformed entries are left to
         # the readers, which ignore them with a warning (fail closed).
@@ -2435,6 +2440,8 @@ class ChainMixin:
             # in the final summary/worklist/coverage/report -- not just in a local
             # list. Also feed the re-crawl's responses into credential detection.
             state.merge_from(st2)
+            if run_context is not None and getattr(state, "client_routes", None) is not None:
+                run_context.client_routes = state.client_routes
             if _round_in_background:   # reviewed into the merged state, in the background
                 _overlap.extend(list(getattr(rc2, "captured", None) or []))
             _responses.update(_responses_from(getattr(rc2, "captured", None)))
@@ -2709,8 +2716,28 @@ class ChainMixin:
                                       "reason": "route placeholders have no complete observed object identifiers", "finding_class": None}
                     if legacy:
                         node = dict(node, template=dict(template, object_id=str(template["object_id"])))
+                    route = _client_route_of(node)
+                    if route is not None:
+                        # A client-side route the run knows only from the page: load
+                        # the route's own page, its parameters blank.
+                        node = dict(node, template=node.get("template") or route.template())
+                        ex = worklist_investigator._seed_exchange(
+                            base_url, node, _role_headers.get(identity, {}), "")
+                        return ex.model_copy(update={"url": route.seed_url(base_url)}), None
                     return worklist_investigator._seed_exchange(
                         base_url, node, _role_headers.get(identity, {}), ""), None
+
+                def _client_route_of(node):
+                    """The client-side route (client_routes.py) a coverage endpoint with
+                    no captured request stands for, or None."""
+                    key = f"{node.get('method') or 'GET'} {node.get('path') or ''}"
+                    routes = getattr(state, "client_routes", None)
+                    if routes is None or key in state.endpoints:
+                        return None
+                    try:
+                        return routes.route_for_key(key)
+                    except Exception:
+                        return None
 
                 async def _run_captured_leg(identity, method, path, check, case_key=None, node=None,
                                             remainder_only=False):
