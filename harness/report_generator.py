@@ -166,6 +166,10 @@ class ReportFinding:
     # did not reproduce (store row `evidence_source`). Such a row is reported in its
     # own section and count, never as a confirmed finding.
     tool_reported: bool = False
+    # Header-policy grouping (issues.header_policy): what the linked proof observed,
+    # and the collapsed locations a confirmed member stands on.
+    proof_observed_result: str = ""
+    confirmed_locations: list[str] = field(default_factory=list)
 
 
 def _from_store_dict(d: dict) -> ReportFinding:
@@ -207,6 +211,7 @@ def _from_store_dict(d: dict) -> ReportFinding:
         input_recorded=d.get("input_recorded", True) is not False,
         tool_reported=bool(d.get("confirmed")) and __import__(
             "harness.evidence", fromlist=["is_tool_reported"]).is_tool_reported(d),
+        proof_observed_result=d.get("proof_observed_result", "") or "",
         **finding_triage(d),
     )
 
@@ -313,12 +318,18 @@ def _dedup_key(f: "ReportFinding") -> tuple:
     distinct issues. It is exactly `issues.issue_key`, so the report's collapse and
     the issue export agree by construction."""
     from harness import issues
-    return issues.issue_key({
+    return issues.issue_key(_issue_view(f))
+
+
+def _issue_view(f: "ReportFinding") -> dict:
+    """The fields issues.issue_key and issues.header_policy read, from a report row."""
+    return {
         "url": f.url, "method": f.method, "vulnerability_class": f.vulnerability_class,
         "parameter_location": f.parameter_location, "parameter_name": f.parameter_name,
         "validator": f.validator, "policy_fingerprint": f.policy_fingerprint,
         "principal_id": f.principal_id, "workflow_state_id": f.workflow_state_id,
-        "fingerprint": f.fingerprint, "input_recorded": f.input_recorded})
+        "fingerprint": f.fingerprint, "input_recorded": f.input_recorded,
+        "agent": f.agent, "evidence": f.evidence, "proof_observed_result": f.proof_observed_result}
 
 
 # Finding dedup (2026-11-03): an authorization flaw on one object route is one issue
@@ -344,16 +355,23 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
     the shortlist. The survivor carries `duplicate_count` (how many collapsed into
     it). Returns (survivors, number_removed). Order-stable on first appearance;
     the caller re-sorts anyway."""
+    from harness import issues
     groups: dict[tuple[str, str], "ReportFinding"] = {}
     order: list[tuple[str, str]] = []
     for f in findings:
-        key = _dedup_key(f)
-        k = (key, "" if key[3] in _PRINCIPAL_INDEPENDENT_CLASSES else f.captured_principal_id)
+        view = _issue_view(f)
+        key = issues.issue_key(view)
+        # A header policy is the response headers' fact, keyed on its recorded value: one
+        # issue whichever captured user fetched it, as in the issue export.
+        shared = key[3] in _PRINCIPAL_INDEPENDENT_CLASSES or issues.header_policy(view) is not None
+        k = (key, "" if shared else f.captured_principal_id)
         member_id = f.finding_id or f.fingerprint
+        proven_here = [f.url] if f.url and f.confirmed and not f.tool_reported else []
         cur = groups.get(k)
         if cur is None:
             f.duplicate_count = 1
             f.locations = [f.url] if f.url else []
+            f.confirmed_locations = proven_here
             f.member_ids = [member_id] if member_id else []
             f.principals = [f.captured_principal_id] if f.captured_principal_id else []
             groups[k] = f
@@ -361,6 +379,8 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
         else:
             total = cur.duplicate_count + 1
             locations = cur.locations + ([f.url] if f.url and f.url not in cur.locations else [])
+            confirmed_locations = cur.confirmed_locations + [
+                u for u in proven_here if u not in cur.confirmed_locations]
             member_ids = cur.member_ids + ([member_id] if member_id else [])
             principals = cur.principals + (
                 [f.captured_principal_id]
@@ -368,6 +388,7 @@ def _collapse_duplicates(findings: list["ReportFinding"]) -> tuple[list["ReportF
             winner = f if _rank_tuple(f) > _rank_tuple(cur) else cur
             winner.duplicate_count = total
             winner.locations = locations
+            winner.confirmed_locations = confirmed_locations
             winner.member_ids = member_ids
             winner.principals = principals
             groups[k] = winner
@@ -766,6 +787,20 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
         lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** under the same "
                      f"{f.validator} policy -- collapsed into this one finding. Locations: "
                      + ", ".join(f"`{issues.redact_url(u)}`" for u in f.locations))
+    elif f.duplicate_count > 1 and (policy := issues.header_policy(_issue_view(f))) is not None:
+        named = ", ".join(policy.headers) or "security headers"
+        lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** on this host under "
+                     + ("one recorded header policy" if policy.recorded else "one header name")
+                     + f" ({named}) -- collapsed into this one finding. Locations: "
+                     + ", ".join(f"`{issues.redact_url(u)}` ("
+                                 + ("confirmed" if u in f.confirmed_locations else "candidate") + ")"
+                                 for u in f.locations))
+        if policy.observed:
+            lines.append("**Observed policy:** " + "; ".join(
+                f"{h}: `{issues.redact(v)}`" for h, v in policy.observed))
+        if not policy.recorded:
+            lines.append("_The header value was not recorded for every location; these routes "
+                         "are grouped by header name only and may differ._")
     elif f.duplicate_count > 1 and issues.issue_class(f.vulnerability_class) in issues._HOST_WIDE_CLASSES:
         lines.append(f"**Also observed on {f.duplicate_count - 1} other instance(s)** on this host "
                      f"(a host-wide class) -- collapsed into this one finding. Locations: "

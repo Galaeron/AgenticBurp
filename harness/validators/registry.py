@@ -369,6 +369,28 @@ class ValidatorRegistry:
         if cfg.get("content_exposure", {}).get("enabled", True):
             self.validators["content_exposure"] = ContentExposureValidator()
 
+        # r9 exposure leads (AV-EXPOSURE-02/03, AV-FILTER-01, AV-WELLKNOWN-01): GET-only
+        # legs that fetch what a listing or metrics capture points at, and the origin's
+        # .well-known files. Active: they run only under validators.active_enabled.
+        from .exposure_leads import (FilterBypassValidator, ListingExposureValidator,
+                                     MetricsExposureValidator, WellKnownValidator)
+        le_cfg = cfg.get("listing_exposure", {})
+        if le_cfg.get("enabled", True):
+            self.validators["listing_exposure"] = ListingExposureValidator(
+                allowed_hosts=_allowed, timeout=float(le_cfg.get("timeout", 10.0)))
+        fb_cfg = cfg.get("filter_bypass", {})
+        if fb_cfg.get("enabled", True):
+            self.validators["filter_bypass"] = FilterBypassValidator(
+                allowed_hosts=_allowed, timeout=float(fb_cfg.get("timeout", 10.0)))
+        me_cfg = cfg.get("metrics_exposure", {})
+        if me_cfg.get("enabled", True):
+            self.validators["metrics_exposure"] = MetricsExposureValidator(
+                allowed_hosts=_allowed, timeout=float(me_cfg.get("timeout", 10.0)))
+        wk_cfg = cfg.get("well_known", {})
+        if wk_cfg.get("enabled", True):
+            self.validators["well_known"] = WellKnownValidator(
+                allowed_hosts=_allowed, timeout=float(wk_cfg.get("timeout", 10.0)))
+
         # Browser-driven XSS validator (A2) -- active: loads candidate URLs in a
         # real headless browser and confirms only on observed script execution.
         # Enabled here just registers it; it still only RUNS when
@@ -572,6 +594,19 @@ class ValidatorRegistry:
                 return decision("needs_prerequisite", "missing_response_media_type", "observed response media type is required")
             if "html" not in content_type:
                 return decision("unsupported", "non_html_response", "this CSP procedure requires an HTML response")
+        if family in {"listing_exposure", "filter_bypass", "metrics_exposure"} and method != "GET":
+            return decision("unsupported", "unsupported_method", "this procedure replays a captured GET")
+        if family in {"listing_exposure", "filter_bypass"}:
+            from .exposure_leads import parse_listing
+            if not parse_listing(exchange):
+                return decision("unsupported", "not_a_listing",
+                                "the captured response is not a directory listing")
+        if family == "metrics_exposure":
+            from .exposure_leads import is_metrics_exposition
+            if not is_metrics_exposition(exchange.response_status, exchange.response_headers,
+                                         exchange.response_body or ""):
+                return decision("unsupported", "not_metrics",
+                                "the captured response is not a metrics exposition")
         if family == "jwt_forge":
             from .jwt_forge_validator import _extract_jwt, _decode
             if method != "GET":

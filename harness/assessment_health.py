@@ -404,7 +404,8 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         claimed = ('hardening' if validator in ('csp_validator', 'crypto_validator', 'verbose_error_validator',
                                                 'security_headers_validator', 'error_handling_validator',
                                                 'content_exposure_validator')
-                   else 'reconnaissance' if validator == 'recon_validator' else 'vulnerability')
+                   else 'reconnaissance' if validator in ('recon_validator', 'well_known_validator')
+                   else 'vulnerability')
         refs = [proof.get('baseline_artifact_id'), proof.get('attack_artifact_id'),
                 *(proof.get('control_artifact_ids') or [])]
         structured = bool(proof.get('executed') and not proof.get('legacy', True)

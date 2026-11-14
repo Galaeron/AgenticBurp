@@ -171,10 +171,16 @@ class HeaderPolicyStorePathTests(_CallerBase, unittest.TestCase):
         self._persist("/b", "csp-fp-2")
         self.assertEqual(len(self._issues()), 2)
 
-    def test_unfingerprinted_stored_proofs_keep_one_issue_per_route(self):
+    def test_unfingerprinted_stored_proofs_are_one_issue_that_says_the_routes_may_differ(self):
+        # 2026-11-13: with no recorded value a header policy groups by origin + class +
+        # header name (issues.header_policy), and the issue says the routes may differ.
         self._persist("/a", "")
         self._persist("/b", "")
-        self.assertEqual(len(self._issues()), 2)
+        issues = self._issues()
+        self.assertEqual(len(issues), 1, json.dumps(issues, indent=1, default=str))
+        self.assertEqual(issues[0]["affected_routes"], ["/a", "/b"])
+        self.assertFalse(issues[0]["header_policy"]["recorded"])
+        self.assertTrue(any("may differ" in line for line in issues[0]["limitations"]))
 
 
 if __name__ == "__main__":

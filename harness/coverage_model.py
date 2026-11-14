@@ -668,6 +668,65 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("CWE", "CWE-548", "https://cwe.mitre.org/data/definitions/548.html",
                           "Exposure of Information Through Directory Listing"),
           )),
+    # r9: the model raised listing, backup and metrics leads that no leg decided, and
+    # AV-EXPOSURE-01 judged the same captures with no exchange behind its verdict.
+    # These legs send GETs (validators.active_enabled) and keep the exchanges as proof.
+    # Their shape gate (a listing / an exposition) is in capability_for_check.
+    Check("AV-EXPOSURE-02", "Sensitive files served from a directory listing", Phase.ENDPOINT,
+          "info_disclosure", _always_applicable, "listing_exposure",
+          "When a captured 2xx response is a directory listing (HTML index or JSON file "
+          "list), GET each listed file and classify its content: backups, configuration, "
+          "keys and keystores, credentials, documents marked confidential, data dumps, "
+          "package manifests",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-CONF-04",
+                          "https://owasp.org/www-project-web-security-testing-guide/v42/"
+                          "4-Web_Application_Security_Testing/"
+                          "02-Configuration_and_Deployment_Management_Testing/"
+                          "04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information",
+                          "Review Old Backup and Unreferenced Files for Sensitive Information",
+                          version="4.2"),
+              ExternalRef("CWE", "CWE-530", "https://cwe.mitre.org/data/definitions/530.html",
+                          "Exposure of Backup File to an Unauthorized Control Sphere"),
+              ExternalRef("CWE", "CWE-538", "https://cwe.mitre.org/data/definitions/538.html",
+                          "Insertion of Sensitive Information into Externally-Accessible File or Directory"),
+          )),
+    Check("AV-FILTER-01", "File-extension filter bypass (NUL encoding)", Phase.ENDPOINT,
+          "path_filter_bypass", _always_applicable, "filter_bypass",
+          "When a directory listing names a file the server refuses while it serves a "
+          "sibling, GET the refused name with a NUL encoding before an allowed extension "
+          "(name%2500.ext, name%00.ext). Positive control: the same encoding on a served "
+          "listed file returns its exact bytes. Negative control: on a nonexistent name it "
+          "returns no file",
+          external_refs=(
+              ExternalRef("CWE", "CWE-158", "https://cwe.mitre.org/data/definitions/158.html",
+                          "Improper Neutralization of Null Byte or NUL Character"),
+              ExternalRef("CWE", "CWE-20", "https://cwe.mitre.org/data/definitions/20.html",
+                          "Improper Input Validation"),
+          )),
+    Check("AV-EXPOSURE-03", "Metrics endpoint exposed without authentication", Phase.ENDPOINT,
+          "info_disclosure", _always_applicable, "metrics_exposure",
+          "When a captured 2xx response is a metrics exposition, GET it without "
+          "credentials (must still be an exposition) and GET a nonexistent sibling (must "
+          "not be one); record the families, label keys and versions it reveals",
+          external_refs=(
+              ExternalRef("CWE", "CWE-200", "https://cwe.mitre.org/data/definitions/200.html",
+                          "Exposure of Sensitive Information to an Unauthorized Actor"),
+              ExternalRef("CWE", "CWE-306", "https://cwe.mitre.org/data/definitions/306.html",
+                          "Missing Authentication for Critical Function"),
+          )),
+    Check("AV-WELLKNOWN-01", "security.txt and CSAF provider metadata", Phase.DOMAIN,
+          "recon", _always_applicable, "well_known",
+          "Once per origin, GET /.well-known/security.txt (RFC 9116) and "
+          "/.well-known/csaf/provider-metadata.json; what is published is an observation, "
+          "not a vulnerability",
+          external_refs=(
+              ExternalRef("RFC", "RFC 9116", "https://www.rfc-editor.org/rfc/rfc9116",
+                          "A File Format to Aid in Security Vulnerability Disclosure"),
+              ExternalRef("OASIS", "CSAF 2.0",
+                          "https://docs.oasis-open.org/csaf/csaf/v2.0/csaf-v2.0.html",
+                          "Common Security Advisory Framework Version 2.0"),
+          ), origin_scoped=True),
     # Mass assignment is an API-layer scenario with NO dedicated WSTG v4.2 test
     # (WSTG-CONF-09 is "Test File Permission" -- a different thing), so it carries an
     # internal id and its real sources live in external_refs. See coverage_manifest.

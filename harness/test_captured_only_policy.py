@@ -63,6 +63,29 @@ class CapturedOnlyPolicyTests(unittest.TestCase):
         self.assertTrue(ctx.gate.authorize(validator_name='benign', method='GET',
                                           url='https://target.test/logout-help').allowed)
 
+    def test_nul_path_probe_is_sendable_but_never_reaches_an_exclusion(self):
+        # A decoded NUL is read both ways: truncated (a C-string file layer) and
+        # stripped (a sanitizer). The exclusion must hold under either reading.
+        ctx = RunContext.create(allowed_hosts=['target.test'], config={
+            'transport': {'excluded_path_prefixes': ['/logout', '/files/secret']}})
+        for suffix in ('/logout%00.md', '/logout%2500.md', '/log%00out', '/files/secret%2500.md',
+                       '/files/secret/x%00.md', '/ordinary/..%00/logout'):
+            with self.subTest(path=suffix), patch.object(ctx, 'default_client',
+                    side_effect=AssertionError('client forbidden')):
+                out = completed_without_await(ctx.target_transport().execute(
+                    TypedRequest('GET', 'https://target.test' + suffix), capability='benign'))
+                self.assertEqual(out.outcome, 'blocked')
+                self.assertIn('excluded', out.error)
+        # Other control characters and over-deep encodings stay ambiguous.
+        policy = ctx.target_policy
+        for suffix in ('/x%01y', '/a%0d%0a', '/a%25252500'):
+            self.assertEqual(policy.denial_reason('https://target.test' + suffix),
+                             'ambiguous target path', suffix)
+        # Negative control: a filter-bypass probe on an ordinary path passes the gate.
+        for suffix in ('/files/app.conf.bak%2500.md', '/files/app.conf.bak%00.md'):
+            self.assertTrue(ctx.gate.authorize(validator_name='benign', method='GET',
+                                              url='https://target.test' + suffix).allowed, suffix)
+
     def test_malformed_policy_fails_before_client_and_snapshot_is_immutable(self):
         for transport in ({'captured_only': 'false'}, {'excluded_path_prefixes': '/logout'},
                           {'excluded_path_prefixes': ['/bad%zz']},

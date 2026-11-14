@@ -294,6 +294,20 @@ _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
                  note="PASSIVE AV-EXPOSURE-01 coverage leg: a directory index, Prometheus "
                       "exposition or JSONP callback wrapper in a captured 2xx. Sends nothing; "
                       "no Java case."),
+    _python_only("listing_exposure", "listing_exposure",
+                 note="AV-EXPOSURE-02 leg: GETs the files a captured directory listing names and "
+                      "classifies their content (backup, config, key, credentials, confidential "
+                      "document, manifest). GET-only; no Java case."),
+    _python_only("filter_bypass", "filter_bypass",
+                 note="AV-FILTER-01 leg: a listed file refused by an extension filter, fetched "
+                      "through a NUL encoding before an allowed extension, with a positive and a "
+                      "negative control. GET-only; no Java case."),
+    _python_only("metrics_exposure", "metrics_exposure",
+                 note="AV-EXPOSURE-03 leg: a metrics exposition re-fetched without credentials, "
+                      "with a nonexistent-sibling control. GET-only; no Java case."),
+    _python_only("well_known", "well_known",
+                 note="AV-WELLKNOWN-01 leg: security.txt and CSAF provider metadata once per "
+                      "origin, reported as observations. GET-only; no Java case."),
 )
 
 CAPABILITY_MATRIX: dict[str, CapabilityOwnership] = {

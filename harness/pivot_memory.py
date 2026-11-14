@@ -112,14 +112,15 @@ def attach_to_proven_issues(held: list[Finding], exchange: HttpExchange, rows: l
         if f.confirmed or f.proof_id or f.case_id:
             continue
         d = dict(f.model_dump(), url=exchange.url, method=(exchange.method or "").upper())
-        key = issues.issue_key(d)
+        key = issues.issue_key(d, recorded_policy=False)
         # The proof must be of THIS route: a host-wide or dependency class drops the
         # route from issue_key, and a header missing on one route is not proven on
-        # another by that route's proof.
+        # another by that route's proof. recorded_policy=False: the key before the
+        # report grouped header policies by their recorded value, so binding is unchanged.
         on_route = [r for r in proven if _route(r) == _route(d)]
-        same = [r for r in on_route if issues.issue_key(r) == key]
+        same = [r for r in on_route if issues.issue_key(r, recorded_policy=False) == key]
         if not same and not issues._affected_input(d):
-            if len({issues.issue_key(r) for r in on_route}) == 1:
+            if len({issues.issue_key(r, recorded_policy=False) for r in on_route}) == 1:
                 same = on_route
         if not same:
             continue
