@@ -1,5 +1,6 @@
 """
-File-upload extension/content-type bypass leg (V33, WSTG-BUSL-09).
+File-upload extension/content-type bypass leg (V33, WSTG-BUSL-08 Upload of
+Unexpected File Types: a benign file of a disallowed type, never a malicious one).
 
 Per LEG_DECISIONS.md: confirm only the SAFE slice — that a file with a
 disallowed content-type/extension is stored and retrievable (no execution).

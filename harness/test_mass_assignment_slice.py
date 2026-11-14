@@ -1,5 +1,5 @@
 """
-Mass-assignment vertical slice (internal id AV-MASSASSIGN-01) -- deterministic
+Mass-assignment vertical slice (WSTG-INJT-20, formerly AV-MASSASSIGN-01) -- deterministic
 regression over ACTUAL HTTP.
 
 This is the reference regression the requirement-coverage manifest points at. It is a

@@ -148,15 +148,15 @@ class AssessmentEvidence(unittest.TestCase):
         tracker = CoverageTracker()
         tracker.build({"POST /api/search": {"path": "/api/search", "methods": ("POST",),
                                            "reachable_roles": ["user"]}}, ["user"])
-        tracker.matrix.record("user", "POST /api/search", "WSTG-INPV-05",
+        tracker.matrix.record("user", "POST /api/search", "WSTG-INJT-05",
                               status=CellStatus.DETECTED, reason="model inference")
         calls = []
         async def run(identity, method, path, check):
             calls.append(check.id)
             return SimpleNamespace(status="not_confirmed", summary="control", evidence="", confidence=0, validator="test")
         asyncio.run(tracker.drive_coverage_legs(run, budget=100))
-        self.assertIn("WSTG-INPV-05", calls)
-        self.assertTrue(tracker.matrix.get("user", "POST /api/search", "WSTG-INPV-05").executed)
+        self.assertIn("WSTG-INJT-05", calls)
+        self.assertTrue(tracker.matrix.get("user", "POST /api/search", "WSTG-INJT-05").executed)
 
     def test_failed_coverage_dispatch_is_visible_and_spends_attempt_budget(self):
         from harness.coverage_tracker import (CoverageTracker, _LEG_CONFIRMATIONS,

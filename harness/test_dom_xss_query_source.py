@@ -44,7 +44,7 @@ from harness.validators.injection_targets import (NAMED_PARAMETER_UNTESTED, PER_
 from harness.coverage_model import CaseKey
 
 ROLES = [RoleSession("anonymous", {})]
-REFLECTED, DOM = "WSTG-INPV-01", "WSTG-CLNT-01"
+REFLECTED, DOM = "WSTG-INJT-01", "WSTG-CLNT-01"
 HTML = {"Content-Type": "text/html; charset=utf-8"}
 JSON_TYPE = {"Content-Type": "application/json"}
 

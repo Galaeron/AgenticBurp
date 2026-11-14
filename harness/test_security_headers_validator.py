@@ -1,4 +1,4 @@
-"""WSTG-CONF-02 passive header adapter: the oracle, its cache key, and the
+"""WSTG-CONF-14 passive header adapter: the oracle, its cache key, and the
 engagement coverage drive that calls it."""
 import asyncio
 import tempfile
@@ -95,7 +95,7 @@ class ValidateTests(unittest.TestCase):
         from types import SimpleNamespace
         from harness.coverage_model import CHECKS_BY_ID
         from harness.orchestrator_helpers import coverage_confirmation_finding
-        check = CHECKS_BY_ID["WSTG-CONF-02"]
+        check = CHECKS_BY_ID["WSTG-CONF-14"]
         found = coverage_confirmation_finding(self.validate(_ex(200, {})), check, "http://t/a", "user")
         self.assertEqual(found["severity"], "low")
         legacy = SimpleNamespace(confirmed=True, finding_class="x", confidence=0.9, summary="s",
@@ -191,7 +191,7 @@ class PassiveLegCallerTest(unittest.TestCase):
 
 class EngagementCallerTests(PassiveLegCallerTest):
     def run_caller(self, enabled, case_drive):
-        return self.drive("security_headers", "WSTG-CONF-02", SecurityHeadersValidator.name,
+        return self.drive("security_headers", "WSTG-CONF-14", SecurityHeadersValidator.name,
                           _header_state, enabled, case_drive)
 
     def test_drive_confirms_controls_and_skips_without_sending(self):

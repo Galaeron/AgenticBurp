@@ -180,8 +180,8 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         self.assertGreater(cov.get("total_cells", 0), 0)
         self.assertGreaterEqual(cov.get("confirmed", 0), 1,
                                 "the confirmed JWT forge did not fill a CONFIRMED coverage cell")
-        # WSTG-CRYP-04 is the JWT check; it must show a confirmed cell.
-        jwt_check = cov.get("by_check", {}).get("WSTG-CRYP-04", {})
+        # WSTG-SESS-10 is the JWT check; it must show a confirmed cell.
+        jwt_check = cov.get("by_check", {}).get("WSTG-SESS-10", {})
         self.assertGreaterEqual(jwt_check.get("confirmed", 0), 1)
         # every not-tested cell carries a reason (the audit guarantee)
         self.assertTrue(all(nt.get("reason") for nt in cov.get("not_tested", [])))
@@ -195,7 +195,7 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         cov = result.get("coverage") or {}
         self.assertGreaterEqual(cov.get("legs_driven", 0), 1,
                                 "coverage driver did not fire any legs end-to-end")
-        self.assertGreaterEqual(cov.get("by_check", {}).get("WSTG-CRYP-04", {}).get("confirmed", 0), 1)
+        self.assertGreaterEqual(cov.get("by_check", {}).get("WSTG-SESS-10", {}).get("confirmed", 0), 1)
 
     def test_coverage_driver_confirmation_reaches_findings_not_just_matrix(self):
         """R06: a matrix-driven confirmation must enter the finding pipeline, not
@@ -205,7 +205,7 @@ class InvestigateProactiveJwtSmokeTest(unittest.TestCase):
         the state findings."""
         result = self._run(vulnerable=True, drive=True, max_nodes=0)
         cov = result.get("coverage") or {}
-        self.assertGreaterEqual(cov.get("by_check", {}).get("WSTG-CRYP-04", {}).get("confirmed", 0), 1,
+        self.assertGreaterEqual(cov.get("by_check", {}).get("WSTG-SESS-10", {}).get("confirmed", 0), 1,
                                 "coverage driver did not confirm the JWT check with the worklist off")
         # The same confirmation is now a real finding on the endpoint in state.
         self.assertTrue(
@@ -351,7 +351,7 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
         orch = Orchestrator(_test_config())
         ctx = RunContext.create(run_id="coverage-run-A", config=_test_config(),
                                 allowed_hosts=["localhost"])
-        check = CHECKS_BY_ID["WSTG-INPV-05"]  # SQLi, parameter phase
+        check = CHECKS_BY_ID["WSTG-INJT-05"]  # SQLi, parameter phase
         ex = SimpleNamespace(method="POST", url="http://localhost/api/search",
                              request_body="search=x&sort=y")
         res = SimpleNamespace(validator="sqlmap", status="confirmed", confirmed=True,
@@ -366,7 +366,7 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
         case = rows[0]["case"]
         self.assertEqual(case["parameter_location"], "query")
         self.assertEqual(case["parameter_name"], "search")
-        self.assertEqual(case["check_id"], "WSTG-INPV-05")
+        self.assertEqual(case["check_id"], "WSTG-INJT-05")
         self.assertEqual(case["principal_id"], "user")
         self.assertEqual(case["run_id"], "coverage-run-A")
         self.assertEqual(rows[0]["verdict"], "confirmed")
@@ -377,7 +377,7 @@ class CoverageProofCoordinatesTest(unittest.TestCase):
         orch = Orchestrator(_test_config())
         ctx = RunContext.create(run_id="coverage-run-B", config=_test_config(),
                                 allowed_hosts=["localhost"])
-        check = CHECKS_BY_ID["WSTG-INPV-05"]
+        check = CHECKS_BY_ID["WSTG-INJT-05"]
         ex = SimpleNamespace(method="GET", url="http://localhost/x?id=1&id=2", request_body="")
         res = SimpleNamespace(validator="sqlmap", status="not_confirmed", confirmed=False,
                               summary="", evidence="", confidence=0.0)

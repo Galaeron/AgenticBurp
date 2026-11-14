@@ -158,7 +158,7 @@ class PollingCapabilityTests(unittest.TestCase):
         from harness.validators.registry import ValidatorRegistry
         cfg = _config(mutating=False)
         self.registry = ValidatorRegistry(cfg)
-        self.cmdi = CHECKS_BY_ID["WSTG-INPV-12"]
+        self.cmdi = CHECKS_BY_ID["WSTG-INJT-12"]
 
     def decide(self, url):
         from harness.validators.command_injection_validator import CommandInjectionValidator
@@ -307,7 +307,7 @@ class DriveCallerTests(_EngagementCallerBase, unittest.TestCase):
         self.assertEqual(self.alice_urls(calls, "command_injection", "/rt/"), set(), calls)
         disposition = next(d for d in result["coverage"]["capability_dispositions"]
                            if d["identity"] == ALICE_ID and d["endpoint"] == "GET /rt"
-                           and d["check"] == "WSTG-INPV-12")
+                           and d["check"] == "WSTG-INJT-12")
         self.assertEqual((disposition["status"], disposition["reason_code"]),
                          ("unsupported", "protocol_inapplicable"))
         # Control: an ordinary query parameter still gets the leg.

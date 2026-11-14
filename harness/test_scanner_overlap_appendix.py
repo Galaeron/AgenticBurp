@@ -81,7 +81,7 @@ class ReportAppendixTests(_Store):
         self._seed("/e", "verbose_error_disclosure", "ERR-1 stack trace in 500 page")
         # A passive confirmation with a proof is still a scanner observation.
         self._seed("/f", "missing_headers", "HDR-3 confirmed nosniff absent",
-                   proof=("security_headers_validator", "WSTG-CONF-02 header policy fails"))
+                   proof=("security_headers_validator", "WSTG-CONF-14 header policy fails"))
         self._seed("/g", "sqli", "SQLI-1 concrete injection", severity="high")
 
     def _main(self, report: str) -> str:

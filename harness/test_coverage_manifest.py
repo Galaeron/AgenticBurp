@@ -7,7 +7,8 @@ Pins the review fixes:
   - issue 2: evidence is bound to the run id (a stale artifact can't satisfy a new
     run) and outcomes are recorded THROUGH the runner (fail/skip are recorded);
   - issue 3: exact non-empty test_id match, schema validation, duplicate rejection;
-  - issue 4: the mass-assignment scenario has an internal id + external refs;
+  - issue 4: the mass-assignment scenario keeps its external refs (WG-1: its id is now
+    WSTG-INJT-20, formerly the internal AV-MASSASSIGN-01);
   - issue 5: each aspect is a separate labelled artifact;
   - issue 6: applicability with rationale (incl. requirement-level not_applicable),
     and residual aspects are retained in gaps even under partial coverage.
@@ -54,38 +55,38 @@ class WriteLoadTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
 
     def test_round_trip_separates_observation_and_execution(self):
-        _write(self._tmp, "WSTG-INPV-05", "sqli in q", TestStatus.PASS, test_id="mod.T.test_x")
+        _write(self._tmp, "WSTG-INJT-05", "sqli in q", TestStatus.PASS, test_id="mod.T.test_x")
         body = json.loads(next(self._tmp.glob("*.json")).read_text())
         self.assertEqual(body["schema_version"], cm.SCHEMA_VERSION)
         self.assertIn("observation", body)
         self.assertIn("execution", body)
         self.assertEqual(body["execution"]["run_id"], RUN)
         loaded = load_evidence(self._tmp, run_id=RUN)
-        rec = loaded[("WSTG-INPV-05", "sqli in q")]
+        rec = loaded[("WSTG-INJT-05", "sqli in q")]
         self.assertEqual(rec.status, TestStatus.PASS)
         self.assertEqual(rec.test_id, "mod.T.test_x")
 
     def test_freshness_stale_run_is_ignored(self):
-        _write(self._tmp, "WSTG-INPV-05", "sqli", TestStatus.PASS, run_id="OLD_RUN")
+        _write(self._tmp, "WSTG-INJT-05", "sqli", TestStatus.PASS, run_id="OLD_RUN")
         self.assertEqual(load_evidence(self._tmp, run_id="NEW_RUN"), {})   # stale -> gone
-        self.assertIn(("WSTG-INPV-05", "sqli"), load_evidence(self._tmp, run_id="OLD_RUN"))
+        self.assertIn(("WSTG-INJT-05", "sqli"), load_evidence(self._tmp, run_id="OLD_RUN"))
 
     def test_unsupported_schema_is_invalid_never_pass(self):
-        p = self._tmp / cm.evidence_basename("WSTG-INPV-05", "x")
-        p.write_text(json.dumps({"schema_version": 999, "check_id": "WSTG-INPV-05",
+        p = self._tmp / cm.evidence_basename("WSTG-INJT-05", "x")
+        p.write_text(json.dumps({"schema_version": 999, "check_id": "WSTG-INJT-05",
                                  "aspect": "x", "execution": {"status": "pass",
                                  "run_id": RUN, "test_id": "m.T.test_x"}}))
-        rec = load_evidence(self._tmp, run_id=RUN)[("WSTG-INPV-05", "x")]
+        rec = load_evidence(self._tmp, run_id=RUN)[("WSTG-INJT-05", "x")]
         self.assertTrue(rec.conflict)
         self.assertEqual(rec.status, TestStatus.FAIL)
 
     def test_duplicate_artifacts_become_a_conflict(self):
         for name in ("a.json", "b.json"):
             (self._tmp / name).write_text(json.dumps({
-                "schema_version": cm.SCHEMA_VERSION, "check_id": "WSTG-INPV-05",
+                "schema_version": cm.SCHEMA_VERSION, "check_id": "WSTG-INJT-05",
                 "aspect": "dup", "execution": {"status": "pass", "run_id": RUN,
                                                "test_id": "m.T.test_x"}}))
-        rec = load_evidence(self._tmp, run_id=RUN)[("WSTG-INPV-05", "dup")]
+        rec = load_evidence(self._tmp, run_id=RUN)[("WSTG-INJT-05", "dup")]
         self.assertTrue(rec.conflict)
         self.assertEqual(rec.status, TestStatus.FAIL)
 
@@ -96,7 +97,7 @@ class WriteLoadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             TestSpec(check_id="WSTG-NOPE-99", test_id="t", aspect="a")
         with self.assertRaises(ValueError):
-            TestSpec(check_id="WSTG-INPV-05", test_id="", aspect="a")  # automated needs id
+            TestSpec(check_id="WSTG-INJT-05", test_id="", aspect="a")  # automated needs id
 
 
 class ReconcileTests(unittest.TestCase):
@@ -108,55 +109,55 @@ class ReconcileTests(unittest.TestCase):
         return reconcile(tuple(specs), evidence_dir=self._tmp, run_id=RUN, **kw)
 
     def test_pass_is_partial_never_complete(self):
-        spec = _spec("WSTG-INPV-05", "sqli in q", test_id="mod.T.test_x")
-        _write(self._tmp, "WSTG-INPV-05", "sqli in q", TestStatus.PASS, test_id="mod.T.test_x")
-        r = _req(self._reconcile([spec]), "WSTG-INPV-05")
+        spec = _spec("WSTG-INJT-05", "sqli in q", test_id="mod.T.test_x")
+        _write(self._tmp, "WSTG-INJT-05", "sqli in q", TestStatus.PASS, test_id="mod.T.test_x")
+        r = _req(self._reconcile([spec]), "WSTG-INJT-05")
         self.assertEqual(r["requirement_status"], RequirementStatus.COVERED_PARTIAL.value)
         self.assertIn("partial", r["note"])
         self.assertTrue(declared_coverage_ok(self._reconcile([spec]))[0])
 
     def test_missing_evidence_never_covered(self):
-        spec = _spec("WSTG-INPV-05", "sqli")   # nothing written
+        spec = _spec("WSTG-INJT-05", "sqli")   # nothing written
         rep = self._reconcile([spec])
-        r = _req(rep, "WSTG-INPV-05")
+        r = _req(rep, "WSTG-INJT-05")
         self.assertEqual(r["tests"][0]["status"], TestStatus.NOT_IMPLEMENTED.value)
         ok, probs = declared_coverage_ok(rep)
         self.assertFalse(ok)
-        self.assertTrue(any("WSTG-INPV-05" in p for p in probs))
+        self.assertTrue(any("WSTG-INJT-05" in p for p in probs))
 
     def test_empty_test_id_is_rejected(self):
         # issue 3: an empty evidence test_id must NOT pass.
-        spec = _spec("WSTG-INPV-05", "sqli", test_id="mod.T.test_x")
-        _write(self._tmp, "WSTG-INPV-05", "sqli", TestStatus.PASS, test_id="")
-        r = _req(self._reconcile([spec]), "WSTG-INPV-05")
+        spec = _spec("WSTG-INJT-05", "sqli", test_id="mod.T.test_x")
+        _write(self._tmp, "WSTG-INJT-05", "sqli", TestStatus.PASS, test_id="")
+        r = _req(self._reconcile([spec]), "WSTG-INJT-05")
         self.assertEqual(r["tests"][0]["status"], TestStatus.FAIL.value)
         self.assertFalse(declared_coverage_ok(self._reconcile([spec]))[0])
 
     def test_mismatched_test_id_is_rejected(self):
-        spec = _spec("WSTG-INPV-05", "sqli", test_id="mod.T.test_x")
-        _write(self._tmp, "WSTG-INPV-05", "sqli", TestStatus.PASS, test_id="mod.T.other")
-        r = _req(self._reconcile([spec]), "WSTG-INPV-05")
+        spec = _spec("WSTG-INJT-05", "sqli", test_id="mod.T.test_x")
+        _write(self._tmp, "WSTG-INJT-05", "sqli", TestStatus.PASS, test_id="mod.T.other")
+        r = _req(self._reconcile([spec]), "WSTG-INJT-05")
         self.assertEqual(r["tests"][0]["status"], TestStatus.FAIL.value)
 
     # ---- issue 1: one passing aspect must not hide a failing sibling ----
 
     def _mixed(self, sibling_status, *, write_sibling=True):
-        a = _spec("WSTG-INPV-05", "aspect A", test_id="mod.T.test_a")
-        b = _spec("WSTG-INPV-05", "aspect B", test_id="mod.T.test_b")
-        _write(self._tmp, "WSTG-INPV-05", "aspect A", TestStatus.PASS, test_id="mod.T.test_a")
+        a = _spec("WSTG-INJT-05", "aspect A", test_id="mod.T.test_a")
+        b = _spec("WSTG-INJT-05", "aspect B", test_id="mod.T.test_b")
+        _write(self._tmp, "WSTG-INJT-05", "aspect A", TestStatus.PASS, test_id="mod.T.test_a")
         if write_sibling:
-            _write(self._tmp, "WSTG-INPV-05", "aspect B", sibling_status, test_id="mod.T.test_b")
+            _write(self._tmp, "WSTG-INJT-05", "aspect B", sibling_status, test_id="mod.T.test_b")
         return self._reconcile([a, b])
 
     def test_gate_fails_on_pass_plus_fail(self):
         rep = self._mixed(TestStatus.FAIL)
-        r = _req(rep, "WSTG-INPV-05")
+        r = _req(rep, "WSTG-INJT-05")
         self.assertEqual(r["requirement_status"], RequirementStatus.COVERED_PARTIAL.value)
         ok, probs = declared_coverage_ok(rep)
         self.assertFalse(ok, "gate passed despite a failing sibling aspect")
         self.assertTrue(any("aspect B" in p for p in probs))
         # issue 6: the failing sibling is retained in gaps under a partial requirement.
-        self.assertIn("WSTG-INPV-05", [g["check_id"] for g in rep["gaps"]])
+        self.assertIn("WSTG-INJT-05", [g["check_id"] for g in rep["gaps"]])
 
     def test_gate_fails_on_pass_plus_skipped(self):
         rep = self._mixed(TestStatus.SKIPPED)
@@ -166,7 +167,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_gate_fails_on_pass_plus_missing(self):
         rep = self._mixed(None, write_sibling=False)  # sibling evidence never written
-        r = _req(rep, "WSTG-INPV-05")
+        r = _req(rep, "WSTG-INJT-05")
         ok, probs = declared_coverage_ok(rep)
         self.assertFalse(ok)
         self.assertTrue(any("aspect B" in p for p in probs))
@@ -192,12 +193,12 @@ class ReconcileTests(unittest.TestCase):
     def test_declared_not_applicable_with_rationale(self):
         # issue 6: a requirement-level not_applicable now exists, carrying a rationale,
         # and it is excluded from gaps and from the gate.
-        spec = _spec("WSTG-INPV-07", "xxe")   # would be a gap if applicable
-        rep = self._reconcile([spec], applicability={"WSTG-INPV-07": (False, "no XML endpoints in scope")})
-        r = _req(rep, "WSTG-INPV-07")
+        spec = _spec("WSTG-INJT-07", "xxe")   # would be a gap if applicable
+        rep = self._reconcile([spec], applicability={"WSTG-INJT-07": (False, "no XML endpoints in scope")})
+        r = _req(rep, "WSTG-INJT-07")
         self.assertEqual(r["requirement_status"], RequirementStatus.NOT_APPLICABLE.value)
         self.assertEqual(r["applicability"], {"applicable": False, "rationale": "no XML endpoints in scope"})
-        self.assertNotIn("WSTG-INPV-07", [g["check_id"] for g in rep["gaps"]])
+        self.assertNotIn("WSTG-INJT-07", [g["check_id"] for g in rep["gaps"]])
         self.assertTrue(declared_coverage_ok(rep)[0])
 
     def test_every_requirement_carries_applicability_rationale(self):
@@ -205,10 +206,10 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(all(r["applicability"]["rationale"] for r in rep["requirements"]))
 
     def test_duplicate_evidence_fails_the_gate(self):
-        spec = _spec("WSTG-INPV-05", "dup", test_id="mod.T.test_x")
+        spec = _spec("WSTG-INJT-05", "dup", test_id="mod.T.test_x")
         for name in ("a.json", "b.json"):
             (self._tmp / name).write_text(json.dumps({
-                "schema_version": cm.SCHEMA_VERSION, "check_id": "WSTG-INPV-05",
+                "schema_version": cm.SCHEMA_VERSION, "check_id": "WSTG-INJT-05",
                 "aspect": "dup", "execution": {"status": "pass", "run_id": RUN,
                                                "test_id": "mod.T.test_x"}}))
         self.assertFalse(declared_coverage_ok(self._reconcile([spec]))[0])
@@ -234,7 +235,7 @@ class EvidenceRunnerTests(unittest.TestCase):
     def _run_case(self, aspect, body):
         tmp = self._tmp
 
-        @evidence_for(check_id="WSTG-INPV-05", aspect=aspect, label="unit")
+        @evidence_for(check_id="WSTG-INJT-05", aspect=aspect, label="unit")
         def test_it(self):
             body(self)
 
@@ -247,45 +248,47 @@ class EvidenceRunnerTests(unittest.TestCase):
         def body(s):
             s.record_observation({"x": 1})
             s.assertTrue(True)
-        rec = self._run_case("runner pass", body)[("WSTG-INPV-05", "runner pass")]
+        rec = self._run_case("runner pass", body)[("WSTG-INJT-05", "runner pass")]
         self.assertEqual(rec.status, TestStatus.PASS)
         self.assertEqual(rec.observation, {"x": 1})
         self.assertTrue(rec.test_id.endswith(".test_it"))
 
     def test_failure_records_fail_not_pass(self):
-        rec = self._run_case("runner fail", lambda s: s.assertEqual(1, 2))[("WSTG-INPV-05", "runner fail")]
+        rec = self._run_case("runner fail", lambda s: s.assertEqual(1, 2))[("WSTG-INJT-05", "runner fail")]
         self.assertEqual(rec.status, TestStatus.FAIL)
 
     def test_skip_records_skipped(self):
-        rec = self._run_case("runner skip", lambda s: s.skipTest("x"))[("WSTG-INPV-05", "runner skip")]
+        rec = self._run_case("runner skip", lambda s: s.skipTest("x"))[("WSTG-INJT-05", "runner skip")]
         self.assertEqual(rec.status, TestStatus.SKIPPED)
 
     def test_failed_run_cannot_satisfy_gate(self):
         # A failing run's fresh 'fail' artifact must not read as coverage.
         loaded = self._run_case("runner fail2", lambda s: s.assertEqual(1, 2))
-        rec = loaded[("WSTG-INPV-05", "runner fail2")]
-        spec = _spec("WSTG-INPV-05", "runner fail2", test_id=rec.test_id)
+        rec = loaded[("WSTG-INJT-05", "runner fail2")]
+        spec = _spec("WSTG-INJT-05", "runner fail2", test_id=rec.test_id)
         rep = reconcile((spec,), evidence_dir=self._tmp, run_id=cm.current_run_id())
         self.assertFalse(declared_coverage_ok(rep)[0])
 
 
 # ---------------------------------------------------------------------------
-# Model extension (issue 4): internal id + external refs; WSTG-CONF-09 unbound
+# Model extension (issue 4): mass assignment + external refs; WSTG-CONF-09 unbound
 # ---------------------------------------------------------------------------
 
 class ModelExtensionTests(unittest.TestCase):
     def test_genuine_wstg_ref_is_versioned(self):
-        self.assertEqual(CHECKS_BY_ID["WSTG-INPV-05"].reference_label(), "WSTG-INPV-05 (WSTG v4.2)")
-        self.assertTrue(CHECKS_BY_ID["WSTG-INPV-05"].is_wstg())
+        self.assertEqual(CHECKS_BY_ID["WSTG-INJT-05"].reference_label(), "WSTG-INJT-05 (WSTG latest)")
+        self.assertTrue(CHECKS_BY_ID["WSTG-INJT-05"].is_wstg())
 
-    def test_mass_assignment_is_internal_with_external_refs(self):
-        c = CHECKS_BY_ID["AV-MASSASSIGN-01"]
-        self.assertFalse(c.is_wstg())
-        self.assertIn("internal", c.reference_label())
+    def test_mass_assignment_is_wstg_injt_20_with_external_refs(self):
+        # WG-1: current WSTG has Mass Assignment (INJT-20), so the row left its
+        # internal AV-MASSASSIGN-01 id; the API-layer sources stay attached.
+        c = CHECKS_BY_ID["WSTG-INJT-20"]
+        self.assertTrue(c.is_wstg())
+        self.assertEqual(c.reference_label(), "WSTG-INJT-20 (WSTG latest)")
         catalogs = {e.catalog for e in c.external_refs}
         self.assertIn("PortSwigger Academy", catalogs)
         self.assertTrue(any("OWASP" in cat for cat in catalogs))
-        # It must NOT falsely claim a WSTG id anywhere.
+        # The external refs stay the non-WSTG sources; the primary id is the WSTG claim.
         self.assertTrue(all(e.catalog != "WSTG" for e in c.external_refs))
 
     def test_wstg_conf_09_is_test_file_permission_not_mass_assignment(self):

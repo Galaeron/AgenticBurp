@@ -53,19 +53,21 @@ class CoverageCapabilityTests(unittest.IsolatedAsyncioTestCase):
         rows = tracker.phase_ledger()['cells']
         def row(check):
             return next(r for r in rows if r['check'] == check and r['identity'] == 'anonymous')
-        self.assertEqual(row('WSTG-CONF-05')['terminal_reason'], 'validator_unavailable')
+        self.assertEqual(row('WSTG-CONF-12')['terminal_reason'], 'validator_unavailable')
         self.assertEqual(row('WSTG-CONF-09')['terminal_reason'], 'manual_required')
         self.assertEqual(row('WSTG-INFO-02')['terminal_reason'], 'check_adapter_missing')
         # CONF-02 has an adapter now; an empty driver leaves it unavailable, not missing.
-        self.assertEqual(row('WSTG-CONF-02')['terminal_reason'], 'validator_unavailable')
-        self.assertFalse(row('WSTG-CONF-05')['eligible'])
+        self.assertEqual(row('WSTG-CONF-14')['terminal_reason'], 'validator_unavailable')
+        self.assertFalse(row('WSTG-CONF-12')['eligible'])
         self.assertTrue(any(r['terminal_reason'] == 'unreachable_identity' for r in rows))
 
     async def test_dispatch_and_policy_block_are_visible(self):
         tracker = self.tracker()
         callback = AsyncMock(return_value=SimpleNamespace(status='blocked', sent_count=0))
         await tracker.drive_coverage_legs(callback, driveable={'csp', 'cors'})
-        self.assertEqual(callback.await_count, 4)
+        # CONF-12 (csp), CLNT-07 (cors) and WG-1's CLNT-09 framing row (csp) on
+        # two endpoints each.
+        self.assertEqual(callback.await_count, 6)
         rows = [r for r in tracker.phase_ledger()['cells'] if r['attempted']]
         self.assertEqual({r['terminal_reason'] for r in rows}, {'policy_blocked'})
         self.assertTrue(all(not r['sent'] for r in rows))
@@ -80,14 +82,18 @@ class CoverageCapabilityTests(unittest.IsolatedAsyncioTestCase):
             tracker.matrix.record('user', 'GET /b', cid, status=CellStatus.DETECTED)
             self.assertEqual(tracker.matrix.get('user', 'GET /b', cid).status,
                              CellStatus.NOT_APPLICABLE)
-        for cid in ('WSTG-CONF-05', 'WSTG-CONF-07', 'WSTG-CONF-08'):
+        for cid in ('WSTG-CONF-12', 'WSTG-CONF-07', 'WSTG-CLNT-07'):
             self.assertEqual(sum(k[2] == cid and v.status != CellStatus.NOT_APPLICABLE
                                  for k, v in tracker.matrix.cells().items()), 4)
 
-    def test_catalog_routes_available_oracles_and_preserves_manual_csrf(self):
-        self.assertEqual(CHECKS_BY_ID['WSTG-INPV-06'].confirmation, 'nosql')
-        self.assertEqual(CHECKS_BY_ID['WSTG-BUSL-09'].confirmation, 'file_upload')
-        self.assertEqual(CHECKS_BY_ID['WSTG-SESS-05'].confirmation, 'manual')
+    def test_catalog_routes_available_oracles_including_csrf(self):
+        self.assertEqual(CHECKS_BY_ID['WSTG-INJT-05.6'].confirmation, 'nosql')
+        # WG-1: BUSL-09 (malicious files) is operator-judged; the extension-bypass
+        # leg belongs to BUSL-08 (unexpected file types).
+        self.assertEqual(CHECKS_BY_ID['WSTG-BUSL-09'].confirmation, 'manual')
+        # WG-2 routes CSRF to its registered leg; a confirmation still needs the
+        # browser PoC (ORACLE_RETIREMENTS.md).
+        self.assertEqual(CHECKS_BY_ID['WSTG-SESS-05'].confirmation, 'csrf')
 
 
 class EngagementCapabilityTests(unittest.TestCase):
@@ -128,7 +134,7 @@ class EngagementCapabilityTests(unittest.TestCase):
             result = asyncio.run(orch.investigate_engagement(
                 smoke.BASE_URL, smoke.ROLES, max_nodes=0, step_budget=1, max_chain_rounds=0))
         return calls, [r for r in result['coverage']['phase_ledger']['cells']
-                       if r['check'] == 'WSTG-CONF-05' and r['identity'] != 'anonymous']
+                       if r['check'] == 'WSTG-CONF-12' and r['identity'] != 'anonymous']
 
     def test_registered_csp_reaches_driver_and_disabled_control_does_not(self):
         for case_drive in (False, True):
@@ -169,8 +175,10 @@ class EngagementCapabilityTests(unittest.TestCase):
         from harness.role_crawl import RoleCrawlResult
         from harness.validators.base import ValidationResult
         from harness.coverage_tracker import _LEG_CONFIRMATIONS
+        # file_upload rejoins once the WSTG-BUSL-08 row lands (WG-2 item 1);
+        # WG-1 made BUSL-09 operator-judged.
         expected = {'csp', 'cors', 'header_injection', 'http_request_smuggling',
-                    'race_condition', 'nosql', 'file_upload'}
+                    'race_condition', 'nosql'}
         cfg = smoke._test_config()
         for name in _LEG_CONFIRMATIONS:
             cfg['validators'].setdefault(name, {})['enabled'] = name in expected
@@ -211,9 +219,12 @@ class EngagementCapabilityTests(unittest.TestCase):
         self.assertEqual({r['confirmation'] for r in rows if r['attempted']}, expected | {'cross_identity'})
         self.assertTrue({'csp_validator', 'cors_validator', 'header_injection_validator',
                          'http_request_smuggling_validator', 'race_condition_validator',
-                         'nosql', 'file_upload'} <= seen, seen)
+                         'nosql'} <= seen, seen)
+        # WG-2: SESS-05 names the registered csrf leg (its verdict stays a retired
+        # observation, and its replays stay behind allow_mutating_replay). Disabled
+        # here, it is unavailable rather than manual, and is never attempted.
         csrf = next(r for r in rows if r['check'] == 'WSTG-SESS-05')
-        self.assertEqual(csrf['terminal_reason'], 'manual_required')
+        self.assertEqual(csrf['terminal_reason'], 'validator_unavailable')
         self.assertFalse(csrf['attempted'])
 
     def test_cross_identity_leg_is_not_gated_by_the_registry_arming_flag(self):
@@ -331,7 +342,7 @@ class ExactProcedureCallerTests(unittest.TestCase):
     def test_unsupported_and_wrong_shape_checks_do_not_spend_dispatch_budget(self):
         result=self.assert_registration(bad_first=True)
         rows=result['coverage']['phase_ledger']['cells']
-        self.assertFalse(any(r['attempted'] for r in rows if r['check'] in ('WSTG-ATHN-01','WSTG-SESS-01')))
+        self.assertFalse(any(r['attempted'] for r in rows if r['check'] in ('WSTG-ATHN-04','WSTG-SESS-01')))
 
     def test_disabled_procedure_has_zero_sends(self):
         received,classes,result=self.run_registration(enabled=False)
@@ -365,7 +376,7 @@ class ReadinessInputTests(unittest.TestCase):
     def test_exact_auth_classes_and_unrelated_catalog_claims(self):
         self.assertEqual(self.decide('WSTG-ATHN-07')['finding_class'],'weak_password_policy')
         self.assertEqual(self.decide('WSTG-SESS-03',url='http://fixture.invalid/login')['finding_class'],'session_fixation')
-        for check in ('WSTG-ATHN-01','WSTG-SESS-01'):
+        for check in ('WSTG-ATHN-04','WSTG-SESS-01'):
             result=self.decide(check)
             self.assertEqual(result['status'],'unsupported');self.assertIsNone(result['finding_class'])
         self.assertEqual(self.decide('WSTG-ATHN-07',method='GET')['reason_code'],'unsupported_method')
@@ -373,30 +384,30 @@ class ReadinessInputTests(unittest.TestCase):
         self.assertEqual(self.decide('WSTG-SESS-03')['reason_code'],'unsupported_boundary')
 
     def test_missing_inputs_are_not_security_negatives(self):
-        self.assertEqual(self.decide('WSTG-CONF-05',headers={'Content-Type':'application/json'})['reason_code'],'non_html_response')
-        self.assertEqual(self.decide('WSTG-CONF-05')['status'],'needs_prerequisite')
-        self.assertEqual(self.decide('WSTG-CONF-05',headers={'Content-Type':'text/html'})['status'],'ready')
-        self.assertEqual(self.decide('WSTG-CRYP-04',method='GET')['reason_code'],'missing_jwt')
+        self.assertEqual(self.decide('WSTG-CONF-12',headers={'Content-Type':'application/json'})['reason_code'],'non_html_response')
+        self.assertEqual(self.decide('WSTG-CONF-12')['status'],'needs_prerequisite')
+        self.assertEqual(self.decide('WSTG-CONF-12',headers={'Content-Type':'text/html'})['status'],'ready')
+        self.assertEqual(self.decide('WSTG-SESS-10',method='GET')['reason_code'],'missing_jwt')
         self.assertEqual(self.decide('WSTG-ATHZ-04',method='GET')['reason_code'],'missing_object_id')
         self.assertEqual(self.decide('WSTG-ATHZ-04',url='http://fixture.invalid/objects/7',method='GET')['status'],'ready')
         # r7: a non-login request is tested on its own parameters, not refused.
-        self.assertEqual(self.decide('WSTG-INPV-06')['mechanism_id'],'nosql.operator_differential')
-        self.assertEqual(self.decide('WSTG-INPV-06',body='{}')['reason_code'],'missing_parameter')
-        self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login',method='GET')['reason_code'],'missing_parameter')
-        self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login?u=a',method='GET')['status'],'ready')
-        self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login')['mechanism_id'],'nosql.login_operator')
+        self.assertEqual(self.decide('WSTG-INJT-05.6')['mechanism_id'],'nosql.operator_differential')
+        self.assertEqual(self.decide('WSTG-INJT-05.6',body='{}')['reason_code'],'missing_parameter')
+        self.assertEqual(self.decide('WSTG-INJT-05.6',url='http://fixture.invalid/login',method='GET')['reason_code'],'missing_parameter')
+        self.assertEqual(self.decide('WSTG-INJT-05.6',url='http://fixture.invalid/login?u=a',method='GET')['status'],'ready')
+        self.assertEqual(self.decide('WSTG-INJT-05.6',url='http://fixture.invalid/login')['mechanism_id'],'nosql.login_operator')
 
     def test_unavailable_adapter_protocol_and_disable_dispositions(self):
         for check in ('WSTG-CONF-06','WSTG-INFO-02','WSTG-INFO-05'):
             result=self.decide(check)
             self.assertEqual(result['reason_code'],'check_adapter_missing');self.assertIsNone(result['finding_class'])
         # CONF-02 and ERRH-01 are bound to passive adapters: unavailable until registered.
-        for check in ('WSTG-CONF-02','WSTG-ERRH-01'):
+        for check in ('WSTG-CONF-14','WSTG-ERRH-01'):
             self.assertEqual(self.decide(check)['reason_code'],'validator_unavailable')
         registry=self.registry();registry.validators['security_headers']=SimpleNamespace(active=False)
         registry.active_enabled=False
         from harness.models import HttpExchange
-        result=registry.capability_for_check(CHECKS_BY_ID['WSTG-CONF-02'],HttpExchange(url='http://fixture.invalid',method='GET'))
+        result=registry.capability_for_check(CHECKS_BY_ID['WSTG-CONF-14'],HttpExchange(url='http://fixture.invalid',method='GET'))
         self.assertEqual(result['status'],'ready');self.assertIsNotNone(result['finding_class'])
         self.assertEqual(self.decide('WSTG-CRYP-01')['reason_code'],'protocol_inapplicable')
         # HSTS is ignored over plain HTTP (RFC 6797 8.1); over HTTPS its adapter is missing.
@@ -405,11 +416,11 @@ class ReadinessInputTests(unittest.TestCase):
                          'check_adapter_missing')
         registry=self.registry();registry.active_enabled=False
         from harness.models import HttpExchange
-        result=registry.capability_for_check(CHECKS_BY_ID['WSTG-CONF-05'],HttpExchange(url='http://fixture.invalid',method='GET'))
+        result=registry.capability_for_check(CHECKS_BY_ID['WSTG-CONF-12'],HttpExchange(url='http://fixture.invalid',method='GET'))
         self.assertEqual(result['status'],'disabled')
 
     def test_readiness_decline_does_not_spend_one_dispatch_budget(self):
-        checks=tuple(CHECKS_BY_ID[k] for k in ('WSTG-ATHN-01','WSTG-ATHN-07'))
+        checks=tuple(CHECKS_BY_ID[k] for k in ('WSTG-ATHN-04','WSTG-ATHN-07'))
         tracker=CoverageTracker(checks)
         tracker.build({'POST /register':{'path':'/register','method':'POST','reachable_roles':['anonymous']}},['anonymous'])
         calls=[]
@@ -419,7 +430,7 @@ class ReadinessInputTests(unittest.TestCase):
             calls.append(check.id);return SimpleNamespace(status='blocked',sent_count=0)
         asyncio.run(tracker.drive_coverage_legs(dispatch,driveable={'auth_sequence'},budget=1,readiness=ready))
         self.assertEqual(calls,['WSTG-ATHN-07'])
-        row=next(r for r in tracker.phase_ledger()['cells'] if r['check']=='WSTG-ATHN-01')
+        row=next(r for r in tracker.phase_ledger()['cells'] if r['check']=='WSTG-ATHN-04')
         self.assertFalse(row['attempted']);self.assertFalse(row['eligible'])
         self.assertEqual(row['readiness']['status'],'unsupported')
 
@@ -430,7 +441,7 @@ class ReviewReadinessRegressionTests(unittest.TestCase):
     def test_jwt_invalid_method_and_json_decline_before_valid_dispatch(self):
         from harness.models import HttpExchange
         from harness.test_smoke_investigate import ORIGINAL_TOKEN
-        check=CHECKS_BY_ID['WSTG-CRYP-04'];registry=self.registry()
+        check=CHECKS_BY_ID['WSTG-SESS-10'];registry=self.registry()
         tracker=CoverageTracker((check,))
         endpoints={key:{'path':key.split(' ',1)[1],'method':key.split(' ',1)[0],
                         'reachable_roles':['user']} for key in ('POST /bad-method','GET /bad-token','GET /good')}
@@ -450,7 +461,7 @@ class ReviewReadinessRegressionTests(unittest.TestCase):
     def test_disabled_export_is_unavailable_and_never_eligible(self):
         from harness.models import HttpExchange
         registry=self.registry();registry.active_enabled=False
-        check=CHECKS_BY_ID['WSTG-CONF-05'];tracker=CoverageTracker((check,))
+        check=CHECKS_BY_ID['WSTG-CONF-12'];tracker=CoverageTracker((check,))
         tracker.build({'GET /page':{'path':'/page','method':'GET','reachable_roles':['anonymous']}},['anonymous'])
         def readiness(*args):
             return registry.capability_for_check(check,HttpExchange(url='http://fixture.invalid/page',method='GET',

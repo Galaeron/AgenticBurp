@@ -47,7 +47,7 @@ from harness.role_crawl import RoleSession
 
 _HARNESS = Path(__file__).resolve().parent
 _JINJA_MUL = re.compile(r"\{\{(\d+)\*(\d+)\}\}")
-SSTI, REDIRECT, CMDI, TRAVERSAL = "WSTG-INPV-18", "WSTG-INPV-17", "WSTG-INPV-12", "WSTG-ATHZ-01"
+SSTI, REDIRECT, CMDI, TRAVERSAL = "WSTG-INJT-18", "WSTG-CLNT-04", "WSTG-INJT-12", "WSTG-ATHZ-01"
 ROLES = [RoleSession("anonymous", {})]
 # Every coverage leg but the two this file is about stays off, so the loopback
 # server only sees SSTI and open-redirect traffic.

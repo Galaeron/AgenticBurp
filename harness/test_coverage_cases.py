@@ -134,7 +134,7 @@ class DeriveTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 class AggregationTests(unittest.TestCase):
-    KEY = ("user", "GET /api/search", "WSTG-INPV-05")
+    KEY = ("user", "GET /api/search", "WSTG-INJT-05")
 
     def _matrix_with_two_query_cases(self):
         m = CoverageMatrix()
@@ -210,12 +210,12 @@ class AggregationTests(unittest.TestCase):
         # handoff: "two principals" -- principal == identity == distinct cell
         m = CoverageMatrix()
         cases = derive_input_cases(query="q=1")
-        m.expand_cases("alice", "GET /x", "WSTG-INPV-05", cases)
-        m.expand_cases("bob", "GET /x", "WSTG-INPV-05", cases)
-        m.record_case("alice", "GET /x", "WSTG-INPV-05", cases[0],
+        m.expand_cases("alice", "GET /x", "WSTG-INJT-05", cases)
+        m.expand_cases("bob", "GET /x", "WSTG-INJT-05", cases)
+        m.record_case("alice", "GET /x", "WSTG-INJT-05", cases[0],
                       status=CellStatus.CONFIRMED, reason="x")
-        self.assertEqual(m.get("alice", "GET /x", "WSTG-INPV-05").status, CellStatus.CONFIRMED)
-        self.assertEqual(m.get("bob", "GET /x", "WSTG-INPV-05").status, CellStatus.PENDING)
+        self.assertEqual(m.get("alice", "GET /x", "WSTG-INJT-05").status, CellStatus.CONFIRMED)
+        self.assertEqual(m.get("bob", "GET /x", "WSTG-INJT-05").status, CellStatus.PENDING)
 
     def test_confirmed_case_not_overwritten(self):
         m, by_name = self._matrix_with_two_query_cases()
@@ -230,7 +230,7 @@ class AggregationTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 class BudgetTests(unittest.TestCase):
-    KEY = ("user", "POST /api/x", "WSTG-INPV-05")
+    KEY = ("user", "POST /api/x", "WSTG-INJT-05")
 
     def test_budget_exhausted_cases_visible_not_tested(self):
         # handoff: "skipped-required cases"; T05: budget-exhausted stays visible
@@ -262,7 +262,7 @@ class VerdictSemanticsTests(unittest.TestCase):
     def test_controlled_negative_counts_as_conclusive(self):
         m = CoverageMatrix()
         ck = CaseKey("query", "q", 0)
-        m.record_case("u", "GET /x", "WSTG-INPV-05", ck,
+        m.record_case("u", "GET /x", "WSTG-INJT-05", ck,
                       status=CellStatus.CONTROLLED_NEGATIVE, reason="held")
         self.assertEqual(m.case_summary()["conclusive"], 1)
 
@@ -279,9 +279,9 @@ class VerdictSemanticsTests(unittest.TestCase):
         # the review's explicit rule: an old not_detected must never be re-read as
         # a controlled negative. The cell/case status is preserved verbatim.
         m = CoverageMatrix()
-        m.record("u", "GET /x", "WSTG-INPV-05", status=CellStatus.NOT_DETECTED, reason="legacy")
+        m.record("u", "GET /x", "WSTG-INJT-05", status=CellStatus.NOT_DETECTED, reason="legacy")
         m2 = CoverageMatrix.from_dict(m.to_dict())
-        self.assertEqual(m2.get("u", "GET /x", "WSTG-INPV-05").status, CellStatus.NOT_DETECTED)
+        self.assertEqual(m2.get("u", "GET /x", "WSTG-INJT-05").status, CellStatus.NOT_DETECTED)
         self.assertEqual(m2.summary()["controlled_negative"], 0)
 
 
@@ -293,27 +293,27 @@ class SerializationTests(unittest.TestCase):
     def test_cases_round_trip(self):
         m = CoverageMatrix()
         cases = derive_input_cases(query="a=1&b=2")
-        m.expand_cases("u", "GET /x", "WSTG-INPV-05", cases)
-        m.record_case("u", "GET /x", "WSTG-INPV-05", cases[0],
+        m.expand_cases("u", "GET /x", "WSTG-INJT-05", cases)
+        m.record_case("u", "GET /x", "WSTG-INJT-05", cases[0],
                       status=CellStatus.CONFIRMED, reason="x")
         m2 = CoverageMatrix.from_dict(m.to_dict())
-        self.assertEqual(len(m2.cases_for_cell("u", "GET /x", "WSTG-INPV-05")), 2)
-        self.assertEqual(m2.get("u", "GET /x", "WSTG-INPV-05").status, CellStatus.CONFIRMED)
+        self.assertEqual(len(m2.cases_for_cell("u", "GET /x", "WSTG-INJT-05")), 2)
+        self.assertEqual(m2.get("u", "GET /x", "WSTG-INJT-05").status, CellStatus.CONFIRMED)
 
     def test_old_matrix_without_cases_key_loads(self):
         # handoff: "old matrix deserialization"
-        old = {"cells": {"user|GET /x|WSTG-INPV-05": {"status": "not_detected", "reason": "r"}}}
+        old = {"cells": {"user|GET /x|WSTG-INJT-05": {"status": "not_detected", "reason": "r"}}}
         m = CoverageMatrix.from_dict(old)
-        self.assertEqual(m.get("user", "GET /x", "WSTG-INPV-05").status, CellStatus.NOT_DETECTED)
+        self.assertEqual(m.get("user", "GET /x", "WSTG-INJT-05").status, CellStatus.NOT_DETECTED)
         self.assertEqual(m.case_summary()["total_cases"], 0)
 
     def test_case_counts_agree_with_actual_attempts(self):
         # handoff: "counts agree with actual attempts"
         m = CoverageMatrix()
         cases = derive_input_cases(query="a=1&b=2&c=3")
-        m.expand_cases("u", "GET /x", "WSTG-INPV-05", cases)
-        m.record_case("u", "GET /x", "WSTG-INPV-05", cases[0], status=CellStatus.CONFIRMED, reason="x")
-        m.record_case("u", "GET /x", "WSTG-INPV-05", cases[1], status=CellStatus.NOT_DETECTED, reason="x")
+        m.expand_cases("u", "GET /x", "WSTG-INJT-05", cases)
+        m.record_case("u", "GET /x", "WSTG-INJT-05", cases[0], status=CellStatus.CONFIRMED, reason="x")
+        m.record_case("u", "GET /x", "WSTG-INJT-05", cases[1], status=CellStatus.NOT_DETECTED, reason="x")
         cs = m.case_summary()
         # two attempts (confirm + not_detected), one still pending
         self.assertEqual(cs["attempted"], 2)
@@ -328,7 +328,7 @@ class SerializationTests(unittest.TestCase):
 class TestCaseRefAlignmentTests(unittest.TestCase):
     def _case_id(self, ck):
         return evidence.TestCaseRef.make(
-            run_id="run1", request_template_id="tmpl1", check_id="WSTG-INPV-05",
+            run_id="run1", request_template_id="tmpl1", check_id="WSTG-INJT-05",
             principal_id="user",
             parameter_location=ck.parameter_location,
             parameter_name=ck.case_parameter_name(),
@@ -353,7 +353,7 @@ if __name__ == "__main__":
 
 
 class ExecutionAggregationTests(unittest.TestCase):
-    KEY = ("alice", "GET /x", "WSTG-INPV-05")
+    KEY = ("alice", "GET /x", "WSTG-INJT-05")
 
     def test_executed_child_survives_pending_sibling_and_prior_risk(self):
         for prior in (None, CellStatus.DETECTED, CellStatus.CONFIRMED):

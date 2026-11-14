@@ -1,5 +1,5 @@
 """
-Security Headers Validator -- the WSTG-CONF-02 coverage adapter.
+Security Headers Validator -- the WSTG-CONF-14 coverage adapter.
 
 Passive: judges the response headers of the captured exchange it is handed and
 sends nothing. The coverage drive hands it each replayable capture of an
@@ -7,7 +7,7 @@ endpoint, so the verdict is per endpoint, per identity, per observed response.
 
 The anomaly detector's header audit flags six headers missing on every
 response, which is a lead, not a verdict: CSP and framing belong to
-WSTG-CONF-05 (csp validator), HSTS to WSTG-CONF-07 and means nothing over plain
+WSTG-CONF-12 (csp validator), HSTS to WSTG-CONF-07 and means nothing over plain
 HTTP, and X-XSS-Protection is deprecated, so its absence is no weakness. This
 adapter decides only the headers no other catalog check owns:
 
@@ -60,7 +60,7 @@ def _referrer_policy(value: str) -> str:
 
 
 def audit_security_headers(exchange: "HttpExchange") -> dict:
-    """Decide WSTG-CONF-02 on one captured response.
+    """Decide WSTG-CONF-14 on one captured response.
 
     Returns {"verdict": "fail" | "pass" | "skip", "reason": str, "failures":
     [str], "fingerprint": str}. "fail" names each header that fails; "pass"
@@ -96,7 +96,7 @@ def audit_security_headers(exchange: "HttpExchange") -> dict:
 
 
 class SecurityHeadersValidator(Validator):
-    """Passive WSTG-CONF-02 oracle over a captured response's headers."""
+    """Passive WSTG-CONF-14 oracle over a captured response's headers."""
 
     name = "security_headers_validator"
     finding_classes: set[str] = set()   # coverage dispatch only; see the module docstring
@@ -116,14 +116,14 @@ class SecurityHeadersValidator(Validator):
         target = f"{(exchange.method or 'GET').upper()} {exchange.url}"
         if audit["verdict"] == "skip":
             return ValidationResult(self.name, "skipped", finding.vulnerability_class,
-                                    summary=f"WSTG-CONF-02 not judged: {audit['reason']}")
+                                    summary=f"WSTG-CONF-14 not judged: {audit['reason']}")
         if audit["verdict"] == "pass":
             return ValidationResult(self.name, "not_confirmed", finding.vulnerability_class,
                                     confidence=0.9,
-                                    summary=f"WSTG-CONF-02 held on {exchange.response_status}: {audit['reason']}",
+                                    summary=f"WSTG-CONF-14 held on {exchange.response_status}: {audit['reason']}",
                                     header_fingerprint=audit["fingerprint"])
         return ValidationResult(self.name, "confirmed", finding.vulnerability_class,
                                 confidence=0.95, confirmed=True, severity="low",
-                                summary=f"WSTG-CONF-02 header policy fails on {target}: {audit['reason']}",
+                                summary=f"WSTG-CONF-14 header policy fails on {target}: {audit['reason']}",
                                 evidence=f"response {exchange.response_status}: {audit['reason']}",
                                 header_fingerprint=audit["fingerprint"])

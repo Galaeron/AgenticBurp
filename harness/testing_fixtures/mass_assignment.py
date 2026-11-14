@@ -1,5 +1,5 @@
 """
-Readable mass-assignment fixture (WSTG-CONF-09). INTENTIONALLY readable -- an owned
+Readable mass-assignment fixture (WSTG-INJT-20). INTENTIONALLY readable -- an owned
 regression target, NOT a blind one, so a deterministic test can assert the
 protected-field invariant over real HTTP.
 

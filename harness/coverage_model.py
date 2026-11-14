@@ -29,6 +29,7 @@ from urllib.parse import parse_qsl, urlsplit
 from harness.categories import canonicalize
 from harness.client_routes import (CLIENT_ROUTE_LEGS, PAGE, SEGMENT, route_params_of_template,
                                    route_segments_of_template)
+from harness.wstg_ids import WSTG_RELEASE_LABEL, is_current_wstg_id
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +507,89 @@ def _accepts_create(endpoint: dict) -> tuple[bool, str]:
     return False, "endpoint accepts no POST create"
 
 
+# --- WG-2: narrow predicates for the rows of already-registered validators. Each
+# fires only where the exchange shape fits the validator's own oracle, so a new row
+# does not add coverage-drive work on endpoints its leg would decline anyway.
+
+def _query_and_body_keys(endpoint: dict) -> set[str]:
+    """Lower-cased parameter names visible on the endpoint: the path's own query
+    string plus the captured template's query and (form or JSON top-level) body."""
+    template = endpoint.get("template") or {}
+    path = endpoint.get("path", "") or ""
+    keys = {k.lower() for k, _ in parse_qsl(urlsplit(path).query, keep_blank_values=True)}
+    keys |= {k.lower() for k, _ in parse_qsl(template.get("query", "") or "",
+                                             keep_blank_values=True)}
+    body = template.get("body", "") or ""
+    if body:
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError):
+            keys |= {k.lower() for k, _ in parse_qsl(body, keep_blank_values=True)}
+        else:
+            if isinstance(parsed, dict):
+                keys |= {str(k).lower() for k in parsed}
+    return keys
+
+def _issues_session_cookie(endpoint: dict) -> tuple[bool, str]:
+    headers = endpoint.get("response_headers") or {}
+    if endpoint.get("sets_cookie") or any((k or "").lower() == "set-cookie" for k in headers):
+        return True, "response sets a cookie"
+    path = (endpoint.get("path", "") or "").lower()
+    if any(k in path for k in ("login", "signin", "sign-in", "logon", "session")):
+        return True, "login/session endpoint issues the session cookie"
+    return False, "no Set-Cookie response or login/session endpoint"
+
+def _is_websocket_endpoint(endpoint: dict) -> tuple[bool, str]:
+    if endpoint.get("websocket") or (endpoint.get("upgrade") or "").lower() == "websocket":
+        return True, "endpoint performs a WebSocket upgrade"
+    path = (endpoint.get("path", "") or "").lower()
+    if re.search(r"(^|/)(ws|wss|websockets?|socket\.io|sockjs|cable)(/|$|\?)", path):
+        return True, "path is a WebSocket handshake endpoint"
+    return False, "no WebSocket upgrade indicators"
+
+_OAUTH_PARAMS = frozenset({"redirect_uri", "response_type", "client_id"})
+
+def _has_oauth_params(endpoint: dict) -> tuple[bool, str]:
+    if _query_and_body_keys(endpoint) & _OAUTH_PARAMS:
+        return True, "request carries OAuth parameters (redirect_uri/response_type/client_id)"
+    path = (endpoint.get("path", "") or "").lower()
+    if "oauth" in path or re.search(r"/authorize(/|$|\?)", path):
+        return True, "OAuth authorization endpoint"
+    return False, "no OAuth parameters or authorization endpoint"
+
+def _has_denied_role(endpoint: dict) -> tuple[bool, str]:
+    access = endpoint.get("access") or {}
+    if any(str(v) in ("401", "403", "405") for v in access.values()):
+        return True, "a role is denied (401/403/405), so a verb alternate can be tested"
+    return False, "no denied role recorded (verb tampering needs a denial to bypass)"
+
+_CLIENT_VALUE_FIELD = re.compile(
+    r"price|amount|total|cost|discount|quantity|qty|subtotal|fee|balance")
+_CLIENT_VALUE_PATH = ("cart", "checkout", "basket", "order", "payment", "purchase")
+
+def _has_client_value_field(endpoint: dict) -> tuple[bool, str]:
+    if not _accepts_body(endpoint)[0]:
+        return False, "no body-bearing write to tamper"
+    if any(_CLIENT_VALUE_FIELD.search(k) for k in _query_and_body_keys(endpoint)):
+        return True, "write carries a client-supplied value field (price/amount/total)"
+    path = (endpoint.get("path", "") or "").lower()
+    if any(k in path for k in _CLIENT_VALUE_PATH):
+        return True, "write on a cart/checkout/order/payment path"
+    return False, "no client-supplied value field on this write"
+
+def _is_get(endpoint: dict) -> tuple[bool, str]:
+    if any(m in ("GET", "HEAD") for m in endpoint.get("methods", ())):
+        return True, "GET response can be cached"
+    return False, "not a GET/HEAD endpoint (not cached)"
+
+def _is_authed_get(endpoint: dict) -> tuple[bool, str]:
+    if not _is_get(endpoint)[0]:
+        return False, "not a GET/HEAD endpoint (not cached)"
+    if _is_authed(endpoint)[0]:
+        return True, "authenticated GET content could be cached for another user"
+    return False, "no role/access information (no per-user content to deceive a cache with)"
+
+
 # Predicate type: endpoint dict → (applicable: bool, reason: str)
 ApplicabilityPredicate = Callable[[dict], tuple[bool, str]]
 
@@ -522,7 +606,7 @@ class ExternalRef:
     test id from an OWASP-API entry or an Academy topic, and so we never encode a
     catalog id we cannot stand behind. `catalog` names the source (e.g. "WSTG",
     "OWASP API Security Top 10 2023", "PortSwigger Academy"); `ref` is the id within
-    it (e.g. "WSTG-INPV-05", "API3:2023") or "" for a URL-only reference."""
+    it (e.g. "WSTG-INJT-05", "API3:2023") or "" for a URL-only reference."""
     catalog: str
     ref: str = ""
     url: str = ""
@@ -535,14 +619,15 @@ class Check:
     """A single security check in the catalog.
 
     The `id` is the check's PRIMARY identifier. For checks that map cleanly onto a
-    WSTG test it is the versioned WSTG id (the stable WSTG id + `wstg_version` it is
-    anchored to). For a scenario with NO clean WSTG mapping (e.g. mass assignment,
-    which is an API-layer issue with no dedicated WSTG v4.2 test) it is an INTERNAL
-    `AV-*` id, and the real external sources live in `external_refs` -- so the catalog
-    never falsely labels a scenario with a WSTG id that means something else. WSTG and
-    Academy are *reference catalogs* here, not an exploitation runner.
+    WSTG test it is the current WSTG id (WG-1: checked against the vendored list in
+    `harness/wstg_ids.py`; `wstg_version` names the release it is anchored to). For a
+    scenario with NO clean WSTG mapping it is an INTERNAL `AV-*` id, and the real
+    external sources live in `external_refs` -- so the catalog never falsely labels a
+    scenario with a WSTG id that means something else. IDs the catalog used before
+    WG-1 resolve through `LEGACY_CHECK_ID_ALIASES`. WSTG and Academy are *reference
+    catalogs* here, not an exploitation runner.
     """
-    id: str                              # e.g. "WSTG-INPV-05" or internal "AV-MASSASSIGN-01"
+    id: str                              # e.g. "WSTG-INJT-05" or an internal "AV-*" id
     name: str                            # human-readable
     phase: Phase
     vulnerability_class: str             # maps to categories.canonicalize
@@ -551,9 +636,17 @@ class Check:
     description: str = ""
     academy_ref: str = ""                # PortSwigger Academy topic name if applicable
     academy_url: str = ""                # optional full Academy topic URL (scenario reference)
-    wstg_version: str = "4.2"            # the WSTG release a genuine WSTG id is anchored to
+    wstg_version: str = WSTG_RELEASE_LABEL   # the WSTG release a genuine WSTG id is anchored to
     external_refs: tuple[ExternalRef, ...] = ()   # independently-verified external sources
     origin_scoped: bool = False  # A transport/deployment fact, not a response policy.
+    # WG-2 (4): finding-class tokens (lower-case; space and snake forms) that pick out
+    # THIS row among the rows sharing its canonical class, so one finding is attributed
+    # to the one cell it names, not to every sibling. Required on every row of a shared
+    # class (`shared_class_specificity_problems`); no token may sit on two rows.
+    specific_classes: tuple[str, ...] = ()
+    # WG-2 (3): the class the coverage driver hands the leg. Empty = vulnerability_class.
+    # Lets a shared-class row route to its own sub-check (e.g. auth_sequence's enum leg).
+    leg_class: str = ""
 
     def applies(self, endpoint: dict) -> tuple[bool, str]:
         """Deterministic applicability + the rationale for WHY it applies or doesn't.
@@ -585,7 +678,11 @@ class Check:
         """A human label for the primary id: versioned for a genuine WSTG id, else the
         internal id marked as such (external sources are in `external_refs`)."""
         if self.is_wstg():
-            return f"{self.id} (WSTG v{self.wstg_version})"
+            # A numbered release reads "WSTG v4.2"; the unnumbered master set reads
+            # "WSTG latest" (never "vlatest").
+            version = self.wstg_version
+            prefix = "v" if version[:1].isdigit() else ""
+            return f"{self.id} (WSTG {prefix}{version})"
         return f"{self.id} (internal scenario)"
 
     # Back-compat alias; only meaningful for genuine WSTG ids.
@@ -602,31 +699,88 @@ CHECK_CATALOG: tuple[Check, ...] = (
     Check("WSTG-CRYP-01", "TLS/SSL configuration", Phase.DOMAIN,
           "crypto", _always_applicable, "crypto",
           "Verify TLS versions, cipher suites, certificate validity",
-          "Server-side TLS", origin_scoped=True),
+          "Server-side TLS", origin_scoped=True,
+          specific_classes=(
+              "tls", "ssl", "ssl/tls", "weak tls", "weak_tls", "tls configuration",
+              "tls_configuration", "tls misconfiguration", "tls_misconfiguration",
+              "weak cipher", "weak_cipher", "weak ciphers", "weak_ciphers",
+          )),
     Check("WSTG-CONF-07", "HTTP Strict Transport Security", Phase.DOMAIN,
           "misconfig", _always_applicable, "crypto",
-          "Check HSTS header presence and configuration"),
-    Check("WSTG-CONF-05", "Content Security Policy", Phase.DOMAIN,
+          "Check HSTS header presence and configuration",
+          specific_classes=(
+              "hsts", "missing hsts", "missing_hsts", "strict transport security",
+              "strict-transport-security", "strict_transport_security",
+              "http strict transport security", "http_strict_transport_security",
+          )),
+    # WG-2: CONF-12 is the natural primary row for a bare "csp" finding (it names the
+    # policy itself), so "csp" is one of its specific_classes; framing goes to CLNT-09.
+    Check("WSTG-CONF-12", "Content Security Policy", Phase.DOMAIN,
           "csp", _always_applicable, "csp",
           "Evaluate CSP header directives",
-          "Content security policy"),
-    Check("WSTG-CONF-08", "CORS policy", Phase.DOMAIN,
+          "Content security policy",
+          specific_classes=(
+              "csp", "content security policy", "content_security_policy", "missing csp",
+              "missing_csp", "weak csp", "weak_csp", "csp bypass", "csp_bypass",
+          )),
+    Check("WSTG-CLNT-07", "CORS policy", Phase.DOMAIN,
           "cors", _always_applicable, "cors",
           "Test Cross-Origin Resource Sharing configuration",
           "CORS"),
     Check("WSTG-INFO-02", "Server fingerprinting", Phase.DOMAIN,
           "recon", _always_applicable, "recon",
-          "Identify web server software and version"),
+          "Identify web server software and version",
+          specific_classes=(
+              "server fingerprinting", "server_fingerprinting", "web server fingerprinting",
+              "fingerprinting", "server banner", "server_banner", "banner grabbing",
+              "version disclosure", "version_disclosure", "technology fingerprinting",
+          )),
     Check("WSTG-INFO-05", "Information in comments/metadata", Phase.DOMAIN,
           "info_disclosure", _always_applicable, "recon",
-          "Check for sensitive data in HTML comments, headers, metadata"),
+          "Check for sensitive data in HTML comments, headers, metadata",
+          specific_classes=(
+              "html comments", "html_comments", "information in comments",
+              "information_in_comments", "sensitive comments", "sensitive_comments",
+              "source code comments", "source_code_comments", "metadata", "metadata leakage",
+              "metadata_leakage",
+          )),
     Check("WSTG-CONF-06", "HTTP methods", Phase.DOMAIN,
           "misconfig", _always_applicable, "recon",
-          "Test which HTTP methods are enabled"),
-    Check("WSTG-CONF-02", "Security headers", Phase.DOMAIN,
+          "Test which HTTP methods are enabled",
+          specific_classes=(
+              "http methods", "http_methods", "dangerous http methods",
+              "dangerous_http_methods", "unsafe http methods", "unsafe_http_methods", "trace",
+              "trace method", "trace_method", "http trace", "http_trace", "trace enabled",
+              "trace_enabled", "cross-site tracing", "cross_site_tracing", "xst",
+          )),
+    # The passive security_headers adapter (main, dbb0dab7) judges this row; WG-1
+    # moved it from v4.2 CONF-02 to current CONF-14.
+    Check("WSTG-CONF-14", "Security headers", Phase.DOMAIN,
           "misconfig", _always_applicable, "security_headers",
           "Check the captured response's X-Content-Type-Options and Referrer-Policy "
-          "(CSP/framing: WSTG-CONF-05; HSTS: WSTG-CONF-07)"),
+          "(CSP: WSTG-CONF-12; framing: WSTG-CLNT-09; HSTS: WSTG-CONF-07)",
+          specific_classes=(
+              "security headers", "security_headers", "security header", "security_header",
+              "missing security headers", "missing_security_headers",
+              "missing security header", "missing_security_header", "x-content-type-options",
+              "x_content_type_options",
+          )),
+    # WG-2: the csp validator also audits framing (X-Frame-Options / CSP
+    # frame-ancestors); phased and scoped like its CONF-12 sibling.
+    Check("WSTG-CLNT-09", "Clickjacking", Phase.DOMAIN,
+          "clickjacking", _always_applicable, "csp",
+          "Check that responses forbid framing (X-Frame-Options or CSP frame-ancestors)",
+          "Clickjacking",
+          specific_classes=(
+              "clickjacking", "click jacking", "click_jacking", "x-frame-options",
+              "x_frame_options", "missing x-frame-options", "missing_x_frame_options",
+              "frame-ancestors", "frame_ancestors", "ui redressing", "ui_redressing",
+          )),
+    # WG-2: host-level like CRYP-01; the subdomain_takeover validator checks dangling
+    # DNS / unclaimed-service fingerprints for the engagement's hosts.
+    Check("WSTG-CONF-10", "Subdomain takeover", Phase.DOMAIN,
+          "subdomain_takeover", _always_applicable, "subdomain_takeover",
+          "Check in-scope hosts for dangling DNS records pointing at unclaimed services"),
     # The genuine WSTG-CONF-09. It is a host/deployment file-permission review, not
     # something a black-box HTTP client can confirm -- so it is a MANUAL check.
     Check("WSTG-CONF-09", "Test File Permission", Phase.DOMAIN,
@@ -639,25 +793,90 @@ CHECK_CATALOG: tuple[Check, ...] = (
                           "4-Web_Application_Security_Testing/"
                           "02-Configuration_and_Deployment_Management_Testing/09-Test_File_Permission",
                           "Test File Permission", version="4.2"),
-          ), origin_scoped=True),
+          ), origin_scoped=True,
+          specific_classes=(
+              "file permission", "file_permission", "file permissions", "file_permissions",
+              "insecure file permissions", "insecure_file_permissions",
+          )),
 
     # === ENDPOINT phase ===
+    # WG-2: ATHZ-04 is the natural primary row for a bare "idor" finding; BFLA and
+    # function-level wording names ATHZ-02. The tokens include coverage_tracker's
+    # access-control free-text words, which resolve through specific_classes too.
     Check("WSTG-ATHZ-04", "IDOR / Broken Object-Level Authorization", Phase.ENDPOINT,
           "idor", _is_object_scoped, "cross_identity",
           "Test access to other users' objects by varying identifiers",
-          "Insecure direct object references (IDOR)"),
+          "Insecure direct object references (IDOR)",
+          specific_classes=(
+              "idor", "bola", "broken object level authorization",
+              "broken_object_level_authorization", "insecure direct object reference",
+              "insecure_direct_object_reference", "insecure direct object references",
+              "insecure_direct_object_references", "object level authorization",
+              "object_level_authorization", "object-level", "object level",
+              "insecure direct object",
+          )),
     Check("WSTG-ATHZ-02", "Broken Function-Level Authorization", Phase.ENDPOINT,
           "idor", _is_authed, "cross_identity",
           "Access admin/privileged functions as a lower-privilege user",
-          "Access control vulnerabilities"),
-    Check("WSTG-ATHN-01", "Authentication bypass", Phase.ENDPOINT,
+          "Access control vulnerabilities",
+          specific_classes=(
+              "bfla", "broken function level authorization",
+              "broken_function_level_authorization", "function level authorization",
+              "function_level_authorization", "function-level", "function level",
+              "broken function", "broken_function",
+          )),
+    # WG-2: the five rows of class "auth" have no primary row: a bare "auth" finding
+    # is attributed to none of them as CONFIRMED. Tokens come from auth_sequence's
+    # finding_classes; leg_class routes the driver to the matching sub-check.
+    Check("WSTG-ATHN-04", "Authentication bypass", Phase.ENDPOINT,
           "auth", _has_auth_endpoint, "auth_sequence",
           "Test for authentication bypass techniques",
-          "Authentication vulnerabilities"),
+          "Authentication vulnerabilities",
+          specific_classes=(
+              "authentication bypass", "authentication_bypass", "auth bypass", "auth_bypass",
+              "login bypass", "login_bypass", "bypass authentication",
+              "bypass_authentication",
+          )),
     Check("WSTG-ATHN-07", "Weak password policy", Phase.ENDPOINT,
           "auth", _has_auth_endpoint, "auth_sequence",
           "Test password complexity requirements",
-          "Authentication vulnerabilities"),
+          "Authentication vulnerabilities",
+          specific_classes=(
+              "weak_password", "weak password", "weak passwords", "weak_passwords",
+              "weak password policy", "weak_password_policy", "password policy",
+              "password_policy",
+          ),
+          leg_class="weak_password"),
+    # WG-2: auth_sequence's username-enumeration and second-factor legs. Every row
+    # class must canonicalize, and no canonical class or synonym names enumeration
+    # or MFA, so both carry "auth" like ATHN-04/07. The coverage driver passes that
+    # class to the leg, which routes bare "auth" to no check; a narrower synonym in
+    # categories.py is the follow-up that lets the driver fire these legs.
+    Check("WSTG-IDNT-04", "Account enumeration", Phase.ENDPOINT,
+          "auth", _has_auth_endpoint, "auth_sequence",
+          "Test whether login/registration/reset responses distinguish existing from "
+          "unknown usernames",
+          "Authentication vulnerabilities",
+          specific_classes=(
+              "username_enumeration", "username enumeration", "user enumeration",
+              "user_enumeration", "account enumeration", "account_enumeration",
+              "email enumeration", "email_enumeration",
+          ),
+          leg_class="username_enumeration"),
+    Check("WSTG-ATHN-11", "Multi-factor authentication", Phase.ENDPOINT,
+          "auth", _has_auth_endpoint, "auth_sequence",
+          "Test whether a session that passed only the first factor reaches pages the "
+          "second factor gates",
+          "Authentication vulnerabilities",
+          specific_classes=(
+              "2fa_bypass", "2fa bypass", "mfa_bypass", "mfa bypass", "two_factor_bypass",
+              "two-factor bypass", "two factor bypass", "multi_factor_bypass",
+              "multi-factor bypass", "multi factor bypass", "second factor bypass",
+              "second_factor_bypass", "mfa", "2fa", "multi-factor authentication",
+              "multi_factor_authentication", "two-factor authentication",
+              "two_factor_authentication",
+          ),
+          leg_class="2fa_bypass"),
     Check("WSTG-ATHN-03", "Weak lockout mechanism", Phase.ENDPOINT,
           "rate_limit", _has_auth_endpoint, "rate_limit",
           "Test account lockout / rate limiting after repeated attempts",
@@ -667,25 +886,70 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "Test password-reset tokens for predictability (sequential, timestamp, "
           "below-entropy-floor, or derived from a known value)",
           "Authentication vulnerabilities"),
+    # WG-2: SESS-01's deterministic check is token predictability
+    # (reset_token_validator.analyze_tokens), so it confirms via reset_token, not
+    # auth_sequence. That leg replays a token-issuing POST to sample tokens, so the
+    # row is scoped to auth endpoints like ATHN-09, not every session-bearing one.
     Check("WSTG-SESS-01", "Session management", Phase.ENDPOINT,
-          "auth", _has_cookie_or_session, "auth_sequence",
-          "Test session token generation, fixation, timeout",
-          "Authentication vulnerabilities"),
+          "auth", _has_auth_endpoint, "reset_token",
+          "Test issued tokens for predictability (sequential, timestamp-derived, "
+          "below the entropy floor, or derived from a known value)",
+          "Authentication vulnerabilities",
+          specific_classes=(
+              "session management", "session_management", "broken session management",
+              "broken_session_management", "session management schema",
+              "session token predictability", "session_token_predictability",
+              "predictable session token", "predictable_session_token",
+              "predictable session id", "predictable_session_id", "weak session token",
+              "weak_session_token",
+          ),
+          leg_class="token entropy"),
+    Check("WSTG-SESS-02", "Cookie attributes", Phase.ENDPOINT,
+          "crypto", _issues_session_cookie, "crypto",
+          "Audit Set-Cookie for the Secure, HttpOnly and SameSite attributes",
+          specific_classes=(
+              "cookie attributes", "cookie_attributes", "insecure cookie", "insecure_cookie",
+              "insecure cookie attributes", "insecure_cookie_attributes", "cookie flags",
+              "cookie_flags", "cookie security", "cookie_security", "secure flag",
+              "secure_flag", "missing secure flag", "missing_secure_flag", "httponly",
+              "httponly flag", "httponly_flag", "missing httponly", "missing_httponly",
+              "samesite", "samesite flag", "samesite_flag", "missing samesite",
+              "missing_samesite",
+          )),
     Check("WSTG-SESS-03", "Session fixation", Phase.ENDPOINT,
           "session_fixation", _has_auth_endpoint, "auth_sequence",
           "Test if session tokens are regenerated after login"),
+    # BUSL-09 is malicious-file upload and stays manual. The file_upload leg uploads
+    # only a BENIGN disallowed-extension file, which is BUSL-08 (unexpected file
+    # types). WG-2 could not add that row: "WSTG-BUSL-08" is still the WG-1 legacy
+    # alias for the TOCTOU row (ATHZ-03), so a BUSL-08 row would re-read pre-WG-1
+    # TOCTOU cells as file-upload cells. See VALIDATOR_ROW_EXCLUSIONS.
     Check("WSTG-BUSL-09", "File upload", Phase.ENDPOINT,
-          "file_upload", _has_file_path_segment, "file_upload",
-          "Test file type/size/content validation on upload endpoints",
+          "file_upload", _has_file_path_segment, "manual",
+          "Test upload endpoints against malicious files (manual). The benign "
+          "disallowed-extension leg (file_upload) belongs to BUSL-08, which has no row yet.",
           "File upload vulnerabilities"),
     Check("WSTG-ATHZ-01", "Path traversal", Phase.ENDPOINT,
           "path_traversal", _has_file_path_segment, "path_traversal",
           "Test for directory traversal in file-serving endpoints",
-          "Path traversal"),
+          "Path traversal",
+          specific_classes=(
+              "path traversal", "path_traversal", "directory traversal",
+              "directory_traversal", "file path traversal", "dot dot slash", "lfi",
+              "local file inclusion", "arbitrary file read",
+          )),
     Check("WSTG-ERRH-01", "Error handling / stack traces", Phase.ENDPOINT,
           "info_disclosure", _always_applicable, "error_handling",
           "Check captured error responses for stack traces and framework error pages "
-          "(passive: errors are not provoked)"),
+          "(passive: errors are not provoked)",
+          specific_classes=(
+              "verbose_error", "verbose error", "verbose errors", "verbose_errors",
+              "verbose_error_disclosure", "verbose error disclosure", "stack_trace",
+              "stack trace", "stack trace disclosure", "stack_trace_disclosure", "debug_info",
+              "debug info", "debug_mode", "debug mode", "error_disclosure",
+              "error disclosure", "error handling", "error_handling",
+              "improper error handling", "improper_error_handling",
+          )),
     # r5: /ftp, /metrics and whoami?callback= only met recon (WSTG-INFO-05), which is
     # not a verdict. No single WSTG v4.2 test owns these, so the id is internal.
     Check("AV-EXPOSURE-01", "Directory index, metrics or JSONP exposure", Phase.ENDPOINT,
@@ -702,6 +966,10 @@ CHECK_CATALOG: tuple[Check, ...] = (
                           version="4.2"),
               ExternalRef("CWE", "CWE-548", "https://cwe.mitre.org/data/definitions/548.html",
                           "Exposure of Information Through Directory Listing"),
+          ),
+          specific_classes=(
+              "content_exposure", "content exposure", "jsonp", "jsonp exposure",
+              "jsonp_exposure", "jsonp callback", "jsonp_callback",
           )),
     # r9: the model raised listing, backup and metrics leads that no leg decided, and
     # AV-EXPOSURE-01 judged the same captures with no exchange behind its verdict.
@@ -725,6 +993,11 @@ CHECK_CATALOG: tuple[Check, ...] = (
                           "Exposure of Backup File to an Unauthorized Control Sphere"),
               ExternalRef("CWE", "CWE-538", "https://cwe.mitre.org/data/definitions/538.html",
                           "Insertion of Sensitive Information into Externally-Accessible File or Directory"),
+          ),
+          specific_classes=(
+              "listing_exposure", "directory listing", "directory_listing",
+              "directory indexing", "directory_indexing", "exposed_directory_listing",
+              "directory index",
           )),
     Check("AV-FILTER-01", "File-extension filter bypass (NUL encoding)", Phase.ENDPOINT,
           "path_filter_bypass", _always_applicable, "filter_bypass",
@@ -738,6 +1011,10 @@ CHECK_CATALOG: tuple[Check, ...] = (
                           "Improper Neutralization of Null Byte or NUL Character"),
               ExternalRef("CWE", "CWE-20", "https://cwe.mitre.org/data/definitions/20.html",
                           "Improper Input Validation"),
+          ),
+          specific_classes=(
+              "path_filter_bypass", "filter_bypass", "extension_filter_bypass",
+              "null_byte_injection", "poison_null_byte", "null byte",
           )),
     Check("AV-EXPOSURE-03", "Metrics endpoint exposed without authentication", Phase.ENDPOINT,
           "info_disclosure", _always_applicable, "metrics_exposure",
@@ -749,6 +1026,10 @@ CHECK_CATALOG: tuple[Check, ...] = (
                           "Exposure of Sensitive Information to an Unauthorized Actor"),
               ExternalRef("CWE", "CWE-306", "https://cwe.mitre.org/data/definitions/306.html",
                           "Missing Authentication for Critical Function"),
+          ),
+          specific_classes=(
+              "metrics_exposure", "metrics exposure", "exposed_metrics_endpoint",
+              "public_metrics_endpoint", "unauthenticated_metrics",
           )),
     Check("AV-EXPOSURE-04", "Sensitive file served without authentication", Phase.ENDPOINT,
           "info_disclosure", _always_applicable, "sensitive_file",
@@ -761,6 +1042,11 @@ CHECK_CATALOG: tuple[Check, ...] = (
                           "Insertion of Sensitive Information into Externally-Accessible File or Directory"),
               ExternalRef("CWE", "CWE-530", "https://cwe.mitre.org/data/definitions/530.html",
                           "Exposure of Backup File to an Unauthorized Control Sphere"),
+          ),
+          specific_classes=(
+              "sensitive_file", "exposed_backup_file", "config_file_exposure",
+              "exposed_configuration", "credential_exposure",
+              "confidential_document_exposure", "exposed_file",
           )),
     Check("AV-WELLKNOWN-01", "security.txt and CSAF provider metadata", Phase.DOMAIN,
           "recon", _always_applicable, "well_known",
@@ -773,11 +1059,15 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("OASIS", "CSAF 2.0",
                           "https://docs.oasis-open.org/csaf/csaf/v2.0/csaf-v2.0.html",
                           "Common Security Advisory Framework Version 2.0"),
-          ), origin_scoped=True),
-    # Mass assignment is an API-layer scenario with NO dedicated WSTG v4.2 test
-    # (WSTG-CONF-09 is "Test File Permission" -- a different thing), so it carries an
-    # internal id and its real sources live in external_refs. See coverage_manifest.
-    Check("AV-MASSASSIGN-01", "Mass assignment (server-controlled field protection)", Phase.ENDPOINT,
+          ), origin_scoped=True,
+          specific_classes=(
+              "well_known", "well known", "security.txt", "security_txt", "csaf",
+              "csaf_provider_metadata",
+          )),
+    # Mass assignment had NO WSTG v4.2 test, so it carried the internal id
+    # AV-MASSASSIGN-01 (still an alias); current WSTG adds it as INJT-20. The
+    # API-layer sources stay in external_refs. See coverage_manifest.
+    Check("WSTG-INJT-20", "Mass assignment (server-controlled field protection)", Phase.ENDPOINT,
           "api_security", _accepts_body, "sequence",
           "An ordinary update must not let a client set server-controlled fields "
           "(role, is_admin, balance); send those fields and verify they do not persist.",
@@ -792,76 +1082,147 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("OWASP API Security Top 10 2019", "API6:2019",
                           "https://owasp.org/API-Security/editions/2019/en/0xa6-mass-assignment/",
                           "Mass Assignment"),
+          ),
+          specific_classes=(
+              "mass assignment", "mass_assignment", "mass assignment update",
+              "mass_assignment_update",
           )),
-    Check("WSTG-BUSV-04", "HTTP request smuggling", Phase.ENDPOINT,
+    Check("WSTG-INJT-16", "HTTP request smuggling", Phase.ENDPOINT,
           "http_request_smuggling", _accepts_body, "http_request_smuggling",
           "Test CL/TE and TE/CL desync",
           "HTTP request smuggling"),
-    Check("WSTG-INPV-14", "HTTP header injection / CRLF", Phase.ENDPOINT,
+    Check("WSTG-INJT-15", "HTTP header injection / CRLF", Phase.ENDPOINT,
           "header_injection", _accepts_input, "header_injection",
           "Inject CRLF sequences in header-reflected parameters"),
     # WSTG-SESS-05 is the current WSTG id for CSRF (was mislabelled SESS-09 --
-    # weakness #7). Confirmation is "manual": the csrf leg's autonomous verdict was
-    # retired to an observation (ORACLE_RETIREMENTS.md), so CSRF needs a human/PoC.
+    # weakness #7). WG-2: the row names the registered csrf leg, which runs the
+    # token-strip/SameSite property check. Its verdict is still retired to an
+    # observation (ORACLE_RETIREMENTS.md), so a CONFIRMED CSRF needs a browser PoC;
+    # the manifest keeps the manual aspect for that.
     Check("WSTG-SESS-05", "CSRF", Phase.ENDPOINT,
-          "csrf", _accepts_body, "manual",
+          "csrf", _accepts_body, "csrf",
           "Test state-changing requests for anti-CSRF protections",
           "Cross-site request forgery (CSRF)"),
+    # WG-2 rows for registered validators that had none.
+    Check("WSTG-ATHZ-05", "OAuth weaknesses", Phase.ENDPOINT,
+          "oauth", _has_oauth_params, "oauth",
+          "Test OAuth flows for redirect_uri validation, state/PKCE and token leakage",
+          "OAuth authentication"),
+    Check("WSTG-CLNT-10", "WebSockets", Phase.ENDPOINT,
+          "websocket", _is_websocket_endpoint, "websocket",
+          "Test whether the WebSocket handshake accepts a cross-origin Origin "
+          "(cross-site WebSocket hijacking)",
+          "WebSockets"),
+    # WG-2: "http method" (singular) is a verb_tamper_validator finding class, so it
+    # names this row; the plural "http methods" / TRACE wording names CONF-06.
+    Check("WSTG-INJT-03", "HTTP verb tampering", Phase.ENDPOINT,
+          "misconfig", _has_denied_role, "verb_tamper",
+          "Replay a denied request with read-only method alternates and override headers",
+          specific_classes=(
+              "verb tamper", "verb_tamper", "verb tampering", "verb_tampering",
+              "http verb tampering", "http_verb_tampering", "method tampering",
+              "method_tampering", "http method", "http_method", "method override",
+              "method_override",
+          )),
+    Check("WSTG-BUSL-02", "Ability to forge requests", Phase.ENDPOINT,
+          "business_logic", _has_client_value_field, "client_trust",
+          "Tamper a server-owned value field (price/amount/total) and check whether an "
+          "independent read reflects it",
+          "Business logic vulnerabilities",
+          specific_classes=(
+              "client_trust", "client trust", "client-side controls", "client_side_controls",
+              "price manipulation", "price_manipulation", "excessive trust",
+          )),
+    # The web_cache_poisoning validator has two legs: an unkeyed X-Forwarded-Host
+    # reflection (host header injection) and a static-suffix cache-deception probe
+    # (path confusion).
+    Check("WSTG-INJT-17", "Host header injection", Phase.ENDPOINT,
+          "web_cache_poisoning", _is_get, "web_cache_poisoning",
+          "Test whether X-Forwarded-Host / Host values are reflected into cacheable responses",
+          "Web cache poisoning",
+          specific_classes=(
+              "host header injection", "host_header_injection", "host header poisoning",
+              "host_header_poisoning", "x-forwarded-host", "x_forwarded_host",
+              "unkeyed header", "unkeyed_header",
+          )),
+    Check("WSTG-CONF-13", "Path confusion", Phase.ENDPOINT,
+          "web_cache_poisoning", _is_authed_get, "web_cache_poisoning",
+          "Test whether a static-looking path suffix makes authenticated content cacheable "
+          "(web cache deception)",
+          "Web cache deception",
+          specific_classes=(
+              "cache deception", "cache_deception", "web cache deception",
+              "web_cache_deception", "path confusion", "path_confusion",
+          )),
 
     # === PARAMETER phase ===
-    Check("WSTG-INPV-05", "SQL injection", Phase.PARAMETER,
+    Check("WSTG-INJT-05", "SQL injection", Phase.PARAMETER,
           "sqli", _accepts_input, "sqlmap",
           "Test all input parameters for SQL injection",
           "SQL injection"),
-    Check("WSTG-INPV-01", "Reflected XSS", Phase.PARAMETER,
+    Check("WSTG-INJT-01", "Reflected XSS", Phase.PARAMETER,
           "xss", _accepts_input, "browser_xss",
           "Test input reflection in HTML responses for script injection",
-          "Cross-site scripting (XSS)"),
-    Check("WSTG-INPV-02", "Stored XSS", Phase.PARAMETER,
+          "Cross-site scripting (XSS)",
+          specific_classes=(
+              "reflected xss", "reflected_xss", "reflected cross-site scripting",
+              "reflected_cross_site_scripting", "non-persistent xss",
+          )),
+    Check("WSTG-INJT-02", "Stored XSS", Phase.PARAMETER,
           "xss", _accepts_body, "stored_xss",
           "Test stored input rendered in HTML context",
-          "Stored cross-site scripting"),
+          "Stored cross-site scripting",
+          specific_classes=(
+              "stored xss", "stored_xss", "persistent xss", "persistent_xss",
+              "second order xss", "second_order_xss", "stored cross-site scripting",
+              "stored_cross_site_scripting",
+          )),
     Check("WSTG-CLNT-01", "DOM-based XSS", Phase.PARAMETER,
           "dom_xss", _accepts_input, "dom_xss",
           "Test client-side sources (location.hash/.search) flowing to a DOM sink",
           "DOM-based cross-site scripting"),
-    Check("WSTG-INPV-12", "Command injection", Phase.PARAMETER,
+    Check("WSTG-INJT-12", "Command injection", Phase.PARAMETER,
           "command_injection", _accepts_input, "command_injection",
           "Test for OS command injection in parameters",
           "OS command injection"),
-    Check("WSTG-INPV-18", "Server-side template injection", Phase.PARAMETER,
+    Check("WSTG-INJT-18", "Server-side template injection", Phase.PARAMETER,
           "ssti", _accepts_input, "ssti",
           "Test for template expression evaluation",
           "Server-side template injection (SSTI)"),
-    Check("WSTG-INPV-07", "XXE", Phase.PARAMETER,
+    Check("WSTG-INJT-07", "XXE", Phase.PARAMETER,
           "xxe", _accepts_xml, "xxe",
           "Test XML-accepting endpoints for external entity processing",
           "XML external entity (XXE) injection"),
-    Check("WSTG-INPV-19", "SSRF", Phase.PARAMETER,
+    Check("WSTG-INJT-19", "SSRF", Phase.PARAMETER,
           "ssrf", _has_url_param, "ssrf",
           "Test URL parameters for server-side request forgery",
           "Server-side request forgery (SSRF)"),
-    Check("WSTG-INPV-17", "Open redirect", Phase.PARAMETER,
+    # WSTG has no server-side open-redirect test; CLNT-04 (Client-side URL Redirect)
+    # is the closest. NoSQL is the INJT-05 sub-test 05.6, so it cannot collide with
+    # the SQL-injection row.
+    Check("WSTG-CLNT-04", "Open redirect", Phase.PARAMETER,
           "open_redirect", _has_url_param, "open_redirect",
           "Test redirect parameters for off-site redirection",
           "Open redirection"),
-    Check("WSTG-INPV-06", "NoSQL injection", Phase.PARAMETER,
+    Check("WSTG-INJT-05.6", "NoSQL injection", Phase.PARAMETER,
           "nosql", _accepts_input, "nosql",
           "Test for NoSQL query manipulation",
           "NoSQL injection"),
-    Check("WSTG-CRYP-04", "JWT weaknesses", Phase.PARAMETER,
+    Check("WSTG-SESS-10", "JWT weaknesses", Phase.PARAMETER,
           "jwt", _is_authed, "jwt_forge",
           "Test JWT algorithm confusion, key disclosure, claim tampering",
           "JWT attacks"),
-    Check("WSTG-INPV-11", "Insecure deserialization", Phase.PARAMETER,
+    Check("WSTG-INJT-23", "Insecure deserialization", Phase.PARAMETER,
           "deserialization", _accepts_body, "deserialization_oob",
           "Test for unsafe deserialization of user-supplied data",
           "Insecure deserialization"),
-    Check("WSTG-BUSL-07", "Race conditions", Phase.PARAMETER,
+    Check("WSTG-BUSL-05", "Race conditions", Phase.PARAMETER,
           "race_condition", _accepts_body, "race_condition",
           "Test for TOCTOU and concurrent-request bugs",
           "Race conditions"),
-    Check("WSTG-BUSL-08", "TOCTOU privilege-escalation race", Phase.ENDPOINT,
+    # The TOCTOU row confirms a privilege field flipped, so it is ATHZ-03 (Privilege
+    # Escalation); BUSL-05 is already the generic race row above.
+    Check("WSTG-ATHZ-03", "TOCTOU privilege-escalation race", Phase.ENDPOINT,
           "toctou", _accepts_body, "toctou",
           "Concurrent copies of an authority-changing write race a check-then-write "
           "window; confirm a privilege field flipped under concurrency via re-read",
@@ -878,6 +1239,10 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("OWASP API Security Top 10 2023", "API1:2023",
                           "https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/",
                           "Broken Object Level Authorization"),
+          ),
+          specific_classes=(
+              "cross_identity_write", "cross_identity_create", "cross_user_write",
+              "bola_write", "idor_write", "foreign_reference_write",
           )),
     Check("AV-WRITE-AUTHOR-01", "Forged authorship (author/owner field set by the client)",
           Phase.ENDPOINT, "forged_authorship", _accepts_body, "write_integrity",
@@ -888,6 +1253,10 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("OWASP API Security Top 10 2023", "API3:2023",
                           "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/",
                           "Broken Object Property Level Authorization"),
+          ),
+          specific_classes=(
+              "forged_authorship", "authorship_forgery", "author_spoofing", "forged_owner",
+              "owner_spoofing", "impersonated_write",
           )),
     Check("AV-WRITE-BIZ-01", "Business-rule tampering (quantity, rating or amount bounds)",
           Phase.ENDPOINT, "business_rule_tamper", _accepts_body, "write_integrity",
@@ -898,6 +1267,11 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("WSTG", "WSTG-BUSL-01",
                           "https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/01-Test_Business_Logic_Data_Validation",
                           "Test Business Logic Data Validation", version="4.2"),
+          ),
+          specific_classes=(
+              "business_rule_tamper", "business_rule_bypass", "numeric_tamper",
+              "negative_quantity", "quantity_tampering", "rating_tampering",
+              "out_of_bounds_value", "negative_total",
           )),
     Check("AV-MASSASSIGN-02", "Mass assignment at create (privileged field on a new object)",
           Phase.ENDPOINT, "mass_assignment_create", _accepts_create, "write_integrity",
@@ -908,6 +1282,10 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("OWASP API Security Top 10 2023", "API3:2023",
                           "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/",
                           "Broken Object Property Level Authorization (subsumes mass assignment)"),
+          ),
+          specific_classes=(
+              "mass_assignment_create", "mass assignment create",
+              "mass_assignment_at_create", "registration_mass_assignment",
           )),
     Check("AV-WRITE-VALID-01", "Weak create validation (empty required fields, duplicates)",
           Phase.ENDPOINT, "create_validation", _accepts_create, "write_integrity",
@@ -918,10 +1296,198 @@ CHECK_CATALOG: tuple[Check, ...] = (
               ExternalRef("WSTG", "WSTG-BUSL-01",
                           "https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/01-Test_Business_Logic_Data_Validation",
                           "Test Business Logic Data Validation", version="4.2"),
+          ),
+          specific_classes=(
+              "create_validation", "weak_create_validation", "duplicate_registration",
+              "empty_required_fields", "missing_required_field_validation",
           )),
 )
 
 CHECKS_BY_ID: dict[str, Check] = {c.id: c for c in CHECK_CATALOG}
+
+
+def specific_class_token(text: str) -> str:
+    """Fold a finding-class spelling to the snake token `specific_classes` match on:
+    lower-case, one trailing "(...)" dropped, runs of space / hyphen / slash -> "_"."""
+    low = re.sub(r"\s*\([^)]*\)\s*$", "", (text or "").strip().lower())
+    return re.sub(r"[\s\-/]+", "_", low).strip("_")
+
+
+def shared_class_specificity_problems(checks=None) -> list[str]:
+    """WG-2 (4) guard, pure so a test can inject a bad row set. Returns one message
+    per problem (empty = sound):
+    - every row whose canonical class is shared by another row declares
+      `specific_classes`;
+    - no token (after `specific_class_token`) sits on two rows;
+    - no token canonicalizes to the class of a DIFFERENT row, so a specific token
+      never steals a finding that belongs to another class's row. A token whose
+      class no row carries (e.g. "bfla", "missing security headers") may sit on a
+      row: there is no other row to steal from, and the token is its only route."""
+    checks = CHECK_CATALOG if checks is None else tuple(checks)
+    problems: list[str] = []
+    by_class: dict[str, list] = {}
+    for c in checks:
+        by_class.setdefault(canonicalize(c.vulnerability_class) or c.vulnerability_class,
+                            []).append(c)
+    for cls, rows in sorted(by_class.items()):
+        if len(rows) < 2:
+            continue
+        for c in rows:
+            if not c.specific_classes:
+                problems.append(f"{c.id}: shares class {cls!r} with "
+                                f"{len(rows) - 1} other row(s) but declares no specific_classes")
+    owner: dict[str, str] = {}
+    for c in checks:
+        row_cls = canonicalize(c.vulnerability_class) or c.vulnerability_class
+        for tok in c.specific_classes:
+            key = specific_class_token(tok)
+            if not key:
+                problems.append(f"{c.id}: empty specific_classes token {tok!r}")
+                continue
+            prev = owner.get(key)
+            if prev is not None and prev != c.id:
+                problems.append(f"{c.id}: token {tok!r} is already on {prev}")
+            owner.setdefault(key, c.id)
+            tok_cls = canonicalize(tok)
+            if tok_cls is not None and tok_cls != row_cls and tok_cls in by_class:
+                problems.append(f"{c.id}: token {tok!r} canonicalizes to {tok_cls!r}, "
+                                f"not the row class {row_cls!r}")
+    return problems
+
+# WG-1: the ONE table of pre-WG-1 check ids (WSTG v4.2 numbering, plus the old
+# internal mass-assignment id) -> the current catalog id. Coverage cells, evidence
+# files and event ledgers written by r9, r10 and earlier carry these; every reader
+# resolves them through `resolve_check_id`. An id in neither CHECKS_BY_ID nor this
+# table is rejected, never guessed. Do not add a key that is also a current id.
+LEGACY_CHECK_ID_ALIASES: dict[str, str] = {
+    "WSTG-CONF-05": "WSTG-CONF-12",      # v4.2 CONF-05 = admin interfaces; CSP is CONF-12
+    "WSTG-CONF-08": "WSTG-CLNT-07",      # v4.2 CONF-08 = RIA cross-domain policy; CORS is CLNT-07
+    "WSTG-CONF-02": "WSTG-CONF-14",      # v4.2 CONF-02 = platform config; headers are CONF-14
+    "WSTG-ATHN-01": "WSTG-ATHN-04",      # v4.2 ATHN-01 = encrypted channel; bypass is ATHN-04
+    "WSTG-BUSV-04": "WSTG-INJT-16",      # no BUSV category exists; smuggling is INJT-16
+    "WSTG-INPV-14": "WSTG-INJT-15",      # v4.2 INPV-14 = incubated; CRLF splitting is INJT-15
+    "WSTG-INPV-05": "WSTG-INJT-05",      # INPV-* was renumbered INJT-*
+    "WSTG-INPV-01": "WSTG-INJT-01",
+    "WSTG-INPV-02": "WSTG-INJT-02",
+    "WSTG-INPV-12": "WSTG-INJT-12",
+    "WSTG-INPV-18": "WSTG-INJT-18",
+    "WSTG-INPV-07": "WSTG-INJT-07",
+    "WSTG-INPV-19": "WSTG-INJT-19",
+    "WSTG-INPV-17": "WSTG-CLNT-04",      # v4.2 INPV-17 = Host header; redirect is CLNT-04
+    "WSTG-INPV-06": "WSTG-INJT-05.6",    # v4.2 INPV-06 = LDAP; NoSQL is sub-test INJT-05.6
+    "WSTG-CRYP-04": "WSTG-SESS-10",      # v4.2 CRYP-04 = weak encryption; JWT is SESS-10
+    "WSTG-INPV-11": "WSTG-INJT-23",      # v4.2 INPV-11 = code injection; deserialization is INJT-23
+    "WSTG-BUSL-07": "WSTG-BUSL-05",      # v4.2 BUSL-07 = misuse defenses; race is BUSL-05
+    "WSTG-BUSL-08": "WSTG-ATHZ-03",      # v4.2 BUSL-08 = unexpected file types; TOCTOU is ATHZ-03
+    "AV-MASSASSIGN-01": "WSTG-INJT-20",  # internal id; current WSTG adds Mass Assignment
+}
+
+
+class UnknownCheckIdError(KeyError):
+    """A check id that is neither a current catalog id nor a known legacy alias."""
+
+
+def resolve_check_id(check_id: str) -> str:
+    """Return the current catalog id for `check_id`, which may be a current id or a
+    legacy (pre-WG-1) alias. Raises `UnknownCheckIdError` for anything else -- an
+    unknown id is never silently mapped to a neighbour."""
+    if check_id in CHECKS_BY_ID:
+        return check_id
+    target = LEGACY_CHECK_ID_ALIASES.get(check_id)
+    if target is not None and target in CHECKS_BY_ID:
+        return target
+    raise UnknownCheckIdError(check_id)
+
+
+def _check_catalog_ids() -> None:
+    """Import-time guard: every WSTG-labelled row names a current WSTG test, no alias
+    shadows a current id, and every alias lands on a catalog row."""
+    for c in CHECK_CATALOG:
+        if c.is_wstg() and not is_current_wstg_id(c.id):
+            raise ValueError(f"catalog id {c.id!r} is not in harness/wstg_ids.py")
+    for old, new in LEGACY_CHECK_ID_ALIASES.items():
+        if old in CHECKS_BY_ID:
+            raise ValueError(f"legacy alias {old!r} shadows a current catalog id")
+        if new not in CHECKS_BY_ID:
+            raise ValueError(f"legacy alias {old!r} -> {new!r} has no catalog row")
+
+
+_check_catalog_ids()
+
+
+# ---------------------------------------------------------------------------
+# WG-2: confirmation kinds <-> registered validators
+# ---------------------------------------------------------------------------
+
+# Confirmation kinds that deliberately name no `validators/registry.py` validator.
+NON_VALIDATOR_CONFIRMATIONS: dict[str, str] = {
+    "manual": "needs a human, a browser PoC or host access; never automated coverage",
+    "agent": "confirmed by the LLM agent's own evidence, not a deterministic leg",
+}
+
+# Registered validators that confirm no catalog row, each with the reason.
+VALIDATOR_ROW_EXCLUSIONS: dict[str, str] = {
+    "file_upload": "its benign disallowed-extension oracle is WSTG-BUSL-08, but WSTG-BUSL-08 "
+                   "is still the WG-1 legacy alias for the TOCTOU row (WSTG-ATHZ-03); "
+                   "adding the row needs an owner decision on that alias",
+    "api_security": "mass-assignment / resource-consumption probes from one exchange; the "
+                    "mass-assignment row (WSTG-INJT-20) confirms via the sequence leg",
+    "deserialization": "passive serialized-format fingerprint, no verdict of its own; "
+                       "WSTG-INJT-23 confirms via deserialization_oob",
+    "idor_read": "single-principal read differential; WSTG-ATHZ-04 confirms via "
+                 "cross_identity (switching or adding a kind is an owner decision)",
+    "verbose_error": "passive stack-trace scan; WSTG-ERRH-01 is judged by the passive "
+                     "error_handling adapter instead",
+}
+
+# Current WSTG tests deliberately left without a row, each with the reason.
+EXCLUDED_CATALOG_ROWS: dict[str, str] = {
+    "WSTG-INJT-14": "no registry validator confirms it: the second-order differentials "
+                    "(second_order.py) run inside orchestrator_chain and their findings "
+                    "carry second_order_sqli / second_order_idor, which canonicalize to no "
+                    "class; a row needs a categories.py synonym and a kind decision",
+    "WSTG-SESS-06": "no Python leg confirms logout invalidation yet; WG-3 adds the leg "
+                    "and this row",
+}
+
+
+def catalog_kind_problems(rows, registered_names, exclusions=None, *,
+                          non_validator=None, excluded_rows=None) -> list[str]:
+    """Every problem between catalog confirmation kinds and the registered
+    validators; empty means consistent. A row's kind must be a registered validator
+    or a documented non-validator kind; every registered validator must confirm a
+    row or sit on `exclusions` with a reason; an exclusion must not be stale (the
+    validator gained a row, or is no longer registered); an excluded row id must not
+    have a row."""
+    exclusions = VALIDATOR_ROW_EXCLUSIONS if exclusions is None else exclusions
+    non_validator = NON_VALIDATOR_CONFIRMATIONS if non_validator is None else non_validator
+    excluded_rows = EXCLUDED_CATALOG_ROWS if excluded_rows is None else excluded_rows
+    registered = set(registered_names)
+    rows = tuple(rows)
+    kinds = {r.confirmation for r in rows}
+    problems: list[str] = []
+    for r in rows:
+        if r.confirmation not in non_validator and r.confirmation not in registered:
+            problems.append(f"{r.id}: confirmation {r.confirmation!r} names no registered "
+                            f"validator and is not a documented non-validator kind")
+    for name in sorted(registered):
+        if name in kinds:
+            if name in exclusions:
+                problems.append(f"{name}: excluded but a row names it (stale exclusion)")
+        elif not (exclusions.get(name) or "").strip():
+            problems.append(f"{name}: registered validator has no catalog row and no "
+                            f"exclusion reason")
+    for name in sorted(set(exclusions) - registered):
+        problems.append(f"{name}: excluded but not registered (stale exclusion)")
+    ids = {r.id for r in rows}
+    for row_id, why in sorted(excluded_rows.items()):
+        if row_id in ids:
+            problems.append(f"{row_id}: on the excluded-row list but has a row")
+        elif not (why or "").strip():
+            problems.append(f"{row_id}: excluded row has no reason")
+    return problems
+
+
 CHECKS_BY_PHASE: dict[Phase, list[Check]] = {}
 for _c in CHECK_CATALOG:
     CHECKS_BY_PHASE.setdefault(_c.phase, []).append(_c)
@@ -1329,18 +1895,43 @@ class CoverageMatrix:
 
     @classmethod
     def from_dict(cls, d: dict) -> "CoverageMatrix":
+        """WG-1: a cell or case stored under a legacy check id (pre-WG-1 WSTG v4.2
+        numbering) loads under its current id. When a matrix holds BOTH spellings of
+        one cell, the entry already under the current id wins. An id that is neither
+        current nor a known alias is kept verbatim -- never mapped onto a neighbour."""
         m = cls()
-        for key_str, cell_dict in (d.get("cells", {}) or {}).items():
-            parts = key_str.split("|", 2)
-            if len(parts) == 3:
-                m._cells[(parts[0], parts[1], parts[2])] = CellResult.from_dict(cell_dict)
-        for key_str, cases in (d.get("cases", {}) or {}).items():
+
+        def split_key(key_str: str) -> tuple[tuple[str, str, str], bool] | None:
             parts = key_str.split("|", 2)
             if len(parts) != 3:
+                return None
+            check_id = parts[2]
+            if check_id in LEGACY_CHECK_ID_ALIASES:
+                return (parts[0], parts[1], resolve_check_id(check_id)), True
+            return (parts[0], parts[1], check_id), False
+
+        # Current-id entries first, so a legacy duplicate never overwrites one.
+        cells = []
+        for key_str, cell_dict in (d.get("cells", {}) or {}).items():
+            parsed = split_key(key_str)
+            if parsed is not None:
+                cells.append((parsed[1], parsed[0], cell_dict))
+        for legacy, key, cell_dict in sorted(cells, key=lambda t: t[0]):
+            if legacy and key in m._cells:
                 continue
-            bucket = m._cases.setdefault((parts[0], parts[1], parts[2]), {})
+            m._cells[key] = CellResult.from_dict(cell_dict)
+
+        buckets = []
+        for key_str, cases in (d.get("cases", {}) or {}).items():
+            parsed = split_key(key_str)
+            if parsed is not None:
+                buckets.append((parsed[1], parsed[0], cases))
+        for legacy, key, cases in sorted(buckets, key=lambda t: t[0]):
+            bucket = m._cases.setdefault(key, {})
             for entry in cases or []:
                 ck = CaseKey.from_dict(entry.get("key", {}) or {})
                 res = CellResult.from_dict(entry.get("result", {}) or {})
+                if legacy and ck.coord_id() in bucket:
+                    continue
                 bucket[ck.coord_id()] = (ck, res)
         return m

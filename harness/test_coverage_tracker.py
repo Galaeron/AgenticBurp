@@ -13,14 +13,14 @@ class ClassMappingTests(unittest.TestCase):
         self.t = CoverageTracker()
 
     def test_maps_canonical_and_freetext_classes(self):
-        self.assertIn("WSTG-INPV-05", self.t.checks_for_class("sqli"))
-        self.assertIn("WSTG-INPV-05", self.t.checks_for_class("SQL Injection"))
+        self.assertIn("WSTG-INJT-05", self.t.checks_for_class("sqli"))
+        self.assertIn("WSTG-INJT-05", self.t.checks_for_class("SQL Injection"))
         # free-text access-control the canonicaliser returns None for
         self.assertIn("WSTG-ATHZ-04", self.t.checks_for_class("IDOR/BOLA"))
         self.assertTrue(self.t.checks_for_class("Broken Function-Level Authorization"))
-        # mass assignment -> api_security check (internal id; WSTG-CONF-09 is a
+        # mass assignment -> api_security check (WSTG-INJT-20; WSTG-CONF-09 is a
         # different requirement -- "Test File Permission")
-        self.assertIn("AV-MASSASSIGN-01", self.t.checks_for_class("mass_assignment"))
+        self.assertIn("WSTG-INJT-20", self.t.checks_for_class("mass_assignment"))
 
     def test_unknown_class_maps_to_nothing(self):
         self.assertEqual(self.t.checks_for_class("totally-made-up-class"), [])
@@ -160,7 +160,7 @@ class BuildTests(unittest.TestCase):
             {"identity": "user", "endpoint_key": "GET /api/tickets/{id}",
              "check_id": "WSTG-ATHZ-04", "status": "not_detected"},
             {"identity": "user", "endpoint_key": "POST /api/search",
-             "check_id": "WSTG-INPV-05", "status": "error"},
+             "check_id": "WSTG-INJT-05", "status": "error"},
         ])
         t.finalize_pending_reasons(investigated_keys={"GET /api/tickets/{id}", "POST /api/search"})
         s = t.matrix.summary()
@@ -234,7 +234,7 @@ class DriveLegsTests(unittest.TestCase):
         idor_cell = t.matrix.get("user", "GET /api/tickets/{id}", "WSTG-ATHZ-04")
         self.assertEqual(idor_cell.status, CellStatus.CONFIRMED)
         # a driven-but-not-confirmed leg cell is NOT_DETECTED (attempted), not pending
-        sqli_cell = t.matrix.get("user", "POST /api/search", "WSTG-INPV-05")
+        sqli_cell = t.matrix.get("user", "POST /api/search", "WSTG-INJT-05")
         self.assertEqual(sqli_cell.status, CellStatus.NOT_DETECTED)
 
     def test_driver_respects_budget(self):
@@ -341,7 +341,7 @@ class CasesDrivenTests(unittest.TestCase):
         t.build(eps, ["user"])
         t.expand_parameter_cases(eps, per_cell_budget=8)
         # SQLi (parameter phase) -> a request-level representative + one case per input
-        sqli_cases = t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-05")
+        sqli_cases = t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INJT-05")
         param_names = sorted(ck.parameter_name for ck, _ in sqli_cases if not ck.is_no_parameter)
         self.assertEqual(param_names, ["search", "sort"])
         self.assertTrue(any(ck.is_no_parameter for ck, _ in sqli_cases))  # the representative
@@ -367,7 +367,7 @@ class CasesDrivenTests(unittest.TestCase):
         dispatched = []
 
         async def run_case(identity, method, path, check, case_key):
-            if check.id == "WSTG-INPV-05" and path == "/api/search":
+            if check.id == "WSTG-INJT-05" and path == "/api/search":
                 dispatched.append(case_key.parameter_name)
                 return _Res("confirmed" if case_key.parameter_name == "search" else "not_confirmed",
                             ((case_key.parameter_location, case_key.parameter_name),))
@@ -375,16 +375,16 @@ class CasesDrivenTests(unittest.TestCase):
 
         asyncio.run(t.drive_coverage_cases(run_case, budget=100))
         self.assertEqual(dispatched, ["search", "sort"])      # no request-level dispatch
-        self.assertEqual(t.matrix.get("user", "POST /api/search", "WSTG-INPV-05").status,
+        self.assertEqual(t.matrix.get("user", "POST /api/search", "WSTG-INJT-05").status,
                          CellStatus.CONFIRMED)
         cases = {ck.parameter_name: r for ck, r in
-                 t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-05")}
+                 t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INJT-05")}
         self.assertEqual(cases["search"].status, CellStatus.CONFIRMED)
         self.assertEqual(cases["sort"].status, CellStatus.NOT_DETECTED)
         self.assertEqual(cases[""].status, CellStatus.INCONCLUSIVE)   # request-level case unsent
         nt = {(c["check"], c["parameter_name"]) for c in t.matrix.cases_not_tested()}
-        self.assertNotIn(("WSTG-INPV-05", "search"), nt)
-        self.assertNotIn(("WSTG-INPV-05", "sort"), nt)
+        self.assertNotIn(("WSTG-INJT-05", "search"), nt)
+        self.assertNotIn(("WSTG-INJT-05", "sort"), nt)
 
     def test_control_request_level_confirm_does_not_credit_parameter_siblings(self):
         """Control (R01): a leg that cannot test one input (NoSQL injection) is still
@@ -403,18 +403,18 @@ class CasesDrivenTests(unittest.TestCase):
         async def run_case(identity, method, path, check, case_key):
             # a request-level confirm on the NoSQL cell (the driver only calls
             # the no-parameter representative); no per-parameter attribution
-            if check.id == "WSTG-INPV-06":
+            if check.id == "WSTG-INJT-05.6":
                 self.assertTrue(case_key.is_no_parameter)   # driven at request level
                 return _Res("confirmed")
             return None
 
         asyncio.run(t.drive_coverage_cases(run_case, budget=100))
         # the cell shows endpoint RISK ...
-        self.assertEqual(t.matrix.get("user", "POST /api/search", "WSTG-INPV-06").status,
+        self.assertEqual(t.matrix.get("user", "POST /api/search", "WSTG-INJT-05.6").status,
                          CellStatus.CONFIRMED)
         # ... but neither parameter input is confirmed; both stay inconclusive (untested)
         cases = {ck.parameter_name: r for ck, r in
-                 t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-06")}
+                 t.matrix.cases_for_cell("user", "POST /api/search", "WSTG-INJT-05.6")}
         self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
         self.assertEqual(cases["sort"].status, CellStatus.INCONCLUSIVE)
         nt_params = {c["parameter_name"] for c in t.matrix.cases_not_tested()}
@@ -454,21 +454,21 @@ class CasesDrivenTests(unittest.TestCase):
         """Per-parameter dispatch through the builder: sqlmap is driven once per
         input, each clean result concludes that input, so neither 'search' nor
         'sort' is in the not-tested list, and cases_driven counts every dispatch."""
-        report, dispatched, nt = self._cases_driven_report("WSTG-INPV-05")
+        report, dispatched, nt = self._cases_driven_report("WSTG-INJT-05")
         self.assertEqual(dispatched, ["search", "sort"])
         self.assertGreaterEqual(report["cases_driven"], len(dispatched))
-        self.assertNotIn(("POST /api/search", "WSTG-INPV-05", "search"), nt)
-        self.assertNotIn(("POST /api/search", "WSTG-INPV-05", "sort"), nt)
+        self.assertNotIn(("POST /api/search", "WSTG-INJT-05", "search"), nt)
+        self.assertNotIn(("POST /api/search", "WSTG-INJT-05", "sort"), nt)
 
     def test_control_build_coverage_cases_driven_reports_request_level_pending_honestly(self):
         """Control: the NoSQL leg runs at REQUEST LEVEL (not_confirmed), so the
         concrete inputs 'search'/'sort' are NOT individually attributed and stay in
         the honest not-tested list; the request-level result is not itself a gap."""
-        report, dispatched, nt = self._cases_driven_report("WSTG-INPV-06")
+        report, dispatched, nt = self._cases_driven_report("WSTG-INJT-05.6")
         self.assertEqual(dispatched, [""])
         self.assertGreaterEqual(report["cases_driven"], 1)
-        self.assertIn(("POST /api/search", "WSTG-INPV-06", "search"), nt)
-        self.assertIn(("POST /api/search", "WSTG-INPV-06", "sort"), nt)
+        self.assertIn(("POST /api/search", "WSTG-INJT-05.6", "search"), nt)
+        self.assertIn(("POST /api/search", "WSTG-INJT-05.6", "sort"), nt)
 
     def test_failing_callback_is_recorded_as_error_and_consumes_budget(self):
         # R05: a raising callback must be recorded ERROR (visible) and the budget must
@@ -519,7 +519,7 @@ class CasesDrivenTests(unittest.TestCase):
         eps = endpoint_view(st)
         t.build(eps, ["user"])
         t.expand_parameter_cases(eps, per_cell_budget=2)
-        cases = t.matrix.cases_for_cell("user", "POST /api/x", "WSTG-INPV-05")
+        cases = t.matrix.cases_for_cell("user", "POST /api/x", "WSTG-INJT-05")
         # parameter inputs are budgeted (2 of 4 pending, 2 budget-skipped); the
         # request-level representative is always present on top.
         param_pending = [r for ck, r in cases if not ck.is_no_parameter and r.status == CellStatus.PENDING]
@@ -535,7 +535,7 @@ class PerParameterDispatchTests(unittest.TestCase):
     case, and each verdict binds to that parameter only when the leg reports
     testing exactly it."""
 
-    KEY = ("user", "POST /api/x", "WSTG-INPV-05")   # sqlmap
+    KEY = ("user", "POST /api/x", "WSTG-INJT-05")   # sqlmap
 
     class _Res:
         # tested=None: report the input the dispatch bound the leg to, as the
@@ -643,7 +643,7 @@ class PerParameterDispatchTests(unittest.TestCase):
     def test_request_level_leg_is_unchanged(self):
         # NoSQL injection (nosql) cannot target one input: still one dispatch on
         # the request-level case, siblings inconclusive.
-        self.KEY = ("user", "POST /api/x", "WSTG-INPV-06")
+        self.KEY = ("user", "POST /api/x", "WSTG-INJT-05.6")
         t, cases, calls = self._drive("search=x&sort=y", lambda ck: self._Res("not_confirmed"))
         self.assertEqual(calls, [""])
         self.assertEqual(cases["search"].status, CellStatus.INCONCLUSIVE)
@@ -651,7 +651,7 @@ class PerParameterDispatchTests(unittest.TestCase):
 
     def test_reported_input_concludes_each_newly_per_parameter_leg(self):
         # Open redirect, SSRF and reflected XSS now dispatch per query input.
-        for check_id in ("WSTG-INPV-17", "WSTG-INPV-19", "WSTG-INPV-01"):
+        for check_id in ("WSTG-CLNT-04", "WSTG-INJT-19", "WSTG-INJT-01"):
             self.KEY = ("user", "POST /api/redirect", check_id)   # a URL-shaped path
             with self.subTest(check_id):
                 t, cases, calls = self._drive("next=x&sort=y", lambda ck: self._Res("not_confirmed"))

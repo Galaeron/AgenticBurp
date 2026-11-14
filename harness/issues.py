@@ -141,7 +141,7 @@ def _route_independent_identity(finding: dict) -> str:
 # Classes (categories.py): csp -- a missing or weak CSP, and framing protection, which
 # the taxonomy files as csp ("clickjacking", "missing x frame options"); missing_headers
 # -- missing security headers, HSTS among them; and a misconfig row whose record is the
-# security-header audit (security_headers_validator files WSTG-CONF-02 as misconfig;
+# security-header audit (security_headers_validator files WSTG-CONF-14 as misconfig;
 # any other misconfig row keeps its endpoint key). A label the taxonomy does not map
 # that names a policy header and its absence ("Missing Strict-Transport-Security
 # Header", "csp_missing") is read as that header's class, for issue grouping only.
@@ -271,7 +271,7 @@ def _csp_policy(finding: dict, label: str) -> HeaderPolicy:
 
 
 def _audit_policy(finding: dict, cls: str) -> HeaderPolicy | None:
-    """The security-header audit's recorded failures (WSTG-CONF-02), or None."""
+    """The security-header audit's recorded failures (WSTG-CONF-14), or None."""
     for text in _recorded_texts(finding, _AUDIT_VALIDATOR):
         states: dict[str, str | None] = {}
         for m in _AUDIT_RE.finditer(text):

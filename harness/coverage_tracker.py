@@ -175,7 +175,8 @@ from harness.client_routes import CLIENT_ROUTE_LEGS, CLIENT_ROUTE_LOCATIONS
 from harness.validators.injection_targets import (PER_PARAMETER_FIELD_CAP, PER_PARAMETER_LOCATIONS,
                                                   REQUEST_LEVEL_INPUTS, case_target)
 from harness.coverage_model import (
-    ATTEMPT_SCHEMA_VERSION, CHECK_CATALOG, CHECKS_BY_ID, Check, CellStatus, CellResult, CoverageMatrix,
+    ATTEMPT_SCHEMA_VERSION, CHECK_CATALOG, CHECKS_BY_ID, LEGACY_CHECK_ID_ALIASES, Check,
+    CellStatus, CellResult, CoverageMatrix, resolve_check_id, specific_class_token,
 )
 
 log = logging.getLogger("harness.coverage_tracker")
@@ -330,38 +331,93 @@ class CoverageTracker:
         for c in checks:
             for token in {c.vulnerability_class, canonicalize(c.vulnerability_class) or c.vulnerability_class}:
                 self._class_to_checks.setdefault(token, []).append(c.id)
+        # WG-2 (4): snake token -> the ONE row whose specific_classes names it (the
+        # catalog guard keeps tokens unique; on an injected clash the first row wins).
+        self._specific_to_check: dict[str, str] = {}
+        for c in checks:
+            for tok in c.specific_classes:
+                self._specific_to_check.setdefault(specific_class_token(tok), c.id)
 
     # --- mapping a finding's class to catalog checks ---
 
-    def checks_for_class(self, vuln_class: str) -> list[str]:
-        """Catalog check ids a finding of `vuln_class` bears on. Tries the
-        canonical class, then the access-control free-text family (which the
-        canonicaliser returns None for), then a whole-word fallback against each
-        check's own class token. Whole-word so a short token like 'auth' does not
-        spuriously match inside 'authorization'."""
+    # Access-control free-text words (canonicalize misses most of these). Each one is
+    # in a row's specific_classes, so it resolves to that ONE row (WG-2: "idor" no
+    # longer also fills ATHZ-02). BFLA wording is tried first, as before.
+    _ACCESS_CONTROL_WORDS = (
+        ("bfla", "function-level", "function level", "broken function"),
+        ("idor", "bola", "object-level", "object level", "insecure direct object"),
+    )
+
+    def _specific_check(self, text: str) -> str | None:
+        return self._specific_to_check.get(specific_class_token(text))
+
+    def resolve_class(self, vuln_class: str, validator: str | None = None) -> tuple[list[str], bool]:
+        """Catalog check ids a finding of `vuln_class` bears on, and whether that
+        result is AMBIGUOUS (more than one row left). Order (WG-2 (4)):
+
+        (a) the raw/snake class is one of a row's `specific_classes` -> that row only;
+        (b) the canonical/raw class match; when several rows share it and `validator`
+            (the finding's validator / confirmed_by_leg) is given, narrow to the rows
+            whose `confirmation` equals it, when that leaves at least one;
+        (c) the access-control free-text words (resolved through (a)), then a
+            whole-word fallback against each check's class token -- whole-word so a
+            short token like 'auth' does not match inside 'authorization'."""
         import re as _re
         raw = (vuln_class or "").lower().strip()
+        if not raw:
+            return [], False
+        # (a) a token that names one row of a shared class.
+        hit = self._specific_check(raw)
+        if hit:
+            return [hit], False
+        # (b) exact canonical / raw token match.
         canon = canonicalize(vuln_class)
-        # 1. exact canonical / raw token match.
         ids: list[str] = []
         for key in (canon, raw):
             if key and key in self._class_to_checks:
                 ids.extend(self._class_to_checks[key])
+        ids = sorted(set(ids))
         if ids:
-            return sorted(set(ids))
-        # 2. access-control free-text family (canonicalize misses these; BFLA and
-        #    function-level authz map to WSTG-ATHZ-02, IDOR/BOLA to WSTG-ATHZ-04).
-        if any(w in raw for w in ("bfla", "function-level", "function level", "broken function")):
-            return ["WSTG-ATHZ-02"]
-        if any(w in raw for w in ("idor", "bola", "object-level", "object level",
-                                   "insecure direct object")):
-            return sorted(c.id for c in self.checks if c.vulnerability_class == "idor")
-        # 3. whole-word fallback against check class tokens.
+            if len(ids) > 1 and validator:
+                v = str(validator).lower().strip()
+                v = v[:-len("_validator")] if v.endswith("_validator") else v
+                by_id = {c.id: c for c in self.checks}
+                narrowed = [i for i in ids if i in by_id and by_id[i].confirmation == v]
+                if narrowed:
+                    ids = narrowed
+            if len(ids) > 1:
+                # A compound class ("IDOR/BOLA") canonicalizes to a shared class but
+                # names one row through its access-control words.
+                for words in self._ACCESS_CONTROL_WORDS:
+                    for w in words:
+                        if w in raw:
+                            hit = self._specific_check(w)
+                            if hit in ids:
+                                return [hit], False
+            return ids, len(ids) > 1
+        # (c) access-control free text, through the specific-token table.
+        for words in self._ACCESS_CONTROL_WORDS:
+            for w in words:
+                if w in raw:
+                    hit = self._specific_check(w)
+                    if hit:
+                        return [hit], False
         for c in self.checks:
             ct = c.vulnerability_class.lower()
             if len(ct) >= 4 and _re.search(r"\b" + _re.escape(ct) + r"\b", raw):
                 ids.append(c.id)
-        return sorted(set(ids))
+        ids = sorted(set(ids))
+        return ids, len(ids) > 1
+
+    def checks_for_class(self, vuln_class: str, validator: str | None = None) -> list[str]:
+        """Catalog check ids a finding of `vuln_class` bears on (see `resolve_class`;
+        `class_is_ambiguous` says whether more than one row is left)."""
+        return self.resolve_class(vuln_class, validator)[0]
+
+    def class_is_ambiguous(self, vuln_class: str, validator: str | None = None) -> bool:
+        """True when `vuln_class` (narrowed by `validator`) still names several rows,
+        so a confirmation cannot say which cell it proves."""
+        return self.resolve_class(vuln_class, validator)[1]
 
     # --- build the matrix from the engagement ---
 
@@ -442,16 +498,28 @@ class CoverageTracker:
             for f in findings:
                 vc = f.get("vulnerability_class", "")
                 confirmed = bool(f.get("confirmed"))
+                check_ids, ambiguous = self.resolve_class(
+                    vc, f.get("validator") or f.get("confirmed_by_leg"))
                 status = CellStatus.CONFIRMED if confirmed else CellStatus.DETECTED
-                for check_id in self.checks_for_class(vc):
+                reason = f"{'confirmed' if confirmed else 'detected'} {vc}"
+                if confirmed and ambiguous:
+                    # WG-2 (4): one confirmation proves ONE cell; when the class is
+                    # shared and the finding names no specific row, every candidate is
+                    # DETECTED (still visible, still drivable), never CONFIRMED.
+                    status = CellStatus.DETECTED
+                    reason = (f"confirmed {vc}, but the class is shared by {len(check_ids)} "
+                              f"rows and the finding names no specific one")
+                for check_id in check_ids:
                     if late:
                         cell = self.matrix.get(ident, ep_key, check_id)
+                        # A late DETECTED (an agent label, or an ambiguous confirmation)
+                        # only fills a cell no leg executed.
                         if (cell is None or cell.status in (status, CellStatus.CONFIRMED)
-                                or (not confirmed and cell.executed)):
+                                or (status != CellStatus.CONFIRMED and cell.executed)):
                             continue
                     self.matrix.record(
                         ident, ep_key, check_id, status=status,
-                        reason=f"{'confirmed' if confirmed else 'detected'} {vc}",
+                        reason=reason,
                         severity=f.get("severity"), confidence=f.get("confidence"),
                         validator=CHECKS_BY_ID.get(check_id).confirmation if check_id in CHECKS_BY_ID else None,
                         evidence=(f.get("summary") or "")[:200])
@@ -486,7 +554,10 @@ class CoverageTracker:
             if not ident or not ep_key or status is None:
                 continue
             if ev.get("check_id"):
-                check_ids = [ev["check_id"]]
+                # WG-1: an event naming a legacy (pre-WG-1) id lands on its current
+                # cell; an unknown id matches no cell and is skipped below.
+                cid = ev["check_id"]
+                check_ids = [resolve_check_id(cid) if cid in LEGACY_CHECK_ID_ALIASES else cid]
             elif ev.get("confirmation"):
                 check_ids = [c.id for c in self.checks if c.confirmation == ev["confirmation"]]
             else:

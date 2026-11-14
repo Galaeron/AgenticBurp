@@ -27,7 +27,7 @@ from harness.validators.base import ValidationResult
 from harness.validators.injection_targets import case_target, tested_inputs
 
 ROLES = [RoleSession("anonymous", {})]
-CHECK = "WSTG-INPV-05"          # SQL injection, a parameter (case-driven) check
+CHECK = "WSTG-INJT-05"          # SQL injection, a parameter (case-driven) check
 
 
 class _Target:

@@ -45,7 +45,10 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from harness.coverage_model import CHECKS_BY_ID, CHECK_CATALOG, Check
+from harness.coverage_model import (
+    CHECKS_BY_ID, CHECK_CATALOG, LEGACY_CHECK_ID_ALIASES, Check, UnknownCheckIdError,
+    resolve_check_id,
+)
 
 SCHEMA_VERSION = 1
 _HARNESS = Path(__file__).resolve().parent
@@ -162,8 +165,8 @@ def evidence_basename(check_id: str, aspect: str) -> str:
     return f"{check_id}__{_slug(aspect)}.json"
 
 
-# ---- the mass-assignment vertical slice (internal id, external refs in catalog) ----
-_MASS = "AV-MASSASSIGN-01"
+# ---- the mass-assignment vertical slice (WSTG-INJT-20; was internal AV-MASSASSIGN-01) ----
+_MASS = "WSTG-INJT-20"
 _ASPECT_INVARIANT = ("patched fixture leaves server-controlled fields unchanged under "
                      "an ordinary update (independent re-read)")
 _ASPECT_CONFIRM = ("harness SequenceValidator confirms mass assignment on the vulnerable "
@@ -171,8 +174,10 @@ _ASPECT_CONFIRM = ("harness SequenceValidator confirms mass assignment on the vu
 _ASPECT_CONTROL = ("harness SequenceValidator returns a controlled negative on the "
                    "patched fixture")
 
-# ---- the open-redirect vertical slice (WSTG-INPV-17, a genuine WSTG id) ----
-_OR = "WSTG-INPV-17"
+# ---- the open-redirect vertical slice (WSTG-CLNT-04, Client-side URL Redirect) ----
+# WSTG has no server-side open-redirect test; CLNT-04 is the closest current id. The
+# v4.2-era binding to WSTG-INPV-17 was wrong (INPV-17 is Host header injection).
+_OR = "WSTG-CLNT-04"
 _ASPECT_OR_INVARIANT = ("patched login neutralises an off-origin next and never issues "
                         "an off-origin redirect")
 _ASPECT_OR_CONFIRM = ("harness OpenRedirectValidator confirms open redirect on the "
@@ -200,10 +205,12 @@ _CALLER_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
                      "harness CrossIdentityValidator does not confirm on the patched fixture (the "
                      "second principal's attempt reached the target; verdict is inconclusive, never "
                      "confirmed)"),
-    "mfa_confirm": ("WSTG-ATHN-01", _LEG, "test_auth_2fa_bypass_confirms", _CONFIRM,
+    # The second-factor legs belong to WSTG-ATHN-11 (MFA); WG-2 added that row and
+    # moved them off the authentication-bypass row (ATHN-04) where WG-1 parked them.
+    "mfa_confirm": ("WSTG-ATHN-11", _LEG, "test_auth_2fa_bypass_confirms", _CONFIRM,
                     "harness AuthSequenceValidator confirms a second-factor bypass (a step-1-only "
                     "session reaches the account page that a tokenless request is denied)"),
-    "mfa_control": ("WSTG-ATHN-01", _LEG, "test_auth_2fa_bypass_silent_on_enforcing_control", _CONTROL,
+    "mfa_control": ("WSTG-ATHN-11", _LEG, "test_auth_2fa_bypass_silent_on_enforcing_control", _CONTROL,
                     "harness AuthSequenceValidator returns a controlled negative where the account "
                     "page enforces the second factor"),
     "weakpw_confirm": ("WSTG-ATHN-07", _LEG, "test_auth_weak_password_confirms", _CONFIRM,
@@ -220,64 +227,64 @@ _CALLER_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
                          _CONTROL,
                          "harness AuthSequenceValidator returns a controlled negative where the "
                          "session token rotates at login"),
-    "stored_xss_confirm": ("WSTG-INPV-02", _LEG, "test_stored_xss_confirms_on_raw_render", _CONFIRM,
+    "stored_xss_confirm": ("WSTG-INJT-02", _LEG, "test_stored_xss_confirms_on_raw_render", _CONFIRM,
                            "harness StoredXssValidator confirms stored XSS (plant, then the "
                            "payload executes on an independent render, logging a value computed "
                            "at run time to the console; a raw render alone is a candidate)"),
-    "stored_xss_control": ("WSTG-INPV-02", _LEG, "test_stored_xss_silent_on_escaped_render_control",
+    "stored_xss_control": ("WSTG-INJT-02", _LEG, "test_stored_xss_silent_on_escaped_render_control",
                            _CONTROL,
                            "harness StoredXssValidator returns a controlled negative where the "
                            "stored value renders escaped"),
-    "stored_xss_form_confirm": ("WSTG-INPV-02", _LEG, "test_stored_xss_confirms_through_csrf_bound_form",
+    "stored_xss_form_confirm": ("WSTG-INJT-02", _LEG, "test_stored_xss_confirms_through_csrf_bound_form",
                                 _CONFIRM,
                                 "harness StoredXssValidator confirms stored XSS through a CSRF-token "
                                 "bound comment form (token refreshed in-session)"),
-    "stored_xss_form_control": ("WSTG-INPV-02", _LEG,
+    "stored_xss_form_control": ("WSTG-INJT-02", _LEG,
                                 "test_stored_xss_silent_on_escaped_csrf_bound_form_control", _CONTROL,
                                 "harness StoredXssValidator returns a controlled negative through a "
                                 "CSRF-token bound comment form that renders escaped"),
-    "cmdi_confirm": ("WSTG-INPV-12", _LEG, "test_command_injection_confirms_via_shell", _CONFIRM,
+    "cmdi_confirm": ("WSTG-INJT-12", _LEG, "test_command_injection_confirms_via_shell", _CONFIRM,
                      "harness CommandInjectionValidator confirms command injection (shell fetch "
                      "reaches the out-of-band collaborator)"),
-    "cmdi_control": ("WSTG-INPV-12", _LEG, "test_command_injection_silent_on_no_shell_control", _CONTROL,
+    "cmdi_control": ("WSTG-INJT-12", _LEG, "test_command_injection_silent_on_no_shell_control", _CONTROL,
                      "harness CommandInjectionValidator returns a controlled negative where the "
                      "parameter never reaches a shell"),
-    "ssti_confirm": ("WSTG-INPV-18", _LEG, "test_ssti_confirms_on_real_template_render", _CONFIRM,
+    "ssti_confirm": ("WSTG-INJT-18", _LEG, "test_ssti_confirms_on_real_template_render", _CONFIRM,
                      "harness SstiValidator confirms server-side template injection (the "
                      "expression is evaluated by a real Jinja render)"),
-    "ssti_control": ("WSTG-INPV-18", _LEG, "test_ssti_silent_on_escaped_echo_control", _CONTROL,
+    "ssti_control": ("WSTG-INJT-18", _LEG, "test_ssti_silent_on_escaped_echo_control", _CONTROL,
                      "harness SstiValidator returns a controlled negative where the probe is "
                      "only echoed escaped"),
-    "xxe_confirm": ("WSTG-INPV-07", _LEG, "test_xxe_confirms_on_entity_resolving_parser", _CONFIRM,
+    "xxe_confirm": ("WSTG-INJT-07", _LEG, "test_xxe_confirms_on_entity_resolving_parser", _CONFIRM,
                     "harness XxeValidator confirms XXE (a SYSTEM entity in an XML POST is "
                     "fetched server-side, seen by the out-of-band collaborator)"),
-    "xxe_control": ("WSTG-INPV-07", _LEG, "test_xxe_silent_on_non_resolving_parser_control", _CONTROL,
+    "xxe_control": ("WSTG-INJT-07", _LEG, "test_xxe_silent_on_non_resolving_parser_control", _CONTROL,
                     "harness XxeValidator returns a controlled negative where the XML parser "
                     "never resolves external entities"),
-    "ssrf_confirm": ("WSTG-INPV-19", _LEG, "test_ssrf_confirms_on_real_server_side_fetch", _CONFIRM,
+    "ssrf_confirm": ("WSTG-INJT-19", _LEG, "test_ssrf_confirms_on_real_server_side_fetch", _CONFIRM,
                      "harness SsrfValidator confirms SSRF (the server fetches the supplied URL, "
                      "seen by the out-of-band collaborator)"),
-    "ssrf_control": ("WSTG-INPV-19", _LEG, "test_ssrf_silent_on_no_fetch_control", _CONTROL,
+    "ssrf_control": ("WSTG-INJT-19", _LEG, "test_ssrf_silent_on_no_fetch_control", _CONTROL,
                      "harness SsrfValidator returns a controlled negative where the URL "
                      "parameter is never fetched"),
-    "jwt_kid_confirm": ("WSTG-CRYP-04", _LEG, "test_jwt_kid_confusion_confirms", _CONFIRM,
+    "jwt_kid_confirm": ("WSTG-SESS-10", _LEG, "test_jwt_kid_confusion_confirms", _CONFIRM,
                         "harness JwtForgeValidator confirms kid key-confusion (a token HS256-signed "
                         "with the key its attacker-chosen kid implies is accepted)"),
-    "jwt_kid_control": ("WSTG-CRYP-04", _LEG, "test_jwt_kid_silent_on_fixed_secret_control", _CONTROL,
+    "jwt_kid_control": ("WSTG-SESS-10", _LEG, "test_jwt_kid_silent_on_fixed_secret_control", _CONTROL,
                         "harness JwtForgeValidator returns a controlled negative where the "
                         "verification key is fixed server-side"),
-    "jwt_unverified_confirm": ("WSTG-CRYP-04", _LEG, "test_jwt_unverified_signature_confirms",
+    "jwt_unverified_confirm": ("WSTG-SESS-10", _LEG, "test_jwt_unverified_signature_confirms",
                                _CONFIRM,
                                "harness JwtForgeValidator confirms an unverified JWT signature (an "
                                "invalid-signature token is accepted where a tokenless request is denied)"),
-    "jwt_unverified_control": ("WSTG-CRYP-04", _LEG,
+    "jwt_unverified_control": ("WSTG-SESS-10", _LEG,
                                "test_jwt_unverified_silent_on_public_endpoint_control", _CONTROL,
                                "harness JwtForgeValidator claims no signature bug on a public endpoint "
                                "the token does not gate (probed, then declined with that reason)"),
-    "deser_confirm": ("WSTG-INPV-11", _LEG, "test_deserialization_oob_confirms_on_pickle_sink", _CONFIRM,
+    "deser_confirm": ("WSTG-INJT-23", _LEG, "test_deserialization_oob_confirms_on_pickle_sink", _CONFIRM,
                       "harness DeserializationOobValidator confirms unsafe deserialization (a "
                       "pickle payload reaches the out-of-band collaborator)"),
-    "deser_control": ("WSTG-INPV-11", _LEG, "test_deserialization_oob_silent_on_json_control", _CONTROL,
+    "deser_control": ("WSTG-INJT-23", _LEG, "test_deserialization_oob_silent_on_json_control", _CONTROL,
                       "harness DeserializationOobValidator returns a controlled negative where "
                       "the cookie is parsed as JSON"),
 }
@@ -313,7 +320,7 @@ REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
              _ASPECT_CONTROL, mode="automated", label="harness_control",
              evidence_file=evidence_basename(_MASS, _ASPECT_CONTROL)),
 
-    # open redirect (WSTG-INPV-17)
+    # open redirect (WSTG-CLNT-04)
     TestSpec(_OR,
              "harness.test_open_redirect_slice.OpenRedirectSliceTest."
              "test_patched_neutralises_off_origin_redirect",
@@ -335,8 +342,10 @@ REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
 
     # Manual checks: genuinely need a human / host access, so they are declared MANUAL
     # (a flagged gap, never automated coverage) rather than left as silent
-    # "unimplemented". CSRF and file-upload oracles were retired to manual
-    # (ORACLE_RETIREMENTS.md); file-permission needs host access.
+    # "unimplemented". The CSRF leg's verdict is retired to an observation
+    # (ORACLE_RETIREMENTS.md), so its confirmation stays a manual browser PoC even
+    # though the catalog row now names the csrf leg (WG-2); malicious-file upload
+    # (BUSL-09) is manual; file-permission needs host access.
     TestSpec("WSTG-CONF-09", "", "server files/directories are least-privilege "
              "(host-level review)", mode="manual", label="manual"),
     TestSpec("WSTG-SESS-05", "", "state-changing requests carry anti-CSRF protection "
@@ -444,8 +453,12 @@ def write_evidence(*, check_id: str, aspect: str, status, test_id: str,
     path. The observation block is reproducible; the execution block binds the record
     to `run_id` (defaults to the current run) with a timestamp. Writes into the
     run-specific dir by default."""
-    if check_id not in CHECKS_BY_ID:
-        raise ValueError(f"evidence references unknown check id {check_id!r}")
+    # WG-1: a legacy (pre-WG-1) id is written under its current id; anything else
+    # is refused.
+    try:
+        check_id = resolve_check_id(check_id)
+    except UnknownCheckIdError:
+        raise ValueError(f"evidence references unknown check id {check_id!r}") from None
     st = status if isinstance(status, TestStatus) else TestStatus.coerce(status)
     rid = run_id or current_run_id()
     rec = EvidenceRecord(
@@ -485,6 +498,10 @@ def load_evidence(evidence_dir: Path | str | None = None, *,
             continue
         rel = p.relative_to(d.parent) if d.parent in p.parents else p
         rec = EvidenceRecord.from_dict(body, path=rel.as_posix())
+        # WG-1: an artifact written under a legacy id counts for its current id. An
+        # unknown id stays as written, so it matches no requirement.
+        if rec.check_id in LEGACY_CHECK_ID_ALIASES:
+            rec.check_id = resolve_check_id(rec.check_id)
         # Freshness FIRST: a record from another run is not part of this run at all.
         if run_id is not None and rec.run_id != run_id:
             continue

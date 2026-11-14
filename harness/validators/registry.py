@@ -357,7 +357,7 @@ class ValidatorRegistry:
         if verbose_cfg.get("enabled", True):
             self.validators["verbose_error"] = VerboseErrorValidator()
 
-        # WSTG-CONF-02 coverage adapter (passive -- judges captured response headers).
+        # WSTG-CONF-14 coverage adapter (passive -- judges captured response headers).
         if cfg.get("security_headers", {}).get("enabled", True):
             self.validators["security_headers"] = SecurityHeadersValidator()
 
@@ -518,7 +518,9 @@ class ValidatorRegistry:
         """
         from urllib.parse import urlsplit
         family = check.confirmation
-        finding_class = check.vulnerability_class
+        # WG-2 (3): a shared-class row names the sub-check its leg runs (e.g.
+        # username_enumeration for WSTG-IDNT-04), so the leg is handed that class.
+        finding_class = getattr(check, "leg_class", "") or check.vulnerability_class
         mechanism = "legacy:" + family
         def decision(status, code, reason):
             return {"status": status, "reason_code": code, "reason": reason,
@@ -529,7 +531,7 @@ class ValidatorRegistry:
             "WSTG-CONF-07": "HTTP absence does not prove HTTPS HSTS policy",
             "WSTG-INFO-02": "fingerprinting is reconnaissance, without this check adapter",
             "WSTG-INFO-05": "comments alone do not establish sensitive disclosure",
-            "WSTG-ATHN-01": "generic authentication bypass has no exact bound procedure",
+            "WSTG-ATHN-04": "generic authentication bypass has no exact bound procedure",
             "WSTG-SESS-01": "generic session management has no exact bound procedure",
         }
         if check.id == "WSTG-CRYP-01":
@@ -566,7 +568,7 @@ class ValidatorRegistry:
                             "a long-polling transport request carries framing, not application input")
         method = (exchange.method or "GET").upper()
         path = urlsplit(exchange.url).path.lower()
-        if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03"}:
+        if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03", "WSTG-IDNT-04", "WSTG-ATHN-11"}:
             from .auth_sequence_validator import _parse_body, _find_key, _PASS_KEYS, _USER_KEYS
             fields, _kind = _parse_body(exchange)
             password, user = _find_key(fields, _PASS_KEYS), _find_key(fields, _USER_KEYS)
@@ -576,11 +578,24 @@ class ValidatorRegistry:
                 if not any(word in path for word in ("regist", "signup", "sign-up")):
                     return decision("unsupported", "unsupported_boundary", "weak-password procedure requires registration")
                 finding_class, mechanism = "weak_password_policy", "auth.weak_password_policy"
+            elif check.id == "WSTG-ATHN-11":
+                # WG-2 row: the MFA leg replays a step-1 login, never a registration.
+                if (any(word in path for word in ("regist", "signup", "sign-up"))
+                        or not any(word in path for word in ("login", "signin", "sign-in", "session", "auth"))):
+                    return decision("unsupported", "unsupported_boundary", "MFA procedure requires an observed login")
+                mechanism = "auth.mfa_bypass"
+            elif check.id == "WSTG-IDNT-04":
+                # WG-2 row: the enumeration leg swaps the captured username (the
+                # password is optional), so a capture without one must not spend budget.
+                mechanism = "auth.username_enumeration"
+                if not user or not str(fields.get(user) or "").strip():
+                    return decision("needs_prerequisite", "missing_credentials",
+                                    "a captured username/email field is required")
             else:
                 if not any(word in path for word in ("login", "signin", "sign-in", "session")):
                     return decision("unsupported", "unsupported_boundary", "session fixation requires an observed login")
                 finding_class, mechanism = "session_fixation", "auth.session_fixation"
-            if not password or not user:
+            if check.id != "WSTG-IDNT-04" and (not password or not user):
                 return decision("needs_prerequisite", "missing_credentials", "captured username/password fields are required")
         if family == "nosql":
             from .nosql_validator import _login_boundary, operator_targets

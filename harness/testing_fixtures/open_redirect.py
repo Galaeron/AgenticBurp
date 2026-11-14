@@ -1,5 +1,5 @@
 """
-Readable open-redirect fixture (WSTG-INPV-17). INTENTIONALLY readable -- an owned
+Readable open-redirect fixture (WSTG-CLNT-04). INTENTIONALLY readable -- an owned
 regression target, NOT a blind one.
 
 `GET /login?next=<url>` issues a 302 whose `Location` is derived from the client's

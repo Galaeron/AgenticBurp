@@ -48,7 +48,7 @@ from harness.validators.dom_xss_validator import DomXssValidator
 from harness.validators.injection_targets import NAMED_PARAMETER_UNTESTED, case_target
 
 ROLES = [RoleSession("anonymous", {})]
-REFLECTED, DOM = "WSTG-INPV-01", "WSTG-CLNT-01"
+REFLECTED, DOM = "WSTG-INJT-01", "WSTG-CLNT-01"
 
 _SHELL = """<!doctype html><html><head><meta charset="utf-8"><title>Shelf</title></head>
 <body><main id="view">home</main><script src="/static/app.js"></script></body></html>"""

@@ -50,7 +50,7 @@ from harness.validators.injection_targets import NAMED_PARAMETER_UNTESTED, case_
 
 _HARNESS = Path(__file__).resolve().parent
 ROLES = [RoleSession("anonymous", {})]
-REFLECTED, STORED, DOM, SQLI = "WSTG-INPV-01", "WSTG-INPV-02", "WSTG-CLNT-01", "WSTG-INPV-05"
+REFLECTED, STORED, DOM, SQLI = "WSTG-INJT-01", "WSTG-INJT-02", "WSTG-CLNT-01", "WSTG-INJT-05"
 
 _SHELL = """<!doctype html><html><head><meta charset="utf-8"><title>Catalog</title></head>
 <body><nav>

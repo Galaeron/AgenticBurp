@@ -23,7 +23,7 @@ from harness.role_crawl import RoleSession
 
 BASE = "http://127.0.0.1:9/"
 ROLES = [RoleSession("anonymous", {})]
-SQLI = "WSTG-INPV-05"
+SQLI = "WSTG-INJT-05"
 
 
 def _state(captures, endpoints):

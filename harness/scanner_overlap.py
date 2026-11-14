@@ -33,11 +33,11 @@ from harness.categories import canonicalize
 
 # The scanner-equivalent classes, as the harness emits them. Each maps to how it is
 # recognised; see overlap_class(). Order is the appendix's row order.
-#   missing_headers -- WSTG-CONF-02 (security_headers validator), canonical
+#   missing_headers -- WSTG-CONF-14 (security_headers validator), canonical
 #                      `missing_headers`, anomaly `missing_security_header`
-#   csp             -- WSTG-CONF-05 (csp validator), canonical `csp`
+#   csp             -- WSTG-CONF-12 (csp validator), canonical `csp`
 #   clickjacking    -- framing (X-Frame-Options / frame-ancestors); canonicalises to csp
-#   cors            -- WSTG-CONF-08 (cors validator), canonical `cors`
+#   cors            -- WSTG-CLNT-07 (cors validator), canonical `cors`
 #   cookie_flags    -- Secure / HttpOnly / SameSite cookie attributes
 #   verbose_error   -- WSTG-ERRH-01 (error_handling) and verbose_error validators,
 #                      class `verbose_error_disclosure`, stack traces

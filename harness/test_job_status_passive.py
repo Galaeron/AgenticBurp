@@ -64,7 +64,7 @@ class DurableJobCallerTests(unittest.TestCase):
     def test_export_retains_child_execution_without_parent_completion(self):
         from harness.coverage_model import CoverageMatrix, CaseKey, NO_PARAMETER_CASE, CellStatus
         matrix = CoverageMatrix()
-        key = ("alice", "GET /x", "WSTG-INPV-05")
+        key = ("alice", "GET /x", "WSTG-INJT-05")
         matrix.expand_cases(*key, [NO_PARAMETER_CASE, CaseKey("query", "q")])
         matrix.record_case(*key, NO_PARAMETER_CASE, status=CellStatus.INCONCLUSIVE,
                            executed=True, validator="fixture")
@@ -78,7 +78,7 @@ class DurableJobCallerTests(unittest.TestCase):
         durable = self.poll(job_id, 'done')
         for result in (completed['result'], durable['result']):
             coverage = result['coverage']
-            parent = coverage['matrix']['cells']['alice|GET /x|WSTG-INPV-05']
+            parent = coverage['matrix']['cells']['alice|GET /x|WSTG-INJT-05']
             self.assertEqual(parent['status'], 'pending')
             self.assertTrue(parent.get('executed', False))
             self.assertEqual(coverage['summary']['cases']['pending'], 1)

@@ -163,7 +163,7 @@ class SafeVerdictCaseTests(unittest.TestCase):
         run = _Run(self.target, status=status, bind_cases=True)
         report = run.drive(build_coverage_cases_driven, _state(self.target.base, "/items/1?q=1"))
         matrix, _parent = _cell(report)
-        return {ck.parameter_name: r for ck, r in matrix.cases_for_cell("anonymous", ITEMS, "WSTG-INPV-05")}
+        return {ck.parameter_name: r for ck, r in matrix.cases_for_cell("anonymous", ITEMS, "WSTG-INJT-05")}
 
     def test_safe_is_a_tested_negative(self):
         cases = self._cases("safe")

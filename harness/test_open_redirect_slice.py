@@ -1,5 +1,5 @@
 """
-Open-redirect vertical slice (WSTG-INPV-17) -- deterministic regression over ACTUAL HTTP.
+Open-redirect vertical slice (WSTG-CLNT-04) -- deterministic regression over ACTUAL HTTP.
 
 The second automated slice behind the requirement-coverage manifest, using a DIFFERENT
 validator (OpenRedirectValidator) and a different fixture -- so coverage is not just the

@@ -230,32 +230,32 @@ class MatrixTests(unittest.TestCase):
         m = CoverageMatrix()
         eps = self._endpoints()
         m.fill_applicability(["user"], eps)
-        sqli_cell = m.get("user", "POST /api/login", "WSTG-INPV-05")
+        sqli_cell = m.get("user", "POST /api/login", "WSTG-INJT-05")
         self.assertIsNotNone(sqli_cell)
         self.assertEqual(sqli_cell.status, CellStatus.PENDING)
 
     def test_record_confirmed(self):
         m = CoverageMatrix()
-        m.record("user", "POST /api/login", "WSTG-INPV-05",
+        m.record("user", "POST /api/login", "WSTG-INJT-05",
                  status=CellStatus.CONFIRMED, reason="sqlmap confirmed",
                  severity="high", confidence=0.99, validator="sqlmap")
-        cell = m.get("user", "POST /api/login", "WSTG-INPV-05")
+        cell = m.get("user", "POST /api/login", "WSTG-INJT-05")
         self.assertEqual(cell.status, CellStatus.CONFIRMED)
 
     def test_confirmed_not_overwritten(self):
         m = CoverageMatrix()
-        m.record("user", "POST /api/login", "WSTG-INPV-05",
+        m.record("user", "POST /api/login", "WSTG-INJT-05",
                  status=CellStatus.CONFIRMED, reason="proven")
-        m.record("user", "POST /api/login", "WSTG-INPV-05",
+        m.record("user", "POST /api/login", "WSTG-INJT-05",
                  status=CellStatus.NOT_DETECTED, reason="retry")
-        cell = m.get("user", "POST /api/login", "WSTG-INPV-05")
+        cell = m.get("user", "POST /api/login", "WSTG-INJT-05")
         self.assertEqual(cell.status, CellStatus.CONFIRMED)
         self.assertEqual(cell.reason, "proven")
 
     def test_summary(self):
         m = CoverageMatrix()
         m.fill_applicability(["user"], self._endpoints())
-        m.record("user", "POST /api/login", "WSTG-INPV-05",
+        m.record("user", "POST /api/login", "WSTG-INJT-05",
                  status=CellStatus.CONFIRMED, reason="test")
         s = m.summary()
         self.assertGreater(s["total_cells"], 0)
@@ -293,26 +293,26 @@ class MatrixTests(unittest.TestCase):
     def test_for_check(self):
         m = CoverageMatrix()
         m.fill_applicability(["user"], self._endpoints())
-        chk_cells = m.for_check("WSTG-INPV-05")
+        chk_cells = m.for_check("WSTG-INJT-05")
         self.assertEqual(len(chk_cells), len(self._endpoints()))
 
     def test_round_trip(self):
         m = CoverageMatrix()
         m.fill_applicability(["user"], self._endpoints())
-        m.record("user", "POST /api/login", "WSTG-INPV-05",
+        m.record("user", "POST /api/login", "WSTG-INJT-05",
                  status=CellStatus.CONFIRMED, reason="test", severity="high")
         d = m.to_dict()
         m2 = CoverageMatrix.from_dict(d)
-        cell = m2.get("user", "POST /api/login", "WSTG-INPV-05")
+        cell = m2.get("user", "POST /api/login", "WSTG-INJT-05")
         self.assertEqual(cell.status, CellStatus.CONFIRMED)
         self.assertEqual(len(m2.cells()), len(m.cells()))
 
     def test_fill_does_not_overwrite_existing(self):
         m = CoverageMatrix()
-        m.record("user", "POST /api/login", "WSTG-INPV-05",
+        m.record("user", "POST /api/login", "WSTG-INJT-05",
                  status=CellStatus.CONFIRMED, reason="prior")
         m.fill_applicability(["user"], self._endpoints())
-        cell = m.get("user", "POST /api/login", "WSTG-INPV-05")
+        cell = m.get("user", "POST /api/login", "WSTG-INJT-05")
         self.assertEqual(cell.status, CellStatus.CONFIRMED)
 
 
@@ -348,11 +348,11 @@ class NegativeControlTests(unittest.TestCase):
         m.fill_applicability(["user"], {"GET /x": {"path": "/x", "methods": ("GET",),
                                                     "access": {}, "reachable_roles": [],
                                                     "object_scoped": False}})
-        m.record("user", "GET /x", "WSTG-INPV-05",
+        m.record("user", "GET /x", "WSTG-INJT-05",
                  status=CellStatus.CONFIRMED, reason="proven")
         # The blocked / inconclusive / error case this fixture lacked.
-        unexecuted = (("WSTG-CONF-02", CellStatus.BLOCKED),
-                      ("WSTG-CONF-05", CellStatus.INCONCLUSIVE),
+        unexecuted = (("WSTG-CONF-14", CellStatus.BLOCKED),
+                      ("WSTG-CONF-12", CellStatus.INCONCLUSIVE),
                       ("WSTG-CONF-06", CellStatus.ERROR))
         for check_id, status in unexecuted:
             m.record("user", "GET /x", check_id, status=status)
@@ -360,7 +360,7 @@ class NegativeControlTests(unittest.TestCase):
             self.assertIn(item["status"], ("not_applicable", "skipped", "pending",
                                            "blocked", "inconclusive", "error"))
         listed = {item["check"]: item for item in m.not_tested()}
-        self.assertNotIn("WSTG-INPV-05", listed)
+        self.assertNotIn("WSTG-INJT-05", listed)
         for check_id, status in unexecuted:
             self.assertEqual(listed[check_id]["status"], status.value)
             self.assertTrue(listed[check_id]["reason"])

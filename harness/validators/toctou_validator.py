@@ -1,5 +1,5 @@
 """
-TOCTOU privilege-escalation race leg (V19, WSTG-BUSL-07 / atomicity).
+TOCTOU privilege-escalation race leg (V19, WSTG-ATHZ-03 Privilege Escalation / atomicity).
 
 The distinction from the two legs it sits between:
 

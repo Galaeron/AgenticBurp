@@ -1,4 +1,4 @@
-"""CSRF confirmation leg (V32, WSTG-SESS-09).
+"""CSRF confirmation leg (V32, WSTG-SESS-05 Cross Site Request Forgery).
 
 A token-bearing, cookie-authenticated form can be confirmed when a tokenless
 top-level GET performs the same state change and the authenticated redirect page

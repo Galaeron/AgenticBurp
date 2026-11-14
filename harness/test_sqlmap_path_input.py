@@ -27,7 +27,7 @@ from harness.test_param_dispatch_caller import _LoopbackDrive
 from harness.validators import injection_targets
 from harness.validators.sqlmap import SqlmapValidator
 
-SQLI = "WSTG-INPV-05"
+SQLI = "WSTG-INJT-05"
 _CLEAN = "all tested parameters do not appear to be injectable"
 
 

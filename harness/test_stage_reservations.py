@@ -233,10 +233,10 @@ class CoverageDeadlineTests(unittest.TestCase):
         self.assertEqual(report["drive_stopped_by"], "time budget")
         matrix = CoverageMatrix.from_dict(report["checkpoint"]["matrix"])
         cases = {ck.parameter_name: r for ck, r in
-                 matrix.cases_for_cell("user", "POST /api/search", "WSTG-INPV-05")}
+                 matrix.cases_for_cell("user", "POST /api/search", "WSTG-INJT-05")}
         self.assertEqual(cases["sort"].status, CellStatus.INCONCLUSIVE)
         self.assertIn("time budget", cases["sort"].reason)
-        self.assertNotEqual(matrix.get("user", "POST /api/search", "WSTG-INPV-05").status,
+        self.assertNotEqual(matrix.get("user", "POST /api/search", "WSTG-INJT-05").status,
                             CellStatus.NOT_DETECTED)
         # the queue counts cells: the one cell was attempted
         self.assertEqual(report["queued_not_attempted"], 0)

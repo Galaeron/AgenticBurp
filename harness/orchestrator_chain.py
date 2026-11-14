@@ -2702,7 +2702,7 @@ class ChainMixin:
                         # Explicit compatibility for legacy injected registries.
                         return {"status": "ready", "reason_code": "legacy_adapter",
                                 "reason": "legacy caller capability adapter",
-                                "finding_class": check.vulnerability_class,
+                                "finding_class": check.leg_class or check.vulnerability_class,
                                 "mechanism_id": "legacy:" + check.confirmation}
                     return resolve(check, exchange, run_context=run_context,
                                    validator=_val_by_conf.get(check.confirmation, False))
