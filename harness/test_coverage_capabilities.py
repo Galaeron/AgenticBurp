@@ -89,8 +89,9 @@ class CoverageCapabilityTests(unittest.IsolatedAsyncioTestCase):
     def test_catalog_routes_available_oracles_including_csrf(self):
         self.assertEqual(CHECKS_BY_ID['WSTG-INJT-05.6'].confirmation, 'nosql')
         # WG-1: BUSL-09 (malicious files) is operator-judged; the extension-bypass
-        # leg belongs to BUSL-08 (unexpected file types).
+        # leg is BUSL-08 (unexpected file types).
         self.assertEqual(CHECKS_BY_ID['WSTG-BUSL-09'].confirmation, 'manual')
+        self.assertEqual(CHECKS_BY_ID['WSTG-BUSL-08'].confirmation, 'file_upload')
         # WG-2 routes CSRF to its registered leg; a confirmation still needs the
         # browser PoC (ORACLE_RETIREMENTS.md).
         self.assertEqual(CHECKS_BY_ID['WSTG-SESS-05'].confirmation, 'csrf')
@@ -175,10 +176,10 @@ class EngagementCapabilityTests(unittest.TestCase):
         from harness.role_crawl import RoleCrawlResult
         from harness.validators.base import ValidationResult
         from harness.coverage_tracker import _LEG_CONFIRMATIONS
-        # file_upload rejoins once the WSTG-BUSL-08 row lands (WG-2 item 1);
-        # WG-1 made BUSL-09 operator-judged.
+        # file_upload reaches dispatch through the WSTG-BUSL-08 row (WG-2 item 1);
+        # BUSL-09 is operator-judged.
         expected = {'csp', 'cors', 'header_injection', 'http_request_smuggling',
-                    'race_condition', 'nosql'}
+                    'race_condition', 'nosql', 'file_upload'}
         cfg = smoke._test_config()
         for name in _LEG_CONFIRMATIONS:
             cfg['validators'].setdefault(name, {})['enabled'] = name in expected
@@ -219,7 +220,7 @@ class EngagementCapabilityTests(unittest.TestCase):
         self.assertEqual({r['confirmation'] for r in rows if r['attempted']}, expected | {'cross_identity'})
         self.assertTrue({'csp_validator', 'cors_validator', 'header_injection_validator',
                          'http_request_smuggling_validator', 'race_condition_validator',
-                         'nosql'} <= seen, seen)
+                         'nosql', 'file_upload'} <= seen, seen)
         # WG-2: SESS-05 names the registered csrf leg (its verdict stays a retired
         # observation, and its replays stay behind allow_mutating_replay). Disabled
         # here, it is unavailable rather than manual, and is never attempted.

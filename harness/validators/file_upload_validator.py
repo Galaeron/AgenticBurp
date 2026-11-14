@@ -135,6 +135,10 @@ class FileUploadValidator(Validator):
         method = (exchange.method or "GET").upper()
         if method not in ("POST", "PUT", "PATCH"):
             return self._skip("endpoint does not accept file uploads")
+        # The leg's verdict needs the mutating upload, so with mutating replay off it
+        # sends nothing at all (not even the read-only source-form fetch).
+        if not get_default_gate().config.allow_mutating_replay:
+            return self._skip("mutating file upload not authorized (set validators.allow_mutating_replay)")
 
         url = exchange.url
         headers = replay_headers(exchange)

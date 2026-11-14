@@ -175,8 +175,9 @@ from harness.client_routes import CLIENT_ROUTE_LEGS, CLIENT_ROUTE_LOCATIONS
 from harness.validators.injection_targets import (PER_PARAMETER_FIELD_CAP, PER_PARAMETER_LOCATIONS,
                                                   REQUEST_LEVEL_INPUTS, case_target)
 from harness.coverage_model import (
-    ATTEMPT_SCHEMA_VERSION, CHECK_CATALOG, CHECKS_BY_ID, LEGACY_CHECK_ID_ALIASES, Check,
-    CellStatus, CellResult, CoverageMatrix, resolve_check_id, specific_class_token,
+    ATTEMPT_SCHEMA_VERSION, CHECK_CATALOG, CHECK_ID_SCHEME, CHECKS_BY_ID, Check,
+    CellStatus, CellResult, CoverageMatrix, check_id_scheme_of, is_legacy_check_id,
+    resolve_check_id, specific_class_token,
 )
 
 log = logging.getLogger("harness.coverage_tracker")
@@ -555,9 +556,17 @@ class CoverageTracker:
                 continue
             if ev.get("check_id"):
                 # WG-1: an event naming a legacy (pre-WG-1) id lands on its current
-                # cell; an unknown id matches no cell and is skipped below.
+                # cell; an unknown id matches no cell and is skipped below. Events
+                # come from this run's legs (no persisted ledger is replayed), so an
+                # unmarked event uses the current id scheme; one stamped
+                # `check_id_scheme: 1` reads as pre-WG-1 data.
                 cid = ev["check_id"]
-                check_ids = [resolve_check_id(cid) if cid in LEGACY_CHECK_ID_ALIASES else cid]
+                try:
+                    scheme = check_id_scheme_of(ev.get("check_id_scheme", CHECK_ID_SCHEME))
+                except ValueError:
+                    continue
+                check_ids = [resolve_check_id(cid, scheme=scheme)
+                             if is_legacy_check_id(cid, scheme) else cid]
             elif ev.get("confirmation"):
                 check_ids = [c.id for c in self.checks if c.confirmation == ev["confirmation"]]
             else:

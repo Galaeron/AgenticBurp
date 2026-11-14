@@ -97,6 +97,8 @@ class FixedKindTests(unittest.TestCase):
         self.assertEqual(CHECKS_BY_ID["WSTG-INJT-05.6"].confirmation, "nosql")
         self.assertEqual(CHECKS_BY_ID["WSTG-SESS-01"].confirmation, "reset_token")
         self.assertEqual(CHECKS_BY_ID["WSTG-BUSL-09"].confirmation, "manual")
+        self.assertEqual(CHECKS_BY_ID["WSTG-BUSL-08"].confirmation, "file_upload")
+        self.assertNotIn("file_upload", VALIDATOR_ROW_EXCLUSIONS)
         self.assertNotIn("agent", {c.confirmation for c in CHECK_CATALOG})
 
     def test_mfa_bindings_moved_to_athn_11(self):

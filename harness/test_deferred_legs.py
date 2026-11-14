@@ -358,6 +358,13 @@ class RunContextTransportTests(unittest.TestCase):
 
 class FileUploadTests(unittest.TestCase):
     def setUp(self):
+        # The leg checks allow_mutating_replay before sending anything (WG-2), so
+        # the mocked-client tests run with it on; the gate itself is mocked out.
+        from harness import safety_gate
+        safety_gate.reset_default_gate()
+        safety_gate.get_default_gate({"active_enabled": True, "allow_mutating_replay": True,
+                                      "allowed_hosts": ["target.test"]})
+        self.addCleanup(safety_gate.reset_default_gate)
         self.v = FileUploadValidator(allowed_hosts=["target.test"])
 
     def test_applies_post(self):

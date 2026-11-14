@@ -5005,6 +5005,24 @@ non-negotiables at the top of this file apply.
   detected 7 -> 7. `harness.suite full` on 3.14: unittest 3990 OK, testing 440 OK,
   evaluation_integrity 59 OK, pytest 38 passed, coverage gate passed. Still open: (1), (2), (5);
   ATHN-04 has no bypass leg and spends one driver slot per identity per auth endpoint on a skip.
+- **Result, open item (1) (2026-11-13; on main 2026-11-14):** VERIFIED (offline). Stored data now names its
+  id scheme: `CoverageMatrix.to_dict` and `write_evidence` stamp `check_id_scheme: 2` (current WSTG
+  ids); unmarked data is scheme 1 (pre-WG-1). `REUSED_LEGACY_IDS = {"WSTG-BUSL-08"}` declares the one
+  alias key that is also a current row; the import guard still refuses any undeclared shadowing
+  alias. `resolve_check_id(cid, scheme=)` / `is_legacy_check_id`: in scheme 1, BUSL-08 is TOCTOU
+  (ATHZ-03); in scheme 2 it is the new row. `CoverageMatrix.from_dict`, `load_evidence` and
+  `record_execution_events` read each record under its own scheme. An unknown scheme is refused, never
+  guessed: from_dict raises, load_evidence makes an invalid FAIL record, and the event is skipped.
+  The evidence `SCHEMA_VERSION` stays 1, so older records stay valid. Execution events are in-process only (no persisted
+  ledger is replayed), so an unmarked event is scheme 2. New row `WSTG-BUSL-08` "Upload of
+  unexpected file types" (class/kind `file_upload`, predicate `_is_file_upload_write` = body-bearing
+  write on a file path, since the leg skips GET). BUSL-08/BUSL-09 declare `specific_classes`;
+  `file_upload` leaves `VALIDATOR_ROW_EXCLUSIONS`; manifest gains `upload_confirm`/`upload_control`
+  (51 requirements on the branch, 62 on main). `file_upload_validator` now checks `allow_mutating_replay` before any send (it
+  fetched the source form with the gate off). New `harness.test_file_upload_busl08` (22 tests:
+  caller confirm/control/gate-off against a loopback upload app, scheme reads for cells, cases,
+  evidence and events, attribution controls, import guard). `harness.suite full` on 3.14: unittest
+  4012 OK, testing 440 OK, evaluation_integrity 59 OK, pytest 38 passed. Still open: (2), (5).
 
 ### [~] WG-3 — Python leg for logout invalidation (WSTG-SESS-06); end its Java-only status
 - **Domain:** Validator coverage / Safety · **Effort:** M · **Depends on:** none ·

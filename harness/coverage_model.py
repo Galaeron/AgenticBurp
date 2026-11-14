@@ -577,6 +577,16 @@ def _has_client_value_field(endpoint: dict) -> tuple[bool, str]:
         return True, "write on a cart/checkout/order/payment path"
     return False, "no client-supplied value field on this write"
 
+def _is_file_upload_write(endpoint: dict) -> tuple[bool, str]:
+    # The file_upload leg skips any non-POST/PUT/PATCH exchange, so a file-handling
+    # path alone (a GET /download/...) gives it nothing to run.
+    if not _accepts_body(endpoint)[0]:
+        return False, "no body-bearing write to upload through"
+    has, reason = _has_file_path_segment(endpoint)
+    if has:
+        return True, f"body-bearing write; {reason}"
+    return False, reason
+
 def _is_get(endpoint: dict) -> tuple[bool, str]:
     if any(m in ("GET", "HEAD") for m in endpoint.get("methods", ())):
         return True, "GET response can be cached"
@@ -926,16 +936,35 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "session_timeout", _has_auth_endpoint, "auth_sequence",
           "Test whether logout invalidates the session server-side (the pre-logout "
           "cookie must stop reaching authenticated pages)"),
-    # BUSL-09 is malicious-file upload and stays manual. The file_upload leg uploads
-    # only a BENIGN disallowed-extension file, which is BUSL-08 (unexpected file
-    # types). WG-2 could not add that row: "WSTG-BUSL-08" is still the WG-1 legacy
-    # alias for the TOCTOU row (ATHZ-03), so a BUSL-08 row would re-read pre-WG-1
-    # TOCTOU cells as file-upload cells. See VALIDATOR_ROW_EXCLUSIONS.
+    # The file_upload leg uploads only a BENIGN disallowed-extension (.html) file and
+    # checks it is stored and served back: BUSL-08 (unexpected file types). In
+    # scheme-1 data (pre-WG-1, unmarked) "WSTG-BUSL-08" meant the TOCTOU row and still
+    # resolves to ATHZ-03; see CHECK_ID_SCHEME and REUSED_LEGACY_IDS.
+    Check("WSTG-BUSL-08", "Upload of unexpected file types", Phase.ENDPOINT,
+          "file_upload", _is_file_upload_write, "file_upload",
+          "Upload a benign file of a disallowed type (.html) and check whether the "
+          "server stores it and serves it back as an active context",
+          "File upload vulnerabilities",
+          specific_classes=(
+              "unrestricted file upload", "unrestricted_file_upload",
+              "upload of unexpected file types", "upload_of_unexpected_file_types",
+              "unexpected file type", "unexpected_file_type", "unexpected file types",
+              "unexpected_file_types", "disallowed file type", "disallowed_file_type",
+              "file type bypass", "file_type_bypass", "file extension bypass",
+              "file_extension_bypass", "upload filter bypass", "upload_filter_bypass",
+          )),
+    # BUSL-09 is malicious-file upload and stays manual; the benign leg is BUSL-08.
     Check("WSTG-BUSL-09", "File upload", Phase.ENDPOINT,
           "file_upload", _has_file_path_segment, "manual",
           "Test upload endpoints against malicious files (manual). The benign "
-          "disallowed-extension leg (file_upload) belongs to BUSL-08, which has no row yet.",
-          "File upload vulnerabilities"),
+          "disallowed-extension leg (file_upload) belongs to WSTG-BUSL-08.",
+          "File upload vulnerabilities",
+          specific_classes=(
+              "malicious file upload", "malicious_file_upload", "upload of malicious files",
+              "upload_of_malicious_files", "malicious file", "malicious_file",
+              "webshell upload", "webshell_upload", "web shell upload", "web_shell_upload",
+              "malware upload", "malware_upload", "eicar",
+          )),
     Check("WSTG-ATHZ-01", "Path traversal", Phase.ENDPOINT,
           "path_traversal", _has_file_path_segment, "path_traversal",
           "Test for directory traversal in file-serving endpoints",
@@ -1365,7 +1394,16 @@ def shared_class_specificity_problems(checks=None) -> list[str]:
 # internal mass-assignment id) -> the current catalog id. Coverage cells, evidence
 # files and event ledgers written by r9, r10 and earlier carry these; every reader
 # resolves them through `resolve_check_id`. An id in neither CHECKS_BY_ID nor this
-# table is rejected, never guessed. Do not add a key that is also a current id.
+# table is rejected, never guessed. A key that is also a current id must be declared
+# in REUSED_LEGACY_IDS (the import guard enforces it).
+#
+# ID schemes: data stamped `check_id_scheme: 2` (CHECK_ID_SCHEME) uses current WSTG
+# ids; data with no stamp is scheme 1 (pre-WG-1, v4.2 numbering). Everything written
+# before the stamp existed is unmarked, which is safe: post-WG-1 writers never wrote
+# "WSTG-BUSL-08", and no other alias key is a current id.
+CHECK_ID_SCHEME = 2
+LEGACY_CHECK_ID_SCHEME = 1
+
 LEGACY_CHECK_ID_ALIASES: dict[str, str] = {
     "WSTG-CONF-05": "WSTG-CONF-12",      # v4.2 CONF-05 = admin interfaces; CSP is CONF-12
     "WSTG-CONF-08": "WSTG-CLNT-07",      # v4.2 CONF-08 = RIA cross-domain policy; CORS is CLNT-07
@@ -1389,34 +1427,77 @@ LEGACY_CHECK_ID_ALIASES: dict[str, str] = {
     "AV-MASSASSIGN-01": "WSTG-INJT-20",  # internal id; current WSTG adds Mass Assignment
 }
 
+# Alias keys that are ALSO current catalog ids but meant something else in scheme 1.
+# They resolve through the alias table only in scheme-1 data; in scheme-2 data they
+# are the current row. WSTG-BUSL-08 was the v4.2-era TOCTOU row; today it is
+# "Upload of Unexpected File Types" (the file_upload leg).
+REUSED_LEGACY_IDS: frozenset[str] = frozenset({"WSTG-BUSL-08"})
+
 
 class UnknownCheckIdError(KeyError):
     """A check id that is neither a current catalog id nor a known legacy alias."""
 
 
-def resolve_check_id(check_id: str) -> str:
-    """Return the current catalog id for `check_id`, which may be a current id or a
-    legacy (pre-WG-1) alias. Raises `UnknownCheckIdError` for anything else -- an
-    unknown id is never silently mapped to a neighbour."""
+def check_id_scheme_of(value) -> int:
+    """The id scheme a stored `check_id_scheme` value names: absent (None) is scheme 1;
+    1 or 2 is itself. Anything else raises ValueError -- an unknown scheme is never
+    read as a known one."""
+    if value is None:
+        return LEGACY_CHECK_ID_SCHEME
+    if isinstance(value, int) and not isinstance(value, bool) and value in (
+            LEGACY_CHECK_ID_SCHEME, CHECK_ID_SCHEME):
+        return value
+    raise ValueError(f"unsupported check_id_scheme {value!r}")
+
+
+def is_legacy_check_id(check_id: str, scheme: int = CHECK_ID_SCHEME) -> bool:
+    """True when `check_id`, read under `scheme`, is a legacy alias that resolves to
+    another id. In scheme 1 every alias key is legacy; in scheme 2 a reused id
+    (REUSED_LEGACY_IDS) is the current row, not an alias."""
+    if check_id not in LEGACY_CHECK_ID_ALIASES:
+        return False
+    if scheme == LEGACY_CHECK_ID_SCHEME:
+        return True
+    if scheme == CHECK_ID_SCHEME:
+        return check_id not in REUSED_LEGACY_IDS
+    raise ValueError(f"unsupported check_id_scheme {scheme!r}")
+
+
+def resolve_check_id(check_id: str, *, scheme: int = CHECK_ID_SCHEME) -> str:
+    """Return the current catalog id for `check_id` read under `scheme`.
+
+    Scheme 1 (pre-WG-1 data): an alias key resolves through the table (BUSL-08 ->
+    ATHZ-03); a current id resolves to itself. Scheme 2 (current): a current id
+    resolves to itself; a non-reused alias still resolves (tolerant reads). Raises
+    `UnknownCheckIdError` for anything else -- an unknown id is never silently
+    mapped to a neighbour."""
+    if is_legacy_check_id(check_id, scheme):
+        target = LEGACY_CHECK_ID_ALIASES[check_id]
+        if target in CHECKS_BY_ID:
+            return target
+        raise UnknownCheckIdError(check_id)
     if check_id in CHECKS_BY_ID:
         return check_id
-    target = LEGACY_CHECK_ID_ALIASES.get(check_id)
-    if target is not None and target in CHECKS_BY_ID:
-        return target
     raise UnknownCheckIdError(check_id)
 
 
 def _check_catalog_ids() -> None:
     """Import-time guard: every WSTG-labelled row names a current WSTG test, no alias
-    shadows a current id, and every alias lands on a catalog row."""
+    shadows a current id unless it is declared in REUSED_LEGACY_IDS, every declared
+    reused id really is both an alias key and a current id, and every alias lands on
+    a catalog row."""
     for c in CHECK_CATALOG:
         if c.is_wstg() and not is_current_wstg_id(c.id):
             raise ValueError(f"catalog id {c.id!r} is not in harness/wstg_ids.py")
     for old, new in LEGACY_CHECK_ID_ALIASES.items():
-        if old in CHECKS_BY_ID:
+        if old in CHECKS_BY_ID and old not in REUSED_LEGACY_IDS:
             raise ValueError(f"legacy alias {old!r} shadows a current catalog id")
         if new not in CHECKS_BY_ID:
             raise ValueError(f"legacy alias {old!r} -> {new!r} has no catalog row")
+    for reused in REUSED_LEGACY_IDS:
+        if reused not in LEGACY_CHECK_ID_ALIASES or reused not in CHECKS_BY_ID:
+            raise ValueError(f"reused legacy id {reused!r} is not both a legacy alias "
+                             f"and a current catalog id")
 
 
 _check_catalog_ids()
@@ -1434,9 +1515,6 @@ NON_VALIDATOR_CONFIRMATIONS: dict[str, str] = {
 
 # Registered validators that confirm no catalog row, each with the reason.
 VALIDATOR_ROW_EXCLUSIONS: dict[str, str] = {
-    "file_upload": "its benign disallowed-extension oracle is WSTG-BUSL-08, but WSTG-BUSL-08 "
-                   "is still the WG-1 legacy alias for the TOCTOU row (WSTG-ATHZ-03); "
-                   "adding the row needs an owner decision on that alias",
     "api_security": "mass-assignment / resource-consumption probes from one exchange; the "
                     "mass-assignment row (WSTG-INJT-20) confirms via the sequence leg",
     "deserialization": "passive serialized-format fingerprint, no verdict of its own; "
@@ -1877,10 +1955,12 @@ class CoverageMatrix:
 
     def to_dict(self) -> dict:
         out: dict = {
+            # WG-2: the id scheme the keys below use; an unmarked dict is scheme 1.
+            "check_id_scheme": CHECK_ID_SCHEME,
             "cells": {
                 f"{i}|{e}|{c}": r.to_dict()
                 for (i, e, c), r in self._cells.items()
-            }
+            },
         }
         # T05: child cases, additive -- an older reader ignores the key and a
         # matrix with no cases omits it, so round-tripping stays compatible.
@@ -1903,16 +1983,20 @@ class CoverageMatrix:
         """WG-1: a cell or case stored under a legacy check id (pre-WG-1 WSTG v4.2
         numbering) loads under its current id. When a matrix holds BOTH spellings of
         one cell, the entry already under the current id wins. An id that is neither
-        current nor a known alias is kept verbatim -- never mapped onto a neighbour."""
+        current nor a known alias is kept verbatim -- never mapped onto a neighbour.
+        The dict's `check_id_scheme` (absent = 1) decides how a reused id reads: a
+        "WSTG-BUSL-08" key is the TOCTOU row (ATHZ-03) in scheme 1 and the
+        file-upload row in scheme 2."""
         m = cls()
+        scheme = check_id_scheme_of(d.get("check_id_scheme"))
 
         def split_key(key_str: str) -> tuple[tuple[str, str, str], bool] | None:
             parts = key_str.split("|", 2)
             if len(parts) != 3:
                 return None
             check_id = parts[2]
-            if check_id in LEGACY_CHECK_ID_ALIASES:
-                return (parts[0], parts[1], resolve_check_id(check_id)), True
+            if is_legacy_check_id(check_id, scheme):
+                return (parts[0], parts[1], resolve_check_id(check_id, scheme=scheme)), True
             return (parts[0], parts[1], check_id), False
 
         # Current-id entries first, so a legacy duplicate never overwrites one.

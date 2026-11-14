@@ -46,8 +46,8 @@ from enum import Enum
 from pathlib import Path
 
 from harness.coverage_model import (
-    CHECKS_BY_ID, CHECK_CATALOG, LEGACY_CHECK_ID_ALIASES, Check, UnknownCheckIdError,
-    resolve_check_id,
+    CHECK_ID_SCHEME, CHECKS_BY_ID, CHECK_CATALOG, Check, UnknownCheckIdError,
+    check_id_scheme_of, is_legacy_check_id, resolve_check_id,
 )
 
 SCHEMA_VERSION = 1
@@ -195,6 +195,7 @@ _ASPECT_OR_CONTROL = ("harness OpenRedirectValidator returns a controlled negati
 _LEG = "harness.test_leg_live_verification.LiveLegVerificationTest"
 _AUTHZ = "harness.test_smoke_authorization_workflow.AuthorizationSliceSmokeTest"
 _LOGOUT = "harness.test_auth_logout_invalidation.LogoutInvalidationCallerTests"
+_UPLOAD = "harness.test_file_upload_busl08.FileUploadCallerTests"
 _CONFIRM, _CONTROL = "harness_confirmation", "harness_control"
 
 # key -> (check_id, test class, test method, label, aspect)
@@ -237,6 +238,15 @@ _CALLER_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
                        _CONTROL,
                        "harness AuthSequenceValidator returns a controlled negative where logout "
                        "invalidates the session server-side"),
+    # WG-2: the benign disallowed-extension upload leg (WSTG-BUSL-08).
+    "upload_confirm": ("WSTG-BUSL-08", _UPLOAD, "test_disallowed_html_upload_served_confirms",
+                       _CONFIRM,
+                       "harness FileUploadValidator confirms an unexpected file type upload (a "
+                       "benign .html file is stored and served back as text/html)"),
+    "upload_control": ("WSTG-BUSL-08", _UPLOAD, "test_rejected_disallowed_type_is_not_confirmed",
+                       _CONTROL,
+                       "harness FileUploadValidator returns a controlled negative where the "
+                       "server rejects the disallowed file type"),
     "stored_xss_confirm": ("WSTG-INJT-02", _LEG, "test_stored_xss_confirms_on_raw_render", _CONFIRM,
                            "harness StoredXssValidator confirms stored XSS (plant, then the "
                            "payload executes on an independent render, logging a value computed "
@@ -413,13 +423,16 @@ class EvidenceRecord:
     recorded_at: str = ""
     reason: str = ""
     schema_version: int = SCHEMA_VERSION
+    # WG-2: the check-id scheme `check_id` uses; None = unmarked (scheme 1, pre-WG-1).
+    # Additive and optional, so SCHEMA_VERSION is unchanged and older records stay valid.
+    check_id_scheme: int | None = None
     # runtime-only:
     path: str = ""
     conflict: bool = False
     invalid_reason: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "schema_version": self.schema_version,
             "check_id": self.check_id,
             "aspect": self.aspect,
@@ -434,6 +447,9 @@ class EvidenceRecord:
                 "reason": self.reason,
             },
         }
+        if self.check_id_scheme is not None:
+            out["check_id_scheme"] = self.check_id_scheme
+        return out
 
     @classmethod
     def from_dict(cls, d: dict, *, path: str = "") -> "EvidenceRecord":
@@ -450,6 +466,7 @@ class EvidenceRecord:
             recorded_at=str(ex.get("recorded_at", "")),
             reason=str(ex.get("reason", "")),
             schema_version=d.get("schema_version"),
+            check_id_scheme=d.get("check_id_scheme"),
             path=path,
         )
 
@@ -475,7 +492,7 @@ def write_evidence(*, check_id: str, aspect: str, status, test_id: str,
         check_id=check_id, aspect=aspect, status=st, kind=kind, invariant=invariant,
         observation=observation or {}, test_id=test_id, run_id=rid,
         recorded_at=recorded_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        reason=reason)
+        reason=reason, check_id_scheme=CHECK_ID_SCHEME)
     d = Path(evidence_dir) if evidence_dir is not None else run_evidence_dir(rid)
     d.mkdir(parents=True, exist_ok=True)
     path = d / evidence_basename(check_id, aspect)
@@ -509,9 +526,15 @@ def load_evidence(evidence_dir: Path | str | None = None, *,
         rel = p.relative_to(d.parent) if d.parent in p.parents else p
         rec = EvidenceRecord.from_dict(body, path=rel.as_posix())
         # WG-1: an artifact written under a legacy id counts for its current id. An
-        # unknown id stays as written, so it matches no requirement.
-        if rec.check_id in LEGACY_CHECK_ID_ALIASES:
-            rec.check_id = resolve_check_id(rec.check_id)
+        # unknown id stays as written, so it matches no requirement. Each record is
+        # read under its own `check_id_scheme` (absent = 1): an unmarked BUSL-08
+        # record is pre-WG-1 TOCTOU evidence and counts for ATHZ-03.
+        try:
+            scheme = check_id_scheme_of(rec.check_id_scheme)
+        except ValueError:
+            scheme = None
+        if scheme is not None and is_legacy_check_id(rec.check_id, scheme):
+            rec.check_id = resolve_check_id(rec.check_id, scheme=scheme)
         # Freshness FIRST: a record from another run is not part of this run at all.
         if run_id is not None and rec.run_id != run_id:
             continue
@@ -520,6 +543,10 @@ def load_evidence(evidence_dir: Path | str | None = None, *,
             rec.conflict = True
             rec.status = TestStatus.FAIL
             rec.invalid_reason = f"unsupported schema_version {rec.schema_version!r} (expected {SCHEMA_VERSION})"
+        elif scheme is None:
+            rec.conflict = True
+            rec.status = TestStatus.FAIL
+            rec.invalid_reason = f"unsupported check_id_scheme {rec.check_id_scheme!r}"
         buckets.setdefault((rec.check_id, rec.aspect), []).append(rec)
 
     out: dict[tuple[str, str], EvidenceRecord] = {}

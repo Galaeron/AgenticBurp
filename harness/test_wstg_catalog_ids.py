@@ -12,9 +12,9 @@ Pins:
   - negative controls: an id in neither the current list nor the alias table is
     rejected (never silently aliased), and a current WSTG id with no catalog row
     is not mapped onto a neighbouring row;
-  - the requirement manifest still has one requirement per catalog row (61: 38 from
-    WG-1, the 11 WG-2 rows, WG-3's SESS-06 and the 11 internal rows main added
-    before the port).
+  - the requirement manifest still has one requirement per catalog row (62: 38 from
+    WG-1, the 11 WG-2 rows, WG-3's SESS-06, WG-2's BUSL-08 and the 11 internal
+    rows main added before the port).
 
 A row added later must be added to the hand-checked tables below (WG-2's rows are in
 ADDED_ROWS; internal AV-* rows are in INTERNAL_ROWS).
@@ -32,8 +32,8 @@ import harness.coverage_manifest as cm
 import harness.coverage_model as model
 from harness import engagement
 from harness.coverage_model import (
-    CHECK_CATALOG, CHECKS_BY_ID, LEGACY_CHECK_ID_ALIASES, CellStatus, CoverageMatrix,
-    UnknownCheckIdError, resolve_check_id,
+    CHECK_CATALOG, CHECKS_BY_ID, LEGACY_CHECK_ID_ALIASES, REUSED_LEGACY_IDS, CellStatus,
+    CoverageMatrix, UnknownCheckIdError, resolve_check_id,
 )
 from harness.coverage_tracker import CoverageTracker, endpoint_view
 from harness.wstg_ids import (
@@ -106,6 +106,9 @@ ADDED_ROWS: dict[str, tuple[str, str, str]] = {
     "WSTG-CONF-13": ("Path Confusion", "web_cache_poisoning", "web_cache_poisoning"),
     # WG-3: the Python logout-invalidation leg.
     "WSTG-SESS-06": ("Logout Functionality", "session_timeout", "auth_sequence"),
+    # WG-2: the benign disallowed-extension upload leg. "WSTG-BUSL-08" is also a
+    # scheme-1 alias (REKEYED_ROWS) and is declared in REUSED_LEGACY_IDS.
+    "WSTG-BUSL-08": ("Upload of Unexpected File Types", "file_upload", "file_upload"),
 }
 
 
@@ -162,7 +165,8 @@ class HandCheckedMappingTests(unittest.TestCase):
         for old, (new, name, vuln_class) in REKEYED_ROWS.items():
             with self.subTest(old=old):
                 self.assertEqual(LEGACY_CHECK_ID_ALIASES[old], new)
-                self.assertNotIn(old, CHECKS_BY_ID)
+                if old not in REUSED_LEGACY_IDS:
+                    self.assertNotIn(old, CHECKS_BY_ID)
                 self.assertIn(new, CHECKS_BY_ID)
                 self.assertEqual(CHECKS_BY_ID[new].vulnerability_class, vuln_class)
                 self.assertEqual(_upstream_name(new), name)
@@ -179,7 +183,8 @@ class HandCheckedMappingTests(unittest.TestCase):
         for check_id, (name, vuln_class, kind) in ADDED_ROWS.items():
             with self.subTest(check=check_id):
                 self.assertIn(check_id, CHECKS_BY_ID)
-                self.assertNotIn(check_id, LEGACY_CHECK_ID_ALIASES)
+                if check_id not in REUSED_LEGACY_IDS:
+                    self.assertNotIn(check_id, LEGACY_CHECK_ID_ALIASES)
                 self.assertEqual(WSTG_LATEST_TESTS[check_id], name)
                 self.assertEqual(CHECKS_BY_ID[check_id].vulnerability_class, vuln_class)
                 self.assertEqual(CHECKS_BY_ID[check_id].confirmation, kind)
@@ -201,7 +206,9 @@ class HandCheckedMappingTests(unittest.TestCase):
         self.assertEqual(set(LEGACY_CHECK_ID_ALIASES), set(REKEYED_ROWS))
 
     def test_alias_table_never_shadows_a_current_row(self):
-        self.assertFalse(set(LEGACY_CHECK_ID_ALIASES) & set(CHECKS_BY_ID))
+        # Only a declared reused id (scheme-1 meaning differs) may be both.
+        self.assertEqual(set(LEGACY_CHECK_ID_ALIASES) & set(CHECKS_BY_ID), set(REUSED_LEGACY_IDS))
+        self.assertEqual(REUSED_LEGACY_IDS, frozenset({"WSTG-BUSL-08"}))
         self.assertLessEqual(set(LEGACY_CHECK_ID_ALIASES.values()), set(CHECKS_BY_ID))
 
     def test_import_guard_rejects_a_shadowing_alias_and_a_stale_row_id(self):
@@ -218,7 +225,9 @@ class ResolveTests(unittest.TestCase):
     def test_current_and_legacy_ids_resolve(self):
         self.assertEqual(resolve_check_id("WSTG-INJT-05"), "WSTG-INJT-05")
         for old, (new, _, _) in REKEYED_ROWS.items():
-            self.assertEqual(resolve_check_id(old), new)
+            self.assertEqual(resolve_check_id(old, scheme=1), new)
+            if old not in REUSED_LEGACY_IDS:
+                self.assertEqual(resolve_check_id(old), new)
 
     def test_unknown_id_is_rejected_not_aliased(self):
         # Neither a current catalog id nor an alias: a typo, a made-up v4.2-style id,
@@ -361,11 +370,12 @@ class ManifestCountTests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="cov_wg1_count_"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         rep = cm.reconcile(evidence_dir=tmp, run_id="RUN_EMPTY")
-        self.assertEqual(rep["totals"]["requirements"], 61)
+        self.assertEqual(rep["totals"]["requirements"], 62)
         self.assertEqual({r["check_id"] for r in rep["requirements"]}, set(CHECKS_BY_ID))
         for spec in cm.REQUIREMENT_TESTS:
             self.assertIn(spec.check_id, CHECKS_BY_ID)
-            self.assertNotIn(spec.check_id, LEGACY_CHECK_ID_ALIASES)
+            if spec.check_id not in REUSED_LEGACY_IDS:
+                self.assertNotIn(spec.check_id, LEGACY_CHECK_ID_ALIASES)
 
 
 if __name__ == "__main__":
