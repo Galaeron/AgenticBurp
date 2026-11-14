@@ -57,8 +57,9 @@ class KindAuditTests(unittest.TestCase):
         for name in sorted(self.registered):
             with self.subTest(validator=name):
                 self.assertTrue(name in kinds or VALIDATOR_ROW_EXCLUSIONS.get(name, "").strip())
-        self.assertIn("WSTG-SESS-06", EXCLUDED_CATALOG_ROWS)
-        self.assertNotIn("WSTG-SESS-06", CHECKS_BY_ID)
+        # WG-3 landed the logout leg, so SESS-06 is a row, not an exclusion.
+        self.assertNotIn("WSTG-SESS-06", EXCLUDED_CATALOG_ROWS)
+        self.assertEqual("auth_sequence", CHECKS_BY_ID["WSTG-SESS-06"].confirmation)
 
     def test_row_naming_an_unregistered_validator_is_reported(self):
         # Negative control: the audit must fail on a made-up kind.

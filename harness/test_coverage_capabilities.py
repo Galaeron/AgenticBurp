@@ -383,6 +383,27 @@ class ReadinessInputTests(unittest.TestCase):
         self.assertEqual(self.decide('WSTG-ATHN-07',body='{}')['reason_code'],'missing_credentials')
         self.assertEqual(self.decide('WSTG-SESS-03')['reason_code'],'unsupported_boundary')
 
+    def test_wg_auth_rows_are_gated_on_request_shape(self):
+        """The rows WG-2/WG-3 added to auth_sequence (IDNT-04, ATHN-11, SESS-06)
+        decline a wrong-shape capture before dispatch, as ATHN-07/SESS-03 do."""
+        login='http://fixture.invalid/login'
+        ready=self.decide('WSTG-IDNT-04',url=login)
+        self.assertEqual((ready['status'],ready['finding_class']),('ready','username_enumeration'))
+        self.assertEqual(ready['mechanism_id'],'auth.username_enumeration')
+        # Enumeration swaps the username only; a password is not required.
+        self.assertEqual(self.decide('WSTG-IDNT-04',url=login,body='{"email":"a@b.c"}')['status'],'ready')
+        self.assertEqual(self.decide('WSTG-IDNT-04',url=login,body='{"email":""}')['reason_code'],'missing_credentials')
+        self.assertEqual(self.decide('WSTG-IDNT-04',url=login,method='GET')['reason_code'],'unsupported_method')
+        mfa=self.decide('WSTG-ATHN-11',url=login)
+        self.assertEqual((mfa['status'],mfa['finding_class']),('ready','2fa_bypass'))
+        self.assertEqual(self.decide('WSTG-ATHN-11')['reason_code'],'unsupported_boundary')  # /register
+        self.assertEqual(self.decide('WSTG-ATHN-11',url=login,body='{"username":"u"}')['reason_code'],'missing_credentials')
+        logout=self.decide('WSTG-SESS-06',url=login)
+        self.assertEqual((logout['status'],logout['finding_class']),('ready','session_timeout'))
+        self.assertEqual(logout['mechanism_id'],'auth.logout_invalidation')
+        self.assertEqual(self.decide('WSTG-SESS-06')['reason_code'],'unsupported_boundary')
+        self.assertEqual(self.decide('WSTG-SESS-06',url=login,method='GET')['reason_code'],'unsupported_method')
+
     def test_missing_inputs_are_not_security_negatives(self):
         self.assertEqual(self.decide('WSTG-CONF-12',headers={'Content-Type':'application/json'})['reason_code'],'non_html_response')
         self.assertEqual(self.decide('WSTG-CONF-12')['status'],'needs_prerequisite')

@@ -137,6 +137,13 @@ CONFIRMABLE_CLASS_MARKERS = frozenset({
     "username_enumeration",
     "username enumeration",
     "user enumeration",
+    # WG-3: logout invalidation (WSTG-SESS-06), auth_sequence's logout leg.
+    # Provisional: no live-verified fixture case yet, so not in LIVE_VERIFIED_MARKERS.
+    "session_timeout",
+    "session timeout",
+    "logout invalidation",
+    "logout_invalidation",
+    "session not invalidated",
 
     # CSRF family (csrf_validator)
     "csrf",

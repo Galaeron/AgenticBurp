@@ -12,8 +12,9 @@ Pins:
   - negative controls: an id in neither the current list nor the alias table is
     rejected (never silently aliased), and a current WSTG id with no catalog row
     is not mapped onto a neighbouring row;
-  - the requirement manifest still has one requirement per catalog row (60: 38 from
-    WG-1, the 11 WG-2 rows and the 11 internal rows main added before the port).
+  - the requirement manifest still has one requirement per catalog row (61: 38 from
+    WG-1, the 11 WG-2 rows, WG-3's SESS-06 and the 11 internal rows main added
+    before the port).
 
 A row added later must be added to the hand-checked tables below (WG-2's rows are in
 ADDED_ROWS; internal AV-* rows are in INTERNAL_ROWS).
@@ -103,6 +104,8 @@ ADDED_ROWS: dict[str, tuple[str, str, str]] = {
     "WSTG-BUSL-02": ("Ability to Forge Requests", "business_logic", "client_trust"),
     "WSTG-INJT-17": ("Host Header Injection", "web_cache_poisoning", "web_cache_poisoning"),
     "WSTG-CONF-13": ("Path Confusion", "web_cache_poisoning", "web_cache_poisoning"),
+    # WG-3: the Python logout-invalidation leg.
+    "WSTG-SESS-06": ("Logout Functionality", "session_timeout", "auth_sequence"),
 }
 
 
@@ -358,7 +361,7 @@ class ManifestCountTests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="cov_wg1_count_"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         rep = cm.reconcile(evidence_dir=tmp, run_id="RUN_EMPTY")
-        self.assertEqual(rep["totals"]["requirements"], 60)
+        self.assertEqual(rep["totals"]["requirements"], 61)
         self.assertEqual({r["check_id"] for r in rep["requirements"]}, set(CHECKS_BY_ID))
         for spec in cm.REQUIREMENT_TESTS:
             self.assertIn(spec.check_id, CHECKS_BY_ID)

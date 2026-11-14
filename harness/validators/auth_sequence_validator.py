@@ -16,6 +16,13 @@ oracle, dispatched by the finding's class:
   - username_enumeration   -- a login/reset response DISCRIMINATES a valid account
                              from an invalid one (after masking the echoed username),
                              leaking which usernames exist.
+  - session_timeout        -- logout invalidation (WSTG-SESS-06): a FRESH
+                             throwaway login's session reaches an authenticated
+                             page (anonymous denied), the page's own logout
+                             request is sent on that session, and the SAME
+                             pre-logout cookie still reaches the page -- the
+                             server never invalidated it. The operator's
+                             captured session is never sent to the logout.
 
 Credentials/usernames come from the captured request itself (a login/register
 body), so no tester input is needed. All sends route through the safety gate and,
@@ -57,6 +64,41 @@ _MFA_MARKERS = re.compile(
 _PROTECTED_CANDIDATES = ("/my-account", "/account", "/dashboard", "/profile", "/home", "/settings")
 # A redirect path segment that names a login page (login, sign-in, logon, login.php, ...).
 _LOGIN_SEGMENT = re.compile(r"^(?:log[-_]?in|sign[-_]?in|log[-_]?on)\b", re.I)
+# A request path that names a logout (logout, log-out, signout, sign_out, logoff).
+_LOGOUT_PATH = re.compile(r"log[-_]?out|sign[-_]?out|log[-_]?off", re.I)
+# A logout named in a finding class ("not invalidated on log out", "after signout").
+_LOGOUT_WORD = re.compile(r"log[\s_-]?out|sign[\s_-]?out|log[\s_-]?off", re.I)
+
+
+def _authenticated_signal(status: int, body: str, username: str) -> bool:
+    """The positive authenticated-page signal shared by the fixation and logout
+    legs: a substantive 2xx showing a logout control or the account's username."""
+    from harness.missing_auth_probe import _substantive
+    low = (body or "").lower()
+    return _substantive(status, body or "") and (
+        "log out" in low or "logout" in low or bool(username and username in low))
+
+
+def _logout_requests(body: str, page_url: str) -> list[tuple[str, str, str | None]]:
+    """Same-origin logout requests the page itself offers, as (method, url, body):
+    a form whose action path names a logout (submitted with its own fields, e.g. a
+    CSRF token), then a link whose path does. Never a guessed path: a wrong
+    endpoint that leaves the session alive would look like a missing invalidation."""
+    from harness.feature_workflow import extract_forms, extract_links
+    origin = urlsplit(page_url)
+
+    def same(u):
+        return (urlsplit(u).scheme, urlsplit(u).netloc) == (origin.scheme, origin.netloc)
+
+    out = []
+    for form in extract_forms(body or "", page_url):
+        if same(form.action) and _LOGOUT_PATH.search(urlsplit(form.action).path):
+            method = (form.method or "POST").upper()
+            out.append((method, form.action, form.body() if method != "GET" else None))
+    for link in extract_links(body or "", page_url):
+        if same(link) and _LOGOUT_PATH.search(urlsplit(link).path):
+            out.append(("GET", link, None))
+    return out
 
 
 def _anonymous_denial(status: int, body: str, location: str) -> str:
@@ -122,6 +164,19 @@ def _session_cookies(set_cookie_headers) -> dict:
     return out
 
 
+def _is_logout_class(low: str) -> bool:
+    """A session_timeout / logout-invalidation claim (WSTG-SESS-06)."""
+    from harness.categories import canonicalize
+    # Not a bare "logout": a different claim about the logout endpoint (CSRF on
+    # the logout form, say) must not borrow this check's confirmation. Nor a bare
+    # "not invalidated": a reset token or a session kept after a password change
+    # is a different claim; it counts only when it names a logout.
+    return (canonicalize(low) == "session_timeout" or "session_timeout" in low
+            or "session timeout" in low or "logout invalidation" in low
+            or "logout_invalidation" in low
+            or ("not invalidated" in low and bool(_LOGOUT_WORD.search(low))))
+
+
 class AuthSequenceValidator(Validator):
     name = "auth_sequence"
     finding_classes = {
@@ -132,6 +187,8 @@ class AuthSequenceValidator(Validator):
         "2fa_bypass", "2fa bypass", "mfa_bypass", "mfa bypass", "two_factor_bypass",
         "two-factor bypass", "multi_factor_bypass", "second factor bypass",
         "broken_authentication", "broken authentication", "authentication",
+        "session_timeout", "session timeout", "logout_invalidation", "logout invalidation",
+        "session not invalidated",
     }
     active = True
 
@@ -148,6 +205,10 @@ class AuthSequenceValidator(Validator):
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if not super().applies(finding, exchange):
             return False
+        if self._which_checks(finding.vulnerability_class, exchange) == ["logout"]:
+            # Any exchange: validate() mints its own throwaway login from a
+            # captured login, or reports why it cannot without sending anything.
+            return True
         if (exchange.method or "").upper() not in ("POST", "PUT"):
             return False
         fields, _ = _parse_body(exchange)
@@ -189,6 +250,8 @@ class AuthSequenceValidator(Validator):
             return ["weak"]
         if "enum" in low:
             return ["enum"]
+        if _is_logout_class(low):
+            return ["logout"]
         if "2fa" in low or "mfa" in low or "two" in low or "multi" in low or "second factor" in low:
             return ["mfa"]
         if "authentication" not in low:
@@ -228,6 +291,8 @@ class AuthSequenceValidator(Validator):
                     result = await self._check_weak_password(exchange)
                 elif check == "mfa":
                     result = await self._check_mfa_bypass(exchange)
+                elif check == "logout":
+                    result = await self._check_logout_invalidation(exchange)
                 else:
                     result = await self._check_username_enum(exchange)
                 if result.confirmed:
@@ -324,7 +389,6 @@ class AuthSequenceValidator(Validator):
         on proof, else (None, why the first failed anonymous control did not
         count, or "")."""
         from urllib.parse import urljoin
-        from harness.missing_auth_probe import _AUTH_HEADERS, _substantive
         fields, _ = _parse_body(exchange)
         ukey = _find_key(fields, _USER_KEYS)
         username = str(fields.get(ukey) or "").strip().lower() if ukey else ""
@@ -337,13 +401,10 @@ class AuthSequenceValidator(Validator):
             if urlsplit(target).netloc == p.netloc and urlsplit(target).scheme == p.scheme:
                 targets.append(target)
         targets += [origin + path for path in _PROTECTED_CANDIDATES]
-        headers = {k: v for k, v in self._headers(exchange).items()
-                   if k.lower() not in _AUTH_HEADERS and k.lower() != "content-type"}
+        headers = self._page_headers(exchange)
 
         def authed(status, body):
-            low = (body or "").lower()
-            return _substantive(status, body or "") and (
-                "log out" in low or "logout" in low or bool(username and username in low))
+            return _authenticated_signal(status, body, username)
 
         seen, failed = set(), ""
         for url in targets:
@@ -379,6 +440,137 @@ class AuthSequenceValidator(Validator):
                 f"the anonymous control GET {url} answered HTTP {anon_got.status_code}, which is not an "
                 f"authorization denial (only 401/403, a redirect to a login page or a login page is)")
         return None, failed
+
+    def _page_headers(self, exchange) -> dict:
+        """Captured headers for a GET of an account page: no credential header
+        (the session under test is supplied explicitly) and no Content-Type."""
+        from harness.missing_auth_probe import _AUTH_HEADERS
+        return {k: v for k, v in self._headers(exchange).items()
+                if k.lower() not in _AUTH_HEADERS and k.lower() != "content-type"}
+
+    # --- logout invalidation (session_timeout, WSTG-SESS-06) ------------------
+    async def _check_logout_invalidation(self, exchange) -> ValidationResult:
+        """A logout that only clears the cookie client-side leaves the session
+        valid on the server. Proof, all on a FRESH throwaway login (the
+        operator's captured session is never sent, so the tester is not logged
+        out): (a) the fresh session alone reaches an authenticated page that an
+        anonymous request is denied; (b) the page's own logout request is sent
+        on that session; (c) the same pre-logout cookie(s) are replayed against
+        the page. Confirmed only when (a) held and (c) still shows the
+        authenticated signal; (c) denied or redirected to login is the negative.
+        Every send goes through the gate; validate() already requires
+        validators.allow_mutating_replay, which covers the logout even as a GET.
+        Idle/absolute timeout (WSTG-SESS-07) needs long waits: out of scope."""
+        fc = "session_timeout"
+        steps: list[dict] = []
+
+        def done(status, summary, evidence="", confidence=0.0):
+            return ValidationResult(
+                self.name, status, fc, confidence=confidence, confirmed=status == "confirmed",
+                summary=summary, evidence=evidence or summary,
+                raw_output=json.dumps({"check": "logout_invalidation", "steps": steps}))
+
+        method = (exchange.method or "").upper()
+        fields, _ = _parse_body(exchange)
+        if method not in ("POST", "PUT") or not (_find_key(fields, _PASS_KEYS)
+                                                and _find_key(fields, _USER_KEYS)):
+            steps.append({"step": "fresh_session", "status": "unavailable"})
+            return done("skipped",
+                        "Logout invalidation not tested: no captured login to mint a fresh throwaway "
+                        "session, and the captured session is never sent to a logout (that would log "
+                        "the tester out). Nothing was sent.",
+                        f"The finding's exchange ({method or '?'} {urlsplit(exchange.url).path}) is not a "
+                        f"username+password login. Re-run on the captured login request.")
+
+        # 1. Fresh throwaway login (_headers never forwards the captured Cookie).
+        async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                    follow_redirects=False, verify=False) as client:
+            body = await self._refresh_login_body(client, exchange)
+            login = await self._send(client, method, exchange.url, self._headers(exchange), body)
+        fresh = _session_cookies(login.headers.get_list("set-cookie"))
+        steps.append({"step": "fresh_login", "status": login.status_code, "cookies": sorted(fresh)})
+        if login.status_code >= 400 or not fresh:
+            return done("inconclusive",
+                        "Logout invalidation not tested: the fresh login issued no session cookie "
+                        f"(HTTP {login.status_code}), so there is no throwaway session to log out. "
+                        "Nothing was sent to a logout.")
+        names = ", ".join(sorted(fresh))
+        cookie = "; ".join(f"{n}={v}" for n, v in fresh.items())
+
+        # 2. (a) The fresh session reaches an authenticated page; anonymous is denied.
+        proof, failed = await self._fixed_id_authenticates(exchange, login, fresh)
+        if proof is None:
+            steps.append({"step": "authenticated_before_logout", "status": "unproven"})
+            return done("inconclusive",
+                        f"Logout invalidation not tested: the fresh session ({names}) reached no "
+                        f"authenticated page that an anonymous request is denied"
+                        + (f" ({failed})" if failed else "") + ". Nothing was sent to a logout.")
+        # The proven page's response carries the logout control step 3 reads.
+        page, status_a, denial_a, page_resp, _anon = proof
+        steps.append({"step": "authenticated_before_logout", "url": page, "status": status_a,
+                      "anonymous": denial_a})
+
+        # 3. The logout request the page (or the captured login response) offers.
+        offered = (_logout_requests(page_resp.text or "", page)
+                   or _logout_requests(exchange.response_body or "", exchange.url))
+        if not offered:
+            steps.append({"step": "logout_request", "status": "not_found"})
+            return done("inconclusive",
+                        f"Logout invalidation not tested: {urlsplit(page).path} offers no same-origin "
+                        f"logout link or form, and no logout path is guessed. Nothing was sent to a "
+                        f"logout.")
+        lo_method, lo_url, lo_body = offered[0]
+        headers = self._page_headers(exchange)
+
+        # 4. (b) Log the FRESH session out.
+        lo_headers = dict(headers, Cookie=cookie)
+        if lo_body is not None:
+            lo_headers["Content-Type"] = "application/x-www-form-urlencoded"
+        async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                    follow_redirects=False, verify=False) as lo_client:
+            logout = await self._send(lo_client, lo_method, lo_url, lo_headers, lo_body)
+        steps.append({"step": "logout", "method": lo_method, "url": lo_url,
+                      "status": logout.status_code})
+        if logout.status_code >= 400:
+            return done("inconclusive",
+                        f"Logout invalidation not tested: {lo_method} {urlsplit(lo_url).path} answered "
+                        f"HTTP {logout.status_code}, so the logout itself did not complete.")
+        if 200 <= logout.status_code < 300 and _logout_requests(logout.text or "", lo_url):
+            return done("inconclusive",
+                        f"Logout invalidation not tested: {lo_method} {urlsplit(lo_url).path} answered "
+                        f"with another logout control (a confirmation step?), so the logout is not "
+                        f"shown to have run.")
+
+        # 5. (c) Replay the authenticated request with the same pre-logout cookie(s).
+        async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                    follow_redirects=False, verify=False) as replay_client:
+            after = await self._send(replay_client, "GET", page, dict(headers, Cookie=cookie), None)
+        ukey = _find_key(fields, _USER_KEYS)
+        username = str(fields.get(ukey) or "").strip().lower() if ukey else ""
+        authed_after = _authenticated_signal(after.status_code, after.text or "", username)
+        steps.append({"step": "replay_after_logout", "url": page, "status": after.status_code,
+                      "authenticated": authed_after})
+        if authed_after:
+            return done(
+                "confirmed",
+                f"Logout invalidation missing: the pre-logout {names} still reaches the authenticated "
+                f"{urlsplit(page).path} after {lo_method} {urlsplit(lo_url).path}.",
+                f"A fresh login's {names} alone reached {page} (HTTP {status_a}, a logout control or "
+                f"the account's username) while the same request with no session was denied "
+                f"({denial_a}). After {lo_method} {lo_url} on that session (HTTP {logout.status_code}), "
+                f"replaying {page} with the same pre-logout cookie still returned the authenticated "
+                f"page (HTTP {after.status_code}): logout does not invalidate the session server-side.",
+                confidence=0.9)
+        denial_c = _anonymous_denial(after.status_code, after.text or "",
+                                     after.headers.get("location") or "")
+        if denial_c:
+            return done("not_confirmed",
+                        f"Session invalidated on logout: after {lo_method} {urlsplit(lo_url).path} the "
+                        f"pre-logout {names} is denied ({denial_c}).")
+        return done("inconclusive",
+                    f"Logout invalidation unproven: after {lo_method} {urlsplit(lo_url).path} the replay "
+                    f"of {urlsplit(page).path} answered HTTP {after.status_code}, which neither shows the "
+                    f"authenticated page nor denies the session.")
 
     # --- 2FA / MFA bypass -----------------------------------------------------
     async def _check_mfa_bypass(self, exchange) -> ValidationResult:

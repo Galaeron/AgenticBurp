@@ -194,6 +194,7 @@ _ASPECT_OR_CONTROL = ("harness OpenRedirectValidator returns a controlled negati
 # scenario exercised; it never claims the whole requirement.
 _LEG = "harness.test_leg_live_verification.LiveLegVerificationTest"
 _AUTHZ = "harness.test_smoke_authorization_workflow.AuthorizationSliceSmokeTest"
+_LOGOUT = "harness.test_auth_logout_invalidation.LogoutInvalidationCallerTests"
 _CONFIRM, _CONTROL = "harness_confirmation", "harness_control"
 
 # key -> (check_id, test class, test method, label, aspect)
@@ -227,6 +228,15 @@ _CALLER_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
                          _CONTROL,
                          "harness AuthSequenceValidator returns a controlled negative where the "
                          "session token rotates at login"),
+    # WG-3: the logout-invalidation leg's caller-level confirm and control.
+    "logout_confirm": ("WSTG-SESS-06", _LOGOUT, "test_client_side_only_logout_confirms", _CONFIRM,
+                       "harness AuthSequenceValidator confirms missing logout invalidation (a "
+                       "fresh throwaway session reaches the account page, is logged out, and its "
+                       "pre-logout cookie still reaches the page; the operator is never logged out)"),
+    "logout_control": ("WSTG-SESS-06", _LOGOUT, "test_server_side_invalidation_is_not_confirmed",
+                       _CONTROL,
+                       "harness AuthSequenceValidator returns a controlled negative where logout "
+                       "invalidates the session server-side"),
     "stored_xss_confirm": ("WSTG-INJT-02", _LEG, "test_stored_xss_confirms_on_raw_render", _CONFIRM,
                            "harness StoredXssValidator confirms stored XSS (plant, then the "
                            "payload executes on an independent render, logging a value computed "

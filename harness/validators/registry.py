@@ -568,7 +568,7 @@ class ValidatorRegistry:
                             "a long-polling transport request carries framing, not application input")
         method = (exchange.method or "GET").upper()
         path = urlsplit(exchange.url).path.lower()
-        if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03", "WSTG-IDNT-04", "WSTG-ATHN-11"}:
+        if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03", "WSTG-IDNT-04", "WSTG-ATHN-11", "WSTG-SESS-06"}:
             from .auth_sequence_validator import _parse_body, _find_key, _PASS_KEYS, _USER_KEYS
             fields, _kind = _parse_body(exchange)
             password, user = _find_key(fields, _PASS_KEYS), _find_key(fields, _USER_KEYS)
@@ -591,6 +591,12 @@ class ValidatorRegistry:
                 if not user or not str(fields.get(user) or "").strip():
                     return decision("needs_prerequisite", "missing_credentials",
                                     "a captured username/email field is required")
+            elif check.id == "WSTG-SESS-06":
+                # WG-3: the logout leg mints its own throwaway login from the
+                # captured one, so it needs that login, as session fixation does.
+                if not any(word in path for word in ("login", "signin", "sign-in", "session")):
+                    return decision("unsupported", "unsupported_boundary", "logout invalidation requires an observed login")
+                mechanism = "auth.logout_invalidation"
             else:
                 if not any(word in path for word in ("login", "signin", "sign-in", "session")):
                     return decision("unsupported", "unsupported_boundary", "session fixation requires an observed login")

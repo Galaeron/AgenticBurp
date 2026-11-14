@@ -919,6 +919,13 @@ CHECK_CATALOG: tuple[Check, ...] = (
     Check("WSTG-SESS-03", "Session fixation", Phase.ENDPOINT,
           "session_fixation", _has_auth_endpoint, "auth_sequence",
           "Test if session tokens are regenerated after login"),
+    # WG-3: auth_sequence's logout leg (session_timeout class) mints a fresh throwaway
+    # login from a captured login and never logs the operator out, so the row is
+    # scoped to auth endpoints like SESS-03. Idle/absolute timeout (SESS-07) has no leg.
+    Check("WSTG-SESS-06", "Logout functionality", Phase.ENDPOINT,
+          "session_timeout", _has_auth_endpoint, "auth_sequence",
+          "Test whether logout invalidates the session server-side (the pre-logout "
+          "cookie must stop reaching authenticated pages)"),
     # BUSL-09 is malicious-file upload and stays manual. The file_upload leg uploads
     # only a BENIGN disallowed-extension file, which is BUSL-08 (unexpected file
     # types). WG-2 could not add that row: "WSTG-BUSL-08" is still the WG-1 legacy
@@ -1446,8 +1453,6 @@ EXCLUDED_CATALOG_ROWS: dict[str, str] = {
                     "(second_order.py) run inside orchestrator_chain and their findings "
                     "carry second_order_sqli / second_order_idor, which canonicalize to no "
                     "class; a row needs a categories.py synonym and a kind decision",
-    "WSTG-SESS-06": "no Python leg confirms logout invalidation yet; WG-3 adds the leg "
-                    "and this row",
 }
 
 

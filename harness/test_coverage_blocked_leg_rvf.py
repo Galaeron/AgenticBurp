@@ -226,6 +226,13 @@ class CoverageSharedAuthLegEngagementTests(unittest.TestCase):
             state.ingest_role_crawl({"endpoints": [{
                 "method": "POST", "path": "/login", "by_role": {"anonymous": 200, "user": 200},
                 "reachable_roles": ["anonymous"], "object_scoped": False}], "idor_findings": []})
+            # A captured credential write: the capability gate refuses the
+            # enumeration and MFA rows on a login without username/password.
+            from harness.models import HttpExchange
+            state.record_template(base_url + "/login", "POST", HttpExchange(
+                url=base_url + "/login", method="POST",
+                request_headers={"Content-Type": "application/json"},
+                request_body='{"username":"user","password":"password"}', response_status=200))
             for r in roles:
                 state.ingest_identity(f"rolecrawl:{r.role}", r.role, source="seed")
             return state, SimpleNamespace(auth_bypass_candidates=[], idor_candidates=[],
@@ -263,7 +270,9 @@ class CoverageSharedAuthLegEngagementTests(unittest.TestCase):
               patch.object(asv.AuthSequenceValidator, "_check_mfa_bypass",
                            sub_check("mfa", "2fa_bypass")),
               patch.object(asv.AuthSequenceValidator, "_check_session_fixation",
-                           sub_check("fixation", "session_fixation"))):
+                           sub_check("fixation", "session_fixation")),
+              patch.object(asv.AuthSequenceValidator, "_check_logout_invalidation",
+                           sub_check("logout", "session_timeout"))):
             result = asyncio.run(orch.investigate_engagement(
                 smoke.BASE_URL, smoke.ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0))
         coverage = result.get("coverage") or {}

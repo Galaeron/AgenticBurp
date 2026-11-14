@@ -210,6 +210,7 @@ class KnownDualPlaneCapabilitiesArePythonAuthoritativeTests(unittest.TestCase):
     KNOWN_DUAL_PLANE = (
         "cross_identity", "jwt", "xxe", "csrf", "ssti", "command_injection",
         "open_redirect", "rate_limit", "file_upload", "sql_injection",
+        "logout_invalidation",
     )
 
     def test_known_dual_plane_capabilities_are_present_in_both_planes(self):
@@ -245,6 +246,31 @@ class ClientTrustIsPythonOnlyTests(unittest.TestCase):
         self.assertFalse(cap.java_present, "client_trust has no Java case label")
         self.assertEqual("python", execution_planes.authoritative_plane("client_trust"))
         self.assertNotIn("client_trust", execution_planes.dual_plane_capabilities())
+
+
+class LogoutInvalidationIsDualPlaneTests(unittest.TestCase):
+    """WG-3: logout invalidation has a Python leg (auth_sequence's logout check)
+    and is no longer Java-only; the Java-only plane keeps the two capabilities
+    that still have no Python leg."""
+
+    def test_logout_invalidation_is_dual_and_python_authoritative(self):
+        cap = CAPABILITY_MATRIX["logout_invalidation"]
+        self.assertTrue(cap.python_present and cap.java_present)
+        self.assertEqual("auth_sequence", cap.python_name)
+        self.assertEqual(("logout_invalidation_compare",), cap.java_names)
+        self.assertEqual("python", execution_planes.authoritative_plane("logout_invalidation"))
+        self.assertIn("logout_invalidation", execution_planes.dual_plane_capabilities())
+
+    def test_plane_counts(self):
+        planes = [("dual" if c.python_present and c.java_present
+                   else "java" if c.java_present else "python")
+                  for c in CAPABILITY_MATRIX.values()]
+        # 23 Python-only: the branch's 14 plus main's nine passive/GET-only legs
+        # (security headers, error handling, exposure, filter, well-known).
+        self.assertEqual((27, 2, 23), (planes.count("dual"), planes.count("java"),
+                                       planes.count("python")))
+        java_only = {k for k, c in CAPABILITY_MATRIX.items() if not c.python_present}
+        self.assertEqual({"xss_reflected_context", "workflow_replay_boundary"}, java_only)
 
 
 class MatrixConstructionNegativeControlTests(unittest.TestCase):

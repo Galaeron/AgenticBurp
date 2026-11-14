@@ -1397,7 +1397,7 @@ class ChainMixin:
         from harness.validators.open_redirect_validator import OpenRedirectValidator
         from harness.validators.sequence_validator import SequenceValidator
         from harness.validators.deserialization_oob_validator import DeserializationOobValidator
-        from harness.validators.auth_sequence_validator import AuthSequenceValidator
+        from harness.validators.auth_sequence_validator import AuthSequenceValidator, _is_logout_class
         from harness.validators.stored_xss_validator import StoredXssValidator
         from harness.validators.rate_limit_validator import RateLimitValidator
         from harness.validators.reset_token_validator import ResetTokenValidator
@@ -1958,7 +1958,7 @@ class ChainMixin:
                   or "broken authentication" in low
                   or "broken_authentication" in low or "2fa" in low or "mfa" in low
                   or "two_factor" in low or "two-factor" in low or "multi_factor" in low
-                  or "second factor" in low):
+                  or "second factor" in low or _is_logout_class(low)):
                 # Only an ACCOUNT enumeration is this leg's ("Broken Object/Resource
                 # Enumeration" is not), and only on a captured credential write.
                 _gap = _auth_sequence_shape_gap(exchange)

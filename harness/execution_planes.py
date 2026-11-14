@@ -181,11 +181,20 @@ _DUAL: tuple[CapabilityOwnership, ...] = (
                "blind-SSRF OOB-collaborator leg (redirect a URL-shaped param to a callback, "
                "watch for the hit)."),
     _dual("session_fixation", "auth_sequence", "session_fixation_compare",
-          note="Python AuthSequenceValidator dispatches session_fixation as one of three "
-               "classes (session_fixation / weak_password_policy / username_enumeration); "
-               "Java has a dedicated sessionFixationCompare(). Only the session_fixation "
-               "class overlaps -- see weak_password_policy/username_enumeration below "
-               "(Python-only) and logout_invalidation below (Java-only)."),
+          note="Python AuthSequenceValidator dispatches session_fixation as one of its "
+               "classes (session_fixation / weak_password_policy / username_enumeration / "
+               "2fa_bypass / session_timeout); Java has a dedicated sessionFixationCompare(). "
+               "session_fixation and logout_invalidation overlap -- see "
+               "weak_password_policy/username_enumeration below (Python-only)."),
+    _dual("logout_invalidation", "auth_sequence", "logout_invalidation_compare",
+          note="WG-3: AuthSequenceValidator's logout leg (session_timeout class, "
+               "WSTG-SESS-06) mints a fresh throwaway login, proves it reaches an "
+               "authenticated page an anonymous request is denied, sends the page's own "
+               "logout on that session, and confirms only when the pre-logout cookie still "
+               "reaches the page. It runs under the Python SafetyGate (needs "
+               "validators.allow_mutating_replay) with evidence-ledger visibility; Java's "
+               "SessionLifecycleLogic keeps its executor, Python is authoritative. Idle/"
+               "absolute timeout (SESS-07) stays out of scope on both planes."),
     _dual("deserialization_format", "deserialization", "deserialization_format_confirmation",
           note="Both are the PASSIVE format-fingerprint scan (no live send on either side). "
                "Distinct from Python's 'deserialization_oob' (active pickle OOB beacon, "
@@ -216,14 +225,6 @@ _JAVA_ONLY: tuple[CapabilityOwnership, ...] = (
                     "unconfirmed finding with no automated leg to state.flag_business_logic() "
                     "as a human-verification task instead of confirming it -- business logic "
                     "is a deliberate no-leg class in the Python plane today, not an oversight."),
-    _java_only("logout_invalidation", "logout_invalidation_compare",
-               note="auth_sequence_validator.py's docstring enumerates exactly three dispatched "
-                    "classes (session_fixation, weak_password_policy, username_enumeration) and "
-                    "explicitly does not include logout/session invalidation. No Python leg "
-                    "confirms it, so this Java executor's live traffic for this capability is "
-                    "the only one of the two planes reachable, and today runs with no Python "
-                    "SafetyGate/evidence-ledger visibility at all -- worth owner attention "
-                    "independent of the dual-plane drift concern RB-6 is about."),
     _dual("nosql_injection", "nosql", "nosql_validation",
           note="Python confirms login operator injection with fresh-token positive/negative "
                "differentials and administrator readback; Java retains its executor."),
@@ -280,9 +281,9 @@ _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
                  note="ACTIVE pickle OOB-beacon leg (proves code execution). Distinct from the "
                       "passive 'deserialization_format' capability above, which IS dual-plane."),
     _python_only("weak_password_policy", "auth_sequence",
-                 note="One of AuthSequenceValidator's three dispatched classes; no Java case."),
+                 note="One of AuthSequenceValidator's dispatched classes; no Java case."),
     _python_only("username_enumeration", "auth_sequence",
-                 note="One of AuthSequenceValidator's three dispatched classes; no Java case."),
+                 note="One of AuthSequenceValidator's dispatched classes; no Java case."),
     _python_only("security_headers", "security_headers",
                  note="PASSIVE WSTG-CONF-14 coverage leg: nosniff / Referrer-Policy on a captured "
                       "2xx. Judges the captured response and sends nothing; no Java case."),
