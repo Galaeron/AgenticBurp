@@ -319,6 +319,17 @@ driver_capture:
   # view, so the XSS legs test it. GET navigation only, as the crawling identity.
   # Its own cap, apart from max_views. 0 = off.
   route_probes: 0
+  # File inputs (needs spa_navigation): on each view, attach a small benign
+  # generated file of a type the input's `accept` allows, once per input, and
+  # capture the upload request the page then issues -- so the file_upload
+  # validator has a capture to work from. An uploaded file cannot be removed
+  # generically, so the request is HELD in the browser and never forwarded: the
+  # validator makes its own gated upload. Still treated as a write: only with
+  # validators.active_enabled + allow_mutating_replay and one per-input mutating
+  # ceiling case. An input with no reachable upload is recorded as a skip.
+  # DEFAULT OFF. max_uploads caps the inputs tried per crawl.
+  file_uploads: false
+  max_uploads: 4
 
 # Cross-site browser PoC for CSRF confirmation -- LB-5 (harness/browser_driver.py
 # PlaywrightDriver.cross_site_submit + harness/validators/csrf_validator.py).
@@ -379,6 +390,23 @@ engagement:
   # validators.allow_mutating_replay, so with mutating replay off this reduces to
   # an authenticated read-only walk. Scope-gated to server.allowed_hosts + throttled.
   feature_crawl: false
+  # Forms on fetched HTML documents as request templates (harness/form_capture.py).
+  # enabled: every form on a 2xx HTML page the run already fetched becomes a
+  # request template (method, resolved action, the page's own current values with
+  # hidden fields such as anti-CSRF tokens as rendered) that review and the
+  # validators get like any other capture. PASSIVE: nothing is sent. A form with a
+  # password field is never templated; no field value is logged.
+  # baseline: additionally submit each POST form ONCE, UNCHANGED, as the identity
+  # that fetched its page, so the capture carries the real answer. A WRITE: only
+  # with validators.active_enabled + allow_mutating_replay, through the gate and
+  # one per-form mutating ceiling case, and only for a fully filled edit form; the
+  # page is re-read and the write marked restored or restore_failed. Anything that
+  # could not be restored (create-shaped, button-only, file forms) is skipped with
+  # the reason. DEFAULT OFF, both.
+  form_templates:
+    enabled: false
+    baseline: false
+    max_forms: 40
   # Coverage matrix as a DRIVER (I1): after the worklist pass, actively fire every
   # applicable deterministic confirmation leg per (identity x endpoint x check)
   # cell -- regardless of whether an agent labelled that class -- and record the

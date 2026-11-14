@@ -118,6 +118,34 @@ def _mine_capture_routes(routes, exchange) -> None:
         log.warning("build_engagement: client route mining failed: %s", exc)
 
 
+async def _add_form_templates(state, result, base_url, form_config, run_context, scope) -> None:
+    """Template every form on the fetched HTML documents into the captures (and,
+    with `baseline`, submit each POST form once unchanged under the write gate).
+    Logs counts, paths and field names only -- never a field value."""
+    from harness import form_capture
+    try:
+        capture = form_capture.mine_templates(
+            result.captured, base_url=base_url, in_scope=scope.in_scope,
+            max_forms=max(0, int(form_config.get("max_forms", 40))))
+        if form_config.get("baseline", False):
+            if run_context is None:
+                capture.baselines.append({"form": "*", "outcome": "skipped",
+                                          "reason": "owning RunContext required"})
+            else:
+                await form_capture.submit_baselines(capture, run_context)
+    except Exception as exc:  # template mining never sinks the build
+        log.warning("build_engagement: form templates failed: %s", type(exc).__name__)
+        return
+    for ex in capture.templates:
+        result.captured.append(ex.model_dump())
+        state.record_template(ex.url, ex.method, ex)
+    result.form_templates = capture.summary()
+    log.info("build_engagement: form templates -- %d documents, %d forms, %d templated "
+             "(%s), %d skipped, %d baseline outcomes", capture.documents, capture.forms,
+             len(capture.mined), ", ".join(m.label for m in capture.mined[:10]) or "none",
+             len(capture.skipped), len(capture.baselines))
+
+
 async def build_engagement(
     base_url: str,
     roles: list[RoleSession],
@@ -139,6 +167,7 @@ async def build_engagement(
     discovery_recursion_max_requests: int = 0,
     per_principal: bool = False,
     extra_views=(),
+    form_templates_config=None,
 ) -> tuple[engagement.EngagementState, role_crawl.RoleCrawlResult]:
     """Discover + build the access matrix + fuse into an EngagementState.
 
@@ -184,7 +213,12 @@ async def build_engagement(
                             max_depth=max(0, int(capture_config.get("max_depth", 4))),
                             declared_views=max(0, int(capture_config.get("declared_views", 0))),
                             extra_views=extra_views,
-                            **_probe_kwargs(capture_config))
+                            **_probe_kwargs(capture_config),
+                            # File inputs: a benign file attached, the upload held
+                            # and captured (driver_capture.file_uploads; off).
+                            **({"file_uploads": True, "max_uploads": max(
+                                0, int(capture_config.get("max_uploads", 4)))}
+                               if capture_config.get("file_uploads", False) else {}))
                         supplied.extend(crawl.exchanges[:200 - len(supplied)])
                         _collect_spa_routes(client_routes, crawl)
                         spa_views.append({"principal": role.principal_id(),
@@ -195,6 +229,8 @@ async def build_engagement(
                                           "guarded": list(getattr(crawl, "guarded", []) or []),
                                           "probes": [{"view": p.get("view"), "names": p.get("names")}
                                                      for p in getattr(crawl, "probes", None) or []],
+                                          **({"uploads": list(getattr(crawl, "uploads", []) or [])}
+                                             if capture_config.get("file_uploads", False) else {}),
                                           "stopped_by": crawl.stopped_by})
                         seed_errors.extend("browser spa crawl: " + e for e in crawl.errors)
                         continue
@@ -323,6 +359,12 @@ async def build_engagement(
             ep.record_principal_observation(principal_id, **observation)
             access.record(principal_id, **observation)
         state.record_template(ex.url, ex.method, ex)
+    # Forms on the HTML documents the run fetched, as request templates
+    # (engagement.form_templates; off by default). Mining is passive; the
+    # baseline submit is a gated, restore-checked write (form_capture.py).
+    form_config = form_templates_config or {}
+    if form_config.get("enabled", False):
+        await _add_form_templates(state, result, base_url, form_config, run_context, scope)
     # E5b: every probe the crawl sent is a replayable request AS the identity that
     # sent it, so a check on an identity whose body (or 401) was not kept as a
     # capture still has its own request to replay.

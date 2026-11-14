@@ -357,6 +357,10 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     # The server-error follow-up hands database-error leads to sqlmap / the nosql
     # leg -- active traffic. Forced to False (= 0 leads); the passive ledger stays.
     "engagement.server_errors.max_lead_confirmations",
+    # The form baseline submits each templated POST form once (a write), and the
+    # browser file-input capture attaches a file and triggers the upload.
+    "engagement.form_templates.baseline",
+    "driver_capture.file_uploads",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

@@ -1189,6 +1189,9 @@ class ChainMixin:
                 log.warning("investigate_engagement: journaled discovery unusable (%s); "
                             "discovering again", type(e).__name__)
         if not _resumed_units["discovery"]:
+            # Forms on fetched HTML documents as request templates (form_capture.py).
+            _form_templates_cfg = ((self.config.get("engagement") or {})
+                                   .get("form_templates") or {})
             state, rc = await engagement_builder.build_engagement(
                 base_url, roles, allowed_hosts=self.allowed_hosts,
                 crawl_max_pages=discovery_max_pages,
@@ -1200,7 +1203,9 @@ class ChainMixin:
                 **({"per_principal": True} if _per_principal else {}),
                 **({"seed_exchanges": seed_exchanges} if seed_exchanges else {}),
                 **({"driver_capture_config": self.config["driver_capture"]}
-                   if (self.config.get("driver_capture") or {}).get("enabled") else {}))
+                   if (self.config.get("driver_capture") or {}).get("enabled") else {}),
+                **({"form_templates_config": _form_templates_cfg}
+                   if _form_templates_cfg.get("enabled") else {}))
             if _journal is not None:
                 try:
                     _journal_put("discovery", run_journal.discovery_payload(state, rc, roles))
@@ -3284,6 +3289,7 @@ class ChainMixin:
             "crawl_loop": {
                 "per_principal": _per_principal,
                 "spa_views": getattr(rc, "spa_views", None) or [],
+                "form_templates": getattr(rc, "form_templates", None),
                 "recrawl": _recrawl_report,
                 "phase_schedule": _schedule.report() if _schedule.active else None,
                 "review_overlap": _overlap.report() if _overlap is not None else None,

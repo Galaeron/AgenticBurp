@@ -573,6 +573,9 @@ class _IdentityRouter:
         # router config they declare. None (the default) keeps none.
         self.script_bodies: list[str] | None = None
         self._scripts_kept = 0
+        # crawl_spa(file_uploads=True) while one file input's upload is tried: every
+        # write the page issues is HELD and aborted, never sent (see _hold_write).
+        self.hold: dict | None = None
         extra, cookies = _extra_headers_and_cookies(headers, url)
         self.identity_headers = {k.lower(): v for k, v in (extra or {}).items()}
         self.identity_cookies = {c["name"]: c["value"] for c in cookies}
@@ -647,6 +650,9 @@ class _IdentityRouter:
             if self.obs is not None:
                 self.obs.cancelled = True
             await _quietly(route.abort())
+            return
+        if self.hold is not None and (request.method or "GET").upper() not in _HELD_READS:
+            await self._hold_write(route, request, self.hold)
             return
         is_navigation = request.is_navigation_request()
         decision = self._decide(request.url, request.method, request.resource_type,
@@ -742,6 +748,67 @@ class _IdentityRouter:
             url, method = next_url, next_method
         await route.abort()
 
+    async def _hold_write(self, route, request, hold: dict) -> None:
+        """A write the page issued while a file input's upload is tried. Nothing
+        is forwarded: an uploaded file cannot be removed generically, so the
+        request is captured as a template and dropped (_drop_held). The first one
+        carrying the attached file is the upload: checked against scope and
+        same-origin, then authorized as a write (active + mutating replay, the
+        input's ceiling case) before it is recorded. Any other write is dropped
+        and counted."""
+        from harness.models import HttpExchange
+        method, url = (request.method or "POST").upper(), request.url
+        try:
+            body = request.post_data_buffer or b""
+        except Exception:
+            body = b""
+        if hold.get("exchange") is not None or not any(m and m in body for m in hold["markers"]):
+            hold["aborted"].append(f"{method} {urlsplit(url).path or '/'}")
+            log.info("%s: held write %s %s aborted (not the upload)", self.label, method,
+                     urlsplit(url).path or "/")
+            await self._drop_held(route, request)
+            return
+        decision = evaluate_browser_request(
+            url=url, method=method, resource_type="fetch", is_navigation=False,
+            run_origin=self.run_origin, scope=self.scope)
+        if not decision.allow:
+            hold["reason"] = f"upload request refused: {decision.reason}"
+        elif self.gate is None:
+            hold["reason"] = "upload capture not authorized: no gate"
+        else:
+            verdict = self.gate.authorize(validator_name=hold["capability"], method=method,
+                                          url=url, finding_id=hold["case_ref"])
+            if not verdict.allowed:
+                hold["reason"] = f"upload capture not authorized: {verdict.reason}"
+            else:
+                try:
+                    headers = dict(request.headers)
+                except Exception:
+                    headers = {}
+                hold["exchange"] = HttpExchange(
+                    url=url, method=method, request_headers=headers,
+                    request_body=body.decode("utf-8", "replace"),
+                    analyst_note=hold["note"][:2000], capture_source=hold["capability"],
+                ).model_dump()
+        await self._drop_held(route, request)
+
+    @staticmethod
+    async def _drop_held(route, request) -> None:
+        """End a held request without sending it. A held form submit (a navigation)
+        is answered locally with 204 No Content, so the page stays on its document
+        instead of committing an error page; anything else is aborted."""
+        try:
+            navigation = request.is_navigation_request()
+        except Exception:
+            navigation = False
+        if navigation:
+            try:
+                await route.fulfill(status=204, headers={"cache-control": "no-store"}, body="")
+                return
+            except Exception:
+                pass
+        await _quietly(route.abort())
+
     def _offer_route(self, url: str, method: str, body, response) -> None:
         """route_feed (engagement.recrawl): an XHR/fetch call a page fired is offered
         back to the engagement, so a route a later browser visit reveals reaches
@@ -830,6 +897,116 @@ class _IdentityRouter:
             target = json.dumps(next_url).replace("<", "\\u003c")
             body = f"<!doctype html><script>location.replace({target})</script>"
         await route.fulfill(status=200, headers=headers, body=body)
+
+
+# ---------------------------------------------------------------------------
+# File inputs (crawl_spa(file_uploads=True), driver_capture.file_uploads)
+# ---------------------------------------------------------------------------
+
+# Methods a held upload attempt lets through to the normal routing: reads.
+_HELD_READS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+_FILE_INPUTS_JS = """() => Array.from(document.querySelectorAll('input[type=file]')).map(
+  (el, index) => {
+    const f = el.form;
+    return {index: index, name: el.name || '', accept: el.getAttribute('accept') || '',
+            multiple: !!el.multiple, disabled: !!el.disabled,
+            form: f ? {action: f.action || '', method: (f.method || 'get').toLowerCase(),
+                       enctype: f.enctype || '', novalidate: !!f.noValidate} : null};
+  })"""
+
+_SUBMIT_FILE_FORM_JS = """el => {
+  const f = el.form;
+  if (!f) return 'noform';
+  if (!f.noValidate && !f.checkValidity()) return 'invalid';
+  if (typeof f.requestSubmit === 'function') f.requestSubmit(); else f.submit();
+  return 'submitted';
+}"""
+
+
+async def _await_hold(hold: dict, wait_ms: int) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.3, min(wait_ms, 10000) / 1000)
+    while hold["exchange"] is None and not hold["reason"] and loop.time() < deadline:
+        await asyncio.sleep(0.05)
+
+
+def _upload_refusal(gate, case_ref: str) -> str:
+    """Why no file may be attached for this input's capture, or ""."""
+    from harness.spa_navigation import UPLOAD_CAPABILITY
+    if gate is None:
+        return "withheld: no write gate"
+    cfg = getattr(gate, "config", None)
+    if not getattr(cfg, "active_enabled", False):
+        return "withheld: writes are off (active_testing_disabled)"
+    if not getattr(cfg, "allow_mutating_replay", False):
+        return "withheld: writes are off (mutating_replay_disabled)"
+    remaining, used, ceiling = gate.mutating_headroom(case_ref, UPLOAD_CAPABILITY)
+    if remaining < 1:
+        return f"per-finding mutating ceiling reached ({used}/{ceiling})"
+    return ""
+
+
+async def _upload_file_input(page, router, desc: dict, *, gate, headers: dict | None,
+                             wait_ms: int):
+    """Try one file input: attach a small benign file its `accept` allows, wait for
+    the page's own upload request, and (an input in a POST form, nothing seen yet)
+    submit the form as the page would. The router HOLDS every write meanwhile:
+    the upload is captured as a request template and aborted, never sent (an
+    uploaded file cannot be removed generically; the file_upload validator makes
+    its own gated upload from the capture). Only with writes on and the input's
+    ceiling case open, checked before anything is attached. Returns (exchange
+    dict or None, reason)."""
+    import secrets
+    from harness import upload_files
+    from harness.spa_navigation import UPLOAD_CAPABILITY, view_key
+    case_ref = str(desc.get("case_ref") or "")
+    accept = str(desc.get("accept") or "")
+    refusal = _upload_refusal(gate, case_ref)
+    if refusal:
+        return None, refusal
+    made = upload_files.benign_file(accept, secrets.token_hex(6))
+    if made is None:
+        return None, f"no benign file type matches accept={accept!r}"
+    name, mime, data = made
+    handles = await page.query_selector_all("input[type=file]")
+    index = int(desc.get("index", -1))
+    if not 0 <= index < len(handles):
+        return None, "the file input is no longer on the view"
+    form = desc.get("form") or None
+    label = str(desc.get("name") or f"#{index}")
+    ext = name.rsplit(".", 1)[-1]
+    hold = {"markers": (name.encode(), data), "case_ref": case_ref,
+            "capability": UPLOAD_CAPABILITY, "exchange": None, "reason": "", "aborted": [],
+            "note": (f"driver_capture: upload request the page issued for file input "
+                     f"'{label}' on view {view_key(page.url or '')} with a benign generated "
+                     f".{ext} file (accept={accept or 'any'}); held in the browser and "
+                     "never sent -- an uploaded file cannot be removed generically")}
+    submitted = ""
+    router.hold = hold
+    try:
+        await handles[index].set_input_files({"name": name, "mimeType": mime, "buffer": data})
+        await _await_hold(hold, wait_ms)
+        if (hold["exchange"] is None and not hold["reason"] and form
+                and (form.get("method") or "get") == "post"):
+            submitted = str(await handles[index].evaluate(_SUBMIT_FILE_FORM_JS))
+            if submitted == "submitted":
+                await _await_hold(hold, wait_ms)
+    finally:
+        router.hold = None
+    others =(f"; {len(hold['aborted'])} other write(s) held and aborted"
+              if hold["aborted"] else "")
+    if hold["exchange"] is not None:
+        return (_with_identity(hold["exchange"], router.run_origin, headers),
+                f"held, not sent; benign .{ext} file{others}")
+    if hold["reason"]:
+        return None, hold["reason"] + others
+    if submitted == "invalid":
+        return None, "its form needs other fields filled before it submits; not submitted" + others
+    if form and (form.get("method") or "get") != "post":
+        return None, "no upload request observed; its form does not submit by POST" + others
+    return None, (f"no upload request observed after attaching a benign .{ext} file"
+                  + (" and submitting its form" if submitted == "submitted" else "") + others)
 
 
 def playwright_available() -> bool:
@@ -1109,6 +1286,7 @@ class PlaywrightDriver:
                         max_views: int = 30, max_depth: int = 4,
                         max_captured: int = 200, extra_views=(),
                         declared_views: int = 0, route_probes: int = 0,
+                        file_uploads: bool = False, max_uploads: int = 4,
                         deadline: float | None = None):
         """`capture_requests` across the app's client-side views: load `url`, then
         follow the in-app links and router targets the rendered DOM exposes
@@ -1124,7 +1302,10 @@ class PlaywrightDriver:
         navigation, through the same router). `route_probes` > 0 also keeps them,
         to load up to that many views once more with a marker in each parameter
         name the scripts read (spa_navigation.crawl_views; the rendered text and
-        form values are read back). Returns a `spa_navigation.SpaCrawlResult`."""
+        form values are read back). `file_uploads` also tries, up to
+        `max_uploads`, each view's file inputs (_upload_file_input: a benign file
+        attached, the upload request held and captured, never sent). Returns a
+        `spa_navigation.SpaCrawlResult`."""
         from harness.spa_navigation import (LINK_TARGETS_JS, SpaCrawlResult, ViewRefused,
                                             crawl_views, describe_error)
         effective_scope = scope if scope is not None else ScopePolicy(
@@ -1230,11 +1411,25 @@ class PlaywrightDriver:
                             found = await page.evaluate(_VIEW_TEXT_JS)
                             return found if isinstance(found, str) else ""
 
+                    class _UploadAdapter(_Adapter):
+                        # driver_capture.file_uploads: see _upload_file_input.
+                        async def file_inputs(self) -> list:
+                            found = await page.evaluate(_FILE_INPUTS_JS)
+                            return [d for d in found or [] if isinstance(d, dict)]
+
+                        async def upload(self, desc: dict):
+                            self.stale = True     # the attempt may have left the view
+                            return await _upload_file_input(
+                                page, router, desc, gate=gate, headers=headers,
+                                wait_ms=wait_ms)
+
+                    adapter = _UploadAdapter() if file_uploads else _Adapter()
                     return await crawl_views(
-                        _Adapter(), url, in_scope=effective_scope.in_scope,
+                        adapter, url, in_scope=effective_scope.in_scope,
                         max_views=max_views, max_depth=max_depth, max_captured=max_captured,
                         extra_views=extra_views, declared_views=max(0, int(declared_views)),
                         route_probes=max(0, int(route_probes)),
+                        uploads=max(0, int(max_uploads)) if file_uploads else 0,
                         cancel=cancel, budget=budget, deadline=deadline)
                 finally:
                     if context is not None:

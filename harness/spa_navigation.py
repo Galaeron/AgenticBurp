@@ -154,6 +154,9 @@ class SpaCrawlResult:
     # "view": its view key, "names": the names whose marker the view showed or
     # sent, "calls": [(method, url, body), ...] it fired}.
     probes: list[dict] = field(default_factory=list)
+    # File inputs (uploads > 0): one entry per input tried or passed over --
+    # {"view", "input", "accept", "outcome": "captured" | "skipped", "reason"}.
+    uploads: list[dict] = field(default_factory=list)
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -232,9 +235,69 @@ def _declared_url(current: str, path: str, hash_hint: bool) -> str | None:
     return resolve_view(current, path)
 
 
+UPLOAD_CAPABILITY = "file_upload_capture"
+
+
+def upload_case_ref(scope_key: str, input_key: str) -> str:
+    """The per-input mutating-ceiling case of one file input's upload capture."""
+    import hashlib
+    digest = hashlib.sha256(f"{scope_key}\x00{input_key}".encode("utf-8", "replace")).hexdigest()
+    return f"{UPLOAD_CAPABILITY}:{digest[:12]}"
+
+
+async def _try_uploads(adapter, current: str, result: SpaCrawlResult, keys: set,
+                       room: int) -> int:
+    """crawl_views' file-input pass over the view at `current` (see its doc).
+    Returns the inputs still allowed."""
+    view = view_key(current)
+    try:
+        inputs = await adapter.file_inputs()
+    except Exception as exc:
+        result.errors.append(f"file inputs {view}: {describe_error(exc)}")
+        return room
+    for desc in inputs or ():
+        form = desc.get("form") or {}
+        action = str(form.get("action") or "")
+        # One input is one form field: the same form on two views is tried once.
+        scope_key = urlsplit(action).path or view if action else view
+        input_key = str(desc.get("name") or f"#{desc.get('index', 0)}")
+        if (scope_key, input_key) in keys:
+            continue
+        keys.add((scope_key, input_key))
+        entry = {"view": view, "input": input_key, "accept": str(desc.get("accept") or "")}
+        result.uploads.append(entry)
+        if desc.get("disabled"):
+            entry.update(outcome="skipped", reason="the input is disabled")
+            continue
+        if action and _DESTRUCTIVE.search(urlsplit(action).path or ""):
+            entry.update(outcome="skipped", reason="destructive-looking form action")
+            continue
+        if room <= 0:
+            entry.update(outcome="skipped", reason="upload cap reached")
+            continue
+        room -= 1
+        try:
+            exchange, reason = await adapter.upload(
+                dict(desc, case_ref=upload_case_ref(scope_key, input_key)))
+        except Exception as exc:
+            exchange, reason = None, f"upload attempt failed: {describe_error(exc)}"
+        if exchange is None:
+            entry.update(outcome="skipped", reason=reason or "no upload request observed")
+            continue
+        entry.update(outcome="captured", reason=reason or "",
+                     request=f"{exchange.get('method') or 'POST'} "
+                             f"{urlsplit(exchange.get('url') or '').path or '/'}")
+        result.exchanges.append(dict(exchange))
+        if len(result.view_calls) < 2000:
+            result.view_calls.append((current, exchange.get("method") or "POST",
+                                      exchange.get("url") or "", ""))
+    return room
+
+
 async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_views: int = 30,
                       max_depth: int = 4, max_captured: int = 200, extra_views=(),
                       declared_views: int = 0, route_probes: int = 0,
+                      uploads: int = 0,
                       cancel: Any = None, budget: Any = None,
                       deadline: float | None = None) -> SpaCrawlResult:
     """Breadth-first walk of the app's client-side views from `start_url`.
@@ -264,7 +327,14 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     marker the rendered view shows (`text()`: the visible text and the form
     values) or sends in a call is a route input of that view (`probes`). Its own
     cap, apart from max_views; a probe the app does not stay on records nothing,
-    and the calls it fired are captured all the same."""
+    and the calls it fired are captured all the same.
+
+    `uploads` > 0 (an adapter with `file_inputs()` and `upload()`) also tries, once
+    per input and up to that many inputs, each file input a view renders: the
+    adapter attaches a benign file the input accepts and returns the upload
+    request the page issued (held, never sent), or why there was none. A file
+    input in a destructive-looking form is never tried. Every input tried or
+    passed over is recorded in `uploads`; a captured request joins `exchanges`."""
     result = SpaCrawlResult(start_url=start_url)
     origin = urlsplit(start_url)[:2]
     queue: list[tuple[str, int, bool]] = [(start_url, 0, False)]
@@ -281,6 +351,8 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     probed: set = set()
     baseline_text: str | None = None   # the first view's text (in-place denials)
     text_of = getattr(adapter, "text", None)
+    upload_room = max(0, int(uploads or 0))
+    upload_keys: set = set()
 
     def admit(url: str | None, depth: int, declared: bool = False) -> None:
         if url is None:
@@ -480,6 +552,9 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
             await absorb_scripts(current)
         if probe_room > 0 and not guarded:
             await probe(current)
+        if (upload_room > 0 and not guarded and callable(getattr(adapter, "file_inputs", None))
+                and callable(getattr(adapter, "upload", None))):
+            upload_room = await _try_uploads(adapter, current, result, upload_keys, upload_room)
         if declared_room > 0 and callable(getattr(adapter, "scripts", None)):
             await mine_declared(current)
     else:

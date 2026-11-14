@@ -34,7 +34,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlsplit, urlencode
+from urllib.parse import urljoin, urlsplit, urlencode, urlunsplit
 
 from harness.models import HttpExchange
 
@@ -64,6 +64,14 @@ class FormField:
     name: str
     type: str = "text"
     value: str = ""
+    # The control as the page rendered it (form templates): a checkbox or radio's
+    # `checked`, a `disabled` control (never submitted), a file input's `accept`,
+    # and a textarea's text. `value` keeps its old meaning, so body() and the
+    # workflow crawl are unchanged.
+    checked: bool = False
+    disabled: bool = False
+    accept: str = ""
+    text: str = ""
 
 
 @dataclass
@@ -87,6 +95,90 @@ class FormAction:
                 continue
             pairs.append((f.name, f.value if f.value else _default_value(f.name, f.type)))
         return urlencode(pairs)
+
+    def has_type(self, *types: str) -> bool:
+        wanted = {t.lower() for t in types}
+        return any((f.type or "text").lower() in wanted for f in self.fields if f.name)
+
+    def field_schema(self) -> list[dict]:
+        """Each named field's name and type (a file input's `accept` too). Never a value."""
+        out = []
+        for f in self.fields:
+            if not f.name:
+                continue
+            entry = {"name": f.name, "type": (f.type or "text").lower()}
+            if entry["type"] == "file" and f.accept:
+                entry["accept"] = f.accept
+            out.append(entry)
+        return out
+
+    def submission_entries(self) -> list[tuple[str, str, bool]]:
+        """(name, value, is_file) for what a browser submits when this form is sent
+        UNCHANGED, in document order: each control's own current value, checked
+        boxes and radios only, no disabled control, the first submit button as the
+        submitter. Hidden fields (anti-CSRF tokens) keep their value as rendered. A
+        password's value is never kept and a file input is an empty part."""
+        entries = []
+        submitter = False
+        for f in self.fields:
+            kind = (f.type or "text").lower()
+            if not f.name or f.disabled or kind in ("button", "reset", "image"):
+                continue
+            if kind in ("checkbox", "radio"):
+                if f.checked:
+                    entries.append((f.name, f.value or "on", False))
+            elif kind == "submit":
+                if not submitter:
+                    submitter = True
+                    entries.append((f.name, f.value, False))
+            elif kind == "file":
+                entries.append((f.name, "", True))
+            elif kind == "password":
+                entries.append((f.name, "", False))
+            elif kind == "textarea":
+                entries.append((f.name, f.text, False))
+            else:
+                entries.append((f.name, f.value, False))
+        return entries
+
+    def current_request(self) -> tuple[str, str, str]:
+        """(url, body, content_type) of this form submitted unchanged. A GET form's
+        controls replace the action's query, as a browser does; a multipart form is
+        encoded as multipart (an empty part per file input)."""
+        entries = self.submission_entries()
+        pairs = [(n, v) for n, v, is_file in entries if not is_file]
+        if (self.method or "GET").upper() == "GET":
+            parts = urlsplit(self.action)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), "")), "", ""
+        action = self.action.split("#", 1)[0]
+        if "multipart/form-data" in (self.enctype or "").lower():
+            body, ctype = multipart_body(entries)
+            return action, body, ctype
+        return action, urlencode(pairs), "application/x-www-form-urlencoded"
+
+
+# A fixed boundary keeps a template deterministic (the same form, the same body).
+_FORM_BOUNDARY = "----harness-form-template"
+
+
+def _part_name(name: str) -> str:
+    # HTML's multipart/form-data encoding of a field name.
+    return name.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def multipart_body(entries) -> tuple[str, str]:
+    """`entries` as (name, value, is_file) -> (multipart body, content type). A file
+    entry is the empty part a browser sends for a file input with no file chosen."""
+    lines = []
+    for name, value, is_file in entries:
+        lines.append(f"--{_FORM_BOUNDARY}")
+        if is_file:
+            lines += [f'Content-Disposition: form-data; name="{_part_name(name)}"; filename=""',
+                      "Content-Type: application/octet-stream", "", ""]
+        else:
+            lines += [f'Content-Disposition: form-data; name="{_part_name(name)}"', "", value or ""]
+    lines += [f"--{_FORM_BOUNDARY}--", ""]
+    return "\r\n".join(lines), f"multipart/form-data; boundary={_FORM_BOUNDARY}"
 
 
 def _default_value(name: str, input_type: str) -> str:
@@ -129,6 +221,7 @@ class _FormParser(HTMLParser):
         self.links: list[str] = []
         self._cur: FormAction | None = None
         self._in_textarea_name: str | None = None
+        self._cur_textarea: FormField | None = None
         # The <select> currently open inside self._cur, so its <option> values
         # can be captured as the field's real submitted value.
         self._cur_select: FormField | None = None
@@ -148,11 +241,13 @@ class _FormParser(HTMLParser):
             name = a.get("name") or ""
             if name:
                 self._cur.fields.append(FormField(
-                    name=name, type=a.get("type") or "text", value=a.get("value") or ""))
+                    name=name, type=a.get("type") or "text", value=a.get("value") or "",
+                    checked="checked" in a, disabled="disabled" in a,
+                    accept=a.get("accept") or ""))
         elif tag == "select" and self._cur is not None:
             name = a.get("name") or ""
             if name:
-                fld = FormField(name=name, type="select", value="")
+                fld = FormField(name=name, type="select", value="", disabled="disabled" in a)
                 self._cur.fields.append(fld)
                 self._cur_select = fld
         elif tag == "option" and self._cur_select is not None:
@@ -171,7 +266,9 @@ class _FormParser(HTMLParser):
         elif tag == "textarea" and self._cur is not None:
             self._in_textarea_name = a.get("name") or ""
             if self._in_textarea_name:
-                self._cur.fields.append(FormField(name=self._in_textarea_name, type="textarea"))
+                self._cur_textarea = FormField(name=self._in_textarea_name, type="textarea",
+                                               disabled="disabled" in a)
+                self._cur.fields.append(self._cur_textarea)
         elif tag == "button" and self._cur is not None:
             # HTML submits only the button that triggered the form.  A headless
             # workflow needs one deterministic submitter; choose the first named
@@ -190,6 +287,13 @@ class _FormParser(HTMLParser):
                 self.links.append(urljoin(self.base_url, href))
 
     def handle_data(self, data):
+        # A textarea's text is its current value (form templates). A browser drops
+        # one newline straight after the start tag.
+        textarea = self._cur_textarea
+        if textarea is not None and self._in_textarea_name:
+            if not textarea.text and data.startswith("\n"):
+                data = data[1:]
+            textarea.text += data
         # <option> with no value attribute submits its visible text. Capture it
         # as the select's value when no earlier option already supplied one.
         if (self._in_option and not self._option_has_value
@@ -213,6 +317,7 @@ class _FormParser(HTMLParser):
             self._in_option = False
         elif tag == "textarea":
             self._in_textarea_name = None
+            self._cur_textarea = None
 
 
 def extract_forms(html: str, base_url: str) -> list[FormAction]:
