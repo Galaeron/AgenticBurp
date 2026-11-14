@@ -244,6 +244,22 @@ class OwnershipLedger:
             tenant=tenant, shared_with=frozenset(shared_with or ()), public=bool(public),
             provenance=provenance))
 
+    def owned_objects(self, principal_id: str) -> list[tuple[str, str]]:
+        """(collection segment, object id) of every recorded or declared object whose
+        owner is `principal_id`, in recording order. A write check uses it to name
+        another principal's object; [] for an empty id or an unowned ledger."""
+        out: list[tuple[str, str]] = []
+        if not principal_id:
+            return out
+        for fact in list(self._by_ref.values()):
+            if fact.owner_principal_id != principal_id:
+                continue
+            resource = fact.object_ref.rsplit("|resource:", 1)[-1].split("?", 1)[0]
+            segments = [s for s in resource.split("/") if s]
+            if len(segments) >= 2:
+                out.append((segments[-2], segments[-1]))
+        return out
+
     def declare_pattern(self, target_url, method, segments, fact):
         from harness.protected_routes import _target_of
         # Exact paths outrank globs, then more literal characters; method wins ties.

@@ -393,6 +393,11 @@ _GATE_ROUTED_EXCEPTIONS = {
     # client_trust replays the captured write method with a tampered value field
     # (price/amount) through GatedAsyncClient, self-gated on allow_mutating_replay.
     "client_trust_validator.py",
+    # write_integrity replays the captured create/update method (and DELETEs what
+    # it created) only through the run executor, which applies the SafetyGate to
+    # every send; it preflights each write with gate.authorize and is self-gated
+    # on allow_mutating_replay.
+    "write_integrity_validator.py",
 }
 
 
@@ -603,6 +608,13 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
         self.assertIn("get_default_gate", sqlmap_src,
                        "sqlmap.py uses exchange.method for --method but doesn't call the safety gate")
         self.assertIn(".authorize(", sqlmap_src)
+
+        write = (here / "validators" / "write_integrity_validator.py").read_text()
+        self.assertIn("executor().execute(", write,
+                      "write_integrity_validator.py writes but not through the run executor")
+        self.assertIn("gate.authorize(", write)
+        self.assertIn("allow_mutating_replay", write)
+        self.assertNotIn("httpx", write, "write_integrity_validator.py must not hold a raw client")
 
         for name in ("ssrf_validator.py", "xxe_validator.py",
                      "command_injection_validator.py", "ssti_validator.py",

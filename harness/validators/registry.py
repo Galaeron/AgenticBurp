@@ -41,6 +41,7 @@ from .verbose_error_validator import VerboseErrorValidator
 from .security_headers_validator import SecurityHeadersValidator
 from .error_handling_validator import ErrorHandlingValidator
 from .content_exposure_validator import ContentExposureValidator
+from .write_integrity_validator import WriteIntegrityValidator
 from harness.safety_gate import get_default_gate, reset_default_gate
 
 log = logging.getLogger(__name__)
@@ -327,6 +328,17 @@ class ValidatorRegistry:
             self.validators["toctou"] = ToctouValidator(
                 allowed_hosts=_allowed, timeout=float(toctou_cfg.get("timeout", 10.0)),
                 burst_size=int(toctou_cfg.get("burst_size", 12)))
+        # Write integrity -- creates, reads back and deletes (or updates and
+        # restores) to confirm cross-identity, forged-authorship, business-rule,
+        # create-time mass-assignment and create-validation write flaws. Active;
+        # every write needs allow_mutating_replay, a per-case write ceiling
+        # (mutating_ceiling_by_check.write_integrity) and a known restore route.
+        wi_cfg = cfg.get("write_integrity", {})
+        if wi_cfg.get("enabled", True):
+            from harness.config_schema import parse_validators_flags
+            self.validators["write_integrity"] = WriteIntegrityValidator(
+                allowed_hosts=_allowed, restore_routes=wi_cfg.get("restore_routes") or (),
+                allow_writes=parse_validators_flags(cfg)["allow_mutating_replay"])
 
         # DOM-based XSS leg -- drives a real browser with the payload in the URL
         # FRAGMENT (never sent to the server), so execution proves a client-side
@@ -410,7 +422,7 @@ class ValidatorRegistry:
         registered and the auto-armed cross-identity validator alike; the cached
         auto-armed instance is rebuilt so a declaration made after arming counts."""
         self.ownership = ledger
-        for name in ("cross_identity", "idor_read"):
+        for name in ("cross_identity", "idor_read", "write_integrity"):
             validator = self.validators.get(name)
             if validator is not None:
                 validator.ownership = ledger
@@ -584,6 +596,18 @@ class ValidatorRegistry:
                 return decision("policy_denied", "mutating_policy_denied", "write authorization requires explicit mutating replay permission")
             if method == "DELETE" and str(self._xid_cfg.get("delete_restore_method", "")).upper() != "PUT":
                 return decision("needs_prerequisite", "missing_restore_contract", "DELETE requires an explicit PUT recreation contract")
+        if family == "write_integrity":
+            from .write_integrity_validator import BUSINESS_RULE_TAMPER, kind_for, _is_create, _json_object
+            kind = kind_for(finding_class, exchange)
+            if method not in {"POST", "PUT", "PATCH"} or kind is None:
+                return decision("unsupported", "unsupported_method", "write checks need a captured JSON create or update")
+            if _json_object(exchange.request_body) is None:
+                return decision("needs_prerequisite", "missing_json_body", "a captured JSON object body is required")
+            if not _is_create(exchange) and kind != BUSINESS_RULE_TAMPER:
+                return decision("unsupported", "unsupported_method", "this write check needs a POST create to a collection")
+            if run_context is None or not run_context.gate.config.allow_mutating_replay:
+                return decision("policy_denied", "mutating_policy_denied", "write checks require explicit mutating replay permission")
+            mechanism = "write_integrity." + kind
         if check.id == "WSTG-ATHZ-04":
             from .idor_read_validator import _locate_id
             if not _locate_id(exchange):

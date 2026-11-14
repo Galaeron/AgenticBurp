@@ -426,6 +426,20 @@ class SelfOwnership:
                 return hit
         return None
 
+    def account_ids(self, principal_id: str) -> list[str]:
+        """The account ids ("id:<x>" bindings) this run observed `principal_id` holding."""
+        return sorted(k.split(":", 1)[1] for k in self._accounts.get(principal_id or "", ())
+                      if k.startswith("id:"))
+
+    def owned_objects(self, principal_id: str) -> list[tuple[str, str]]:
+        """(object type key, id) of every object observed as owned by `principal_id`:
+        created by that principal, or owned by an account it is bound to."""
+        if not principal_id:
+            return []
+        mine = _Owner(principal=principal_id)
+        return [key for key, (owner, _prov) in list(self._objects.items())
+                if owner is not None and self._same_owner(owner, mine) is True]
+
     def _account(self, principal) -> set:
         return set(self._accounts.get(getattr(principal, "id", ""), ()))
 

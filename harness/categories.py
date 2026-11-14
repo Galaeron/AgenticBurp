@@ -224,6 +224,13 @@ _DEDUP_SYNONYMS: dict[str, str] = {
     # Content Security Policy" and grouped as two observations of one header.
     "csp weakness": "csp", "weak csp": "csp", "weak content security policy": "csp",
     "content security policy weakness": "csp",
+    # write_integrity_validator's classes (each is a create/update read back and undone).
+    "cross_identity_write": "idor", "cross identity write": "idor",
+    "forged_authorship": "idor", "forged authorship": "idor",
+    "business_rule_tamper": "business_logic", "business rule tamper": "business_logic",
+    "create_validation": "business_logic", "create validation": "business_logic",
+    "mass_assignment_create": "api_security", "mass assignment create": "api_security",
+    "write_integrity": "business_logic", "write integrity": "business_logic",
 }
 
 

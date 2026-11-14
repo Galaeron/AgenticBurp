@@ -90,6 +90,19 @@ def _walk(obj):
             yield from _walk(item)
 
 
+def _lists_a_collection(doc) -> bool:
+    """True when a GET answered with a listing envelope ({"data": [{...}, ...]}):
+    the URL names a collection, so a POST to it creates rather than updates."""
+    if not isinstance(doc, dict) or "id" in doc or any(isinstance(v, dict) for v in doc.values()):
+        return False
+    return any(str(k).lower() in _LISTING_KEYS and isinstance(v, list)
+               and (not v or isinstance(v[0], dict)) for k, v in doc.items())
+
+
+_LISTING_KEYS = frozenset({"data", "items", "results", "records", "rows", "entries", "list",
+                           "content", "elements", "hits", "objects"})
+
+
 def _present_privileged(obj, field, priv) -> bool:
     """True if `field` appears anywhere in the (possibly nested) response with the
     privileged value -- the recursive counterpart of a top-level `obj.get(field)`."""
@@ -205,6 +218,12 @@ class SequenceValidator(Validator):
                 if not isinstance(baseline, dict):
                     return self._skip(f"resource not readable as a JSON object for a "
                                       f"differential (GET -> {b_status})")
+                if method == "POST" and _lists_a_collection(baseline):
+                    # A POST to a collection CREATES an object this leg could never
+                    # delete again. write_integrity's mass_assignment_create runs it
+                    # with a plain-create control, a read-back and a verified DELETE.
+                    return self._skip("POST to a collection is a create: handed to write_integrity "
+                                      "(mass_assignment_create, restored by DELETE); nothing was written")
                 # Broaden with authority-named fields the resource itself exposes but
                 # the request didn't set (covers escalation fields outside the canonical
                 # list, e.g. a target-specific `is_premium`/`plan`/`org_owner`).

@@ -255,6 +255,11 @@ _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
                       "independent authority-field re-read (toctou_validator.py). Distinct "
                       "from the generic concurrent-burst 'race_condition' capability above, "
                       "which Java does implement -- toctou has no Java equivalent."),
+    _python_only("write_integrity", "write_integrity",
+                 note="Create/update write flaws (cross-identity reference, forged "
+                      "authorship, out-of-range business values, create-time mass "
+                      "assignment, weak create validation), each read back and undone "
+                      "by a verified DELETE or snapshot write (write_integrity_validator.py)."),
     _python_only("stored_xss", "stored_xss",
                  note="Plant-via-write, confirm-on-independent-render second-order XSS; "
                       "no Java case."),

@@ -187,6 +187,12 @@ CONFIRMABLE_CLASS_MARKERS = frozenset({
     "time of check",
     "check-then-act",
     "privilege escalation race",
+
+    # Write integrity (write_integrity_validator -- create/update, read back, undo)
+    "write_integrity", "cross_identity_write", "forged_authorship",
+    "business_rule_tamper", "mass_assignment_create", "create_validation",
+    "write integrity", "cross identity write", "forged authorship",
+    "business rule tamper", "mass assignment create", "create validation",
 })
 
 # The subset of confirmable classes whose leg is LIVE-VERIFIED -- proven to
@@ -267,6 +273,12 @@ PROVISIONAL_MARKERS = frozenset({
     "lockout", "account lockout",
     # predictable reset/session token
     "reset_token", "reset token", "predictable token", "insecure token", "token entropy",
+    # write integrity: fixture-verified only (mass_assignment_create contains the
+    # live "mass_assignment"; it must stay provisional until a live trial)
+    "write_integrity", "cross_identity_write", "forged_authorship",
+    "business_rule_tamper", "mass_assignment_create", "create_validation",
+    "write integrity", "cross identity write", "forged authorship",
+    "business rule tamper", "mass assignment create", "create validation",
 })
 
 
